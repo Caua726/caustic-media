@@ -1,0 +1,380 @@
+// math/geom.cst — the shapes a renderer tests against, and the tests.
+//
+// Picking a pixel, culling a mesh, deciding whether a light reaches a room:
+// all of it is ray, plane, box, sphere and triangle. The routines here return
+// the parameter t along a ray rather than a point, because a caller usually
+// wants to compare hits before turning one into a position, and a t below zero
+// is a hit behind the origin that has to be rejected.
+//
+// Pure: only math, no allocation, no OS.
+use "std/math.cst" as fm;
+use "vec.cst" as v;
+use "mat.cst" as mt;
+
+// --- Types ---
+
+// dir is expected to be unit length; the ray routines assume it so t comes
+// back in world units rather than in multiples of an arbitrary length.
+struct Ray { origin as v.Vec3; dir as v.Vec3; }
+
+// n·p + d = 0, with n unit length, so plane_distance is a true distance.
+struct Plane { n as v.Vec3; d as f64; }
+
+struct AABB { min as v.Vec3; max as v.Vec3; }
+struct Sphere { center as v.Vec3; radius as f64; }
+struct Triangle { a as v.Vec3; b as v.Vec3; c as v.Vec3; }
+
+// Left, right, bottom, top, near, far — with every normal pointing inward, so
+// "inside" is a positive distance to all six.
+struct Frustum { p as [6]Plane; }
+
+// --- Construction ---
+
+fn ray(origin as v.Vec3, dir as v.Vec3) as Ray {
+    let is Ray as r; r.origin = origin; r.dir = v.v3_normalize(dir); return r;
+}
+
+fn ray_at(r as Ray, t as f64) as v.Vec3 {
+    return v.v3_add(r.origin, v.v3_scale(r.dir, t));
+}
+
+fn plane(n as v.Vec3, d as f64) as Plane {
+    let is Plane as p; p.n = v.v3_normalize(n); p.d = d; return p;
+}
+
+fn plane_from_point_normal(point as v.Vec3, n as v.Vec3) as Plane {
+    let is v.Vec3 as un = v.v3_normalize(n);
+    let is Plane as p; p.n = un; p.d = 0.0 - v.v3_dot(un, point); return p;
+}
+
+// Normal follows the winding: counter-clockwise seen from the front.
+fn plane_from_triangle(t as Triangle) as Plane {
+    let is v.Vec3 as n = v.v3_cross(v.v3_sub(t.b, t.a), v.v3_sub(t.c, t.a));
+    return plane_from_point_normal(t.a, n);
+}
+
+fn aabb(min as v.Vec3, max as v.Vec3) as AABB {
+    let is AABB as b; b.min = min; b.max = max; return b;
+}
+
+// Deliberately inverted, so folding aabb_encompass over a point set builds
+// the tight box without a special case for the first point.
+fn aabb_empty() as AABB {
+    let is f64 as big = 100000000000000000000.0;
+    return aabb(v.v3(big, big, big), v.v3(0.0 - big, 0.0 - big, 0.0 - big));
+}
+
+fn aabb_from_center(center as v.Vec3, half as v.Vec3) as AABB {
+    return aabb(v.v3_sub(center, half), v.v3_add(center, half));
+}
+
+fn sphere(center as v.Vec3, radius as f64) as Sphere {
+    let is Sphere as s; s.center = center; s.radius = radius; return s;
+}
+
+fn triangle(a as v.Vec3, b as v.Vec3, c as v.Vec3) as Triangle {
+    let is Triangle as t; t.a = a; t.b = b; t.c = c; return t;
+}
+
+// --- Plane queries ---
+
+// Signed: positive on the side the normal points to.
+fn plane_distance(p as Plane, point as v.Vec3) as f64 {
+    return v.v3_dot(p.n, point) + p.d;
+}
+
+fn plane_project(p as Plane, point as v.Vec3) as v.Vec3 {
+    return v.v3_sub(point, v.v3_scale(p.n, plane_distance(p, point)));
+}
+
+// --- AABB queries ---
+
+fn aabb_center(b as AABB) as v.Vec3 { return v.v3_scale(v.v3_add(b.min, b.max), 0.5); }
+fn aabb_size(b as AABB) as v.Vec3   { return v.v3_sub(b.max, b.min); }
+fn aabb_half(b as AABB) as v.Vec3   { return v.v3_scale(aabb_size(b), 0.5); }
+
+fn aabb_is_empty(b as AABB) as i32 {
+    if (b.min.x > b.max.x || b.min.y > b.max.y || b.min.z > b.max.z) { return 1; }
+    return 0;
+}
+
+fn aabb_contains(b as AABB, p as v.Vec3) as i32 {
+    if (p.x < b.min.x || p.x > b.max.x) { return 0; }
+    if (p.y < b.min.y || p.y > b.max.y) { return 0; }
+    if (p.z < b.min.z || p.z > b.max.z) { return 0; }
+    return 1;
+}
+
+fn aabb_encompass(b as AABB, p as v.Vec3) as AABB {
+    return aabb(v.v3_min(b.min, p), v.v3_max(b.max, p));
+}
+
+fn aabb_union(a as AABB, b as AABB) as AABB {
+    return aabb(v.v3_min(a.min, b.min), v.v3_max(a.max, b.max));
+}
+
+fn aabb_expand(b as AABB, by as f64) as AABB {
+    let is v.Vec3 as e = v.v3(by, by, by);
+    return aabb(v.v3_sub(b.min, e), v.v3_add(b.max, e));
+}
+
+// The point inside the box nearest to p — the basis of box-sphere and of
+// pushing an object out of a wall.
+fn aabb_closest_point(b as AABB, p as v.Vec3) as v.Vec3 {
+    return v.v3(fm.clamp_f64(p.x, b.min.x, b.max.x),
+                fm.clamp_f64(p.y, b.min.y, b.max.y),
+                fm.clamp_f64(p.z, b.min.z, b.max.z));
+}
+
+// The box holding the transformed box. Rotating an AABB does not give an
+// AABB, so this takes the extent along each axis from the absolute values of
+// the matrix rows — the standard trick, and tighter than transforming all
+// eight corners and re-fitting.
+fn aabb_transform(b as AABB, m as mt.Mat4) as AABB {
+    let is v.Vec3 as c = aabb_center(b);
+    let is v.Vec3 as h = aabb_half(b);
+    let is v.Vec3 as nc = mt.m4_mul_point(m, c);
+    let is v.Vec3 as nh = v.v3(
+        fm.abs_f64(m.m[0]) * h.x + fm.abs_f64(m.m[4]) * h.y + fm.abs_f64(m.m[8])  * h.z,
+        fm.abs_f64(m.m[1]) * h.x + fm.abs_f64(m.m[5]) * h.y + fm.abs_f64(m.m[9])  * h.z,
+        fm.abs_f64(m.m[2]) * h.x + fm.abs_f64(m.m[6]) * h.y + fm.abs_f64(m.m[10]) * h.z);
+    return aabb_from_center(nc, nh);
+}
+
+// --- Overlap tests ---
+
+fn aabb_overlaps(a as AABB, b as AABB) as i32 {
+    if (a.max.x < b.min.x || b.max.x < a.min.x) { return 0; }
+    if (a.max.y < b.min.y || b.max.y < a.min.y) { return 0; }
+    if (a.max.z < b.min.z || b.max.z < a.min.z) { return 0; }
+    return 1;
+}
+
+// Compared squared, so no sqrt.
+fn sphere_overlaps(a as Sphere, b as Sphere) as i32 {
+    let is f64 as rr = a.radius + b.radius;
+    if (v.v3_len_sq(v.v3_sub(a.center, b.center)) <= rr * rr) { return 1; }
+    return 0;
+}
+
+fn sphere_contains(s as Sphere, p as v.Vec3) as i32 {
+    if (v.v3_len_sq(v.v3_sub(p, s.center)) <= s.radius * s.radius) { return 1; }
+    return 0;
+}
+
+fn aabb_overlaps_sphere(b as AABB, s as Sphere) as i32 {
+    let is v.Vec3 as q = aabb_closest_point(b, s.center);
+    if (v.v3_len_sq(v.v3_sub(q, s.center)) <= s.radius * s.radius) { return 1; }
+    return 0;
+}
+
+// --- Ray intersection ---
+//
+// Each returns 1 on a hit and writes the parameter t; t is always the nearest
+// hit in front of the origin.
+
+fn ray_plane(r as Ray, p as Plane, t_out as *f64) as i32 {
+    let is f64 as denom = v.v3_dot(p.n, r.dir);
+    // Parallel: either no hit, or the ray lies in the plane and there is no
+    // single answer to give.
+    if (fm.abs_f64(denom) < 0.000000001) { return 0; }
+    let is f64 as t = 0.0 - (v.v3_dot(p.n, r.origin) + p.d) / denom;
+    if (t < 0.0) { return 0; }
+    *t_out = t;
+    return 1;
+}
+
+// Solves |o + td - c|^2 = r^2. Uses the half-b form of the quadratic, which
+// drops a factor of 2 through the whole discriminant.
+fn ray_sphere(r as Ray, s as Sphere, t_out as *f64) as i32 {
+    let is v.Vec3 as oc = v.v3_sub(r.origin, s.center);
+    let is f64 as half_b = v.v3_dot(oc, r.dir);
+    let is f64 as c = v.v3_len_sq(oc) - s.radius * s.radius;
+    let is f64 as disc = half_b * half_b - c;
+    if (disc < 0.0) { return 0; }
+    let is f64 as sq = fm.sqrt(disc);
+    let is f64 as t with mut = 0.0 - half_b - sq;   // near root first
+    if (t < 0.0) { t = 0.0 - half_b + sq; }         // origin inside the sphere
+    if (t < 0.0) { return 0; }
+    *t_out = t;
+    return 1;
+}
+
+// Slab method: intersect the ray with each pair of parallel faces and keep
+// the overlap of the three intervals. Division by a zero direction component
+// yields infinities that compare correctly, so an axis-parallel ray needs no
+// special case.
+fn ray_aabb(r as Ray, b as AABB, t_out as *f64) as i32 {
+    let is f64 as tmin with mut = 0.0 - 100000000000000000000.0;
+    let is f64 as tmax with mut = 100000000000000000000.0;
+
+    let is f64 as inv with mut = 0.0;
+    let is f64 as t1 with mut = 0.0;
+    let is f64 as t2 with mut = 0.0;
+
+    if (r.dir.x != 0.0) {
+        inv = 1.0 / r.dir.x;
+        t1 = (b.min.x - r.origin.x) * inv;
+        t2 = (b.max.x - r.origin.x) * inv;
+        tmin = fm.max_f64(tmin, fm.min_f64(t1, t2));
+        tmax = fm.min_f64(tmax, fm.max_f64(t1, t2));
+    } else if (r.origin.x < b.min.x || r.origin.x > b.max.x) { return 0; }
+
+    if (r.dir.y != 0.0) {
+        inv = 1.0 / r.dir.y;
+        t1 = (b.min.y - r.origin.y) * inv;
+        t2 = (b.max.y - r.origin.y) * inv;
+        tmin = fm.max_f64(tmin, fm.min_f64(t1, t2));
+        tmax = fm.min_f64(tmax, fm.max_f64(t1, t2));
+    } else if (r.origin.y < b.min.y || r.origin.y > b.max.y) { return 0; }
+
+    if (r.dir.z != 0.0) {
+        inv = 1.0 / r.dir.z;
+        t1 = (b.min.z - r.origin.z) * inv;
+        t2 = (b.max.z - r.origin.z) * inv;
+        tmin = fm.max_f64(tmin, fm.min_f64(t1, t2));
+        tmax = fm.min_f64(tmax, fm.max_f64(t1, t2));
+    } else if (r.origin.z < b.min.z || r.origin.z > b.max.z) { return 0; }
+
+    if (tmax < tmin || tmax < 0.0) { return 0; }
+    if (tmin < 0.0) { *t_out = 0.0; } else { *t_out = tmin; }   // origin inside
+    return 1;
+}
+
+// Moller-Trumbore. Solves for the barycentric coordinates directly, so it
+// never builds the triangle's plane and the coordinates come out as a
+// by-product — which is what interpolates the vertex attributes at the hit.
+// Writes u and v; the third weight is 1 - u - v.
+fn ray_triangle(r as Ray, tri as Triangle,
+                t_out as *f64, u_out as *f64, v_out as *f64) as i32 {
+    let is v.Vec3 as e1 = v.v3_sub(tri.b, tri.a);
+    let is v.Vec3 as e2 = v.v3_sub(tri.c, tri.a);
+    let is v.Vec3 as pv = v.v3_cross(r.dir, e2);
+    let is f64 as det = v.v3_dot(e1, pv);
+    // Near zero means the ray is parallel to the triangle's plane. Testing
+    // the signed value instead would cull back faces; this accepts both.
+    if (fm.abs_f64(det) < 0.000000001) { return 0; }
+
+    let is f64 as inv = 1.0 / det;
+    let is v.Vec3 as tv = v.v3_sub(r.origin, tri.a);
+    let is f64 as u = v.v3_dot(tv, pv) * inv;
+    if (u < 0.0 || u > 1.0) { return 0; }
+
+    let is v.Vec3 as qv = v.v3_cross(tv, e1);
+    let is f64 as vv = v.v3_dot(r.dir, qv) * inv;
+    if (vv < 0.0 || u + vv > 1.0) { return 0; }
+
+    let is f64 as t = v.v3_dot(e2, qv) * inv;
+    if (t < 0.0) { return 0; }
+
+    *t_out = t; *u_out = u; *v_out = vv;
+    return 1;
+}
+
+// --- Frustum ---
+
+// The six planes of a view-projection, by Gribb-Hartmann: each plane is a sum
+// or difference of two rows of the matrix, which falls out of the clip-space
+// inequalities -w <= x,y,z <= w. Works for any projection the matrix encodes,
+// perspective or orthographic, and needs no knowledge of how it was built.
+//
+// Pass the combined projection * view to cull in world space, or
+// projection * view * model to cull in a mesh's own space.
+fn frustum_from_matrix(m as mt.Mat4) as Frustum {
+    let is Frustum as f;
+    // Rows of the matrix; the storage is column-major, so row r is
+    // m[r], m[4+r], m[8+r], m[12+r].
+    let is i32 as i with mut = 0;
+    while (i < 6) {
+        let is i32 as row = i / 2;          // 0 = x, 1 = y, 2 = z
+        let is f64 as sign with mut = 1.0;  // even index adds the row, odd subtracts
+        if (i % 2 == 1) { sign = 0.0 - 1.0; }
+        let is f64 as a = m.m[3]  + sign * m.m[row];
+        let is f64 as b = m.m[7]  + sign * m.m[4 + row];
+        let is f64 as c = m.m[11] + sign * m.m[8 + row];
+        let is f64 as d = m.m[15] + sign * m.m[12 + row];
+        // Normalizing makes the plane's distance a real distance, which is
+        // what the sphere test needs.
+        let is f64 as len = fm.sqrt(a * a + b * b + c * c);
+        if (len == 0.0) {
+            f.p[i].n = v.v3(0.0, 0.0, 1.0);
+            f.p[i].d = 0.0;
+        } else {
+            f.p[i].n = v.v3(a / len, b / len, c / len);
+            f.p[i].d = d / len;
+        }
+        i = i + 1;
+    }
+    return f;
+}
+
+fn frustum_contains_point(f as Frustum, p as v.Vec3) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 6) {
+        if (v.v3_dot(f.p[i].n, p) + f.p[i].d < 0.0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Conservative: a sphere outside every plane is outside, but a sphere in the
+// corner region beyond two planes at once can be reported visible. That costs
+// a few extra draws and never drops a visible object, which is the trade every
+// renderer makes here.
+fn frustum_overlaps_sphere(f as Frustum, s as Sphere) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 6) {
+        if (v.v3_dot(f.p[i].n, s.center) + f.p[i].d < 0.0 - s.radius) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Tests the box corner furthest along each plane's normal: if even that one
+// is behind the plane, no part of the box is in front of it.
+fn frustum_overlaps_aabb(f as Frustum, b as AABB) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 6) {
+        let is v.Vec3 as n = f.p[i].n;
+        let is v.Vec3 as far = v.v3(b.min.x, b.min.y, b.min.z);
+        if (n.x >= 0.0) { far.x = b.max.x; }
+        if (n.y >= 0.0) { far.y = b.max.y; }
+        if (n.z >= 0.0) { far.z = b.max.z; }
+        if (v.v3_dot(n, far) + f.p[i].d < 0.0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// --- Triangle helpers ---
+
+fn tri_normal(t as Triangle) as v.Vec3 {
+    return v.v3_normalize(v.v3_cross(v.v3_sub(t.b, t.a), v.v3_sub(t.c, t.a)));
+}
+
+fn tri_area(t as Triangle) as f64 {
+    return v.v3_len(v.v3_cross(v.v3_sub(t.b, t.a), v.v3_sub(t.c, t.a))) * 0.5;
+}
+
+fn tri_centroid(t as Triangle) as v.Vec3 {
+    return v.v3_scale(v.v3_add(v.v3_add(t.a, t.b), t.c), 1.0 / 3.0);
+}
+
+// Weights (u, v, w) with u+v+w = 1, reconstructing p as u*a + v*b + w*c.
+// Degenerate triangles report (1, 0, 0) rather than dividing by zero.
+fn tri_barycentric(t as Triangle, p as v.Vec3,
+                   u_out as *f64, v_out as *f64, w_out as *f64) as void {
+    let is v.Vec3 as v0 = v.v3_sub(t.b, t.a);
+    let is v.Vec3 as v1 = v.v3_sub(t.c, t.a);
+    let is v.Vec3 as v2 = v.v3_sub(p, t.a);
+    let is f64 as d00 = v.v3_dot(v0, v0);
+    let is f64 as d01 = v.v3_dot(v0, v1);
+    let is f64 as d11 = v.v3_dot(v1, v1);
+    let is f64 as d20 = v.v3_dot(v2, v0);
+    let is f64 as d21 = v.v3_dot(v2, v1);
+    let is f64 as den = d00 * d11 - d01 * d01;
+    if (den == 0.0) { *u_out = 1.0; *v_out = 0.0; *w_out = 0.0; return; }
+    let is f64 as vv = (d11 * d20 - d01 * d21) / den;
+    let is f64 as ww = (d00 * d21 - d01 * d20) / den;
+    *v_out = vv; *w_out = ww; *u_out = 1.0 - vv - ww;
+}
