@@ -12,25 +12,60 @@ a program can take the whole stack, take part of it, or take a window and drive
 the GPU itself.
 
 ```
-math/     vectors, matrices, quaternions, projections   — pure
-window/   window + input:  x11 | wayland | win32 | causticos
-gpu/      device access:  gl | vk
-render/   the renderer, over either path:
-            software/   rasterizer, z-buffer, texturing — pure
-            gpu/        the same scene through gpu/
-audio/    playback:  alsa | wasapi | causticos
+math/     vectors, matrices, quaternions, geometry, colour, curves   — pure
+window/   window, display, platform:  x11 | wayland | kms | win32
+input/    keyboard, mouse, touch, pen, gamepad, haptics, sensors
+gpu/      the device, in the shape of wgpu:  vk | gl | d3d | software
+render/   the framework: meshes, sprites, materials, cameras, a frame
+3d/       models, meshes, skeletons, animation
+image/    pixels on the CPU: load, save, transform, generate, atlas
+text/     fonts, glyph atlases, shaping, layout
+audio/    device, mixer, music, positional:  alsa | wasapi | causticos
 ui/       immediate-mode widgets, drawn through render/
 ```
 
-`math/` and `render/software/` import nothing below them, so a program that
-only needs geometry or software rendering still builds with no external
-dependency.
+Each has a design note beside it — [`window/window.md`](window/window.md),
+[`gpu/gpu.md`](gpu/gpu.md), [`render/render.md`](render/render.md) — recording
+what it holds and why.
 
-The split between `gpu/` and `render/gpu/` is deliberate: `gpu/` is the device
-— buffers, pipelines, submission — and stops there, so a program that wants to
-drive Vulkan itself takes `gpu/` and leaves the rest. `render/` is the opinion
-on top, and it is the layer that can swap between hardware and software without
-the calling code noticing.
+`math/` and `gpu/software/` import nothing below them, so a program that only
+needs geometry or software rendering still builds with no external dependency.
+
+The split between `gpu/` and `render/` is deliberate. `gpu/` is a portable GPU —
+buffers, pipelines, submission, compute — at the level the hardware works, and it
+owns every backend including software. `render/` is a client of it, the way a
+game framework is a client of wgpu: it decides what to draw and has no backends
+of its own. A program that wants to drive Vulkan itself takes `gpu/`, or reaches
+past it to the raw bindings, and leaves the rest.
+
+## Choosing a backend
+
+Every layer that has backends lets the program pick, and the choice happens at
+two levels.
+
+**What is in the binary** is decided in the Causticfile — see *What ships in a
+binary* below. A backend that was not compiled in costs nothing and cannot be
+selected.
+
+**What is used** is decided by the program, at run time, among those:
+
+```cst
+// let the library decide
+let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.AUTO);
+
+// or name it — per platform, per program, per device
+let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.VULKAN);
+let is media.window.Window as w = media.window.open_with(media.window.WAYLAND, ...);
+let is media.input.Source as s = media.input.open_source(media.input.EVDEV);
+```
+
+So Vulkan on one platform and OpenGL on another is a program-level decision, not
+a build-level one, and nothing prevents both from being compiled in. Backends
+also **coexist**: two GPU devices on different backends, or a window whose
+keyboard comes from the display server while its mouse comes from evdev, are all
+representable.
+
+`AUTO` picks in a documented order per layer, listed in that layer's note.
 
 ## Three ways to reach the GPU
 

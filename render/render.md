@@ -189,7 +189,7 @@ render/
   queue.cst       the draw queue: explicit sizing, sorting, batching, submit
   mesh.cst        declared vertex layouts and their presets, mesh handles
   material.cst    material handles, declared parameters, surface state
-  texture.cst     texture handles and formats; opt-in loading
+  texture.cst     texture handles and formats, created from an image.Image
   camera.cst      2D and 3D camera controllers
   draw3d.cst      the 3D family
   draw2d.cst      the 2D family: sprites, atlas batching, layer, scissor
@@ -231,10 +231,10 @@ native code instead of interpreting a shader per fragment.
 
 **`texture.cst`** — handles, formats, sampler settings, upload. Creating a
 texture *usable as a render target* is here, because a GPU wants that declared up
-front; rendering into it is `frame.cst`'s business. `texture_load` is the opt-in
-entry point that goes through
-[caustic-image](https://github.com/Caua726/caustic-image) — a program that never
-calls it does not link the decoder.
+front; rendering into it is `frame.cst`'s business. A texture is created from an
+[`image.Image`](../image/image.md), which is where pixels live on the CPU and
+where loading, transforming and mipmap generation happen — this layer never
+touches a file format.
 
 **`camera.cst`** — perspective and orthographic setup, orbit and first-person
 controllers, 2D pan and zoom, and the frustum that `math/geom` already knows how
@@ -286,6 +286,9 @@ declared at creation. Drawing into it is `pass_begin` with a different target.
   `render/` only knows the handles it was given.
 - **Glyphs.** `text/` produces quads and an atlas; `render/` draws them like any
   other sprite.
+- **Pixels on the CPU.** [`image/`](../image/image.md) owns loading,
+  transforming, generating and atlas packing; `render/` receives an `Image` and
+  uploads it.
 
 ---
 

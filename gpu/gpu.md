@@ -195,6 +195,13 @@ let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.SOFTWARE);
 let is *u8 as surface = media.gpu.vk.surface_from(&win);
 ```
 
+`AUTO` selects in this order: Vulkan, then Direct3D on Windows, then OpenGL,
+then software — which always succeeds, so `AUTO` never fails outright. **The
+program can always name one instead**, and both levels of that choice are
+described in the [README](../README.md#choosing-a-backend): the Causticfile
+decides what is in the binary, the program decides what is used among those. So
+Vulkan on one platform and OpenGL on another is a program-level decision.
+
 Backends coexist: two devices on different backends can be alive at once. That
 requires runtime dispatch through a vtable in `Device` rather than the
 compile-time folding the rest of the library uses, which is the trade recorded in

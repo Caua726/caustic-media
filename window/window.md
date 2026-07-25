@@ -71,8 +71,15 @@ native handles it is built from.
 protocol, same library, same code path. A Wayland session running XWayland is
 served by `x11` with nothing extra.
 
-Selection on Linux, in order: `WAYLAND_DISPLAY` set → `wayland`; otherwise
-`DISPLAY` set → `x11`; otherwise → `kms`.
+`AUTO` selects on Linux in this order: `WAYLAND_DISPLAY` set → `wayland`;
+otherwise `DISPLAY` set → `x11`; otherwise → `kms`.
+
+**The program can always name one instead.** `window.open_with(WAYLAND, ...)`
+opens a Wayland window in a session where `AUTO` would have chosen X11, and
+fails honestly if it cannot. A build that wants only one backend excludes the
+rest in the Causticfile, and then there is nothing to select. Both levels of that
+choice are described in the [README](../README.md#choosing-a-backend), and this
+layer follows the same rule as every other.
 
 ---
 
