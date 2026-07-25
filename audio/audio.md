@@ -14,20 +14,24 @@ audio/
   decode.cst    file formats — opt-in
   music.cst     streamed playback, crossfade, the long-form path
 
-  alsa/      /dev/snd — ioctls, no library
-  pipewire/  the PipeWire socket protocol
-  pulse/     the PulseAudio socket protocol
-  jack/      the JACK socket protocol — pro audio
-  oss/       /dev/dsp — legacy on Linux, native on BSD
+  alsa/      /dev/snd — ioctls, no library        alsa/alsa.md
+  pipewire/  the PipeWire socket protocol         pipewire/pipewire.md
+  pulse/     the PulseAudio socket protocol       pulse/pulse.md
+  jack/      the JACK socket protocol — pro audio jack/jack.md
+  oss/       /dev/dsp — native on FreeBSD, NetBSD oss/oss.md
+  sndio/     OpenBSD's own                        sndio/sndio.md
 
-  wasapi/    Windows, COM — the modern one
-  xaudio2/   Windows, COM — what games use
-  dsound/    Windows, COM — legacy, present everywhere
-  waveout/   Windows, flat C — ancient, and the only one without COM
-  wdmks/     Windows kernel streaming — lowest latency short of ASIO
+  waveout/   Windows, flat C — the only one without COM   waveout/waveout.md
+  wasapi/    Windows, COM — the modern one                wasapi/wasapi.md
+  xaudio2/   Windows, COM — what games use                xaudio2/xaudio2.md
+  dsound/    Windows, COM — the compatibility floor       dsound/dsound.md
+  wdmks/     Windows kernel streaming — lowest latency    wdmks/wdmks.md
 
-  causticos/ our own kernel
+  causticos/ our own kernel                       causticos/causticos.md
 ```
+
+**Twelve backends**, each with a note of its own — the same treatment
+[`window/`](../window/window.md) and [`gpu/`](../gpu/gpu.md) give theirs.
 
 ---
 
@@ -58,9 +62,10 @@ latency, per-application volume and device hotplug rather than basic function.
 
 ## Every backend, and why more than one
 
-Five on Linux, five on Windows. They are not redundant: they differ in latency,
-in whether other applications can play at the same time, and in whether they
-exist at all on a given machine.
+Six on Unix, five on Windows, one of ours. They are not redundant: they differ in
+latency, in whether other applications can play at the same time, in which
+operating system they exist on at all, and in whether reaching them needs
+syscalls the standard library does not yet have.
 
 ### Linux
 
@@ -71,6 +76,7 @@ exist at all on a given machine.
 | **pulse** | socket protocol | libpulse is 314 KB, or speak it directly | Still what many systems run, and what remote-audio setups expect. |
 | **jack** | socket protocol | libjack is 238 KB | Pro audio: sample-accurate, callback-driven, and how a program joins a studio graph. |
 | **oss** | ioctls on `/dev/dsp` | none | Legacy on Linux and **native on FreeBSD and NetBSD**. Simpler than ALSA, and the cheapest way to reach BSD. |
+| **sndio** | socket, no fd passing | libsndio is small, or speak it directly | **OpenBSD's own**, which ships none of the above. Reachable with today's standard library. |
 
 The three daemons are socket protocols, so they can be spoken without linking
 anything — the same shape as Wayland, and needing the same `sendmsg`/`SCM_RIGHTS`
