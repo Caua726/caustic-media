@@ -33,6 +33,35 @@ counterpart there.
 
 ---
 
+## The tree
+
+```
+gpu/
+  gpu.cst         hub
+  device.cst      our portable GPU: open, capabilities, last_error, device loss
+  buffer.cst      creation, upload, mapping
+  texture.cst     textures, samplers, formats
+  shader.cst      SPIR-V modules
+  pipeline.cst    graphics and compute pipelines
+  command.cst     command buffers, passes, submission, synchronisation
+  swapchain.cst   built from the window's native handles
+
+  vk/       vulkan.cst (generated)  + backend.cst    see vk/vk.md
+  gl/       opengl.cst (generated)  + backend.cst    see gl/gl.md
+  d3d/      d3d12.cst dxgi.cst      + backend.cst    see d3d/d3d.md
+  software/ raster.cst target.cst   + backend.cst    see software/software.md
+```
+
+Bindings and backend share a directory for the same reason they do in `window/`:
+whoever touches one touches the other, and `vk/` as a whole is what you delete if
+you drop Vulkan.
+
+**The swapchain lives here, not in `window/`.** When there is a GPU it is the
+swapchain that presents; the window only supplies the native handles it is built
+from.
+
+---
+
 ## The surface to be bound
 
 Measured, not estimated:

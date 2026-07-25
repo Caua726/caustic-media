@@ -17,6 +17,47 @@ API and still reach the raw display handle underneath.
 
 ---
 
+## The tree
+
+```
+window/
+  window.cst      hub
+  device.cst      our portable window: open, next_frame, acquire, submit, close
+  display.cst     monitors, modes, DPI, work area
+  event.cst       raw platform events and the queue they arrive in
+  cursor.cst      shape, visibility, capture
+  clipboard.cst   text and data
+  native.cst      native handle accessors — the public contract
+
+  x11/      xlib.cst      + backend.cst      see x11/x11.md
+  wayland/  protocol.cst  + backend.cst      see wayland/wayland.md
+  kms/      drm.cst       + backend.cst      see kms/kms.md
+  win32/    user32.cst gdi32.cst + backend.cst   see win32/win32.md
+```
+
+`device.cst` is to this layer what `gpu.open()` is to `gpu/`: **one portable
+window, across all four backends.** The backends are not the API — they are what
+it is implemented on, and what a program reaches for when it wants the platform
+directly.
+
+Three placements worth their reasoning:
+
+**Bindings and backend share a directory.** `x11/xlib.cst` is the raw binding,
+`x11/backend.cst` is our abstraction implemented over it. Whoever touches one
+touches the other, and `x11/` as a whole is what you delete if you drop X11.
+
+**`window/` owns the raw event queue; `input/` interprets it.** `event.cst`
+delivers "key 38 pressed, pointer at (x, y)". Turning that into "the JUMP action
+is active", mapping a gamepad, or tracking held state is `input/`'s work. Without
+this line either `input/` has to speak to four platforms, or `window/` grows game
+logic.
+
+**The swapchain is not here.** It belongs to `gpu/`, because when there is a GPU
+it is the swapchain that presents, not the window. This layer only hands over the
+native handles it is built from.
+
+---
+
 ## The four backends
 
 | Backend | Platform | Transport |

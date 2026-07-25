@@ -201,7 +201,60 @@ No subdirectories, and that is the sign the split with `gpu/` landed in the
 right place: with backends owned one level down, there is nothing here to
 separate by platform.
 
-Three placements are worth their reasoning, since none is obvious:
+### What each one holds
+
+**`renderer.cst`** — creation over a `gpu.Device`, and the state that outlives a
+frame: `last_error`, whether the device has been lost, the resource tables the
+handles index into. Nothing draws here.
+
+**`frame.cst`** — the frame boundary and passes. A pass declares its kind (2D or
+3D), its target, whether it has depth, its clear values, and its viewport. That
+declaration is what lets a 2D-only program pay for no depth buffer, and what
+makes rendering to a texture a pass with a different target rather than a concept
+of its own.
+
+**`queue.cst`** — where draws accumulate between `pass_begin` and `pass_end`, and
+where they are sorted and collapsed before submission. Opaque front-to-back,
+transparent back-to-front, consecutive draws sharing a material merged. Its
+capacity is set by the program, since a queue that grows on its own is the hidden
+allocation the philosophy forbids.
+
+**`mesh.cst`** — vertex layout declarations and the presets that keep them from
+being ceremony, plus mesh handle creation and upload through `gpu/buffer`. A
+preset is a named constant that expands to an explicit layout, and you can read
+which.
+
+**`material.cst`** — material handles, their declared parameters, and the state
+that belongs to a surface: blend, cull, depth comparison. Also the built-in
+materials, which exist so the software backend can implement the common cases as
+native code instead of interpreting a shader per fragment.
+
+**`texture.cst`** — handles, formats, sampler settings, upload. Creating a
+texture *usable as a render target* is here, because a GPU wants that declared up
+front; rendering into it is `frame.cst`'s business. `texture_load` is the opt-in
+entry point that goes through
+[caustic-image](https://github.com/Caua726/caustic-image) — a program that never
+calls it does not link the decoder.
+
+**`camera.cst`** — perspective and orthographic setup, orbit and first-person
+controllers, 2D pan and zoom, and the frustum that `math/geom` already knows how
+to build and test against.
+
+**`draw3d.cst`** — `draw(mesh, material, transform)`, and the instanced form.
+Ordering is by depth, so submission order does not matter.
+
+**`draw2d.cst`** — sprites, atlas batching, layer ordering and the scissor stack.
+Submission order matters here, and layers are how a program controls it without
+depending on it.
+
+**`shapes2d.cst`** — rectangles, rounded rectangles, circles, lines, polylines,
+polygons, arcs. Filled and outlined. Geometry generated straight into the batch.
+
+**`debug.cst`** — wireframes for the shapes `math/geom` already describes: AABB,
+sphere, ray, frustum, plus axes and a ground grid. Depth-tested or always on top,
+because both are useful and for different reasons.
+
+### Three placements worth their reasoning
 
 **`shapes2d` is its own file, not part of `draw2d`.** They are the same family —
 same queue, same layer ordering, same scissor — but a different concern: a sprite
