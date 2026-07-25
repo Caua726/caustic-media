@@ -26,11 +26,11 @@ ui/       immediate-mode widgets, drawn through render/
 ```
 
 Each has a design note beside it recording what it holds and why:
-[`window/`](window/window.md) · [`input/`](input/input.md) ·
+[`math/`](math/math.md) · [`window/`](window/window.md) · [`input/`](input/input.md) ·
 [`gpu/`](gpu/gpu.md) · [`render/`](render/render.md) · [`3d/`](3d/3d.md) ·
 [`image/`](image/image.md) · [`text/`](text/text.md) ·
 [`audio/`](audio/audio.md) · [`ui/`](ui/ui.md), with one per backend under
-`window/` and `gpu/`.
+`window/`, `input/`, `gpu/`, `3d/`, `text/` and `audio/`.
 
 `math/` and `gpu/software/` import nothing below them, so a program that only
 needs geometry or software rendering still builds with no external dependency.

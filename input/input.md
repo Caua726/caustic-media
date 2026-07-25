@@ -21,11 +21,11 @@ input/
   action.cst    action mapping, derived from events
   gesture.cst   tap, drag, pinch, hold — derived from touch
 
-  x11/      core events + XInput2 (multitouch, pen, raw motion)
-  wayland/  seat: pointer, keyboard, touch, plus the tablet protocols
-  win32/    WM_* messages, Raw Input, XInput / GameInput
-  evdev/    /dev/input/event* — raw, global, every device
-  hidraw/   /dev/hidraw* — what evdev does not describe
+  x11/      core events + XInput2                  x11/x11.md
+  wayland/  seat, keymap, relative pointer, tablet  wayland/wayland.md
+  win32/    messages, Raw Input, XInput             win32/win32.md
+  evdev/    /dev/input/event* — raw, global         evdev/evdev.md
+  hidraw/   /dev/hidraw* — what evdev cannot say    hidraw/hidraw.md
 ```
 
 ---
