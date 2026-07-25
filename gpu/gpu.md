@@ -1,9 +1,32 @@
 # The GPU layer
 
 Same shape as [`window/`](../window/window.md): every function each graphics API
-exposes, declared in Caustic, with the portable abstraction built on top of those
-bindings rather than on FFI directly. A program either takes our device API or
-reaches straight for `gpu.vk.*` and drives Vulkan itself.
+exposes, declared in Caustic, with a portable abstraction built on top of those
+bindings rather than on FFI directly.
+
+Three things live here, and the middle one is what makes this a layer rather
+than a binding dump:
+
+```
+gpu/
+  vk/  gl/  d3d/     raw bindings — everything the API exposes
+  device            our abstraction: a portable GPU, in the shape of wgpu
+  software/         a backend of that abstraction, implemented by us
+```
+
+**`gpu.open()` is ours and it is not a renderer.** It is a device: buffers,
+textures, samplers, pipelines, command submission, and compute. What wgpu is to
+Vulkan, this is to the bindings beneath it — one API over several backends, at
+the level the hardware actually works.
+
+`render/` is a *client* of this, the way a game framework is a client of wgpu.
+It is not a peer and it does not have backends of its own: everything portable
+about reaching hardware is settled here, and `render/` only decides what to draw.
+
+**Software is a backend here, not in `render/`.** It is another implementation
+of the same device — it fills buffers, runs pipelines and dispatches compute, in
+software. That is what makes a program's choice of backend invisible to
+everything above.
 
 It is six times the size of the window layer, and three of its problems have no
 counterpart there.
@@ -125,12 +148,11 @@ plus the inheritance chain that determines where slots start.
 
 ---
 
-## What the abstraction on top looks like
+## The device abstraction
 
-Fixed by the [design already agreed](../README.md): `gpu/` is device access —
-buffers, pipelines, submission — and stops there. `render/gpu/` is the opinion
-built on it. A program that wants to drive Vulkan itself takes `gpu/` and leaves
-the rest.
+Device access — buffers, textures, samplers, pipelines, command submission,
+compute — and it stops there. It does not know what a mesh is, what a material
+is, or what a sprite is; those are [`render/`](../render/render.md)'s words.
 
 ```cst
 // our way
@@ -138,6 +160,7 @@ let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.AUTO);
 
 // name the backend
 let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.VULKAN);
+let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.SOFTWARE);
 
 // leave the abstraction entirely; the window still supplies the surface
 let is *u8 as surface = media.gpu.vk.surface_from(&win);
@@ -151,6 +174,18 @@ gets everything else stripped by DCE.
 
 The surface comes from the window's native handles, which is why those are public
 contract there rather than an implementation detail.
+
+**Compute lives here and nowhere else.** `render/`'s unit of work is a draw;
+adding dispatch there would make a pass polymorphic and double its surface for
+something inherently explicit — workgroup sizes, storage buffers, barriers.
+Wrapping that in a framework loses exactly what makes it useful. A program that
+needs compute drops one level, which is what this level is for. Tessellation and
+geometry stages are pipeline configuration, so they live where pipelines live:
+also here.
+
+The software backend implements all of it, compute included. Nothing is out of
+reach for software — it is code, and the constraint is speed rather than
+capability.
 
 ---
 
