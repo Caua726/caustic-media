@@ -179,6 +179,48 @@ rasterizer today.
 
 ---
 
+## Modules
+
+```
+render/
+  render.cst      hub
+  renderer.cst    creation over a gpu.Device, last_error, device-loss state
+  frame.cst       frame boundaries, passes, targets, clear
+  queue.cst       the draw queue: explicit sizing, sorting, batching, submit
+  mesh.cst        declared vertex layouts and their presets, mesh handles
+  material.cst    material handles, declared parameters, surface state
+  texture.cst     texture handles and formats; opt-in loading
+  camera.cst      2D and 3D camera controllers
+  draw3d.cst      the 3D family
+  draw2d.cst      the 2D family: sprites, atlas batching, layer, scissor
+  shapes2d.cst    rectangles, circles, lines, polygons
+  debug.cst       wireframes for the shapes math/geom already describes
+```
+
+No subdirectories, and that is the sign the split with `gpu/` landed in the
+right place: with backends owned one level down, there is nothing here to
+separate by platform.
+
+Three placements are worth their reasoning, since none is obvious:
+
+**`shapes2d` is its own file, not part of `draw2d`.** They are the same family —
+same queue, same layer ordering, same scissor — but a different concern: a sprite
+is driven by a texture, a shape is geometry generated on the spot. Generating
+straight into the batch is also what avoids minting a mesh handle per rectangle
+drawn, which is the whole reason immediate 2D drawing is worth having.
+
+**`debug` belongs here, not to `3d/`.** What it draws are `math/geom` types —
+boxes, spheres, frusta — and this layer already depends on `math/`. `3d/` is about
+content: files, meshes, skeletons. A wireframe box is none of those, and
+visualising a frustum has to work in a program that loads no models at all.
+
+**Rendering to a texture is a property of the pass**, which the ownership table
+above already decided: the render target belongs to the pass. `texture.cst` only
+has to be able to create a texture *usable* as a target, since a GPU wants that
+declared at creation. Drawing into it is `pass_begin` with a different target.
+
+---
+
 ## What is not here
 
 - **Compute, tessellation, geometry stages.** They live in `gpu/`, which is the
