@@ -1,0 +1,235 @@
+// render/software/raster.cst — triangle rasterization with a depth buffer.
+//
+// The pipeline, per triangle: transform each vertex by the model-view-
+// projection into clip space, divide by w to reach normalized device
+// coordinates, map those onto the target, drop back-faces, then walk the
+// bounding box testing each pixel against the three edges.
+//
+// Three things here are less obvious than the loop, and each is a class of bug
+// that renders "almost right":
+//
+//   Perspective correction. After the divide, a linear walk across the screen
+//   is NOT linear across the surface — a wall receding into the distance
+//   compresses. Interpolating an attribute by its screen-space barycentric
+//   weight is the classic warped-texture bug. The weights are divided by each
+//   vertex's w and renormalized, which undoes exactly that.
+//
+//   The fill rule. Two triangles sharing an edge must cover each shared pixel
+//   once: not twice, or blending double-darkens the seam, and not zero times,
+//   or a lit gap appears. The top-left rule breaks the tie by which edge the
+//   pixel lies on rather than by which triangle asked first.
+//
+//   The near plane. A vertex at or behind the eye has w <= 0, and dividing by
+//   it flings the vertex to infinity with the wrong sign. Proper clipping
+//   would split the triangle against the plane; this rejects it instead, which
+//   is honest and cheap, and documented so the caller can pre-clip if a
+//   triangle that large matters.
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "target.cst" as tgt;
+
+// A vertex as the caller supplies it: a position in model space and the
+// attributes to interpolate across the face.
+struct Vertex {
+    pos   as math.vec.Vec3;
+    color as math.color.Color;
+    u     as f64;
+    v     as f64;
+}
+
+fn vertex(pos as math.vec.Vec3, c as math.color.Color) as Vertex {
+    let is Vertex as r; r.pos = pos; r.color = c; r.u = 0.0; r.v = 0.0; return r;
+}
+
+fn vertex_uv(pos as math.vec.Vec3, c as math.color.Color, u as f64, v as f64) as Vertex {
+    let is Vertex as r; r.pos = pos; r.color = c; r.u = u; r.v = v; return r;
+}
+
+// Which faces to discard, by winding once projected. Counter-clockwise is the
+// front face, matching the right-handed convention the math layer uses.
+let is i32 as CULL_NONE  = 0;
+let is i32 as CULL_BACK  = 1;
+let is i32 as CULL_FRONT = 2;
+
+// A vertex after projection: screen position, depth, and the reciprocal of the
+// clip w that perspective correction needs.
+struct Projected {
+    x   as f64;
+    y   as f64;
+    z   as f64;   // normalized device z, -1 near .. +1 far
+    inv_w as f64;
+    ok  as i32;   // 0 when the vertex is at or behind the eye
+}
+
+// Clip space -> screen. Y is flipped because normalized device coordinates put
+// +Y up while a framebuffer's rows run downward.
+fn project(t as *tgt.Target, clip as math.vec.Vec4) as Projected {
+    let is Projected as p;
+    p.x = 0.0; p.y = 0.0; p.z = 0.0; p.inv_w = 0.0; p.ok = 0;
+    if (clip.w <= 0.000000001) { return p; }
+    let is f64 as iw = 1.0 / clip.w;
+    p.x = (clip.x * iw * 0.5 + 0.5) * cast(f64, t.width);
+    p.y = (0.5 - clip.y * iw * 0.5) * cast(f64, t.height);
+    p.z = clip.z * iw;
+    p.inv_w = iw;
+    p.ok = 1;
+    return p;
+}
+
+// Twice the signed area of the triangle (a, b, c) in screen space, which is
+// also the edge function of c against the edge ab. Positive means c is to the
+// left of ab — counter-clockwise, given the flipped Y.
+fn edge(ax as f64, ay as f64, bx as f64, by as f64, cx as f64, cy as f64) as f64 {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+// The top-left rule: an edge owns the pixels exactly on it when the edge is a
+// top edge or a left edge, and disowns them otherwise. Applied consistently by
+// both triangles sharing an edge, every pixel along the seam is claimed once.
+fn edge_owns(ax as f64, ay as f64, bx as f64, by as f64) as i32 {
+    let is f64 as dx = bx - ax;
+    let is f64 as dy = by - ay;
+    if (dy == 0.0 && dx < 0.0) { return 1; }   // top edge (horizontal, going left)
+    if (dy < 0.0) { return 1; }                // left edge (going up)
+    return 0;
+}
+
+// Rasterize one triangle. mvp carries model, view and projection together;
+// pass the identity to draw in screen coordinates directly.
+fn triangle(t as *tgt.Target, mvp as math.mat.Mat4,
+            a as Vertex, b as Vertex, c as Vertex, cull as i32) as void {
+    let is math.vec.Vec4 as ca = math.mat.m4_mul_v4(mvp, math.vec.v4_point(a.pos));
+    let is math.vec.Vec4 as cb = math.mat.m4_mul_v4(mvp, math.vec.v4_point(b.pos));
+    let is math.vec.Vec4 as cc = math.mat.m4_mul_v4(mvp, math.vec.v4_point(c.pos));
+
+    let is Projected as pa = project(t, ca);
+    let is Projected as pb = project(t, cb);
+    let is Projected as pc = project(t, cc);
+    // Any vertex behind the eye and the whole triangle is dropped: see the
+    // near-plane note in the header.
+    if (pa.ok == 0 || pb.ok == 0 || pc.ok == 0) { return; }
+
+    let is f64 as area = edge(pa.x, pa.y, pb.x, pb.y, pc.x, pc.y);
+    if (area == 0.0) { return; }                                  // degenerate
+    if (cull == CULL_BACK && area <= 0.0) { return; }
+    if (cull == CULL_FRONT && area >= 0.0) { return; }
+
+    // Bounding box, clipped to the target. Pixel centres are sampled, so the
+    // box runs over whole pixels containing any part of the triangle.
+    let is i64 as x0 = cast(i64, fm.max_f64(0.0, fm.floor(fm.min_f64(pa.x, fm.min_f64(pb.x, pc.x)))));
+    let is i64 as y0 = cast(i64, fm.max_f64(0.0, fm.floor(fm.min_f64(pa.y, fm.min_f64(pb.y, pc.y)))));
+    let is i64 as x1 = cast(i64, fm.min_f64(cast(f64, t.width),  fm.ceil(fm.max_f64(pa.x, fm.max_f64(pb.x, pc.x)))));
+    let is i64 as y1 = cast(i64, fm.min_f64(cast(f64, t.height), fm.ceil(fm.max_f64(pa.y, fm.max_f64(pb.y, pc.y)))));
+    if (x1 <= x0 || y1 <= y0) { return; }
+
+    let is f64 as inv_area = 1.0 / area;
+    // Which shared-edge pixels this triangle claims, decided once per edge
+    // rather than per pixel.
+    let is i32 as own_a = edge_owns(pb.x, pb.y, pc.x, pc.y);   // edge opposite a
+    let is i32 as own_b = edge_owns(pc.x, pc.y, pa.x, pa.y);
+    let is i32 as own_c = edge_owns(pa.x, pa.y, pb.x, pb.y);
+    let is i32 as depth = tgt.has_depth(t);
+
+    let is i64 as py with mut = y0;
+    while (py < y1) {
+        let is i64 as px with mut = x0;
+        while (px < x1) {
+            let is f64 as sx = cast(f64, px) + 0.5;
+            let is f64 as sy = cast(f64, py) + 0.5;
+
+            let is f64 as ea = edge(pb.x, pb.y, pc.x, pc.y, sx, sy);
+            let is f64 as eb = edge(pc.x, pc.y, pa.x, pa.y, sx, sy);
+            let is f64 as ec = edge(pa.x, pa.y, pb.x, pb.y, sx, sy);
+
+            let is i32 as inside with mut = 1;
+            // Compare against the winding, so a clockwise triangle (drawn with
+            // CULL_NONE or CULL_FRONT) works without a separate loop.
+            if (area > 0.0) {
+                if (ea < 0.0 || eb < 0.0 || ec < 0.0) { inside = 0; }
+            } else {
+                if (ea > 0.0 || eb > 0.0 || ec > 0.0) { inside = 0; }
+            }
+            // Exactly on an edge: only draw if this triangle owns it.
+            if (inside == 1 && ea == 0.0 && own_a == 0) { inside = 0; }
+            if (inside == 1 && eb == 0.0 && own_b == 0) { inside = 0; }
+            if (inside == 1 && ec == 0.0 && own_c == 0) { inside = 0; }
+
+            if (inside == 1) {
+                let is f64 as wa = ea * inv_area;
+                let is f64 as wb = eb * inv_area;
+                let is f64 as wc = ec * inv_area;
+
+                // Depth interpolates linearly in screen space — that is what
+                // makes a z-buffer work at all — so no correction here.
+                let is f64 as z = wa * pa.z + wb * pb.z + wc * pc.z;
+
+                let is i32 as visible with mut = 1;
+                if (depth == 1) {
+                    if (z >= tgt.depth_at(t, px, py)) { visible = 0; }
+                }
+
+                if (visible == 1) {
+                    // Everything else does need correcting: weight by 1/w and
+                    // renormalize, or the attribute slides along the screen
+                    // instead of along the surface.
+                    let is f64 as qa = wa * pa.inv_w;
+                    let is f64 as qb = wb * pb.inv_w;
+                    let is f64 as qc = wc * pc.inv_w;
+                    let is f64 as qs = qa + qb + qc;
+                    if (qs != 0.0) {
+                        let is f64 as inv_qs = 1.0 / qs;
+                        let is f64 as fa = qa * inv_qs;
+                        let is f64 as fb = qb * inv_qs;
+                        let is f64 as fc = qc * inv_qs;
+                        let is math.color.Color as col = math.color.rgba(
+                            fa * a.color.r + fb * b.color.r + fc * c.color.r,
+                            fa * a.color.g + fb * b.color.g + fc * c.color.g,
+                            fa * a.color.b + fb * b.color.b + fc * c.color.b,
+                            fa * a.color.a + fb * b.color.a + fc * c.color.a);
+                        tgt.put(t, px, py, math.color.pack_rgba8(col));
+                        if (depth == 1) { tgt.set_depth(t, px, py, z); }
+                    }
+                }
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+}
+
+// Perspective-correct barycentric weights at a pixel, for a caller shading
+// with something other than a vertex colour. Returns 0 when the pixel is
+// outside the triangle.
+fn barycentric_at(pa as Projected, pb as Projected, pc as Projected,
+                  px as f64, py as f64,
+                  wa_out as *f64, wb_out as *f64, wc_out as *f64) as i32 {
+    let is f64 as area = edge(pa.x, pa.y, pb.x, pb.y, pc.x, pc.y);
+    if (area == 0.0) { return 0; }
+    let is f64 as ea = edge(pb.x, pb.y, pc.x, pc.y, px, py);
+    let is f64 as eb = edge(pc.x, pc.y, pa.x, pa.y, px, py);
+    let is f64 as ec = edge(pa.x, pa.y, pb.x, pb.y, px, py);
+    if (area > 0.0) {
+        if (ea < 0.0 || eb < 0.0 || ec < 0.0) { return 0; }
+    } else {
+        if (ea > 0.0 || eb > 0.0 || ec > 0.0) { return 0; }
+    }
+    let is f64 as qa = (ea / area) * pa.inv_w;
+    let is f64 as qb = (eb / area) * pb.inv_w;
+    let is f64 as qc = (ec / area) * pc.inv_w;
+    let is f64 as qs = qa + qb + qc;
+    if (qs == 0.0) { return 0; }
+    *wa_out = qa / qs; *wb_out = qb / qs; *wc_out = qc / qs;
+    return 1;
+}
+
+// Wireframe, for debugging a mesh without shading it.
+fn triangle_wire(t as *tgt.Target, mvp as math.mat.Mat4,
+                 a as Vertex, b as Vertex, c as Vertex, col as math.color.Color) as void {
+    let is Projected as pa = project(t, math.mat.m4_mul_v4(mvp, math.vec.v4_point(a.pos)));
+    let is Projected as pb = project(t, math.mat.m4_mul_v4(mvp, math.vec.v4_point(b.pos)));
+    let is Projected as pc = project(t, math.mat.m4_mul_v4(mvp, math.vec.v4_point(c.pos)));
+    if (pa.ok == 0 || pb.ok == 0 || pc.ok == 0) { return; }
+    tgt.line(t, cast(i64, pa.x), cast(i64, pa.y), cast(i64, pb.x), cast(i64, pb.y), col);
+    tgt.line(t, cast(i64, pb.x), cast(i64, pb.y), cast(i64, pc.x), cast(i64, pc.y), col);
+    tgt.line(t, cast(i64, pc.x), cast(i64, pc.y), cast(i64, pa.x), cast(i64, pa.y), col);
+}

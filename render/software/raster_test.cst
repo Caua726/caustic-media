@@ -1,0 +1,293 @@
+// render/software/raster_test.cst — the rasterizer's invariants.
+//
+// Rendering is hard to assert on pixel by pixel, so these check the properties
+// that distinguish a correct rasterizer from one that merely produces an
+// image: coverage adds up to the triangle's area, a shared edge is drawn
+// exactly once, the depth buffer keeps the nearer surface whichever order the
+// two arrive in, and an attribute interpolated across a perspective view
+// tracks the surface rather than the screen.
+//
+// Exit code is the number of failures.
+use "std/io.cst" as io;
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "software.cst" as soft;
+
+let is i32 as fails with mut = 0;
+
+// 64x64 is enough for every property below and keeps the buffers static, so
+// the test allocates nothing either.
+let is i32 as W with imut = 64;
+let is i32 as H with imut = 64;
+let is [16384]u8 as pixels;   // 64*64*4
+let is [32768]u8 as depth;    // 64*64*8
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("  FAIL %s\n", name); }
+}
+
+fn chk_i(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+fn make_target() as soft.target.Target {
+    return soft.target.target(cast(*u8, &pixels), cast(*u8, &depth),
+                              cast(i64, W), cast(i64, H));
+}
+
+// Pixels differing from the clear colour.
+fn count_drawn(t as *soft.target.Target, clear_packed as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as y with mut = 0;
+    while (y < t.height) {
+        let is i64 as x with mut = 0;
+        while (x < t.width) {
+            if (soft.target.get(t, x, y) != clear_packed) { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+// A vertex in screen coordinates, drawn through an orthographic matrix that
+// maps the target's pixel grid onto clip space one to one.
+fn screen_vertex(x as f64, y as f64, c as math.color.Color) as soft.raster.Vertex {
+    return soft.raster.vertex(math.vec.v3(x, y, 0.0), c);
+}
+
+// Maps (0..W, 0..H, -1..1) onto the clip cube, with Y already pointing down so
+// it survives the rasterizer's flip.
+fn screen_matrix() as math.mat.Mat4 {
+    return math.mat.m4_ortho(0.0, cast(f64, W), cast(f64, H), 0.0, -1.0, 1.0);
+}
+
+fn test_coverage() as void {
+    let is soft.target.Target as t = make_target();
+    let is i64 as bg = math.color.pack_rgba8(math.color.black());
+    soft.target.clear(&t, math.color.black());
+
+    // A right triangle over half a 40x40 square: 800 pixels, give or take the
+    // boundary. Coverage that is wildly off means the edge test or the
+    // bounding box is wrong.
+    let is math.mat.Mat4 as m = screen_matrix();
+    soft.raster.triangle(&t, m,
+        screen_vertex(10.0, 10.0, math.color.white()),
+        screen_vertex(50.0, 10.0, math.color.white()),
+        screen_vertex(10.0, 50.0, math.color.white()),
+        soft.raster.CULL_NONE);
+
+    let is i64 as drawn = count_drawn(&t, bg);
+    chk("coverage near half the square", cast(i32, drawn > 700 && drawn < 900));
+
+    // Nothing outside the triangle's bounding box may be touched.
+    chk("outside box untouched", cast(i32, soft.target.get(&t, 60, 60) == bg));
+    chk("inside filled", cast(i32, soft.target.get(&t, 15, 15) != bg));
+    // The far corner of the box is outside the hypotenuse.
+    chk("beyond hypotenuse empty", cast(i32, soft.target.get(&t, 45, 45) == bg));
+}
+
+fn test_fill_rule() as void {
+    let is soft.target.Target as t = make_target();
+    let is i64 as bg = math.color.pack_rgba8(math.color.black());
+    soft.target.clear(&t, math.color.black());
+    let is math.mat.Mat4 as m = screen_matrix();
+
+    // Two triangles tiling a 40x40 square along a shared diagonal. Under a
+    // correct fill rule the pair covers exactly 1600 pixels: every pixel of
+    // the square once, none of the diagonal twice, and no gap along it.
+    soft.raster.triangle(&t, m,
+        screen_vertex(10.0, 10.0, math.color.white()),
+        screen_vertex(50.0, 10.0, math.color.white()),
+        screen_vertex(10.0, 50.0, math.color.white()),
+        soft.raster.CULL_NONE);
+    soft.raster.triangle(&t, m,
+        screen_vertex(50.0, 10.0, math.color.white()),
+        screen_vertex(50.0, 50.0, math.color.white()),
+        screen_vertex(10.0, 50.0, math.color.white()),
+        soft.raster.CULL_NONE);
+
+    chk_i("two triangles tile the square exactly", count_drawn(&t, bg), 1600);
+}
+
+fn test_depth() as void {
+    let is math.mat.Mat4 as m = screen_matrix();
+    let is math.color.Color as red  = math.color.red();
+    let is math.color.Color as blue = math.color.blue();
+
+    // Same footprint, different depths. Whichever order they are submitted in,
+    // the nearer one has to survive — that is the whole point of the buffer.
+    //
+    // The sign is worth stating: this orthographic matrix has near = -1 and
+    // far = +1, so it maps view z to -z in normalized device coordinates. The
+    // vertex with the LARGER z is therefore the nearer one.
+    let is i64 as i with mut = 0;
+    while (i < 2) {
+        let is soft.target.Target as t = make_target();
+        soft.target.clear(&t, math.color.black());
+        let is f64 as near_z = 0.5;
+        let is f64 as far_z  = -0.5;
+        let is math.color.Color as first with mut = red;
+        let is math.color.Color as second with mut = blue;
+        let is f64 as z1 with mut = near_z;
+        let is f64 as z2 with mut = far_z;
+        if (i == 1) { z1 = far_z; z2 = near_z; first = blue; second = red; }
+
+        soft.raster.triangle(&t, m,
+            soft.raster.vertex(math.vec.v3(10.0, 10.0, z1), first),
+            soft.raster.vertex(math.vec.v3(50.0, 10.0, z1), first),
+            soft.raster.vertex(math.vec.v3(10.0, 50.0, z1), first),
+            soft.raster.CULL_NONE);
+        soft.raster.triangle(&t, m,
+            soft.raster.vertex(math.vec.v3(10.0, 10.0, z2), second),
+            soft.raster.vertex(math.vec.v3(50.0, 10.0, z2), second),
+            soft.raster.vertex(math.vec.v3(10.0, 50.0, z2), second),
+            soft.raster.CULL_NONE);
+
+        // Red is at the near depth in both passes, so red must win both times.
+        chk("nearer surface wins regardless of order",
+            cast(i32, soft.target.get(&t, 15, 15) == math.color.pack_rgba8(red)));
+        i = i + 1;
+    }
+}
+
+fn test_culling() as void {
+    let is soft.target.Target as t = make_target();
+    let is i64 as bg = math.color.pack_rgba8(math.color.black());
+    let is math.mat.Mat4 as m = screen_matrix();
+
+    // The same three points in both windings. Back-face culling has to accept
+    // one and reject the other — and reversing the winding must flip which.
+    soft.target.clear(&t, math.color.black());
+    soft.raster.triangle(&t, m,
+        screen_vertex(10.0, 10.0, math.color.white()),
+        screen_vertex(50.0, 10.0, math.color.white()),
+        screen_vertex(10.0, 50.0, math.color.white()),
+        soft.raster.CULL_BACK);
+    let is i64 as ccw = count_drawn(&t, bg);
+
+    soft.target.clear(&t, math.color.black());
+    soft.raster.triangle(&t, m,
+        screen_vertex(10.0, 10.0, math.color.white()),
+        screen_vertex(10.0, 50.0, math.color.white()),
+        screen_vertex(50.0, 10.0, math.color.white()),
+        soft.raster.CULL_BACK);
+    let is i64 as cw = count_drawn(&t, bg);
+
+    chk("one winding survives back-face culling", cast(i32, (ccw > 0) != (cw > 0)));
+    chk("culling is not dropping everything", cast(i32, ccw + cw > 0));
+}
+
+fn test_near_plane() as void {
+    let is soft.target.Target as t = make_target();
+    let is i64 as bg = math.color.pack_rgba8(math.color.black());
+    soft.target.clear(&t, math.color.black());
+
+    // A triangle straddling the eye. Without the w <= 0 guard the divide
+    // throws vertices to infinity with the wrong sign and the result is
+    // garbage smeared over the target; rejecting it leaves the frame clean.
+    let is math.mat.Mat4 as proj = math.mat.m4_perspective(fm.PI_2, 1.0, 1.0, 100.0);
+    soft.raster.triangle(&t, proj,
+        soft.raster.vertex(math.vec.v3(0.0, 0.0, -5.0), math.color.white()),
+        soft.raster.vertex(math.vec.v3(1.0, 0.0,  5.0), math.color.white()),
+        soft.raster.vertex(math.vec.v3(0.0, 1.0, -5.0), math.color.white()),
+        soft.raster.CULL_NONE);
+    chk_i("triangle crossing the eye is rejected", count_drawn(&t, bg), 0);
+}
+
+fn test_perspective_correction() as void {
+    let is soft.target.Target as t = make_target();
+    soft.target.clear(&t, math.color.black());
+
+    // A floor receding from the camera, red at the near edge and blue at the
+    // far one, spanning distance 1 to 40.
+    //
+    // Perspective crushes the far half into a thin band near the horizon, so
+    // most of the screen shows the near part: the vertical middle of the drawn
+    // band corresponds to distance ~1.95, only about 2% along the surface, and
+    // the colour there is almost pure red.
+    //
+    // Interpolating the colour by the screen-space weight instead — the bug
+    // this catches — would put the surface midpoint at the screen midpoint and
+    // read an even red/blue mix. Demanding red near 1 and blue near 0 is a
+    // result linear interpolation cannot produce by accident.
+    let is math.mat.Mat4 as proj = math.mat.m4_perspective(fm.PI_2, 1.0, 0.5, 100.0);
+    let is math.color.Color as red  = math.color.rgb(1.0, 0.0, 0.0);
+    let is math.color.Color as blue = math.color.rgb(0.0, 0.0, 1.0);
+
+    // Two triangles forming a floor stretching away below the eye line.
+    let is math.vec.Vec3 as nl = math.vec.v3(-2.0, -1.0, -1.0);
+    let is math.vec.Vec3 as nr = math.vec.v3( 2.0, -1.0, -1.0);
+    let is math.vec.Vec3 as fl = math.vec.v3(-2.0, -1.0, -40.0);
+    let is math.vec.Vec3 as fr = math.vec.v3( 2.0, -1.0, -40.0);
+
+    soft.raster.triangle(&t, proj,
+        soft.raster.vertex(nl, red), soft.raster.vertex(nr, red),
+        soft.raster.vertex(fl, blue), soft.raster.CULL_NONE);
+    soft.raster.triangle(&t, proj,
+        soft.raster.vertex(nr, red), soft.raster.vertex(fr, blue),
+        soft.raster.vertex(fl, blue), soft.raster.CULL_NONE);
+
+    // Scan the centre column for the vertical midpoint of the drawn floor and
+    // read the colour there.
+    let is i64 as bg = math.color.pack_rgba8(math.color.black());
+    let is i64 as top with mut = 0 - 1;
+    let is i64 as bot with mut = 0 - 1;
+    let is i64 as y with mut = 0;
+    while (y < t.height) {
+        if (soft.target.get(&t, 32, y) != bg) {
+            if (top < 0) { top = y; }
+            bot = y;
+        }
+        y = y + 1;
+    }
+    chk("floor was drawn", cast(i32, top >= 0 && bot > top));
+    if (top < 0 || bot <= top) { return; }
+
+    let is math.color.Color as mid = math.color.unpack_rgba8(
+        soft.target.get(&t, 32, (top + bot) / 2));
+    chk("screen midpoint sits near the start of the surface",
+        cast(i32, mid.r > 0.85 && mid.b < 0.15));
+    // The far edge of the band is the far edge of the floor, and is blue.
+    let is math.color.Color as far_end = math.color.unpack_rgba8(
+        soft.target.get(&t, 32, top));
+    chk("far edge is the far colour", cast(i32, far_end.b > far_end.r));
+}
+
+fn test_primitives() as void {
+    let is soft.target.Target as t = make_target();
+    let is i64 as bg = math.color.pack_rgba8(math.color.black());
+    soft.target.clear(&t, math.color.black());
+
+    soft.target.fill_rect(&t, math.rect.rect(8.0, 8.0, 16.0, 4.0), math.color.white());
+    chk_i("fill_rect covers its area", count_drawn(&t, bg), 64);
+
+    soft.target.clear(&t, math.color.black());
+    soft.target.line(&t, 0, 0, 31, 0, math.color.white());
+    chk_i("horizontal line length", count_drawn(&t, bg), 32);
+
+    // Off-target coordinates must be clipped, not written out of bounds.
+    soft.target.clear(&t, math.color.black());
+    soft.target.line(&t, -50, 5, 200, 5, math.color.white());
+    chk_i("line clipped to width", count_drawn(&t, bg), cast(i64, W));
+
+    soft.target.clear(&t, math.color.black());
+    soft.target.put_safe(&t, 1000, 1000, math.color.white());
+    chk_i("out-of-range point ignored", count_drawn(&t, bg), 0);
+}
+
+fn main() as i32 {
+    test_coverage();
+    test_fill_rule();
+    test_depth();
+    test_culling();
+    test_near_plane();
+    test_perspective_correction();
+    test_primitives();
+    if (fails == 0) { io.printf("software renderer: all checks passed\n"); }
+    else { io.printf("  raster_test: %d failure(s)\n", cast(i64, fails)); }
+    return fails;
+}

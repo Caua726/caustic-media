@@ -1,0 +1,138 @@
+// render/software/target.cst — what the rasterizer draws into.
+//
+// A Target is a view over memory the CALLER owns. Nothing here allocates, so
+// the same code draws into a heap block, a static array, or a framebuffer
+// mmapped straight from a display device — and the library never has an
+// opinion about where pixels live or who frees them.
+//
+// Colour is 32 bits per pixel, packed 0xAABBGGRR (red in the low byte), which
+// is what a little-endian RGBA8 framebuffer expects. Depth is one f64 per
+// pixel, holding the normalized device z: -1 at the near plane, +1 at the far
+// one, so smaller is nearer.
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+
+struct Target {
+    color  as *u8;   // width*height u32
+    depth  as *u8;   // width*height f64, or null for no depth testing
+    width  as i64;
+    height as i64;
+}
+
+fn target(color as *u8, depth as *u8, width as i64, height as i64) as Target {
+    let is Target as t;
+    t.color = color; t.depth = depth; t.width = width; t.height = height;
+    return t;
+}
+
+// Bytes the caller has to provide for each plane.
+fn color_bytes(width as i64, height as i64) as i64 { return width * height * 4; }
+fn depth_bytes(width as i64, height as i64) as i64 { return width * height * 8; }
+
+fn has_depth(t as *Target) as i32 {
+    if (cast(i64, t.depth) == 0) { return 0; }
+    return 1;
+}
+
+// --- Raw pixel access ---
+//
+// Unchecked: the caller has already decided the coordinate is inside. The
+// rasterizer clips its bounding box before it gets here, so bounds-testing
+// every pixel would be paying for a decision already made.
+
+fn put(t as *Target, x as i64, y as i64, packed as i64) as void {
+    *cast(*i32, cast(i64, t.color) + (y * t.width + x) * 4) = cast(i32, packed);
+}
+
+fn get(t as *Target, x as i64, y as i64) as i64 {
+    return cast(i64, *cast(*i32, cast(i64, t.color) + (y * t.width + x) * 4)) & 4294967295;
+}
+
+fn depth_at(t as *Target, x as i64, y as i64) as f64 {
+    return *cast(*f64, cast(i64, t.depth) + (y * t.width + x) * 8);
+}
+
+fn set_depth(t as *Target, x as i64, y as i64, z as f64) as void {
+    *cast(*f64, cast(i64, t.depth) + (y * t.width + x) * 8) = z;
+}
+
+// Bounds-checked, for callers plotting single points from arbitrary input.
+fn put_safe(t as *Target, x as i64, y as i64, c as math.color.Color) as void {
+    if (x < 0 || y < 0 || x >= t.width || y >= t.height) { return; }
+    put(t, x, y, math.color.pack_rgba8(c));
+}
+
+// --- Clearing ---
+
+fn clear_color(t as *Target, c as math.color.Color) as void {
+    let is i64 as packed = math.color.pack_rgba8(c);
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        *cast(*i32, cast(i64, t.color) + i * 4) = cast(i32, packed);
+        i = i + 1;
+    }
+}
+
+// Cleared to the far plane, so the first fragment at any pixel wins.
+fn clear_depth(t as *Target) as void {
+    if (has_depth(t) == 0) { return; }
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        *cast(*f64, cast(i64, t.depth) + i * 8) = 1.0;
+        i = i + 1;
+    }
+}
+
+fn clear(t as *Target, c as math.color.Color) as void {
+    clear_color(t, c);
+    clear_depth(t);
+}
+
+// --- Lines, for wireframe and debugging ---
+
+// Bresenham, integer only. Ignores depth: a wireframe overlay is drawn on top
+// of a finished image, not into it.
+fn line(t as *Target, x0 as i64, y0 as i64, x1 as i64, y1 as i64, c as math.color.Color) as void {
+    let is i64 as packed = math.color.pack_rgba8(c);
+    let is i64 as x with mut = x0;
+    let is i64 as y with mut = y0;
+    let is i64 as dx = cast(i64, fm.abs_i64(x1 - x0));
+    let is i64 as dy = 0 - cast(i64, fm.abs_i64(y1 - y0));
+    let is i64 as sx with mut = 0 - 1;
+    if (x0 < x1) { sx = 1; }
+    let is i64 as sy with mut = 0 - 1;
+    if (y0 < y1) { sy = 1; }
+    let is i64 as err with mut = dx + dy;
+    while (1 == 1) {
+        if (x >= 0 && y >= 0 && x < t.width && y < t.height) { put(t, x, y, packed); }
+        if (x == x1 && y == y1) { return; }
+        let is i64 as e2 = err + err;
+        if (e2 >= dy) {
+            if (x == x1) { return; }
+            err = err + dy;
+            x = x + sx;
+        }
+        if (e2 <= dx) {
+            if (y == y1) { return; }
+            err = err + dx;
+            y = y + sy;
+        }
+    }
+}
+
+// Filled axis-aligned rectangle, clipped to the target.
+fn fill_rect(t as *Target, r as math.rect.Rect, c as math.color.Color) as void {
+    let is i64 as x0 = cast(i64, fm.max_f64(0.0, fm.floor(r.x)));
+    let is i64 as y0 = cast(i64, fm.max_f64(0.0, fm.floor(r.y)));
+    let is i64 as x1 = cast(i64, fm.min_f64(cast(f64, t.width),  fm.ceil(r.x + r.w)));
+    let is i64 as y1 = cast(i64, fm.min_f64(cast(f64, t.height), fm.ceil(r.y + r.h)));
+    let is i64 as packed = math.color.pack_rgba8(c);
+    let is i64 as y with mut = y0;
+    while (y < y1) {
+        let is i64 as x with mut = x0;
+        while (x < x1) { put(t, x, y, packed); x = x + 1; }
+        y = y + 1;
+    }
+}
