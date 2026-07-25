@@ -154,22 +154,62 @@ contract there rather than an implementation detail.
 
 ---
 
+## Shaders
+
+**SPIR-V is the internal currency**, not merely Vulkan's input format. The
+finding that settles it: OpenGL takes SPIR-V directly too — `GL_ARB_gl_spirv` has
+been core since 4.6, through `glShaderBinary` + `glSpecializeShader`, and 4.6 is
+what Mesa reports here.
+
+```
+              source
+                |            one frontend
+              SPIR-V
+        /        |        \
+   Vulkan    OpenGL 4.6   software
+   native    native       must execute it
+```
+
+So the choice of input language costs one frontend rather than three backends,
+and two of the three consumers need no work at all.
+
+**Decided: SPIR-V comes in precompiled.** A program compiles its shaders with
+`glslc` or `glslangValidator` and embeds the result. That is a build-time
+dependency on the user's side and nothing at run time, and it means the first
+usable version needs no compiler work from us at all.
+
+Writing GLSL → SPIR-V ourselves comes later, and removes that last external
+tool. It is a real compiler — lexer, parser, a type system with vectors,
+matrices and swizzles, and a SPIR-V emitter — somewhere around 6–10k lines for a
+useful subset. One frontend, serving all three consumers.
+
+Further out, shaders could be written in Caustic itself, which would make the
+software path native code with no translation and would need the SPIR-V compiler
+backend that was deferred. Not a near-term question.
+
+**The software backend is where the cost actually lands.** Vulkan and OpenGL
+receive SPIR-V and are done; the rasterizer has to *run* it. Three ways, and the
+gap between them is large:
+
+| | To write | Speed |
+|---|---|---|
+| Interpret SPIR-V | ~2–3k lines | a dispatch per instruction **per pixel** — a 50-instruction fragment shader at 640×480 is 15M interpreter steps a frame |
+| Compile ahead of time, at build | less | native, but no dynamic shaders |
+| Compile at run time | most | native |
+
+Interpretation is where this starts, and it is honest to say that while it
+interprets, the dependency-free path is a demonstration rather than a production
+option.
+
+Run-time compilation is worth noting only for what it would require: linking a
+compiler into the renderer, which this library does not do and does not
+currently plan to. SPIR-V being SSA, and `src/ir/ssa.cst` being SSA, means the
+mapping would be natural if that ever changed — but it is a future architecture,
+not a present one.
+
+---
+
 ## Open questions
-
-**Shaders are unsolved and they decide the shape of everything above `gpu/`.**
-Vulkan consumes SPIR-V, OpenGL consumes GLSL, and the software rasterizer
-consumes neither. One source has to reach all three. Three ways out, in
-ascending ambition:
-
-1. Accept GLSL and translate — SPIR-V for Vulkan, pass-through for GL, interpret
-   for software.
-2. Define our own shading language, one frontend and three backends.
-3. **Write shaders in Caustic.** For the software backend that is native code
-   with no translation at all; for Vulkan it needs the SPIR-V compiler backend
-   that was deferred. Most on-brand and most work.
-
-Nothing in `gpu/` needs the answer, but `render/gpu/` cannot be written without
-it.
 
 **Fallback needs runtime loading.** `AUTO` trying Vulkan and falling back to
 OpenGL cannot use `DT_NEEDED`: a binary that declares `libvulkan.so.1` needed
@@ -187,8 +227,13 @@ the whole API.
 1. **`vk.xml` generator**, and Vulkan against a single window backend. Vulkan
    first because it proves the native-handle contract, and because its loader
    model means the binding is a dispatch table rather than 1719 externs.
-2. **`gl.xml` generator** and OpenGL, which shares the machinery.
+   Shaders arrive as precompiled SPIR-V, so nothing here waits on a shader
+   compiler.
+2. **`gl.xml` generator** and OpenGL, which shares the machinery and takes the
+   same SPIR-V.
 3. **C header parser + COM extractor**, then Direct3D, verified under wine.
+4. **GLSL → SPIR-V**, once the backends it feeds exist and have proven what the
+   frontend actually has to emit.
 
 Vulkan before a second window backend exists: it is the GPU path that tells us
 whether the handle contract is right, and that is cheaper to learn on one
