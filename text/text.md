@@ -7,14 +7,21 @@ sprite.
 ```
 text/
   text.cst      hub
-  sfnt.cst      the TrueType/OpenType container: tables, cmap, metrics
-  outline.cst   glyph outlines — quadratic and cubic curves
-  raster.cst    outline to coverage, with anti-aliasing
+  font.cst      the handle: faces, sizes, styles, fallback chains
   atlas.cst     glyph cache over image/'s packer
-  shape.cst     codepoints to positioned glyphs
-  layout.cst    lines, wrapping, alignment, a text box
-  font.cst      the handle: sizes, styles, fallback chains
+
+  sfnt/         the container: tables, cmap, metrics    sfnt/sfnt.md
+  outline/      glyf quadratic and CFF charstrings      outline/outline.md
+  raster/       outline to coverage, and SDF            raster/raster.md
+  shape/        codepoints to positioned glyphs         shape/shape.md
+  layout/       runs, breaking, bidi, caret             layout/layout.md
+  color/        emoji, and its four standards           color/color.md
 ```
+
+Six of those have notes of their own, because each is a different kind of
+problem: a binary container, two unrelated outline models, a rasterizer with
+unusually high quality standards, a table-driven substitution engine, a text
+algorithm, and a compatibility mess.
 
 ---
 
