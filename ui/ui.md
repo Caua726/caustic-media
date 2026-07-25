@@ -39,9 +39,10 @@ disagree — which is the entire class of bug that retained-mode UI spends its
 machinery preventing.
 
 The costs are real and worth stating rather than discovering: it redraws every
-frame, complex animation is awkward, and accessibility has nothing persistent to
-expose. Against a retained toolkit's ~500k lines for the same widget set, at
-maybe 1% of that, it is the right trade for a framework — and it is what
+frame, and both animation and accessibility need something the model does not
+obviously provide. Both are answered below, and neither turns out to require a
+second mechanism. Against a retained toolkit's ~500k lines for the same widget
+set, at maybe 1% of that, it is the right trade for a framework — and it is what
 [`render/`](../render/render.md)'s decision that state travels with the work was
 already pointing at.
 
@@ -91,27 +92,68 @@ a Japanese user cannot type into is not a text field.
 
 ---
 
-## Layout
+## Layout is immediate too
 
-Widgets need to be placed before they are drawn, and immediate mode makes that
-harder than it sounds: at the moment a widget is called, the size of its siblings
-is not yet known.
+Widgets are placed as they are called, in one pass, taking the space they ask
+for and advancing a cursor. No measure pass, no deferred placement, no second
+traversal.
 
-Three ways out, and the choice shapes the whole API:
+That is the same decision as everything else here: the call does the work, and
+reading it tells you what happened. It also means a widget's position is known
+at the moment it is called, so hit-testing against the pointer can happen right
+there rather than being deferred to a later phase.
 
-- **Fixed pass** — the caller gives coordinates. Simplest, and painful for
-  anything resizable.
-- **Single-pass flow** — widgets stack in a direction and take the space they ask
-  for. Enough for most panels, and cannot centre a row whose total width is not
-  known until the row ends.
-- **Two-pass** — measure, then place. Handles centring and proportional sizing,
-  and costs a frame of latency or a second traversal.
+The cost is real and worth naming: **a row cannot be centred if its total width
+is only known once the row has ended.** Anything whose placement depends on a
+sibling that has not been called yet needs the program to supply a size, or to
+compute it and pass it in.
 
-Dear ImGui is essentially the second with escape hatches. Starting there and
-adding a measure pass where it is needed keeps the common case simple, and the
-decision is recorded here rather than made by accident in the first widget.
+Where that is not enough, the answer is an explicit measure — the program asks
+what a piece of content would occupy, then lays it out with the number in hand.
+That is a function a caller invokes, not a hidden phase the library runs, so it
+stays consistent with the rest.
 
 ---
+
+## Per-id state, which immediate mode never actually avoided
+
+The model is usually described as keeping no state. It does not keep the *widget
+tree*, which is the part that matters — but it has always kept a small table
+keyed by id: which widget is being held, which has keyboard focus, where a
+scroll area is scrolled to, what a text field has selected.
+
+Naming that table makes two things fall out that otherwise look like problems.
+
+**Animation.** A panel that slides open has to remember how far open it is. That
+is another field in a table that already exists, not a new mechanism and not a
+retreat toward retained mode. A program that wants control instead passes its own
+`t` and drives the animation itself, which stays the more explicit path and is
+always available.
+
+**Cheap persistence for expensive widgets.** A table with ten thousand rows does
+not need its layout recomputed every frame; the row height and the scroll offset
+live in the same table, and only the visible rows are built.
+
+The table is bounded and its size is stated, for the same reason the draw queue
+and the event queue are.
+
+## Accessibility
+
+Immediate mode has nothing persistent for a screen reader to walk, and *"not a
+toy — real software"* makes ignoring that uncomfortable.
+
+Implementing it properly means AT-SPI over D-Bus on Linux and UI Automation over
+COM on Windows — a platform surface comparable to a window backend, for a layer
+that does not exist yet. So not now.
+
+What is decided now is that it stays possible: **the id stack is the tree.**
+Immediate mode does have hierarchy — a widget's id is scoped by its container —
+it simply does not persist it. So the context can be told to record a node per
+widget as it goes, and when it is not told, the recording costs nothing. The
+platform bridges become backends later, against a tree that was already there.
+
+Deciding this late instead would mean discovering that ids were generated in a
+way that cannot express hierarchy, and changing every call site.
 
 ## Theme
 
@@ -119,6 +161,20 @@ Colours, spacing, rounding, borders and font choices in one struct the context
 carries, rather than constants scattered through widgets. That is what makes a
 program able to look like itself instead of like the library, and it costs
 nothing to do from the start and a rewrite to add later.
+
+---
+
+## Not now, and deliberately
+
+**Multi-window and docking.** Dear ImGui added both after the fact and it
+reshaped its architecture — viewports turn one context into several, each with
+its own platform window and render target. Doing it later would cost the same
+rework here, and doing it now would cost it before there is a single working
+widget. Neither is worth it yet.
+
+**A retained escape hatch** — a path where a widget keeps its own state and
+rebuilds only what changed. The per-id table above covers the case that motivates
+it, which is expensive widgets, without a second model to maintain.
 
 ---
 
