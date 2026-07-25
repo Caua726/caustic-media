@@ -1,0 +1,278 @@
+// window/x11.cst — a window on X11, and on Wayland through XWayland.
+//
+// Bound to libX11 rather than speaking the wire protocol, so this is one of
+// the places the library links something it did not write. It lives behind its
+// own namespace for exactly that reason: a program that never names
+// window.x11 produces a binary with no libX11 in DT_NEEDED, like any other
+// Caustic build.
+//
+// The surface is deliberately small — open, poll, present, close. Everything
+// about drawing lives in render/, and this only carries finished pixels to the
+// screen.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "../math/math.cst" as math;
+use "../render/software/target.cst" as tgt;
+
+// --- libX11 ---
+
+extern "libX11.so.6" fn XOpenDisplay(name as *u8) as *u8;
+extern "libX11.so.6" fn XCloseDisplay(d as *u8) as i32;
+extern "libX11.so.6" fn XDefaultScreen(d as *u8) as i32;
+extern "libX11.so.6" fn XRootWindow(d as *u8, scr as i32) as i64;
+extern "libX11.so.6" fn XDefaultVisual(d as *u8, scr as i32) as *u8;
+extern "libX11.so.6" fn XDefaultDepth(d as *u8, scr as i32) as i32;
+extern "libX11.so.6" fn XBlackPixel(d as *u8, scr as i32) as i64;
+extern "libX11.so.6" fn XCreateSimpleWindow(d as *u8, parent as i64, x as i32, y as i32,
+                                            w as u32, h as u32, bw as u32,
+                                            border as i64, background as i64) as i64;
+extern "libX11.so.6" fn XDestroyWindow(d as *u8, w as i64) as i32;
+extern "libX11.so.6" fn XStoreName(d as *u8, w as i64, name as *u8) as i32;
+extern "libX11.so.6" fn XSelectInput(d as *u8, w as i64, mask as i64) as i32;
+extern "libX11.so.6" fn XMapWindow(d as *u8, w as i64) as i32;
+extern "libX11.so.6" fn XFlush(d as *u8) as i32;
+extern "libX11.so.6" fn XSync(d as *u8, discard as i32) as i32;
+extern "libX11.so.6" fn XPending(d as *u8) as i32;
+extern "libX11.so.6" fn XNextEvent(d as *u8, ev as *u8) as i32;
+extern "libX11.so.6" fn XCreateGC(d as *u8, drawable as i64, mask as i64, values as *u8) as *u8;
+extern "libX11.so.6" fn XFreeGC(d as *u8, gc as *u8) as i32;
+extern "libX11.so.6" fn XCreateImage(d as *u8, visual as *u8, depth as u32, format as i32,
+                                     offset as i32, data as *u8, w as u32, h as u32,
+                                     pad as i32, bytes_per_line as i32) as *u8;
+extern "libX11.so.6" fn XPutImage(d as *u8, drawable as i64, gc as *u8, image as *u8,
+                                  sx as i32, sy as i32, dx as i32, dy as i32,
+                                  w as u32, h as u32) as i32;
+extern "libX11.so.6" fn XInternAtom(d as *u8, name as *u8, only_if_exists as i32) as i64;
+extern "libX11.so.6" fn XSetWMProtocols(d as *u8, w as i64, protocols as *u8, count as i32) as i32;
+
+// --- Event masks and types, from X.h ---
+
+let is i64 as KeyPressMask       with imut = 1;
+let is i64 as KeyReleaseMask     with imut = 2;
+let is i64 as ButtonPressMask    with imut = 4;
+let is i64 as ButtonReleaseMask  with imut = 8;
+let is i64 as PointerMotionMask  with imut = 64;
+let is i64 as ExposureMask       with imut = 32768;
+let is i64 as StructureNotifyMask with imut = 131072;
+
+let is i32 as EV_KEY_PRESS      with imut = 2;
+let is i32 as EV_KEY_RELEASE    with imut = 3;
+let is i32 as EV_BUTTON_PRESS   with imut = 4;
+let is i32 as EV_BUTTON_RELEASE with imut = 5;
+let is i32 as EV_MOTION         with imut = 6;
+let is i32 as EV_EXPOSE         with imut = 12;
+let is i32 as EV_CONFIGURE      with imut = 22;
+let is i32 as EV_CLIENT_MESSAGE with imut = 33;
+
+let is i32 as ZPixmap with imut = 2;
+
+// XEvent is a union sized to the largest member: 24 longs on 64-bit. Fields
+// are read by offset because Caustic has no notion of a C union — the offsets
+// below come from Xlib.h's XKeyEvent, XButtonEvent, XMotionEvent,
+// XConfigureEvent and XClientMessageEvent, which share a common header.
+let is i64 as EVENT_SIZE with imut = 192;
+let is i64 as OFF_TYPE     with imut = 0;    // int
+let is i64 as OFF_X        with imut = 64;   // int  (key/button/motion)
+let is i64 as OFF_Y        with imut = 68;   // int
+let is i64 as OFF_STATE    with imut = 80;   // unsigned int (modifier mask)
+let is i64 as OFF_KEYCODE  with imut = 84;   // unsigned int; button number shares it
+let is i64 as OFF_CONF_W   with imut = 56;   // int (XConfigureEvent.width)
+let is i64 as OFF_CONF_H   with imut = 60;   // int
+let is i64 as OFF_CLIENT_D with imut = 56;   // long data.l[0]
+
+// --- The window ---
+
+struct Window {
+    display as *u8;
+    win     as i64;
+    gc      as *u8;
+    image   as *u8;
+    pixels  as *u8;     // BGRA scratch the XImage reads from
+    pixbytes as i64;
+    width   as i64;
+    height  as i64;
+    wm_delete as i64;
+    should_close as i32;
+    // Latest input, sampled rather than queued: enough to drive a demo or a
+    // camera, and a queue can come later without changing this.
+    mouse_x as i64;
+    mouse_y as i64;
+    mouse_down as i32;
+    last_key as i32;
+    resized as i32;
+    ok      as i32;
+}
+
+let is [192]u8 as _event;
+let is [8]i64 as _protocols;
+
+fn open(title as *u8, width as i64, height as i64) as Window {
+    let is Window as w;
+    w.display = cast(*u8, 0); w.win = 0; w.gc = cast(*u8, 0);
+    w.image = cast(*u8, 0); w.pixels = cast(*u8, 0); w.pixbytes = 0;
+    w.width = width; w.height = height; w.wm_delete = 0;
+    w.should_close = 0; w.mouse_x = 0; w.mouse_y = 0; w.mouse_down = 0;
+    w.last_key = 0; w.resized = 0; w.ok = 0;
+
+    let is *u8 as d = XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, d) == 0) { return w; }
+    w.display = d;
+
+    let is i32 as scr = XDefaultScreen(d);
+    let is i64 as root = XRootWindow(d, scr);
+    w.win = XCreateSimpleWindow(d, root, 0, 0,
+                                cast(u32, width), cast(u32, height), 0,
+                                XBlackPixel(d, scr), XBlackPixel(d, scr));
+    if (w.win == 0) { XCloseDisplay(d); w.display = cast(*u8, 0); return w; }
+
+    XStoreName(d, w.win, title);
+    XSelectInput(d, w.win, KeyPressMask | KeyReleaseMask | ButtonPressMask
+                          | ButtonReleaseMask | PointerMotionMask
+                          | ExposureMask | StructureNotifyMask);
+
+    // Without this the close button kills the connection outright instead of
+    // telling the program, and the process dies mid-frame with no chance to
+    // shut down.
+    w.wm_delete = XInternAtom(d, "WM_DELETE_WINDOW", 0);
+    _protocols[0] = w.wm_delete;
+    XSetWMProtocols(d, w.win, cast(*u8, &_protocols), 1);
+
+    w.gc = XCreateGC(d, w.win, 0, cast(*u8, 0));
+    if (cast(i64, w.gc) == 0) { XDestroyWindow(d, w.win); XCloseDisplay(d); w.display = cast(*u8, 0); return w; }
+
+    // Straight from the kernel: a frame buffer is large, lives for the life of
+    // the window, and has no business in a general-purpose heap.
+    w.pixbytes = width * height * 4;
+    w.pixels = mem.core.mmap_anon(w.pixbytes);
+    if (cast(i64, w.pixels) == 0) {
+        XFreeGC(d, w.gc); XDestroyWindow(d, w.win); XCloseDisplay(d);
+        w.display = cast(*u8, 0); return w;
+    }
+
+    // XCreateImage takes ownership of neither the data nor its lifetime; it
+    // just records the pointer, so the buffer above has to outlive it.
+    w.image = XCreateImage(d, XDefaultVisual(d, scr), cast(u32, XDefaultDepth(d, scr)),
+                           ZPixmap, 0, w.pixels,
+                           cast(u32, width), cast(u32, height), 32,
+                           cast(i32, width * 4));
+    if (cast(i64, w.image) == 0) {
+        mem.core.munmap(w.pixels, w.pixbytes);
+        XFreeGC(d, w.gc); XDestroyWindow(d, w.win); XCloseDisplay(d);
+        w.display = cast(*u8, 0); return w;
+    }
+
+    XMapWindow(d, w.win);
+    XFlush(d);
+    w.ok = 1;
+    return w;
+}
+
+fn close(w as *Window) as void {
+    if (w.ok == 0) { return; }
+    if (cast(i64, w.pixels) != 0) { mem.core.munmap(w.pixels, w.pixbytes); }
+    if (cast(i64, w.gc) != 0) { XFreeGC(w.display, w.gc); }
+    if (w.win != 0) { XDestroyWindow(w.display, w.win); }
+    if (cast(i64, w.display) != 0) { XCloseDisplay(w.display); }
+    w.ok = 0;
+}
+
+// --- Events ---
+
+fn _ev_i32(off as i64) as i32 {
+    return *cast(*i32, cast(i64, &_event) + off);
+}
+
+fn _ev_i64(off as i64) as i64 {
+    return *cast(*i64, cast(i64, &_event) + off);
+}
+
+// Drains the queue and folds it into the Window's state. Returns 0 once the
+// window should close, so a frame loop reads `while (x11.poll(&w) == 1)`.
+// Never blocks: XPending only reports what has already arrived.
+fn poll(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    w.resized = 0;
+    w.last_key = 0;
+    while (XPending(w.display) > 0) {
+        XNextEvent(w.display, cast(*u8, &_event));
+        let is i32 as ty = _ev_i32(OFF_TYPE);
+        if (ty == EV_CLIENT_MESSAGE) {
+            if (_ev_i64(OFF_CLIENT_D) == w.wm_delete) { w.should_close = 1; }
+        } else if (ty == EV_KEY_PRESS) {
+            w.last_key = _ev_i32(OFF_KEYCODE);
+            if (w.last_key == 9) { w.should_close = 1; }   // Escape
+        } else if (ty == EV_BUTTON_PRESS) {
+            w.mouse_down = 1;
+            w.mouse_x = cast(i64, _ev_i32(OFF_X));
+            w.mouse_y = cast(i64, _ev_i32(OFF_Y));
+        } else if (ty == EV_BUTTON_RELEASE) {
+            w.mouse_down = 0;
+        } else if (ty == EV_MOTION) {
+            w.mouse_x = cast(i64, _ev_i32(OFF_X));
+            w.mouse_y = cast(i64, _ev_i32(OFF_Y));
+        } else if (ty == EV_CONFIGURE) {
+            let is i64 as nw = cast(i64, _ev_i32(OFF_CONF_W));
+            let is i64 as nh = cast(i64, _ev_i32(OFF_CONF_H));
+            if (nw != w.width || nh != w.height) {
+                w.width = nw; w.height = nh; w.resized = 1;
+            }
+        }
+    }
+    if (w.should_close == 1) { return 0; }
+    return 1;
+}
+
+// --- Presenting ---
+
+// Copies a rendered Target to the window.
+//
+// The channel order differs and has to be fixed here: the rasterizer packs
+// 0xAABBGGRR, red in the low byte, while an X11 TrueColor visual on a
+// little-endian machine reads 0xAARRGGBB. Swapping red and blue during the
+// copy is the whole conversion.
+//
+// A Target smaller than the window is drawn at the origin rather than scaled;
+// a larger one is cropped. Nothing here resizes.
+fn present(w as *Window, t as *tgt.Target) as void {
+    if (w.ok == 0) { return; }
+    let is i64 as rows with mut = t.height;
+    if (rows > w.height) { rows = w.height; }
+    let is i64 as cols with mut = t.width;
+    if (cols > w.width) { cols = w.width; }
+
+    let is i64 as y with mut = 0;
+    while (y < rows) {
+        let is i64 as src_row = cast(i64, t.color) + y * t.width * 4;
+        let is i64 as dst_row = cast(i64, w.pixels) + y * w.width * 4;
+        let is i64 as x with mut = 0;
+        while (x < cols) {
+            let is i64 as p = cast(i64, *cast(*i32, src_row + x * 4)) & 4294967295;
+            let is i64 as r = p & 255;
+            let is i64 as g = (p >> 8) & 255;
+            let is i64 as b = (p >> 16) & 255;
+            let is i64 as a = (p >> 24) & 255;
+            *cast(*i32, dst_row + x * 4) = cast(i32, (a << 24) | (r << 16) | (g << 8) | b);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    XPutImage(w.display, w.win, w.gc, w.image, 0, 0, 0, 0,
+              cast(u32, cols), cast(u32, rows));
+    XFlush(w.display);
+}
+
+// Fills the window with one colour, for a program with nothing to draw yet.
+fn present_color(w as *Window, c as math.color.Color) as void {
+    if (w.ok == 0) { return; }
+    let is i64 as packed = math.color.pack_argb8(c);
+    let is i64 as n = w.width * w.height;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        *cast(*i32, cast(i64, w.pixels) + i * 4) = cast(i32, packed);
+        i = i + 1;
+    }
+    XPutImage(w.display, w.win, w.gc, w.image, 0, 0, 0, 0,
+              cast(u32, w.width), cast(u32, w.height));
+    XFlush(w.display);
+}
