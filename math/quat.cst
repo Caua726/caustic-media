@@ -1,0 +1,194 @@
+// math/quat.cst — unit quaternions for rotation.
+//
+// Why quaternions and not three Euler angles: composing rotations by
+// multiplying matrices accumulates error and drifts out of orthogonality,
+// Euler angles gimbal-lock, and neither interpolates smoothly. A unit
+// quaternion composes with 16 multiplies, renormalizes with one sqrt, and
+// slerps along the shortest arc.
+//
+// Layout is (x, y, z, w) with w the scalar part — the order Vulkan, glTF and
+// most engines use. Identity is (0, 0, 0, 1).
+use "std/math.cst" as fm;
+use "vec.cst" as v;
+use "mat.cst" as mt;
+
+struct Quat { x as f64; y as f64; z as f64; w as f64; }
+
+fn quat(x as f64, y as f64, z as f64, w as f64) as Quat {
+    let is Quat as r; r.x = x; r.y = y; r.z = z; r.w = w; return r;
+}
+
+fn q_identity() as Quat { return quat(0.0, 0.0, 0.0, 1.0); }
+
+// --- Construction ---
+
+// Rotation of `rad` radians about `axis`, right-handed. The axis is
+// normalized here, so callers need not.
+fn q_from_axis_angle(axis as v.Vec3, rad as f64) as Quat {
+    let is v.Vec3 as a = v.v3_normalize(axis);
+    let is f64 as h = rad * 0.5;
+    let is f64 as s = fm.sin(h);
+    return quat(a.x * s, a.y * s, a.z * s, fm.cos(h));
+}
+
+// Intrinsic Y-X-Z (yaw, then pitch, then roll) — the order that reads as
+// "turn, look up, tilt" for a camera.
+fn q_from_euler(yaw as f64, pitch as f64, roll as f64) as Quat {
+    let is f64 as cy = fm.cos(yaw * 0.5);
+    let is f64 as sy = fm.sin(yaw * 0.5);
+    let is f64 as cp = fm.cos(pitch * 0.5);
+    let is f64 as sp = fm.sin(pitch * 0.5);
+    let is f64 as cr = fm.cos(roll * 0.5);
+    let is f64 as sr = fm.sin(roll * 0.5);
+    return quat(cy * sp * cr + sy * cp * sr,
+                sy * cp * cr - cy * sp * sr,
+                cy * cp * sr - sy * sp * cr,
+                cy * cp * cr + sy * sp * sr);
+}
+
+// --- Arithmetic ---
+
+// Applies b first, then a — the same right-to-left reading as matrices.
+fn q_mul(a as Quat, b as Quat) as Quat {
+    return quat(a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+}
+
+fn q_add(a as Quat, b as Quat) as Quat {
+    return quat(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+
+fn q_scale(a as Quat, s as f64) as Quat {
+    return quat(a.x * s, a.y * s, a.z * s, a.w * s);
+}
+
+fn q_neg(a as Quat) as Quat {
+    return quat(0.0 - a.x, 0.0 - a.y, 0.0 - a.z, 0.0 - a.w);
+}
+
+fn q_dot(a as Quat, b as Quat) as f64 {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+fn q_len(a as Quat) as f64 { return fm.sqrt(q_dot(a, a)); }
+
+fn q_normalize(a as Quat) as Quat {
+    let is f64 as l = q_len(a);
+    if (l == 0.0) { return q_identity(); }
+    return q_scale(a, 1.0 / l);
+}
+
+// For a unit quaternion the conjugate is the inverse rotation, and costs
+// three negations instead of a division.
+fn q_conjugate(a as Quat) as Quat {
+    return quat(0.0 - a.x, 0.0 - a.y, 0.0 - a.z, a.w);
+}
+
+fn q_inverse(a as Quat) as Quat {
+    let is f64 as d = q_dot(a, a);
+    if (d == 0.0) { return q_identity(); }
+    return q_scale(q_conjugate(a), 1.0 / d);
+}
+
+// --- Applying a rotation ---
+
+// Rotates p by q, via the expanded q*p*q^-1 that avoids building a matrix.
+fn q_rotate_v3(q as Quat, p as v.Vec3) as v.Vec3 {
+    let is v.Vec3 as u = v.v3(q.x, q.y, q.z);
+    let is v.Vec3 as t = v.v3_scale(v.v3_cross(u, p), 2.0);
+    return v.v3_add(v.v3_add(p, v.v3_scale(t, q.w)), v.v3_cross(u, t));
+}
+
+// --- Interpolation ---
+
+fn q_lerp(a as Quat, b as Quat, t as f64) as Quat {
+    return q_normalize(q_add(q_scale(a, 1.0 - t), q_scale(b, t)));
+}
+
+// Spherical interpolation: constant angular velocity along the shortest arc.
+// Negating one input when the dot product is negative picks the short way
+// round; below the threshold the arc is small enough that a normalized lerp
+// is indistinguishable and avoids dividing by a near-zero sine.
+fn q_slerp(a as Quat, b as Quat, t as f64) as Quat {
+    let is f64 as d with mut = q_dot(a, b);
+    let is Quat as e with mut = b;
+    if (d < 0.0) { e = q_neg(b); d = 0.0 - d; }
+    if (d > 0.9995) { return q_lerp(a, e, t); }
+
+    let is f64 as theta = fm.acos(fm.clamp_f64(d, 0.0 - 1.0, 1.0));
+    let is f64 as st = fm.sin(theta);
+    if (st == 0.0) { return q_lerp(a, e, t); }
+    let is f64 as wa = fm.sin((1.0 - t) * theta) / st;
+    let is f64 as wb = fm.sin(t * theta) / st;
+    return q_add(q_scale(a, wa), q_scale(e, wb));
+}
+
+// --- Conversion ---
+
+fn q_to_mat4(q as Quat) as mt.Mat4 {
+    let is Quat as n = q_normalize(q);
+    let is f64 as xx = n.x * n.x;
+    let is f64 as yy = n.y * n.y;
+    let is f64 as zz = n.z * n.z;
+    let is f64 as xy = n.x * n.y;
+    let is f64 as xz = n.x * n.z;
+    let is f64 as yz = n.y * n.z;
+    let is f64 as wx = n.w * n.x;
+    let is f64 as wy = n.w * n.y;
+    let is f64 as wz = n.w * n.z;
+
+    let is mt.Mat4 as r = mt.m4_identity();
+    r.m[0] = 1.0 - 2.0 * (yy + zz);
+    r.m[1] = 2.0 * (xy + wz);
+    r.m[2] = 2.0 * (xz - wy);
+
+    r.m[4] = 2.0 * (xy - wz);
+    r.m[5] = 1.0 - 2.0 * (xx + zz);
+    r.m[6] = 2.0 * (yz + wx);
+
+    r.m[8]  = 2.0 * (xz + wy);
+    r.m[9]  = 2.0 * (yz - wx);
+    r.m[10] = 1.0 - 2.0 * (xx + yy);
+    return r;
+}
+
+// Shepperd's method: pick the largest diagonal term to divide by, so the
+// square root never lands near zero and the sign stays determinate.
+fn q_from_mat4(a as mt.Mat4) as Quat {
+    let is f64 as tr = a.m[0] + a.m[5] + a.m[10];
+    if (tr > 0.0) {
+        let is f64 as s = fm.sqrt(tr + 1.0) * 2.0;
+        return quat((a.m[6] - a.m[9]) / s,
+                    (a.m[8] - a.m[2]) / s,
+                    (a.m[1] - a.m[4]) / s,
+                    0.25 * s);
+    }
+    if (a.m[0] > a.m[5] && a.m[0] > a.m[10]) {
+        let is f64 as s = fm.sqrt(1.0 + a.m[0] - a.m[5] - a.m[10]) * 2.0;
+        return quat(0.25 * s,
+                    (a.m[4] + a.m[1]) / s,
+                    (a.m[8] + a.m[2]) / s,
+                    (a.m[6] - a.m[9]) / s);
+    }
+    if (a.m[5] > a.m[10]) {
+        let is f64 as s = fm.sqrt(1.0 + a.m[5] - a.m[0] - a.m[10]) * 2.0;
+        return quat((a.m[4] + a.m[1]) / s,
+                    0.25 * s,
+                    (a.m[9] + a.m[6]) / s,
+                    (a.m[8] - a.m[2]) / s);
+    }
+    let is f64 as s = fm.sqrt(1.0 + a.m[10] - a.m[0] - a.m[5]) * 2.0;
+    return quat((a.m[8] + a.m[2]) / s,
+                (a.m[9] + a.m[6]) / s,
+                0.25 * s,
+                (a.m[1] - a.m[4]) / s);
+}
+
+// q and -q name the same rotation, so a comparison has to accept either.
+fn q_approx(a as Quat, b as Quat, eps as f64) as i32 {
+    let is f64 as d = fm.abs_f64(q_dot(a, b));
+    if (d < 1.0 - eps) { return 0; }
+    return 1;
+}
