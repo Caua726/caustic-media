@@ -13,15 +13,24 @@ the GPU itself.
 
 ```
 math/     vectors, matrices, quaternions, projections   — pure
-raster/   software rasterizer, z-buffer, texturing      — pure
 window/   window + input:  x11 | wayland | win32 | causticos
-gpu/      portable device API:  soft | gl | vk
+gpu/      device access:  gl | vk
+render/   the renderer, over either path:
+            software/   rasterizer, z-buffer, texturing — pure
+            gpu/        the same scene through gpu/
 audio/    playback:  alsa | wasapi | causticos
-ui/       immediate-mode widgets on top of raster or gpu
+ui/       immediate-mode widgets, drawn through render/
 ```
 
-`math/` and `raster/` import nothing below them, so a program that only needs
-geometry or software rendering still builds with no external dependency.
+`math/` and `render/software/` import nothing below them, so a program that
+only needs geometry or software rendering still builds with no external
+dependency.
+
+The split between `gpu/` and `render/gpu/` is deliberate: `gpu/` is the device
+— buffers, pipelines, submission — and stops there, so a program that wants to
+drive Vulkan itself takes `gpu/` and leaves the rest. `render/` is the opinion
+on top, and it is the layer that can swap between hardware and software without
+the calling code noticing.
 
 ## Three ways to reach the GPU
 
@@ -74,8 +83,9 @@ Textures and image files go through
 
 ## Status
 
-Early. `math/` first, then `raster/`, then one window backend — enough for a
-spinning cube with no external dependency, which is the first milestone.
+Early. `math/` is in. Next is `render/software/`, then one window backend —
+enough for a spinning cube with no external dependency, which is the first
+milestone.
 
 ## License
 
