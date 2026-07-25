@@ -81,6 +81,29 @@ section, like any other Caustic program.
 Textures and image files go through
 [caustic-image](https://github.com/Caua726/caustic-image).
 
+## Building
+
+```
+caustic -q math/math_test.cst -o build/math_test && ./build/math_test
+caustic -q math/geom_test.cst -o build/geom_test && ./build/geom_test
+```
+
+Needs a standard library new enough to carry the float functions in
+`std/math.cst` — `sin`, `cos`, `atan2`, `pow` and the rest. An older install
+fails with "funcao nao encontrada no modulo" pointing at `min_f64` or a
+trigonometric function.
+
+The compiler looks for the stdlib beside its own binary first, at
+`<dir of caustic>/../lib/caustic`, and only then at `/usr/local/lib/caustic`.
+To build against a Caustic checkout without installing anything, point the
+first location at it:
+
+```
+mkdir -p ../lib/caustic && ln -sfn ../../Caustic/std ../lib/caustic/std
+```
+
+Every sibling project then resolves `use "std/..."` to that tree.
+
 ## Status
 
 Early. `math/` is in. Next is `render/software/`, then one window backend —
