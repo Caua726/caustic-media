@@ -109,14 +109,16 @@ same mechanism that keeps a Linux build free of kernel32.
 
 ## Dependencies
 
-`math/`, `raster/` and the CausticOS and KMS paths need nothing but the kernel.
-The Vulkan, OpenGL, X11 and Wayland backends link the corresponding system
-library, which is why they are opt-in and live behind their own namespace: a
-program that never names them produces a static binary with no `.dynamic`
-section, like any other Caustic program.
+`math/`, `gpu/software/`, `input/evdev` and the KMS path need nothing but the
+kernel. The Vulkan, OpenGL, X11 and Wayland backends link the corresponding
+system library, which is why they are opt-in and live behind their own
+namespace: a program that never names them produces a static binary with no
+`.dynamic` section, like any other Caustic program.
 
-Textures and image files go through
-[caustic-image](https://github.com/Caua726/caustic-image).
+Decoding image files goes through
+[caustic-image](https://github.com/Caua726/caustic-image), behind
+[`image/`](image/image.md) and opt-in — a program that only generates or
+transforms images links no decoder.
 
 ## Building
 
@@ -143,9 +145,20 @@ Every sibling project then resolves `use "std/..."` to that tree.
 
 ## Status
 
-Early. `math/` is in. Next is `render/software/`, then one window backend —
-enough for a spinning cube with no external dependency, which is the first
-milestone.
+Early, and the first milestone is met: a shaded cube turns in a window, drawn
+entirely on the CPU, with nothing between the geometry and the screen but our
+own code.
+
+| | |
+|---|---|
+| `math/` | vectors, matrices, quaternions, geometry, colour, curves — tested |
+| `gpu/software/` | rasterizer with a depth buffer, perspective-correct, tested |
+| `window/x11` | opens, presents and reads input — 22 of libX11's 774 functions |
+| everything else | a design note, and the work it describes |
+
+The next pieces are the ones the notes call for first: reshaping `window/x11`
+to the pull model before a second backend exists, and wrapping the rasterizer in
+a device so `gpu.open(SOFTWARE)` reaches it.
 
 ## License
 
