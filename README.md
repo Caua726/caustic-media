@@ -15,6 +15,7 @@ the GPU itself.
 math/     vectors, matrices, quaternions, geometry, colour, curves   — pure
 window/   window, display, platform:  x11 | wayland | kms | win32
 input/    keyboard, mouse, touch, pen, gamepad, haptics, sensors
+            cooked from the display server, or raw from evdev
 gpu/      the device, in the shape of wgpu:  vk | gl | d3d | software
 render/   the framework: meshes, sprites, materials, cameras, a frame
 3d/       models, meshes, skeletons, animation
@@ -24,9 +25,10 @@ audio/    device, mixer, music, positional:  alsa | wasapi | causticos
 ui/       immediate-mode widgets, drawn through render/
 ```
 
-Each has a design note beside it — [`window/window.md`](window/window.md),
-[`gpu/gpu.md`](gpu/gpu.md), [`render/render.md`](render/render.md) — recording
-what it holds and why.
+Each has a design note beside it recording what it holds and why:
+[`window/`](window/window.md) · [`input/`](input/input.md) ·
+[`gpu/`](gpu/gpu.md) · [`render/`](render/render.md) · [`image/`](image/image.md),
+with one per backend under `window/` and `gpu/`.
 
 `math/` and `gpu/software/` import nothing below them, so a program that only
 needs geometry or software rendering still builds with no external dependency.
