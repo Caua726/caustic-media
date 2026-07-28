@@ -1,0 +1,122 @@
+// gpu/shader.cst — the stages a pipeline runs.
+//
+// SPIR-V is the internal currency: Vulkan takes it natively, OpenGL 4.6 takes
+// it natively through GL_ARB_gl_spirv, and only software has to execute it.
+// That is why the choice of input language costs one frontend rather than
+// three backends.
+//
+// It also means the software backend is where the cost lands, and today it
+// has not been paid: interpreting SPIR-V is a dispatch per instruction per
+// fragment, and that interpreter does not exist yet. So from_spirv() reports
+// UNSUPPORTED on software rather than pretending. A program on software uses
+// the built-ins below, which run as native code and cover what render/'s
+// common materials need.
+use "../math/math.cst" as math;
+use "device.cst" as dev;
+
+// Where a module came from.
+let is i32 as SOURCE_BUILTIN with imut = 0;
+let is i32 as SOURCE_SPIRV   with imut = 1;
+
+// The built-in materials. These exist so the software backend can implement
+// the common cases as native functions instead of interpreting a shader per
+// fragment — see software/software.md. A GPU backend compiles the equivalent
+// SPIR-V it ships with, so a program sees the same names either way.
+let is i64 as UNLIT_COLOR with imut = 0;   // interpolated vertex colour
+let is i64 as TEXTURED    with imut = 1;   // texture 0, modulated by vertex colour
+let is i64 as BUILTIN_COUNT with imut = 2;
+
+// What every built-in material reads, on every backend. It lives here rather
+// than in a backend because it is the interface: a program sets these and the
+// picture is the same whether the fragment ran as native code on the software
+// rasterizer or as SPIR-V on a GPU. A backend that laid it out differently
+// would make the built-ins mean different things per backend, which is the
+// one thing the built-ins exist to prevent.
+struct BuiltinUniforms {
+    mvp  as math.mat.Mat4;
+    tint as math.color.Color;
+}
+
+fn uniforms(mvp as math.mat.Mat4, tint as math.color.Color) as BuiltinUniforms {
+    let is BuiltinUniforms as u;
+    u.mvp = mvp;
+    u.tint = tint;
+    return u;
+}
+
+// The common case: transform by mvp, leave colours alone.
+fn uniforms_mvp(mvp as math.mat.Mat4) as BuiltinUniforms {
+    return uniforms(mvp, math.color.white());
+}
+
+struct Info {
+    source as i32;
+    id     as i64;    // built-in id, or 0 for SPIR-V
+}
+
+fn backend_state(payload as *u8) as *u8 {
+    return cast(*u8, cast(i64, payload) + sizeof(Info));
+}
+
+fn info_bytes() as i64 { return sizeof(Info); }
+
+// --- Modules ---
+
+fn builtin(d as *dev.Device, id as i64) as i64 {
+    if (id < 0 || id >= BUILTIN_COUNT) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    let is i64 as h = dev.alloc_handle(d, dev.KIND_SHADER);
+    if (h == 0) { return 0; }
+
+    let is *u8 as p = dev.payload(d, dev.KIND_SHADER, h);
+    let is *Info as inf = cast(*Info, p);
+    inf.source = SOURCE_BUILTIN;
+    inf.id = id;
+
+    if (call(d.vt.shader_builtin, d.self, p, id) != 1) {
+        dev.free_handle(d, dev.KIND_SHADER, h);
+        dev.set_error(d, dev.UNSUPPORTED);
+        return 0;
+    }
+    return h;
+}
+
+// Precompiled SPIR-V, as glslc or glslangValidator emits it. A backend that
+// cannot execute it says so through last_error() rather than accepting the
+// module and drawing nothing, which would be the same failure with the
+// evidence removed.
+fn from_spirv(d as *dev.Device, bytes as *u8, len as i64) as i64 {
+    if (cast(i64, bytes) == 0 || len <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    let is i64 as h = dev.alloc_handle(d, dev.KIND_SHADER);
+    if (h == 0) { return 0; }
+
+    let is *u8 as p = dev.payload(d, dev.KIND_SHADER, h);
+    let is *Info as inf = cast(*Info, p);
+    inf.source = SOURCE_SPIRV;
+    inf.id = 0;
+
+    if (call(d.vt.shader_spirv, d.self, p, bytes, len) != 1) {
+        dev.free_handle(d, dev.KIND_SHADER, h);
+        dev.set_error(d, dev.UNSUPPORTED);
+        return 0;
+    }
+    return h;
+}
+
+fn destroy(d as *dev.Device, h as i64) as void {
+    let is *u8 as p = dev.payload(d, dev.KIND_SHADER, h);
+    if (cast(i64, p) == 0) { return; }
+    call(d.vt.shader_destroy, d.self, p);
+    dev.free_handle(d, dev.KIND_SHADER, h);
+}
+
+fn source(d as *dev.Device, h as i64) as i32 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SHADER, h);
+    if (cast(i64, p) == 0) { return cast(i32, 0 - 1); }
+    return cast(*Info, p).source;
+}
+
+fn builtin_id(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SHADER, h);
+    if (cast(i64, p) == 0) { return 0 - 1; }
+    return cast(*Info, p).id;
+}

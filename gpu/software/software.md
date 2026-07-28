@@ -6,8 +6,9 @@ with no driver and no hardware underneath.
 ```
 software/
   target.cst    ✅ the framebuffer view — colour, depth, clear, lines, rects
-  raster.cst    ✅ triangle rasterization with a depth buffer
-  backend.cst   gpu/device.cst implemented over them
+  raster.cst    ✅ triangle rasterization with a depth buffer, and the
+                   programmable path the device draws through
+  backend.cst   ✅ gpu/device.cst implemented over them
 ```
 
 **This is the only backend that keeps a binary fully self-contained.** Every
@@ -36,9 +37,29 @@ The tests check invariants rather than pixels: coverage against area, a seam
 covered once, the nearer surface winning either submission order, one winding
 surviving culling.
 
-What is missing is the shape around it. Today it is a *renderer* — you hand it
-triangles. It has to become a *device* — you hand it buffers, a pipeline, and a
-draw command.
+`backend.cst` now wraps both in the device's shape, so the shape around it is no
+longer missing: buffers, textures with samplers, pipelines resolved to function
+pointers, recorded command lists, and a swapchain. `gpu.open(SOFTWARE)` reaches
+all of it.
+
+Two things that took a shape worth recording:
+
+**`raster.cst` gained a second entry point rather than growing options.**
+`triangle()` still draws exactly as it did — vertex colours, depth LESS,
+opaque, whole target — and stays the reference. `triangle_shaded()` beside it
+takes the fragment stage as a function pointer and the rest as a state struct,
+which is what a pipeline reduces to once there is no hardware to configure. It
+costs an indirect call per fragment, and that is the honest price of the
+abstraction: about 10% on the cube.
+
+**The device path is checked against the bare rasterizer, not against a
+picture.** `gpu/gpu_test.cst` draws the same triangle both ways and requires
+the two images to be identical pixel for pixel. That is what catches the draw
+path drifting — a bounding box off by one, a weight renormalised differently —
+which no invariant about coverage would notice.
+
+Still missing: SPIR-V, and therefore custom shaders. `from_spirv()` returns
+`UNSUPPORTED` rather than a module that silently draws nothing.
 
 ---
 
@@ -124,9 +145,16 @@ are linear and can be stepped incrementally.
 
 ## Order of work
 
-1. **`backend.cst`** — the device shell: buffers, textures, pipelines as function
-   pointer sets, command recording, submission. This is what makes the existing
-   rasterizer reachable through `gpu.open(SOFTWARE)`.
-2. **Built-in material fragment functions**, so `render/`'s common path is native.
-3. **SPIR-V interpreter**, for custom shaders and for compute.
-4. **Tiled multithreading**, once there is something worth parallelising.
+1. ~~**`backend.cst`** — the device shell.~~ Done: buffers, textures, pipelines
+   as function pointer sets, command recording, submission, swapchain.
+2. ~~**Built-in material fragment functions.**~~ Done for the two that exist:
+   `UNLIT_COLOR` and `TEXTURED`, both native code. More arrive with `render/`'s
+   materials, and lighting is the next one.
+3. **Compute**, which is a loop over a workgroup grid here, and the obvious
+   place for the thread pool.
+4. **SPIR-V interpreter**, for custom shaders and for compute's shader half.
+5. **Tiled multithreading**, once there is something worth parallelising.
+
+Before any of those, the cheap wins named above are still unclaimed: the
+rasterizer walks the full bounding box testing three edge functions per pixel,
+when the edge functions are linear and can be stepped incrementally.

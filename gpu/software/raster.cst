@@ -111,8 +111,21 @@ fn triangle(t as *tgt.Target, mvp as math.mat.Mat4,
 
     let is f64 as area = edge(pa.x, pa.y, pb.x, pb.y, pc.x, pc.y);
     if (area == 0.0) { return; }                                  // degenerate
-    if (cull == CULL_BACK && area <= 0.0) { return; }
-    if (cull == CULL_FRONT && area >= 0.0) { return; }
+
+    // project() flips Y, because framebuffer rows run downward while
+    // normalized device coordinates put +Y up. That flip reverses the sign of
+    // the screen-space area, so a triangle that is counter-clockwise in NDC —
+    // the front face, by the right-handed convention the math layer uses —
+    // arrives here NEGATIVE.
+    //
+    // Getting this backwards does not look like a bug. A closed mesh culled the
+    // wrong way still has the same silhouette: you see the far side of it
+    // instead of the near side, and a spinning cube goes on looking like a
+    // spinning cube. It was caught by rendering one face at a time with the
+    // camera square in front of it, and confirmed by reading the depth buffer —
+    // CULL_BACK was keeping the surfaces with the LARGER depth.
+    if (cull == CULL_BACK && area >= 0.0) { return; }
+    if (cull == CULL_FRONT && area <= 0.0) { return; }
 
     // Bounding box, clipped to the target. Pixel centres are sampled, so the
     // box runs over whole pixels containing any part of the triangle.
@@ -220,6 +233,227 @@ fn barycentric_at(pa as Projected, pb as Projected, pc as Projected,
     if (qs == 0.0) { return 0; }
     *wa_out = qa / qs; *wb_out = qb / qs; *wc_out = qc / qs;
     return 1;
+}
+
+// --- The programmable path ---
+//
+// Everything above draws a triangle one specific way: vertex colours, depth
+// tested with LESS, opaque, filling the whole target. That is the right shape
+// for a renderer and the wrong shape for a device, where what a fragment
+// becomes is the pipeline's business rather than this file's.
+//
+// So this second entry point takes the fragment stage as a function pointer
+// and the rest of the state as a struct, which is exactly what a pipeline is
+// once there is no hardware to configure. It costs an indirect call per
+// fragment. That is the price of the abstraction and it is worth naming: a
+// program on the software backend pays it on every pixel it covers.
+//
+// triangle() above is untouched and stays the reference — the device path is
+// expected to produce identical pixels for the equivalent state, and
+// gpu/gpu_test.cst checks exactly that.
+
+// What gets interpolated across the face. Perspective-corrected, like the
+// colour in triangle(): weights divided by w and renormalised.
+struct Varyings {
+    color as math.color.Color;
+    u     as f64;
+    v     as f64;
+}
+
+// A vertex after the vertex stage has run: clip-space position, and what to
+// interpolate towards the neighbours.
+struct Shaded {
+    clip as math.vec.Vec4;
+    vary as Varyings;
+}
+
+// Depth comparison and blending. These match gpu/pipeline.cst's DEPTH_* and
+// BLEND_* values one for one; the backend passes them straight through rather
+// than translating, and this comment is the contract that makes that safe.
+let is i32 as DEPTH_NONE   with imut = 0;
+let is i32 as DEPTH_LESS   with imut = 1;
+let is i32 as DEPTH_LEQUAL with imut = 2;
+let is i32 as DEPTH_ALWAYS with imut = 3;
+
+let is i32 as BLEND_NONE  with imut = 0;
+let is i32 as BLEND_ALPHA with imut = 1;
+
+// Everything the rasterizer needs that is not the geometry. A struct rather
+// than eleven parameters because it is per-pipeline state: set once per bind,
+// read per triangle.
+struct ShadeState {
+    vx as i64;
+    vy as i64;
+    vw as i64;
+    vh as i64;
+    cull        as i32;
+    depth_test  as i32;
+    depth_write as i32;
+    blend       as i32;
+    // fn(env as *u8, vary as *Varyings) as i64
+    //   -> 0xAABBGGRR packed, or -1 to discard the fragment
+    frag as *u8;
+    env  as *u8;
+}
+
+// Clip space -> screen, into a viewport rather than the whole target. Same
+// mapping as project(), with the viewport's origin and extent replacing the
+// target's; project(t, c) is this with the full target as the viewport.
+fn project_viewport(clip as math.vec.Vec4,
+                    vx as f64, vy as f64, vw as f64, vh as f64) as Projected {
+    let is Projected as p;
+    p.x = 0.0; p.y = 0.0; p.z = 0.0; p.inv_w = 0.0; p.ok = 0;
+    if (clip.w <= 0.000000001) { return p; }
+    let is f64 as iw = 1.0 / clip.w;
+    p.x = vx + (clip.x * iw * 0.5 + 0.5) * vw;
+    p.y = vy + (0.5 - clip.y * iw * 0.5) * vh;
+    p.z = clip.z * iw;
+    p.inv_w = iw;
+    p.ok = 1;
+    return p;
+}
+
+fn _depth_passes(mode as i32, z as f64, stored as f64) as i32 {
+    if (mode == DEPTH_ALWAYS) { return 1; }
+    if (mode == DEPTH_LESS)   { if (z < stored)  { return 1; } return 0; }
+    if (mode == DEPTH_LEQUAL) { if (z <= stored) { return 1; } return 0; }
+    return 1;
+}
+
+// Source-over, on packed 0xAABBGGRR. Done in 8-bit rather than through
+// math.color so the opaque path — which is most of them — costs nothing.
+fn _blend_over(src as i64, dst as i64) as i64 {
+    let is i64 as sa = (src >> 24) & 255;
+    if (sa == 255) { return src; }
+    if (sa == 0) { return dst; }
+    let is i64 as ia = 255 - sa;
+    let is i64 as r = ((src & 255) * sa + (dst & 255) * ia) / 255;
+    let is i64 as g = (((src >> 8) & 255) * sa + ((dst >> 8) & 255) * ia) / 255;
+    let is i64 as b = (((src >> 16) & 255) * sa + ((dst >> 16) & 255) * ia) / 255;
+    let is i64 as a with mut = sa + ((dst >> 24) & 255) * ia / 255;
+    if (a > 255) { a = 255; }
+    return (a << 24) | (b << 16) | (g << 8) | r;
+}
+
+// Rasterize one triangle whose vertices have already been through a vertex
+// stage. The loop is triangle()'s, with the colour computation replaced by a
+// call through st.frag and the depth rule and blending taken from st.
+fn triangle_shaded(t as *tgt.Target, a as Shaded, b as Shaded, c as Shaded,
+                   st as *ShadeState) as void {
+    let is f64 as fvx = cast(f64, st.vx);
+    let is f64 as fvy = cast(f64, st.vy);
+    let is f64 as fvw = cast(f64, st.vw);
+    let is f64 as fvh = cast(f64, st.vh);
+
+    let is Projected as pa = project_viewport(a.clip, fvx, fvy, fvw, fvh);
+    let is Projected as pb = project_viewport(b.clip, fvx, fvy, fvw, fvh);
+    let is Projected as pc = project_viewport(c.clip, fvx, fvy, fvw, fvh);
+    if (pa.ok == 0 || pb.ok == 0 || pc.ok == 0) { return; }
+
+    let is f64 as area = edge(pa.x, pa.y, pb.x, pb.y, pc.x, pc.y);
+    if (area == 0.0) { return; }
+    // Same sign convention as triangle() above: project() flips Y, so a
+    // front-facing triangle arrives with a negative screen-space area. This is
+    // the path the gpu device runs, and it had the same inversion.
+    if (st.cull == CULL_BACK && area >= 0.0) { return; }
+    if (st.cull == CULL_FRONT && area <= 0.0) { return; }
+
+    // Clipped to the viewport as well as the target: a viewport is a scissor
+    // as far as coverage is concerned, and a triangle may hang outside it.
+    let is f64 as clip_x0 = fm.max_f64(0.0, fvx);
+    let is f64 as clip_y0 = fm.max_f64(0.0, fvy);
+    let is f64 as clip_x1 = fm.min_f64(cast(f64, t.width),  fvx + fvw);
+    let is f64 as clip_y1 = fm.min_f64(cast(f64, t.height), fvy + fvh);
+
+    let is i64 as x0 = cast(i64, fm.max_f64(clip_x0, fm.floor(fm.min_f64(pa.x, fm.min_f64(pb.x, pc.x)))));
+    let is i64 as y0 = cast(i64, fm.max_f64(clip_y0, fm.floor(fm.min_f64(pa.y, fm.min_f64(pb.y, pc.y)))));
+    let is i64 as x1 = cast(i64, fm.min_f64(clip_x1, fm.ceil(fm.max_f64(pa.x, fm.max_f64(pb.x, pc.x)))));
+    let is i64 as y1 = cast(i64, fm.min_f64(clip_y1, fm.ceil(fm.max_f64(pa.y, fm.max_f64(pb.y, pc.y)))));
+    if (x1 <= x0 || y1 <= y0) { return; }
+
+    let is f64 as inv_area = 1.0 / area;
+    let is i32 as own_a = edge_owns(pb.x, pb.y, pc.x, pc.y);
+    let is i32 as own_b = edge_owns(pc.x, pc.y, pa.x, pa.y);
+    let is i32 as own_c = edge_owns(pa.x, pa.y, pb.x, pb.y);
+
+    // No depth plane, or a pipeline that asked for none, and the test folds
+    // away for the whole triangle rather than per pixel.
+    let is i32 as depth with mut = tgt.has_depth(t);
+    if (st.depth_test == DEPTH_NONE && st.depth_write == 0) { depth = 0; }
+
+    let is Varyings as vary;
+
+    let is i64 as py with mut = y0;
+    while (py < y1) {
+        let is i64 as px with mut = x0;
+        while (px < x1) {
+            let is f64 as sx = cast(f64, px) + 0.5;
+            let is f64 as sy = cast(f64, py) + 0.5;
+
+            let is f64 as ea = edge(pb.x, pb.y, pc.x, pc.y, sx, sy);
+            let is f64 as eb = edge(pc.x, pc.y, pa.x, pa.y, sx, sy);
+            let is f64 as ec = edge(pa.x, pa.y, pb.x, pb.y, sx, sy);
+
+            let is i32 as inside with mut = 1;
+            if (area > 0.0) {
+                if (ea < 0.0 || eb < 0.0 || ec < 0.0) { inside = 0; }
+            } else {
+                if (ea > 0.0 || eb > 0.0 || ec > 0.0) { inside = 0; }
+            }
+            if (inside == 1 && ea == 0.0 && own_a == 0) { inside = 0; }
+            if (inside == 1 && eb == 0.0 && own_b == 0) { inside = 0; }
+            if (inside == 1 && ec == 0.0 && own_c == 0) { inside = 0; }
+
+            if (inside == 1) {
+                let is f64 as wa = ea * inv_area;
+                let is f64 as wb = eb * inv_area;
+                let is f64 as wc = ec * inv_area;
+                let is f64 as z = wa * pa.z + wb * pb.z + wc * pc.z;
+
+                let is i32 as visible with mut = 1;
+                if (depth == 1 && st.depth_test != DEPTH_NONE) {
+                    visible = _depth_passes(st.depth_test, z, tgt.depth_at(t, px, py));
+                }
+
+                if (visible == 1) {
+                    let is f64 as qa = wa * pa.inv_w;
+                    let is f64 as qb = wb * pb.inv_w;
+                    let is f64 as qc = wc * pc.inv_w;
+                    let is f64 as qs = qa + qb + qc;
+                    if (qs != 0.0) {
+                        let is f64 as inv_qs = 1.0 / qs;
+                        let is f64 as fa = qa * inv_qs;
+                        let is f64 as fb = qb * inv_qs;
+                        let is f64 as fc = qc * inv_qs;
+
+                        vary.color = math.color.rgba(
+                            fa * a.vary.color.r + fb * b.vary.color.r + fc * c.vary.color.r,
+                            fa * a.vary.color.g + fb * b.vary.color.g + fc * c.vary.color.g,
+                            fa * a.vary.color.b + fb * b.vary.color.b + fc * c.vary.color.b,
+                            fa * a.vary.color.a + fb * b.vary.color.a + fc * c.vary.color.a);
+                        vary.u = fa * a.vary.u + fb * b.vary.u + fc * c.vary.u;
+                        vary.v = fa * a.vary.v + fb * b.vary.v + fc * c.vary.v;
+
+                        let is i64 as out = call(st.frag, st.env, &vary);
+                        // A discarded fragment writes neither colour nor
+                        // depth, which is what makes cut-out geometry work.
+                        if (out >= 0) {
+                            let is i64 as packed with mut = out & 4294967295;
+                            if (st.blend == BLEND_ALPHA) {
+                                packed = _blend_over(packed, tgt.get(t, px, py));
+                            }
+                            tgt.put(t, px, py, packed);
+                            if (depth == 1 && st.depth_write == 1) {
+                                tgt.set_depth(t, px, py, z);
+                            }
+                        }
+                    }
+                }
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
 }
 
 // Wireframe, for debugging a mesh without shading it.

@@ -293,6 +293,65 @@ the whole API.
 
 ---
 
+## Current state
+
+The device abstraction exists and the software backend implements it. A
+program reaches the rasterizer through `gpu.open(SOFTWARE)`, and
+`examples/cube.cst` does — the cube is a vertex buffer, a pipeline and a draw,
+with nothing in it naming a rasterizer.
+
+```
+gpu.cst        hub, backend selection, AUTO
+device.cst     Device, the backend vtable, Limits, handles, errors, caps
+buffer.cst     create, upload, map
+texture.cst    textures, samplers, formats, readback
+shader.cst     built-in materials; SPIR-V is accepted and refused honestly
+pipeline.cst   declared vertex layouts, surface state, stages
+command.cst    recording, passes, draws, submission
+swapchain.cst  Surface, acquire, present, resize
+software/backend.cst   all of it, over target.cst and raster.cst
+```
+
+Four decisions the code makes that the note above did not:
+
+**A handle is `(era << 32) | (index + 1)`.** Zero is always invalid, and the
+era means a handle whose slot has been reused is refused rather than quietly
+addressing someone else's resource. Slot bookkeeping belongs to `device.cst`,
+so a backend never invents a handle and every backend fails the same way.
+
+**A backend's payload begins with its module's portable `Info`.** That is what
+lets `buffer.size()` and `texture.width()` answer without a vtable entry each,
+and it is the only layout contract between a resource module and a backend.
+
+**The swapchain takes a `Surface`, and `gpu/` never imports `window/`.** A
+`use` of `window/x11/x11.cst` anywhere here would put libX11 in the `DT_NEEDED` of
+every program that software-renders, and the README's claim that `gpu/software`
+needs nothing but the kernel would quietly stop being true. So the window layer
+supplies native handles plus a present function, and the program is what glues
+the two — see the top of `swapchain.cst`.
+
+**Every vtable entry is `(self, ...) -> i64`.** A function pointer in a `*u8`
+field is called unchecked, so a wrong signature is silent corruption with no
+diagnostic — the same class of failure as a wrong struct offset here or a wrong
+COM slot below. One documented shape, and a test that calls every entry, is the
+whole defence.
+
+Not here yet, and named rather than faked: compute and dispatch, tessellation
+and geometry stages, and SPIR-V. `shader.from_spirv()` on software reports
+`UNSUPPORTED` instead of returning a module that draws nothing.
+
+The cost of the abstraction is measurable and worth stating: the cube runs about
+10% slower through the device than it did calling the rasterizer directly
+(1554 ms against 1410 ms for 120 frames at 640×480), which is the indirect call
+per fragment plus decoding vertices through a declared layout.
+
+`swapchain.resize()` earned its place immediately rather than eventually: a
+tiling compositor hands back 1366×768 for a 640×480 request, so the example
+follows the window's real size from its first frame. That path also surfaced a
+memory-corruption bug in `window/x11` — see the note there.
+
+---
+
 ## Order of work
 
 1. **`vk.xml` generator**, and Vulkan against a single window backend. Vulkan

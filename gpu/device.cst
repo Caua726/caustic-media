@@ -1,0 +1,396 @@
+// gpu/device.cst — the portable GPU.
+//
+// What wgpu is to Vulkan, this is to the bindings beneath it: buffers,
+// textures, samplers, pipelines, command submission. It is NOT a renderer —
+// it does not know what a mesh, a material or a sprite is. Those are
+// render/'s words.
+//
+// Three things live in this file and nothing else does:
+//
+//   The Device, and the vtable a backend fills in. Backends coexist — two
+//   devices on different backends can be alive at once — so dispatch is
+//   through a table of function pointers rather than the compile-time folding
+//   the rest of the library uses.
+//
+//   The handle model. Every resource is an opaque i64 that indexes a slot
+//   table owned here, so a backend never invents a handle and every backend
+//   fails the same way.
+//
+//   The error model. Creation can fail and says so through last_error();
+//   frame operations never fail and are silent no-ops on a bad handle.
+//
+// This file knows about no backend at all. gpu.cst is where a backend is
+// chosen, which is what keeps the dependency arrow pointing one way.
+use "std/mem.cst" as mem;
+
+// --- How things fail ---
+//
+// Creation returns a handle that may be invalid, and last_error() says why.
+// Frame operations never fail: drawing with an invalid handle draws nothing.
+// Device loss is queryable state rather than a return value. The hot path
+// therefore carries no error handling at all, which is how graphics APIs
+// behave in practice.
+let is i32 as OK             with imut = 0;
+let is i32 as NO_BACKEND     with imut = 1;
+let is i32 as OUT_OF_MEMORY  with imut = 2;
+let is i32 as TABLE_FULL     with imut = 3;
+let is i32 as INVALID_HANDLE with imut = 4;
+let is i32 as UNSUPPORTED    with imut = 5;
+let is i32 as BAD_ARGUMENT   with imut = 6;
+let is i32 as DEVICE_LOST    with imut = 7;
+
+fn error_name(code as i32) as *u8 {
+    if (code == OK)             { return "ok"; }
+    if (code == NO_BACKEND)     { return "no backend"; }
+    if (code == OUT_OF_MEMORY)  { return "out of memory"; }
+    if (code == TABLE_FULL)     { return "resource table full"; }
+    if (code == INVALID_HANDLE) { return "invalid handle"; }
+    if (code == UNSUPPORTED)    { return "unsupported"; }
+    if (code == BAD_ARGUMENT)   { return "bad argument"; }
+    if (code == DEVICE_LOST)    { return "device lost"; }
+    return "unknown error";
+}
+
+// --- Resource kinds ---
+//
+// One slot table per kind. Kinds are fixed rather than open because every
+// backend implements exactly these, and a table per kind keeps a handle's
+// index dense.
+let is i64 as KIND_BUFFER    with imut = 0;
+let is i64 as KIND_TEXTURE   with imut = 1;
+let is i64 as KIND_SAMPLER   with imut = 2;
+let is i64 as KIND_SHADER    with imut = 3;
+let is i64 as KIND_PIPELINE  with imut = 4;
+let is i64 as KIND_COMMANDS  with imut = 5;
+let is i64 as KIND_SWAPCHAIN with imut = 6;
+let is i64 as KIND_COUNT     with imut = 7;
+
+// --- The vtable ---
+//
+// Every entry takes the backend's own state pointer first and returns i64.
+// That uniformity is not decoration: a function pointer stored in a *u8 field
+// loses its type, so call() on it is unchecked and its return type defaults
+// to i64 (see the compiler's reference on TY_FN). A wrong signature here is
+// silent memory corruption with no diagnostic — the same class of failure as
+// a wrong struct offset. The defence is that every entry obeys one shape,
+// documented below, and that gpu_test.cst calls every one of them.
+//
+//   close             (self)                                      -> ignored
+//   buffer_create     (self, payload, size, usage)                -> 1 ok, 0 fail
+//   buffer_destroy    (self, payload)                             -> ignored
+//   buffer_upload     (self, payload, offset, src, bytes)         -> 1 ok, 0 fail
+//   buffer_map        (self, payload)                             -> *u8 as i64
+//   texture_create    (self, payload, desc)                       -> 1 ok, 0 fail
+//   texture_destroy   (self, payload)                             -> ignored
+//   texture_upload    (self, payload, src, bytes)                 -> 1 ok, 0 fail
+//   texture_read      (self, payload, dst, bytes)                 -> 1 ok, 0 fail
+//   sampler_create    (self, payload, filter, wrap)               -> 1 ok, 0 fail
+//   sampler_destroy   (self, payload)                             -> ignored
+//   shader_builtin    (self, payload, id)                         -> 1 ok, 0 fail
+//   shader_spirv      (self, payload, bytes, len)                 -> 1 ok, 0 fail
+//   shader_destroy    (self, payload)                             -> ignored
+//   pipeline_create   (self, payload, desc, dev)                  -> 1 ok, 0 fail
+//   pipeline_destroy  (self, payload)                             -> ignored
+//   commands_create   (self, payload, max_records, uniform_bytes) -> 1 ok, 0 fail
+//   commands_destroy  (self, payload)                             -> ignored
+//   commands_submit   (self, payload, dev)                        -> 1 ok, 0 fail
+//   swapchain_create  (self, payload, surface, w, h, images, dev) -> 1 ok, 0 fail
+//   swapchain_destroy (self, payload, dev)                        -> ignored
+//   swapchain_acquire (self, payload, device)                     -> image index, -1 fail
+//   swapchain_present (self, payload)                             -> 1 ok, 0 fail
+//   swapchain_resize  (self, payload, w, h, dev)                  -> 1 ok, 0 fail
+struct VTable {
+    close             as *u8;
+    buffer_create     as *u8;
+    buffer_destroy    as *u8;
+    buffer_upload     as *u8;
+    buffer_map        as *u8;
+    texture_create    as *u8;
+    texture_destroy   as *u8;
+    texture_upload    as *u8;
+    texture_read      as *u8;
+    sampler_create    as *u8;
+    sampler_destroy   as *u8;
+    shader_builtin    as *u8;
+    shader_spirv      as *u8;
+    shader_destroy    as *u8;
+    pipeline_create   as *u8;
+    pipeline_destroy  as *u8;
+    commands_create   as *u8;
+    commands_destroy  as *u8;
+    commands_submit   as *u8;
+    swapchain_create  as *u8;
+    swapchain_destroy as *u8;
+    swapchain_acquire as *u8;
+    swapchain_present as *u8;
+    swapchain_resize  as *u8;
+}
+
+// --- How much a device may hold ---
+//
+// Sized up front rather than grown, because a table that grows on its own is
+// the hidden allocation the philosophy forbids. One mmap at open covers all
+// of it; nothing allocates per frame.
+struct Limits {
+    buffers       as i64;
+    textures      as i64;
+    samplers      as i64;
+    shaders       as i64;
+    pipelines     as i64;
+    commands      as i64;   // command buffers alive at once
+    swapchains    as i64;
+    max_records   as i64;   // recorded commands per command buffer
+    uniform_bytes as i64;   // uniform arena per command buffer
+    backend_bytes as i64;   // the backend's own state
+}
+
+fn limits_default() as Limits {
+    let is Limits as l;
+    l.buffers = 256;
+    l.textures = 128;
+    l.samplers = 32;
+    l.shaders = 32;
+    l.pipelines = 64;
+    l.commands = 8;
+    l.swapchains = 4;
+    l.max_records = 4096;
+    l.uniform_bytes = 65536;
+    l.backend_bytes = 4096;
+    return l;
+}
+
+fn limits_cap(l as *Limits, kind as i64) as i64 {
+    if (kind == KIND_BUFFER)    { return l.buffers; }
+    if (kind == KIND_TEXTURE)   { return l.textures; }
+    if (kind == KIND_SAMPLER)   { return l.samplers; }
+    if (kind == KIND_SHADER)    { return l.shaders; }
+    if (kind == KIND_PIPELINE)  { return l.pipelines; }
+    if (kind == KIND_COMMANDS)  { return l.commands; }
+    if (kind == KIND_SWAPCHAIN) { return l.swapchains; }
+    return 0;
+}
+
+// --- What a device can do ---
+
+struct Caps {
+    backend          as i32;
+    name             as *u8;
+    max_texture      as i64;
+    max_vertex_attrs as i64;
+    has_compute      as i32;
+    has_geometry     as i32;
+    has_custom_shaders as i32;
+}
+
+// --- Slots and tables ---
+//
+// A handle is (era << 32) | (index + 1), so zero is always invalid and a
+// handle whose slot has since been reused fails the era check instead of
+// quietly addressing someone else's resource. That is the difference between
+// a use-after-destroy that reports INVALID_HANDLE and one that corrupts a
+// texture nobody can trace.
+struct Slot {
+    era     as i32;
+    used    as i32;
+    payload as *u8;
+}
+
+struct Table {
+    slots   as *u8;   // *Slot, cap entries
+    payload as *u8;   // cap * stride bytes
+    stride  as i64;
+    cap     as i64;
+    live    as i64;
+    next    as i64;   // where to start looking for a free slot
+}
+
+struct Device {
+    vt          as VTable;
+    self        as *u8;
+    caps        as Caps;
+    backend     as i32;
+    err         as i32;
+    lost        as i32;
+    ok          as i32;
+    arena       as *u8;
+    arena_bytes as i64;
+    limits      as Limits;
+    tables      as [7]Table;
+}
+
+// --- Errors ---
+
+fn set_error(d as *Device, code as i32) as void { d.err = code; }
+fn last_error(d as *Device) as i32 { return d.err; }
+fn clear_error(d as *Device) as void { d.err = OK; }
+fn is_lost(d as *Device) as i32 { return d.lost; }
+fn mark_lost(d as *Device) as void { d.lost = 1; d.err = DEVICE_LOST; }
+fn caps(d as *Device) as Caps { return d.caps; }
+fn is_open(d as *Device) as i32 { return d.ok; }
+
+// --- Setting a device up ---
+//
+// The backend calls this once inside its own open(), having decided how large
+// each kind's payload is. Payload strides are the backend's business; slot
+// bookkeeping is ours, and that split is why a backend never invents a handle.
+fn init(d as *Device, backend as i32, l as *Limits, strides as *i64) as i32 {
+    d.backend = backend;
+    d.err = OK;
+    d.lost = 0;
+    d.ok = 0;
+    d.self = cast(*u8, 0);
+    d.arena = cast(*u8, 0);
+    d.arena_bytes = 0;
+    d.limits = *l;
+
+    // One pass to measure, one to carve. The backend's own state sits at the
+    // front of the same block, so a device is exactly one mapping.
+    let is i64 as total with mut = l.backend_bytes;
+    let is i64 as k with mut = 0;
+    while (k < KIND_COUNT) {
+        let is i64 as cap = limits_cap(l, k);
+        total = total + cap * sizeof(Slot) + cap * strides[k];
+        k = k + 1;
+    }
+
+    let is *u8 as block = mem.core.mmap_anon(total);
+    if (cast(i64, block) == 0) { d.err = OUT_OF_MEMORY; return 0; }
+    mem.core.memzero(block, total);
+
+    d.arena = block;
+    d.arena_bytes = total;
+    d.self = block;
+
+    let is i64 as at with mut = l.backend_bytes;
+    k = 0;
+    while (k < KIND_COUNT) {
+        let is i64 as cap = limits_cap(l, k);
+        d.tables[k].slots = cast(*u8, cast(i64, block) + at);
+        at = at + cap * sizeof(Slot);
+        d.tables[k].payload = cast(*u8, cast(i64, block) + at);
+        at = at + cap * strides[k];
+        d.tables[k].stride = strides[k];
+        d.tables[k].cap = cap;
+        d.tables[k].live = 0;
+        d.tables[k].next = 0;
+        // An era of 0 would make handle 0 look valid for slot 0, so eras
+        // start at 1 and the null handle stays null.
+        let is i64 as i with mut = 0;
+        while (i < cap) {
+            let is *Slot as s = cast(*Slot, cast(i64, d.tables[k].slots) + i * sizeof(Slot));
+            s.era = 1;
+            s.used = 0;
+            s.payload = cast(*u8, 0);
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+
+    d.ok = 1;
+    return 1;
+}
+
+// Releases the one mapping. The backend's close() runs first, so it still has
+// its state while it needs it.
+fn shutdown(d as *Device) as void {
+    if (d.ok == 0) { return; }
+    if (cast(i64, d.arena) != 0) { mem.core.munmap(d.arena, d.arena_bytes); }
+    d.arena = cast(*u8, 0);
+    d.arena_bytes = 0;
+    d.self = cast(*u8, 0);
+    d.ok = 0;
+}
+
+// --- Handles ---
+
+fn handle_index(h as i64) as i64 { return (h & 4294967295) - 1; }
+fn handle_era(h as i64) as i32 { return cast(i32, (h >> 32) & 4294967295); }
+
+fn _slot_at(d as *Device, kind as i64, index as i64) as *Slot {
+    return cast(*Slot, cast(i64, d.tables[kind].slots) + index * sizeof(Slot));
+}
+
+// Claims a free slot and returns its handle, or 0 with TABLE_FULL set. The
+// search starts where the last one finished so a create/destroy cycle does
+// not rescan the whole table every time.
+fn alloc_handle(d as *Device, kind as i64) as i64 {
+    if (d.ok == 0) { d.err = NO_BACKEND; return 0; }
+    let is i64 as cap = d.tables[kind].cap;
+    let is i64 as scanned with mut = 0;
+    let is i64 as i with mut = d.tables[kind].next;
+    while (scanned < cap) {
+        if (i >= cap) { i = 0; }
+        let is *Slot as s = _slot_at(d, kind, i);
+        if (s.used == 0) {
+            s.used = 1;
+            s.payload = cast(*u8, cast(i64, d.tables[kind].payload) + i * d.tables[kind].stride);
+            d.tables[kind].live = d.tables[kind].live + 1;
+            d.tables[kind].next = i + 1;
+            return (cast(i64, s.era) << 32) | (i + 1);
+        }
+        i = i + 1;
+        scanned = scanned + 1;
+    }
+    d.err = TABLE_FULL;
+    return 0;
+}
+
+// The payload behind a handle, or null if the handle names nothing. Does NOT
+// set last_error: this is the frame path, where a bad handle is a silent
+// no-op by design. Creation-path callers check for null and set the error
+// themselves.
+fn payload(d as *Device, kind as i64, h as i64) as *u8 {
+    if (d.ok == 0) { return cast(*u8, 0); }
+    if (h == 0) { return cast(*u8, 0); }
+    let is i64 as i = handle_index(h);
+    if (i < 0 || i >= d.tables[kind].cap) { return cast(*u8, 0); }
+    let is *Slot as s = _slot_at(d, kind, i);
+    if (s.used == 0) { return cast(*u8, 0); }
+    if (s.era != handle_era(h)) { return cast(*u8, 0); }
+    return s.payload;
+}
+
+// Same lookup, for the creation path, where silence would hide a real
+// mistake.
+fn payload_checked(d as *Device, kind as i64, h as i64) as *u8 {
+    let is *u8 as p = payload(d, kind, h);
+    if (cast(i64, p) == 0) { d.err = INVALID_HANDLE; }
+    return p;
+}
+
+fn is_valid(d as *Device, kind as i64, h as i64) as i32 {
+    if (cast(i64, payload(d, kind, h)) == 0) { return 0; }
+    return 1;
+}
+
+// Bumping the era on release is what makes a stale handle detectable rather
+// than merely wrong.
+fn free_handle(d as *Device, kind as i64, h as i64) as void {
+    if (cast(i64, payload(d, kind, h)) == 0) { return; }
+    let is i64 as i = handle_index(h);
+    let is *Slot as s = _slot_at(d, kind, i);
+    s.used = 0;
+    s.payload = cast(*u8, 0);
+    s.era = s.era + 1;
+    if (s.era == 0) { s.era = 1; }
+    d.tables[kind].live = d.tables[kind].live - 1;
+}
+
+fn live_count(d as *Device, kind as i64) as i64 { return d.tables[kind].live; }
+fn capacity(d as *Device, kind as i64) as i64 { return d.tables[kind].cap; }
+
+// The handle occupying a slot, or 0 if the slot is free.
+//
+// This exists so closing a device can release what the program forgot to.
+// Resources allocate outside the device's own arena — a buffer's memory and a
+// texture's pixels are their own mappings — so unmapping the arena is not
+// enough, and a program that opens a device per level and never destroys a
+// texture would leak one texture's worth per level. gpu.cst sweeps with this;
+// see close() there for the order, which is not arbitrary.
+fn handle_at(d as *Device, kind as i64, index as i64) as i64 {
+    if (d.ok == 0) { return 0; }
+    if (index < 0 || index >= d.tables[kind].cap) { return 0; }
+    let is *Slot as s = _slot_at(d, kind, index);
+    if (s.used == 0) { return 0; }
+    return (cast(i64, s.era) << 32) | (index + 1);
+}

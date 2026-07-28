@@ -1,0 +1,853 @@
+// gpu/software/backend.cst — gpu/device.cst, implemented with no hardware.
+//
+// The same device as Vulkan, OpenGL and Direct3D, with no driver underneath.
+// That is what makes a program's choice of backend invisible to everything
+// above: this is not a fallback renderer with a smaller API, it is another
+// implementation of the whole one.
+//
+// It is also the only backend that keeps a binary fully self-contained. Every
+// other one links something written by someone else; this file imports the
+// math layer, the rasterizer beside it, and the kernel. That is why it works
+// on CausticOS, in a VM with no acceleration, over a remote session, and in
+// CI — and why gpu/swapchain.cst refuses to import window/.
+//
+// What a device means without hardware, and it is less than it sounds:
+//
+//   Buffers are memory, upload is a copy, mapping returns the pointer. No
+//   staging, no transfer queue, no visibility rules.
+//
+//   Textures are memory plus a fetch function; the sampler is the small
+//   struct that fetch reads.
+//
+//   Pipelines are a set of function pointers plus a state struct. Binding one
+//   swaps which functions the rasterizer will call.
+//
+//   Submission executes the recorded list on the spot. Recording still builds
+//   a real list — see command.cst for why that matters.
+//
+// Not here yet, and named rather than faked: compute, tessellation, geometry
+// stages, and SPIR-V. A custom shader reports UNSUPPORTED instead of drawing
+// nothing.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../device.cst" as dev;
+use "../buffer.cst" as buf;
+use "../texture.cst" as tex;
+use "../shader.cst" as shd;
+use "../pipeline.cst" as pipe;
+use "../command.cst" as cmd;
+use "../swapchain.cst" as swap;
+use "target.cst" as tgt;
+use "raster.cst" as raster;
+
+// The id this backend answers to. gpu.cst owns the numbering; it is repeated
+// here rather than imported because gpu.cst imports this file, and the arrow
+// has to point one way.
+let is i32 as BACKEND_ID with imut = 3;
+
+// --- What each resource carries beyond its portable Info ---
+//
+// Every payload begins with the Info its module declares and continues here.
+// That split is the layout contract named in buffer.cst: the portable half is
+// readable without a vtable call, the backend half is nobody else's business.
+
+struct BufState {
+    data  as *u8;
+    bytes as i64;
+}
+
+struct TexState {
+    pixels as *u8;
+    bytes  as i64;
+}
+
+struct SampState {
+    unused as i64;
+}
+
+struct ShaderState {
+    vert as *u8;
+    frag as *u8;
+}
+
+struct PipeState {
+    vert as *u8;
+    frag as *u8;
+}
+
+struct CmdState {
+    unused as i64;
+}
+
+struct SwapState {
+    // The images' memory, kept here as well as in the textures so present()
+    // does not need a device to look a handle up. The swapchain owns these
+    // textures, so there is no second owner to disagree with.
+    pixels as [4]i64;
+}
+
+struct Soft {
+    unused as i64;
+}
+
+// What both stages are handed. It is the backend's own struct: the stages
+// below are the only things that read it.
+struct Env {
+    uniforms as *u8;
+    tex0     as *u8;   // texture payload, or null
+    samp0    as *u8;   // sampler payload, or null
+}
+
+// A vertex as decoded from the buffer, per the pipeline's declared layout.
+// The layout is honoured here — offsets and formats are read as declared —
+// so the stages themselves never touch raw bytes.
+struct VertexIn {
+    pos   as math.vec.Vec3;
+    color as math.color.Color;
+    u     as f64;
+    v     as f64;
+}
+
+// --- Sampling ---
+
+fn _wrap(x as f64, mode as i32) as f64 {
+    if (mode == tex.REPEAT) {
+        let is f64 as f with mut = x - fm.floor(x);
+        if (f < 0.0) { f = f + 1.0; }
+        return f;
+    }
+    if (x < 0.0) { return 0.0; }
+    if (x > 1.0) { return 1.0; }
+    return x;
+}
+
+// Clamped at the edge whatever the wrap mode said: wrapping has already
+// happened in texture space, and this is the last line of defence against a
+// bilinear fetch reading one texel past the end.
+fn _texel(inf as *tex.Info, pixels as *u8, tx as i64, ty as i64) as math.color.Color {
+    let is i64 as x with mut = tx;
+    let is i64 as y with mut = ty;
+    if (x < 0) { x = 0; }
+    if (y < 0) { y = 0; }
+    if (x >= inf.width) { x = inf.width - 1; }
+    if (y >= inf.height) { y = inf.height - 1; }
+    let is i64 as i = y * inf.width + x;
+    if (inf.format == tex.R8) {
+        let is i64 as v = cast(i64, *cast(*u8, cast(i64, pixels) + i)) & 255;
+        return math.color.gray(cast(f64, v) / 255.0);
+    }
+    let is i64 as p = cast(i64, *cast(*i32, cast(i64, pixels) + i * 4)) & 4294967295;
+    return math.color.unpack_rgba8(p);
+}
+
+// Reads a texture the way the sampler says to. Filtering and wrapping are
+// code paths rather than hardware state, which is the whole difference
+// between a sampler here and a sampler on a GPU.
+fn _sample(tex_payload as *u8, samp_payload as *u8, u as f64, v as f64) as math.color.Color {
+    let is *tex.Info as inf = cast(*tex.Info, tex_payload);
+    let is *TexState as ts = cast(*TexState, tex.backend_state(tex_payload));
+    if (cast(i64, ts.pixels) == 0) { return math.color.magenta(); }
+
+    let is i32 as filter with mut = tex.NEAREST;
+    let is i32 as wrap with mut = tex.CLAMP;
+    if (cast(i64, samp_payload) != 0) {
+        let is *tex.SamplerInfo as si = cast(*tex.SamplerInfo, samp_payload);
+        filter = si.filter;
+        wrap = si.wrap;
+    }
+
+    let is f64 as uu = _wrap(u, wrap);
+    let is f64 as vv = _wrap(v, wrap);
+
+    if (filter == tex.NEAREST) {
+        let is i64 as x = cast(i64, uu * cast(f64, inf.width));
+        let is i64 as y = cast(i64, vv * cast(f64, inf.height));
+        return _texel(inf, ts.pixels, x, y);
+    }
+
+    // Bilinear: sample at texel centres, so the corners of the image are not
+    // half a texel out — the classic off-by-half that makes a blurred atlas
+    // bleed into its neighbour.
+    let is f64 as fx = uu * cast(f64, inf.width) - 0.5;
+    let is f64 as fy = vv * cast(f64, inf.height) - 0.5;
+    let is i64 as x0 = cast(i64, fm.floor(fx));
+    let is i64 as y0 = cast(i64, fm.floor(fy));
+    let is f64 as tx = fx - fm.floor(fx);
+    let is f64 as ty = fy - fm.floor(fy);
+
+    let is math.color.Color as c00 = _texel(inf, ts.pixels, x0, y0);
+    let is math.color.Color as c10 = _texel(inf, ts.pixels, x0 + 1, y0);
+    let is math.color.Color as c01 = _texel(inf, ts.pixels, x0, y0 + 1);
+    let is math.color.Color as c11 = _texel(inf, ts.pixels, x0 + 1, y0 + 1);
+
+    return math.color.col_lerp(
+        math.color.col_lerp(c00, c10, tx),
+        math.color.col_lerp(c01, c11, tx),
+        ty);
+}
+
+// --- The built-in materials ---
+//
+// Native code, not interpretation. This is what keeps the common path fast:
+// render/'s unlit and textured materials are these functions, and a program
+// only pays for a SPIR-V interpreter when it writes a shader of its own.
+
+// One vertex stage serves both built-ins: transform by the mvp, carry the
+// colour and the uvs across.
+fn vs_builtin(env as *u8, vin as *VertexIn, out as *raster.Shaded) as i64 {
+    let is *Env as e = cast(*Env, env);
+    if (cast(i64, e.uniforms) == 0) {
+        // No uniforms set: draw in clip space directly, which is what a
+        // caller passing raw coordinates means.
+        out.clip = math.vec.v4_point(vin.pos);
+        out.vary.color = vin.color;
+        out.vary.u = vin.u;
+        out.vary.v = vin.v;
+        return 1;
+    }
+    let is *shd.BuiltinUniforms as un = cast(*shd.BuiltinUniforms, e.uniforms);
+    out.clip = math.mat.m4_mul_v4(un.mvp, math.vec.v4_point(vin.pos));
+    out.vary.color = math.color.col_mul(vin.color, un.tint);
+    out.vary.u = vin.u;
+    out.vary.v = vin.v;
+    return 1;
+}
+
+fn fs_unlit(env as *u8, vary as *raster.Varyings) as i64 {
+    return math.color.pack_rgba8(vary.color);
+}
+
+fn fs_textured(env as *u8, vary as *raster.Varyings) as i64 {
+    let is *Env as e = cast(*Env, env);
+    // No texture bound is a program mistake rather than a device one, and a
+    // frame operation does not fail: the vertex colour is the honest thing to
+    // fall back to, and it is visible.
+    if (cast(i64, e.tex0) == 0) { return math.color.pack_rgba8(vary.color); }
+    let is math.color.Color as t = _sample(e.tex0, e.samp0, vary.u, vary.v);
+    return math.color.pack_rgba8(math.color.col_mul(t, vary.color));
+}
+
+// --- Reading a vertex as the layout declares it ---
+
+fn _read_component(base as i64, off as i64, fmt as i32, out as *f64) as i64 {
+    if (fmt == pipe.F32) {
+        *out = cast(f64, *cast(*f32, base + off));
+        return 1;
+    }
+    if (fmt == pipe.F32X2 || fmt == pipe.F32X3 || fmt == pipe.F32X4) {
+        let is i64 as n with mut = 2;
+        if (fmt == pipe.F32X3) { n = 3; }
+        if (fmt == pipe.F32X4) { n = 4; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            *cast(*f64, cast(i64, out) + i * 8) = cast(f64, *cast(*f32, base + off + i * 4));
+            i = i + 1;
+        }
+        return n;
+    }
+    if (fmt == pipe.F64) {
+        *out = *cast(*f64, base + off);
+        return 1;
+    }
+    if (fmt == pipe.F64X2 || fmt == pipe.F64X3 || fmt == pipe.F64X4) {
+        let is i64 as n with mut = 2;
+        if (fmt == pipe.F64X3) { n = 3; }
+        if (fmt == pipe.F64X4) { n = 4; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            *cast(*f64, cast(i64, out) + i * 8) = *cast(*f64, base + off + i * 8);
+            i = i + 1;
+        }
+        return n;
+    }
+    if (fmt == pipe.U8X4_NORM) {
+        let is i64 as i with mut = 0;
+        while (i < 4) {
+            let is i64 as b = cast(i64, *cast(*u8, base + off + i)) & 255;
+            *cast(*f64, cast(i64, out) + i * 8) = cast(f64, b) / 255.0;
+            i = i + 1;
+        }
+        return 4;
+    }
+    return 0;
+}
+
+// Decodes one vertex. Attributes the layout does not declare keep their
+// defaults — white, at the origin, uv zero — so a layout carrying only
+// positions draws something visible rather than something black.
+fn _decode_vertex(vptr as i64, lay as *pipe.Layout, out as *VertexIn) as void {
+    out.pos = math.vec.v3_zero();
+    out.color = math.color.white();
+    out.u = 0.0;
+    out.v = 0.0;
+
+    let is [4]f64 as tmp;
+    let is i32 as i with mut = 0;
+    while (i < lay.count) {
+        let is i64 as n = _read_component(vptr, cast(i64, lay.attrs[i].offset),
+                                          lay.attrs[i].format, cast(*f64, &tmp));
+        if (n > 0) {
+            if (lay.attrs[i].location == pipe.LOC_POSITION) {
+                out.pos = math.vec.v3(tmp[0], tmp[1], tmp[2]);
+                if (n < 3) { out.pos = math.vec.v3(tmp[0], tmp[1], 0.0); }
+            } else if (lay.attrs[i].location == pipe.LOC_COLOR) {
+                let is f64 as al with mut = 1.0;
+                if (n >= 4) { al = tmp[3]; }
+                out.color = math.color.rgba(tmp[0], tmp[1], tmp[2], al);
+            } else if (lay.attrs[i].location == pipe.LOC_UV) {
+                out.u = tmp[0];
+                out.v = tmp[1];
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// --- Buffers ---
+
+fn sw_buffer_create(self as *u8, payload as *u8, size as i64, usage as i64) as i64 {
+    let is *BufState as st = cast(*BufState, buf.backend_state(payload));
+    st.data = mem.core.mmap_anon(size);
+    st.bytes = size;
+    if (cast(i64, st.data) == 0) { st.bytes = 0; return 0; }
+    return 1;
+}
+
+fn sw_buffer_destroy(self as *u8, payload as *u8) as i64 {
+    let is *BufState as st = cast(*BufState, buf.backend_state(payload));
+    if (cast(i64, st.data) != 0) { mem.core.munmap(st.data, st.bytes); }
+    st.data = cast(*u8, 0);
+    st.bytes = 0;
+    return 1;
+}
+
+fn sw_buffer_upload(self as *u8, payload as *u8, offset as i64, src as *u8, bytes as i64) as i64 {
+    let is *BufState as st = cast(*BufState, buf.backend_state(payload));
+    if (cast(i64, st.data) == 0) { return 0; }
+    mem.core.memcpy(cast(*u8, cast(i64, st.data) + offset), src, bytes);
+    return 1;
+}
+
+fn sw_buffer_map(self as *u8, payload as *u8) as i64 {
+    return cast(i64, cast(*BufState, buf.backend_state(payload)).data);
+}
+
+// --- Textures and samplers ---
+
+fn sw_texture_create(self as *u8, payload as *u8, d as *tex.Desc) as i64 {
+    let is *TexState as st = cast(*TexState, tex.backend_state(payload));
+    let is i64 as bytes = d.width * d.height * tex.pixel_bytes(d.format);
+    st.pixels = mem.core.mmap_anon(bytes);
+    st.bytes = bytes;
+    if (cast(i64, st.pixels) == 0) { st.bytes = 0; return 0; }
+    return 1;
+}
+
+fn sw_texture_destroy(self as *u8, payload as *u8) as i64 {
+    let is *TexState as st = cast(*TexState, tex.backend_state(payload));
+    if (cast(i64, st.pixels) != 0) { mem.core.munmap(st.pixels, st.bytes); }
+    st.pixels = cast(*u8, 0);
+    st.bytes = 0;
+    return 1;
+}
+
+fn sw_texture_upload(self as *u8, payload as *u8, src as *u8, bytes as i64) as i64 {
+    let is *TexState as st = cast(*TexState, tex.backend_state(payload));
+    if (cast(i64, st.pixels) == 0) { return 0; }
+    mem.core.memcpy(st.pixels, src, bytes);
+    return 1;
+}
+
+fn sw_texture_read(self as *u8, payload as *u8, dst as *u8, bytes as i64) as i64 {
+    let is *TexState as st = cast(*TexState, tex.backend_state(payload));
+    if (cast(i64, st.pixels) == 0) { return 0; }
+    mem.core.memcpy(dst, st.pixels, bytes);
+    return 1;
+}
+
+// A sampler in software is its own Info and nothing more: there is no
+// hardware object to create. The entry exists because a GPU backend has one.
+fn sw_sampler_create(self as *u8, payload as *u8, filter as i64, wrap as i64) as i64 {
+    return 1;
+}
+
+fn sw_sampler_destroy(self as *u8, payload as *u8) as i64 {
+    return 1;
+}
+
+// --- Shaders ---
+
+fn sw_shader_builtin(self as *u8, payload as *u8, id as i64) as i64 {
+    let is *ShaderState as st = cast(*ShaderState, shd.backend_state(payload));
+    st.vert = fn_ptr(vs_builtin);
+    if (id == shd.UNLIT_COLOR) { st.frag = fn_ptr(fs_unlit); return 1; }
+    if (id == shd.TEXTURED)    { st.frag = fn_ptr(fs_textured); return 1; }
+    st.vert = cast(*u8, 0);
+    st.frag = cast(*u8, 0);
+    return 0;
+}
+
+// Running SPIR-V means interpreting it — a dispatch per instruction per
+// fragment — and that interpreter is not written. Refusing here is what keeps
+// the failure visible: the alternative is a pipeline that builds and draws
+// nothing, which looks like a bug in the program.
+fn sw_shader_spirv(self as *u8, payload as *u8, bytes as *u8, len as i64) as i64 {
+    return 0;
+}
+
+fn sw_shader_destroy(self as *u8, payload as *u8) as i64 {
+    let is *ShaderState as st = cast(*ShaderState, shd.backend_state(payload));
+    st.vert = cast(*u8, 0);
+    st.frag = cast(*u8, 0);
+    return 1;
+}
+
+// --- Pipelines ---
+//
+// Here a pipeline really is a set of function pointers plus a state struct:
+// the stages are resolved once, at creation, and binding is then a matter of
+// which functions the rasterizer will call.
+
+fn sw_pipeline_create(self as *u8, payload as *u8, d as *pipe.Desc, dv as *dev.Device) as i64 {
+    let is *PipeState as st = cast(*PipeState, pipe.backend_state(payload));
+
+    let is *u8 as vp = dev.payload(dv, dev.KIND_SHADER, d.vertex_shader);
+    let is *u8 as fp = dev.payload(dv, dev.KIND_SHADER, d.fragment_shader);
+    if (cast(i64, vp) == 0 || cast(i64, fp) == 0) { return 0; }
+
+    st.vert = cast(*ShaderState, shd.backend_state(vp)).vert;
+    st.frag = cast(*ShaderState, shd.backend_state(fp)).frag;
+    if (cast(i64, st.vert) == 0 || cast(i64, st.frag) == 0) { return 0; }
+    return 1;
+}
+
+fn sw_pipeline_destroy(self as *u8, payload as *u8) as i64 {
+    let is *PipeState as st = cast(*PipeState, pipe.backend_state(payload));
+    st.vert = cast(*u8, 0);
+    st.frag = cast(*u8, 0);
+    return 1;
+}
+
+// --- Command buffers ---
+//
+// The record list and the uniform arena belong to command.cst, because they
+// are portable: a record is the same struct whoever executes it. There is
+// nothing left for software to allocate.
+
+fn sw_commands_create(self as *u8, payload as *u8, records as i64, uniform_bytes as i64) as i64 {
+    return 1;
+}
+
+fn sw_commands_destroy(self as *u8, payload as *u8) as i64 {
+    return 1;
+}
+
+// Everything the walk below carries between records. It is a pipeline's worth
+// of bound state, which is exactly what a GPU keeps in its command processor.
+struct Exec {
+    target      as tgt.Target;
+    st          as raster.ShadeState;
+    env         as Env;
+    layout      as pipe.Layout;
+    vert_stage  as *u8;
+    vdata       as *u8;
+    vbytes      as i64;
+    idata       as *u8;
+    ibytes      as i64;
+    index_bytes as i64;
+    uniforms    as *u8;
+    in_pass     as i32;
+    has_pipe    as i32;
+}
+
+fn _clear_depth_to(t as *tgt.Target, v as f64) as void {
+    if (tgt.has_depth(t) == 0) { return; }
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        *cast(*f64, cast(i64, t.depth) + i * 8) = v;
+        i = i + 1;
+    }
+}
+
+fn _index_at(ex as *Exec, i as i64) as i64 {
+    if (cast(i64, ex.idata) == 0) { return 0; }
+    if (ex.index_bytes == 2) {
+        return cast(i64, *cast(*u16, cast(i64, ex.idata) + i * 2)) & 65535;
+    }
+    return cast(i64, *cast(*i32, cast(i64, ex.idata) + i * 4)) & 4294967295;
+}
+
+// One triangle, from three vertex indices: decode, run the vertex stage,
+// rasterize. This is the whole draw path, and everything above it exists to
+// decide which three indices to hand it.
+fn _emit_triangle(ex as *Exec, ia as i64, ib as i64, ic as i64) as void {
+    let is i64 as stride = cast(i64, ex.layout.stride);
+    let is i64 as base = cast(i64, ex.vdata);
+    // A draw that runs off the end of the buffer draws nothing rather than
+    // reading someone else's memory. A frame operation does not fail, but it
+    // does not corrupt either.
+    if ((ic + 1) * stride > ex.vbytes) { return; }
+    if ((ia + 1) * stride > ex.vbytes) { return; }
+    if ((ib + 1) * stride > ex.vbytes) { return; }
+
+    let is VertexIn as va;
+    let is VertexIn as vb;
+    let is VertexIn as vc;
+    _decode_vertex(base + ia * stride, &ex.layout, &va);
+    _decode_vertex(base + ib * stride, &ex.layout, &vb);
+    _decode_vertex(base + ic * stride, &ex.layout, &vc);
+
+    let is raster.Shaded as sa;
+    let is raster.Shaded as sb;
+    let is raster.Shaded as sc;
+    call(ex.vert_stage, cast(*u8, &ex.env), &va, &sa);
+    call(ex.vert_stage, cast(*u8, &ex.env), &vb, &sb);
+    call(ex.vert_stage, cast(*u8, &ex.env), &vc, &sc);
+
+    raster.triangle_shaded(&ex.target, sa, sb, sc, &ex.st);
+}
+
+fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
+    let is *cmd.Info as ci = cast(*cmd.Info, payload);
+
+    let is Exec as ex;
+    ex.in_pass = 0;
+    ex.has_pipe = 0;
+    ex.vdata = cast(*u8, 0);
+    ex.vbytes = 0;
+    ex.idata = cast(*u8, 0);
+    ex.ibytes = 0;
+    ex.index_bytes = 4;
+    ex.uniforms = cast(*u8, 0);
+    ex.env.uniforms = cast(*u8, 0);
+    ex.env.tex0 = cast(*u8, 0);
+    ex.env.samp0 = cast(*u8, 0);
+    ex.vert_stage = cast(*u8, 0);
+    ex.st.frag = cast(*u8, 0);
+    ex.st.env = cast(*u8, &ex.env);
+
+    let is i64 as n with mut = 0;
+    while (n < ci.count) {
+        let is *cmd.Record as r = cmd.record_at(ci, n);
+
+        if (r.op == cmd.OP_BEGIN_PASS) {
+            let is *u8 as cp = dev.payload(dv, dev.KIND_TEXTURE, r.i0);
+            if (cast(i64, cp) == 0) { ex.in_pass = 0; n = n + 1; continue; }
+            let is *tex.Info as cinf = cast(*tex.Info, cp);
+            let is *TexState as cst = cast(*TexState, tex.backend_state(cp));
+
+            let is *u8 as dp with mut = cast(*u8, 0);
+            if (r.i1 != 0) { dp = dev.payload(dv, dev.KIND_TEXTURE, r.i1); }
+            let is *u8 as dpix with mut = cast(*u8, 0);
+            if (cast(i64, dp) != 0) {
+                dpix = cast(*TexState, tex.backend_state(dp)).pixels;
+            }
+
+            ex.target = tgt.target(cst.pixels, dpix, cinf.width, cinf.height);
+            // A pass starts covering its whole target; SET_VIEWPORT narrows it.
+            ex.st.vx = 0; ex.st.vy = 0;
+            ex.st.vw = cinf.width; ex.st.vh = cinf.height;
+
+            if ((r.i2 & cmd.CLEAR_COLOR) != 0) {
+                tgt.clear_color(&ex.target, math.color.rgba(r.f0, r.f1, r.f2, r.f3));
+            }
+            if ((r.i2 & cmd.CLEAR_DEPTH) != 0) {
+                _clear_depth_to(&ex.target, r.f4);
+            }
+            ex.in_pass = 1;
+
+        } else if (r.op == cmd.OP_END_PASS) {
+            ex.in_pass = 0;
+
+        } else if (r.op == cmd.OP_SET_VIEWPORT) {
+            ex.st.vx = r.i0; ex.st.vy = r.i1;
+            ex.st.vw = r.i2; ex.st.vh = r.i3;
+            if (ex.st.vw <= 0) { ex.st.vw = ex.target.width; }
+            if (ex.st.vh <= 0) { ex.st.vh = ex.target.height; }
+
+        } else if (r.op == cmd.OP_BIND_PIPELINE) {
+            let is *u8 as pp = dev.payload(dv, dev.KIND_PIPELINE, r.i0);
+            if (cast(i64, pp) == 0) { ex.has_pipe = 0; n = n + 1; continue; }
+            let is *pipe.Info as pinf = cast(*pipe.Info, pp);
+            let is *PipeState as pst = cast(*PipeState, pipe.backend_state(pp));
+            ex.layout = pinf.desc.vertex_layout;
+            ex.st.cull = pinf.desc.cull;
+            ex.st.depth_test = pinf.desc.depth_test;
+            ex.st.depth_write = pinf.desc.depth_write;
+            ex.st.blend = pinf.desc.blend;
+            ex.st.frag = pst.frag;
+            ex.vert_stage = pst.vert;
+            ex.has_pipe = 1;
+
+        } else if (r.op == cmd.OP_BIND_VERTEX) {
+            let is *u8 as bp = dev.payload(dv, dev.KIND_BUFFER, r.i0);
+            if (cast(i64, bp) == 0) { ex.vdata = cast(*u8, 0); ex.vbytes = 0; n = n + 1; continue; }
+            let is *BufState as bs = cast(*BufState, buf.backend_state(bp));
+            ex.vdata = bs.data;
+            ex.vbytes = cast(*buf.Info, bp).size;
+
+        } else if (r.op == cmd.OP_BIND_INDEX) {
+            let is *u8 as bp = dev.payload(dv, dev.KIND_BUFFER, r.i0);
+            if (cast(i64, bp) == 0) { ex.idata = cast(*u8, 0); ex.ibytes = 0; n = n + 1; continue; }
+            let is *BufState as bs = cast(*BufState, buf.backend_state(bp));
+            ex.idata = bs.data;
+            ex.ibytes = cast(*buf.Info, bp).size;
+            ex.index_bytes = r.i1;
+
+        } else if (r.op == cmd.OP_BIND_TEXTURE) {
+            // Slot 0 is the only one the built-ins read; the rest are
+            // recorded and ignored until a shader exists that wants them.
+            if (r.i0 == 0) {
+                ex.env.tex0 = dev.payload(dv, dev.KIND_TEXTURE, r.i1);
+                ex.env.samp0 = dev.payload(dv, dev.KIND_SAMPLER, r.i2);
+            }
+
+        } else if (r.op == cmd.OP_SET_UNIFORMS) {
+            ex.env.uniforms = cast(*u8, cast(i64, ci.uniforms) + r.i0);
+
+        } else if (r.op == cmd.OP_DRAW) {
+            if (ex.in_pass == 1 && ex.has_pipe == 1 && cast(i64, ex.vdata) != 0) {
+                let is i64 as i with mut = 0;
+                while (i + 2 < r.i1) {
+                    _emit_triangle(&ex, r.i0 + i, r.i0 + i + 1, r.i0 + i + 2);
+                    i = i + 3;
+                }
+            }
+
+        } else if (r.op == cmd.OP_DRAW_INDEXED) {
+            if (ex.in_pass == 1 && ex.has_pipe == 1
+                && cast(i64, ex.vdata) != 0 && cast(i64, ex.idata) != 0) {
+                let is i64 as i with mut = 0;
+                while (i + 2 < r.i1) {
+                    _emit_triangle(&ex,
+                        _index_at(&ex, r.i0 + i),
+                        _index_at(&ex, r.i0 + i + 1),
+                        _index_at(&ex, r.i0 + i + 2));
+                    i = i + 3;
+                }
+            }
+        }
+
+        n = n + 1;
+    }
+    return 1;
+}
+
+// --- Swapchain ---
+//
+// In software an image is a texture and presenting is a copy through the
+// callback the window layer supplied. A GPU backend builds a real surface
+// from the same Surface's native handles and never looks at the callback.
+
+// The images a swapchain draws into.
+//
+// Two shapes, and the difference is who owns the pixels.
+//
+// Normally the swapchain owns them: one texture per image, each with its own
+// mapping, and present() hands the finished bytes to whoever asked for them.
+//
+// When the surface supplied an `acquire` callback the caller owns them instead.
+// The texture objects are still created — a pass needs a real handle, and the
+// descriptor still says how wide the image is — but their storage is released
+// immediately and their pointer is filled in per frame from what acquire()
+// returns. Setting `bytes` to 0 is what makes that safe: sw_texture_destroy
+// only unmaps when it has a size, so a texture pointing at somebody else's
+// buffer frees nothing.
+fn _swap_make_images(inf as *swap.Info, st as *SwapState, dv as *dev.Device) as i64 {
+    let is tex.Desc as td = tex.desc(inf.width, inf.height, tex.RGBA8,
+                                     tex.RENDER_TARGET | tex.SAMPLED);
+    let is i64 as i with mut = 0;
+    while (i < inf.images) {
+        let is i64 as h = tex.create(dv, &td);
+        if (h == 0) { return 0; }
+        inf.color[i] = h;
+        let is *u8 as p = dev.payload(dv, dev.KIND_TEXTURE, h);
+        let is *TexState as ts = cast(*TexState, tex.backend_state(p));
+        if (inf.shared == 1) {
+            // Give the storage back. The caller's buffer takes its place at
+            // every acquire, and until then this image has none.
+            if (cast(i64, ts.pixels) != 0) { mem.core.munmap(ts.pixels, ts.bytes); }
+            ts.pixels = cast(*u8, 0);
+            ts.bytes = 0;
+            st.pixels[i] = 0;
+        } else {
+            st.pixels[i] = cast(i64, ts.pixels);
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Points the current image at the storage the caller just handed over.
+// Returns 0 when there is none this frame, which is a refusal rather than a
+// failure — under MIT-SHM it means both buffers are still being read.
+fn _swap_bind_shared(inf as *swap.Info, st as *SwapState, dv as *dev.Device) as i64 {
+    let is *u8 as px = cast(*u8, call(inf.surface.acquire, inf.surface.user));
+    if (cast(i64, px) == 0) { return 0; }
+    let is *u8 as p = dev.payload(dv, dev.KIND_TEXTURE, inf.color[inf.current]);
+    if (cast(i64, p) == 0) { return 0; }
+    let is *TexState as ts = cast(*TexState, tex.backend_state(p));
+    ts.pixels = px;
+    ts.bytes = 0;                       // borrowed, never freed here
+    st.pixels[inf.current] = cast(i64, px);
+    return 1;
+}
+
+fn _swap_drop_images(inf as *swap.Info, st as *SwapState, dv as *dev.Device) as void {
+    let is i64 as i with mut = 0;
+    while (i < swap.MAX_IMAGES) {
+        if (inf.color[i] != 0) { tex.destroy(dv, inf.color[i]); }
+        inf.color[i] = 0;
+        st.pixels[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn sw_swapchain_create(self as *u8, payload as *u8, s as *swap.Surface,
+                       w as i64, h as i64, images as i64, dv as *dev.Device) as i64 {
+    let is *swap.Info as inf = cast(*swap.Info, payload);
+    let is *SwapState as st = cast(*SwapState, swap.backend_state(payload));
+    let is i64 as i with mut = 0;
+    while (i < swap.MAX_IMAGES) { st.pixels[i] = 0; i = i + 1; }
+
+    if (_swap_make_images(inf, st, dv) != 1) {
+        _swap_drop_images(inf, st, dv);
+        return 0;
+    }
+    // So the first acquire() hands out image 0.
+    inf.current = images - 1;
+    return 1;
+}
+
+fn sw_swapchain_destroy(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
+    _swap_drop_images(cast(*swap.Info, payload),
+                      cast(*SwapState, swap.backend_state(payload)), dv);
+    return 1;
+}
+
+fn sw_swapchain_acquire(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
+    let is *swap.Info as inf = cast(*swap.Info, payload);
+    let is *SwapState as st = cast(*SwapState, swap.backend_state(payload));
+    inf.current = inf.current + 1;
+    if (inf.current >= inf.images) { inf.current = 0; }
+    // Asked for every frame and never cached: a window presenting through
+    // MIT-SHM alternates between two buffers, and the one that was free last
+    // frame is the one the server is reading now.
+    if (inf.shared == 1) {
+        if (_swap_bind_shared(inf, st, dv) == 0) { return 0 - 1; }
+    }
+    inf.acquired = 1;
+    return inf.current;
+}
+
+fn sw_swapchain_present(self as *u8, payload as *u8) as i64 {
+    let is *swap.Info as inf = cast(*swap.Info, payload);
+    let is *SwapState as st = cast(*SwapState, swap.backend_state(payload));
+    inf.acquired = 0;
+    // Headless: rendering happened, there is simply nowhere to put it. The
+    // frame is still readable from the image texture, which is what a test
+    // and a render-to-file program both want.
+    if (cast(i64, inf.surface.present) == 0) { return 1; }
+    // With shared storage there is nothing to hand back — the caller drew into
+    // its own buffer — so the pixels pointer is null and the call means
+    // "submit". That is the whole saving: no framebuffer crosses this line.
+    if (inf.shared == 1) {
+        call(inf.surface.present, inf.surface.user, cast(*u8, 0), inf.width, inf.height);
+        return 1;
+    }
+    let is i64 as pix = st.pixels[inf.current];
+    if (pix == 0) { return 0; }
+    call(inf.surface.present, inf.surface.user, cast(*u8, pix), inf.width, inf.height);
+    return 1;
+}
+
+fn sw_swapchain_resize(self as *u8, payload as *u8, w as i64, h as i64, dv as *dev.Device) as i64 {
+    let is *swap.Info as inf = cast(*swap.Info, payload);
+    let is *SwapState as st = cast(*SwapState, swap.backend_state(payload));
+    _swap_drop_images(inf, st, dv);
+    inf.width = w;
+    inf.height = h;
+    if (_swap_make_images(inf, st, dv) != 1) {
+        _swap_drop_images(inf, st, dv);
+        return 0;
+    }
+    inf.current = inf.images - 1;
+    return 1;
+}
+
+fn sw_close(self as *u8) as i64 {
+    return 1;
+}
+
+// --- Opening one ---
+
+fn _strides(out as *i64) as void {
+    *cast(*i64, cast(i64, out) + dev.KIND_BUFFER * 8)    = buf.info_bytes() + sizeof(BufState);
+    *cast(*i64, cast(i64, out) + dev.KIND_TEXTURE * 8)   = tex.info_bytes() + sizeof(TexState);
+    *cast(*i64, cast(i64, out) + dev.KIND_SAMPLER * 8)   = tex.sampler_info_bytes() + sizeof(SampState);
+    *cast(*i64, cast(i64, out) + dev.KIND_SHADER * 8)    = shd.info_bytes() + sizeof(ShaderState);
+    *cast(*i64, cast(i64, out) + dev.KIND_PIPELINE * 8)  = pipe.info_bytes() + sizeof(PipeState);
+    *cast(*i64, cast(i64, out) + dev.KIND_COMMANDS * 8)  = cmd.info_bytes() + sizeof(CmdState);
+    *cast(*i64, cast(i64, out) + dev.KIND_SWAPCHAIN * 8) = swap.info_bytes() + sizeof(SwapState);
+}
+
+fn _fill_vtable(d as *dev.Device) as void {
+    d.vt.close             = fn_ptr(sw_close);
+    d.vt.buffer_create     = fn_ptr(sw_buffer_create);
+    d.vt.buffer_destroy    = fn_ptr(sw_buffer_destroy);
+    d.vt.buffer_upload     = fn_ptr(sw_buffer_upload);
+    d.vt.buffer_map        = fn_ptr(sw_buffer_map);
+    d.vt.texture_create    = fn_ptr(sw_texture_create);
+    d.vt.texture_destroy   = fn_ptr(sw_texture_destroy);
+    d.vt.texture_upload    = fn_ptr(sw_texture_upload);
+    d.vt.texture_read      = fn_ptr(sw_texture_read);
+    d.vt.sampler_create    = fn_ptr(sw_sampler_create);
+    d.vt.sampler_destroy   = fn_ptr(sw_sampler_destroy);
+    d.vt.shader_builtin    = fn_ptr(sw_shader_builtin);
+    d.vt.shader_spirv      = fn_ptr(sw_shader_spirv);
+    d.vt.shader_destroy    = fn_ptr(sw_shader_destroy);
+    d.vt.pipeline_create   = fn_ptr(sw_pipeline_create);
+    d.vt.pipeline_destroy  = fn_ptr(sw_pipeline_destroy);
+    d.vt.commands_create   = fn_ptr(sw_commands_create);
+    d.vt.commands_destroy  = fn_ptr(sw_commands_destroy);
+    d.vt.commands_submit   = fn_ptr(sw_commands_submit);
+    d.vt.swapchain_create  = fn_ptr(sw_swapchain_create);
+    d.vt.swapchain_destroy = fn_ptr(sw_swapchain_destroy);
+    d.vt.swapchain_acquire = fn_ptr(sw_swapchain_acquire);
+    d.vt.swapchain_present = fn_ptr(sw_swapchain_present);
+    d.vt.swapchain_resize  = fn_ptr(sw_swapchain_resize);
+}
+
+fn _fill_caps(d as *dev.Device) as void {
+    d.caps.backend = BACKEND_ID;
+    d.caps.name = "software";
+    // Not a hardware limit — there is none — but a number a program can plan
+    // against, and beyond which a texture is a memory problem rather than a
+    // device one.
+    d.caps.max_texture = 16384;
+    d.caps.max_vertex_attrs = cast(i64, pipe.MAX_ATTRIBUTES);
+    d.caps.has_compute = 0;
+    d.caps.has_geometry = 0;
+    d.caps.has_custom_shaders = 0;
+}
+
+// Always succeeds unless memory does. That is what lets gpu.AUTO fall through
+// to software and never fail outright.
+fn open(l as *dev.Limits) as dev.Device {
+    let is dev.Device as d;
+    let is [7]i64 as strides;
+    _strides(cast(*i64, &strides));
+
+    if (dev.init(&d, BACKEND_ID, l, cast(*i64, &strides)) != 1) { return d; }
+    _fill_vtable(&d);
+    _fill_caps(&d);
+    return d;
+}
+
+fn close(d as *dev.Device) as void {
+    if (dev.is_open(d) == 0) { return; }
+    call(d.vt.close, d.self);
+    dev.shutdown(d);
+}

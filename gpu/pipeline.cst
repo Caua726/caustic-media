@@ -1,0 +1,219 @@
+// gpu/pipeline.cst — how a draw turns vertices into pixels.
+//
+// On hardware a pipeline is driver state compiled ahead of the draw. In
+// software it is a set of function pointers plus a state struct: the vertex
+// stage, the fragment stage, the blend function, the depth comparison, the
+// cull mode. bind_pipeline swaps which functions the rasterizer will call.
+// Both are the same idea — everything that does not change between draws,
+// decided once — which is why the type is shared and only the backend differs.
+//
+// Vertex layouts are DECLARED. A mesh carrying eleven optional arrays, null
+// when unused, makes every consumer branch on what happens to be present:
+// behaviour depending on invisible state. A declared layout says what is
+// there, and the presets below keep saying so from becoming ceremony — a
+// preset is a named constant that expands to an explicit layout, and you can
+// read which.
+use "device.cst" as dev;
+
+let is i32 as MAX_ATTRIBUTES with imut = 8;
+
+// Attribute formats. The F32 family is what hardware wants and every backend
+// accepts. The F64 family is native to this library's math layer and to the
+// software rasterizer; a GPU backend may refuse it, and says so through
+// last_error() rather than silently narrowing.
+let is i32 as F32       with imut = 0;
+let is i32 as F32X2     with imut = 1;
+let is i32 as F32X3     with imut = 2;
+let is i32 as F32X4     with imut = 3;
+let is i32 as F64       with imut = 4;
+let is i32 as F64X2     with imut = 5;
+let is i32 as F64X3     with imut = 6;
+let is i32 as F64X4     with imut = 7;
+let is i32 as U8X4_NORM with imut = 8;
+
+// Attribute locations the built-in materials read. A custom shader may use
+// any locations it likes; these are the three the built-ins agree on.
+let is i32 as LOC_POSITION with imut = 0;
+let is i32 as LOC_COLOR    with imut = 1;
+let is i32 as LOC_UV       with imut = 2;
+
+// Which faces to discard, by winding once projected. Counter-clockwise is the
+// front face, matching the right-handed convention math/ uses and the
+// rasterizer already implements.
+let is i32 as CULL_NONE  with imut = 0;
+let is i32 as CULL_BACK  with imut = 1;
+let is i32 as CULL_FRONT with imut = 2;
+
+// Depth comparison. LESS is what the existing rasterizer does and what a
+// z-buffer means by default: smaller is nearer, the first surface at a pixel
+// wins until a nearer one arrives.
+let is i32 as DEPTH_NONE   with imut = 0;
+let is i32 as DEPTH_LESS   with imut = 1;
+let is i32 as DEPTH_LEQUAL with imut = 2;
+let is i32 as DEPTH_ALWAYS with imut = 3;
+
+// Blending. NONE overwrites, which is what an opaque surface wants and what
+// keeps the device path bit-identical to the bare rasterizer.
+let is i32 as BLEND_NONE  with imut = 0;
+let is i32 as BLEND_ALPHA with imut = 1;
+
+let is i32 as TRIANGLES with imut = 0;
+
+fn format_bytes(f as i32) as i64 {
+    if (f == F32)       { return 4; }
+    if (f == F32X2)     { return 8; }
+    if (f == F32X3)     { return 12; }
+    if (f == F32X4)     { return 16; }
+    if (f == F64)       { return 8; }
+    if (f == F64X2)     { return 16; }
+    if (f == F64X3)     { return 24; }
+    if (f == F64X4)     { return 32; }
+    if (f == U8X4_NORM) { return 4; }
+    return 0;
+}
+
+struct Attribute {
+    location as i32;
+    format   as i32;
+    offset   as i32;
+}
+
+struct Layout {
+    stride as i32;
+    count  as i32;
+    attrs  as [8]Attribute;
+}
+
+fn layout(stride as i32) as Layout {
+    let is Layout as l;
+    l.stride = stride;
+    l.count = 0;
+    let is i32 as i with mut = 0;
+    while (i < MAX_ATTRIBUTES) {
+        l.attrs[i].location = 0;
+        l.attrs[i].format = 0;
+        l.attrs[i].offset = 0;
+        i = i + 1;
+    }
+    return l;
+}
+
+// Appends an attribute. Returns 0 if the layout is full or the format is not
+// one this device knows, so a caller building a layout in a loop can tell.
+fn attr(l as *Layout, location as i32, fmt as i32, offset as i32) as i32 {
+    if (l.count >= MAX_ATTRIBUTES) { return 0; }
+    if (format_bytes(fmt) == 0) { return 0; }
+    l.attrs[l.count].location = location;
+    l.attrs[l.count].format = fmt;
+    l.attrs[l.count].offset = offset;
+    l.count = l.count + 1;
+    return 1;
+}
+
+// Finds an attribute by location. Returns its index, or -1 — the backend uses
+// this once per draw rather than per vertex.
+fn find_attr(l as *Layout, location as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < l.count) {
+        if (l.attrs[i].location == location) { return i; }
+        i = i + 1;
+    }
+    return cast(i32, 0 - 1);
+}
+
+// --- Presets ---
+//
+// Named constants that expand to explicit layouts. Nothing here is magic:
+// each one is the layout you would have written, and the struct it matches is
+// named in the comment.
+//
+//   struct { pos as Vec3; color as Color; }        — 3 f64 + 4 f64
+fn layout_pos_color() as Layout {
+    let is Layout as l = layout(56);
+    attr(&l, LOC_POSITION, F64X3, 0);
+    attr(&l, LOC_COLOR, F64X4, 24);
+    return l;
+}
+
+//   struct { pos as Vec3; color as Color; u as f64; v as f64; }
+fn layout_pos_color_uv() as Layout {
+    let is Layout as l = layout(72);
+    attr(&l, LOC_POSITION, F64X3, 0);
+    attr(&l, LOC_COLOR, F64X4, 24);
+    attr(&l, LOC_UV, F64X2, 56);
+    return l;
+}
+
+// --- The pipeline ---
+
+struct Desc {
+    vertex_shader   as i64;
+    fragment_shader as i64;
+    vertex_layout   as Layout;
+    topology        as i32;
+    cull            as i32;
+    depth_test      as i32;
+    depth_write     as i32;
+    blend           as i32;
+}
+
+// A pipeline with the defaults an opaque 3D surface wants: back faces culled,
+// depth tested and written, no blending. Pass the same built-in handle to
+// both stages — a built-in material carries the pair, and separate modules
+// per stage arrive with SPIR-V.
+fn desc_opaque(shader as i64, l as Layout) as Desc {
+    let is Desc as r;
+    r.vertex_shader = shader;
+    r.fragment_shader = shader;
+    r.vertex_layout = l;
+    r.topology = TRIANGLES;
+    r.cull = CULL_BACK;
+    r.depth_test = DEPTH_LESS;
+    r.depth_write = 1;
+    r.blend = BLEND_NONE;
+    return r;
+}
+
+struct Info {
+    desc as Desc;
+}
+
+fn backend_state(payload as *u8) as *u8 {
+    return cast(*u8, cast(i64, payload) + sizeof(Info));
+}
+
+fn info_bytes() as i64 { return sizeof(Info); }
+
+fn create(d as *dev.Device, ds as *Desc) as i64 {
+    if (ds.vertex_layout.count <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    if (ds.vertex_layout.stride <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    if (ds.topology != TRIANGLES) { dev.set_error(d, dev.UNSUPPORTED); return 0; }
+    // Both stages have to name a live module, and this is the setup path, so
+    // saying which one is wrong beats a handle that draws nothing.
+    if (dev.is_valid(d, dev.KIND_SHADER, ds.vertex_shader) == 0) {
+        dev.set_error(d, dev.INVALID_HANDLE); return 0;
+    }
+    if (dev.is_valid(d, dev.KIND_SHADER, ds.fragment_shader) == 0) {
+        dev.set_error(d, dev.INVALID_HANDLE); return 0;
+    }
+
+    let is i64 as h = dev.alloc_handle(d, dev.KIND_PIPELINE);
+    if (h == 0) { return 0; }
+
+    let is *u8 as p = dev.payload(d, dev.KIND_PIPELINE, h);
+    cast(*Info, p).desc = *ds;
+
+    if (call(d.vt.pipeline_create, d.self, p, ds, d) != 1) {
+        dev.free_handle(d, dev.KIND_PIPELINE, h);
+        dev.set_error(d, dev.UNSUPPORTED);
+        return 0;
+    }
+    return h;
+}
+
+fn destroy(d as *dev.Device, h as i64) as void {
+    let is *u8 as p = dev.payload(d, dev.KIND_PIPELINE, h);
+    if (cast(i64, p) == 0) { return; }
+    call(d.vt.pipeline_destroy, d.self, p);
+    dev.free_handle(d, dev.KIND_PIPELINE, h);
+}

@@ -1,0 +1,240 @@
+// gpu/swapchain.cst — what puts a finished frame on a screen.
+//
+// The swapchain lives here rather than in window/ because when there is a GPU
+// it is the swapchain that presents, not the window. The window's remaining
+// job is to hand over the native handles this is built from, which is why
+// those are public contract there rather than an implementation detail.
+//
+// THIS FILE DOES NOT IMPORT window/, AND MUST NOT.
+//
+// That is not tidiness. gpu/software is the one backend that keeps a binary
+// fully self-contained — it is what makes the library work on CausticOS, in a
+// VM with no acceleration, over a remote session and in CI. One `use` of
+// window/x11/x11.cst here would put libX11 in the DT_NEEDED of every program
+// software-renders, and the promise would be quietly gone.
+//
+// So the seam is a Surface: the native handles a GPU backend needs to build a
+// real surface from, plus a present function the window layer supplies for
+// the backends that blit. The arrow points from the program to both layers,
+// and neither layer points at the other.
+use "../math/math.cst" as math;
+use "device.cst" as dev;
+use "texture.cst" as tex;
+
+let is i64 as MAX_IMAGES with imut = 4;
+
+// Which platform the handles below belong to. A GPU backend reads this to
+// pick between VK_KHR_xlib_surface, VK_KHR_wayland_surface and the rest.
+let is i32 as NATIVE_NONE    with imut = 0;   // headless: no screen at all
+let is i32 as NATIVE_X11     with imut = 1;   // a = Display*,     b = Window
+let is i32 as NATIVE_WAYLAND with imut = 2;   // a = wl_display*,  b = wl_surface*
+let is i32 as NATIVE_WIN32   with imut = 3;   // a = HINSTANCE,    b = HWND
+let is i32 as NATIVE_KMS     with imut = 4;   // a = drm fd,       b = connector
+
+struct Surface {
+    kind    as i32;
+    a       as *u8;
+    b       as i64;
+    // fn(user as *u8, pixels as *u8, width as i64, height as i64) as i64
+    //
+    // How a software backend gets its pixels onto the screen. Null for
+    // headless, and unused by a backend that presents through its own
+    // swapchain — Vulkan's vkQueuePresentKHR bypasses this entirely.
+    //
+    // When `acquire` below is set, `pixels` arrives NULL: the caller already
+    // owns the storage that was drawn into, so there is nothing to hand back
+    // and this call means "submit what you gave me".
+    present as *u8;
+
+    // fn(user as *u8) as *u8 — this frame's pixel storage, or null if none is
+    // available right now.
+    //
+    // Set it and the swapchain stops allocating images of its own: the caller's
+    // buffer IS the image, the rasterizer writes straight into it, and the
+    // framebuffer copy that would otherwise happen every frame disappears.
+    // 1.17 MB per frame at 640x480 and 7.9 MB at 1080p, read and written.
+    //
+    // The buffer is asked for on every acquire, never cached, because a window
+    // presenting through MIT-SHM alternates between two of them — one being
+    // read by the X server while the other is drawn. A swapchain that held on
+    // to the first pointer would be writing into the buffer being scanned out.
+    //
+    // Returning null is not an error: it means "not this frame", and acquire()
+    // reports it the same way it reports any other refusal.
+    acquire as *u8;
+    user    as *u8;
+}
+
+// A surface with nothing behind it. Rendering works, presenting does nothing,
+// and the frame is still readable from the image texture — which is what a
+// test wants and what a program rendering to a file wants.
+fn surface_headless() as Surface {
+    let is Surface as s;
+    s.kind = NATIVE_NONE;
+    s.a = cast(*u8, 0);
+    s.b = 0;
+    s.present = cast(*u8, 0);
+    s.acquire = cast(*u8, 0);
+    s.user = cast(*u8, 0);
+    return s;
+}
+
+// The same surface, with the caller supplying the image storage. `acquire`
+// hands out this frame's buffer and `present` is told to submit it.
+//
+// Everything else is identical: a Vulkan backend ignores both callbacks and
+// presents through its own swapchain, exactly as it ignores `present` alone.
+fn surface_native_shared(kind as i32, a as *u8, b as i64,
+                         present as *u8, acquire as *u8, user as *u8) as Surface {
+    let is Surface as s;
+    s.kind = kind;
+    s.a = a;
+    s.b = b;
+    s.present = present;
+    s.acquire = acquire;
+    s.user = user;
+    return s;
+}
+
+fn surface_native(kind as i32, a as *u8, b as i64, present as *u8, user as *u8) as Surface {
+    let is Surface as s;
+    s.kind = kind;
+    s.a = a;
+    s.b = b;
+    s.present = present;
+    s.acquire = cast(*u8, 0);
+    s.user = user;
+    return s;
+}
+
+struct Info {
+    surface as Surface;
+    width   as i64;
+    height  as i64;
+    images  as i64;
+    current as i64;
+    acquired as i32;
+    // 1 when the images are the caller's storage rather than the swapchain's.
+    // Set at create from whether surface.acquire was supplied, and read by the
+    // backend to decide whether to allocate anything.
+    shared  as i32;
+    color   as [4]i64;   // texture handles, MAX_IMAGES of them
+}
+
+fn backend_state(payload as *u8) as *u8 {
+    return cast(*u8, cast(i64, payload) + sizeof(Info));
+}
+
+fn info_bytes() as i64 { return sizeof(Info); }
+
+// --- Life cycle ---
+//
+// image_count is the program's call because it is a real trade rather than a
+// detail: one image is enough where presenting copies synchronously, two is
+// the minimum where the compositor may still be reading what you committed,
+// and three keeps a page-flip from stalling on vblank.
+fn create(d as *dev.Device, s as *Surface, width as i64, height as i64, image_count as i64) as i64 {
+    if (width <= 0 || height <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    if (image_count <= 0 || image_count > MAX_IMAGES) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+
+    let is i64 as h = dev.alloc_handle(d, dev.KIND_SWAPCHAIN);
+    if (h == 0) { return 0; }
+
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    let is *Info as inf = cast(*Info, p);
+    inf.surface = *s;
+    inf.width = width;
+    inf.height = height;
+    inf.images = image_count;
+    inf.current = 0;
+    inf.acquired = 0;
+    // Whether the caller supplies the storage. Decided here, once, from the
+    // surface it handed over — a backend never has to ask twice and never has
+    // to guess.
+    inf.shared = 0;
+    if (cast(i64, s.acquire) != 0) { inf.shared = 1; }
+    let is i64 as i with mut = 0;
+    while (i < MAX_IMAGES) { inf.color[i] = 0; i = i + 1; }
+
+    if (call(d.vt.swapchain_create, d.self, p, s, width, height, image_count, d) != 1) {
+        dev.free_handle(d, dev.KIND_SWAPCHAIN, h);
+        if (dev.last_error(d) == dev.OK) { dev.set_error(d, dev.OUT_OF_MEMORY); }
+        return 0;
+    }
+    return h;
+}
+
+fn destroy(d as *dev.Device, h as i64) as void {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return; }
+    call(d.vt.swapchain_destroy, d.self, p, d);
+    dev.free_handle(d, dev.KIND_SWAPCHAIN, h);
+}
+
+// --- A frame ---
+
+// The image to draw into this frame, or -1. A caller that caches the result
+// across frames is writing into the buffer being presented — the index is
+// returned per frame precisely so that mistake is hard to make.
+fn acquire(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0 - 1; }
+    return call(d.vt.swapchain_acquire, d.self, p, d);
+}
+
+// The colour texture of one image. This is what a pass draws into.
+fn image(d as *dev.Device, h as i64, index as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0; }
+    let is *Info as inf = cast(*Info, p);
+    if (index < 0 || index >= inf.images) { return 0; }
+    return inf.color[index];
+}
+
+// The image the last acquire() handed out, for the common case where the
+// caller does not need the index for anything else.
+fn current_image(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0; }
+    let is *Info as inf = cast(*Info, p);
+    return inf.color[inf.current];
+}
+
+fn present(d as *dev.Device, h as i64) as i32 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0; }
+    if (call(d.vt.swapchain_present, d.self, p) != 1) { return 0; }
+    return 1;
+}
+
+// A window that changed size leaves the swapchain the wrong shape. Resizing
+// remakes the images, so every texture handle from image() before this call
+// is dead — which the era in the handle makes detectable rather than silent.
+fn resize(d as *dev.Device, h as i64, width as i64, height as i64) as i32 {
+    let is *u8 as p = dev.payload_checked(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0; }
+    if (width <= 0 || height <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    if (call(d.vt.swapchain_resize, d.self, p, width, height, d) != 1) {
+        if (dev.last_error(d) == dev.OK) { dev.set_error(d, dev.OUT_OF_MEMORY); }
+        return 0;
+    }
+    return 1;
+}
+
+fn width(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0; }
+    return cast(*Info, p).width;
+}
+
+fn height(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0; }
+    return cast(*Info, p).height;
+}
+
+fn image_count(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_SWAPCHAIN, h);
+    if (cast(i64, p) == 0) { return 0; }
+    return cast(*Info, p).images;
+}

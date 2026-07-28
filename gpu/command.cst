@@ -1,0 +1,336 @@
+// gpu/command.cst — work recorded, then submitted.
+//
+// Recording is a real list here even though the software backend could
+// execute on the spot, and that is deliberate: a program written against the
+// device must not be able to tell which backend it is on. If software drew
+// during recording and Vulkan drew at submission, every program that touched
+// a buffer between the two would behave differently on the two backends —
+// and it would look like a driver bug rather than a design mistake.
+//
+// A command buffer holds a fixed number of records, sized at creation from
+// the device's Limits. It does not grow: a list that grows on its own is the
+// hidden allocation the philosophy forbids, and running out is something a
+// program should hear about rather than pay for silently.
+use "std/mem.cst" as mem;
+use "../math/math.cst" as math;
+use "device.cst" as dev;
+
+// --- The record ---
+//
+// One shape for every command, with slots read differently per op. That is a
+// union in all but name, and the honest way to carry it in a language without
+// them is a documented table:
+//
+//   OP_BEGIN_PASS    i0 colour texture, i1 depth texture, i2 clear flags
+//                    f0..f3 clear colour rgba, f4 clear depth
+//   OP_END_PASS      —
+//   OP_SET_VIEWPORT  i0 x, i1 y, i2 width, i3 height
+//   OP_BIND_PIPELINE i0 pipeline
+//   OP_BIND_VERTEX   i0 buffer
+//   OP_BIND_INDEX    i0 buffer, i1 bytes per index (2 or 4)
+//   OP_BIND_TEXTURE  i0 slot, i1 texture, i2 sampler
+//   OP_SET_UNIFORMS  i0 offset into the uniform arena, i1 bytes
+//   OP_DRAW          i0 first vertex, i1 vertex count
+//   OP_DRAW_INDEXED  i0 first index, i1 index count
+let is i64 as OP_BEGIN_PASS    with imut = 0;
+let is i64 as OP_END_PASS      with imut = 1;
+let is i64 as OP_SET_VIEWPORT  with imut = 2;
+let is i64 as OP_BIND_PIPELINE with imut = 3;
+let is i64 as OP_BIND_VERTEX   with imut = 4;
+let is i64 as OP_BIND_INDEX    with imut = 5;
+let is i64 as OP_BIND_TEXTURE  with imut = 6;
+let is i64 as OP_SET_UNIFORMS  with imut = 7;
+let is i64 as OP_DRAW          with imut = 8;
+let is i64 as OP_DRAW_INDEXED  with imut = 9;
+
+let is i64 as CLEAR_COLOR with imut = 1;
+let is i64 as CLEAR_DEPTH with imut = 2;
+
+let is i64 as MAX_TEXTURE_SLOTS with imut = 4;
+
+struct Record {
+    op as i64;
+    i0 as i64;
+    i1 as i64;
+    i2 as i64;
+    i3 as i64;
+    f0 as f64;
+    f1 as f64;
+    f2 as f64;
+    f3 as f64;
+    f4 as f64;
+}
+
+// --- A pass ---
+//
+// A pass declares its target, whether it has depth, and what to clear. That
+// declaration is what lets a program that wants no depth buffer pay for none,
+// and what makes rendering to a texture a pass with a different target rather
+// than a concept of its own.
+struct Pass {
+    color       as i64;   // texture handle to draw into
+    depth       as i64;   // texture handle, or 0 for no depth
+    clear_color as i32;
+    clear_depth as i32;
+    color_value as math.color.Color;
+    depth_value as f64;
+}
+
+// The common case: clear to a colour, clear depth to the far plane.
+fn pass(color as i64, depth as i64, c as math.color.Color) as Pass {
+    let is Pass as p;
+    p.color = color;
+    p.depth = depth;
+    p.clear_color = 1;
+    p.clear_depth = 1;
+    p.color_value = c;
+    p.depth_value = 1.0;
+    return p;
+}
+
+// Draw on top of what is already there.
+fn pass_load(color as i64, depth as i64) as Pass {
+    let is Pass as p;
+    p.color = color;
+    p.depth = depth;
+    p.clear_color = 0;
+    p.clear_depth = 0;
+    p.color_value = math.color.black();
+    p.depth_value = 1.0;
+    return p;
+}
+
+struct Info {
+    records      as *u8;   // *Record, max_records entries
+    count        as i64;
+    max_records  as i64;
+    uniforms     as *u8;
+    uniform_used as i64;
+    uniform_cap  as i64;
+    bytes        as i64;   // the one mapping behind both, for munmap
+    recording    as i32;
+    in_pass      as i32;
+    overflowed   as i32;
+}
+
+fn backend_state(payload as *u8) as *u8 {
+    return cast(*u8, cast(i64, payload) + sizeof(Info));
+}
+
+fn info_bytes() as i64 { return sizeof(Info); }
+
+fn record_at(inf as *Info, i as i64) as *Record {
+    return cast(*Record, cast(i64, inf.records) + i * sizeof(Record));
+}
+
+// --- Life cycle ---
+
+fn create(d as *dev.Device) as i64 {
+    let is i64 as h = dev.alloc_handle(d, dev.KIND_COMMANDS);
+    if (h == 0) { return 0; }
+
+    let is *u8 as p = dev.payload(d, dev.KIND_COMMANDS, h);
+    let is *Info as inf = cast(*Info, p);
+    let is i64 as recs = d.limits.max_records;
+    let is i64 as ubytes = d.limits.uniform_bytes;
+    let is i64 as total = recs * sizeof(Record) + ubytes;
+
+    // The record list and the uniform arena are one mapping: they live and
+    // die together, and two mappings would be two syscalls for one lifetime.
+    let is *u8 as block = mem.core.mmap_anon(total);
+    if (cast(i64, block) == 0) {
+        dev.free_handle(d, dev.KIND_COMMANDS, h);
+        dev.set_error(d, dev.OUT_OF_MEMORY);
+        return 0;
+    }
+
+    inf.records = block;
+    inf.count = 0;
+    inf.max_records = recs;
+    inf.uniforms = cast(*u8, cast(i64, block) + recs * sizeof(Record));
+    inf.uniform_used = 0;
+    inf.uniform_cap = ubytes;
+    inf.bytes = total;
+    inf.recording = 0;
+    inf.in_pass = 0;
+    inf.overflowed = 0;
+
+    if (call(d.vt.commands_create, d.self, p, recs, ubytes) != 1) {
+        mem.core.munmap(block, total);
+        dev.free_handle(d, dev.KIND_COMMANDS, h);
+        dev.set_error(d, dev.OUT_OF_MEMORY);
+        return 0;
+    }
+    return h;
+}
+
+fn destroy(d as *dev.Device, h as i64) as void {
+    let is *u8 as p = dev.payload(d, dev.KIND_COMMANDS, h);
+    if (cast(i64, p) == 0) { return; }
+    call(d.vt.commands_destroy, d.self, p);
+    let is *Info as inf = cast(*Info, p);
+    if (cast(i64, inf.records) != 0) { mem.core.munmap(inf.records, inf.bytes); }
+    inf.records = cast(*u8, 0);
+    dev.free_handle(d, dev.KIND_COMMANDS, h);
+}
+
+// --- Recording ---
+//
+// Every function below is a frame operation, so none of them fail: a bad
+// handle records nothing, and a full buffer sets a flag that submit() reports
+// once rather than at each of the four hundred draws that overflowed it.
+
+fn _info(d as *dev.Device, h as i64) as *Info {
+    return cast(*Info, dev.payload(d, dev.KIND_COMMANDS, h));
+}
+
+fn _push(inf as *Info, op as i64) as *Record {
+    if (cast(i64, inf) == 0) { return cast(*Record, 0); }
+    if (inf.recording == 0) { return cast(*Record, 0); }
+    if (inf.count >= inf.max_records) { inf.overflowed = 1; return cast(*Record, 0); }
+    let is *Record as r = record_at(inf, inf.count);
+    inf.count = inf.count + 1;
+    r.op = op;
+    r.i0 = 0; r.i1 = 0; r.i2 = 0; r.i3 = 0;
+    r.f0 = 0.0; r.f1 = 0.0; r.f2 = 0.0; r.f3 = 0.0; r.f4 = 0.0;
+    return r;
+}
+
+// Discards whatever was recorded before. A command buffer is re-recorded
+// every frame in practice, so beginning is what resets it.
+fn begin(d as *dev.Device, h as i64) as void {
+    let is *Info as inf = _info(d, h);
+    if (cast(i64, inf) == 0) { return; }
+    inf.count = 0;
+    inf.uniform_used = 0;
+    inf.recording = 1;
+    inf.in_pass = 0;
+    inf.overflowed = 0;
+}
+
+fn end(d as *dev.Device, h as i64) as void {
+    let is *Info as inf = _info(d, h);
+    if (cast(i64, inf) == 0) { return; }
+    // An unclosed pass is a program bug, but closing it here beats submitting
+    // a buffer whose last pass never ended.
+    if (inf.in_pass == 1) { _push(inf, OP_END_PASS); inf.in_pass = 0; }
+    inf.recording = 0;
+}
+
+fn begin_pass(d as *dev.Device, h as i64, ps as *Pass) as void {
+    let is *Info as inf = _info(d, h);
+    let is *Record as r = _push(inf, OP_BEGIN_PASS);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = ps.color;
+    r.i1 = ps.depth;
+    let is i64 as flags with mut = 0;
+    if (ps.clear_color == 1) { flags = flags | CLEAR_COLOR; }
+    if (ps.clear_depth == 1) { flags = flags | CLEAR_DEPTH; }
+    r.i2 = flags;
+    r.f0 = ps.color_value.r;
+    r.f1 = ps.color_value.g;
+    r.f2 = ps.color_value.b;
+    r.f3 = ps.color_value.a;
+    r.f4 = ps.depth_value;
+    inf.in_pass = 1;
+}
+
+fn end_pass(d as *dev.Device, h as i64) as void {
+    let is *Info as inf = _info(d, h);
+    if (cast(i64, inf) == 0) { return; }
+    if (inf.in_pass == 0) { return; }
+    _push(inf, OP_END_PASS);
+    inf.in_pass = 0;
+}
+
+// Where in the target the clip cube lands. Width or height of zero means the
+// whole target, which is what a pass starts as.
+fn set_viewport(d as *dev.Device, h as i64, x as i64, y as i64, w as i64, ht as i64) as void {
+    let is *Record as r = _push(_info(d, h), OP_SET_VIEWPORT);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = x; r.i1 = y; r.i2 = w; r.i3 = ht;
+}
+
+fn bind_pipeline(d as *dev.Device, h as i64, pipe as i64) as void {
+    let is *Record as r = _push(_info(d, h), OP_BIND_PIPELINE);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = pipe;
+}
+
+fn bind_vertex_buffer(d as *dev.Device, h as i64, b as i64) as void {
+    let is *Record as r = _push(_info(d, h), OP_BIND_VERTEX);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = b;
+}
+
+fn bind_index_buffer(d as *dev.Device, h as i64, b as i64, index_bytes as i64) as void {
+    let is *Record as r = _push(_info(d, h), OP_BIND_INDEX);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = b;
+    r.i1 = index_bytes;
+}
+
+fn bind_texture(d as *dev.Device, h as i64, slot as i64, t as i64, samp as i64) as void {
+    if (slot < 0 || slot >= MAX_TEXTURE_SLOTS) { return; }
+    let is *Record as r = _push(_info(d, h), OP_BIND_TEXTURE);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = slot; r.i1 = t; r.i2 = samp;
+}
+
+// Uniforms are COPIED into the command buffer rather than referenced. The
+// alternative — recording the caller's pointer — makes the recorded list
+// depend on memory the caller is free to reuse before submit, which is a
+// use-after-free that only shows up as a wrong-looking frame.
+fn set_uniforms(d as *dev.Device, h as i64, src as *u8, bytes as i64) as void {
+    let is *Info as inf = _info(d, h);
+    if (cast(i64, inf) == 0) { return; }
+    if (cast(i64, src) == 0 || bytes <= 0) { return; }
+    if (inf.uniform_used + bytes > inf.uniform_cap) { inf.overflowed = 1; return; }
+    let is i64 as at = inf.uniform_used;
+    mem.core.memcpy(cast(*u8, cast(i64, inf.uniforms) + at), src, bytes);
+    inf.uniform_used = at + bytes;
+    let is *Record as r = _push(inf, OP_SET_UNIFORMS);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = at;
+    r.i1 = bytes;
+}
+
+fn draw(d as *dev.Device, h as i64, first as i64, count as i64) as void {
+    let is *Record as r = _push(_info(d, h), OP_DRAW);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = first; r.i1 = count;
+}
+
+fn draw_indexed(d as *dev.Device, h as i64, first as i64, count as i64) as void {
+    let is *Record as r = _push(_info(d, h), OP_DRAW_INDEXED);
+    if (cast(i64, r) == 0) { return; }
+    r.i0 = first; r.i1 = count;
+}
+
+// --- Submission ---
+
+// Runs the recorded list. Returns 1, or 0 with last_error() set — submission
+// is where a frame's mistakes are collected, so unlike recording it reports.
+fn submit(d as *dev.Device, h as i64) as i32 {
+    let is *u8 as p = dev.payload_checked(d, dev.KIND_COMMANDS, h);
+    if (cast(i64, p) == 0) { return 0; }
+    let is *Info as inf = cast(*Info, p);
+    if (inf.recording == 1) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    if (inf.overflowed == 1) { dev.set_error(d, dev.TABLE_FULL); return 0; }
+    if (call(d.vt.commands_submit, d.self, p, d) != 1) { return 0; }
+    return 1;
+}
+
+// Software submits synchronously, so this has already happened. It exists
+// because a program written against the device must not have to know that —
+// on Vulkan the same call waits on a fence.
+fn wait(d as *dev.Device, h as i64) as i32 {
+    if (dev.is_valid(d, dev.KIND_COMMANDS, h) == 0) { return 0; }
+    return 1;
+}
+
+fn recorded(d as *dev.Device, h as i64) as i64 {
+    let is *Info as inf = _info(d, h);
+    if (cast(i64, inf) == 0) { return 0; }
+    return inf.count;
+}

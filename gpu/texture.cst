@@ -1,0 +1,200 @@
+// gpu/texture.cst — images the device can sample or draw into.
+//
+// A texture is memory plus a format; a sampler is the small struct that says
+// how to read it. Keeping them apart is not ceremony inherited from Vulkan —
+// the same image is read with different filtering by different draws, and
+// merging the two would force a copy of the image to express that.
+//
+// Same layout contract as buffer.cst: a backend's payload begins with Info
+// (or SamplerInfo), its own state follows at backend_state().
+use "device.cst" as dev;
+
+// Formats the device speaks. Deliberately few: these are what render/ and the
+// swapchain need today, and a format nobody can produce is a promise nobody
+// can keep. The block-compressed ones a GPU wants come with the GPU backends.
+let is i32 as RGBA8 with imut = 0;
+let is i32 as R8    with imut = 1;
+let is i32 as DEPTH with imut = 2;   // the backend's depth format
+
+// Declared at creation because hardware wants it declared at creation:
+// whether a texture can be a render target changes how it is allocated.
+let is i32 as SAMPLED       with imut = 1;
+let is i32 as RENDER_TARGET with imut = 2;
+
+// Filtering and wrapping. NEAREST/CLAMP is the pair that makes a checkerboard
+// look like a checkerboard, which is why it is the default.
+let is i32 as NEAREST with imut = 0;
+let is i32 as LINEAR  with imut = 1;
+let is i32 as CLAMP   with imut = 0;
+let is i32 as REPEAT  with imut = 1;
+
+struct Desc {
+    width  as i64;
+    height as i64;
+    format as i32;
+    usage  as i32;
+}
+
+fn desc(width as i64, height as i64, format as i32, usage as i32) as Desc {
+    let is Desc as r;
+    r.width = width; r.height = height; r.format = format; r.usage = usage;
+    return r;
+}
+
+struct Info {
+    width  as i64;
+    height as i64;
+    format as i32;
+    usage  as i32;
+}
+
+struct SamplerInfo {
+    filter as i32;
+    wrap   as i32;
+}
+
+fn backend_state(payload as *u8) as *u8 {
+    return cast(*u8, cast(i64, payload) + sizeof(Info));
+}
+
+fn sampler_backend_state(payload as *u8) as *u8 {
+    return cast(*u8, cast(i64, payload) + sizeof(SamplerInfo));
+}
+
+fn info_bytes() as i64 { return sizeof(Info); }
+fn sampler_info_bytes() as i64 { return sizeof(SamplerInfo); }
+
+// Bytes one pixel of a format occupies. DEPTH is the odd one: the software
+// target keeps depth as f64 per pixel, and a backend that stores it narrower
+// reports its own number here.
+fn pixel_bytes(format as i32) as i64 {
+    if (format == RGBA8) { return 4; }
+    if (format == R8)    { return 1; }
+    if (format == DEPTH) { return 8; }
+    return 0;
+}
+
+// --- Textures ---
+
+fn create(d as *dev.Device, ds as *Desc) as i64 {
+    if (ds.width <= 0 || ds.height <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    if (pixel_bytes(ds.format) == 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    let is i64 as h = dev.alloc_handle(d, dev.KIND_TEXTURE);
+    if (h == 0) { return 0; }
+
+    let is *u8 as p = dev.payload(d, dev.KIND_TEXTURE, h);
+    let is *Info as inf = cast(*Info, p);
+    inf.width = ds.width;
+    inf.height = ds.height;
+    inf.format = ds.format;
+    inf.usage = ds.usage;
+
+    if (call(d.vt.texture_create, d.self, p, ds) != 1) {
+        dev.free_handle(d, dev.KIND_TEXTURE, h);
+        dev.set_error(d, dev.OUT_OF_MEMORY);
+        return 0;
+    }
+    return h;
+}
+
+fn destroy(d as *dev.Device, h as i64) as void {
+    let is *u8 as p = dev.payload(d, dev.KIND_TEXTURE, h);
+    if (cast(i64, p) == 0) { return; }
+    call(d.vt.texture_destroy, d.self, p);
+    dev.free_handle(d, dev.KIND_TEXTURE, h);
+}
+
+// Replaces the whole image. Partial updates wait until something needs them —
+// a texture atlas does, and that arrives with image/.
+fn upload(d as *dev.Device, h as i64, src as *u8, bytes as i64) as i32 {
+    let is *u8 as p = dev.payload_checked(d, dev.KIND_TEXTURE, h);
+    if (cast(i64, p) == 0) { return 0; }
+    if (cast(i64, src) == 0 || bytes <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    let is *Info as inf = cast(*Info, p);
+    if (bytes > inf.width * inf.height * pixel_bytes(inf.format)) {
+        dev.set_error(d, dev.BAD_ARGUMENT);
+        return 0;
+    }
+    if (call(d.vt.texture_upload, d.self, p, src, bytes) != 1) {
+        dev.set_error(d, dev.DEVICE_LOST);
+        return 0;
+    }
+    return 1;
+}
+
+// Copies the texture back out. This is a copy rather than a pointer on
+// purpose: in software the pixels are right there and handing out the address
+// would be free, but on hardware they are in device memory and reading them
+// means a staging buffer and a wait. An API shaped around the free case would
+// be one a GPU backend could not implement, and a program written against it
+// would work on software and not on Vulkan.
+//
+// It is what makes a headless device useful — rendering to a file, comparing
+// two frames, a test that checks pixels — so it is worth the copy.
+fn read(d as *dev.Device, h as i64, dst as *u8, bytes as i64) as i32 {
+    let is *u8 as p = dev.payload_checked(d, dev.KIND_TEXTURE, h);
+    if (cast(i64, p) == 0) { return 0; }
+    if (cast(i64, dst) == 0 || bytes <= 0) { dev.set_error(d, dev.BAD_ARGUMENT); return 0; }
+    let is *Info as inf = cast(*Info, p);
+    if (bytes > inf.width * inf.height * pixel_bytes(inf.format)) {
+        dev.set_error(d, dev.BAD_ARGUMENT);
+        return 0;
+    }
+    if (call(d.vt.texture_read, d.self, p, dst, bytes) != 1) {
+        dev.set_error(d, dev.UNSUPPORTED);
+        return 0;
+    }
+    return 1;
+}
+
+// Bytes read() would need for the whole image.
+fn byte_size(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_TEXTURE, h);
+    if (cast(i64, p) == 0) { return 0; }
+    let is *Info as inf = cast(*Info, p);
+    return inf.width * inf.height * pixel_bytes(inf.format);
+}
+
+fn width(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_TEXTURE, h);
+    if (cast(i64, p) == 0) { return 0; }
+    return cast(*Info, p).width;
+}
+
+fn height(d as *dev.Device, h as i64) as i64 {
+    let is *u8 as p = dev.payload(d, dev.KIND_TEXTURE, h);
+    if (cast(i64, p) == 0) { return 0; }
+    return cast(*Info, p).height;
+}
+
+fn format(d as *dev.Device, h as i64) as i32 {
+    let is *u8 as p = dev.payload(d, dev.KIND_TEXTURE, h);
+    if (cast(i64, p) == 0) { return cast(i32, 0 - 1); }
+    return cast(*Info, p).format;
+}
+
+// --- Samplers ---
+
+fn sampler(d as *dev.Device, filter as i32, wrap as i32) as i64 {
+    let is i64 as h = dev.alloc_handle(d, dev.KIND_SAMPLER);
+    if (h == 0) { return 0; }
+
+    let is *u8 as p = dev.payload(d, dev.KIND_SAMPLER, h);
+    let is *SamplerInfo as inf = cast(*SamplerInfo, p);
+    inf.filter = filter;
+    inf.wrap = wrap;
+
+    if (call(d.vt.sampler_create, d.self, p, cast(i64, filter), cast(i64, wrap)) != 1) {
+        dev.free_handle(d, dev.KIND_SAMPLER, h);
+        dev.set_error(d, dev.UNSUPPORTED);
+        return 0;
+    }
+    return h;
+}
+
+fn sampler_destroy(d as *dev.Device, h as i64) as void {
+    let is *u8 as p = dev.payload(d, dev.KIND_SAMPLER, h);
+    if (cast(i64, p) == 0) { return; }
+    call(d.vt.sampler_destroy, d.self, p);
+    dev.free_handle(d, dev.KIND_SAMPLER, h);
+}

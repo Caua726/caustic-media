@@ -1,0 +1,871 @@
+// gpu/gpu_test.cst — the device's invariants, headless.
+//
+// A device is hard to assert on by looking at a picture, so these check the
+// properties that separate a correct device from one that merely draws
+// something: a stale handle is refused rather than aliasing a live resource,
+// a full table fails instead of overwriting, recording is not executing, and
+// — the strongest one here — a triangle drawn through the whole device path
+// lands on exactly the same pixels as the rasterizer draws on its own.
+//
+// Every vtable entry is called at least once. That is not thoroughness for
+// its own sake: a function pointer in a *u8 field is called unchecked, so a
+// wrong signature is silent corruption with no diagnostic, and exercising the
+// entry is the only thing that surfaces it.
+//
+// Exit code is the number of failures.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "../math/math.cst" as math;
+use "software/software.cst" as soft;
+use "gpu.cst" as gpu;
+
+let is i32 as fails with mut = 0;
+
+// 64x64 is enough for every property below and keeps the buffers static, so
+// the test allocates nothing the device did not allocate for it.
+let is i64 as W with imut = 64;
+let is i64 as H with imut = 64;
+let is [16384]u8 as ref_pixels;    // 64*64*4, the bare rasterizer's output
+let is [32768]u8 as ref_depth;     // 64*64*8
+let is [16384]u8 as got_pixels;    // read back from the device
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("  FAIL %s\n", name); }
+}
+
+fn chk_i(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+// --- The device itself ---
+
+fn test_open() as void {
+    let is gpu.device.Device as d = gpu.open_headless(64, 64, gpu.SOFTWARE);
+    chk("open_headless succeeds", gpu.device.is_open(&d));
+    chk_i("no error after open", cast(i64, gpu.last_error(&d)), cast(i64, gpu.device.OK));
+    chk("device is not lost", 1 - gpu.device.is_lost(&d));
+
+    let is gpu.device.Caps as c = gpu.device.caps(&d);
+    chk("backend is software", cast(i32, c.backend == gpu.SOFTWARE));
+    chk("max_texture is sane", cast(i32, c.max_texture >= 1024));
+    chk("vertex attrs is sane", cast(i32, c.max_vertex_attrs >= 4));
+    chk("software has no custom shaders yet", 1 - c.has_custom_shaders);
+
+    gpu.close(&d);
+    chk("closed device reports closed", 1 - gpu.device.is_open(&d));
+}
+
+// AUTO must never fail outright: it falls through to software, which always
+// succeeds. That is the promise gpu.md makes, and a program relies on it.
+fn test_auto() as void {
+    let is gpu.device.Device as d = gpu.open_headless(32, 32, gpu.AUTO);
+    chk("AUTO opens", gpu.device.is_open(&d));
+    chk_i("AUTO landed on software", cast(i64, gpu.device.caps(&d).backend), cast(i64, gpu.SOFTWARE));
+    gpu.close(&d);
+}
+
+// --- Handles ---
+
+fn test_handles() as void {
+    let is gpu.device.Device as d = gpu.open_headless(32, 32, gpu.SOFTWARE);
+
+    let is i64 as a = gpu.buffer.create(&d, 256, gpu.buffer.VERTEX);
+    chk("buffer create", cast(i32, a != 0));
+    chk("handle is valid", gpu.device.is_valid(&d, gpu.device.KIND_BUFFER, a));
+    chk("null handle is invalid", 1 - gpu.device.is_valid(&d, gpu.device.KIND_BUFFER, 0));
+
+    gpu.buffer.destroy(&d, a);
+    chk("destroyed handle is invalid", 1 - gpu.device.is_valid(&d, gpu.device.KIND_BUFFER, a));
+
+    // Creation-path use of a dead handle reports why; frame-path use is silent.
+    gpu.device.clear_error(&d);
+    chk_i("upload to dead handle errors",
+          cast(i64, gpu.buffer.upload(&d, a, 0, cast(*u8, 0), 0)), 0);
+    chk_i("and says invalid handle",
+          cast(i64, gpu.last_error(&d)), cast(i64, gpu.device.INVALID_HANDLE));
+
+    gpu.close(&d);
+}
+
+// The point of the era field, and it needs a table small enough to wrap all
+// the way round: once a slot is handed out a second time, the handle that
+// named it the first time must still be refused. Without the era it would
+// address a live buffer belonging to someone else — a use-after-destroy that
+// corrupts rather than reports.
+fn test_handle_reuse() as void {
+    let is gpu.device.Limits as l = gpu.device.limits_default();
+    l.buffers = 2;
+    let is gpu.device.Device as d = gpu.open_headless_with(32, 32, gpu.SOFTWARE, &l);
+
+    let is i64 as a = gpu.buffer.create(&d, 64, gpu.buffer.VERTEX);
+    let is i64 as b = gpu.buffer.create(&d, 64, gpu.buffer.VERTEX);
+    chk("two buffers fit", cast(i32, a != 0 && b != 0));
+
+    gpu.buffer.destroy(&d, a);
+    gpu.buffer.destroy(&d, b);
+
+    // Allocation walks forward, so these come back on the same two slots.
+    let is i64 as c = gpu.buffer.create(&d, 64, gpu.buffer.VERTEX);
+    let is i64 as e = gpu.buffer.create(&d, 64, gpu.buffer.VERTEX);
+    chk("slots came back", cast(i32, c != 0 && e != 0));
+    chk("a slot was genuinely reused",
+        cast(i32, gpu.device.handle_index(c) == gpu.device.handle_index(a)
+               || gpu.device.handle_index(c) == gpu.device.handle_index(b)));
+    chk("but the old handle is not the new one", cast(i32, c != a && c != b));
+    chk("old handle a refused", 1 - gpu.device.is_valid(&d, gpu.device.KIND_BUFFER, a));
+    chk("old handle b refused", 1 - gpu.device.is_valid(&d, gpu.device.KIND_BUFFER, b));
+
+    gpu.close(&d);
+}
+
+// A full table fails honestly instead of handing out a handle that overwrites
+// someone else's resource.
+fn test_table_full() as void {
+    let is gpu.device.Limits as l = gpu.device.limits_default();
+    l.buffers = 4;
+    let is gpu.device.Device as d = gpu.open_headless_with(32, 32, gpu.SOFTWARE, &l);
+
+    let is i64 as n with mut = 0;
+    while (n < 4) {
+        chk("buffer fits", cast(i32, gpu.buffer.create(&d, 16, gpu.buffer.VERTEX) != 0));
+        n = n + 1;
+    }
+    gpu.device.clear_error(&d);
+    chk_i("fifth buffer refused", gpu.buffer.create(&d, 16, gpu.buffer.VERTEX), 0);
+    chk_i("and says table full", cast(i64, gpu.last_error(&d)), cast(i64, gpu.device.TABLE_FULL));
+
+    gpu.close(&d);
+}
+
+// --- Buffers ---
+
+fn test_buffer() as void {
+    let is gpu.device.Device as d = gpu.open_headless(32, 32, gpu.SOFTWARE);
+
+    let is [8]i64 as src;
+    let is i64 as i with mut = 0;
+    while (i < 8) { src[i] = 1000 + i; i = i + 1; }
+
+    let is i64 as b = gpu.buffer.create(&d, 64, gpu.buffer.VERTEX);
+    chk_i("buffer size", gpu.buffer.size(&d, b), 64);
+    chk_i("buffer usage", cast(i64, gpu.buffer.usage(&d, b)), cast(i64, gpu.buffer.VERTEX));
+    chk("upload", gpu.buffer.upload(&d, b, 0, cast(*u8, &src), 64));
+
+    let is *u8 as m = gpu.buffer.map(&d, b);
+    chk("map is not null", cast(i32, cast(i64, m) != 0));
+    let is i32 as same with mut = 1;
+    i = 0;
+    while (i < 8) {
+        if (*cast(*i64, cast(i64, m) + i * 8) != 1000 + i) { same = 0; }
+        i = i + 1;
+    }
+    chk("readback matches upload", same);
+
+    // Uploading past the end is a setup-path mistake, so it reports.
+    gpu.device.clear_error(&d);
+    chk_i("overlong upload refused", cast(i64, gpu.buffer.upload(&d, b, 32, cast(*u8, &src), 64)), 0);
+    chk_i("and says bad argument", cast(i64, gpu.last_error(&d)), cast(i64, gpu.device.BAD_ARGUMENT));
+
+    // An offset upload lands where it was told to.
+    chk("offset upload", gpu.buffer.upload(&d, b, 32, cast(*u8, &src), 16));
+    chk_i("offset landed", *cast(*i64, cast(i64, m) + 32), 1000);
+
+    gpu.buffer.destroy(&d, b);
+    gpu.close(&d);
+}
+
+// --- Textures and samplers ---
+
+// A 2x2 texture: red, green / blue, white. Small enough that every filtering
+// and wrapping answer can be worked out by hand.
+fn upload_quad(d as *gpu.device.Device, t as i64) as void {
+    let is [4]i32 as px;
+    px[0] = cast(i32, math.color.pack_rgba8(math.color.red()));
+    px[1] = cast(i32, math.color.pack_rgba8(math.color.green()));
+    px[2] = cast(i32, math.color.pack_rgba8(math.color.blue()));
+    px[3] = cast(i32, math.color.pack_rgba8(math.color.white()));
+    gpu.texture.upload(d, t, cast(*u8, &px), 16);
+}
+
+fn test_texture() as void {
+    let is gpu.device.Device as d = gpu.open_headless(32, 32, gpu.SOFTWARE);
+
+    let is gpu.texture.Desc as td = gpu.texture.desc(2, 2, gpu.texture.RGBA8, gpu.texture.SAMPLED);
+    let is i64 as t = gpu.texture.create(&d, &td);
+    chk("texture create", cast(i32, t != 0));
+    chk_i("texture width", gpu.texture.width(&d, t), 2);
+    chk_i("texture height", gpu.texture.height(&d, t), 2);
+    chk_i("texture byte size", gpu.texture.byte_size(&d, t), 16);
+    upload_quad(&d, t);
+
+    // Read back: what went in comes out.
+    let is [4]i32 as back;
+    chk("texture read", gpu.texture.read(&d, t, cast(*u8, &back), 16));
+    chk_i("texel 0 survived round trip",
+          cast(i64, back[0]) & 4294967295, math.color.pack_rgba8(math.color.red()));
+    chk_i("texel 3 survived round trip",
+          cast(i64, back[3]) & 4294967295, math.color.pack_rgba8(math.color.white()));
+
+    let is i64 as s_near = gpu.texture.sampler(&d, gpu.texture.NEAREST, gpu.texture.CLAMP);
+    let is i64 as s_lin = gpu.texture.sampler(&d, gpu.texture.LINEAR, gpu.texture.REPEAT);
+    chk("nearest sampler", cast(i32, s_near != 0));
+    chk("linear sampler", cast(i32, s_lin != 0));
+
+    gpu.texture.sampler_destroy(&d, s_near);
+    gpu.texture.sampler_destroy(&d, s_lin);
+    gpu.texture.destroy(&d, t);
+
+    // A format nobody can produce is refused rather than allocated.
+    gpu.device.clear_error(&d);
+    let is gpu.texture.Desc as bad = gpu.texture.desc(4, 4, cast(i32, 99), gpu.texture.SAMPLED);
+    chk_i("unknown format refused", gpu.texture.create(&d, &bad), 0);
+    chk_i("and says bad argument", cast(i64, gpu.last_error(&d)), cast(i64, gpu.device.BAD_ARGUMENT));
+
+    gpu.close(&d);
+}
+
+// --- Shaders ---
+
+fn test_shader() as void {
+    let is gpu.device.Device as d = gpu.open_headless(32, 32, gpu.SOFTWARE);
+
+    let is i64 as unlit = gpu.shader.builtin(&d, gpu.shader.UNLIT_COLOR);
+    chk("unlit builtin", cast(i32, unlit != 0));
+    chk_i("reports builtin source", cast(i64, gpu.shader.source(&d, unlit)),
+          cast(i64, gpu.shader.SOURCE_BUILTIN));
+    chk_i("reports its id", gpu.shader.builtin_id(&d, unlit), gpu.shader.UNLIT_COLOR);
+
+    let is i64 as textured = gpu.shader.builtin(&d, gpu.shader.TEXTURED);
+    chk("textured builtin", cast(i32, textured != 0));
+
+    // SPIR-V is refused rather than accepted and ignored — the whole point of
+    // saying UNSUPPORTED out loud.
+    gpu.device.clear_error(&d);
+    let is [4]i32 as fake_spirv;
+    fake_spirv[0] = cast(i32, 119734787);   // the SPIR-V magic number
+    chk_i("spirv refused on software", gpu.shader.from_spirv(&d, cast(*u8, &fake_spirv), 16), 0);
+    chk_i("and says unsupported", cast(i64, gpu.last_error(&d)), cast(i64, gpu.device.UNSUPPORTED));
+    chk("no shader slot leaked", cast(i32, gpu.device.live_count(&d, gpu.device.KIND_SHADER) == 2));
+
+    gpu.shader.destroy(&d, unlit);
+    gpu.shader.destroy(&d, textured);
+    gpu.close(&d);
+}
+
+// --- The draw path ---
+
+// One vertex as the pos+color preset lays it out: Vec3 then Color, all f64.
+struct Vtx {
+    x as f64; y as f64; z as f64;
+    r as f64; g as f64; b as f64; a as f64;
+}
+
+fn vtx(p as math.vec.Vec3, c as math.color.Color) as Vtx {
+    let is Vtx as v;
+    v.x = p.x; v.y = p.y; v.z = p.z;
+    v.r = c.r; v.g = c.g; v.b = c.b; v.a = c.a;
+    return v;
+}
+
+// Maps (0..W, 0..H) onto the clip cube with Y already pointing down, so it
+// survives the rasterizer's flip. Same matrix the rasterizer's own tests use.
+fn screen_matrix() as math.mat.Mat4 {
+    return math.mat.m4_ortho(0.0, cast(f64, W), cast(f64, H), 0.0, -1.0, 1.0);
+}
+
+// THE test of this milestone.
+//
+// The same triangle, drawn twice: once by calling the rasterizer directly,
+// once through buffers, a pipeline, a recorded command list and a submit. If
+// the device path changed anything about how a fragment is produced, these
+// two images differ, and every layer built on top would inherit the drift.
+fn test_device_matches_rasterizer() as void {
+    let is math.color.Color as bg = math.color.from_hex(0x101018);
+    let is math.mat.Mat4 as m = screen_matrix();
+
+    // Wound so it survives CULL_BACK. project() flips Y, so a front face
+    // reaches the edge test with a negative screen-space area — walking these
+    // three in order is clockwise on the page and counter-clockwise in
+    // normalized device coordinates, which is what "front" means here.
+    //
+    // Worth stating rather than tuning until it draws: the identity check below
+    // passes trivially when both paths cull the triangle, so the coverage
+    // assertion beside it is what keeps this test from comparing two blank
+    // images. It is the assertion that fired when the winding was wrong.
+    let is math.vec.Vec3 as p0 = math.vec.v3(8.0, 6.0, 0.0);
+    let is math.vec.Vec3 as p1 = math.vec.v3(20.0, 58.0, 0.0);
+    let is math.vec.Vec3 as p2 = math.vec.v3(56.0, 14.0, 0.0);
+    let is math.color.Color as c0 = math.color.red();
+    let is math.color.Color as c1 = math.color.green();
+    let is math.color.Color as c2 = math.color.blue();
+
+    // --- the reference: the rasterizer on its own ---
+    let is soft.target.Target as ref = soft.target.target(
+        cast(*u8, &ref_pixels), cast(*u8, &ref_depth), W, H);
+    soft.target.clear(&ref, bg);
+    soft.raster.triangle(&ref, m,
+        soft.raster.vertex(p0, c0),
+        soft.raster.vertex(p1, c1),
+        soft.raster.vertex(p2, c2),
+        soft.raster.CULL_BACK);
+
+    // --- the same thing, through the device ---
+    let is gpu.device.Device as d = gpu.open_headless(W, H, gpu.SOFTWARE);
+
+    let is gpu.texture.Desc as ctd = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    let is gpu.texture.Desc as dtd = gpu.texture.desc(W, H, gpu.texture.DEPTH, gpu.texture.RENDER_TARGET);
+    let is i64 as color = gpu.texture.create(&d, &ctd);
+    let is i64 as depth = gpu.texture.create(&d, &dtd);
+
+    let is [3]Vtx as verts;
+    verts[0] = vtx(p0, c0);
+    verts[1] = vtx(p1, c1);
+    verts[2] = vtx(p2, c2);
+    let is i64 as vb = gpu.buffer.create(&d, sizeof(Vtx) * 3, gpu.buffer.VERTEX);
+    gpu.buffer.upload(&d, vb, 0, cast(*u8, &verts), sizeof(Vtx) * 3);
+
+    let is i64 as sh = gpu.shader.builtin(&d, gpu.shader.UNLIT_COLOR);
+    let is gpu.pipeline.Desc as pd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color());
+    let is i64 as pl = gpu.pipeline.create(&d, &pd);
+    chk("pipeline create", cast(i32, pl != 0));
+
+    let is gpu.shader.BuiltinUniforms as un = gpu.shader.uniforms_mvp(m);
+    let is i64 as cb = gpu.command.create(&d);
+
+    gpu.command.begin(&d, cb);
+    let is gpu.command.Pass as ps = gpu.command.pass(color, depth, bg);
+    gpu.command.begin_pass(&d, cb, &ps);
+    gpu.command.bind_pipeline(&d, cb, pl);
+    gpu.command.bind_vertex_buffer(&d, cb, vb);
+    gpu.command.set_uniforms(&d, cb, cast(*u8, &un), sizeof(gpu.shader.BuiltinUniforms));
+    gpu.command.draw(&d, cb, 0, 3);
+    gpu.command.end_pass(&d, cb);
+    gpu.command.end(&d, cb);
+    chk("submit", gpu.command.submit(&d, cb));
+    chk("wait", gpu.command.wait(&d, cb));
+
+    chk("read back the frame", gpu.texture.read(&d, color, cast(*u8, &got_pixels), W * H * 4));
+
+    let is i64 as diff with mut = 0;
+    let is i64 as drawn with mut = 0;
+    let is i64 as bgp = math.color.pack_rgba8(bg);
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        let is i64 as a = cast(i64, *cast(*i32, cast(i64, &ref_pixels) + i * 4)) & 4294967295;
+        let is i64 as b = cast(i64, *cast(*i32, cast(i64, &got_pixels) + i * 4)) & 4294967295;
+        if (a != b) { diff = diff + 1; }
+        if (a != bgp) { drawn = drawn + 1; }
+        i = i + 1;
+    }
+    chk_i("device path differs from the rasterizer nowhere", diff, 0);
+    // A comparison of two blank images would also report zero differences.
+    chk("and the triangle actually covered something", cast(i32, drawn > 500));
+
+    gpu.command.destroy(&d, cb);
+    gpu.pipeline.destroy(&d, pl);
+    gpu.shader.destroy(&d, sh);
+    gpu.buffer.destroy(&d, vb);
+    gpu.texture.destroy(&d, color);
+    gpu.texture.destroy(&d, depth);
+    gpu.close(&d);
+}
+
+// Recording is not executing. If it were, a program that recorded a frame and
+// decided not to submit it would still have drawn it, and the software and
+// Vulkan backends would disagree about what a command buffer is.
+fn test_recording_is_not_executing() as void {
+    let is gpu.device.Device as d = gpu.open_headless(W, H, gpu.SOFTWARE);
+
+    let is gpu.texture.Desc as ctd = gpu.texture.desc(8, 8, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    let is i64 as color = gpu.texture.create(&d, &ctd);
+
+    // Paint it white by hand, then record a pass that clears to black.
+    let is [64]i32 as white;
+    let is i64 as i with mut = 0;
+    while (i < 64) { white[i] = cast(i32, math.color.pack_rgba8(math.color.white())); i = i + 1; }
+    gpu.texture.upload(&d, color, cast(*u8, &white), 256);
+
+    let is i64 as cb = gpu.command.create(&d);
+    gpu.command.begin(&d, cb);
+    let is gpu.command.Pass as ps = gpu.command.pass(color, 0, math.color.black());
+    gpu.command.begin_pass(&d, cb, &ps);
+    gpu.command.end_pass(&d, cb);
+    gpu.command.end(&d, cb);
+    chk("records were recorded", cast(i32, gpu.command.recorded(&d, cb) == 2));
+
+    let is [64]i32 as back;
+    gpu.texture.read(&d, color, cast(*u8, &back), 256);
+    chk_i("recording alone changed nothing",
+          cast(i64, back[0]) & 4294967295, math.color.pack_rgba8(math.color.white()));
+
+    gpu.command.submit(&d, cb);
+    gpu.texture.read(&d, color, cast(*u8, &back), 256);
+    chk_i("submitting is what cleared it",
+          cast(i64, back[0]) & 4294967295, math.color.pack_rgba8(math.color.black()));
+
+    gpu.command.destroy(&d, cb);
+    gpu.texture.destroy(&d, color);
+    gpu.close(&d);
+}
+
+// The depth buffer keeps the nearer surface whichever order the two arrive
+// in. Submission order deciding the picture is exactly what a depth buffer
+// exists to prevent, and it is the property most easily lost when the draw
+// path is rewritten.
+fn draw_two_quads(d as *gpu.device.Device, color as i64, depth as i64,
+                  near_first as i32) as i64 {
+    let is math.mat.Mat4 as m = screen_matrix();
+    // Two full-target triangles at different depths, red nearer than blue.
+    //
+    // The nearer one has the LARGER model z: m4_ortho negates z, because the
+    // math layer is right-handed and looks down -Z. So model +0.5 becomes
+    // normalized device -0.5, and smaller-is-nearer holds where the depth
+    // test reads it.
+    let is f64 as z_near with imut = 0.5;
+    let is f64 as z_far  with imut = 0.0 - 0.5;
+
+    let is [6]Vtx as verts;
+    // The first three vertices are drawn first. Swapping which depth they
+    // carry is what makes this the same scene submitted in both orders.
+    let is f64 as zn with mut = z_near;
+    let is f64 as zf with mut = z_far;
+    let is math.color.Color as c0 with mut = math.color.red();
+    let is math.color.Color as c1 with mut = math.color.blue();
+    if (near_first == 0) {
+        zn = z_far; zf = z_near;
+        c0 = math.color.blue(); c1 = math.color.red();
+    }
+    verts[0] = vtx(math.vec.v3(0.0, 0.0, zn), c0);
+    verts[1] = vtx(math.vec.v3(cast(f64, W), 0.0, zn), c0);
+    verts[2] = vtx(math.vec.v3(0.0, cast(f64, H), zn), c0);
+    verts[3] = vtx(math.vec.v3(0.0, 0.0, zf), c1);
+    verts[4] = vtx(math.vec.v3(cast(f64, W), 0.0, zf), c1);
+    verts[5] = vtx(math.vec.v3(0.0, cast(f64, H), zf), c1);
+
+    let is i64 as vb = gpu.buffer.create(d, sizeof(Vtx) * 6, gpu.buffer.VERTEX);
+    gpu.buffer.upload(d, vb, 0, cast(*u8, &verts), sizeof(Vtx) * 6);
+
+    let is i64 as sh = gpu.shader.builtin(d, gpu.shader.UNLIT_COLOR);
+    let is gpu.pipeline.Desc as pd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color());
+    pd.cull = gpu.pipeline.CULL_NONE;
+    let is i64 as pl = gpu.pipeline.create(d, &pd);
+
+    let is gpu.shader.BuiltinUniforms as un = gpu.shader.uniforms_mvp(m);
+    let is i64 as cb = gpu.command.create(d);
+    gpu.command.begin(d, cb);
+    let is gpu.command.Pass as ps = gpu.command.pass(color, depth, math.color.black());
+    gpu.command.begin_pass(d, cb, &ps);
+    gpu.command.bind_pipeline(d, cb, pl);
+    gpu.command.bind_vertex_buffer(d, cb, vb);
+    gpu.command.set_uniforms(d, cb, cast(*u8, &un), sizeof(gpu.shader.BuiltinUniforms));
+    gpu.command.draw(d, cb, 0, 6);
+    gpu.command.end_pass(d, cb);
+    gpu.command.end(d, cb);
+    gpu.command.submit(d, cb);
+
+    gpu.texture.read(d, color, cast(*u8, &got_pixels), W * H * 4);
+    // The pixel at (2,2) is covered by both triangles.
+    let is i64 as at = (2 * W + 2) * 4;
+    let is i64 as v = cast(i64, *cast(*i32, cast(i64, &got_pixels) + at)) & 4294967295;
+
+    gpu.command.destroy(d, cb);
+    gpu.pipeline.destroy(d, pl);
+    gpu.shader.destroy(d, sh);
+    gpu.buffer.destroy(d, vb);
+    return v;
+}
+
+fn test_depth() as void {
+    let is gpu.device.Device as d = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as ctd = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    let is gpu.texture.Desc as dtd = gpu.texture.desc(W, H, gpu.texture.DEPTH, gpu.texture.RENDER_TARGET);
+    let is i64 as color = gpu.texture.create(&d, &ctd);
+    let is i64 as depth = gpu.texture.create(&d, &dtd);
+
+    let is i64 as red = math.color.pack_rgba8(math.color.red());
+    chk_i("near drawn first wins", draw_two_quads(&d, color, depth, 1), red);
+    chk_i("near drawn second wins too", draw_two_quads(&d, color, depth, 0), red);
+
+    gpu.texture.destroy(&d, color);
+    gpu.texture.destroy(&d, depth);
+    gpu.close(&d);
+}
+
+// --- Swapchain ---
+
+let is i64 as present_calls with mut = 0;
+let is i64 as present_first_pixel with mut = 0;
+
+// Stands in for the window layer's blit. That this is a plain function
+// pointer the program supplies is the whole reason gpu/ never imports
+// window/ — see the header of swapchain.cst.
+fn fake_present(user as *u8, pixels as *u8, w as i64, h as i64) as i64 {
+    present_calls = present_calls + 1;
+    present_first_pixel = cast(i64, *cast(*i32, cast(i64, pixels))) & 4294967295;
+    return 1;
+}
+
+fn test_swapchain() as void {
+    let is gpu.device.Device as d = gpu.open_headless(32, 32, gpu.SOFTWARE);
+
+    let is gpu.swapchain.Surface as s = gpu.swapchain.surface_native(
+        gpu.swapchain.NATIVE_X11, cast(*u8, 0), 0, fn_ptr(fake_present), cast(*u8, 0));
+    let is i64 as sc = gpu.swapchain.create(&d, &s, 32, 32, 2);
+    chk("swapchain create", cast(i32, sc != 0));
+    chk_i("image count", gpu.swapchain.image_count(&d, sc), 2);
+    chk_i("width", gpu.swapchain.width(&d, sc), 32);
+
+    let is i64 as i0 = gpu.swapchain.acquire(&d, sc);
+    chk_i("first acquire is image 0", i0, 0);
+    let is i64 as t0 = gpu.swapchain.image(&d, sc, i0);
+    chk("image 0 is a texture", cast(i32, t0 != 0));
+    chk("current_image agrees", cast(i32, gpu.swapchain.current_image(&d, sc) == t0));
+
+    let is i64 as i1 = gpu.swapchain.acquire(&d, sc);
+    chk_i("second acquire is image 1", i1, 1);
+    let is i64 as t1 = gpu.swapchain.image(&d, sc, i1);
+    // Two images means two buffers. If acquire handed back the same one, a
+    // compositor still reading last frame would see this frame drawn into it.
+    chk("the two images are different textures", cast(i32, t0 != t1));
+
+    let is i64 as i2 = gpu.swapchain.acquire(&d, sc);
+    chk_i("third acquire wraps to 0", i2, 0);
+
+    // Paint image 0 white and present it: the callback fires exactly once and
+    // receives that image's pixels.
+    let is [1024]i32 as white;
+    let is i64 as i with mut = 0;
+    while (i < 1024) { white[i] = cast(i32, math.color.pack_rgba8(math.color.white())); i = i + 1; }
+    gpu.texture.upload(&d, t0, cast(*u8, &white), 4096);
+
+    present_calls = 0;
+    chk("present", gpu.swapchain.present(&d, sc));
+    chk_i("callback ran once", present_calls, 1);
+    chk_i("and got the acquired image", present_first_pixel,
+          math.color.pack_rgba8(math.color.white()));
+
+    // Resizing remakes the images, so the old handles must stop working —
+    // which is the era in the handle doing its job across a whole resource
+    // set rather than one slot.
+    chk("resize", gpu.swapchain.resize(&d, sc, 16, 16));
+    chk_i("new width", gpu.swapchain.width(&d, sc), 16);
+    chk("old image handle is dead",
+        1 - gpu.device.is_valid(&d, gpu.device.KIND_TEXTURE, t0));
+
+    gpu.swapchain.destroy(&d, sc);
+    chk("swapchain released its textures",
+        cast(i32, gpu.device.live_count(&d, gpu.device.KIND_TEXTURE) == 0));
+
+    // Headless presents successfully and does nothing, which is what makes
+    // the whole layer runnable with no DISPLAY.
+    let is gpu.swapchain.Surface as hs = gpu.swapchain.surface_headless();
+    let is i64 as hsc = gpu.swapchain.create(&d, &hs, 8, 8, 1);
+    gpu.swapchain.acquire(&d, hsc);
+    present_calls = 0;
+    chk("headless present succeeds", gpu.swapchain.present(&d, hsc));
+    chk_i("and called nothing", present_calls, 0);
+    gpu.swapchain.destroy(&d, hsc);
+
+    gpu.close(&d);
+}
+
+// --- The vtable ---
+
+// Every entry, called at least once. A function pointer in a *u8 field is
+// called unchecked — wrong signature, no diagnostic, silent corruption — so
+// this is not thoroughness for its own sake. The tests above already reach
+// most of them; this one exists so that adding an entry and forgetting to
+// exercise it is a failure rather than a quiet gap.
+fn test_every_vtable_entry() as void {
+    let is gpu.device.Device as d = gpu.open_headless(16, 16, gpu.SOFTWARE);
+
+    let is i64 as b = gpu.buffer.create(&d, 32, gpu.buffer.VERTEX);        // buffer_create
+    let is [4]i64 as tmp;
+    tmp[0] = 7;
+    gpu.buffer.upload(&d, b, 0, cast(*u8, &tmp), 32);                      // buffer_upload
+    chk("buffer_map", cast(i32, cast(i64, gpu.buffer.map(&d, b)) != 0));   // buffer_map
+
+    let is gpu.texture.Desc as td = gpu.texture.desc(2, 2, gpu.texture.RGBA8, gpu.texture.SAMPLED);
+    let is i64 as t = gpu.texture.create(&d, &td);                         // texture_create
+    upload_quad(&d, t);                                                    // texture_upload
+    let is [4]i32 as back;
+    chk("texture_read", gpu.texture.read(&d, t, cast(*u8, &back), 16));    // texture_read
+    let is i64 as sm = gpu.texture.sampler(&d, gpu.texture.LINEAR, gpu.texture.REPEAT);  // sampler_create
+
+    let is i64 as sh = gpu.shader.builtin(&d, gpu.shader.TEXTURED);        // shader_builtin
+    gpu.shader.from_spirv(&d, cast(*u8, &tmp), 32);                        // shader_spirv
+
+    let is gpu.pipeline.Desc as pd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color_uv());
+    let is i64 as pl = gpu.pipeline.create(&d, &pd);                       // pipeline_create
+
+    let is i64 as cb = gpu.command.create(&d);                             // commands_create
+    gpu.command.begin(&d, cb);
+    gpu.command.end(&d, cb);
+    chk("commands_submit", gpu.command.submit(&d, cb));                    // commands_submit
+
+    let is gpu.swapchain.Surface as s = gpu.swapchain.surface_headless();
+    let is i64 as sc = gpu.swapchain.create(&d, &s, 8, 8, 1);              // swapchain_create
+    gpu.swapchain.acquire(&d, sc);                                         // swapchain_acquire
+    gpu.swapchain.present(&d, sc);                                         // swapchain_present
+    gpu.swapchain.resize(&d, sc, 4, 4);                                    // swapchain_resize
+    gpu.swapchain.destroy(&d, sc);                                         // swapchain_destroy
+
+    gpu.command.destroy(&d, cb);                                           // commands_destroy
+    gpu.pipeline.destroy(&d, pl);                                          // pipeline_destroy
+    gpu.shader.destroy(&d, sh);                                            // shader_destroy
+    gpu.texture.sampler_destroy(&d, sm);                                   // sampler_destroy
+    gpu.texture.destroy(&d, t);                                            // texture_destroy
+    gpu.buffer.destroy(&d, b);                                             // buffer_destroy
+    gpu.close(&d);                                                         // close
+
+    // Nothing outlived the device.
+    chk("every resource released", cast(i32, gpu.device.is_open(&d) == 0));
+}
+
+// Closing a device releases what the program forgot to.
+//
+// This matters more than it looks: the device's tables are one mapping, but a
+// buffer's memory and a texture's pixels are mappings of their own. Freeing
+// the tables alone would free the bookkeeping and leak the contents, and it
+// would show up as a program that slowly grows and nothing to point at.
+// --- A swapchain drawing into somebody else's memory ---
+//
+// The shared path: the surface supplies the storage, so the swapchain allocates
+// none and the rasterizer writes straight into the caller's buffer. What has to
+// be true, and what the window layer depends on:
+//
+//   acquire() is called once per frame and the buffer it returns is the one the
+//   pass actually draws into — not a copy of it, not one of the swapchain's own
+//   images that gets blitted over later.
+//   Returning null refuses the frame instead of drawing somewhere wrong.
+//   present() is told there is nothing to hand back.
+//
+// Two buffers, alternating, because that is the case that breaks if the
+// swapchain caches the first pointer — which is exactly what MIT-SHM does.
+
+let is [4096]u8 as shared_a;       // 32*32*4
+let is [4096]u8 as shared_b;
+let is i64 as shared_calls with mut = 0;
+let is i64 as shared_submits with mut = 0;
+let is i64 as shared_refuse with mut = 0;
+let is i64 as shared_last_pixels with mut = 0 - 1;
+
+fn shared_acquire(user as *u8) as *u8 {
+    shared_calls = shared_calls + 1;
+    if (shared_refuse == 1) { return cast(*u8, 0); }
+    if ((shared_calls & 1) == 1) { return cast(*u8, &shared_a); }
+    return cast(*u8, &shared_b);
+}
+
+fn shared_submit(user as *u8, pixels as *u8, w as i64, h as i64) as i64 {
+    shared_submits = shared_submits + 1;
+    shared_last_pixels = cast(i64, pixels);
+    return 1;
+}
+
+fn _px(buf as *u8, i as i64) as i64 {
+    return cast(i64, *cast(*i32, cast(i64, buf) + i * 4)) & 4294967295;
+}
+
+fn test_swapchain_shared() as void {
+    let is gpu.device.Device as d = gpu.open_headless(32, 32, gpu.SOFTWARE);
+    shared_calls = 0;
+    shared_submits = 0;
+    shared_refuse = 0;
+    shared_last_pixels = 0 - 1;
+
+    let is i64 as i with mut = 0;
+    while (i < 4096) { shared_a[i] = cast(u8, 0); shared_b[i] = cast(u8, 0); i = i + 1; }
+
+    let is gpu.swapchain.Surface as s = gpu.swapchain.surface_native_shared(
+        gpu.swapchain.NATIVE_X11, cast(*u8, 0), 0,
+        fn_ptr(shared_submit), fn_ptr(shared_acquire), cast(*u8, 0));
+    let is i64 as sc = gpu.swapchain.create(&d, &s, 32, 32, 2);
+    chk("shared swapchain create", cast(i32, sc != 0));
+
+    // Nothing is asked for until a frame begins.
+    chk_i("no buffer asked for at create", shared_calls, 0);
+
+    let is i64 as cb = gpu.command.create(&d);
+    let is math.color.Color as red = math.color.from_hex(0xFF0000);
+
+    // Frame one goes into shared_a.
+    let is i64 as i0 = gpu.swapchain.acquire(&d, sc);
+    chk_i("shared acquire asked the surface", shared_calls, 1);
+    chk("shared acquire succeeded", cast(i32, i0 >= 0));
+
+    gpu.command.begin(&d, cb);
+    let is gpu.command.Pass as p0 = gpu.command.pass(gpu.swapchain.current_image(&d, sc), 0, red);
+    gpu.command.begin_pass(&d, cb, &p0);
+    gpu.command.end_pass(&d, cb);
+    gpu.command.end(&d, cb);
+    gpu.command.submit(&d, cb);
+    gpu.swapchain.present(&d, sc);
+
+    // The clear landed in OUR buffer, not in one the swapchain owns.
+    chk_i("frame one cleared the caller's buffer", _px(cast(*u8, &shared_a), 0),
+          math.color.pack_rgba8(red));
+    chk_i("and every pixel of it", _px(cast(*u8, &shared_a), 1023),
+          math.color.pack_rgba8(red));
+    chk_i("the other buffer was untouched", _px(cast(*u8, &shared_b), 0), 0);
+    chk_i("present submitted once", shared_submits, 1);
+    // Nothing to hand back: the caller already owns what was drawn.
+    chk_i("present got no pixels to copy", shared_last_pixels, 0);
+
+    // Frame two must go into the OTHER buffer. A swapchain that cached the
+    // first pointer would draw over the frame the server is reading.
+    let is math.color.Color as green = math.color.from_hex(0x00FF00);
+    gpu.swapchain.acquire(&d, sc);
+    chk_i("second frame asked again", shared_calls, 2);
+    gpu.command.begin(&d, cb);
+    let is gpu.command.Pass as p1 = gpu.command.pass(gpu.swapchain.current_image(&d, sc), 0, green);
+    gpu.command.begin_pass(&d, cb, &p1);
+    gpu.command.end_pass(&d, cb);
+    gpu.command.end(&d, cb);
+    gpu.command.submit(&d, cb);
+    gpu.swapchain.present(&d, sc);
+
+    chk_i("frame two went to the other buffer", _px(cast(*u8, &shared_b), 0),
+          math.color.pack_rgba8(green));
+    chk_i("frame one was not overwritten", _px(cast(*u8, &shared_a), 0),
+          math.color.pack_rgba8(red));
+
+    // A third frame, and this is the assertion that actually pins "asked every
+    // frame". With two images and two buffers the first two frames line up
+    // whether the swapchain asks each time or caches one pointer per image —
+    // a cache is only visible when an image comes round again. It did come
+    // round: this is image 0 for the second time, and it must have asked.
+    gpu.swapchain.acquire(&d, sc);
+    chk_i("third frame asked a third time", shared_calls, 3);
+    let is math.color.Color as blue = math.color.from_hex(0x0000FF);
+    gpu.command.begin(&d, cb);
+    let is gpu.command.Pass as p2 = gpu.command.pass(gpu.swapchain.current_image(&d, sc), 0, blue);
+    gpu.command.begin_pass(&d, cb, &p2);
+    gpu.command.end_pass(&d, cb);
+    gpu.command.end(&d, cb);
+    gpu.command.submit(&d, cb);
+    gpu.swapchain.present(&d, sc);
+    // The fake surface alternates a, b, a — so the third frame lands back in
+    // shared_a, over the red. A swapchain that cached image 0's first pointer
+    // would land there too, which is why the count above is the real check and
+    // this is the corroboration.
+    chk_i("third frame followed the surface, not a cache",
+          _px(cast(*u8, &shared_a), 0), math.color.pack_rgba8(blue));
+
+    // A surface with no buffer this frame refuses rather than drawing anywhere.
+    shared_refuse = 1;
+    chk_i("acquire refuses when the surface has nothing", gpu.swapchain.acquire(&d, sc), 0 - 1);
+    shared_refuse = 0;
+
+    gpu.command.destroy(&d, cb);
+    gpu.swapchain.destroy(&d, sc);
+    // The buffers are the caller's. Destroying the swapchain must not have
+    // unmapped them, and reading them here is what proves it did not.
+    chk_i("caller's buffer survives destroy", _px(cast(*u8, &shared_a), 0),
+          math.color.pack_rgba8(blue));
+    gpu.close(&d);
+}
+
+fn test_close_releases_everything() as void {
+    let is gpu.device.Device as d = gpu.open_headless(16, 16, gpu.SOFTWARE);
+
+    // Everything, and destroy none of it.
+    let is gpu.texture.Desc as td = gpu.texture.desc(8, 8, gpu.texture.RGBA8, gpu.texture.SAMPLED);
+    gpu.buffer.create(&d, 64, gpu.buffer.VERTEX);
+    gpu.texture.create(&d, &td);
+    gpu.texture.sampler(&d, gpu.texture.NEAREST, gpu.texture.CLAMP);
+    let is i64 as sh = gpu.shader.builtin(&d, gpu.shader.UNLIT_COLOR);
+    let is gpu.pipeline.Desc as pd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color());
+    gpu.pipeline.create(&d, &pd);
+    gpu.command.create(&d);
+    let is gpu.swapchain.Surface as s = gpu.swapchain.surface_headless();
+    gpu.swapchain.create(&d, &s, 8, 8, 2);
+
+    chk("resources are live", cast(i32, gpu.device.live_count(&d, gpu.device.KIND_BUFFER) == 1));
+    // The swapchain's two images plus the one created above.
+    chk_i("swapchain took its images", gpu.device.live_count(&d, gpu.device.KIND_TEXTURE), 3);
+
+    gpu.release_all(&d);
+
+    chk_i("buffers released", gpu.device.live_count(&d, gpu.device.KIND_BUFFER), 0);
+    chk_i("textures released", gpu.device.live_count(&d, gpu.device.KIND_TEXTURE), 0);
+    chk_i("samplers released", gpu.device.live_count(&d, gpu.device.KIND_SAMPLER), 0);
+    chk_i("shaders released", gpu.device.live_count(&d, gpu.device.KIND_SHADER), 0);
+    chk_i("pipelines released", gpu.device.live_count(&d, gpu.device.KIND_PIPELINE), 0);
+    chk_i("commands released", gpu.device.live_count(&d, gpu.device.KIND_COMMANDS), 0);
+    chk_i("swapchains released", gpu.device.live_count(&d, gpu.device.KIND_SWAPCHAIN), 0);
+
+    gpu.close(&d);
+}
+
+// Frame operations never fail, and that has to include the ugly cases: a pass
+// whose target was destroyed, a draw with no pipeline bound, a draw from a
+// buffer that is gone. Each has to be a no-op. The submit walk advances its
+// cursor before skipping a bad record, so getting this wrong is a hang rather
+// than a wrong picture — which is worth a test of its own.
+fn test_bad_records_are_no_ops() as void {
+    let is gpu.device.Device as d = gpu.open_headless(16, 16, gpu.SOFTWARE);
+
+    let is gpu.texture.Desc as td = gpu.texture.desc(8, 8, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    let is i64 as color = gpu.texture.create(&d, &td);
+    let is i64 as cb = gpu.command.create(&d);
+
+    // A pass onto a texture that no longer exists.
+    gpu.texture.destroy(&d, color);
+    gpu.command.begin(&d, cb);
+    let is gpu.command.Pass as ps = gpu.command.pass(color, 0, math.color.black());
+    gpu.command.begin_pass(&d, cb, &ps);
+    gpu.command.draw(&d, cb, 0, 3);
+    gpu.command.end_pass(&d, cb);
+    gpu.command.end(&d, cb);
+    chk("submit survives a dead render target", gpu.command.submit(&d, cb));
+
+    // A draw with nothing bound at all.
+    let is i64 as color2 = gpu.texture.create(&d, &td);
+    gpu.command.begin(&d, cb);
+    let is gpu.command.Pass as ps2 = gpu.command.pass(color2, 0, math.color.black());
+    gpu.command.begin_pass(&d, cb, &ps2);
+    gpu.command.draw(&d, cb, 0, 3);
+    gpu.command.bind_pipeline(&d, cb, 0);
+    gpu.command.bind_vertex_buffer(&d, cb, 0);
+    gpu.command.draw(&d, cb, 0, 3);
+    gpu.command.end_pass(&d, cb);
+    gpu.command.end(&d, cb);
+    chk("submit survives a draw with nothing bound", gpu.command.submit(&d, cb));
+
+    // And the target is still just the clear colour.
+    let is [64]i32 as back;
+    gpu.texture.read(&d, color2, cast(*u8, &back), 256);
+    chk_i("nothing was drawn", cast(i64, back[0]) & 4294967295,
+          math.color.pack_rgba8(math.color.black()));
+
+    gpu.command.destroy(&d, cb);
+    gpu.texture.destroy(&d, color2);
+    gpu.close(&d);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    test_open();
+    test_auto();
+    test_handles();
+    test_handle_reuse();
+    test_table_full();
+    test_buffer();
+    test_texture();
+    test_shader();
+    test_device_matches_rasterizer();
+    test_recording_is_not_executing();
+    test_depth();
+    test_swapchain();
+    test_swapchain_shared();
+    test_close_releases_everything();
+    test_bad_records_are_no_ops();
+    test_every_vtable_entry();
+
+    if (fails == 0) { io.printf("gpu device: all checks passed\n"); }
+    else { io.printf("gpu device: %d failures\n", fails); }
+    return fails;
+}
