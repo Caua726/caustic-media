@@ -3,15 +3,17 @@
 **Windowing, input, graphics and audio for [Caustic](https://github.com/Caua726/Caustic) — roughly what SDL is for C, plus a renderer and a UI layer.**
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
-![status](https://img.shields.io/badge/status-3%20of%2010%20layers%20started-yellow)
+![status](https://img.shields.io/badge/status-4%20of%2010%20layers%20started-yellow)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **This repository is mostly a design, not an implementation.** Three of the ten
-> layers have code: `math/` (complete and tested), `gpu/software/` (a working
-> software rasteriser, tested) and `window/x11.cst` (X11 only). The other seven
-> — input, render, 3d, image, text, audio, ui — are **design notes with no code
-> behind them**, and several backends named below (Wayland, KMS, Win32, Vulkan,
-> OpenGL, D3D, ALSA, WASAPI) are not written either.
+> **This repository is partly an implementation and mostly a design.** Four of
+> the ten layers have code: `math/` (complete and tested), `gpu/software/` (a
+> working software rasteriser, tested), `gpu/` (the portable device, tested) and
+> `window/x11/` (complete: 1163 bound functions, MIT-SHM, cursors, clipboard,
+> monitors, tested against a real server). The other six — input, render, 3d,
+> image, text, audio, ui — are **design notes with no code behind them**, and
+> several backends named below (Wayland, KMS, Win32, Vulkan, OpenGL, D3D, ALSA,
+> WASAPI) are not written either.
 >
 > The API examples further down describe the **designed** interface. They will
 > not compile today. The design is the point of the repository at this stage —
@@ -28,7 +30,7 @@ window and drive the GPU itself.
 |---|---|---|
 | `math/` | vectors, matrices, quaternions, geometry, colour, curves — pure | **done**, 2,500 lines, two test suites |
 | `gpu/software/` | the software rasteriser | **done**, tested |
-| `window/` | window, display, platform | **X11 only** (`window/x11.cst`); wayland, kms, win32 designed |
+| `window/` | window, display, platform | **X11 done** (`window/x11/`, 1163 functions bound, tested); wayland, kms, win32 designed |
 | `gpu/` (device) | the portable device, in the shape of wgpu | in progress; vk, gl, d3d designed |
 | `input/` | keyboard, mouse, touch, pen, gamepad, haptics, sensors | design note only |
 | `render/` | the framework: meshes, sprites, materials, cameras, a frame | design note only |
@@ -84,13 +86,17 @@ selected.
 
 ```cst
 // let the library decide
-let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.AUTO);
+let is gpu.device.Device as d = gpu.open(&surface, gpu.AUTO);
 
 // or name it — per platform, per program, per device
-let is media.gpu.Device as d = media.gpu.open(&win, media.gpu.VULKAN);
+let is gpu.device.Device as d = gpu.open(&surface, gpu.VULKAN);
 let is media.window.Window as w = media.window.open_with(media.window.WAYLAND, ...);
 let is media.input.Source as s = media.input.open_source(media.input.EVDEV);
 ```
+
+A type lives in the module that declares it — `gpu.device.Device`, the way
+`soft.target.Target` already reads — because Caustic's `type` alias does not
+cross a module boundary. Functions do forward, so the calls stay short.
 
 So Vulkan on one platform and OpenGL on another is a program-level decision, not
 a build-level one, and nothing prevents both from being compiled in. Backends
@@ -103,19 +109,30 @@ representable.
 ## Three ways to reach the GPU
 
 ```cst
-use "media/media.cst" as media;
+use "caustic-media/gpu/gpu.cst" as gpu;
+use "caustic-media/window/x11/x11.cst" as x11;
 
-let is media.window.Window as win = media.window.open("app", 1280, 720);
+let is x11.window.Window as win = x11.open("app", 1280, 720);
+
+// The window supplies its native handles and a way to put pixels on itself.
+// gpu/ takes them as data and never imports window/ — which is what keeps a
+// software-rendering binary free of libX11.
+let is gpu.swapchain.Surface as surf = x11.surface_for_gpu(&win, fn_ptr(blit), &win);
 
 // let the library choose
-let is media.gpu.Device as a = media.gpu.open(&win, media.gpu.AUTO);
+let is gpu.device.Device as a = gpu.open(&surf, gpu.AUTO);
 
 // or name the backend
-let is media.gpu.Device as b = media.gpu.open(&win, media.gpu.VULKAN);
+let is gpu.device.Device as b = gpu.open(&surf, gpu.VULKAN);
 
 // or skip the abstraction and drive Vulkan yourself on our window
-let is *u8 as surface = media.gpu.vk.surface(&win);
+let is *u8 as vksurface = gpu.vk.surface_from(&surf);
 ```
+
+There is a fourth way, and it is the one CI uses: `gpu.open_headless(w, h,
+AUTO)` gives a device with no screen behind it, rendering into textures the
+program reads back. That is what makes the whole layer testable with no
+`DISPLAY`.
 
 Backends coexist: two devices on different backends can be alive at once.
 
@@ -154,8 +171,12 @@ transforms images links no decoder.
 ## Building
 
 ```sh
-caustic-mk run test     # the three suites that exist: math, geometry, rasteriser
+caustic-mk run test     # math, geometry, the rasteriser, the device
+caustic -q examples/cube.cst -o build/cube && ./build/cube
 ```
+
+Every suite is headless, the device included, so tests run with no `DISPLAY`.
+Only the example needs a screen.
 
 Needs a standard library new enough to carry the float functions in
 `std/math.cst` — `sin`, `cos`, `atan2`, `pow` and the rest. An older install
@@ -182,13 +203,34 @@ own code.
 | | |
 |---|---|
 | `math/` | vectors, matrices, quaternions, geometry, colour, curves — tested |
-| `gpu/software/` | rasterizer with a depth buffer, perspective-correct, tested |
-| `window/x11` | opens, presents and reads input — 22 of libX11's 774 functions |
+| `gpu/` | the portable device: buffers, textures, pipelines, commands, swapchain — tested |
+| `gpu/software/` | the device implemented with no hardware, over a tested rasterizer |
+| `window/x11` | window, MIT-SHM presentation, events, keys, cursor, clipboard, monitors — 770 of libX11's 774, and libXext, Xss, Xrandr, Xi, Xcursor and Xfixes complete — 1163 symbols |
 | everything else | a design note, and the work it describes |
 
+The cube now turns through the abstraction rather than beside it: it is a
+vertex buffer, a pipeline and a draw submitted to a `gpu.Device`, and nothing
+in `examples/cube.cst` names a rasterizer. Compiling a GPU backend in and
+changing `AUTO` to `VULKAN` would not move that file.
+
 The next pieces are the ones the notes call for first: reshaping `window/x11`
-to the pull model before a second backend exists, and wrapping the rasterizer in
-a device so `gpu.open(SOFTWARE)` reaches it.
+to the pull model before a second backend exists, then the `vk.xml` generator
+and Vulkan against that one backend.
+
+Two things measured rather than assumed, so they are not rediscovered later.
+
+The device costs about 10% against calling the rasterizer directly — 1554 ms
+against 1410 ms for 120 frames at 640×480 — which is the indirect call per
+fragment plus decoding vertices through a declared layout.
+
+And `window/x11` did not survive a window manager that ignores the requested
+size. A tiling compositor grants 1366×768 for a 640×480 request; the backend
+updated its width and height and rebuilt neither the scratch buffer nor the
+XImage, so `present` wrote megabytes past the end of its mapping while the
+server read every row at a stale stride — a crash and visible banding, both
+silent in the code. It now rebuilds both on `ConfigureNotify`, and the frame
+the server holds is byte-for-byte what was sent, checked with `XGetImage`
+rather than by looking.
 
 ## License
 
