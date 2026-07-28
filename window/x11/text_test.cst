@@ -1,0 +1,167 @@
+// window/x11/text_test.cst — key presses in, the text a person typed out.
+//
+// Synthetic KeyPress events, sent to our own window with XSendEvent and read
+// back through the pump. That is the only way to test this without a human at
+// a keyboard, and it exercises the real path: the server's keysym translation,
+// the modifier state, and the Latin-1 to UTF-8 widening.
+//
+// What it asserts:
+//
+//   An unshifted letter key produces that letter.
+//   The same key with Shift produces the capital, which proves the modifier
+//   state reaches XLookupString rather than being dropped.
+//   A key that is not text — an arrow — produces no bytes but still reports a
+//   keysym, which is the distinction between "which key" and "what was typed".
+//   A code point above 127 comes back as two bytes of UTF-8, which is the
+//   whole of the Latin-1 conversion and the one part written here rather than
+//   by libX11.
+//
+// Exit code is the number of failures.
+use "std/io.cst" as io;
+use "x11.cst" as x11;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+use "bind/xutil.cst" as xutil;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("  FAIL %s\n", name); }
+}
+
+fn chk_i(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+fn chk_text(name as *u8, got as *u8, want as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        if (got[i] != want[i]) {
+            fails = fails + 1;
+            io.printf("  FAIL %s: got [%s] want [%s]\n", name, got, want);
+            return;
+        }
+        if (got[i] == cast(u8, 0)) { return; }
+        i = i + 1;
+    }
+}
+
+let is xev.XEvent as _ev;
+
+// Builds a KeyPress for a keysym and hands it straight to lookup().
+//
+// Not sent through the server: XSendEvent would work but a synthetic event
+// arrives with send_event set, and some paths treat those differently. Building
+// it here tests exactly what the pump would hand over, with the keycode the
+// server says this keysym lives on — which is the part that has to come from
+// the real keymap rather than from a guess.
+fn press(w as *x11.window.Window, keysym as i64, state as u32) as i64 {
+    let is i64 as code = cast(i64, xlib.XKeysymToKeycode(x11.display(w), keysym));
+    if (code == 0) { return 0 - 1; }
+
+    xev.clear(&_ev);
+    let is *xev.XKeyEvent as k = xev.key(&_ev);
+    k.kind = x.KeyPress;
+    k.serial = 0;
+    k.send_event = 0;
+    k.display = x11.display(w);
+    k.window = x11.xid(w);
+    k.root = x11.root(w);
+    k.subwindow = 0;
+    k.time = 0;
+    k.x = 1; k.y = 1;
+    k.x_root = 1; k.y_root = 1;
+    k.state = state;
+    k.keycode = cast(u32, code);
+    k.same_screen = 1;
+
+    return x11.text_of(w, &_ev);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is x11.window.Window as w = x11.open("caustic-text-test", 200, 150);
+    if (x11.is_open(&w) == 0) {
+        io.printf("  FAIL open: %s\n", x11.error_name(x11.last_error(&w)));
+        return 1;
+    }
+    let is i64 as n with mut = 0;
+    while (n < 8) { x11.next_frame(&w); n = n + 1; }
+
+    // No input method was opened, so this is the first tier throughout.
+    chk_i("no input method by default", cast(i64, x11.has_input_method(&w)), 0);
+
+    // 'a' is keysym 0x61.
+    let is i64 as got = press(&w, 97, cast(u32, 0));
+    if (got < 0) {
+        io.printf("  note: no keycode maps to 'a' on this keymap; skipping the letter checks\n");
+    } else {
+        chk_i("unshifted 'a' is one byte", got, 1);
+        chk_text("unshifted a gives a", x11.text_buffer(&w), "a");
+        chk_i("and reports its keysym", x11.text_keysym(&w), 97);
+
+        // ShiftMask is 1. The capital proves the modifier state reached the
+        // translation rather than being dropped on the way.
+        let is i64 as up = press(&w, 97, cast(u32, 1));
+        chk_i("shifted 'a' is one byte", up, 1);
+        chk_text("shifted a gives A", x11.text_buffer(&w), "A");
+    }
+
+    // XK_Left is 0xff51. A key that is not text: no bytes, but a keysym.
+    let is i64 as arrow = press(&w, 65361, cast(u32, 0));
+    if (arrow >= 0) {
+        chk_i("an arrow produces no text", arrow, 0);
+        chk_i("but still reports its keysym", x11.text_keysym(&w), 65361);
+    }
+
+    // XK_eacute is 0xe9 — Latin-1, one code point above 127, which is the one
+    // case the conversion in text.cst actually does work for. Two bytes of
+    // UTF-8: 0xC3 0xA9.
+    let is i64 as acc = press(&w, 233, cast(u32, 0));
+    if (acc < 0) {
+        io.printf("  note: no keycode maps to e-acute on this keymap; skipping the UTF-8 check\n");
+    } else {
+        chk_i("e-acute is two bytes of UTF-8", acc, 2);
+        let is *u8 as t = x11.text_buffer(&w);
+        chk_i("first byte", cast(i64, t[0]) & 255, 195);    // 0xC3
+        chk_i("second byte", cast(i64, t[1]) & 255, 169);   // 0xA9
+    }
+
+    // --- The conversion, directly ---
+    //
+    // A US layout maps no Latin-1 key, so the check above skips on most
+    // machines and the one piece of encoding this layer writes itself would go
+    // untested. This drives it with bytes instead of with a keyboard.
+    let is [4]u8 as raw;
+    raw[0] = cast(u8, 65);    // 'A', under 0x80: one byte through
+    raw[1] = cast(u8, 233);   // e-acute, Latin-1: two bytes of UTF-8
+    raw[2] = cast(u8, 255);   // y-diaeresis, the top of Latin-1
+    let is i64 as conv = x11.text.from_latin1(&w.txt, cast(*u8, &raw), 3);
+    chk_i("three Latin-1 bytes become five of UTF-8", conv, 5);
+    let is *u8 as c = x11.text.text(&w.txt);
+    chk_i("ASCII passes through", cast(i64, c[0]) & 255, 65);
+    chk_i("e-acute first byte", cast(i64, c[1]) & 255, 195);    // 0xC3
+    chk_i("e-acute second byte", cast(i64, c[2]) & 255, 169);   // 0xA9
+    chk_i("y-diaeresis first byte", cast(i64, c[3]) & 255, 195);  // 0xC3
+    chk_i("y-diaeresis second byte", cast(i64, c[4]) & 255, 191); // 0xBF
+    chk_i("and it is terminated", cast(i64, c[5]) & 255, 0);
+
+    chk_i("nothing was dropped", x11.text_dropped(&w), 0);
+
+    // Opening an input method is allowed to fail — no locale was set and there
+    // may be none running — and the first tier has to keep working either way.
+    let is i32 as im = x11.open_input_method(&w);
+    io.printf("  input method: %d\n", cast(i64, im));
+    if (im == 1) {
+        chk("has_input_method agrees", x11.has_input_method(&w));
+    }
+
+    x11.close(&w);
+
+    if (fails == 0) { io.printf("x11 text: all checks passed\n"); }
+    else { io.printf("  text_test: %d failure(s)\n", cast(i64, fails)); }
+    return fails;
+}

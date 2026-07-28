@@ -29,7 +29,7 @@ window/
   clipboard.cst   text and data
   native.cst      native handle accessors — the public contract
 
-  x11/      xlib.cst      + backend.cst      see x11/x11.md
+  x11/      done — 8 modules over bind/, see x11/x11.md
   wayland/  protocol.cst  + backend.cst      see wayland/wayland.md
   kms/      drm.cst       + backend.cst      see kms/kms.md
   win32/    user32.cst gdi32.cst + backend.cst   see win32/win32.md
@@ -115,15 +115,20 @@ while (window.next_frame(&w) == 1) {     // blocks until drawing is useful
 }
 ```
 
-On X11 `next_frame` returns immediately; on Wayland it waits for the frame
-callback; on KMS it waits for vblank.
+On Wayland `next_frame` waits for the frame callback and on KMS it waits for
+vblank. On X11 it returns immediately **on the socket path** — and blocks when
+both MIT-SHM buffers are still being read, because `XShmPutImage` returns before
+the server has finished with the segment. That was a surprise: MIT-SHM makes X11
+behave like Wayland, and the same two-buffer-plus-release handling applies. See
+[`x11/x11.md`](x11/x11.md).
 
 ---
 
 ## Buffer ownership differs, and that follows too
 
-- **X11**: `XPutImage` copies synchronously, so one buffer is enough. (With
-  MIT-SHM the copy is a shared mapping instead of a socket write — see below.)
+- **X11**: on the socket path `XPutImage` copies synchronously, so one buffer is
+  enough. Under MIT-SHM it does not copy at all, and X11 needs two buffers and
+  release tracking exactly as Wayland does.
 - **Wayland**: the compositor may still be reading the buffer you just
   committed. Touching it before `wl_buffer.release` arrives corrupts the frame
   on screen. Two buffers minimum, with release tracking.
@@ -168,8 +173,8 @@ Therefore the native handles are **public contract**, not an implementation
 detail:
 
 ```cst
-window.x11.display(&w)      // Display*
-window.x11.xid(&w)          // Window
+window.x11.display(&w)      // Display*     — implemented
+window.x11.xid(&w)          // Window       — implemented
 window.wayland.display(&w)  // wl_display*
 window.wayland.surface(&w)  // wl_surface*
 window.win32.hwnd(&w)       // HWND
@@ -206,10 +211,11 @@ declaration nobody can call.
 
 **Caustic has no unions, and X11's event model is one.** `XEvent` is a union of
 33 event structs sharing a common header. The options are offset accessors —
-what `x11.cst` does today — or generating 33 structs plus a discriminator. The
-first is compact and the second is safer; either way a wrong offset is silent
-memory corruption rather than a compile error, which is the strongest argument
-for generating both from the headers rather than typing them.
+the first thing `x11.cst` did — or spelling out 33 structs plus a discriminator.
+`x11/bind/xevent.cst` took the second: the union is 192 bytes of storage and one
+pointer cast per member, so the cast *is* the union and nothing copies. Either
+way a wrong offset is silent memory corruption rather than a compile error,
+which is why the offsets come from the C compiler and 565 assertions check them.
 
 **Wayland is not a function API.** `libwayland-client` exports only 63 symbols
 because the protocol is *data*: everything goes through
@@ -306,11 +312,71 @@ better discovered with one platform than with three.
 
 ## Current state
 
-`x11.cst` is a working backend covering 22 of libX11's 774 functions — enough
-to open a window, read input and blit a software-rendered frame. It is shaped
-around the push model described above, which is the wrong shape, and it treats
-the window as owning a single surface, which Wayland cannot honour.
+`x11/` is finished and tested: **1030 of the 1035 functions** across libX11,
+libXext, libXrandr, libXcursor, libXfixes and libXi, plus a window layer built on
+top of them that is pull-shaped, hands out a per-frame buffer, and exposes its
+native handles. It presents through MIT-SHM with a socket fallback, and it has
+cursors, clipboard and monitor enumeration. [`x11/x11.md`](x11/x11.md) has the
+detail.
 
-It should be reshaped to pull + per-frame buffer + native handles **before** a
-second backend exists. Reshaping one implementation is cheap; reshaping three is
-a migration.
+The five unbound exports are named there rather than left as a silent gap: each
+is exported without a leading `_` but declared in no shipped public header, and
+binding one would mean inventing a prototype.
+
+**A window is whatever size the window manager says it is**, and that turned out
+to be the backend's sharpest edge rather than a detail. A tiling compositor
+grants 1366×768 for a 640×480 request, immediately, before the program has drawn
+anything. The backend used to record the new width and height on
+`ConfigureNotify` and stop there, which broke two things at once and neither of
+them loudly:
+
+- The scratch buffer stayed its original size while `present` walked
+  `height` rows at a stride of `width`, writing megabytes past the end of the
+  mapping on every frame.
+- The `XImage` kept its original `bytes_per_line` while `XPutImage` was told
+  the image had grown, so the server read every row at the wrong offset. On
+  screen that is interleaved banding; in the code it is nothing at all.
+
+Both are fixed, and the fix is now a test rather than a memory: `x11_test.cst`
+fills a frame with a known pattern, submits it, reads the window back with
+`XGetImage` and compares byte for byte — at 640×480, 641×481 and 1023×769,
+because non-multiples of four are where the stride assumption breaks. A
+screenshot would have shown the banding without ever saying whose fault it was,
+and the first two guesses were both wrong.
+
+Three things this cost that are worth writing down for whoever does Wayland:
+
+**Packed structs are the hardest part of a binding, not the FFI.** Caustic
+structs have no alignment padding and C structs do, so all 82 bound structs carry
+explicit `_padN` fields. A missing one is silent memory corruption with no
+diagnostic. The defence is `tools/x11_layout.c`, which asks the C compiler for
+every offset, and 565 assertions that check the compiler's layout against it.
+
+**Declaring a binding is free; importing a module that calls one is not.** The
+compiler emits a library import at the call site, so `bind/` can declare a
+thousand symbols and a program that opens a window still links two libraries. But
+importing a *module* that calls into an extension makes that extension reachable
+from `main` even when nothing calls the module, and lazy initialisation does not
+help. That is why `x11/cursor.cst` and `x11/monitors.cst` are not wired into the
+window and a program takes them directly.
+
+**The toolchain has a ceiling worth knowing about.** A single binary importing
+more than roughly 256 distinct extern symbols gets PLT relocations for every
+soname but a `DT_NEEDED` entry for only the first, and dies at `exec` naming a
+function whose library was never recorded. The link tests are one binary per
+shared object because of it.
+
+---
+
+## Order of work, from here
+
+1. **KMS.** 111 ioctls, no FFI, no generator, no dependency. Proves the pull
+   presentation model in its rawest form and is the backend CausticOS needs.
+2. **Vulkan against X11**, which now has the native-handle contract to build on.
+   It is the GPU path that proves whether that contract is right, and that is
+   better discovered with one platform than with three.
+3. **The C header generator.** `bind/` was written by hand; the layout table and
+   the symbol manifest are already the shape a generator would consume, and DRM
+   and Win32 would come out of the same tool.
+4. **The Wayland XML generator**, plus the `sendmsg`/`memfd` syscalls.
+5. **Win32**, through the same header generator, verified under wine.

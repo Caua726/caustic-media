@@ -1,0 +1,153 @@
+// window/x11/bind/xshm.cst — MIT-SHM, and the four syscalls it is built on.
+//
+// The socket path sends the whole framebuffer through the X connection every
+// frame: 1.2 MB at 640x480, 8 MB at 1080p, every frame, forever. MIT-SHM
+// replaces that with a mapping both processes can see, so presenting costs a
+// request header instead of a framebuffer.
+//
+// The extension is 10 functions in libXext. What it is *built on* is System V
+// shared memory, which is four Linux syscalls and no library at all — so those
+// are here too, in the same file, because they are not separable: an
+// XShmSegmentInfo is meaningless without the shmid that shmget returned.
+//
+// --- Why the syscalls live here rather than in std/ ---
+//
+// They belong in std/os/linux.cst, which is where read, mmap and the rest are,
+// and ../../window.md already makes the same observation about sendmsg and
+// memfd_create for the Wayland backend. They are here because std/ does not
+// have them yet and this layer is not the right place to decide what std/
+// grows. Moving them later is a rename.
+//
+// They are raw syscalls rather than libc calls for the reason the whole project
+// is: a Caustic binary is a static, zero-dependency ELF, and pulling in libc
+// for shmget would put 2 MB in the address space of a program whose identity is
+// not having it. `syscall` is Linux-only and the compiler rejects it on other
+// targets, which is correct — SysV shared memory is not portable either.
+//
+// --- The asynchronous failure ---
+//
+// XShmAttach returns True and fails anyway. The real answer is a BadAccess
+// error that arrives later, because X errors are asynchronous, and a backend
+// that trusts the return value works on the developer's machine and produces a
+// blank window inside a Flatpak or a container with a different IPC namespace,
+// with no diagnostic at all.
+//
+// The only way to know is to install an error handler, XSync to force the round
+// trip, and see whether one arrived. ../surface.cst does exactly that, once, at
+// open. It costs one round trip and it is not optional.
+use "std/os.cst" as os;
+
+// --- The extension ---
+//
+// libXext, not libX11. A program that never opens a window links neither, and a
+// program that opens one on the socket path links only libX11 — the import is
+// emitted at the call site, so declaring these costs nothing until surface.cst
+// actually reaches the SHM branch.
+
+extern "libXext.so.6" fn XShmQueryExtension(dpy as *u8) as i32;
+extern "libXext.so.6" fn XShmQueryVersion(dpy as *u8, majorVersion as *u8,
+                                          minorVersion as *u8, sharedPixmaps as *u8) as i32;
+extern "libXext.so.6" fn XShmGetEventBase(dpy as *u8) as i32;
+extern "libXext.so.6" fn XShmPixmapFormat(dpy as *u8) as i32;
+extern "libXext.so.6" fn XShmAttach(dpy as *u8, shminfo as *u8) as i32;
+extern "libXext.so.6" fn XShmDetach(dpy as *u8, shminfo as *u8) as i32;
+extern "libXext.so.6" fn XShmCreateImage(dpy as *u8, visual as *u8, depth as u32,
+                                         format as i32, data as *u8, shminfo as *u8,
+                                         width as u32, height as u32) as *u8;
+extern "libXext.so.6" fn XShmPutImage(dpy as *u8, d as i64, gc as *u8, image as *u8,
+                                      src_x as i32, src_y as i32, dst_x as i32, dst_y as i32,
+                                      src_width as u32, src_height as u32,
+                                      send_event as i32) as i32;
+extern "libXext.so.6" fn XShmGetImage(dpy as *u8, d as i64, image as *u8,
+                                      x as i32, y as i32, plane_mask as i64) as i32;
+extern "libXext.so.6" fn XShmCreatePixmap(dpy as *u8, d as i64, data as *u8, shminfo as *u8,
+                                          width as u32, height as u32, depth as u32) as i64;
+
+// --- The segment descriptor ---
+//
+// Caller-owned, and it has to OUTLIVE the XImage that references it: the server
+// keeps reading this struct after XShmAttach returns, so a version of it on the
+// stack of the function that attached is a use-after-free that works right up
+// until the stack is reused. surface.cst embeds it in the Buffer for exactly
+// that reason.
+struct XShmSegmentInfo {
+    shmseg   as i64;    //  0   the server's id for the segment
+    shmid    as i32;    //  8   ours, from shmget
+    _pad0    as i32;    // 12
+    shmaddr  as *u8;    // 16   where shmat put it
+    readOnly as i32;    // 24
+    _pad1    as i32;    // 28
+}                       // 32
+
+// The event the server sends when it has finished reading a buffer. Its type is
+// XShmGetEventBase(dpy) + ShmCompletion, which is not a constant: the base is
+// assigned when the extension is initialised on that connection.
+let is i32 as ShmCompletion with imut = 0;
+
+struct XShmCompletionEvent {
+    kind       as i32;    //  0   `type` in C
+    _pad0      as i32;    //  4
+    serial     as i64;    //  8
+    send_event as i32;    // 16
+    _pad1      as i32;    // 20
+    display    as *u8;    // 24
+    drawable   as i64;    // 32
+    major_code as i32;    // 40
+    minor_code as i32;    // 44
+    shmseg     as i64;    // 48
+    offset     as i64;    // 56
+}                         // 64
+
+// --- System V shared memory ---
+//
+// x86_64 syscall numbers. aarch64 has no SysV shm syscalls at all — it uses the
+// ipc() multiplexer — so this is x86_64 Linux and says so rather than producing
+// a wrong number somewhere else.
+
+let is i64 as SYS_shmget with imut = 29;
+let is i64 as SYS_shmat  with imut = 30;
+let is i64 as SYS_shmctl with imut = 31;
+let is i64 as SYS_shmdt  with imut = 67;
+
+let is i64 as IPC_PRIVATE with imut = 0;
+let is i64 as IPC_RMID    with imut = 0;
+let is i64 as IPC_CREAT   with imut = 512;    // 01000
+
+// 0600: this process only. A segment the X server can attach to does not need
+// to be world-readable — the server runs as the same user, or MIT-SHM would not
+// be available in the first place.
+let is i64 as SHM_MODE with imut = 384;       // 0600
+
+fn available() as i32 {
+    if (os.current() == os.OS_LINUX) { return 1; }
+    return 0;
+}
+
+// A new private segment. Returns the id, or negative on failure.
+fn shmget(size as i64) as i64 {
+    if (os.current() != os.OS_LINUX) { return 0 - 1; }
+    return syscall(SYS_shmget, IPC_PRIVATE, size, IPC_CREAT | SHM_MODE);
+}
+
+// Maps it. Returns the address, or -1 as an integer — which is why the caller
+// compares against -1 rather than against 0.
+fn shmat(id as i64) as *u8 {
+    if (os.current() != os.OS_LINUX) { return cast(*u8, 0); }
+    return cast(*u8, syscall(SYS_shmat, id, 0, 0));
+}
+
+fn shmdt(addr as *u8) as i64 {
+    if (os.current() != os.OS_LINUX) { return 0 - 1; }
+    return syscall(SYS_shmdt, cast(i64, addr), 0, 0);
+}
+
+// Marks the segment for destruction. Called IMMEDIATELY after attaching, not at
+// close: a segment marked this way disappears when the last process detaches,
+// so the mapping stays valid for as long as it is used and the kernel reclaims
+// it even if this process is killed. Deferring it to close is how a machine
+// accumulates orphaned segments that only `ipcrm` clears, and it is the step
+// every implementation forgets.
+fn shmrmid(id as i64) as i64 {
+    if (os.current() != os.OS_LINUX) { return 0 - 1; }
+    return syscall(SYS_shmctl, id, IPC_RMID, 0);
+}

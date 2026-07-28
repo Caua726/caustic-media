@@ -1,0 +1,152 @@
+// window/x11/framesync.cst — telling the compositor when a frame is ready.
+//
+// The problem it solves is visible and everyone has seen it: drag a window's
+// edge and the contents lag, tear, or flash the old size for a frame. That
+// happens because a resize is two parties doing two things at once — the
+// compositor changing the frame, the client redrawing its contents — with
+// nothing keeping them in step.
+//
+// `_NET_WM_SYNC_REQUEST` is the agreement. The compositor sends a number with
+// the configure; the client draws; the client sets a counter to that number.
+// Until the counter moves, the compositor keeps showing the last complete
+// frame instead of a half-drawn one.
+//
+// --- Which half of the protocol this is ---
+//
+// The basic one, not the extended. Basic is: the value arrives, the client
+// sets the counter to exactly that value once the frame is on screen. Extended
+// adds a second counter and odd/even parity so the compositor can tell drawing
+// from idle, and it exists to let a compositor throttle a client that is
+// falling behind. It is worth having later; it is not what stops a resize from
+// flickering, and doing it wrong is worse than not doing it.
+//
+// --- It costs no new library ---
+//
+// The SYNC extension lives in libXext, which is already in the DT_NEEDED of
+// any window that presents through MIT-SHM. bind/xsync.cst is the binding.
+//
+// --- And what it is NOT ---
+//
+// Not vsync, and not a frame limiter. Nothing here makes next_frame wait for
+// the display's refresh: libX11 has no way to ask. That is the Present
+// extension, which lives in libxcb rather than here. window.cst's own limiter
+// is a clock, and says so.
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+use "bind/xsync.cst" as xsync;
+
+struct State {
+    ready       as i32;   // the extension is present and the counter exists
+    have_value  as i32;   // a request arrived and has not been answered
+    counter     as i64;   // XSyncCounter
+    value_lo    as i64;   // the value the compositor asked us to set
+    value_hi    as i64;
+    atom_request as i64;  // _NET_WM_SYNC_REQUEST
+    atom_counter as i64;  // _NET_WM_SYNC_REQUEST_COUNTER
+    answered    as i64;   // how many requests have been completed
+}
+
+// Creates the counter and advertises it, returning 1 when the whole thing is
+// in place. Zero means the server has no SYNC extension, and everything below
+// then does nothing — which is correct: a compositor that never sends a
+// request never needs an answer.
+//
+// The counter starts at zero. The compositor sends the value it wants; we
+// never invent one.
+fn init(st as *State, d as *u8, xid as i64) as i32 {
+    st.ready = 0;
+    st.have_value = 0;
+    st.counter = 0;
+    st.value_lo = 0;
+    st.value_hi = 0;
+    st.answered = 0;
+    st.atom_request = 0;
+    st.atom_counter = 0;
+
+    let is i32 as major with mut = 0;
+    let is i32 as minor with mut = 0;
+    if (xsync.XSyncInitialize(d, cast(*u8, &major), cast(*u8, &minor)) == 0) {
+        return 0;
+    }
+
+    // XSyncValue is two ints in one 64-bit register, so zero is zero.
+    st.counter = xsync.XSyncCreateCounter(d, 0);
+    if (st.counter == 0) { return 0; }
+
+    st.atom_request = xlib.XInternAtom(d, "_NET_WM_SYNC_REQUEST", 0);
+    st.atom_counter = xlib.XInternAtom(d, "_NET_WM_SYNC_REQUEST_COUNTER", 0);
+    if (st.atom_request == 0 || st.atom_counter == 0) {
+        xsync.XSyncDestroyCounter(d, st.counter);
+        st.counter = 0;
+        return 0;
+    }
+
+    // The property is the counter's id, as a 32-bit CARDINAL. A compositor
+    // reads it to know which counter to watch, and a window without it is one
+    // that never gets a request.
+    let is i64 as cardinal = xlib.XInternAtom(d, "CARDINAL", 0);
+    let is i64 as id = st.counter;
+    xlib.XChangeProperty(d, xid, st.atom_counter, cardinal, 32, x.PropModeReplace,
+                         cast(*u8, &id), 1);
+
+    st.ready = 1;
+    return 1;
+}
+
+fn available(st as *State) as i32 { return st.ready; }
+fn counter(st as *State) as i64 { return st.counter; }
+fn answered(st as *State) as i64 { return st.answered; }
+fn pending(st as *State) as i32 { return st.have_value; }
+
+// The atom a window's WM_PROTOCOLS has to list, so window.cst can advertise it
+// alongside WM_DELETE_WINDOW. A compositor will not send a request to a window
+// that has not said it understands one.
+fn protocol_atom(st as *State) as i64 { return st.atom_request; }
+
+fn close(st as *State, d as *u8) as void {
+    if (st.ready == 0) { return; }
+    if (st.counter != 0) { xsync.XSyncDestroyCounter(d, st.counter); }
+    st.counter = 0;
+    st.ready = 0;
+    st.have_value = 0;
+}
+
+// --- The two halves of the exchange ---
+
+// 1 when this event was a sync request and was absorbed.
+//
+// The message arrives as WM_PROTOCOLS with _NET_WM_SYNC_REQUEST in data[0] and
+// the value split across data[2] and data[3] — low word first, because the
+// protocol predates anyone worrying about 64-bit and the two halves are sent
+// as separate CARD32s.
+fn handle(st as *State, e as *xev.XEvent, wm_protocols as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    if (xev.kind(e) != x.ClientMessage) { return 0; }
+    let is *xev.XClientMessageEvent as c = xev.client(e);
+    if (c.message_type != wm_protocols) { return 0; }
+    if (c.data[0] != st.atom_request) { return 0; }
+
+    st.value_lo = c.data[2];
+    st.value_hi = c.data[3];
+    st.have_value = 1;
+    return 1;
+}
+
+// Answers the outstanding request, if there is one. Called after the frame is
+// on screen — that is the whole meaning of the counter, and setting it before
+// presenting says the frame is ready when it is not.
+//
+// Does nothing when no request is outstanding, which is the common case: a
+// compositor sends one per resize, not one per frame.
+fn complete(st as *State, d as *u8) as i32 {
+    if (st.ready == 0 || st.have_value == 0) { return 0; }
+    // Back into the one register XSyncValue travels in: high word up, low word
+    // masked to 32 bits so a negative low half does not bleed upward.
+    let is i64 as v = (st.value_hi << 32) | (st.value_lo & 4294967295);
+    xsync.XSyncSetCounter(d, st.counter, v);
+    xlib.XFlush(d);
+    st.have_value = 0;
+    st.answered = st.answered + 1;
+    return 1;
+}

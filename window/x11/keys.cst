@@ -1,0 +1,259 @@
+// window/x11/keys.cst — from a key that was pressed to a key you can name.
+//
+// X reports a keycode, which is a number the keyboard hardware assigns to a
+// physical key and which means nothing on its own: 38 is `a` on a QWERTY
+// layout, `q` on AZERTY, and something else again on Dvorak. What a key
+// *produces* is a keysym, and the mapping between them belongs to the X server
+// and changes while the program runs — someone switching layout mid-session is
+// ordinary.
+//
+// So this module holds a cache of that mapping, and refreshes it when the
+// server says it changed. Without the cache every key event costs a round trip;
+// without the refresh, the program keeps reporting the old layout forever with
+// no sign anything is wrong.
+//
+// --- What a key id is here ---
+//
+// The keysym at the unshifted level, unchanged. That means:
+//
+//   letters and digits are their ASCII codes, lowercase — `a` is 97 whether or
+//   not shift was held, so a keybinding does not need to know about case
+//   special keys are the 0xff.. range keysymdef.h assigns them, exposed below
+//   as named constants
+//
+// Two things it deliberately is NOT. It is not a physical position: a program
+// that wants WASD-as-position rather than WASD-as-letters wants scancodes, and
+// that is XKB's business in xkblib.cst, not this file's. And it is not text:
+// the character a keypress produces involves shift, level 3, dead keys and
+// compose sequences, which is XLookupString and the input-method family. A key
+// id answers "which key", not "what did it type".
+//
+// ../../window.md draws the line this file sits on: window/ delivers "key 38
+// pressed, and 38 means `a`", and input/ turns that into "the JUMP action is
+// active". Nothing here knows what an action is.
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+
+// X keycodes are one byte, and the server reports a usable range inside it
+// (8..255 on every Linux server in practice). Caching the whole byte costs 2 KB
+// and removes the bounds question entirely.
+let is i64 as KEYCODE_COUNT with imut = 256;
+
+struct Map {
+    // keycode -> keysym at the unshifted level. 0 where the key produces
+    // nothing, which is most of the range on most keyboards.
+    sym   as [256]i64;
+    min   as i32;
+    max   as i32;
+    ready as i32;
+    _pad0 as i32;
+}
+
+// --- Named keys ---
+//
+// keysymdef.h's values, unchanged, so a program can compare against these or
+// against a raw keysym it got from anywhere else and both work. The printable
+// ASCII range needs no names: `a` is 97 and writing 97 is worse than writing
+// keys.A, so the letters and digits are here too.
+
+let is i32 as UNKNOWN with imut = 0;
+
+// Latin-1 printable, which is ASCII in this range.
+let is i32 as SPACE        with imut = 32;
+let is i32 as APOSTROPHE   with imut = 39;
+let is i32 as COMMA        with imut = 44;
+let is i32 as MINUS        with imut = 45;
+let is i32 as PERIOD       with imut = 46;
+let is i32 as SLASH        with imut = 47;
+let is i32 as NUM_0 with imut = 48;
+let is i32 as NUM_1 with imut = 49;
+let is i32 as NUM_2 with imut = 50;
+let is i32 as NUM_3 with imut = 51;
+let is i32 as NUM_4 with imut = 52;
+let is i32 as NUM_5 with imut = 53;
+let is i32 as NUM_6 with imut = 54;
+let is i32 as NUM_7 with imut = 55;
+let is i32 as NUM_8 with imut = 56;
+let is i32 as NUM_9 with imut = 57;
+let is i32 as SEMICOLON    with imut = 59;
+let is i32 as EQUAL        with imut = 61;
+let is i32 as LEFT_BRACKET with imut = 91;
+let is i32 as BACKSLASH    with imut = 92;
+let is i32 as RIGHT_BRACKET with imut = 93;
+let is i32 as GRAVE        with imut = 96;
+
+let is i32 as A with imut = 97;
+let is i32 as B with imut = 98;
+let is i32 as C with imut = 99;
+let is i32 as D with imut = 100;
+let is i32 as E with imut = 101;
+let is i32 as F with imut = 102;
+let is i32 as G with imut = 103;
+let is i32 as H with imut = 104;
+let is i32 as I with imut = 105;
+let is i32 as J with imut = 106;
+let is i32 as K with imut = 107;
+let is i32 as L with imut = 108;
+let is i32 as M with imut = 109;
+let is i32 as N with imut = 110;
+let is i32 as O with imut = 111;
+let is i32 as P with imut = 112;
+let is i32 as Q with imut = 113;
+let is i32 as R with imut = 114;
+let is i32 as S with imut = 115;
+let is i32 as T with imut = 116;
+let is i32 as U with imut = 117;
+let is i32 as V with imut = 118;
+let is i32 as W with imut = 119;
+let is i32 as X with imut = 120;
+let is i32 as Y with imut = 121;
+let is i32 as Z with imut = 122;
+
+// The 0xff.. range: keys that produce no character.
+let is i32 as BACKSPACE with imut = 65288;   // 0xff08
+let is i32 as TAB       with imut = 65289;   // 0xff09
+let is i32 as RETURN    with imut = 65293;   // 0xff0d
+let is i32 as PAUSE     with imut = 65299;   // 0xff13
+let is i32 as ESCAPE    with imut = 65307;   // 0xff1b
+let is i32 as HOME      with imut = 65360;   // 0xff50
+let is i32 as LEFT      with imut = 65361;   // 0xff51
+let is i32 as UP        with imut = 65362;   // 0xff52
+let is i32 as RIGHT     with imut = 65363;   // 0xff53
+let is i32 as DOWN      with imut = 65364;   // 0xff54
+let is i32 as PAGE_UP   with imut = 65365;   // 0xff55
+let is i32 as PAGE_DOWN with imut = 65366;   // 0xff56
+let is i32 as END       with imut = 65367;   // 0xff57
+let is i32 as INSERT    with imut = 65379;   // 0xff63
+let is i32 as MENU      with imut = 65383;   // 0xff67
+let is i32 as NUM_LOCK  with imut = 65407;   // 0xff7f
+
+let is i32 as F1  with imut = 65470;   // 0xffbe
+let is i32 as F2  with imut = 65471;
+let is i32 as F3  with imut = 65472;
+let is i32 as F4  with imut = 65473;
+let is i32 as F5  with imut = 65474;
+let is i32 as F6  with imut = 65475;
+let is i32 as F7  with imut = 65476;
+let is i32 as F8  with imut = 65477;
+let is i32 as F9  with imut = 65478;
+let is i32 as F10 with imut = 65479;
+let is i32 as F11 with imut = 65480;
+let is i32 as F12 with imut = 65481;   // 0xffc9
+
+let is i32 as SHIFT_L   with imut = 65505;   // 0xffe1
+let is i32 as SHIFT_R   with imut = 65506;
+let is i32 as CONTROL_L with imut = 65507;
+let is i32 as CONTROL_R with imut = 65508;
+let is i32 as CAPS_LOCK with imut = 65509;
+let is i32 as ALT_L     with imut = 65513;   // 0xffe9
+let is i32 as ALT_R     with imut = 65514;
+let is i32 as SUPER_L   with imut = 65515;   // 0xffeb
+let is i32 as SUPER_R   with imut = 65516;
+let is i32 as DELETE    with imut = 65535;   // 0xffff
+
+// --- Modifiers ---
+//
+// X reports the raw modifier mask in the event's `state` field, where Mod1 and
+// Mod4 are whatever the keyboard's modifier map says they are. On every desktop
+// Linux that is Alt and Super, and the mapping to be sure would be
+// XGetModifierMapping — which this layer does not do yet, and says so rather
+// than pretending the answer is certain.
+
+let is i32 as MOD_SHIFT   with imut = 1;
+let is i32 as MOD_CONTROL with imut = 2;
+let is i32 as MOD_ALT     with imut = 4;
+let is i32 as MOD_SUPER   with imut = 8;
+let is i32 as MOD_CAPS    with imut = 16;
+let is i32 as MOD_NUM     with imut = 32;
+
+// The event's state field, folded to the six that programs actually branch on.
+fn modifiers_of(state as u32) as i32 {
+    let is i64 as s = cast(i64, state);
+    let is i32 as m with mut = 0;
+    if ((s & cast(i64, x.ShiftMask))   != 0) { m = m | MOD_SHIFT; }
+    if ((s & cast(i64, x.ControlMask)) != 0) { m = m | MOD_CONTROL; }
+    if ((s & cast(i64, x.Mod1Mask))    != 0) { m = m | MOD_ALT; }
+    if ((s & cast(i64, x.Mod4Mask))    != 0) { m = m | MOD_SUPER; }
+    if ((s & cast(i64, x.LockMask))    != 0) { m = m | MOD_CAPS; }
+    if ((s & cast(i64, x.Mod2Mask))    != 0) { m = m | MOD_NUM; }
+    return m;
+}
+
+// --- The mapping ---
+
+// Fills the cache from the server. Called at open and again on every
+// MappingNotify, which is what a layout switch produces.
+fn refresh(m as *Map, d as *u8) as i32 {
+    let is i32 as lo with mut = 8;
+    let is i32 as hi with mut = 255;
+    xlib.XDisplayKeycodes(d, &lo, &hi);
+    if (lo < 0) { lo = 0; }
+    if (hi > 255) { hi = 255; }
+    if (hi < lo) { m.ready = 0; return 0; }
+
+    m.min = lo;
+    m.max = hi;
+
+    let is i64 as i with mut = 0;
+    while (i < KEYCODE_COUNT) { m.sym[i] = 0; i = i + 1; }
+
+    // Index 0 is the unshifted level. XKeycodeToKeysym is deprecated in favour
+    // of XkbKeycodeToKeysym, which lives in XKBlib.h and arrives with
+    // bind/xkblib.cst; the two agree for level 0, which is all this wants.
+    let is i64 as kc with mut = cast(i64, lo);
+    while (kc <= cast(i64, hi)) {
+        m.sym[kc] = xlib.XKeycodeToKeysym(d, cast(u8, kc), 0);
+        kc = kc + 1;
+    }
+    m.ready = 1;
+    return 1;
+}
+
+fn init(m as *Map, d as *u8) as i32 {
+    m.min = 0; m.max = 0; m.ready = 0;
+    return refresh(m, d);
+}
+
+// A keycode from an event to a key id. Out-of-range and unmapped keys are
+// UNKNOWN rather than an error: a keyboard with a key this server has no keysym
+// for is a real thing, and a program should be able to ignore it without
+// checking first.
+fn id_of(m as *Map, keycode as u32) as i32 {
+    let is i64 as kc = cast(i64, keycode);
+    if (kc < 0 || kc >= KEYCODE_COUNT) { return UNKNOWN; }
+    let is i64 as s = m.sym[kc];
+    if (s == 0) { return UNKNOWN; }
+    // Keysyms above 32 bits do not exist; anything that would not fit is not
+    // a key this layer can name.
+    if (s < 0 || s > 2147483647) { return UNKNOWN; }
+    return cast(i32, s);
+}
+
+// For logging and for tests. Returns a static string, never null.
+fn name(id as i32) as *u8 {
+    if (id == UNKNOWN)   { return "unknown"; }
+    if (id == SPACE)     { return "space"; }
+    if (id == ESCAPE)    { return "escape"; }
+    if (id == RETURN)    { return "return"; }
+    if (id == TAB)       { return "tab"; }
+    if (id == BACKSPACE) { return "backspace"; }
+    if (id == DELETE)    { return "delete"; }
+    if (id == LEFT)      { return "left"; }
+    if (id == RIGHT)     { return "right"; }
+    if (id == UP)        { return "up"; }
+    if (id == DOWN)      { return "down"; }
+    if (id == HOME)      { return "home"; }
+    if (id == END)       { return "end"; }
+    if (id == PAGE_UP)   { return "page up"; }
+    if (id == PAGE_DOWN) { return "page down"; }
+    if (id == INSERT)    { return "insert"; }
+    if (id == SHIFT_L || id == SHIFT_R)     { return "shift"; }
+    if (id == CONTROL_L || id == CONTROL_R) { return "control"; }
+    if (id == ALT_L || id == ALT_R)         { return "alt"; }
+    if (id == SUPER_L || id == SUPER_R)     { return "super"; }
+    if (id == CAPS_LOCK) { return "caps lock"; }
+    if (id >= F1 && id <= F12) { return "function key"; }
+    if (id >= A && id <= Z)         { return "letter"; }
+    if (id >= NUM_0 && id <= NUM_9) { return "digit"; }
+    return "other";
+}

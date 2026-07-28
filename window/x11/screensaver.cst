@@ -1,0 +1,155 @@
+// window/x11/screensaver.cst — not blanking the screen out from under a game.
+//
+// A program running fullscreen with a gamepad in hand sends no key events and
+// no pointer motion, so the server's idle timer keeps counting and the screen
+// blanks in the middle of play. Every game has to ask not to be blanked, and
+// MIT-SCREEN-SAVER is how it asks on X11.
+//
+// --- Suspension is a counter, and that is the whole API design ---
+//
+// `XScreenSaverSuspend(dpy, True)` increments a per-client counter and `False`
+// decrements it. Two suspends and one resume leaves the screensaver still
+// suspended, which is the correct behaviour — two subsystems each wanting the
+// screen awake should not be able to undo each other — and the wrong behaviour
+// if a program treats it as a boolean.
+//
+// So this keeps the depth and refuses to go below zero. `inhibit()` and
+// `release()` nest; `release_all()` unwinds however deep it got, which is what
+// close() wants.
+//
+// The server also drops a client's suspensions when the connection goes,
+// including when the process crashes. That is worth knowing: a program that
+// dies mid-game does not leave the machine unable to blank its screen.
+//
+// --- Why it does not know what a Window is ---
+//
+// Same rule as cursor.cst, monitors.cst and wm.cst: display in, no Window. And
+// unlike wm.cst it reaches a second shared object, so window.cst does NOT
+// import it — see the note at the bottom of window.cst about what an import
+// costs in DT_NEEDED. A program that wants it reaches for it directly:
+//
+//     use "…/window/x11/screensaver.cst" as screensaver;
+//
+//     let is screensaver.State as ss;
+//     screensaver.init(&ss, x11.display(&w));
+//     screensaver.inhibit(&ss, x11.display(&w));
+use "bind/xscrnsaver.cst" as xss;
+use "bind/xlib.cst" as xlib;
+
+struct State {
+    ready      as i32;   // the extension answered
+    depth      as i32;   // how many nested inhibits are outstanding
+    event_base as i32;
+    error_base as i32;
+    major      as i32;
+    minor      as i32;
+    info       as *u8;   // XScreenSaverInfo*, allocated by the extension
+}
+
+// Returns 1 when the extension is present. A server without it is not an
+// error: it simply cannot blank, or blanks in a way no client can influence,
+// and every call below then does nothing and says so.
+fn init(st as *State, d as *u8) as i32 {
+    st.ready = 0;
+    st.depth = 0;
+    st.event_base = 0;
+    st.error_base = 0;
+    st.major = 0;
+    st.minor = 0;
+    st.info = cast(*u8, 0);
+
+    if (xss.XScreenSaverQueryExtension(d, cast(*u8, &st.event_base),
+                                       cast(*u8, &st.error_base)) == 0) {
+        return 0;
+    }
+    if (xss.XScreenSaverQueryVersion(d, cast(*u8, &st.major),
+                                     cast(*u8, &st.minor)) == 0) {
+        return 0;
+    }
+    st.ready = 1;
+    return 1;
+}
+
+fn available(st as *State) as i32 { return st.ready; }
+fn version_major(st as *State) as i32 { return st.major; }
+fn version_minor(st as *State) as i32 { return st.minor; }
+fn depth(st as *State) as i32 { return st.depth; }
+
+// --- Keeping the screen awake ---
+
+// One more reason not to blank. Nests: call it twice and the screen stays
+// awake until release() has run twice.
+fn inhibit(st as *State, d as *u8) as i32 {
+    if (st.ready == 0) { return 0; }
+    xss.XScreenSaverSuspend(d, 1);
+    xlib.XFlush(d);
+    st.depth = st.depth + 1;
+    return 1;
+}
+
+// One reason fewer. Does nothing at depth zero rather than sending a decrement
+// the server would apply to somebody else's suspension — the counter is
+// per-client, and driving it negative from here would let a later inhibit
+// silently fail to take effect.
+fn release(st as *State, d as *u8) as i32 {
+    if (st.ready == 0) { return 0; }
+    if (st.depth <= 0) { return 0; }
+    xss.XScreenSaverSuspend(d, 0);
+    xlib.XFlush(d);
+    st.depth = st.depth - 1;
+    return 1;
+}
+
+// Unwinds however deep it got. What a close path wants: the program is going
+// away and should leave the counter where it found it.
+fn release_all(st as *State, d as *u8) as i32 {
+    if (st.ready == 0) { return 0; }
+    let is i32 as n = st.depth;
+    while (st.depth > 0) {
+        xss.XScreenSaverSuspend(d, 0);
+        st.depth = st.depth - 1;
+    }
+    if (n > 0) { xlib.XFlush(d); }
+    return n;
+}
+
+fn close(st as *State, d as *u8) as void {
+    release_all(st, d);
+    if (cast(i64, st.info) != 0) {
+        xlib.XFree(st.info);
+        st.info = cast(*u8, 0);
+    }
+    st.ready = 0;
+}
+
+// --- How long the user has been away ---
+//
+// The other half of the extension, and the reason a program might want it: an
+// editor that autosaves when idle, or a game that pauses itself. The info
+// struct is allocated by the extension rather than by us, once, and reused.
+
+fn _need_info(st as *State) as i32 {
+    if (cast(i64, st.info) != 0) { return 1; }
+    st.info = xss.XScreenSaverAllocInfo();
+    if (cast(i64, st.info) == 0) { return 0; }
+    return 1;
+}
+
+// Milliseconds since the last key or pointer event, or -1 if unavailable.
+fn idle_ms(st as *State, d as *u8, root as i64) as i64 {
+    if (st.ready == 0 || _need_info(st) == 0) { return 0 - 1; }
+    if (xss.XScreenSaverQueryInfo(d, root, st.info) == 0) { return 0 - 1; }
+    return cast(*xss.XScreenSaverInfo, st.info).idle;
+}
+
+// ScreenSaverOff, ScreenSaverOn or ScreenSaverDisabled, or -1.
+fn state_of(st as *State, d as *u8, root as i64) as i32 {
+    if (st.ready == 0 || _need_info(st) == 0) { return cast(i32, 0 - 1); }
+    if (xss.XScreenSaverQueryInfo(d, root, st.info) == 0) { return cast(i32, 0 - 1); }
+    return cast(*xss.XScreenSaverInfo, st.info).state;
+}
+
+fn blanked(st as *State, d as *u8, root as i64) as i32 {
+    if (state_of(st, d, root) == xss.ScreenSaverOn) { return 1; }
+    return 0;
+}

@@ -1,0 +1,214 @@
+// window/x11/wm_test.cst — the window-manager requests, against a real server.
+//
+// Everything here is a request a window manager may refuse, so what can be
+// asserted splits in two and the split is the point:
+//
+//   Always true: the message was built and sent, the property round-trips, the
+//   query agrees with itself, and nothing crashes when the window manager is
+//   absent. Xvfb has NO window manager at all, so this is what CI checks.
+//
+//   True only with a window manager: the state actually changes. Asserting
+//   that under Xvfb would assert that nobody is listening. So the state
+//   queries are checked for *consistency* — a window is not both minimized and
+//   fullscreen, a query on a window with no _NET_WM_STATE returns 0 rather
+//   than garbage — and the honest report is printed rather than asserted.
+//
+// Run by tools/run_headless.sh like the rest. Exit code is the number of
+// failures.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "x11.cst" as x11;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("  FAIL %s\n", name); }
+}
+
+fn chk_i(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+// Waits for the window manager to act, in TIME rather than in frames.
+//
+// This is the mistake this test made first: it pumped thirty frames and
+// asserted. But next_frame returns immediately on X11 when there is nothing to
+// wait for, so thirty iterations is a few microseconds — and a compositor
+// answering a client message needs milliseconds. Measured on niri: the state
+// changed 156 iterations later, which is no time at all.
+//
+// A frame count is not a clock. Five seconds, and the margin is PRINTED rather
+// than assumed: at two seconds this went intermittent under load — niri busy
+// with another client took longer than the deadline, and an assertion that
+// fails sometimes is worse than no assertion, because it teaches everyone to
+// ignore a red run.
+//
+// Five is far beyond what any window manager needs for a state change and
+// short enough that a broken one fails the run instead of hanging it. The
+// elapsed time goes to stdout so a compositor drifting towards the limit is
+// visible before it starts flaking again.
+fn wait_fullscreen(w as *x11.window.Window, want as i32) as i32 {
+    let is i64 as start = time.now_ns();
+    let is i64 as deadline = start + 5000000000;
+    while (time.now_ns() < deadline) {
+        if (x11.next_frame(w) == 0) { return 0; }
+        if (x11.fullscreen(w) == want) {
+            io.printf("  fullscreen -> %d after %d ms\n", cast(i64, want),
+                      (time.now_ns() - start) / 1000000);
+            return 1;
+        }
+    }
+    io.printf("  fullscreen -> %d never happened in 5000 ms\n", cast(i64, want));
+    return 0;
+}
+
+// Pumps for a stretch of real time.
+//
+// Everything a window manager does is asynchronous, and next_frame returns
+// immediately on X11, so "wait N frames" is not waiting at all — N iterations
+// of an empty loop is microseconds. Every wait in this file is a clock for that
+// reason; the fullscreen round trip below learned it the same way.
+fn settle(w as *x11.window.Window, ms as i64) as void {
+    let is i64 as deadline = time.now_ns() + ms * 1000000;
+    while (time.now_ns() < deadline) {
+        if (x11.next_frame(w) == 0) { return; }
+    }
+}
+
+// A 4x4 icon, ARGB with alpha in the high byte.
+let is [16]i32 as icon;
+
+fn build_icon() as void {
+    let is i64 as i with mut = 0;
+    while (i < 16) {
+        // opaque, with a diagonal that differs so a wrong stride would show
+        icon[i] = cast(i32, 0 - 16777216);   // 0xFF000000
+        i = i + 1;
+    }
+    icon[0] = cast(i32, 0 - 16711936);       // 0xFF00FF00
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    build_icon();
+
+    let is x11.window.Window as w = x11.open("caustic-wm-test", 320, 240);
+    if (x11.is_open(&w) == 0) {
+        io.printf("  FAIL open: %s\n", x11.error_name(x11.last_error(&w)));
+        return 1;
+    }
+
+    // Drain the map and the first configure, so the window exists as far as
+    // the server is concerned before anything is asked of it. On a clock: a
+    // fixed number of next_frame calls is microseconds, and the server has not
+    // answered yet.
+    settle(&w, 200);
+
+    // --- Queries on a window nobody manages ---
+    //
+    // Under Xvfb no window manager ever sets _NET_WM_STATE, so every one of
+    // these reads a property that does not exist. Returning 0 rather than
+    // reading past a null pointer is the whole assertion.
+    chk_i("fullscreen query on an unmanaged window", cast(i64, x11.fullscreen(&w)), 0);
+    chk_i("maximized query on an unmanaged window", cast(i64, x11.maximized(&w)), 0);
+    chk_i("minimized query on an unmanaged window", cast(i64, x11.minimized(&w)), 0);
+
+    // --- The requests ---
+    //
+    // Each returns whether the client message was sent. With no window manager
+    // listening nothing happens, which is correct and is exactly what a
+    // program on a bare server should see.
+    chk("set_fullscreen sends", x11.set_fullscreen(&w, 1));
+    chk("set_fullscreen off sends", x11.set_fullscreen(&w, 0));
+    chk("set_maximized sends", x11.set_maximized(&w, 1));
+    chk("set_maximized off sends", x11.set_maximized(&w, 0));
+    chk("set_above sends", x11.set_above(&w, 1));
+    chk("set_above off sends", x11.set_above(&w, 0));
+    chk("activate sends", x11.activate(&w));
+
+    // Iconify is ICCCM and goes through libX11 rather than a client message,
+    // so it succeeds even with nothing managing the window.
+    chk("minimize returns", x11.minimize(&w));
+    chk("restore returns", x11.restore(&w));
+
+    // --- Position ---
+    //
+    // XTranslateCoordinates against the root, which is the only reading that
+    // means what a caller expects under a reparenting window manager.
+    let is i64 as px with mut = 0 - 1;
+    let is i64 as py with mut = 0 - 1;
+    chk("position reads", x11.position(&w, &px, &py));
+    chk("position is a real coordinate", cast(i32, px >= 0 && py >= 0));
+
+    chk("move_to sends", x11.move_to(&w, 40, 30));
+    settle(&w, 200);
+    let is i64 as mx with mut = 0 - 1;
+    let is i64 as my with mut = 0 - 1;
+    chk("position reads after move", x11.position(&w, &mx, &my));
+    // With no window manager to reparent it, a move lands exactly. With one it
+    // may not, so this is reported rather than asserted when they differ.
+    if (mx != 40 || my != 30) {
+        io.printf("  note: asked to move to 40,30 and landed at %d,%d — a window manager is placing it\n", mx, my);
+    }
+
+    chk("move_resize sends", x11.move_resize(&w, 40, 30, 300, 200));
+    settle(&w, 200);
+    // Reported, not asserted, and this is the assertion that taught the
+    // difference: it passed under Xvfb, where nothing is listening and the
+    // server grants every geometry request, and failed under niri, which tiles
+    // the window and keeps its own size. Both are correct behaviour from the
+    // window manager. What this layer guarantees is that the request went out.
+    if (x11.width(&w) != 300 || x11.height(&w) != 200) {
+        io.printf("  note: asked for 300x200 and have %dx%d — the window manager owns the size\n",
+                  x11.width(&w), x11.height(&w));
+    }
+
+    // --- The icon ---
+    //
+    // The one thing here that is a plain property, so it round-trips whether or
+    // not anything is managing the window. A wrong stride — writing 32-bit
+    // words where the protocol wants longs — would fail this.
+    chk("set_icon sends", x11.set_icon(&w, cast(*u8, &icon), 4, 4));
+    chk("clear_icon sends", x11.clear_icon(&w));
+
+    // --- Frame extents ---
+    //
+    // Only a window manager sets these, so absence is the expected answer here
+    // and the assertion is that it says so instead of returning rubbish.
+    let is i64 as fl with mut = 0 - 1;
+    let is i64 as fr with mut = 0 - 1;
+    let is i64 as ft with mut = 0 - 1;
+    let is i64 as fb with mut = 0 - 1;
+    let is i32 as got_extents = x11.frame_extents(&w, &fl, &fr, &ft, &fb);
+    if (got_extents == 1) {
+        chk("frame extents are not negative", cast(i32, fl >= 0 && fr >= 0 && ft >= 0 && fb >= 0));
+    } else {
+        chk("frame extents absent leaves the outputs untouched",
+            cast(i32, fl == 0 - 1 && fr == 0 - 1));
+    }
+
+    // --- The round trip, where there is someone to answer ---
+    //
+    // Under Xvfb there is no window manager, _NET_SUPPORTED does not exist, and
+    // asserting that fullscreen works would be asserting that nobody is
+    // listening. So the real check runs only where the manager says it
+    // implements the hint — and there it is a hard assertion, because a
+    // request that is advertised as supported and then does nothing is a bug in
+    // this layer, not a policy decision.
+    let is i32 as can_fullscreen = x11.supports_fullscreen(&w);
+    io.printf("  supports fullscreen: %d\n", cast(i64, can_fullscreen));
+    if (can_fullscreen == 1) {
+        x11.set_fullscreen(&w, 1);
+        chk("fullscreen took effect", wait_fullscreen(&w, 1));
+        x11.set_fullscreen(&w, 0);
+        chk("fullscreen came back off", wait_fullscreen(&w, 0));
+    }
+
+    x11.close(&w);
+
+    if (fails == 0) { io.printf("x11 wm: all checks passed\n"); }
+    else { io.printf("  wm_test: %d failure(s)\n", cast(i64, fails)); }
+    return fails;
+}

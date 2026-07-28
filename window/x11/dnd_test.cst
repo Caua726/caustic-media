@@ -1,0 +1,232 @@
+// window/x11/dnd_test.cst — a real drag, from a second connection.
+//
+// A client cannot drop on itself in any way that proves anything: the
+// interesting part of XDND is two processes taking turns, and a single
+// connection short-circuits the ordering that makes it hard.
+//
+// So this opens a second window to play the source, and drives the whole
+// exchange by hand — Enter, Position, Drop — while the target runs its normal
+// pump. The clipboard test in x11_ext_test.cst does the same thing for the
+// same reason.
+//
+// What it proves:
+//
+//   XdndAware is advertised, or no source would ever start.
+//   Every XdndPosition is answered with XdndStatus, and the accept flag is 1
+//   when text/uri-list was offered and 0 when it was not. This is the message
+//   whose absence breaks drag-and-drop silently.
+//   A drop delivers the paths, decoded: no file:// prefix, no percent escapes.
+//   A source offering a type we do not take is refused rather than left hanging.
+//
+// Exit code is the number of failures.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "x11.cst" as x11;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("  FAIL %s\n", name); }
+}
+
+fn chk_i(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+fn chk_str(name as *u8, got as *u8, want as *u8) as void {
+    if (cast(i64, got) == 0) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got null\n", name);
+        return;
+    }
+    let is i64 as i with mut = 0;
+    while (i < 512) {
+        if (got[i] != want[i]) {
+            fails = fails + 1;
+            io.printf("  FAIL %s: got [%s] want [%s]\n", name, got, want);
+            return;
+        }
+        if (got[i] == cast(u8, 0)) { return; }
+        i = i + 1;
+    }
+}
+
+let is xev.XEvent as _ev;
+let is xev.XEvent as _got;
+
+// Two files, one with a space that has to survive percent-decoding.
+//
+// A function rather than a global: a module-level `let is *u8 as X = "..."`
+// does not carry the literal's address, and reading through it is a fault
+// before main gets anywhere. Worth knowing about this compiler.
+fn uris() as *u8 { return "file:///tmp/one.txt\r\nfile:///tmp/two%20three.txt\r\n"; }
+
+fn uri_bytes() as i64 {
+    let is *u8 as u = uris();
+    let is i64 as n with mut = 0;
+    while (u[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+fn send_to(d as *u8, to as i64, mtype as i64, from as i64,
+           d1 as i64, d2 as i64, d3 as i64, d4 as i64) as void {
+    xev.clear(&_ev);
+    let is *xev.XClientMessageEvent as c = xev.client(&_ev);
+    c.kind = x.ClientMessage;
+    c.send_event = 1;
+    c.window = to;
+    c.message_type = mtype;
+    c.format = 32;
+    c.data[0] = from;
+    c.data[1] = d1;
+    c.data[2] = d2;
+    c.data[3] = d3;
+    c.data[4] = d4;
+    xlib.XSendEvent(d, to, 0, 0, cast(*u8, &_ev));
+    xlib.XFlush(d);
+}
+
+// Waits for the target to answer with XdndStatus, and reports the accept bit.
+// -1 if nothing arrived, which is the failure this test exists to catch.
+//
+// On a CLOCK, not on an iteration count, and that distinction is the whole
+// reason this comment is long. The first version spun forty times and gave up;
+// forty tight iterations is microseconds, while an XdndStatus is a round trip
+// through the X server and back. It passed almost always and failed about once
+// in twenty runs — the worst kind of test, because a red run looks like noise.
+//
+// The target's pump has to run for the reply to be produced at all, so this
+// drives it while it waits rather than only draining the source.
+fn await_status(w as *x11.window.Window, sd as *u8, a_status as i64, ms as i64) as i64 {
+    let is i64 as deadline = time.now_ns() + ms * 1000000;
+    while (time.now_ns() < deadline) {
+        x11.next_frame(w);
+        while (xlib.XPending(sd) > 0) {
+            xlib.XNextEvent(sd, cast(*u8, &_got));
+            if (xev.kind(&_got) == x.ClientMessage) {
+                let is *xev.XClientMessageEvent as c = xev.client(&_got);
+                if (c.message_type == a_status) { return c.data[1] & 1; }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    // The target: a normal window, pumped normally.
+    let is x11.window.Window as w = x11.open("caustic-dnd-target", 300, 200);
+    if (x11.is_open(&w) == 0) {
+        io.printf("  FAIL open target: %s\n", x11.error_name(x11.last_error(&w)));
+        return 1;
+    }
+    let is i64 as n with mut = 0;
+    while (n < 8) { x11.next_frame(&w); n = n + 1; }
+
+    let is *u8 as td = x11.display(&w);
+    let is i64 as target = x11.xid(&w);
+
+    // XdndAware has to be there, or no file manager would ever begin.
+    let is i64 as a_aware = xlib.XInternAtom(td, "XdndAware", 0);
+    let is i64 as at with mut = 0;
+    let is i32 as fmt with mut = 0;
+    let is i64 as items with mut = 0;
+    let is i64 as after with mut = 0;
+    let is *u8 as prop with mut = cast(*u8, 0);
+    xlib.XGetWindowProperty(td, target, a_aware, 0, 4, 0, 0,
+                            cast(*u8, &at), cast(*u8, &fmt), cast(*u8, &items),
+                            cast(*u8, &after), cast(*u8, &prop));
+    chk("XdndAware is advertised", cast(i32, cast(i64, prop) != 0 && items >= 1));
+    if (cast(i64, prop) != 0) {
+        chk("and the version is at least 3",
+            cast(i32, *cast(*i64, cast(i64, prop)) >= 3));
+        xlib.XFree(prop);
+    }
+
+    // The source: its own connection, because that is what a real drag is.
+    let is *u8 as sd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, sd) == 0) { io.printf("  FAIL second connection\n"); return 1; }
+    let is i32 as scr = xlib.XDefaultScreen(sd);
+    let is i64 as sroot = xlib.XRootWindow(sd, scr);
+    let is i64 as source = xlib.XCreateSimpleWindow(sd, sroot, 0, 0, 1, 1, 0, 0, 0);
+
+    let is i64 as a_enter    = xlib.XInternAtom(sd, "XdndEnter", 0);
+    let is i64 as a_position = xlib.XInternAtom(sd, "XdndPosition", 0);
+    let is i64 as a_status   = xlib.XInternAtom(sd, "XdndStatus", 0);
+    let is i64 as a_drop     = xlib.XInternAtom(sd, "XdndDrop", 0);
+    let is i64 as a_selection = xlib.XInternAtom(sd, "XdndSelection", 0);
+    let is i64 as a_uri      = xlib.XInternAtom(sd, "text/uri-list", 0);
+    let is i64 as a_junk     = xlib.XInternAtom(sd, "application/x-nothing", 0);
+
+    // The source owns XdndSelection: that is where the data comes from.
+    xlib.XSetSelectionOwner(sd, a_selection, source, 0);
+    xlib.XFlush(sd);
+
+    // --- A drag offering something we do not take ---
+    //
+    // The answer must be a refusal, not silence.
+    send_to(sd, target, a_enter, source, 5 << 24, a_junk, 0, 0);
+    send_to(sd, target, a_position, source, 0, (10 << 16) | 20, 0, 0);
+    chk_i("an unwanted type is refused, not ignored",
+          await_status(&w, sd, a_status, 2000), 0);
+
+    // --- A drag offering text/uri-list ---
+    send_to(sd, target, a_enter, source, 5 << 24, a_uri, 0, 0);
+    send_to(sd, target, a_position, source, 0, (30 << 16) | 40, 0, 0);
+    chk_i("text/uri-list is accepted", await_status(&w, sd, a_status, 2000), 1);
+    chk("the target knows a drag is over it", x11.dragging(&w));
+
+    // --- The drop ---
+    //
+    // The target asks for the selection; the source has to answer, which means
+    // pumping the source's own connection for the SelectionRequest.
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+
+    // Also a clock. The drop is two more round trips — the target asks for the
+    // selection, the source answers — so a loop count would flake here too.
+    let is i64 as drop_deadline = time.now_ns() + 3000000000;
+    while (time.now_ns() < drop_deadline) {
+        x11.next_frame(&w);
+        while (xlib.XPending(sd) > 0) {
+            xlib.XNextEvent(sd, cast(*u8, &_got));
+            if (xev.kind(&_got) == x.SelectionRequest) {
+                let is *xev.XSelectionRequestEvent as r = xev.selection_request(&_got);
+                // Hand over the URI list, then tell the requestor where it went.
+                xlib.XChangeProperty(sd, r.requestor, r.property, r.target, 8,
+                                     x.PropModeReplace, uris(), cast(i32, uri_bytes()));
+                xev.clear(&_ev);
+                let is *xev.XSelectionEvent as sn = xev.selection(&_ev);
+                sn.kind = x.SelectionNotify;
+                sn.requestor = r.requestor;
+                sn.selection = r.selection;
+                sn.target = r.target;
+                sn.property = r.property;
+                sn.time = r.time;
+                xlib.XSendEvent(sd, r.requestor, 0, 0, cast(*u8, &_ev));
+                xlib.XFlush(sd);
+            }
+        }
+        if (x11.dropped_files(&w) > 0) { break; }
+    }
+
+    chk_i("two files arrived", x11.dropped_files(&w), 2);
+    chk_str("the first path is decoded", x11.dropped_file(&w, 0), "/tmp/one.txt");
+    // %20 is a space, and a path that keeps the escape is the bug this catches.
+    chk_str("and so is the second", x11.dropped_file(&w, 1), "/tmp/two three.txt");
+
+    x11.clear_drop(&w);
+    chk_i("clearing forgets the drop", x11.dropped_files(&w), 0);
+
+    xlib.XDestroyWindow(sd, source);
+    xlib.XCloseDisplay(sd);
+    x11.close(&w);
+
+    if (fails == 0) { io.printf("x11 dnd: all checks passed\n"); }
+    else { io.printf("  dnd_test: %d failure(s)\n", cast(i64, fails)); }
+    return fails;
+}

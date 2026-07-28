@@ -1,0 +1,348 @@
+// window/x11/events.cst — two ways to read the same events, and why both exist.
+//
+// A frame loop wants to ask "is W held?" — a question about state, answered the
+// same way however many times it is asked, and answerable even by a program
+// that never drains a queue. A text field wants "which keys arrived, in order"
+// — a question about history, where missing one or seeing it twice is a bug.
+// Neither answers the other, so the pump produces both from one drain.
+//
+//   State   folded from every event as it arrives, before anything else
+//           happens to it. Cannot fail, cannot overflow, cannot be missed.
+//   Event   a decoded projection of one raw XEvent, handed out on request.
+//
+// The order is the load-bearing part. fold() runs before the event reaches the
+// ring, so a program that never calls poll_event still gets should_close, the
+// window size, the pointer position and every held key — and a ring that
+// overflows under load loses individual keystrokes but never loses the fact
+// that the window was closed.
+//
+// --- Why Event is a projection and not the storage ---
+//
+// ../../window.md says window/ owns the raw event queue and input/ interprets
+// it. The queue in window.cst therefore holds raw 192-byte XEvents, not this
+// struct: the moment window/ decides which fields matter, input/ inherits that
+// decision, and an XI2 valuator or a touch point has nowhere to live. Event is
+// the convenient view for programs that want one, produced on demand and
+// costing nothing to the programs that do not.
+use "bind/x.cst" as x;
+use "bind/xevent.cst" as xev;
+use "keys.cst" as keys;
+
+// --- The decoded view ---
+
+let is i32 as NONE       with imut = 0;
+let is i32 as KEY_DOWN   with imut = 1;
+let is i32 as KEY_UP     with imut = 2;
+let is i32 as MOUSE_DOWN with imut = 3;
+let is i32 as MOUSE_UP   with imut = 4;
+let is i32 as MOUSE_MOVE with imut = 5;
+let is i32 as WHEEL      with imut = 6;
+let is i32 as ENTER      with imut = 7;
+let is i32 as LEAVE      with imut = 8;
+let is i32 as FOCUS_IN   with imut = 9;
+let is i32 as FOCUS_OUT  with imut = 10;
+let is i32 as RESIZE     with imut = 11;
+let is i32 as EXPOSE     with imut = 12;
+let is i32 as CLOSE      with imut = 13;
+// Everything this file does not name. The raw XEvent is still in the ring, so a
+// program that cares reads it with poll_xevent instead.
+let is i32 as OTHER      with imut = 14;
+
+struct Event {
+    kind      as i32;
+    key       as i32;   // KEY_DOWN/UP: the key id from keys.cst
+    keycode   as i32;   // KEY_DOWN/UP: the physical keycode, unmapped
+    modifiers as i32;   // the six in keys.cst, at the moment of the event
+    button    as i32;   // MOUSE_DOWN/UP: 1 left, 2 middle, 3 right
+    wheel     as i32;   // WHEEL: +1 up, -1 down
+    x         as i64;   // pointer, window coordinates
+    y         as i64;
+    width     as i64;   // RESIZE
+    height    as i64;
+    xkind     as i32;   // the raw X event type, always filled
+    _pad0     as i32;
+}
+
+fn clear(e as *Event) as void {
+    e.kind = NONE; e.key = 0; e.keycode = 0; e.modifiers = 0;
+    e.button = 0; e.wheel = 0; e.x = 0; e.y = 0;
+    e.width = 0; e.height = 0; e.xkind = 0;
+}
+
+// --- The sampled state ---
+//
+// `down` is indexed by KEYCODE, not by key id: keycodes are one byte, so the
+// bitmap is 32 bytes and needs no search, while key ids run past 65000 and are
+// not dense. keycode_down() answers directly; key_down() walks the map, which
+// is 256 comparisons and still cheaper than a server round trip.
+struct State {
+    down       as [32]u8;   // one bit per keycode
+    buttons    as i32;      // bit per button, 1-based: bit 0 is button 1
+    modifiers  as i32;
+    mouse_x    as i64;
+    mouse_y    as i64;
+    mouse_dx   as i64;      // since the last next_frame
+    mouse_dy   as i64;
+    wheel      as i64;      // accumulated since the last next_frame
+    width      as i64;
+    height     as i64;
+    focused    as i32;
+    visible    as i32;
+    resized    as i32;      // true for exactly one frame
+    exposed    as i32;
+    should_close as i32;
+    // Counts XI_RawMotion events seen this frame. The deltas themselves are
+    // valuators that input/ will decode; window/ only reports that raw motion
+    // is arriving, which is what tells a program its relative mode is real.
+    raw_motion as i32;
+}
+
+fn state_init(s as *State, w as i64, h as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 32) { s.down[i] = cast(u8, 0); i = i + 1; }
+    s.buttons = 0; s.modifiers = 0;
+    s.mouse_x = 0; s.mouse_y = 0; s.mouse_dx = 0; s.mouse_dy = 0; s.wheel = 0;
+    s.width = w; s.height = h;
+    s.focused = 0; s.visible = 0; s.resized = 0; s.exposed = 0;
+    s.should_close = 0;
+    s.raw_motion = 0;
+}
+
+// Per-frame values are edges, not levels: a delta that survived into the next
+// frame would be reported twice and a resize flag that never cleared would make
+// every frame look like a resize. next_frame() calls this before draining.
+fn state_new_frame(s as *State) as void {
+    s.mouse_dx = 0;
+    s.mouse_dy = 0;
+    s.wheel = 0;
+    s.resized = 0;
+    s.exposed = 0;
+    s.raw_motion = 0;
+}
+
+fn _set_down(s as *State, keycode as i64, on as i32) as void {
+    if (keycode < 0 || keycode >= 256) { return; }
+    let is i64 as byte = keycode >> 3;
+    let is i64 as bit = 1 << (keycode & 7);
+    let is i64 as cur = cast(i64, s.down[byte]);
+    if (on == 1) { s.down[byte] = cast(u8, cur | bit); }
+    else { s.down[byte] = cast(u8, cur & (255 - bit)); }
+}
+
+fn keycode_down(s as *State, keycode as i32) as i32 {
+    let is i64 as kc = cast(i64, keycode);
+    if (kc < 0 || kc >= 256) { return 0; }
+    if ((cast(i64, s.down[kc >> 3]) & (1 << (kc & 7))) != 0) { return 1; }
+    return 0;
+}
+
+fn key_down(s as *State, m as *keys.Map, key_id as i32) as i32 {
+    if (key_id == keys.UNKNOWN) { return 0; }
+    let is i64 as kc with mut = 0;
+    while (kc < 256) {
+        if (keys.id_of(m, cast(u32, kc)) == key_id) {
+            if (keycode_down(s, cast(i32, kc)) == 1) { return 1; }
+        }
+        kc = kc + 1;
+    }
+    return 0;
+}
+
+fn button_down(s as *State, button as i32) as i32 {
+    if (button < 1 || button > 31) { return 0; }
+    if ((s.buttons & (1 << (button - 1))) != 0) { return 1; }
+    return 0;
+}
+
+// --- Folding ---
+//
+// Runs on every event, unconditionally, before the ring. Nothing here can fail
+// and nothing here allocates.
+//
+// wm_delete is passed in rather than looked up because the atom belongs to the
+// window: interning it per event would be a round trip per event.
+fn fold(s as *State, e as *xev.XEvent, m as *keys.Map, wm_delete as i64) as void {
+    let is i32 as ty = xev.kind(e);
+
+    if (ty == x.KeyPress) {
+        let is *xev.XKeyEvent as k = xev.key(e);
+        _set_down(s, cast(i64, k.keycode), 1);
+        s.modifiers = keys.modifiers_of(k.state);
+        s.mouse_x = cast(i64, k.x);
+        s.mouse_y = cast(i64, k.y);
+        return;
+    }
+    if (ty == x.KeyRelease) {
+        let is *xev.XKeyEvent as k = xev.key(e);
+        _set_down(s, cast(i64, k.keycode), 0);
+        s.modifiers = keys.modifiers_of(k.state);
+        return;
+    }
+    if (ty == x.ButtonPress) {
+        let is *xev.XButtonEvent as b = xev.button(e);
+        let is i64 as n = cast(i64, b.button);
+        // X has no scroll event and never grew one: the wheel arrives as
+        // buttons 4 and 5, which are press-and-release pairs rather than a
+        // held state. Recording them as buttons would leave a phantom button
+        // held whenever a release was missed.
+        if (n == 4) { s.wheel = s.wheel + 1; }
+        else if (n == 5) { s.wheel = s.wheel - 1; }
+        else if (n >= 1 && n <= 31) { s.buttons = s.buttons | cast(i32, 1 << (n - 1)); }
+        s.modifiers = keys.modifiers_of(b.state);
+        s.mouse_x = cast(i64, b.x);
+        s.mouse_y = cast(i64, b.y);
+        return;
+    }
+    if (ty == x.ButtonRelease) {
+        let is *xev.XButtonEvent as b = xev.button(e);
+        let is i64 as n = cast(i64, b.button);
+        if (n >= 1 && n <= 31 && n != 4 && n != 5) {
+            s.buttons = s.buttons & cast(i32, 2147483647 - (1 << (n - 1)));
+        }
+        s.modifiers = keys.modifiers_of(b.state);
+        return;
+    }
+    if (ty == x.MotionNotify) {
+        let is *xev.XMotionEvent as mo = xev.motion(e);
+        let is i64 as nx = cast(i64, mo.x);
+        let is i64 as ny = cast(i64, mo.y);
+        s.mouse_dx = s.mouse_dx + (nx - s.mouse_x);
+        s.mouse_dy = s.mouse_dy + (ny - s.mouse_y);
+        s.mouse_x = nx;
+        s.mouse_y = ny;
+        s.modifiers = keys.modifiers_of(mo.state);
+        return;
+    }
+    if (ty == x.EnterNotify) {
+        let is *xev.XCrossingEvent as c = xev.crossing(e);
+        s.mouse_x = cast(i64, c.x);
+        s.mouse_y = cast(i64, c.y);
+        return;
+    }
+    if (ty == x.FocusIn)  { s.focused = 1; return; }
+    if (ty == x.FocusOut) {
+        s.focused = 0;
+        // Every key is released as far as this program can tell: a key let go
+        // while another window had focus produces no KeyRelease here, and the
+        // key would otherwise stay held forever.
+        let is i64 as i with mut = 0;
+        while (i < 32) { s.down[i] = cast(u8, 0); i = i + 1; }
+        s.buttons = 0;
+        s.modifiers = 0;
+        return;
+    }
+    if (ty == x.ConfigureNotify) {
+        let is *xev.XConfigureEvent as c = xev.configure(e);
+        let is i64 as nw = cast(i64, c.width);
+        let is i64 as nh = cast(i64, c.height);
+        if (nw != s.width || nh != s.height) {
+            s.width = nw;
+            s.height = nh;
+            s.resized = 1;
+        }
+        return;
+    }
+    if (ty == x.Expose)     { s.exposed = 1; return; }
+    if (ty == x.MapNotify)  { s.visible = 1; return; }
+    if (ty == x.UnmapNotify){ s.visible = 0; return; }
+    if (ty == x.ClientMessage) {
+        let is *xev.XClientMessageEvent as c = xev.client(e);
+        if (c.data[0] == wm_delete) { s.should_close = 1; }
+        return;
+    }
+}
+
+// --- Decoding ---
+//
+// One raw event to one Event. Returns 0 for events this view has no shape for,
+// so a caller looping on poll_event never sees a half-filled record; the raw
+// XEvent is still available through poll_xevent for anything that matters.
+fn decode(e as *xev.XEvent, m as *keys.Map, out as *Event) as i32 {
+    clear(out);
+    let is i32 as ty = xev.kind(e);
+    out.xkind = ty;
+
+    if (ty == x.KeyPress || ty == x.KeyRelease) {
+        let is *xev.XKeyEvent as k = xev.key(e);
+        if (ty == x.KeyPress) { out.kind = KEY_DOWN; } else { out.kind = KEY_UP; }
+        out.keycode = cast(i32, k.keycode);
+        out.key = keys.id_of(m, k.keycode);
+        out.modifiers = keys.modifiers_of(k.state);
+        out.x = cast(i64, k.x);
+        out.y = cast(i64, k.y);
+        return 1;
+    }
+    if (ty == x.ButtonPress || ty == x.ButtonRelease) {
+        let is *xev.XButtonEvent as b = xev.button(e);
+        let is i64 as n = cast(i64, b.button);
+        out.modifiers = keys.modifiers_of(b.state);
+        out.x = cast(i64, b.x);
+        out.y = cast(i64, b.y);
+        if (n == 4 || n == 5) {
+            // A wheel notch is one press and one release. Reporting both would
+            // scroll twice per notch, so the release is dropped.
+            if (ty == x.ButtonRelease) { return 0; }
+            out.kind = WHEEL;
+            if (n == 4) { out.wheel = 1; } else { out.wheel = 0 - 1; }
+            return 1;
+        }
+        if (ty == x.ButtonPress) { out.kind = MOUSE_DOWN; } else { out.kind = MOUSE_UP; }
+        out.button = cast(i32, n);
+        return 1;
+    }
+    if (ty == x.MotionNotify) {
+        let is *xev.XMotionEvent as mo = xev.motion(e);
+        out.kind = MOUSE_MOVE;
+        out.x = cast(i64, mo.x);
+        out.y = cast(i64, mo.y);
+        out.modifiers = keys.modifiers_of(mo.state);
+        return 1;
+    }
+    if (ty == x.EnterNotify || ty == x.LeaveNotify) {
+        let is *xev.XCrossingEvent as c = xev.crossing(e);
+        if (ty == x.EnterNotify) { out.kind = ENTER; } else { out.kind = LEAVE; }
+        out.x = cast(i64, c.x);
+        out.y = cast(i64, c.y);
+        return 1;
+    }
+    if (ty == x.FocusIn)  { out.kind = FOCUS_IN;  return 1; }
+    if (ty == x.FocusOut) { out.kind = FOCUS_OUT; return 1; }
+    if (ty == x.ConfigureNotify) {
+        let is *xev.XConfigureEvent as c = xev.configure(e);
+        out.kind = RESIZE;
+        out.width = cast(i64, c.width);
+        out.height = cast(i64, c.height);
+        out.x = cast(i64, c.x);
+        out.y = cast(i64, c.y);
+        return 1;
+    }
+    if (ty == x.Expose) {
+        let is *xev.XExposeEvent as ex = xev.expose(e);
+        out.kind = EXPOSE;
+        out.x = cast(i64, ex.x);
+        out.y = cast(i64, ex.y);
+        out.width = cast(i64, ex.width);
+        out.height = cast(i64, ex.height);
+        return 1;
+    }
+    out.kind = OTHER;
+    return 1;
+}
+
+fn kind_name(k as i32) as *u8 {
+    if (k == NONE)       { return "none"; }
+    if (k == KEY_DOWN)   { return "key down"; }
+    if (k == KEY_UP)     { return "key up"; }
+    if (k == MOUSE_DOWN) { return "mouse down"; }
+    if (k == MOUSE_UP)   { return "mouse up"; }
+    if (k == MOUSE_MOVE) { return "mouse move"; }
+    if (k == WHEEL)      { return "wheel"; }
+    if (k == ENTER)      { return "enter"; }
+    if (k == LEAVE)      { return "leave"; }
+    if (k == FOCUS_IN)   { return "focus in"; }
+    if (k == FOCUS_OUT)  { return "focus out"; }
+    if (k == RESIZE)     { return "resize"; }
+    if (k == EXPOSE)     { return "expose"; }
+    if (k == CLOSE)      { return "close"; }
+    return "other";
+}

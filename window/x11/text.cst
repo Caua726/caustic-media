@@ -1,0 +1,263 @@
+// window/x11/text.cst — turning key presses into text a person typed.
+//
+// keys.cst answers "which key", which is what a game binds. This answers "what
+// did they type", which is a different question with a much longer answer:
+// shift and AltGr, dead keys, compose sequences, and input methods where one
+// character takes several keystrokes and a candidate window in between.
+//
+// --- Two tiers, and the first one costs nothing ---
+//
+// XLookupString is in libX11, needs no locale, no input method and no extra
+// library. It applies the modifier state and the server's own keysym
+// translation, so shift and AltGr work and so do dead keys on a keymap that
+// defines them. What it returns is Latin-1, which this file widens to UTF-8 —
+// two lines, because Latin-1 IS the first 256 code points.
+//
+// That covers every Latin keyboard and it is the default: `init()` opens
+// nothing.
+//
+// An input method covers the rest — CJK, and any compose that needs state
+// across keystrokes. `open_method()` opens one, and everything it calls is
+// still libX11, so this file remains safe for the hub to forward.
+//
+// The one thing an input method also needs is a C locale that is not "C", and
+// setting that is a libc call. It is deliberately NOT here: see locale.cst for
+// why one function got its own file. A program that wants an input method
+// calls locale.use_environment() first; one that does not pays nothing.
+//
+// open_method() reports honestly when it cannot open one — a machine with no
+// input method running is the common case, and the answer there is to keep
+// using the first tier rather than to fail.
+//
+// --- The three calls an input method needs from the event loop ---
+//
+// An IM is not a function you call on a key press. It is a participant in the
+// event loop, and skipping any of these produces an input method that half
+// works:
+//
+//   filter()     BEFORE anything else looks at an event. The IM eats the
+//                keystrokes that are building a character and returns 1; those
+//                must not also be handled as keys.
+//   focus_in()   and focus_out(), so the candidate window follows the window.
+//   lookup()     on a KeyPress the filter did not eat.
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xutil.cst" as xutil;
+use "bind/xevent.cst" as xev;
+
+// XLookupString's status_in_out / Xutf8LookupString's status_return.
+let is i32 as BUFFER_OVERFLOW with imut = cast(i32, 0 - 1);
+let is i32 as LOOKUP_NONE     with imut = 1;
+let is i32 as LOOKUP_CHARS    with imut = 2;
+let is i32 as LOOKUP_KEYSYM   with imut = 3;
+let is i32 as LOOKUP_BOTH     with imut = 4;
+
+// The one input style that needs no drawing from us: the input method owns its
+// own preedit and status windows. Anything else means rendering the composition
+// in progress ourselves, which is render/'s and text/'s business rather than
+// this layer's.
+let is i64 as PREEDIT_NOTHING with imut = 8;      // 0x0008
+let is i64 as STATUS_NOTHING  with imut = 1024;   // 0x0400
+
+// 256 bytes is four times the longest composition any input method produces
+// for one keystroke. Overflow is reported rather than grown: a key press that
+// needs more than this is not text, it is a bug somewhere upstream.
+let is i64 as BUF_BYTES with imut = 256;
+
+struct Input {
+    im       as *u8;    // XIM, or null when there is no input method
+    ic       as *u8;    // XIC, or null
+    have_im  as i32;    // the method opened and the context was created
+    _pad0    as i32;
+    keysym   as i64;    // the keysym of the last lookup, 0 if none
+    len      as i64;    // bytes of UTF-8 in buf, 0 if the key produced no text
+    overflow as i64;    // how many lookups were dropped for being too long
+    buf      as [256]u8;
+}
+
+// The first tier. Opens nothing, needs nothing, and works everywhere.
+fn init(in as *Input) as void {
+    in.im = cast(*u8, 0);
+    in.ic = cast(*u8, 0);
+    in.have_im = 0;
+    in.keysym = 0;
+    in.len = 0;
+    in.overflow = 0;
+    in.buf[0] = cast(u8, 0);
+}
+
+// --- The second tier ---
+
+// Opens an input method and a context for this window. Returns 1 on success.
+//
+// Zero is the normal answer on a machine with no input method running, and it
+// is not a failure: lookup() keeps working through XLookupString. The caller
+// decides whether to care.
+//
+// Call locale.use_environment() BEFORE this if the program wants an input
+// method to be findable. In the default "C" locale XOpenIM finds nothing, and
+// this returns 0 — correctly, and with no way to tell from here whether the
+// cause was the locale or an absent method.
+fn open_method(in as *Input, d as *u8, xid as i64) as i32 {
+    if (in.have_im == 1) { return 1; }
+
+    // Tells Xlib to consult XMODIFIERS, which is where a desktop names the
+    // input method it is running. Without it XOpenIM finds nothing even when
+    // ibus or fcitx is up. Harmless with no locale set.
+    xlib.XSetLocaleModifiers("");
+
+    // Xlib cannot do multibyte input in a locale it does not implement, and
+    // says so here rather than failing later in a way that looks like a bug.
+    if (xlib.XSupportsLocale() == 0) { return 0; }
+
+    in.im = xlib.XOpenIM(d, cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+    if (cast(i64, in.im) == 0) { return 0; }
+
+    // Variadic, at the fixed arity xlib.cst declares, with the tail zeroed —
+    // the callee stops at the first null. Style is preedit-nothing and
+    // status-nothing so the input method draws its own windows.
+    in.ic = xlib.XCreateIC(in.im,
+                           "inputStyle", cast(*u8, PREEDIT_NOTHING | STATUS_NOTHING),
+                           "clientWindow", cast(*u8, xid),
+                           "focusWindow", cast(*u8, xid),
+                           cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                           cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+    if (cast(i64, in.ic) == 0) {
+        xlib.XCloseIM(in.im);
+        in.im = cast(*u8, 0);
+        return 0;
+    }
+    in.have_im = 1;
+    return 1;
+}
+
+fn has_method(in as *Input) as i32 { return in.have_im; }
+
+fn close(in as *Input) as void {
+    if (cast(i64, in.ic) != 0) { xlib.XDestroyIC(in.ic); in.ic = cast(*u8, 0); }
+    if (cast(i64, in.im) != 0) { xlib.XCloseIM(in.im); in.im = cast(*u8, 0); }
+    in.have_im = 0;
+}
+
+// --- The event loop's three obligations ---
+
+// 1 when the input method consumed the event and nothing else should see it.
+//
+// This has to run on EVERY event, not just key presses, and before anything
+// else looks at it: an input method uses key releases and client messages of
+// its own, and a loop that only filters KeyPress leaves it half fed.
+//
+// Always 0 when there is no input method, so a loop can call it unconditionally.
+fn filter(in as *Input, e as *xev.XEvent) as i32 {
+    if (in.have_im == 0) { return 0; }
+    return xlib.XFilterEvent(cast(*u8, e), 0);
+}
+
+fn focus_in(in as *Input) as void {
+    if (in.have_im == 0) { return; }
+    xlib.XSetICFocus(in.ic);
+}
+
+fn focus_out(in as *Input) as void {
+    if (in.have_im == 0) { return; }
+    xlib.XUnsetICFocus(in.ic);
+}
+
+// --- Latin-1 to UTF-8 ---
+//
+// XLookupString returns bytes in the C locale, which is Latin-1, and Latin-1 is
+// exactly the first 256 code points of Unicode. So the conversion is: pass
+// bytes under 0x80 through, and split the rest into the two-byte form. That is
+// the whole of it, and it is why the first tier needs no encoding library.
+// Public because it is the one piece of encoding this file does itself, and
+// because a keymap that maps no Latin-1 key — a plain US layout maps none —
+// would otherwise leave it untested. Writes into the Input's buffer and returns
+// the byte count, or -1 if it would not fit.
+fn from_latin1(in as *Input, src as *u8, n as i64) as i64 {
+    let is i64 as out with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, src[i]) & 255;
+        if (c < 128) {
+            if (out + 1 >= BUF_BYTES) { return 0 - 1; }
+            in.buf[out] = cast(u8, c);
+            out = out + 1;
+        } else {
+            if (out + 2 >= BUF_BYTES) { return 0 - 1; }
+            in.buf[out] = cast(u8, 192 | (c >> 6));
+            in.buf[out + 1] = cast(u8, 128 | (c & 63));
+            out = out + 2;
+        }
+        i = i + 1;
+    }
+    in.buf[out] = cast(u8, 0);
+    return out;
+}
+
+// --- Looking a key press up ---
+
+let is [256]u8 as _raw;
+let is i64 as _keysym with mut = 0;
+let is i32 as _status with mut = 0;
+
+// Bytes of UTF-8 the key produced, 0 for a key that is not text — an arrow, a
+// function key, a modifier. The text itself is text(), NUL-terminated.
+//
+// Call only on a KeyPress, and only on one filter() did not eat.
+fn lookup(in as *Input, e as *xev.XEvent) as i64 {
+    in.len = 0;
+    in.keysym = 0;
+    in.buf[0] = cast(u8, 0);
+    if (xev.kind(e) != x.KeyPress) { return 0; }
+
+    _keysym = 0;
+    _status = 0;
+
+    if (in.have_im == 1) {
+        // Already UTF-8: Xutf8LookupString is the whole reason to open an input
+        // method, and it is also what handles a compose that spans keystrokes.
+        let is i32 as n = xlib.Xutf8LookupString(in.ic, cast(*u8, e),
+                                                 cast(*u8, &in.buf),
+                                                 cast(i32, BUF_BYTES - 1),
+                                                 cast(*u8, &_keysym),
+                                                 cast(*u8, &_status));
+        in.keysym = _keysym;
+        if (_status == BUFFER_OVERFLOW) {
+            in.overflow = in.overflow + 1;
+            in.buf[0] = cast(u8, 0);
+            return 0;
+        }
+        if (_status != LOOKUP_CHARS && _status != LOOKUP_BOTH) {
+            in.buf[0] = cast(u8, 0);
+            return 0;
+        }
+        let is i64 as got with mut = cast(i64, n);
+        if (got < 0) { got = 0; }
+        in.buf[got] = cast(u8, 0);
+        in.len = got;
+        return got;
+    }
+
+    // The first tier. status_in_out is an input for XLookupString when there is
+    // no input context, and it wants a zero.
+    let is i32 as n = xutil.XLookupString(cast(*u8, e), cast(*u8, &_raw),
+                                          cast(i32, BUF_BYTES - 1),
+                                          cast(*u8, &_keysym),
+                                          cast(*u8, &_status));
+    in.keysym = _keysym;
+    if (n <= 0) { return 0; }
+
+    let is i64 as out = from_latin1(in, cast(*u8, &_raw), cast(i64, n));
+    if (out < 0) {
+        in.overflow = in.overflow + 1;
+        in.buf[0] = cast(u8, 0);
+        return 0;
+    }
+    in.len = out;
+    return out;
+}
+
+fn text(in as *Input) as *u8 { return cast(*u8, &in.buf); }
+fn text_len(in as *Input) as i64 { return in.len; }
+fn keysym(in as *Input) as i64 { return in.keysym; }
+fn dropped(in as *Input) as i64 { return in.overflow; }

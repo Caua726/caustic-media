@@ -1,0 +1,1147 @@
+// window/x11/window.cst — a window on X11, shaped the way the portable API will
+// want it rather than the way X11 happens to work.
+//
+// The loop is pull:
+//
+//     while (x11.next_frame(&w) == 1) {
+//         let is tgt.Target as t = x11.acquire(&w);
+//         if (t.width == 0) { continue; }
+//         // draw into t
+//         x11.submit(&w);
+//     }
+//
+// ../../window.md argues that shape at length and the argument is not about
+// X11. X11 is push: call XPutImage whenever you like, no pacing, the client
+// decides when a frame happens. Wayland is pull — you request a frame callback
+// and the compositor says when drawing is worth doing — and KMS is pull in its
+// own way, waiting on vblank. Faking pull on a push platform is trivial: return
+// immediately. Faking push on a pull platform means spinning or blocking inside
+// present, and both are wrong. So the interface is pull and X11 is the easy
+// case.
+//
+// Three rules, each with a reason:
+//
+//   next_frame BEFORE acquire, always. next_frame is where a ConfigureNotify
+//   rebuilds the buffers; acquire called first hands out a buffer sized for a
+//   window that no longer exists. Calling acquire without it returns a zero
+//   Target rather than a stale pointer.
+//
+//   Never cache the Target. It is this frame's buffer. Under MIT-SHM the
+//   buffers genuinely alternate, so a cached one writes into a segment the
+//   server is scanning out — visible as tearing on the first run rather than as
+//   a rare corruption. The mistake is deliberately loud.
+//
+//   Its contents are undefined at acquire. Every swapchain says this; here it
+//   is also what lets submit swap red and blue in place instead of copying.
+//
+// --- Two views of the same events ---
+//
+// The pump drains once and produces both. fold() runs first and cannot fail, so
+// a program that never touches the queue still gets should_close, the window
+// size and every held key. The ring holds raw 192-byte XEvents, because
+// ../../window.md says window/ owns the RAW queue and input/ interprets it —
+// the moment this file decides which fields matter, input/ inherits that
+// decision and an XI2 valuator has nowhere to live.
+//
+// Ring overflow drops the oldest and counts it. dropped() is monotonic and a
+// program that drains once a frame will never see it move.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "../../gpu/software/target.cst" as tgt;
+use "../../gpu/swapchain.cst" as swapchain;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xutil.cst" as xutil;
+use "bind/xevent.cst" as xev;
+use "surface.cst" as surface;
+use "keys.cst" as keys;
+use "events.cst" as events;
+use "clipboard.cst" as clipboard;
+use "wm.cst" as wm;
+use "text.cst" as text;
+use "framesync.cst" as framesync;
+use "dnd.cst" as dnd;
+use "std/time.cst" as time;
+
+// --- How things fail ---
+//
+// open() is the only thing here that can fail in an interesting way, and it
+// says why. Everything on the frame path is a silent no-op on a dead window,
+// for the same reason gpu/device.cst gives: a hot path that carries error
+// handling is a hot path nobody reads.
+
+let is i32 as OK          with imut = 0;
+let is i32 as NO_DISPLAY  with imut = 1;
+let is i32 as NO_VISUAL   with imut = 2;
+let is i32 as NO_WINDOW   with imut = 3;
+let is i32 as NO_GC       with imut = 4;
+let is i32 as NO_MEMORY   with imut = 5;
+let is i32 as NO_SURFACE  with imut = 6;
+let is i32 as BAD_ARGUMENT with imut = 7;
+
+fn error_name(code as i32) as *u8 {
+    if (code == OK)           { return "ok"; }
+    if (code == NO_DISPLAY)   { return "no display (is DISPLAY set?)"; }
+    if (code == NO_VISUAL)    { return "no truecolor visual"; }
+    if (code == NO_WINDOW)    { return "could not create the window"; }
+    if (code == NO_GC)        { return "could not create a graphics context"; }
+    if (code == NO_MEMORY)    { return "out of memory"; }
+    if (code == NO_SURFACE)   { return "could not create the framebuffer"; }
+    if (code == BAD_ARGUMENT) { return "bad argument"; }
+    return "unknown error";
+}
+
+// --- Opening ---
+
+struct Config {
+    title      as *u8;
+    class_name as *u8;   // WM_CLASS, what a taskbar groups by. Null for none.
+    width      as i64;
+    height     as i64;
+    events     as i64;   // ring capacity, in events. 0 for the default.
+    // A floor a window manager is asked not to go below. Ignored when
+    // resizable is 0, which pins the size outright. 0 for no floor.
+    min_width  as i64;
+    min_height as i64;
+    prefer_shm as i32;   // MIT-SHM when available. Honoured from M4.
+    // 0 asks the window manager not to resize this window at all, by declaring
+    // its minimum and maximum size equal in WM_NORMAL_HINTS. On a tiling
+    // compositor that is also the difference between a window and a tile the
+    // size of the monitor — see _set_size_hints.
+    resizable  as i32;
+}
+
+let is i64 as DEFAULT_RING with imut = 256;
+
+fn config(title as *u8, width as i64, height as i64) as Config {
+    let is Config as c;
+    c.title = title;
+    c.class_name = cast(*u8, 0);
+    c.width = width;
+    c.height = height;
+    c.events = DEFAULT_RING;
+    c.min_width = 0;
+    c.min_height = 0;
+    c.prefer_shm = 1;
+    c.resizable = 1;
+    return c;
+}
+
+// A window that keeps the size it asked for. On a floating window manager the
+// difference from config() is only that the user cannot drag its edges; on a
+// tiling one it is the difference between a window and the whole screen.
+fn config_fixed(title as *u8, width as i64, height as i64) as Config {
+    let is Config as c = config(title, width, height);
+    c.resizable = 0;
+    return c;
+}
+
+struct Window {
+    display as *u8;
+    xid     as i64;
+    gc      as *u8;
+    visual  as *u8;
+    colormap as i64;
+    screen  as i32;
+    xdepth  as u32;
+
+    wm_delete as i64;
+    wm_protocols as i64;
+
+    back as surface.Backing;
+    km   as keys.Map;
+    st   as events.State;
+    // clipboard.cst is here because the pump MUST answer selection requests
+    // whether the program asked for a clipboard or not, and because it reaches
+    // no library beyond libX11.
+    //
+    // cursor.cst and monitors.cst are deliberately NOT here — see the note at
+    // the bottom of this file.
+    clip as clipboard.Selection;
+    // wm.cst IS here, and the difference is which library it reaches: asking
+    // for fullscreen is atoms and client messages, all of it libX11, so
+    // forwarding it costs a binary nothing. Initialised lazily all the same —
+    // it interns thirteen atoms, and thirteen round trips is not something to
+    // spend at open on a program that never asks for any of them.
+    wmst as wm.State;
+    // text.cst is here for the same reason wm.cst is: everything it calls is
+    // libX11. The libc half — setlocale, which an input method needs before it
+    // can be found — is deliberately NOT, and lives in locale.cst.
+    txt  as text.Input;
+    // _NET_WM_SYNC_REQUEST. libXext is already in DT_NEEDED for the MIT-SHM
+    // path, so this costs no new library.
+    fsync as framesync.State;
+    // XDND, the target side. libX11 only, so it forwards like wm.cst.
+    drop  as dnd.State;
+
+    // The frame limiter, in nanoseconds per frame. 0 means unlimited, which is
+    // the default and what X11 gives you: there is no vsync signal reachable
+    // through libX11, so this is a clock rather than a display refresh. See
+    // set_frame_limit.
+    frame_ns   as i64;
+    last_frame as i64;
+
+    // The raw queue. Mapped rather than inline because 256 XEvents is 48 KB and
+    // a Window is a value the caller declares on the stack.
+    ring     as *u8;
+    ring_cap as i64;
+    ring_head as i64;
+    ring_len  as i64;
+    dropped   as i64;
+
+    frames as i64;
+    framed as i32;      // next_frame ran for this frame; acquire refuses without it
+    err    as i32;
+    ok     as i32;
+    _pad0  as i32;
+}
+
+// One scratch event for the pump. The pump is not reentrant and neither is X11
+// on one Display, so a module-level one costs 192 bytes and saves it from the
+// stack on every drain.
+let is xev.XEvent as _scratch;
+let is [8]i64 as _protocols;
+
+fn _slot(w as *Window, i as i64) as *xev.XEvent {
+    return cast(*xev.XEvent, cast(i64, w.ring) + (i % w.ring_cap) * sizeof(xev.XEvent));
+}
+
+// A TrueColor visual at 24 or 32 bits, which is what a packed 0xAARRGGBB
+// framebuffer means. On a PseudoColor visual those bytes are colormap indices
+// and the picture is wrong rather than absent, so failing here is better than
+// drawing.
+fn _pick_visual(w as *Window, d as *u8, scr as i32) as i32 {
+    w.visual = xlib.XDefaultVisual(d, scr);
+    w.xdepth = cast(u32, xlib.XDefaultDepth(d, scr));
+    if (cast(i64, w.visual) == 0) { return 0; }
+    if (w.xdepth != cast(u32, 24) && w.xdepth != cast(u32, 32)) { return 0; }
+    let is *xlib.Visual as v = cast(*xlib.Visual, w.visual);
+    if (v.class != x.TrueColor && v.class != x.DirectColor) { return 0; }
+    return 1;
+}
+
+// WM_CLASS is what a taskbar groups windows by and what a compositor matches
+// its per-application rules against. The property is two NUL-terminated
+// strings back to back — instance name then class name — which is why this
+// builds the buffer by hand rather than calling XSetClassHint: that lives in
+// Xutil.h and arrives with bind/xutil.cst.
+let is [256]u8 as _class_buf;
+
+fn _set_class(w as *Window, d as *u8, name as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (n < 120 && name[n] != cast(u8, 0)) { n = n + 1; }
+    if (n == 0) { return; }
+
+    let is i64 as i with mut = 0;
+    while (i < n) { _class_buf[i] = name[i]; i = i + 1; }
+    _class_buf[n] = cast(u8, 0);
+    i = 0;
+    while (i < n) { _class_buf[n + 1 + i] = name[i]; i = i + 1; }
+    _class_buf[n + 1 + n] = cast(u8, 0);
+
+    let is i64 as wm_class = xlib.XInternAtom(d, "WM_CLASS", 0);
+    let is i64 as str_atom = xlib.XInternAtom(d, "STRING", 0);
+    xlib.XChangeProperty(d, w.xid, wm_class, str_atom, 8, x.PropModeReplace,
+                         cast(*u8, &_class_buf), cast(i32, n + n + 2));
+}
+
+// WM_NORMAL_HINTS, which is the only thing a window manager is told about what
+// size a window wants to be.
+//
+// This is what makes `resizable` mean something rather than being a field
+// nobody reads. A window that sets nothing here is, to a tiling compositor, a
+// window with no opinion — and niri, sway, i3 and river all give it whatever
+// their layout says, which on a single monitor is the whole screen. The 640x480
+// asked for is granted by a floating window manager and silently ignored by
+// every tiling one.
+//
+// Declaring PMinSize equal to PMaxSize says the window cannot be resized, and
+// that is the documented rule niri floats on: "new windows automatically float
+// if they have a parent or are fixed size". Under XWayland the hints reach it
+// through xwayland-satellite, which turns them into the min and max size of the
+// xdg_toplevel it creates.
+//
+// It stays a request. A window manager is free to ignore all of it, which is
+// why the example checks the size it actually got rather than assuming.
+fn _set_size_hints(w as *Window, d as *u8, c as *Config) as void {
+    let is xutil.XSizeHints as h;
+    h.flags = 0;
+    h.x = 0; h.y = 0;
+    h.width = cast(i32, c.width);
+    h.height = cast(i32, c.height);
+    h.min_width = 0; h.min_height = 0;
+    h.max_width = 0; h.max_height = 0;
+    h.width_inc = 0; h.height_inc = 0;
+    h.min_aspect.x = 0; h.min_aspect.y = 0;
+    h.max_aspect.x = 0; h.max_aspect.y = 0;
+    h.base_width = cast(i32, c.width);
+    h.base_height = cast(i32, c.height);
+    h.win_gravity = 0;
+    h._pad0 = 0;
+
+    // PSize says the size came from the program rather than the user, which is
+    // what it did: it is the argument to open().
+    h.flags = xutil.PSize | xutil.PBaseSize;
+
+    if (c.resizable == 0) {
+        h.min_width = cast(i32, c.width);
+        h.min_height = cast(i32, c.height);
+        h.max_width = cast(i32, c.width);
+        h.max_height = cast(i32, c.height);
+        h.flags = h.flags | xutil.PMinSize | xutil.PMaxSize;
+    } else if (c.min_width > 0 || c.min_height > 0) {
+        h.min_width = cast(i32, c.min_width);
+        h.min_height = cast(i32, c.min_height);
+        h.flags = h.flags | xutil.PMinSize;
+    }
+
+    xutil.XSetWMNormalHints(d, w.xid, cast(*u8, &h));
+}
+
+fn open_with(c as *Config) as Window {
+    let is Window as w;
+    w.display = cast(*u8, 0); w.xid = 0; w.gc = cast(*u8, 0);
+    w.visual = cast(*u8, 0); w.colormap = 0; w.screen = 0; w.xdepth = 0;
+    w.wm_delete = 0; w.wm_protocols = 0;
+    w.ring = cast(*u8, 0); w.ring_cap = 0; w.ring_head = 0; w.ring_len = 0;
+    w.dropped = 0; w.frames = 0; w.framed = 0; w.err = OK; w.ok = 0;
+    w.back.ok = 0;
+
+    if (c.width <= 0 || c.height <= 0) { w.err = BAD_ARGUMENT; return w; }
+
+    let is *u8 as d = _display_acquire();
+    if (cast(i64, d) == 0) { w.err = NO_DISPLAY; return w; }
+    w.display = d;
+
+    w.screen = xlib.XDefaultScreen(d);
+    if (_pick_visual(&w, d, w.screen) == 0) {
+        _display_release(); w.display = cast(*u8, 0);
+        w.err = NO_VISUAL; return w;
+    }
+    w.colormap = xlib.XDefaultColormap(d, w.screen);
+
+    let is i64 as root = xlib.XRootWindow(d, w.screen);
+    let is i64 as black = xlib.XBlackPixel(d, w.screen);
+    w.xid = xlib.XCreateSimpleWindow(d, root, 0, 0,
+                                     cast(u32, c.width), cast(u32, c.height), 0,
+                                     black, black);
+    if (w.xid == 0) {
+        _display_release(); w.display = cast(*u8, 0);
+        w.err = NO_WINDOW; return w;
+    }
+
+    if (cast(i64, c.title) != 0) { xlib.XStoreName(d, w.xid, c.title); }
+    if (cast(i64, c.class_name) != 0) { _set_class(&w, d, c.class_name); }
+    _set_size_hints(&w, d, c);
+
+    xlib.XSelectInput(d, w.xid,
+        x.KeyPressMask | x.KeyReleaseMask | x.ButtonPressMask | x.ButtonReleaseMask
+        | x.PointerMotionMask | x.EnterWindowMask | x.LeaveWindowMask
+        | x.ExposureMask | x.StructureNotifyMask | x.FocusChangeMask
+        | x.VisibilityChangeMask | x.PropertyChangeMask);
+
+    // Without this the close button kills the connection outright and the
+    // process dies mid-frame with no chance to shut anything down.
+    w.wm_protocols = xlib.XInternAtom(d, "WM_PROTOCOLS", 0);
+    w.wm_delete = xlib.XInternAtom(d, "WM_DELETE_WINDOW", 0);
+    _protocols[0] = w.wm_delete;
+    let is i32 as nproto with mut = 1;
+
+    // Before XSetWMProtocols, because a compositor will not send a sync
+    // request to a window that has not listed the protocol. Failing is fine —
+    // a server with no SYNC extension simply never sends one.
+    framesync.init(&w.fsync, d, w.xid);
+    if (framesync.available(&w.fsync) == 1) {
+        _protocols[1] = framesync.protocol_atom(&w.fsync);
+        nproto = 2;
+    }
+    xlib.XSetWMProtocols(d, w.xid, cast(*u8, &_protocols), nproto);
+
+    w.gc = xlib.XCreateGC(d, w.xid, 0, cast(*u8, 0));
+    if (cast(i64, w.gc) == 0) {
+        xlib.XDestroyWindow(d, w.xid); _display_release();
+        w.display = cast(*u8, 0); w.err = NO_GC; return w;
+    }
+
+    w.ring_cap = c.events;
+    if (w.ring_cap <= 0) { w.ring_cap = DEFAULT_RING; }
+    w.ring = mem.core.mmap_anon(w.ring_cap * sizeof(xev.XEvent));
+    if (cast(i64, w.ring) == 0) {
+        xlib.XFreeGC(d, w.gc); xlib.XDestroyWindow(d, w.xid); _display_release();
+        w.display = cast(*u8, 0); w.err = NO_MEMORY; return w;
+    }
+
+    if (surface.open(&w.back, d, w.visual, w.xdepth, c.width, c.height, c.prefer_shm) == 0) {
+        mem.core.munmap(w.ring, w.ring_cap * sizeof(xev.XEvent));
+        xlib.XFreeGC(d, w.gc); xlib.XDestroyWindow(d, w.xid); _display_release();
+        w.display = cast(*u8, 0); w.err = NO_SURFACE; return w;
+    }
+
+    keys.init(&w.km, d);
+    events.state_init(&w.st, c.width, c.height);
+    // Clipboard is libX11 only, and the pump has to answer selection requests
+    // whether the program asked for a clipboard or not, so it is set up here.
+    clipboard.init(&w.clip, d);
+    // Not interned here: wm.cst asks the server for thirteen atoms, and a
+    // program that never asks for fullscreen should not pay thirteen round
+    // trips at open. _need_wm does it on first use.
+    w.wmst.ready = 0;
+    // The first tier costs nothing to set up: no locale, no input method, no
+    // round trip. An input method is opened only if the program asks.
+    text.init(&w.txt);
+    dnd.init(&w.drop, d, w.xid);
+    w.frame_ns = 0;
+    w.last_frame = 0;
+
+    xlib.XMapWindow(d, w.xid);
+    xlib.XFlush(d);
+    w.ok = 1;
+    w.err = OK;
+    return w;
+}
+
+fn open(title as *u8, width as i64, height as i64) as Window {
+    let is Config as c = config(title, width, height);
+    return open_with(&c);
+}
+
+fn close(w as *Window) as void {
+    if (w.ok == 0) { return; }
+    // Out of the routing table first: an event that arrives between here and
+    // the last release must not be handed to a window being torn down.
+    _unregister(w);
+    text.close(&w.txt);
+    dnd.close(&w.drop);
+    framesync.close(&w.fsync, w.display);
+    clipboard.close(&w.clip);
+    surface.close(&w.back, w.display);
+    if (cast(i64, w.ring) != 0) {
+        mem.core.munmap(w.ring, w.ring_cap * sizeof(xev.XEvent));
+        w.ring = cast(*u8, 0);
+    }
+    if (cast(i64, w.gc) != 0) { xlib.XFreeGC(w.display, w.gc); }
+    if (w.xid != 0) { xlib.XDestroyWindow(w.display, w.xid); }
+    // Not XCloseDisplay: the connection is shared, and the last window out
+    // turns off the light. Closing it here would leave every other open window
+    // holding a freed Display.
+    if (cast(i64, w.display) != 0) { _display_release(); }
+    w.display = cast(*u8, 0);
+    w.xid = 0;
+    w.gc = cast(*u8, 0);
+    w.ok = 0;
+}
+
+fn is_open(w as *Window) as i32 { return w.ok; }
+fn last_error(w as *Window) as i32 { return w.err; }
+
+// --- The pump ---
+
+fn _ring_push(w as *Window, e as *xev.XEvent) as void {
+    if (w.ring_len == w.ring_cap) {
+        // Drop the oldest. Counted, never silent: a program that stalls will
+        // see dropped() move and will know why.
+        w.ring_head = w.ring_head + 1;
+        w.ring_len = w.ring_len - 1;
+        w.dropped = w.dropped + 1;
+    }
+    let is *xev.XEvent as s = _slot(w, w.ring_head + w.ring_len);
+    let is i64 as i with mut = 0;
+    while (i < 24) { s.pad[i] = e.pad[i]; i = i + 1; }
+    w.ring_len = w.ring_len + 1;
+}
+
+// Fetches a generic event's payload, folds what this layer understands out of
+// it, and gives it straight back. The alternative — copying 256 bytes into
+// every ring slot against the chance that a program wants it — costs 64 KB per
+// window for something almost nothing reads.
+//
+// Raw motion is the exception and it is why this exists: cursor_mode(RELATIVE)
+// needs deltas that never reach a normal MotionNotify, so they are folded into
+// the sampled state here, where the payload is still alive.
+fn _absorb_cookie(w as *Window, e as *xev.XEvent) as void {
+    let is *xev.XGenericEventCookie as ck = xev.cookie(e);
+    if (xlib.XGetEventData(w.display, cast(*u8, e)) == 0) { return; }
+    // XI_RawMotion is 17, and its opcode is whatever the server assigned the
+    // XInput extension on this connection. Counting rather than decoding is
+    // deliberate: the valuators are a variable-length tail and reading them is
+    // input/'s job. window/ only guarantees the payload survived the frame.
+    if (ck.evtype == 17) { w.st.raw_motion = w.st.raw_motion + 1; }
+    xlib.XFreeEventData(w.display, cast(*u8, e));
+}
+
+fn _configure_changed(w as *Window, e as *xev.XEvent) as i32 {
+    if (xev.kind(e) != x.ConfigureNotify) { return 0; }
+    let is *xev.XConfigureEvent as c = xev.configure(e);
+    if (cast(i64, c.width) == surface.width(&w.back)
+        && cast(i64, c.height) == surface.height(&w.back)) { return 0; }
+    return 1;
+}
+
+// Drains what has arrived. `block` waits for at least one event first, which is
+// what wait_xevent needs and what a pull loop on a pull platform would need.
+// --- One connection, many windows ---
+//
+// Every Window used to call XOpenDisplay, so two windows were two sockets, two
+// event queues and two copies of every interned atom. One connection is the
+// conventional shape and the cheaper one, and it costs exactly one thing: the
+// pump now dequeues events for windows other than the one it was called on,
+// and has to hand each to its owner.
+//
+// That routing is the whole risk of the change. An event delivered to the
+// wrong window is not a crash — it is a key press the program never sees, or a
+// resize applied to the wrong surface — so multi_test.cst was written against
+// the two-connection version first, to have something to regress against.
+let is *u8 as _display with mut = cast(*u8, 0);
+let is i64 as _display_refs with mut = 0;
+
+let is i64 as MAX_WINDOWS with imut = 32;
+let is [32]i64 as _reg_xid;
+let is [32]i64 as _reg_win;      // *Window, as an integer
+let is i64 as _reg_count with mut = 0;
+
+fn _display_acquire() as *u8 {
+    if (_display_refs == 0) {
+        _display = xlib.XOpenDisplay(cast(*u8, 0));
+        if (cast(i64, _display) == 0) { return cast(*u8, 0); }
+    }
+    _display_refs = _display_refs + 1;
+    return _display;
+}
+
+// Closes the connection when the last window goes. A refcount rather than a
+// flag because closing early is a use-after-free in whatever is still open,
+// and never closing leaks a socket per program run.
+fn _display_release() as void {
+    if (_display_refs <= 0) { return; }
+    _display_refs = _display_refs - 1;
+    if (_display_refs == 0 && cast(i64, _display) != 0) {
+        xlib.XCloseDisplay(_display);
+        _display = cast(*u8, 0);
+    }
+}
+
+// Registered from the PUMP rather than from open_with, and that is not a
+// stylistic choice.
+//
+// open_with builds a Window in a local and returns it by value, so the address
+// it could register is a stack slot that stops existing the moment it returns
+// — the same lifetime trap that put a dead pointer in every XImage under
+// MIT-SHM, and it produced the same kind of failure here: a routing table full
+// of addresses into reused stack, and events delivered through them.
+//
+// The pump is called with the caller's real, stable address, so registering
+// there is correct by construction. It also self-heals: a Window that was
+// moved or copied re-registers under its new address the next time it pumps.
+fn _ensure_registered(w as *Window) as void {
+    let is i64 as i with mut = 0;
+    while (i < _reg_count) {
+        if (_reg_xid[i] == w.xid) { _reg_win[i] = cast(i64, w); return; }
+        i = i + 1;
+    }
+    if (_reg_count >= MAX_WINDOWS) { return; }
+    _reg_xid[_reg_count] = w.xid;
+    _reg_win[_reg_count] = cast(i64, w);
+    _reg_count = _reg_count + 1;
+}
+
+fn _unregister(w as *Window) as void {
+    let is i64 as i with mut = 0;
+    while (i < _reg_count) {
+        if (_reg_xid[i] == w.xid) {
+            _reg_xid[i] = _reg_xid[_reg_count - 1];
+            _reg_win[i] = _reg_win[_reg_count - 1];
+            _reg_count = _reg_count - 1;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// Which open window an event belongs to, or null.
+//
+// xany.window is the event's target for everything that has one. The events
+// that do not — MappingNotify, and a GenericEvent whose payload names its own
+// window — fall through to null and are handled by the window that pumped,
+// which is the only sensible owner for something the server sent to nobody in
+// particular.
+fn _owner(e as *xev.XEvent) as *Window {
+    let is i64 as target = xev.any(e).window;
+    if (target == 0) { return cast(*Window, 0); }
+    let is i64 as i with mut = 0;
+    while (i < _reg_count) {
+        if (_reg_xid[i] == target) { return cast(*Window, _reg_win[i]); }
+        i = i + 1;
+    }
+    return cast(*Window, 0);
+}
+
+// Everything that used to be the body of the pump loop, for one window and one
+// event. Split out so the loop above it can choose which window that is.
+fn _deliver(w as *Window, e as *xev.XEvent) as void {
+        // 0. The input method first, and it has to be first. An IM eats the
+        //    keystrokes that are building a character, and anything that saw
+        //    them before the filter would also handle them — the program gets
+        //    both the composition and the raw keys. It also uses events of its
+        //    own that mean nothing here.
+        //
+        //    Always 0 when no input method is open, so this costs a branch.
+        if (text.filter(&w.txt, e) == 1) { return; }
+
+        // 1. Fold. Unconditional and before the ring, so a full ring never
+        //    costs a resize, a close, or a held key.
+        events.fold(&w.st, e, &w.km, w.wm_delete);
+
+        // 2. Follow the window's size. Both the mapping and the XImage have to
+        //    be rebuilt together, and before the caller can draw: everything
+        //    that presents reads them, and both are now the wrong size for the
+        //    window they belong to.
+        if (_configure_changed(w, e) == 1) {
+            if (surface.resize(&w.back, w.display,
+                               w.st.width, w.st.height) == 0) {
+                w.err = NO_SURFACE;
+                w.st.should_close = 1;
+            }
+        }
+
+        // 2b. The input method's candidate window follows our focus, or it
+        //     draws itself next to a window that no longer has the keyboard.
+        if (xev.kind(e) == x.FocusIn)  { text.focus_in(&w.txt); }
+        if (xev.kind(e) == x.FocusOut) { text.focus_out(&w.txt); }
+
+        // 3. A layout switch invalidates every keycode this program has cached.
+        if (xev.kind(e) == x.MappingNotify) {
+            xlib.XRefreshKeyboardMapping(cast(*u8, e));
+            keys.refresh(&w.km, w.display);
+        }
+
+        // 4. XI2 and every other GenericEvent carries a pointer into libX11's
+        //    own memory that XFreeEventData invalidates. Storing the event in
+        //    the ring and reading its payload a frame later is a use-after-free,
+        //    so the payload is fetched and released here and the ring keeps only
+        //    the 192-byte header. A program that needs the payload reads it in
+        //    the same frame through poll_event, which is what raw motion does.
+        if (xev.kind(e) == x.GenericEvent) {
+            _absorb_cookie(w, e);
+        }
+
+        // 4b. The compositor asking when this frame will be ready. Absorbed
+        //     here rather than queued: the answer is submit()'s job and the
+        //     program has nothing to decide.
+        if (framesync.handle(&w.fsync, e, w.wm_protocols) == 1) { return; }
+
+        // 4c. A drag over the window. Absorbed because the protocol demands an
+        //     answer to every XdndPosition and a program cannot be relied on to
+        //     send one — a source that gets no XdndStatus refuses to drop, with
+        //     nothing anywhere reporting why.
+        if (dnd.handle(&w.drop, w.display, w.xid, e) == 1) { return; }
+
+        // 5. Ours rather than the program's: the buffer release under MIT-SHM,
+        //    and any selection traffic. A SelectionRequest this program does not
+        //    answer leaves the client that sent it waiting, so it is serviced
+        //    here rather than deferred to a frame loop that may never drain.
+        if (surface.complete(&w.back, e) == 1) { return; }
+        // Both of these are SelectionNotify and only the property tells them
+        // apart, so the drop is offered the event first and the clipboard sees
+        // what is left.
+        if (dnd.handle_selection(&w.drop, w.display, w.xid, e) == 1) { return; }
+        if (clipboard.answer(&w.clip, w.display, w.xid, e) == 1) { return; }
+
+        // 6. Queue it. WM_DELETE_WINDOW is folded above AND pushed here,
+        //    because a program may want to veto rather than obey.
+        _ring_push(w, e);
+}
+
+fn _pump(w as *Window, block as i32) as void {
+    _ensure_registered(w);
+    let is i32 as first with mut = block;
+    while (xlib.XPending(w.display) > 0 || first == 1) {
+        xlib.XNextEvent(w.display, cast(*u8, &_scratch));
+        first = 0;
+
+        // Whose event is this? With one connection shared by every window, the
+        // answer is usually but not always the window that called pump.
+        let is i64 as target = xev.any(&_scratch).window;
+        let is *Window as owner with mut = _owner(&_scratch);
+
+        if (cast(i64, owner) == 0) {
+            // An event naming a window we do not know is NOT ours to apply.
+            // Dropping it is the whole difference between correct routing and
+            // a ConfigureNotify for a window that just closed resizing
+            // whichever window happened to be pumping — which is exactly what
+            // multi_test.cst caught.
+            if (target != 0) { continue; }
+            // No target at all: MappingNotify, and a GenericEvent whose payload
+            // names its own window. The pumping window is the only sensible
+            // owner for something the server sent to nobody in particular.
+            owner = w;
+        }
+        _deliver(owner, &_scratch);
+    }
+}
+
+// Blocks until drawing is useful, and returns 0 once the window should close.
+// On X11 there is no pacing to wait for, so this returns immediately — but it
+// is still where the frame begins, which is what makes the loop portable.
+fn next_frame(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    _throttle(w);
+    events.state_new_frame(&w.st);
+    _pump(w, 0);
+    if (w.st.should_close == 1) { return 0; }
+    if (w.ok == 0) { return 0; }
+    w.framed = 1;
+    return 1;
+}
+
+// This frame's back buffer, as a Target the rasterizer draws into. Zero-sized
+// when there is nothing to draw into, which a caller should check rather than
+// assume: after a failed resize there genuinely is no buffer.
+fn acquire(w as *Window) as tgt.Target {
+    let is tgt.Target as t;
+    t.color = cast(*u8, 0); t.depth = cast(*u8, 0); t.width = 0; t.height = 0;
+    if (w.ok == 0) { return t; }
+    // acquire before next_frame would hand out a buffer sized for the window as
+    // it was, which after a resize is a buffer of the wrong size. Returning
+    // nothing is louder than returning something stale.
+    if (w.framed == 0) { return t; }
+    let is *u8 as px = surface.acquire(&w.back);
+    if (cast(i64, px) == 0) { return t; }
+    t.color = px;
+    t.width = surface.width(&w.back);
+    t.height = surface.height(&w.back);
+    return t;
+}
+
+fn submit(w as *Window) as void {
+    if (w.ok == 0 || w.framed == 0) { return; }
+    surface.swap_channels(&w.back);
+    surface.put(&w.back, w.display, w.xid, w.gc);
+    xlib.XFlush(w.display);
+    // AFTER the frame is on its way, never before. The counter means "the
+    // contents you asked about are ready", and setting it early is how a
+    // resize goes back to showing half-drawn frames — with the protocol in
+    // place and apparently working.
+    framesync.complete(&w.fsync, w.display);
+    w.frames = w.frames + 1;
+    w.framed = 0;
+}
+
+// --- The frame limiter ---
+//
+// A cap in frames per second, or 0 for none. Default is none.
+//
+// Be clear about what this is NOT: it is not vsync. libX11 offers no way to
+// wait for the display's refresh — that is the Present extension, which lives
+// in libxcb rather than in anything bound here — so this is a clock, and a
+// clock drifts against the monitor. What it is for is the honest case where
+// ../../window.md's pull model has nothing to pull against: without it a
+// program on X11 spins as fast as it can draw, which on the software backend
+// means burning a core to produce frames nobody sees.
+fn set_frame_limit(w as *Window, fps as i64) as void {
+    if (fps <= 0) { w.frame_ns = 0; return; }
+    w.frame_ns = 1000000000 / fps;
+}
+
+fn frame_limit(w as *Window) as i64 {
+    if (w.frame_ns <= 0) { return 0; }
+    return 1000000000 / w.frame_ns;
+}
+
+// Sleeps out the rest of this frame's budget. Called from next_frame, which is
+// where ../../window.md says the wait belongs on a platform that paces.
+fn _throttle(w as *Window) as void {
+    if (w.frame_ns <= 0) { return; }
+    let is i64 as now = time.now_ns();
+    if (w.last_frame == 0) { w.last_frame = now; return; }
+    let is i64 as due = w.last_frame + w.frame_ns;
+    if (due > now) { time.sleep_ns(due - now); }
+    // From the deadline rather than from the wake-up, so a frame that ran long
+    // does not push every later one back with it.
+    w.last_frame = due;
+    if (time.now_ns() - w.last_frame > w.frame_ns * 4) { w.last_frame = time.now_ns(); }
+}
+
+fn frame_index(w as *Window) as i64 { return w.frames; }
+fn image_count(w as *Window) as i64 { return surface.image_count(&w.back); }
+fn transport_name(w as *Window) as *u8 { return surface.name(&w.back); }
+
+// --- The raw queue ---
+
+fn poll_xevent(w as *Window, out as *xev.XEvent) as i32 {
+    if (w.ok == 0 || w.ring_len == 0) { return 0; }
+    let is *xev.XEvent as s = _slot(w, w.ring_head);
+    let is i64 as i with mut = 0;
+    while (i < 24) { out.pad[i] = s.pad[i]; i = i + 1; }
+    w.ring_head = w.ring_head + 1;
+    w.ring_len = w.ring_len - 1;
+    return 1;
+}
+
+fn wait_xevent(w as *Window, out as *xev.XEvent) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (w.ring_len == 0) { _pump(w, 1); }
+    return poll_xevent(w, out);
+}
+
+fn poll_event(w as *Window, out as *events.Event) as i32 {
+    let is xev.XEvent as raw;
+    while (poll_xevent(w, &raw) == 1) {
+        if (events.decode(&raw, &w.km, out) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn queue_len(w as *Window) as i64 { return w.ring_len; }
+fn dropped(w as *Window) as i64 { return w.dropped; }
+
+// --- Sampled state ---
+
+fn width(w as *Window) as i64 { return surface.width(&w.back); }
+fn height(w as *Window) as i64 { return surface.height(&w.back); }
+fn resized(w as *Window) as i32 { return w.st.resized; }
+fn exposed(w as *Window) as i32 { return w.st.exposed; }
+fn focused(w as *Window) as i32 { return w.st.focused; }
+fn visible(w as *Window) as i32 { return w.st.visible; }
+fn should_close(w as *Window) as i32 { return w.st.should_close; }
+fn request_close(w as *Window) as void { w.st.should_close = 1; }
+
+fn key_down(w as *Window, key_id as i32) as i32 { return events.key_down(&w.st, &w.km, key_id); }
+fn keycode_down(w as *Window, keycode as i32) as i32 { return events.keycode_down(&w.st, keycode); }
+fn modifiers(w as *Window) as i32 { return w.st.modifiers; }
+fn mouse_x(w as *Window) as i64 { return w.st.mouse_x; }
+fn mouse_y(w as *Window) as i64 { return w.st.mouse_y; }
+fn mouse_dx(w as *Window) as i64 { return w.st.mouse_dx; }
+fn mouse_dy(w as *Window) as i64 { return w.st.mouse_dy; }
+fn wheel(w as *Window) as i64 { return w.st.wheel; }
+fn button_down(w as *Window, button as i32) as i32 { return events.button_down(&w.st, button); }
+
+// --- Changing the window ---
+
+fn set_title(w as *Window, title as *u8) as void {
+    if (w.ok == 0) { return; }
+    xlib.XStoreName(w.display, w.xid, title);
+    xlib.XFlush(w.display);
+}
+
+// A request, not a command: the window manager decides, and the answer arrives
+// as a ConfigureNotify that next_frame will fold. Reading width() straight
+// after this returns the old size, and that is correct rather than a bug.
+fn set_size(w as *Window, cw as i64, ch as i64) as i32 {
+    if (w.ok == 0 || cw <= 0 || ch <= 0) { return 0; }
+    xlib.XResizeWindow(w.display, w.xid, cast(u32, cw), cast(u32, ch));
+    xlib.XFlush(w.display);
+    return 1;
+}
+
+fn show(w as *Window) as void {
+    if (w.ok == 0) { return; }
+    xlib.XMapWindow(w.display, w.xid);
+    xlib.XFlush(w.display);
+}
+
+fn hide(w as *Window) as void {
+    if (w.ok == 0) { return; }
+    xlib.XUnmapWindow(w.display, w.xid);
+    xlib.XFlush(w.display);
+}
+
+fn focus(w as *Window) as void {
+    if (w.ok == 0) { return; }
+    xlib.XSetInputFocus(w.display, w.xid, x.RevertToParent, x.CurrentTime);
+    xlib.XFlush(w.display);
+}
+
+// --- Native handles ---
+//
+// Public contract, not implementation detail. ../../window.md is explicit about
+// why: when Vulkan or OpenGL renders, the swapchain owns presentation entirely
+// and this layer's whole remaining job is handing over the pair that
+// VK_KHR_xlib_surface and EGL need. A layer never hides the layer beneath it.
+
+fn display(w as *Window) as *u8 { return w.display; }
+fn xid(w as *Window) as i64 { return w.xid; }
+fn screen(w as *Window) as i32 { return w.screen; }
+fn visual(w as *Window) as *u8 { return w.visual; }
+fn colormap(w as *Window) as i64 { return w.colormap; }
+fn gc(w as *Window) as *u8 { return w.gc; }
+fn connection_fd(w as *Window) as i32 {
+    if (w.ok == 0) { return cast(i32, 0 - 1); }
+    return xlib.XConnectionNumber(w.display);
+}
+
+// The gpu/ seam, prebuilt. gpu/swapchain.cst does not import window/ and must
+// not, so it takes the handles as opaque values and a callback for the software
+// path; this hands it both. A Vulkan backend would use a and b and ignore the
+// callback entirely, which is why it is a field rather than a requirement.
+fn surface_for_gpu(w as *Window, present as *u8, user as *u8) as swapchain.Surface {
+    return swapchain.surface_native(swapchain.NATIVE_X11, w.display, w.xid, present, user);
+}
+
+// --- The same seam, without the copy ---
+//
+// surface_for_gpu above gives the swapchain its own images and hands the
+// finished frame back through `present`, which the program then copies into
+// this window's buffer. That copy is a whole framebuffer every frame: 1.17 MB
+// at 640x480, 7.9 MB at 1080p, read and written.
+//
+// It does not have to happen. The window already owns a buffer of exactly the
+// right size and format — acquire() hands it out, submit() puts it on screen —
+// so the swapchain can draw straight into it and the copy disappears.
+//
+// The two functions below are what gpu/ calls. They are file-scope rather than
+// methods because fn_ptr needs a plain function, and they take the Window as
+// the `user` value the Surface carries.
+//
+// Two things make this safe rather than clever:
+//
+//   The buffer is asked for EVERY frame. Under MIT-SHM the window alternates
+//   between two, and the one that was free last frame is being read by the X
+//   server now. Caching it would be writing into the frame on screen.
+//
+//   Returning null is normal. It means next_frame has not run yet, or a resize
+//   failed, or both SHM buffers are still outstanding. The swapchain reports
+//   that as a refused acquire, which is what a caller already has to handle.
+fn _gpu_acquire(user as *u8) as *u8 {
+    let is *Window as w = cast(*Window, user);
+    let is tgt.Target as t = acquire(w);
+    if (t.width == 0) { return cast(*u8, 0); }
+    return t.color;
+}
+
+// pixels arrives null: the swapchain drew into the buffer this window gave it,
+// so there is nothing to copy and this only has to put it on screen.
+fn _gpu_submit(user as *u8, pixels as *u8, cw as i64, ch as i64) as i64 {
+    let is *Window as w = cast(*Window, user);
+    submit(w);
+    return 1;
+}
+
+fn surface_for_gpu_shared(w as *Window) as swapchain.Surface {
+    return swapchain.surface_native_shared(swapchain.NATIVE_X11, w.display, w.xid,
+                                           fn_ptr(_gpu_submit), fn_ptr(_gpu_acquire),
+                                           cast(*u8, w));
+}
+
+// --- What is deliberately NOT here: the cursor and the monitors ---
+//
+// cursor.cst and monitors.cst exist, are finished, and are not imported by this
+// file. Not an oversight — measured.
+//
+// Importing a module that CALLS an extension's functions makes that extension
+// reachable from main, even when nothing in the program calls the module.
+// Caustic's dead-code elimination does not reach through a module boundary the
+// way it reaches through an unused declaration: bind/xrandr.cst can be imported
+// for free because it only declares externs, but monitors.cst calls them, and
+// importing it put libXrandr, libXi, libXcursor and libXfixes into
+// examples/cube.cst's DT_NEEDED. The loader then requires all four to be
+// INSTALLED before the program can start, for features it never uses.
+//
+// Lazy initialisation does not fix it. The reachability is decided by the
+// import, not by the call, so guarding cursor.init() behind a flag left the
+// six libraries exactly where they were.
+//
+// So a program that wants them takes them directly, which is possible precisely
+// because neither module knows what a Window is:
+//
+//     use "…/window/x11/monitors.cst" as monitors;
+//
+//     let is monitors.State as mons;
+//     monitors.refresh(&mons, x11.display(&w), x11.root(&w));
+//     monitors.compute_dpi(&mons, x11.display(&w));
+//     io.printf("%d monitors at %d dpi\n", monitors.count(&mons), monitors.dpi(&mons));
+//
+// That is the same escape hatch the rest of the library offers, and the price
+// of it is one `use` line in the programs that want a feature, rather than four
+// shared-object dependencies in every program that does not.
+//
+// tools/check_needed.sh asserts the result on every CI run: cube links libX11
+// and libXext and nothing else.
+
+// The root window, which cursor.cst and monitors.cst both need and which a
+// program has no other way to name without reaching into bind/ itself.
+fn root(w as *Window) as i64 {
+    if (w.ok == 0) { return 0; }
+    return xlib.XRootWindow(w.display, w.screen);
+}
+
+// --- Clipboard ---
+
+fn clipboard_set_text(w as *Window, s as *u8, n as i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    return clipboard.set_text(&w.clip, w.display, w.xid, clipboard.CLIPBOARD, s, n);
+}
+fn clipboard_request_text(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    return clipboard.request_text(&w.clip, w.display, w.xid, clipboard.CLIPBOARD);
+}
+fn clipboard_text(w as *Window, buf as *u8, cap as i64) as i64 {
+    return clipboard.text(&w.clip, buf, cap);
+}
+
+// The blocking form. It PUMPS rather than sleeps: if the other client asks us
+// for something while we wait and we are asleep, both sides wait forever.
+fn clipboard_get_text(w as *Window, buf as *u8, cap as i64, rounds as i64) as i64 {
+    if (w.ok == 0) { return 0 - 1; }
+    if (clipboard.request_text(&w.clip, w.display, w.xid, clipboard.CLIPBOARD) == 0) {
+        return 0 - 1;
+    }
+    let is i64 as i with mut = 0;
+    while (i < rounds) {
+        _pump(w, 0);
+        if (clipboard.ready(&w.clip) == 1) { return clipboard.text(&w.clip, buf, cap); }
+        if (clipboard.pending(&w.clip) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn clipboard_owns(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    return clipboard.owns(&w.clip, w.display, w.xid, clipboard.CLIPBOARD);
+}
+
+// --- Window state, through the window manager ---
+//
+// Every one of these is a request the window manager may refuse. The queries
+// beside them read what actually happened, which is the only honest way to
+// know: `set_fullscreen` returning 1 means the message was sent, not that the
+// window is fullscreen.
+//
+// The atoms are interned on first use rather than at open, so a program that
+// never asks pays nothing.
+
+fn _need_wm(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (w.wmst.ready == 0) { wm.init(&w.wmst, w.display); }
+    return w.wmst.ready;
+}
+
+fn set_fullscreen(w as *Window, on as i32) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.set_fullscreen(&w.wmst, w.display, root(w), w.xid, on);
+}
+fn fullscreen(w as *Window) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.fullscreen(&w.wmst, w.display, w.xid);
+}
+fn supports_fullscreen(w as *Window) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.supports_fullscreen(&w.wmst, w.display, root(w));
+}
+
+fn set_maximized(w as *Window, on as i32) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.set_maximized(&w.wmst, w.display, root(w), w.xid, on);
+}
+fn maximized(w as *Window) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.maximized(&w.wmst, w.display, w.xid);
+}
+
+fn minimize(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    return wm.minimize(w.display, w.screen, w.xid);
+}
+fn minimized(w as *Window) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.minimized(&w.wmst, w.display, w.xid);
+}
+fn restore(w as *Window) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.restore(&w.wmst, w.display, root(w), w.xid);
+}
+
+fn set_above(w as *Window, on as i32) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.set_above(&w.wmst, w.display, root(w), w.xid, on);
+}
+fn activate(w as *Window) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.activate(&w.wmst, w.display, root(w), w.xid);
+}
+
+fn move_to(w as *Window, wx as i64, wy as i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    return wm.move_to(w.display, w.xid, wx, wy);
+}
+fn move_resize(w as *Window, wx as i64, wy as i64, cw as i64, ch as i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    return wm.move_resize(w.display, w.xid, wx, wy, cw, ch);
+}
+// In ROOT coordinates, which is what a caller means. A reparenting window
+// manager makes the window's own x and y relative to the frame it was wrapped
+// in, so those are usually zero and always the wrong answer.
+fn position(w as *Window, x_out as *i64, y_out as *i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    return wm.position(w.display, w.xid, root(w), x_out, y_out);
+}
+
+// ARGB, alpha in the high byte — NOT the 0xAABBGGRR the rasterizer packs, so a
+// program converting a rendered image has to swap red and blue first.
+fn set_icon(w as *Window, argb as *u8, iw as i64, ih as i64) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.set_icon(&w.wmst, w.display, w.xid, argb, iw, ih);
+}
+fn clear_icon(w as *Window) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.clear_icon(&w.wmst, w.display, w.xid);
+}
+
+// The decorations the window manager drew around us, in pixels.
+fn frame_extents(w as *Window, l as *i64, r as *i64, t as *i64, b as *i64) as i32 {
+    if (_need_wm(w) == 0) { return 0; }
+    return wm.frame_extents(&w.wmst, w.display, w.xid, l, r, t, b);
+}
+
+// --- Text ---
+//
+// What the user typed, as opposed to which key they pressed. keys.cst answers
+// the second; this answers the first, and they are different questions —
+// binding a key to jump wants a keycode, typing a name wants text.
+//
+// The pump calls text_filter() on every event before anything else sees it,
+// because an input method is a participant in the event loop rather than a
+// function: it eats the keystrokes that are building a character, and a loop
+// that hands those to the program as well produces doubled input.
+
+fn text_of(w as *Window, e as *xev.XEvent) as i64 {
+    if (w.ok == 0) { return 0; }
+    return text.lookup(&w.txt, e);
+}
+fn text_buffer(w as *Window) as *u8 { return text.text(&w.txt); }
+fn text_len(w as *Window) as i64 { return text.text_len(&w.txt); }
+fn text_keysym(w as *Window) as i64 { return text.keysym(&w.txt); }
+fn text_dropped(w as *Window) as i64 { return text.dropped(&w.txt); }
+
+// Opens an input method for this window, for CJK and anything else that
+// composes across keystrokes. Returns 0 when there is none to open, which is
+// the common case and not a failure — the first tier keeps working.
+//
+// Call locale.use_environment() first, or this finds nothing whatever is
+// running: XOpenIM consults the C locale and the default is "C". That call
+// lives in its own file because it is libc; see locale.cst.
+fn open_input_method(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    return text.open_method(&w.txt, w.display, w.xid);
+}
+fn has_input_method(w as *Window) as i32 { return text.has_method(&w.txt); }
+
+// Whether _NET_WM_SYNC_REQUEST is in place: the extension exists, the counter
+// was created, and the protocol is advertised. A compositor that never sends a
+// request is not a failure — this only says we could answer one.
+fn frame_sync(w as *Window) as i32 { return framesync.available(&w.fsync); }
+fn frames_synced(w as *Window) as i64 { return framesync.answered(&w.fsync); }
+
+// --- Files dropped on the window ---
+//
+// The pump answers the protocol; a program only reads the result. dropped()
+// goes to 1 once the paths have arrived, and stays there until clear_drop() —
+// so a loop that checks once a frame cannot miss one.
+//
+// Paths are already decoded: no file:// prefix, no percent escapes.
+fn dropped_files(w as *Window) as i64 { return dnd.count(&w.drop); }
+fn dropped_file(w as *Window, i as i64) as *u8 { return dnd.path_at(&w.drop, i); }
+fn clear_drop(w as *Window) as void { dnd.clear(&w.drop); }
+fn dragging(w as *Window) as i32 { return dnd.dragging(&w.drop); }
+fn drag_x(w as *Window) as i64 { return dnd.pointer_x(&w.drop); }
+fn drag_y(w as *Window) as i64 { return dnd.pointer_y(&w.drop); }

@@ -1,0 +1,481 @@
+// window/x11/surface.cst — where a finished frame becomes pixels on a screen.
+//
+// One job, two ways to do it, and the choice is made once at open():
+//
+//   SOCKET   XPutImage sends the whole framebuffer through the X connection
+//            every frame. 1.2 MB at 640x480, 8 MB at 1080p. The call copies
+//            synchronously, so one buffer is enough and nothing can be reading
+//            it when the call returns.
+//
+//   SHM      XShmPutImage hands the server a shared mapping and returns before
+//            it has been read. Nothing crosses the socket. But the server may
+//            still be reading the buffer, so there have to be two of them and a
+//            completion event to say when one is free again.
+//
+// Which one is live is reported by name(), so a program wiring a gpu swapchain
+// to this window can ask rather than guess.
+//
+// --- Why the branch lives here and not in a vtable ---
+//
+// gpu/device.cst dispatches through a table of *u8 function pointers, and its
+// own comment says why that is dangerous: a function pointer in a *u8 field is
+// called unchecked, and a wrong signature is silent corruption with no
+// diagnostic. It pays that price because backends are open-ended and two can be
+// alive at once.
+//
+// Here there are exactly two transports, chosen once, that never coexist. Four
+// type-checked branches — open, put, resize, close — beat six unchecked
+// indirect calls, and window.cst never learns which one is live. It calls
+// surface.put and the string "shm" appears nowhere in it.
+//
+// --- The channel swap ---
+//
+// The rasterizer packs 0xAABBGGRR, red in the low byte, because that is what a
+// little-endian RGBA8 framebuffer expects. An X11 TrueColor visual on the same
+// machine reads 0xAARRGGBB. Somebody has to swap red and blue.
+//
+// It happens in place, in swap_channels, immediately before the put. In place
+// is only legal because a buffer's contents are undefined at acquire() — a
+// contract the SHM path needs anyway, since its two buffers alternate. That one
+// promise turns what used to be a copy plus a swizzle into a single pass.
+//
+// Setting the XImage's own masks to match the rasterizer instead does NOT work:
+// for a ZPixmap at the drawable's depth Xlib copies the bytes through and the
+// server interprets them by the drawable's visual, so the masks are ignored and
+// the colours come out swapped anyway — silently.
+use "std/mem.cst" as mem;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+use "bind/xshm.cst" as xshm;
+
+// --- Transports ---
+
+let is i32 as SOCKET with imut = 0;
+let is i32 as SHM    with imut = 1;
+
+fn transport_name(t as i32) as *u8 {
+    if (t == SHM) { return "mit-shm"; }
+    return "xputimage";
+}
+
+// At most two. One is enough for the socket path; the SHM path needs a second
+// so there is something to draw into while the server reads the first.
+let is i64 as MAX_BUFFERS with imut = 2;
+
+// --- What a buffer is ---
+//
+// `image` is an XImage the server reads through. `pixels` is the mapping it
+// points at, which this file owns: XCreateImage records the pointer and takes
+// responsibility for neither the memory nor its lifetime.
+//
+// `seg` is XShmSegmentInfo, unused on the socket path. It is inline rather than
+// allocated because the X server keeps reading it after XShmAttach returns, so
+// it has to outlive the call — a detail that has bitten every implementation
+// that put it on the stack.
+struct Buffer {
+    pixels  as *u8;
+    image   as *u8;      // XImage*
+    seg     as xshm.XShmSegmentInfo;
+    pending as i32;      // the server may still be reading this one
+    _pad0   as i32;
+}
+
+struct Backing {
+    transport  as i32;
+    count      as i32;   // 1 on the socket path, 2 on SHM
+    completion as i32;   // XShmGetEventBase(d) + ShmCompletion
+    _pad0      as i32;
+    current    as i64;   // which buffer acquire() hands out
+    width      as i64;
+    height     as i64;
+    stride     as i64;   // bytes per row: width * 4
+    bytes      as i64;   // per buffer
+    visual     as *u8;
+    depth      as u32;
+    _pad1      as i32;
+    ok         as i32;
+    _pad2      as i32;
+    // MAX_BUFFERS Buffers, mapped rather than inline, and this is a
+    // correctness requirement rather than a size one.
+    //
+    // XShmCreateImage does not copy the XShmSegmentInfo it is given: it stores
+    // the POINTER in the XImage's obdata, and every XShmPutImage afterwards
+    // reads the segment id back out through it. So the segment structs have to
+    // outlive the call and stay at one address forever.
+    //
+    // An inline array cannot promise that. window.cst builds a Window in a
+    // local and returns it by value, so an inline seg would be captured at the
+    // address it had inside open_with and then copied somewhere else — leaving
+    // every XImage pointing into a dead stack frame. That is not a theory: it
+    // read back a segment id of 0 and the server answered BadShmSeg, but only
+    // once enough stack had been reused to clobber it, which is why it looked
+    // like it depended on the window size.
+    //
+    // Mapped once here, the address is stable and copying a Backing copies the
+    // pointer, which is what the XImage was told.
+    buf        as *u8;
+}
+
+let is i64 as MAX_BUFFERS with imut = 2;
+
+fn _buf(b as *Backing, i as i64) as *Buffer {
+    return cast(*Buffer, cast(i64, b.buf) + i * sizeof(Buffer));
+}
+
+// --- Opening ---
+
+fn _zero(b as *Backing) as void {
+    b.transport = SOCKET; b.count = 0; b.completion = 0;
+    b.current = 0; b.width = 0; b.height = 0; b.stride = 0; b.bytes = 0;
+    b.visual = cast(*u8, 0); b.depth = 0; b.ok = 0;
+    if (cast(i64, b.buf) == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < MAX_BUFFERS) {
+        let is *Buffer as bf = _buf(b, i);
+        bf.pixels = cast(*u8, 0); bf.image = cast(*u8, 0); bf.pending = 0;
+        bf.seg.shmseg = 0; bf.seg.shmid = cast(i32, 0 - 1);
+        bf.seg.shmaddr = cast(*u8, 0); bf.seg.readOnly = 0;
+        i = i + 1;
+    }
+}
+
+// One buffer, its mapping and its XImage. The mapping comes straight from the
+// kernel rather than a general-purpose heap: a framebuffer is large, lives as
+// long as the window, and is exactly the allocation the philosophy in
+// ../../README.md says not to hide inside an allocator.
+fn _sock_buffer(b as *Backing, d as *u8, i as i64) as i32 {
+    let is *Buffer as bf = _buf(b, i);
+    bf.pixels = mem.core.mmap_anon(b.bytes);
+    if (cast(i64, bf.pixels) == 0) { return 0; }
+
+    bf.image = xlib.XCreateImage(d, b.visual, b.depth, x.ZPixmap, 0, bf.pixels,
+                                 cast(u32, b.width), cast(u32, b.height), 32,
+                                 cast(i32, b.stride));
+    if (cast(i64, bf.image) == 0) {
+        mem.core.munmap(bf.pixels, b.bytes);
+        bf.pixels = cast(*u8, 0);
+        return 0;
+    }
+    bf.pending = 0;
+    return 1;
+}
+
+// --- MIT-SHM ---
+//
+// XShmAttach returns True and fails anyway: the real answer is a BadAccess that
+// arrives later, because X errors are asynchronous. Ignoring that produces a
+// blank window inside a container with a different IPC namespace, on a machine
+// where it worked yesterday, with nothing in any log.
+//
+// So the attach is bracketed by an error handler and an XSync. The handler is a
+// Caustic fn passed to libX11 through fn_ptr — the first place in this library
+// where foreign code calls back into ours — and it does nothing but set a flag,
+// because an X error handler runs at an arbitrary point in the caller's stack
+// and is not a place to do work.
+let is i32 as _probe_saw_error with mut = 0;
+
+fn _probe_handler(d as *u8, e as *u8) as i32 {
+    _probe_saw_error = 1;
+    return 0;
+}
+
+// A remote display cannot share memory with us, and the failure is not local:
+// shmget succeeds here and the attach fails on the server's side. Checking the
+// display string first turns a confusing round trip into an obvious decision.
+// Local forms are ":0", ":0.0" and "unix:0"; anything with a host before the
+// colon is somebody else's machine.
+fn _display_is_local(d as *u8) as i32 {
+    let is *u8 as s = xlib.XDisplayString(d);
+    if (cast(i64, s) == 0) { return 1; }        // null means :0 via $DISPLAY
+    if (s[0] == cast(u8, 58)) { return 1; }     // ':'
+    // "unix:..." is local too.
+    if (s[0] == cast(u8, 117) && s[1] == cast(u8, 110)
+        && s[2] == cast(u8, 105) && s[3] == cast(u8, 120)) { return 1; }
+    return 0;
+}
+
+fn _shm_buffer(b as *Backing, d as *u8, i as i64) as i32 {
+    let is *Buffer as bf = _buf(b, i);
+
+    let is i64 as id = xshm.shmget(b.bytes);
+    if (id < 0) { return 0; }
+    bf.seg.shmid = cast(i32, id);
+
+    let is *u8 as addr = xshm.shmat(id);
+    if (cast(i64, addr) == 0 || cast(i64, addr) == 0 - 1) {
+        xshm.shmrmid(id);
+        return 0;
+    }
+    bf.seg.shmaddr = addr;
+    bf.seg.readOnly = 0;
+    bf.pixels = addr;
+
+    // Immediately, not at close. A segment marked for destruction survives
+    // until the last process detaches, so this stays valid for as long as it is
+    // used and the kernel reclaims it even if this process is killed. Deferring
+    // it is how a machine ends up with orphaned segments.
+    xshm.shmrmid(id);
+
+    bf.image = xshm.XShmCreateImage(d, b.visual, b.depth, x.ZPixmap, addr,
+                                    cast(*u8, &bf.seg),
+                                    cast(u32, b.width), cast(u32, b.height));
+    if (cast(i64, bf.image) == 0) {
+        xshm.shmdt(addr);
+        bf.pixels = cast(*u8, 0);
+        return 0;
+    }
+
+    _probe_saw_error = 0;
+    let is *u8 as old = xlib.XSetErrorHandler(fn_ptr(_probe_handler));
+    xshm.XShmAttach(d, cast(*u8, &bf.seg));
+    xlib.XSync(d, 0);
+    xlib.XSetErrorHandler(old);
+
+    if (_probe_saw_error == 1) {
+        let is *xlib.XImage as img = cast(*xlib.XImage, bf.image);
+        img.data = cast(*u8, 0);
+        xlib.XDestroyImage(bf.image);
+        bf.image = cast(*u8, 0);
+        xshm.shmdt(addr);
+        bf.pixels = cast(*u8, 0);
+        return 0;
+    }
+
+    bf.pending = 0;
+    return 1;
+}
+
+fn _shm_free(b as *Backing, d as *u8, i as i64) as void {
+    let is *Buffer as bf = _buf(b, i);
+    if (cast(i64, bf.image) != 0) {
+        xshm.XShmDetach(d, cast(*u8, &bf.seg));
+        let is *xlib.XImage as img = cast(*xlib.XImage, bf.image);
+        img.data = cast(*u8, 0);
+        xlib.XDestroyImage(bf.image);
+        bf.image = cast(*u8, 0);
+    }
+    if (cast(i64, bf.pixels) != 0) {
+        xshm.shmdt(bf.pixels);
+        bf.pixels = cast(*u8, 0);
+    }
+    bf.pending = 0;
+}
+
+// Every reason to fall back, checked in the order that costs least. Returns 0
+// without having changed anything the socket path cannot use.
+fn _shm_try(b as *Backing, d as *u8) as i32 {
+    if (xshm.available() == 0) { return 0; }
+    if (_display_is_local(d) == 0) { return 0; }
+    if (xshm.XShmQueryExtension(d) == 0) { return 0; }
+
+    let is i32 as maj with mut = 0;
+    let is i32 as min with mut = 0;
+    let is i32 as pix with mut = 0;
+    if (xshm.XShmQueryVersion(d, cast(*u8, &maj), cast(*u8, &min), cast(*u8, &pix)) == 0) {
+        return 0;
+    }
+
+    b.transport = SHM;
+    b.count = 2;
+    b.completion = xshm.XShmGetEventBase(d) + xshm.ShmCompletion;
+
+    if (_shm_buffer(b, d, 0) == 0) { b.transport = SOCKET; b.count = 0; return 0; }
+    if (_shm_buffer(b, d, 1) == 0) {
+        _shm_free(b, d, 0);
+        b.transport = SOCKET; b.count = 0; return 0;
+    }
+    b.ok = 1;
+    return 1;
+}
+
+// Asynchronous: this returns before the server has read the buffer, which is
+// what makes it fast and what makes the second buffer necessary. send_event is
+// True so the server tells us when it is done — without it there is no
+// completion event and no way to know when the buffer is free again.
+fn _shm_put(b as *Backing, d as *u8, drawable as i64, gc as *u8) as void {
+    let is *Buffer as bf = _buf(b, b.current);
+    xshm.XShmPutImage(d, drawable, gc, bf.image, 0, 0, 0, 0,
+                      cast(u32, b.width), cast(u32, b.height), 1);
+    bf.pending = 1;
+    b.current = (b.current + 1) % cast(i64, b.count);
+}
+
+fn _sock_open(b as *Backing, d as *u8) as i32 {
+    b.transport = SOCKET;
+    b.count = 1;
+    if (_sock_buffer(b, d, 0) == 0) { return 0; }
+    b.ok = 1;
+    return 1;
+}
+
+fn open(b as *Backing, d as *u8, vis as *u8, depth as u32,
+        w as i64, h as i64, prefer_shm as i32) as i32 {
+    // Before _zero, which walks the array this points at. The XImages created
+    // below capture the address of each buffer's segment info and read it on
+    // every present, so it has to be somewhere that outlives this frame and
+    // survives the Window being copied out of open_with by value.
+    b.buf = mem.core.mmap_anon(MAX_BUFFERS * sizeof(Buffer));
+    if (cast(i64, b.buf) == 0) { return 0; }
+    _zero(b);
+    if (w <= 0 || h <= 0) { return 0; }
+    b.visual = vis;
+    b.depth = depth;
+    b.width = w;
+    b.height = h;
+    b.stride = w * 4;
+    b.bytes = b.stride * h;
+    if (prefer_shm == 1 && _shm_try(b, d) == 1) { return 1; }
+    return _sock_open(b, d);
+}
+
+// --- Releasing ---
+//
+// XDestroyImage frees image->data as well, and ours came from mmap rather than
+// malloc. Clearing the pointer first is what keeps Xlib from calling free() on
+// a mapping it does not own — which is not a leak, it is a heap corruption.
+fn _free_buffer_at(b as *Backing, d as *u8, i as i64) as void {
+    if (b.transport == SHM) { _shm_free(b, d, i); return; }
+    let is *Buffer as bf = _buf(b, i);
+    if (cast(i64, bf.image) != 0) {
+        let is *xlib.XImage as img = cast(*xlib.XImage, bf.image);
+        img.data = cast(*u8, 0);
+        xlib.XDestroyImage(bf.image);
+        bf.image = cast(*u8, 0);
+    }
+    if (cast(i64, bf.pixels) != 0) {
+        mem.core.munmap(bf.pixels, b.bytes);
+        bf.pixels = cast(*u8, 0);
+    }
+    bf.pending = 0;
+}
+
+fn close(b as *Backing, d as *u8) as void {
+    if (b.ok == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, b.count)) { _free_buffer_at(b, d, i); i = i + 1; }
+    b.ok = 0;
+    b.count = 0;
+    // After the buffers, never before: _free_buffer_at reads through it, and
+    // XShmDetach reads the segment info the mapping holds.
+    if (cast(i64, b.buf) != 0) {
+        mem.core.munmap(b.buf, MAX_BUFFERS * sizeof(Buffer));
+        b.buf = cast(*u8, 0);
+    }
+}
+
+// --- Following the window's size ---
+//
+// A window manager decides how big a window is and is under no obligation to
+// grant what was asked for: a tiling compositor maps a 640x480 request straight
+// to 1366x768, before the program has drawn anything.
+//
+// Both halves have to be rebuilt together. Growing the mapping alone leaves the
+// XImage with its original bytes_per_line while XPutImage is told the image is
+// wider, and the server then reads every row at the wrong offset — which is
+// interleaved banding on screen and nothing at all in the code. That is the bug
+// ../../window.md records, and the reason x11_test.cst compares XGetImage
+// against what was sent rather than trusting a screenshot.
+fn resize(b as *Backing, d as *u8, w as i64, h as i64) as i32 {
+    if (w <= 0 || h <= 0) { return 0; }
+    if (w == b.width && h == b.height) { return 1; }
+
+    // Both buffers may still be being read. Waiting is not an option here —
+    // the old ones describe a window that no longer exists — so the detach
+    // tells the server to stop, which is what XShmDetach is for.
+    let is i32 as n = b.count;
+    let is i32 as was = b.transport;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, n)) { _free_buffer_at(b, d, i); i = i + 1; }
+
+    b.width = w;
+    b.height = h;
+    b.stride = w * 4;
+    b.bytes = b.stride * h;
+    b.current = 0;
+
+    i = 0;
+    while (i < cast(i64, n)) {
+        let is i32 as made with mut = 0;
+        if (was == SHM) { made = _shm_buffer(b, d, i); }
+        else { made = _sock_buffer(b, d, i); }
+        if (made == 0) { b.ok = 0; return 0; }
+        i = i + 1;
+    }
+    b.transport = was;
+    b.count = n;
+    return 1;
+}
+
+// --- The frame ---
+
+// This frame's buffer, or null when every one of them is still being read. On
+// the socket path that never happens; on SHM it is the back pressure that makes
+// next_frame() honest.
+fn acquire(b as *Backing) as *u8 {
+    if (b.ok == 0) { return cast(*u8, 0); }
+    let is *Buffer as bf = _buf(b, b.current);
+    if (bf.pending == 1) { return cast(*u8, 0); }
+    return bf.pixels;
+}
+
+fn outstanding(b as *Backing) as i32 {
+    let is i32 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, b.count)) {
+        if (_buf(b, i).pending == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 0xAABBGGRR -> 0xAARRGGBB, in place. See the header comment for why in place is
+// safe and why fixing it with XImage masks is not.
+fn swap_channels(b as *Backing) as void {
+    let is *Buffer as bf = _buf(b, b.current);
+    if (cast(i64, bf.pixels) == 0) { return; }
+    let is i64 as base = cast(i64, bf.pixels);
+    let is i64 as n = b.width * b.height;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as at = base + i * 4;
+        let is i64 as p = cast(i64, *cast(*i32, at)) & 4294967295;
+        let is i64 as r = p & 255;
+        let is i64 as g = (p >> 8) & 255;
+        let is i64 as bl = (p >> 16) & 255;
+        let is i64 as a = (p >> 24) & 255;
+        *cast(*i32, at) = cast(i32, (a << 24) | (r << 16) | (g << 8) | bl);
+        i = i + 1;
+    }
+}
+
+fn _sock_put(b as *Backing, d as *u8, drawable as i64, gc as *u8) as void {
+    let is *Buffer as bf = _buf(b, b.current);
+    xlib.XPutImage(d, drawable, gc, bf.image, 0, 0, 0, 0,
+                   cast(u32, b.width), cast(u32, b.height));
+}
+
+// The one call window.cst makes to present a frame. The transport branch is
+// here and nowhere above.
+fn put(b as *Backing, d as *u8, drawable as i64, gc as *u8) as void {
+    if (b.ok == 0) { return; }
+    if (b.transport == SHM) { _shm_put(b, d, drawable, gc); return; }
+    // On the socket path XPutImage has already copied, so the buffer is free
+    // again the moment the call returns and there is nothing to rotate.
+    _sock_put(b, d, drawable, gc);
+}
+
+// Whether an event was this layer's completion notice rather than the program's
+// business. Always 0 on the socket path, which has no such event.
+fn complete(b as *Backing, e as *xev.XEvent) as i32 {
+    if (b.transport != SHM) { return 0; }
+    if (xev.kind(e) != b.completion) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, b.count)) { _buf(b, i).pending = 0; i = i + 1; }
+    return 1;
+}
+
+fn image_count(b as *Backing) as i64 { return cast(i64, b.count); }
+fn width(b as *Backing) as i64 { return b.width; }
+fn height(b as *Backing) as i64 { return b.height; }
+fn name(b as *Backing) as *u8 { return transport_name(b.transport); }

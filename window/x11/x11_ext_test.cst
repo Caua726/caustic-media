@@ -1,0 +1,267 @@
+// window/x11/x11_ext_test.cst — the parts that need more than libX11.
+//
+// Separate from x11_test.cst for the same reason cursor.cst and monitors.cst
+// are not imported by window.cst: this binary genuinely links libXrandr,
+// libXcursor, libXfixes and libXi, and keeping that in its own file is what
+// lets tools/check_needed.sh assert that x11_test.cst and examples/cube.cst do
+// not.
+//
+// Under Xvfb there is one output, no cursor theme and no other client, so what
+// can be asserted is narrower than on a desktop: that the calls reach the
+// server, agree with each other, and report honestly when a feature is absent.
+// The clipboard test is the exception — it opens a second connection and does a
+// real round trip, because a client cannot answer its own selection request.
+//
+// Exit code is the number of failures.
+use "std/io.cst" as io;
+use "bind/xlib.cst" as xlib;
+use "x11.cst" as x11;
+use "screensaver.cst" as screensaver;
+use "cursor.cst" as cursor;
+use "monitors.cst" as monitors;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("  FAIL %s\n", name); }
+}
+fn chk_i(name as *u8, got as i64, want as i64) as void {
+    if (got != want) { fails = fails + 1; io.printf("  FAIL %s: got=%d want=%d\n", name, got, want); }
+}
+
+fn open_retry(label as *u8) as x11.window.Window {
+    let is i64 as t with mut = 0;
+    while (t < 5) {
+        let is x11.window.Window as w = x11.open(label, 320, 240);
+        if (x11.is_open(&w) == 1) { return w; }
+        if (x11.last_error(&w) != x11.window.NO_DISPLAY) { return w; }
+        t = t + 1;
+    }
+    return x11.open(label, 320, 240);
+}
+
+fn settle(w as *x11.window.Window, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { x11.next_frame(w); xlib.XSync(x11.display(w), 0); i = i + 1; }
+}
+
+// --- Monitors ---
+//
+// Xvfb reports exactly one output covering the whole screen. That is a weak
+// assertion on its own; what makes it worth running is that the geometry has to
+// agree with what the core protocol says about the same screen, and the two
+// come from completely different requests.
+fn test_monitors() as void {
+    let is x11.window.Window as w = open_retry("monitors");
+    if (x11.is_open(&w) == 0) { chk("monitors: window opened", 0); return; }
+
+    let is monitors.State as st;
+    let is i32 as ok = monitors.refresh(&st, x11.display(&w), x11.root(&w));
+    monitors.compute_dpi(&st, x11.display(&w));
+
+    if (ok == 0) {
+        // No Xrandr is a legitimate answer, not a failure — but then there must
+        // be no monitors reported either, rather than stale ones.
+        chk_i("no xrandr means no monitors", monitors.count(&st), 0);
+        x11.close(&w);
+        return;
+    }
+
+    chk("at least one monitor", cast(i32, monitors.count(&st) > 0));
+
+    let is monitors.Monitor as m;
+    chk("primary exists", monitors.primary(&st, &m));
+    chk("primary has area", cast(i32, m.width > 0 && m.height > 0));
+
+    // The union of the monitors has to cover the screen the core protocol
+    // reports. Two independent requests that must agree.
+    let is i32 as scr = xlib.XDefaultScreen(x11.display(&w));
+    let is i32 as sw = xlib.XDisplayWidth(x11.display(&w), scr);
+    let is i32 as sh = xlib.XDisplayHeight(x11.display(&w), scr);
+    let is i64 as maxx with mut = 0;
+    let is i64 as maxy with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < monitors.count(&st)) {
+        let is monitors.Monitor as mm;
+        monitors.get(&st, i, &mm);
+        if (mm.x + mm.width > maxx) { maxx = mm.x + mm.width; }
+        if (mm.y + mm.height > maxy) { maxy = mm.y + mm.height; }
+        i = i + 1;
+    }
+    chk_i("monitors span the screen width", maxx, cast(i64, sw));
+    chk_i("monitors span the screen height", maxy, cast(i64, sh));
+
+    // for_rect on the whole screen has to land on a real monitor.
+    let is monitors.Monitor as r;
+    chk("for_rect finds one", monitors.for_rect(&st, 0, 0, cast(i64, sw), cast(i64, sh), &r));
+
+    // DPI always answers, and always says where the answer came from.
+    chk("dpi is positive", cast(i32, monitors.dpi(&st) > 0));
+    chk("scale is positive", cast(i32, monitors.scale(&st) > 0.0));
+    chk("dpi source is named", cast(i32, monitors.dpi_source_name(monitors.dpi_source(&st))[0] != cast(u8, 0)));
+
+    x11.close(&w);
+}
+
+// --- Cursor ---
+//
+// Xvfb has no cursor theme, so XcursorLibraryLoadCursor will miss and the core
+// font is what answers. That is the fallback path, and exercising it is more
+// useful than exercising the themed one would be.
+fn test_cursor() as void {
+    let is x11.window.Window as w = open_retry("cursor");
+    if (x11.is_open(&w) == 0) { chk("cursor: window opened", 0); return; }
+    settle(&w, 4);
+
+    let is cursor.State as cs;
+    cursor.init(&cs, x11.display(&w));
+
+    // Every shape resolves to something, themed or not. A shape that silently
+    // produced None would leave the window with whatever the parent had.
+    let is i32 as s with mut = 0;
+    while (s < cursor.SHAPE_COUNT) {
+        chk("every shape sets", cursor.set_shape(&cs, x11.display(&w), x11.xid(&w), s));
+        chk_i("shape is remembered", cast(i64, cursor.shape(&cs)), cast(i64, s));
+        s = s + 1;
+    }
+    chk("out of range shape refused",
+        1 - cursor.set_shape(&cs, x11.display(&w), x11.xid(&w), cursor.SHAPE_COUNT));
+
+    // Hide and show are idempotent: calling either twice must not unbalance the
+    // server's hide counter, which is what Xfixes actually keeps.
+    cursor.show(&cs, x11.display(&w), x11.xid(&w), 0);
+    chk("hidden after hide", cursor.hidden(&cs));
+    cursor.show(&cs, x11.display(&w), x11.xid(&w), 0);
+    chk("still hidden after a second hide", cursor.hidden(&cs));
+    cursor.show(&cs, x11.display(&w), x11.xid(&w), 1);
+    chk("shown after show", 1 - cursor.hidden(&cs));
+    cursor.show(&cs, x11.display(&w), x11.xid(&w), 1);
+    chk("still shown after a second show", 1 - cursor.hidden(&cs));
+
+    // Modes. A grab can legitimately fail under a window manager, so what is
+    // asserted is that the state agrees with the outcome — never that it
+    // succeeded.
+    chk_i("starts normal", cast(i64, cursor.mode(&cs)), cast(i64, cursor.NORMAL));
+    let is i32 as got = cursor.set_mode(&cs, x11.display(&w), x11.xid(&w), x11.root(&w),
+                                        cursor.CONFINED, 10, 10);
+    if (got == 1) { chk_i("confined took", cast(i64, cursor.mode(&cs)), cast(i64, cursor.CONFINED)); }
+    else { chk_i("failed grab leaves normal", cast(i64, cursor.mode(&cs)), cast(i64, cursor.NORMAL)); }
+
+    cursor.set_mode(&cs, x11.display(&w), x11.xid(&w), x11.root(&w), cursor.NORMAL, 10, 10);
+    chk_i("back to normal", cast(i64, cursor.mode(&cs)), cast(i64, cursor.NORMAL));
+    chk("cursor visible again after leaving relative", 1 - cursor.hidden(&cs));
+
+    cursor.close(&cs, x11.display(&w));
+    x11.close(&w);
+}
+
+// --- Clipboard ---
+//
+// The one test here that is a real round trip. It needs TWO connections,
+// because a client cannot answer its own SelectionRequest while blocked waiting
+// for the reply to its own ConvertSelection — that is the protocol, not a
+// limitation of this code.
+//
+// The owner is a window on connection A. The asker is this program pumping
+// connection B. A's pump answers the request that B's ConvertSelection
+// produced, which only works because answering happens inside the pump rather
+// than in a frame loop the test would have to run by hand.
+fn test_clipboard() as void {
+    let is x11.window.Window as owner = open_retry("clipboard-owner");
+    if (x11.is_open(&owner) == 0) { chk("clipboard: owner opened", 0); return; }
+    let is x11.window.Window as asker = open_retry("clipboard-asker");
+    if (x11.is_open(&asker) == 0) { chk("clipboard: asker opened", 0); x11.close(&owner); return; }
+    settle(&owner, 4);
+    settle(&asker, 4);
+
+    chk("nobody owns it yet", 1 - x11.clipboard_owns(&asker));
+
+    let is *u8 as msg = "caustic-media clipboard round trip";
+    chk("owner takes the selection", x11.clipboard_set_text(&owner, msg, 34));
+    chk("owner reports owning it", x11.clipboard_owns(&owner));
+    chk("asker does not own it", 1 - x11.clipboard_owns(&asker));
+
+    // The asker requests; the owner's pump has to answer. Neither can block.
+    chk("request sent", x11.clipboard_request_text(&asker));
+
+    let is [128]u8 as buf;
+    let is i64 as n with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < 200 && n < 0) {
+        x11.next_frame(&owner);      // services the SelectionRequest
+        x11.next_frame(&asker);      // receives the SelectionNotify
+        n = x11.clipboard_text(&asker, cast(*u8, &buf), 128);
+        i = i + 1;
+    }
+
+    chk_i("text came back with the right length", n, 34);
+    if (n == 34) {
+        let is i32 as same with mut = 1;
+        let is i64 as k with mut = 0;
+        while (k < 34) {
+            if (buf[k] != msg[k]) { same = 0; }
+            k = k + 1;
+        }
+        chk("text came back byte for byte", same);
+    }
+
+    x11.close(&asker);
+    x11.close(&owner);
+}
+
+// --- MIT-SCREEN-SAVER ---
+//
+// Xvfb has the extension, so this runs everywhere. What it asserts is the
+// counter discipline rather than that the screen stayed on: suspension is a
+// per-client COUNT, so a release at depth zero must be refused, nesting must
+// nest, and release_all must unwind however deep it got. Getting that wrong is
+// silent — the screen blanks anyway and nobody knows why.
+fn test_screensaver() as void {
+    let is x11.window.Window as w = open_retry("screensaver");
+    if (x11.is_open(&w) == 0) { chk("screensaver window opens", 0); return; }
+
+    let is screensaver.State as ss;
+    if (screensaver.init(&ss, x11.display(&w)) == 0) {
+        io.printf("  note: no MIT-SCREEN-SAVER on this server\n");
+        x11.close(&w);
+        return;
+    }
+
+    chk_i("screensaver starts at depth 0", cast(i64, screensaver.depth(&ss)), 0);
+    chk_i("release at depth 0 is refused",
+          cast(i64, screensaver.release(&ss, x11.display(&w))), 0);
+
+    chk("inhibit", screensaver.inhibit(&ss, x11.display(&w)));
+    chk("inhibit nests", screensaver.inhibit(&ss, x11.display(&w)));
+    chk_i("depth follows", cast(i64, screensaver.depth(&ss)), 2);
+
+    chk("release", screensaver.release(&ss, x11.display(&w)));
+    chk_i("one release is not two", cast(i64, screensaver.depth(&ss)), 1);
+
+    chk_i("release_all unwinds the rest",
+          cast(i64, screensaver.release_all(&ss, x11.display(&w))), 1);
+    chk_i("and lands at 0", cast(i64, screensaver.depth(&ss)), 0);
+
+    // Idle time is whatever the server says; the assertion is that it is a
+    // number rather than the -1 that means the query failed.
+    let is i64 as idle = screensaver.idle_ms(&ss, x11.display(&w), x11.root(&w));
+    chk("idle time reads", cast(i32, idle >= 0));
+    io.printf("  screensaver %d.%d, idle %d ms\n",
+              cast(i64, screensaver.version_major(&ss)),
+              cast(i64, screensaver.version_minor(&ss)), idle);
+
+    screensaver.close(&ss, x11.display(&w));
+    x11.close(&w);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    test_monitors();
+    test_cursor();
+    test_clipboard();
+    test_screensaver();
+
+
+    if (fails == 0) { io.printf("x11 extensions: all checks passed\n"); }
+    else { io.printf("  x11_ext_test: %d failure(s)\n", cast(i64, fails)); }
+    return fails;
+}

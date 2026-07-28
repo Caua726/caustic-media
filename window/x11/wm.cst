@@ -1,0 +1,416 @@
+// window/x11/wm.cst — asking the window manager for a window state.
+//
+// Fullscreen, maximized, minimized, always-on-top, where the window is, and
+// what icon a taskbar shows for it. None of that is in the X protocol: the
+// server has no idea what "maximized" means. It is EWMH, a convention every
+// window manager agreed to, carried as properties and client messages.
+//
+// That is why this file talks in atoms rather than in functions. `XMoveWindow`
+// exists and moves a window; there is no `XSetFullscreen`, and there cannot be
+// — the window manager owns the decision and a client can only ask.
+//
+// --- What that means for the API ---
+//
+// Every setter here is a REQUEST. The window manager may refuse, may honour it
+// later, and on a tiling compositor may have its own idea entirely — the same
+// lesson `_set_size_hints` in window.cst learned the hard way. So each setter
+// returns whether the request was sent, never whether it was granted, and each
+// has a matching query that reads the state back from the server.
+//
+// `supports()` answers the question before it is asked: a window manager
+// publishes the list of hints it implements in `_NET_SUPPORTED`, so a program
+// can find out that fullscreen is unavailable rather than discover it by
+// nothing happening.
+//
+// --- Why it does not know what a Window is ---
+//
+// Same rule cursor.cst, clipboard.cst and monitors.cst follow: this takes a
+// display and an xid. window.cst forwards to it, and the dependency arrow
+// points one way. It also means a program driving X11 itself can use this
+// without adopting the window abstraction.
+use "std/mem.cst" as mem;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+
+// _NET_WM_STATE's first data word.
+let is i64 as REMOVE with imut = 0;
+let is i64 as ADD    with imut = 1;
+let is i64 as TOGGLE with imut = 2;
+
+// The source indication EWMH asks for. 1 is "a normal application", which is
+// what this is; 2 is a pager or taskbar acting on the user's behalf, and some
+// window managers treat the two differently when deciding whether to steal
+// focus.
+let is i64 as SOURCE_APPLICATION with imut = 1;
+
+struct State {
+    ready as i32;
+    _pad0 as i32;
+
+    net_wm_state       as i64;
+    st_fullscreen      as i64;
+    st_maximized_vert  as i64;
+    st_maximized_horz  as i64;
+    st_above           as i64;
+    st_hidden          as i64;
+    net_active_window  as i64;
+    net_wm_icon        as i64;
+    net_supported      as i64;
+    net_frame_extents  as i64;
+    wm_state           as i64;
+    cardinal           as i64;
+    atom               as i64;
+}
+
+fn init(st as *State, d as *u8) as void {
+    if (st.ready == 1) { return; }
+    st.net_wm_state      = xlib.XInternAtom(d, "_NET_WM_STATE", 0);
+    st.st_fullscreen     = xlib.XInternAtom(d, "_NET_WM_STATE_FULLSCREEN", 0);
+    st.st_maximized_vert = xlib.XInternAtom(d, "_NET_WM_STATE_MAXIMIZED_VERT", 0);
+    st.st_maximized_horz = xlib.XInternAtom(d, "_NET_WM_STATE_MAXIMIZED_HORZ", 0);
+    st.st_above          = xlib.XInternAtom(d, "_NET_WM_STATE_ABOVE", 0);
+    st.st_hidden         = xlib.XInternAtom(d, "_NET_WM_STATE_HIDDEN", 0);
+    st.net_active_window = xlib.XInternAtom(d, "_NET_ACTIVE_WINDOW", 0);
+    st.net_wm_icon       = xlib.XInternAtom(d, "_NET_WM_ICON", 0);
+    st.net_supported     = xlib.XInternAtom(d, "_NET_SUPPORTED", 0);
+    st.net_frame_extents = xlib.XInternAtom(d, "_NET_FRAME_EXTENTS", 0);
+    st.wm_state          = xlib.XInternAtom(d, "WM_STATE", 0);
+    st.cardinal          = xlib.XInternAtom(d, "CARDINAL", 0);
+    st.atom              = xlib.XInternAtom(d, "ATOM", 0);
+    st.ready = 1;
+}
+
+// --- Reading a property that is a list of atoms ---
+//
+// One scratch event and one scratch reply, module-level for the same reason
+// window.cst's is: neither this nor X11 on one display is reentrant, and a
+// 96-byte event on the stack of every call is not worth the copy.
+let is xev.XEvent as _msg;
+let is i64 as _actual_type with mut = 0;
+let is i32 as _actual_format with mut = 0;
+let is i64 as _nitems with mut = 0;
+let is i64 as _bytes_after with mut = 0;
+let is *u8 as _prop with mut = cast(*u8, 0);
+
+// Returns the number of atoms read, with the data left in _prop. The caller
+// must call _release() before the next read.
+fn _read_atoms(d as *u8, xid as i64, property as i64) as i64 {
+    _prop = cast(*u8, 0);
+    _nitems = 0;
+    // 1024 longs is 32 times more atoms than any window manager sets, and
+    // asking for more than exists is not an error — nitems says what came back.
+    let is i32 as r = xlib.XGetWindowProperty(d, xid, property, 0, 1024, 0, 0,
+                                              cast(*u8, &_actual_type),
+                                              cast(*u8, &_actual_format),
+                                              cast(*u8, &_nitems),
+                                              cast(*u8, &_bytes_after),
+                                              cast(*u8, &_prop));
+    if (r != 0) { _prop = cast(*u8, 0); return 0; }
+    if (cast(i64, _prop) == 0) { return 0; }
+    // A 32-bit property comes back as an array of long, not of int. Reading it
+    // as i32 would halve the stride and produce garbage on the second entry.
+    if (_actual_format != 32) { xlib.XFree(_prop); _prop = cast(*u8, 0); return 0; }
+    return _nitems;
+}
+
+fn _release() as void {
+    if (cast(i64, _prop) != 0) { xlib.XFree(_prop); _prop = cast(*u8, 0); }
+}
+
+fn _atom_at(i as i64) as i64 {
+    return *cast(*i64, cast(i64, _prop) + i * 8);
+}
+
+fn _list_has(d as *u8, xid as i64, property as i64, wanted as i64) as i32 {
+    if (wanted == 0) { return 0; }
+    let is i64 as n = _read_atoms(d, xid, property);
+    let is i32 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (_atom_at(i) == wanted) { found = 1; }
+        i = i + 1;
+    }
+    _release();
+    return found;
+}
+
+// --- Asking ---
+
+// The client message EWMH defines for changing a window state. It goes to the
+// ROOT window rather than to our own: the window manager is what listens, and
+// it listens on the root for SubstructureRedirect.
+fn _send_state(d as *u8, root as i64, xid as i64, action as i64,
+               a1 as i64, a2 as i64, net_wm_state as i64) as i32 {
+    if (net_wm_state == 0) { return 0; }
+    xev.clear(&_msg);
+    let is *xev.XClientMessageEvent as e = xev.client(&_msg);
+    e.kind = x.ClientMessage;
+    e.serial = 0;
+    e.send_event = 1;
+    e.display = d;
+    e.window = xid;
+    e.message_type = net_wm_state;
+    e.format = 32;
+    e.data[0] = action;
+    e.data[1] = a1;
+    e.data[2] = a2;
+    e.data[3] = SOURCE_APPLICATION;
+    e.data[4] = 0;
+    xlib.XSendEvent(d, root, 0,
+                    x.SubstructureNotifyMask | x.SubstructureRedirectMask,
+                    cast(*u8, &_msg));
+    xlib.XFlush(d);
+    return 1;
+}
+
+// Whether the window manager implements a hint at all. A tiling compositor
+// that does not do fullscreen says so here, which is better than a program
+// discovering it by nothing happening.
+fn supports(st as *State, d as *u8, root as i64, hint as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    return _list_has(d, root, st.net_supported, hint);
+}
+
+fn supports_fullscreen(st as *State, d as *u8, root as i64) as i32 {
+    return supports(st, d, root, st.st_fullscreen);
+}
+
+// --- Fullscreen ---
+//
+// The one every game needs, and the only one with a single atom.
+
+fn set_fullscreen(st as *State, d as *u8, root as i64, xid as i64, on as i32) as i32 {
+    if (st.ready == 0) { return 0; }
+    let is i64 as action with mut = REMOVE;
+    if (on == 1) { action = ADD; }
+    return _send_state(d, root, xid, action, st.st_fullscreen, 0, st.net_wm_state);
+}
+
+fn fullscreen(st as *State, d as *u8, xid as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    return _list_has(d, xid, st.net_wm_state, st.st_fullscreen);
+}
+
+// --- Maximize ---
+//
+// Two atoms, one per axis, and they are genuinely independent: a window
+// maximized only vertically is a normal thing to want. Both are sent in one
+// message because EWMH gives the client message two atom slots for exactly
+// this case.
+
+fn set_maximized(st as *State, d as *u8, root as i64, xid as i64, on as i32) as i32 {
+    if (st.ready == 0) { return 0; }
+    let is i64 as action with mut = REMOVE;
+    if (on == 1) { action = ADD; }
+    return _send_state(d, root, xid, action,
+                       st.st_maximized_vert, st.st_maximized_horz, st.net_wm_state);
+}
+
+fn set_maximized_vertical(st as *State, d as *u8, root as i64, xid as i64, on as i32) as i32 {
+    if (st.ready == 0) { return 0; }
+    let is i64 as action with mut = REMOVE;
+    if (on == 1) { action = ADD; }
+    return _send_state(d, root, xid, action, st.st_maximized_vert, 0, st.net_wm_state);
+}
+
+fn set_maximized_horizontal(st as *State, d as *u8, root as i64, xid as i64, on as i32) as i32 {
+    if (st.ready == 0) { return 0; }
+    let is i64 as action with mut = REMOVE;
+    if (on == 1) { action = ADD; }
+    return _send_state(d, root, xid, action, st.st_maximized_horz, 0, st.net_wm_state);
+}
+
+// True only when BOTH axes are set, which is what a program means by
+// "maximized". maximized_vertical and maximized_horizontal answer separately.
+fn maximized(st as *State, d as *u8, xid as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    let is i64 as n = _read_atoms(d, xid, st.net_wm_state);
+    let is i32 as v with mut = 0;
+    let is i32 as h with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as a = _atom_at(i);
+        if (a == st.st_maximized_vert) { v = 1; }
+        if (a == st.st_maximized_horz) { h = 1; }
+        i = i + 1;
+    }
+    _release();
+    if (v == 1 && h == 1) { return 1; }
+    return 0;
+}
+
+fn maximized_vertical(st as *State, d as *u8, xid as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    return _list_has(d, xid, st.net_wm_state, st.st_maximized_vert);
+}
+
+fn maximized_horizontal(st as *State, d as *u8, xid as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    return _list_has(d, xid, st.net_wm_state, st.st_maximized_horz);
+}
+
+// --- Minimize ---
+//
+// The odd one out: iconifying predates EWMH, so it is an ICCCM operation with
+// a real libX11 function rather than a _NET_WM_STATE atom. Un-minimizing is
+// mapping the window again.
+//
+// Reading it back IS an EWMH atom — _NET_WM_STATE_HIDDEN — because ICCCM's own
+// WM_STATE says "iconic" for several situations that are not minimization.
+
+fn minimize(d as *u8, screen as i32, xid as i64) as i32 {
+    let is i32 as r = xlib.XIconifyWindow(d, xid, screen);
+    xlib.XFlush(d);
+    return r;
+}
+
+fn minimized(st as *State, d as *u8, xid as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    return _list_has(d, xid, st.net_wm_state, st.st_hidden);
+}
+
+// Un-minimize and raise. Mapping an iconified window is what ICCCM says
+// restores it, and the activate below is what brings it forward.
+fn restore(st as *State, d as *u8, root as i64, xid as i64) as i32 {
+    xlib.XMapWindow(d, xid);
+    xlib.XFlush(d);
+    return activate(st, d, root, xid);
+}
+
+// --- Stacking and focus ---
+
+fn set_above(st as *State, d as *u8, root as i64, xid as i64, on as i32) as i32 {
+    if (st.ready == 0) { return 0; }
+    let is i64 as action with mut = REMOVE;
+    if (on == 1) { action = ADD; }
+    return _send_state(d, root, xid, action, st.st_above, 0, st.net_wm_state);
+}
+
+fn above(st as *State, d as *u8, xid as i64) as i32 {
+    if (st.ready == 0) { return 0; }
+    return _list_has(d, xid, st.net_wm_state, st.st_above);
+}
+
+// Ask to become the active window. XSetInputFocus alone is the wrong tool
+// under a window manager: it moves the input focus without telling the manager,
+// so the window gets keys while the manager still draws someone else as
+// focused. _NET_ACTIVE_WINDOW asks the manager to do the whole thing.
+fn activate(st as *State, d as *u8, root as i64, xid as i64) as i32 {
+    if (st.ready == 0 || st.net_active_window == 0) { return 0; }
+    xev.clear(&_msg);
+    let is *xev.XClientMessageEvent as e = xev.client(&_msg);
+    e.kind = x.ClientMessage;
+    e.send_event = 1;
+    e.display = d;
+    e.window = xid;
+    e.message_type = st.net_active_window;
+    e.format = 32;
+    e.data[0] = SOURCE_APPLICATION;
+    e.data[1] = 0;      // timestamp; 0 means "now", which is all we can say
+    e.data[2] = 0;      // the currently active window, if we knew it
+    xlib.XSendEvent(d, root, 0,
+                    x.SubstructureNotifyMask | x.SubstructureRedirectMask,
+                    cast(*u8, &_msg));
+    xlib.XFlush(d);
+    return 1;
+}
+
+// --- Where the window is ---
+
+fn move_to(d as *u8, xid as i64, wx as i64, wy as i64) as i32 {
+    xlib.XMoveWindow(d, xid, cast(i32, wx), cast(i32, wy));
+    xlib.XFlush(d);
+    return 1;
+}
+
+fn move_resize(d as *u8, xid as i64, wx as i64, wy as i64, cw as i64, ch as i64) as i32 {
+    if (cw <= 0 || ch <= 0) { return 0; }
+    xlib.XMoveResizeWindow(d, xid, cast(i32, wx), cast(i32, wy),
+                           cast(u32, cw), cast(u32, ch));
+    xlib.XFlush(d);
+    return 1;
+}
+
+let is i64 as _tx with mut = 0;
+let is i64 as _ty with mut = 0;
+let is i64 as _child with mut = 0;
+
+// The window's position in root coordinates.
+//
+// NOT what XGetWindowAttributes returns: under a reparenting window manager a
+// window's x and y are relative to the frame the manager wrapped it in, so they
+// are usually (0, 0) and always wrong. Translating (0, 0) to the root is the
+// only answer that means what a caller expects.
+fn position(d as *u8, xid as i64, root as i64, x_out as *i64, y_out as *i64) as i32 {
+    let is i32 as tx with mut = 0;
+    let is i32 as ty with mut = 0;
+    let is i32 as r = xlib.XTranslateCoordinates(d, xid, root, 0, 0,
+                                                 cast(*u8, &tx), cast(*u8, &ty),
+                                                 cast(*u8, &_child));
+    if (r == 0) { return 0; }
+    *x_out = cast(i64, tx);
+    *y_out = cast(i64, ty);
+    return 1;
+}
+
+// --- The icon ---
+//
+// _NET_WM_ICON is width, height, then width*height pixels, and every one of
+// those is a LONG rather than a 32-bit word. On 64-bit that means the property
+// is twice the size of the pixel data it carries, and a caller passing packed
+// ARGB has to be widened here rather than handed straight to the server.
+//
+// Pixels are ARGB with the alpha in the high byte, premultiplied by nothing.
+// That is not the order the rasterizer packs (0xAABBGGRR), so a program
+// converting an image has to swap red and blue — the same swap surface.cst
+// does on present, and for the same reason.
+fn set_icon(st as *State, d as *u8, xid as i64, argb as *u8, w as i64, h as i64) as i32 {
+    if (st.ready == 0 || st.net_wm_icon == 0) { return 0; }
+    if (cast(i64, argb) == 0 || w <= 0 || h <= 0) { return 0; }
+
+    let is i64 as n = w * h;
+    let is i64 as bytes = (n + 2) * 8;
+    let is *u8 as buf = mem.core.mmap_anon(bytes);
+    if (cast(i64, buf) == 0) { return 0; }
+
+    *cast(*i64, cast(i64, buf)) = w;
+    *cast(*i64, cast(i64, buf) + 8) = h;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as p = cast(i64, *cast(*i32, cast(i64, argb) + i * 4)) & 4294967295;
+        *cast(*i64, cast(i64, buf) + (i + 2) * 8) = p;
+        i = i + 1;
+    }
+
+    xlib.XChangeProperty(d, xid, st.net_wm_icon, st.cardinal, 32, x.PropModeReplace,
+                         buf, cast(i32, n + 2));
+    xlib.XFlush(d);
+    mem.core.munmap(buf, bytes);
+    return 1;
+}
+
+fn clear_icon(st as *State, d as *u8, xid as i64) as i32 {
+    if (st.ready == 0 || st.net_wm_icon == 0) { return 0; }
+    xlib.XDeleteProperty(d, xid, st.net_wm_icon);
+    xlib.XFlush(d);
+    return 1;
+}
+
+// --- What the decorations cost ---
+
+// The frame the window manager drew around us: left, right, top, bottom. A
+// program placing a window by its outer edge needs these, and a program that
+// assumes zero is wrong on every desktop with a title bar.
+fn frame_extents(st as *State, d as *u8, xid as i64,
+                 l as *i64, r as *i64, t as *i64, b as *i64) as i32 {
+    if (st.ready == 0 || st.net_frame_extents == 0) { return 0; }
+    let is i64 as n = _read_atoms(d, xid, st.net_frame_extents);
+    if (n < 4) { _release(); return 0; }
+    *l = _atom_at(0);
+    *r = _atom_at(1);
+    *t = _atom_at(2);
+    *b = _atom_at(3);
+    _release();
+    return 1;
+}

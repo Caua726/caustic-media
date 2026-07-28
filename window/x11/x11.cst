@@ -1,0 +1,264 @@
+// window/x11/x11.cst — a window on X11, and on Wayland through XWayland.
+//
+//   use "caustic-media/window/x11/x11.cst" as x11;
+//
+//   let is x11.window.Window as w = x11.open("hello", 1280, 720);
+//   while (x11.next_frame(&w) == 1) {
+//       let is tgt.Target as t = x11.acquire(&w);
+//       if (t.width == 0) { continue; }
+//       // draw into t
+//       x11.submit(&w);
+//   }
+//   x11.close(&w);
+//
+// XWayland is not a separate backend and there should never be one: from a
+// client's side it is X11 — same protocol, same library, same code path. A
+// Wayland session running XWayland is served by this unchanged.
+//
+// --- The two levels ---
+//
+// bind/ is every function libX11 exposes, declared in Caustic. The rest of this
+// directory is one portable window built on top of those bindings rather than
+// on FFI directly, which is the split ../window.md calls the whole design. A
+// program picks a level and stays there, or mixes: open a window with this and
+// still reach XCreatePixmap through x11.bind.xlib.
+//
+//   x11.open(...)                    the abstraction
+//   x11.bind.xlib.XCreatePixmap(...) the binding
+//   x11.display(&w), x11.xid(&w)     the seam between them
+//
+// The native handles are public contract, not an implementation detail. When
+// Vulkan or OpenGL renders it is the swapchain that presents and this layer's
+// remaining job is handing over the Display* and Window that
+// VK_KHR_xlib_surface and EGL are built from. That seam is what lets
+// gpu.vk.surface_from(&w) exist without gpu/ ever importing window/.
+//
+// --- What lands in DT_NEEDED ---
+//
+// libX11.so.6 and libXext.so.6 — the second because presenting negotiates
+// MIT-SHM. Not libXrandr, libXcursor, libXfixes or libXi, even though bind/
+// declares all four: the compiler emits a library import at the CALL SITE
+// rather than at the declaration, so a file full of unused externs costs
+// nothing.
+//
+// That holds for declarations, not for modules. See the note further down about
+// why cursor.cst and monitors.cst are not forwarded here.
+// tools/check_needed.sh asserts the result on every CI run rather than trusting
+// it.
+//
+// --- Types are named through their module ---
+//
+// x11.window.Window, x11.events.Event, x11.keys.Map — the same shape as
+// gpu.device.Device and soft.target.Target, and for the same reason: a type
+// alias does not cross a module boundary in Caustic, while a function can be
+// forwarded. The forwarders below are the common path; anything not forwarded
+// is reachable one level down.
+use "../../gpu/software/target.cst" as tgt;
+use "../../gpu/swapchain.cst" as swapchain;
+use "bind/bind.cst" as bind;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xevent;
+use "surface.cst" as surface;
+use "keys.cst" as keys;
+use "events.cst" as events;
+use "text.cst" as text;
+use "window.cst" as window;
+
+// --- Opening ---
+
+fn open(title as *u8, width as i64, height as i64) as window.Window {
+    return window.open(title, width, height);
+}
+fn open_with(c as *window.Config) as window.Window { return window.open_with(c); }
+fn config(title as *u8, width as i64, height as i64) as window.Config {
+    return window.config(title, width, height);
+}
+fn config_fixed(title as *u8, width as i64, height as i64) as window.Config {
+    return window.config_fixed(title, width, height);
+}
+fn close(w as *window.Window) as void { window.close(w); }
+fn is_open(w as *window.Window) as i32 { return window.is_open(w); }
+fn last_error(w as *window.Window) as i32 { return window.last_error(w); }
+fn error_name(code as i32) as *u8 { return window.error_name(code); }
+
+// --- The frame ---
+
+fn next_frame(w as *window.Window) as i32 { return window.next_frame(w); }
+fn acquire(w as *window.Window) as tgt.Target { return window.acquire(w); }
+fn submit(w as *window.Window) as void { window.submit(w); }
+fn frame_index(w as *window.Window) as i64 { return window.frame_index(w); }
+fn image_count(w as *window.Window) as i64 { return window.image_count(w); }
+fn transport_name(w as *window.Window) as *u8 { return window.transport_name(w); }
+
+// --- Geometry ---
+
+fn width(w as *window.Window) as i64 { return window.width(w); }
+fn height(w as *window.Window) as i64 { return window.height(w); }
+fn resized(w as *window.Window) as i32 { return window.resized(w); }
+fn exposed(w as *window.Window) as i32 { return window.exposed(w); }
+fn set_title(w as *window.Window, title as *u8) as void { window.set_title(w, title); }
+fn set_size(w as *window.Window, cw as i64, ch as i64) as i32 { return window.set_size(w, cw, ch); }
+fn show(w as *window.Window) as void { window.show(w); }
+fn hide(w as *window.Window) as void { window.hide(w); }
+fn focus(w as *window.Window) as void { window.focus(w); }
+
+// --- Clipboard ---
+//
+// Owning a selection and asking for one. The pump answers requests from other
+// clients whether or not a program calls any of this, because a request left
+// unanswered hangs the client that sent it.
+
+fn clipboard_set_text(w as *window.Window, s as *u8, n as i64) as i32 {
+    return window.clipboard_set_text(w, s, n);
+}
+fn clipboard_request_text(w as *window.Window) as i32 { return window.clipboard_request_text(w); }
+fn clipboard_text(w as *window.Window, buf as *u8, cap as i64) as i64 {
+    return window.clipboard_text(w, buf, cap);
+}
+fn clipboard_get_text(w as *window.Window, buf as *u8, cap as i64, rounds as i64) as i64 {
+    return window.clipboard_get_text(w, buf, cap, rounds);
+}
+fn clipboard_owns(w as *window.Window) as i32 { return window.clipboard_owns(w); }
+
+// --- Not forwarded: the cursor and the monitors ---
+//
+// cursor.cst and monitors.cst are finished and deliberately absent from this
+// hub. Importing a module that CALLS an extension makes that extension
+// reachable from main even when nothing calls the module, so forwarding them
+// here would put libXrandr, libXcursor, libXfixes and libXi into the DT_NEEDED
+// of every program that opens a window — and the loader would then require all
+// four to be installed before such a program could start.
+//
+// A program that wants them imports them directly, which works because neither
+// knows what a Window is:
+//
+//     use "…/window/x11/cursor.cst" as cursor;
+//     use "…/window/x11/monitors.cst" as monitors;
+//
+//     cursor.set_shape(&cur, x11.display(&w), x11.xid(&w), cursor.IBEAM);
+//     monitors.refresh(&mons, x11.display(&w), x11.root(&w));
+//
+// The reasoning, and the measurement behind it, is in window.cst.
+
+// --- Events, raw and decoded ---
+
+fn poll_xevent(w as *window.Window, out as *xevent.XEvent) as i32 { return window.poll_xevent(w, out); }
+fn wait_xevent(w as *window.Window, out as *xevent.XEvent) as i32 { return window.wait_xevent(w, out); }
+fn poll_event(w as *window.Window, out as *events.Event) as i32 { return window.poll_event(w, out); }
+fn queue_len(w as *window.Window) as i64 { return window.queue_len(w); }
+fn dropped(w as *window.Window) as i64 { return window.dropped(w); }
+
+// --- Sampled state ---
+
+fn key_down(w as *window.Window, key_id as i32) as i32 { return window.key_down(w, key_id); }
+fn keycode_down(w as *window.Window, keycode as i32) as i32 { return window.keycode_down(w, keycode); }
+fn modifiers(w as *window.Window) as i32 { return window.modifiers(w); }
+fn mouse_x(w as *window.Window) as i64 { return window.mouse_x(w); }
+fn mouse_y(w as *window.Window) as i64 { return window.mouse_y(w); }
+fn mouse_dx(w as *window.Window) as i64 { return window.mouse_dx(w); }
+fn mouse_dy(w as *window.Window) as i64 { return window.mouse_dy(w); }
+fn wheel(w as *window.Window) as i64 { return window.wheel(w); }
+fn button_down(w as *window.Window, button as i32) as i32 { return window.button_down(w, button); }
+fn focused(w as *window.Window) as i32 { return window.focused(w); }
+fn visible(w as *window.Window) as i32 { return window.visible(w); }
+fn should_close(w as *window.Window) as i32 { return window.should_close(w); }
+fn request_close(w as *window.Window) as void { window.request_close(w); }
+
+// --- Native handles ---
+
+fn display(w as *window.Window) as *u8 { return window.display(w); }
+fn xid(w as *window.Window) as i64 { return window.xid(w); }
+fn screen(w as *window.Window) as i32 { return window.screen(w); }
+fn visual(w as *window.Window) as *u8 { return window.visual(w); }
+fn colormap(w as *window.Window) as i64 { return window.colormap(w); }
+fn gc(w as *window.Window) as *u8 { return window.gc(w); }
+fn connection_fd(w as *window.Window) as i32 { return window.connection_fd(w); }
+fn root(w as *window.Window) as i64 { return window.root(w); }
+fn surface_for_gpu(w as *window.Window, present as *u8, user as *u8) as swapchain.Surface {
+    return window.surface_for_gpu(w, present, user);
+}
+
+// The zero-copy form: the swapchain draws into this window's own buffer, so no
+// framebuffer crosses the seam. Nothing to pass — the window supplies both
+// halves itself.
+fn surface_for_gpu_shared(w as *window.Window) as swapchain.Surface {
+    return window.surface_for_gpu_shared(w);
+}
+
+// --- Window state ---
+//
+// Forwarded here, unlike the cursor and the monitors, because wm.cst reaches
+// no library beyond libX11: fullscreen is atoms and client messages, not an
+// extension. check_needed.sh still reports two DT_NEEDED entries for a program
+// that opens a window and draws.
+//
+// Every setter is a REQUEST. It returns whether the message was sent; the
+// query beside it says what the window manager actually did.
+
+fn set_fullscreen(w as *window.Window, on as i32) as i32 { return window.set_fullscreen(w, on); }
+fn fullscreen(w as *window.Window) as i32 { return window.fullscreen(w); }
+fn supports_fullscreen(w as *window.Window) as i32 { return window.supports_fullscreen(w); }
+fn set_maximized(w as *window.Window, on as i32) as i32 { return window.set_maximized(w, on); }
+fn maximized(w as *window.Window) as i32 { return window.maximized(w); }
+fn minimize(w as *window.Window) as i32 { return window.minimize(w); }
+fn minimized(w as *window.Window) as i32 { return window.minimized(w); }
+fn restore(w as *window.Window) as i32 { return window.restore(w); }
+fn set_above(w as *window.Window, on as i32) as i32 { return window.set_above(w, on); }
+fn activate(w as *window.Window) as i32 { return window.activate(w); }
+fn move_to(w as *window.Window, wx as i64, wy as i64) as i32 { return window.move_to(w, wx, wy); }
+fn move_resize(w as *window.Window, wx as i64, wy as i64, cw as i64, ch as i64) as i32 {
+    return window.move_resize(w, wx, wy, cw, ch);
+}
+fn position(w as *window.Window, x_out as *i64, y_out as *i64) as i32 {
+    return window.position(w, x_out, y_out);
+}
+fn set_icon(w as *window.Window, argb as *u8, iw as i64, ih as i64) as i32 {
+    return window.set_icon(w, argb, iw, ih);
+}
+fn clear_icon(w as *window.Window) as i32 { return window.clear_icon(w); }
+fn frame_extents(w as *window.Window, l as *i64, r as *i64, t as *i64, b as *i64) as i32 {
+    return window.frame_extents(w, l, r, t, b);
+}
+
+// --- Text ---
+//
+// Forwarded, like wm.cst and unlike cursor.cst, because text.cst reaches
+// nothing beyond libX11. The libc call an input method wants first is
+// locale.use_environment(), which a program imports separately and pays for
+// separately.
+
+fn text_of(w as *window.Window, e as *xevent.XEvent) as i64 { return window.text_of(w, e); }
+fn text_buffer(w as *window.Window) as *u8 { return window.text_buffer(w); }
+fn text_len(w as *window.Window) as i64 { return window.text_len(w); }
+fn text_keysym(w as *window.Window) as i64 { return window.text_keysym(w); }
+fn text_dropped(w as *window.Window) as i64 { return window.text_dropped(w); }
+fn open_input_method(w as *window.Window) as i32 { return window.open_input_method(w); }
+fn has_input_method(w as *window.Window) as i32 { return window.has_input_method(w); }
+
+// --- Frame sync and pacing ---
+//
+// set_frame_limit is a CLOCK, not vsync: libX11 has no way to wait for the
+// display's refresh. What it prevents is a program on X11 spinning as fast as
+// it can draw. 0 is unlimited, and is the default.
+//
+// The sync counter needs nothing from a program — the pump answers the
+// compositor's requests and submit() completes them — so what is exposed here
+// is only whether it is running and how many have been answered.
+
+fn set_frame_limit(w as *window.Window, fps as i64) as void { window.set_frame_limit(w, fps); }
+fn frame_limit(w as *window.Window) as i64 { return window.frame_limit(w); }
+fn frame_sync(w as *window.Window) as i32 { return window.frame_sync(w); }
+fn frames_synced(w as *window.Window) as i64 { return window.frames_synced(w); }
+
+// --- Drag and drop ---
+//
+// The target side only: a program can be dropped on, not drag from. The pump
+// answers the protocol, so a program just checks once a frame.
+
+fn dropped_files(w as *window.Window) as i64 { return window.dropped_files(w); }
+fn dropped_file(w as *window.Window, i as i64) as *u8 { return window.dropped_file(w, i); }
+fn clear_drop(w as *window.Window) as void { window.clear_drop(w); }
+fn dragging(w as *window.Window) as i32 { return window.dragging(w); }
+fn drag_x(w as *window.Window) as i64 { return window.drag_x(w); }
+fn drag_y(w as *window.Window) as i64 { return window.drag_y(w); }

@@ -1,0 +1,140 @@
+// window/x11/multi_test.cst — two windows at once, and events reaching the
+// right one.
+//
+// Written BEFORE the shared-connection refactor rather than after, so there is
+// something to regress against. Today each Window opens its own XOpenDisplay,
+// which makes this easy: two connections cannot confuse each other's events.
+// The moment they share one, routing becomes real work — the pump dequeues
+// whatever arrives and has to decide whose it is — and this is the test that
+// says whether it got it right.
+//
+// What it asserts:
+//
+//   Two windows open, and they are distinct: different xids, different
+//   surfaces, different sizes that stay different.
+//   A resize of one does not move the other.
+//   Closing one leaves the other alive and drawable, which is the part a
+//   refcounted shared connection can break: close the last user of the display
+//   too early and the survivor's next call is a use-after-free.
+//   Drawing into both produces the right pixels in each.
+//
+// Exit code is the number of failures.
+use "std/io.cst" as io;
+use "../../math/math.cst" as math;
+use "../../gpu/software/target.cst" as tgt;
+use "x11.cst" as x11;
+use "bind/xlib.cst" as xlib;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("  FAIL %s\n", name); }
+}
+
+fn chk_i(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        fails = fails + 1;
+        io.printf("  FAIL %s: got=%d want=%d\n", name, got, want);
+    }
+}
+
+// Draws one flat colour and reads the first pixel back out of the window's own
+// buffer, which is the cheapest proof that this window's surface is this
+// window's and not the other one's.
+fn paint(w as *x11.window.Window, c as math.color.Color) as i64 {
+    if (x11.next_frame(w) == 0) { return 0 - 1; }
+    let is tgt.Target as t = x11.acquire(w);
+    if (t.width == 0) { return 0 - 1; }
+    tgt.clear_color(&t, c);
+    let is i64 as first = tgt.get(&t, 0, 0);
+    x11.submit(w);
+    return first;
+}
+
+fn pump(w as *x11.window.Window, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { x11.next_frame(w); i = i + 1; }
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is x11.window.Window as a = x11.open("caustic-multi-a", 200, 150);
+    if (x11.is_open(&a) == 0) {
+        io.printf("  FAIL open a: %s\n", x11.error_name(x11.last_error(&a)));
+        return 1;
+    }
+    let is x11.window.Window as b = x11.open("caustic-multi-b", 320, 240);
+    if (x11.is_open(&b) == 0) {
+        io.printf("  FAIL open b: %s\n", x11.error_name(x11.last_error(&b)));
+        x11.close(&a);
+        return 1;
+    }
+
+    pump(&a, 8);
+    pump(&b, 8);
+
+    // --- They are two windows, not one ---
+
+    chk("both are open", cast(i32, x11.is_open(&a) == 1 && x11.is_open(&b) == 1));
+    chk("different xids", cast(i32, x11.xid(&a) != x11.xid(&b)));
+    chk_i("a kept its size", x11.width(&a), 200);
+    chk_i("b kept its size", x11.width(&b), 320);
+
+    // --- Their surfaces are their own ---
+
+    let is i64 as red = math.color.pack_rgba8(math.color.red());
+    let is i64 as blue = math.color.pack_rgba8(math.color.blue());
+    chk_i("a paints red", paint(&a, math.color.red()), red);
+    chk_i("b paints blue", paint(&b, math.color.blue()), blue);
+    // And painting b did not repaint a: read a back without drawing again.
+    x11.next_frame(&a);
+    let is tgt.Target as ta = x11.acquire(&a);
+    if (ta.width != 0) {
+        // Under MIT-SHM the buffers alternate, so this is the OTHER buffer of
+        // a — which must still be a's, whatever is in it. The assertion that
+        // means something is the size, not the colour.
+        chk_i("a's buffer is still a's size", ta.width, 200);
+    }
+
+    // --- A resize of one leaves the other alone ---
+
+    x11.set_size(&a, 260, 190);
+    pump(&a, 20);
+    pump(&b, 20);
+    // The window manager may refuse the resize; what must NOT happen is b
+    // changing because a asked.
+    chk_i("b is untouched by a's resize", x11.width(&b), 320);
+    chk_i("and b's height too", x11.height(&b), 240);
+
+    // --- Closing one leaves the other alive ---
+    //
+    // The check a refcounted shared connection has to survive: closing the
+    // first window must not take the display down under the second.
+    x11.close(&a);
+    chk("a is closed", cast(i32, x11.is_open(&a) == 0));
+    chk("b is still open", x11.is_open(&b));
+
+    chk_i("b still draws after a is gone", paint(&b, math.color.green()),
+          math.color.pack_rgba8(math.color.green()));
+    pump(&b, 8);
+    chk_i("and still knows its size", x11.width(&b), 320);
+
+    x11.close(&b);
+    chk("b is closed", cast(i32, x11.is_open(&b) == 0));
+
+    // --- And a third, after both are gone ---
+    //
+    // A refcount that hit zero and closed the display has to be able to open a
+    // new one. Getting this wrong leaves a program unable to reopen a window.
+    let is x11.window.Window as c = x11.open("caustic-multi-c", 128, 96);
+    chk("a window opens again after all were closed", x11.is_open(&c));
+    if (x11.is_open(&c) == 1) {
+        pump(&c, 8);
+        chk_i("and it works", paint(&c, math.color.white()),
+              math.color.pack_rgba8(math.color.white()));
+        x11.close(&c);
+    }
+
+    if (fails == 0) { io.printf("x11 multi-window: all checks passed\n"); }
+    else { io.printf("  multi_test: %d failure(s)\n", cast(i64, fails)); }
+    return fails;
+}

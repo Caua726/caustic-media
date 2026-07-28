@@ -1,0 +1,282 @@
+// window/x11/cursor.cst — the pointer: what it looks like, and where it may go.
+//
+// Three separable things that all happen to be about the pointer:
+//
+//   Shape       an arrow, an I-beam, a resize handle. Themed through Xcursor
+//               when the user has a theme, from the 1987 cursor font when not.
+//   Visibility  hidden or shown. Xfixes, because the core protocol has no way
+//               to hide a pointer at all.
+//   Mode        normal, confined to the window, or relative — the last being
+//               what a first-person camera needs.
+//
+// --- Why relative mode is not just "hide it and warp it back" ---
+//
+// The usual trick is to hide the cursor, read its position, and warp it to the
+// centre every frame. It half works and it is wrong in two ways: XWarpPointer
+// generates a MotionNotify of its own, so the program has to recognise and
+// discard its own warps, and the deltas it produces have already been through
+// the server's pointer acceleration and clamped at the screen edge — so a fast
+// flick reports less movement than the mouse actually made.
+//
+// XI2 raw motion is the real answer. It reports the device's movement before
+// acceleration and before any clamping, and it keeps reporting while the
+// pointer sits still against the edge of the screen. The grab is still needed
+// so the events keep coming when the pointer leaves the window, but nothing
+// gets warped and nothing has to be filtered out.
+//
+// A build without XI2 falls back to the warp, and mode_name() says which one is
+// live rather than pretending they are the same.
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xfixes.cst" as xfixes;
+use "bind/xcursor.cst" as xcursor;
+use "bind/xinput2.cst" as xi2;
+
+// --- Shapes ---
+//
+// The names are Xcursor's, which are the freedesktop cursor-spec names a theme
+// is required to provide. The numbers are the cursorfont.h glyphs to fall back
+// to, and they are not a coincidence — each is the shape the same name meant
+// before themes existed.
+
+let is i32 as ARROW     with imut = 0;
+let is i32 as IBEAM     with imut = 1;
+let is i32 as CROSSHAIR with imut = 2;
+let is i32 as HAND      with imut = 3;
+let is i32 as WAIT      with imut = 4;
+let is i32 as PROGRESS  with imut = 5;
+let is i32 as NOT_ALLOWED with imut = 6;
+let is i32 as MOVE      with imut = 7;
+let is i32 as RESIZE_H  with imut = 8;
+let is i32 as RESIZE_V  with imut = 9;
+let is i32 as RESIZE_NWSE with imut = 10;
+let is i32 as RESIZE_NESW with imut = 11;
+let is i32 as SHAPE_COUNT with imut = 12;
+
+fn _theme_name(shape as i32) as *u8 {
+    if (shape == ARROW)       { return "default"; }
+    if (shape == IBEAM)       { return "text"; }
+    if (shape == CROSSHAIR)   { return "crosshair"; }
+    if (shape == HAND)        { return "pointer"; }
+    if (shape == WAIT)        { return "wait"; }
+    if (shape == PROGRESS)    { return "progress"; }
+    if (shape == NOT_ALLOWED) { return "not-allowed"; }
+    if (shape == MOVE)        { return "all-scroll"; }
+    if (shape == RESIZE_H)    { return "ew-resize"; }
+    if (shape == RESIZE_V)    { return "ns-resize"; }
+    if (shape == RESIZE_NWSE) { return "nwse-resize"; }
+    if (shape == RESIZE_NESW) { return "nesw-resize"; }
+    return "default";
+}
+
+// cursorfont.h glyph numbers. XC_left_ptr is 68, XC_xterm 152, and so on; the
+// font has no diagonal resize glyphs, so those fall back to the plain sizing
+// arrows rather than to something misleading.
+fn _font_glyph(shape as i32) as u32 {
+    if (shape == ARROW)       { return cast(u32, 68); }    // XC_left_ptr
+    if (shape == IBEAM)       { return cast(u32, 152); }   // XC_xterm
+    if (shape == CROSSHAIR)   { return cast(u32, 34); }    // XC_crosshair
+    if (shape == HAND)        { return cast(u32, 60); }    // XC_hand2
+    if (shape == WAIT)        { return cast(u32, 150); }   // XC_watch
+    if (shape == PROGRESS)    { return cast(u32, 150); }   // XC_watch
+    if (shape == NOT_ALLOWED) { return cast(u32, 24); }    // XC_circle
+    if (shape == MOVE)        { return cast(u32, 52); }    // XC_fleur
+    if (shape == RESIZE_H)    { return cast(u32, 108); }   // XC_sb_h_double_arrow
+    if (shape == RESIZE_V)    { return cast(u32, 116); }   // XC_sb_v_double_arrow
+    if (shape == RESIZE_NWSE) { return cast(u32, 120); }   // XC_sizing
+    if (shape == RESIZE_NESW) { return cast(u32, 120); }   // XC_sizing
+    return cast(u32, 68);
+}
+
+// --- Modes ---
+
+let is i32 as NORMAL   with imut = 0;
+let is i32 as CONFINED with imut = 1;    // may move, cannot leave the window
+let is i32 as RELATIVE with imut = 2;    // hidden, grabbed, deltas only
+
+fn mode_name(m as i32) as *u8 {
+    if (m == CONFINED) { return "confined"; }
+    if (m == RELATIVE) { return "relative"; }
+    return "normal";
+}
+
+struct State {
+    // Set by window.cst when init() has run. Cursor support is reached lazily
+    // so that a program which never touches the pointer does not require
+    // libXcursor, libXfixes and libXi to be present just to start.
+    ready   as i32;
+    _pad1   as i32;
+    // One server-side Cursor per shape, made on first use and kept: creating
+    // one is a round trip, and a program changing the cursor on hover would
+    // otherwise pay it on every crossing.
+    cached  as [12]i64;
+    shape   as i32;
+    mode    as i32;
+    hidden  as i32;
+    // Whether XI2 answered. Decides whether RELATIVE is raw motion or the warp.
+    xi2_ok  as i32;
+    xi2_opcode as i32;
+    _pad0   as i32;
+    // Where the pointer was left when RELATIVE began, so leaving the mode can
+    // put it back rather than dropping it wherever the last warp landed.
+    saved_x as i64;
+    saved_y as i64;
+}
+
+fn init(st as *State, d as *u8) as void {
+    st.ready = 0;
+    let is i64 as i with mut = 0;
+    while (i < SHAPE_COUNT) { st.cached[i] = 0; i = i + 1; }
+    st.shape = ARROW;
+    st.mode = NORMAL;
+    st.hidden = 0;
+    st.saved_x = 0;
+    st.saved_y = 0;
+    st.xi2_ok = 0;
+    st.xi2_opcode = 0;
+
+    let is i32 as ev with mut = 0;
+    let is i32 as er with mut = 0;
+    let is i32 as op with mut = 0;
+    if (xlib.XQueryExtension(d, "XInputExtension", &op, &ev, &er) != 0) {
+        // The server does not send XI2 events until a client asks for a
+        // version it also speaks. Asking is the negotiation, not a query.
+        let is i32 as major with mut = 2;
+        let is i32 as minor with mut = 0;
+        if (xi2.XIQueryVersion(d, &major, &minor) == x.Success) {
+            st.xi2_ok = 1;
+            st.xi2_opcode = op;
+        }
+    }
+}
+
+fn close(st as *State, d as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < SHAPE_COUNT) {
+        if (st.cached[i] != 0) { xlib.XFreeCursor(d, st.cached[i]); st.cached[i] = 0; }
+        i = i + 1;
+    }
+}
+
+// Themed if there is a theme, the core font if not. XcursorLibraryLoadCursor
+// returns None when the name is not in the user's theme, which is the normal
+// case for the diagonal resize shapes on older themes.
+fn _cursor_for(st as *State, d as *u8, shape as i32) as i64 {
+    if (shape < 0 || shape >= SHAPE_COUNT) { return 0; }
+    if (st.cached[shape] != 0) { return st.cached[shape]; }
+
+    let is i64 as c with mut = xcursor.XcursorLibraryLoadCursor(d, _theme_name(shape));
+    if (c == 0) { c = xlib.XCreateFontCursor(d, _font_glyph(shape)); }
+    st.cached[shape] = c;
+    return c;
+}
+
+fn set_shape(st as *State, d as *u8, win as i64, shape as i32) as i32 {
+    if (shape < 0 || shape >= SHAPE_COUNT) { return 0; }
+    st.shape = shape;
+    if (st.hidden == 1) { return 1; }        // applied when it is shown again
+    let is i64 as c = _cursor_for(st, d, shape);
+    if (c == 0) { return 0; }
+    xlib.XDefineCursor(d, win, c);
+    xlib.XFlush(d);
+    return 1;
+}
+
+fn shape(st as *State) as i32 { return st.shape; }
+
+// Xfixes rather than a 1x1 transparent cursor. The transparent-cursor trick
+// leaves a cursor defined, which a compositor may still draw a shadow for and
+// which shows through screen recording; this actually hides it.
+fn show(st as *State, d as *u8, win as i64, on as i32) as void {
+    if (on == 1) {
+        if (st.hidden == 0) { return; }
+        st.hidden = 0;
+        xfixes.XFixesShowCursor(d, win);
+        let is i64 as c = _cursor_for(st, d, st.shape);
+        if (c != 0) { xlib.XDefineCursor(d, win, c); }
+    } else {
+        if (st.hidden == 1) { return; }
+        st.hidden = 1;
+        xfixes.XFixesHideCursor(d, win);
+    }
+    xlib.XFlush(d);
+}
+
+fn hidden(st as *State) as i32 { return st.hidden; }
+
+fn warp(d as *u8, win as i64, cx as i64, cy as i64) as void {
+    xlib.XWarpPointer(d, 0, win, 0, 0, cast(u32, 0), cast(u32, 0),
+                      cast(i32, cx), cast(i32, cy));
+    xlib.XFlush(d);
+}
+
+// --- Modes ---
+
+// Selecting raw motion is a root-window request, not a window one: raw events
+// are not delivered per-window because they happen before the server has
+// decided which window the pointer is over.
+let is [4]u8 as _xi_mask;
+let is [4]i64 as _xi_evmask;
+
+fn _select_raw(st as *State, d as *u8, root as i64, on as i32) as i32 {
+    if (st.xi2_ok == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < 4) { _xi_mask[i] = cast(u8, 0); i = i + 1; }
+    if (on == 1) {
+        // XI_RawMotion is 17; the mask is a bitmap indexed by event type.
+        _xi_mask[17 >> 3] = cast(u8, 1 << (17 & 7));
+    }
+    // XIEventMask is { int deviceid; int mask_len; unsigned char *mask; }
+    // XIAllMasterDevices is 1.
+    _xi_evmask[0] = 1;                          // deviceid, and mask_len in the
+    _xi_evmask[1] = cast(i64, &_xi_mask);       // packed pair below
+    *cast(*i32, cast(i64, &_xi_evmask) + 4) = 4;
+    xi2.XISelectEvents(d, root, cast(*u8, &_xi_evmask), 1);
+    xlib.XFlush(d);
+    return 1;
+}
+
+fn set_mode(st as *State, d as *u8, win as i64, root as i64,
+            mode as i32, cx as i64, cy as i64) as i32 {
+    if (mode == st.mode) { return 1; }
+
+    // Leave the old one first, whatever it was.
+    if (st.mode == RELATIVE) {
+        _select_raw(st, d, root, 0);
+        xlib.XUngrabPointer(d, x.CurrentTime);
+        show(st, d, win, 1);
+        warp(d, win, st.saved_x, st.saved_y);
+    } else if (st.mode == CONFINED) {
+        xlib.XUngrabPointer(d, x.CurrentTime);
+    }
+    st.mode = NORMAL;
+
+    if (mode == NORMAL) { xlib.XFlush(d); return 1; }
+
+    // Confine and relative both grab, because both need events to keep coming
+    // when the pointer is against or past the window's edge. The grab is
+    // GrabModeAsync on both so the program is not responsible for replaying
+    // events it did not ask to freeze.
+    let is i64 as mask = x.PointerMotionMask | x.ButtonPressMask | x.ButtonReleaseMask;
+    let is i64 as confine with mut = win;
+    let is i32 as r = xlib.XGrabPointer(d, win, 0, mask, x.GrabModeAsync, x.GrabModeAsync,
+                                        confine, 0, x.CurrentTime);
+    if (r != x.GrabSuccess) { xlib.XFlush(d); return 0; }
+
+    if (mode == RELATIVE) {
+        st.saved_x = cx;
+        st.saved_y = cy;
+        show(st, d, win, 0);
+        _select_raw(st, d, root, 1);
+    }
+    st.mode = mode;
+    xlib.XFlush(d);
+    return 1;
+}
+
+fn mode(st as *State) as i32 { return st.mode; }
+
+// Whether relative mode is delivering raw device motion or falling back to
+// cooked motion plus warping. A program doing mouse-look should be able to say
+// so rather than silently feeling different on two machines.
+fn raw_motion_available(st as *State) as i32 { return st.xi2_ok; }
