@@ -1,0 +1,422 @@
+// examples/cube_interactive.cst — a cube you can actually move, in a window.
+//
+// cube.cst is the smallest program that draws through the device. This one is
+// the smallest program that is *used*: it reads the keyboard, follows the
+// mouse, and turns a wheel into a camera distance. Everything it reads comes
+// from window/x11's sampled state, which is the half of that layer the first
+// example never touched.
+//
+//   caustic -q examples/cube_interactive.cst -o build/cube_interactive
+//   ./build/cube_interactive
+//   ./build/cube_interactive 300     # stop after 300 frames, for a scripted run
+//
+//   drag left mouse   orbit
+//   W A S D           move the cube along X and Y
+//   R / F             move it along Z, towards and away
+//   wheel             camera distance
+//   space             put everything back
+//   escape            quit
+//
+// --- Why this one asks for a fixed size ---
+//
+// It opens with x11.config_fixed rather than x11.open. A window that sets no
+// WM_NORMAL_HINTS has told the window manager nothing about the size it wants,
+// and a tiling compositor gives it whatever the layout says — which on one
+// monitor is the whole screen. Declaring the minimum and maximum size equal
+// says the window cannot be resized, and niri's documented rule is that a
+// window floats if it has a parent or is fixed size.
+//
+// Measured on niri rather than assumed, because the answer was not uniform:
+// asking for 800x600 gets a floating window at exactly that size — `niri msg
+// windows` reports is_floating true — while the same binary asking for 640x480
+// is tiled to the full 1366x768 instead. The hints go out correctly either way;
+// xprop shows minimum and maximum both at the requested size. What a compositor
+// does with them is its own policy.
+//
+// So the program prints the size it actually got beside the size it asked for,
+// and follows the window if it is resized anyway. If a compositor tiles this
+// and you want it floating, that is a rule on your side — under niri:
+//
+//     window-rule {
+//         match app-id="caustic-media"
+//         open-floating true
+//     }
+use "std/io.cst" as io;
+use "std/math.cst" as fm;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../gpu/software/target.cst" as tgt;
+use "../window/x11/x11.cst" as x11;
+
+let is i64 as WIDTH  = 800;
+let is i64 as HEIGHT = 600;
+
+// A vertex, laid out exactly as pipeline.layout_pos_color() declares it:
+// three f64 of position, then four of colour.
+struct Vtx {
+    x as f64; y as f64; z as f64;
+    r as f64; g as f64; b as f64; a as f64;
+}
+
+// 6 faces * 2 triangles * 3 vertices, plus a chequered floor so the cube has
+// something to move against. Without it, translating the cube and orbiting the
+// camera look identical.
+//
+// A chequerboard rather than grid lines, and the reason is this rasterizer:
+// it walks a triangle's whole bounding box testing three edge functions per
+// pixel, so a thin strip lying almost along a screen axis costs a full screen
+// of tests to cover a few hundred pixels. Twenty of those took the example
+// from interactive to five frames a second. A floor of squares covers the same
+// ground with compact triangles, where the bounding box IS the coverage.
+let is i64 as CUBE_VERTS with imut = 36;
+let is i64 as FLOOR_SIDE with imut = 8;       // squares per side
+let is i64 as FLOOR_VERTS with imut = 384;    // 8*8 quads * 6 vertices
+let is [420]Vtx as verts;
+
+fn vtx(p as math.vec.Vec3, c as math.color.Color) as Vtx {
+    let is Vtx as v;
+    v.x = p.x; v.y = p.y; v.z = p.z;
+    v.r = c.r; v.g = c.g; v.b = c.b; v.a = c.a;
+    return v;
+}
+
+fn corner(i as i32) as math.vec.Vec3 {
+    let is f64 as x with mut = -1.0;
+    let is f64 as y with mut = -1.0;
+    let is f64 as z with mut = -1.0;
+    if ((i & 1) != 0) { x = 1.0; }
+    if ((i & 2) != 0) { y = 1.0; }
+    if ((i & 4) != 0) { z = 1.0; }
+    return math.vec.v3(x, y, z);
+}
+
+fn face(at as i64, a as i32, b as i32, c as i32, d as i32, col as math.color.Color) as i64 {
+    let is math.color.Color as dim = math.color.col_scale(col, 0.75);
+    verts[at + 0] = vtx(corner(a), col);
+    verts[at + 1] = vtx(corner(b), col);
+    verts[at + 2] = vtx(corner(c), dim);
+    verts[at + 3] = vtx(corner(a), col);
+    verts[at + 4] = vtx(corner(c), dim);
+    verts[at + 5] = vtx(corner(d), dim);
+    return at + 6;
+}
+
+// One square of the floor, flat on the ground plane.
+fn tile(at as i64, x0 as f64, z0 as f64, x1 as f64, z1 as f64,
+        col as math.color.Color) as i64 {
+    let is f64 as y = -1.001;   // just under the cube, so they never z-fight
+    let is math.vec.Vec3 as a = math.vec.v3(x0, y, z0);
+    let is math.vec.Vec3 as b = math.vec.v3(x1, y, z0);
+    let is math.vec.Vec3 as c = math.vec.v3(x1, y, z1);
+    let is math.vec.Vec3 as d = math.vec.v3(x0, y, z1);
+
+    verts[at + 0] = vtx(a, col);
+    verts[at + 1] = vtx(b, col);
+    verts[at + 2] = vtx(c, col);
+    verts[at + 3] = vtx(a, col);
+    verts[at + 4] = vtx(c, col);
+    verts[at + 5] = vtx(d, col);
+    return at + 6;
+}
+
+fn build() as void {
+    // Corner index bits are x=1, y=2, z=4.
+    let is i64 as at with mut = 0;
+    at = face(at, 4, 5, 7, 6, math.color.from_hex(0xE8453C));   // +z  front
+    at = face(at, 1, 0, 2, 3, math.color.from_hex(0x3B78E7));   // -z  back
+    at = face(at, 5, 1, 3, 7, math.color.from_hex(0x4CAF50));   // +x  right
+    at = face(at, 0, 4, 6, 2, math.color.from_hex(0xF4B400));   // -x  left
+    at = face(at, 2, 6, 7, 3, math.color.from_hex(0x9C27B0));   // +y  top
+    at = face(at, 0, 1, 5, 4, math.color.from_hex(0x00ACC1));   // -y  bottom
+
+    // Two greys the cube's colours never collide with, so the floor reads as
+    // ground rather than as another object.
+    let is math.color.Color as dark = math.color.from_hex(0x21212C);
+    let is math.color.Color as light = math.color.from_hex(0x2C2C3A);
+    let is f64 as extent = 4.5;
+    let is f64 as step = extent * 2.0 / cast(f64, FLOOR_SIDE);
+    let is i64 as ix with mut = 0;
+    while (ix < FLOOR_SIDE) {
+        let is i64 as iz with mut = 0;
+        while (iz < FLOOR_SIDE) {
+            let is math.color.Color as c with mut = dark;
+            if (((ix + iz) & 1) == 0) { c = light; }
+            let is f64 as x0 = 0.0 - extent + cast(f64, ix) * step;
+            let is f64 as z0 = 0.0 - extent + cast(f64, iz) * step;
+            at = tile(at, x0, z0, x0 + step, z0 + step, c);
+            iz = iz + 1;
+        }
+        ix = ix + 1;
+    }
+}
+
+// --- What the user is doing to the scene ---
+
+struct Scene {
+    yaw      as f64;   // camera, radians
+    pitch    as f64;
+    distance as f64;
+    px       as f64;   // where the cube is
+    py       as f64;
+    pz       as f64;
+    spin     as f64;   // the cube's own rotation, so it still reads as solid
+    spinning as i32;
+}
+
+fn scene_reset(s as *Scene) as void {
+    s.yaw = 0.6;
+    s.pitch = 0.45;
+    s.distance = 8.0;
+    s.px = 0.0; s.py = 0.0; s.pz = 0.0;
+    s.spin = 0.0;
+    s.spinning = 1;
+}
+
+// Clamped just short of straight down and straight up: at exactly vertical the
+// view direction is parallel to the up vector and the look-at matrix has no
+// unique answer, which shows as the scene flipping over.
+fn clamp_pitch(p as f64) as f64 {
+    let is f64 as limit = 1.55;
+    if (p > limit) { return limit; }
+    if (p < 0.0 - limit) { return 0.0 - limit; }
+    return p;
+}
+
+fn view_matrix(s as *Scene) as math.mat.Mat4 {
+    let is f64 as cp = fm.cos(s.pitch);
+    let is math.vec.Vec3 as eye = math.vec.v3(
+        s.distance * cp * fm.sin(s.yaw),
+        s.distance * fm.sin(s.pitch),
+        s.distance * cp * fm.cos(s.yaw));
+    return math.mat.m4_look_at(eye, math.vec.v3_zero(), math.vec.v3_up());
+}
+
+// --- The seam between the two layers ---
+//
+// gpu/ never imports window/, so the program is what joins them: the device
+// finishes a frame and calls this, which the Surface carried as a function
+// pointer. A Vulkan backend would ignore it and present through its own
+// swapchain.
+fn present_to_window(user as *u8, pixels as *u8, w as i64, h as i64) as i64 {
+    let is *x11.window.Window as win = cast(*x11.window.Window, user);
+    let is tgt.Target as dst = x11.acquire(win);
+    if (dst.width == 0) { return 0; }
+
+    let is i64 as rows with mut = h;
+    if (rows > dst.height) { rows = dst.height; }
+    let is i64 as cols with mut = w;
+    if (cols > dst.width) { cols = dst.width; }
+
+    let is i64 as y with mut = 0;
+    while (y < rows) {
+        let is i64 as src = cast(i64, pixels) + y * w * 4;
+        let is i64 as dso = cast(i64, dst.color) + y * dst.width * 4;
+        let is i64 as px with mut = 0;
+        while (px < cols) {
+            *cast(*i32, dso + px * 4) = *cast(*i32, src + px * 4);
+            px = px + 1;
+        }
+        y = y + 1;
+    }
+
+    x11.submit(win);
+    return 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+
+    let is i64 as max_frames with mut = 0;
+    if (env.argc() > 1) {
+        let is *u8 as a = env.argv(1);
+        let is i64 as n with mut = 0;
+        let is i64 as i with mut = 0;
+        while (a[i] >= 48 && a[i] <= 57) { n = n * 10 + cast(i64, a[i]) - 48; i = i + 1; }
+        max_frames = n;
+    }
+
+    build();
+
+    // config_fixed rather than open(): see the header. This is the line that
+    // decides whether a tiling compositor gives back a window or a screen.
+    let is x11.window.Config as cfg = x11.config_fixed("caustic-media — move the cube",
+                                                        WIDTH, HEIGHT);
+    cfg.class_name = "caustic-media";
+    let is x11.window.Window as win = x11.open_with(&cfg);
+    if (x11.is_open(&win) == 0) {
+        io.printf("could not open a window: %s\n", x11.error_name(x11.last_error(&win)));
+        return 1;
+    }
+
+    let is gpu.swapchain.Surface as surf = x11.surface_for_gpu(
+        &win, fn_ptr(present_to_window), cast(*u8, &win));
+
+    let is gpu.device.Device as d = gpu.open(&surf, gpu.AUTO);
+    if (gpu.device.is_open(&d) == 0) {
+        io.printf("could not open a device: %s\n", gpu.error_name(gpu.last_error(&d)));
+        x11.close(&win);
+        return 1;
+    }
+
+    let is i64 as sc = gpu.swapchain.create(&d, &surf, WIDTH, HEIGHT, 1);
+    let is gpu.texture.Desc as dtd with mut = gpu.texture.desc(WIDTH, HEIGHT, gpu.texture.DEPTH,
+                                                               gpu.texture.RENDER_TARGET);
+    let is i64 as depth with mut = gpu.texture.create(&d, &dtd);
+
+    let is i64 as total = CUBE_VERTS + FLOOR_VERTS;
+    let is i64 as vb = gpu.buffer.create(&d, sizeof(Vtx) * total, gpu.buffer.VERTEX);
+    gpu.buffer.upload(&d, vb, 0, cast(*u8, &verts), sizeof(Vtx) * total);
+
+    let is i64 as sh = gpu.shader.builtin(&d, gpu.shader.UNLIT_COLOR);
+    let is gpu.pipeline.Desc as pd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color());
+    let is i64 as pl = gpu.pipeline.create(&d, &pd);
+    // The grid is two-sided: from below, its triangles wind the other way and
+    // back-face culling would take the whole floor away.
+    let is gpu.pipeline.Desc as gd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color());
+    gd.cull = gpu.pipeline.CULL_NONE;
+    let is i64 as floor_pl = gpu.pipeline.create(&d, &gd);
+    let is i64 as cb = gpu.command.create(&d);
+
+    if (sc == 0 || depth == 0 || vb == 0 || sh == 0 || pl == 0 || floor_pl == 0 || cb == 0) {
+        io.printf("setup failed: %s\n", gpu.error_name(gpu.last_error(&d)));
+        gpu.close(&d);
+        x11.close(&win);
+        return 1;
+    }
+
+    // What was asked for, and what the window manager granted. Printed rather
+    // than assumed: the hints are a request, and a compositor that ignores them
+    // should be visible here instead of being a mystery on screen.
+    io.printf("device: %s   transport: %s\n", gpu.caps(&d).name, x11.transport_name(&win));
+    io.printf("asked for %dx%d, got %dx%d\n", WIDTH, HEIGHT, x11.width(&win), x11.height(&win));
+    if (x11.width(&win) != WIDTH || x11.height(&win) != HEIGHT) {
+        io.printf("  the window manager resized it anyway — the cube follows the window\n");
+    }
+    io.printf("drag to orbit, WASD to move, R/F for depth, wheel to zoom, space to reset\n");
+
+    let is Scene as sc_state;
+    scene_reset(&sc_state);
+
+    let is math.color.Color as bg = math.color.from_hex(0x0E0E14);
+    let is i64 as start = time.now_ns();
+    let is i64 as last with mut = start;
+    let is i64 as frames with mut = 0;
+
+    while (x11.next_frame(&win) == 1) {
+        if (x11.should_close(&win) == 1) { break; }
+        if (x11.key_down(&win, x11.keys.ESCAPE) == 1) { break; }
+
+        // Seconds since the previous frame. Everything below is a rate, so the
+        // cube moves at the same speed whatever the frame rate turns out to be
+        // — and at 960x640 in software the frame rate is not steady.
+        let is i64 as now = time.now_ns();
+        let is f64 as dt with mut = cast(f64, now - last) / 1000000000.0;
+        last = now;
+        if (dt > 0.1) { dt = 0.1; }   // a stall must not teleport the cube
+
+        if (x11.resized(&win) == 1) {
+            let is i64 as nw = x11.width(&win);
+            let is i64 as nh = x11.height(&win);
+            if (gpu.swapchain.resize(&d, sc, nw, nh) == 0) { break; }
+            gpu.texture.destroy(&d, depth);
+            dtd = gpu.texture.desc(nw, nh, gpu.texture.DEPTH, gpu.texture.RENDER_TARGET);
+            depth = gpu.texture.create(&d, &dtd);
+            if (depth == 0) { break; }
+        }
+
+        // --- input ---
+
+        // Button 1 is left. The deltas are per-frame, so this is a drag rather
+        // than an absolute position, and it keeps working when the pointer
+        // leaves the window.
+        if (x11.button_down(&win, 1) == 1) {
+            sc_state.yaw = sc_state.yaw + cast(f64, x11.mouse_dx(&win)) * 0.008;
+            sc_state.pitch = clamp_pitch(sc_state.pitch
+                                         - cast(f64, x11.mouse_dy(&win)) * 0.008);
+        }
+
+        let is i64 as w = x11.wheel(&win);
+        if (w != 0) {
+            sc_state.distance = sc_state.distance - cast(f64, w) * 0.6;
+            if (sc_state.distance < 2.5) { sc_state.distance = 2.5; }
+            if (sc_state.distance > 30.0) { sc_state.distance = 30.0; }
+        }
+
+        // Movement is in the cube's own axes rather than the camera's, so what
+        // a key does stays the same however the view is turned. Camera-relative
+        // movement is the other reasonable choice and it belongs to a camera
+        // controller, which is render/'s job rather than an example's.
+        let is f64 as speed = 4.0 * dt;
+        if (x11.key_down(&win, x11.keys.A) == 1) { sc_state.px = sc_state.px - speed; }
+        if (x11.key_down(&win, x11.keys.D) == 1) { sc_state.px = sc_state.px + speed; }
+        if (x11.key_down(&win, x11.keys.W) == 1) { sc_state.py = sc_state.py + speed; }
+        if (x11.key_down(&win, x11.keys.S) == 1) { sc_state.py = sc_state.py - speed; }
+        if (x11.key_down(&win, x11.keys.R) == 1) { sc_state.pz = sc_state.pz - speed; }
+        if (x11.key_down(&win, x11.keys.F) == 1) { sc_state.pz = sc_state.pz + speed; }
+        if (x11.key_down(&win, x11.keys.SPACE) == 1) { scene_reset(&sc_state); }
+
+        if (sc_state.spinning == 1) { sc_state.spin = sc_state.spin + dt * 0.7; }
+
+        // --- draw ---
+
+        let is i64 as img = gpu.swapchain.acquire(&d, sc);
+        if (img < 0) { break; }
+        let is i64 as color = gpu.swapchain.image(&d, sc, img);
+
+        let is f64 as aspect = cast(f64, x11.width(&win)) / cast(f64, x11.height(&win));
+        let is math.mat.Mat4 as proj = math.mat.m4_perspective(
+            math.scalar.radians(55.0), aspect, 0.1, 100.0);
+        let is math.mat.Mat4 as vp = math.mat.m4_mul(proj, view_matrix(&sc_state));
+
+        // The grid sits at the origin; only the cube carries the translation.
+        let is gpu.shader.BuiltinUniforms as floor_un = gpu.shader.uniforms_mvp(vp);
+        let is math.mat.Mat4 as model = math.mat.m4_mul(
+            math.mat.m4_translation(math.vec.v3(sc_state.px, sc_state.py, sc_state.pz)),
+            math.mat.m4_mul(math.mat.m4_rotation_y(sc_state.spin),
+                            math.mat.m4_rotation_x(sc_state.spin * 0.5)));
+        let is gpu.shader.BuiltinUniforms as cube_un = gpu.shader.uniforms_mvp(
+            math.mat.m4_mul(vp, model));
+
+        gpu.command.begin(&d, cb);
+        let is gpu.command.Pass as ps = gpu.command.pass(color, depth, bg);
+        gpu.command.begin_pass(&d, cb, &ps);
+
+        gpu.command.bind_vertex_buffer(&d, cb, vb);
+
+        gpu.command.bind_pipeline(&d, cb, floor_pl);
+        gpu.command.set_uniforms(&d, cb, cast(*u8, &floor_un), sizeof(gpu.shader.BuiltinUniforms));
+        gpu.command.draw(&d, cb, CUBE_VERTS, FLOOR_VERTS);
+
+        gpu.command.bind_pipeline(&d, cb, pl);
+        gpu.command.set_uniforms(&d, cb, cast(*u8, &cube_un), sizeof(gpu.shader.BuiltinUniforms));
+        gpu.command.draw(&d, cb, 0, CUBE_VERTS);
+
+        gpu.command.end_pass(&d, cb);
+        gpu.command.end(&d, cb);
+        gpu.command.submit(&d, cb);
+
+        gpu.swapchain.present(&d, sc);
+
+        frames = frames + 1;
+        if (max_frames > 0 && frames >= max_frames) { break; }
+    }
+
+    let is i64 as total_ns = time.now_ns() - start;
+
+    gpu.command.destroy(&d, cb);
+    gpu.pipeline.destroy(&d, floor_pl);
+    gpu.pipeline.destroy(&d, pl);
+    gpu.shader.destroy(&d, sh);
+    gpu.buffer.destroy(&d, vb);
+    gpu.texture.destroy(&d, depth);
+    gpu.swapchain.destroy(&d, sc);
+    gpu.close(&d);
+    x11.close(&win);
+
+    if (total_ns > 0) {
+        io.printf("%d frames in %d ms\n", frames, total_ns / 1000000);
+    }
+    return 0;
+}

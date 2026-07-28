@@ -1,0 +1,623 @@
+// examples/vkcube.cst — the cube everyone has seen, drawn through this stack.
+//
+// A deliberate reimplementation of `vkcube` from Vulkan-Tools: same geometry,
+// same UVs, same camera, same background, same slow spin about Y. Anyone who
+// has run `vkcube` to check whether their driver works should recognise this
+// one immediately, and that is the point — it makes the two directly
+// comparable.
+//
+// What it is NOT is a Vulkan program. `gpu.AUTO` picks the only backend
+// compiled in today, which is the software rasterizer, and everything below
+// stays the same when a Vulkan backend arrives. That is the claim the whole
+// gpu/ layer exists to make, and running this beside the real vkcube is how it
+// gets checked.
+//
+// Differences from the original, and why:
+//
+//   The texture is generated here rather than loaded from lunarg.ppm. There is
+//   no image loader in this repository yet — that is image/, which is a design
+//   note — and shipping somebody else's logo to test our own rasterizer would
+//   be borrowing the wrong thing. The generated one is built to make errors
+//   visible instead: see make_texture below.
+//
+//   vkcube pushes a new uniform buffer per frame through a descriptor set;
+//   here the equivalent is gpu.command.set_uniforms, which is the same idea at
+//   the level this layer works.
+//
+//   caustic -q examples/vkcube.cst -o build/vkcube && ./build/vkcube
+//   ./build/vkcube 300        # stop after 300 frames, for a scripted run
+//
+// Escape or the window's close button ends it.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/math.cst" as fm;
+use "std/env.cst" as env;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../gpu/software/target.cst" as tgt;
+use "../window/x11/x11.cst" as x11;
+
+let is i64 as WIDTH  = 640;
+let is i64 as HEIGHT = 640;
+
+// vkcube's window is square, and so is the projection it builds: it passes an
+// aspect of 1.0 regardless of the window. Following that keeps the picture
+// identical rather than merely similar.
+let is i64 as TEX_SIZE = 256;
+
+// The vertex layout gpu.pipeline.layout_pos_color_uv() declares: three f64 of
+// position, four of colour, two of texture coordinate. vkcube has no vertex
+// colour at all — its fragment shader is a plain texture fetch — so every
+// colour here is white and the built-in TEXTURED material, which modulates the
+// texture by the vertex colour, reduces to exactly that fetch.
+struct Vtx {
+    x as f64; y as f64; z as f64;
+    r as f64; g as f64; b as f64; a as f64;
+    u as f64; v as f64;
+}
+
+let is [36]Vtx as verts;
+let is [262144]u8 as texels;    // 256 * 256 * 4
+let is [64]i64 as seen;         // cores distintas, so --check usa
+let is [262144]u8 as readback;  // 256 * 256 * 4, only --check uses it
+
+// --- The model ---
+//
+// The same cube examples/cube.cst builds, corner for corner: eight corners
+// addressed by bits — x=1, y=2, z=4 — and six faces, each a quad written as two
+// triangles. The only thing added here is a texture coordinate per corner.
+//
+// Sharing the model rather than transcribing vkcube's own is the point of this
+// example. Two programs, one geometry, one difference: what the fragment does
+// with it. Anything that looks different between them is the material, not the
+// mesh.
+//
+// The winding is cube.cst's and is already right for this projection. That is
+// not a small thing — the first version of this file used vkcube's vertex data
+// unmodified, and every triangle came out back-facing, because Vulkan's clip
+// space has Y pointing down while math.mat.m4_perspective builds the Y-up form.
+// The cube rendered, spun, and was textured, and it was the inside of the cube.
+fn put(at as i64, px as f64, py as f64, pz as f64, u as f64, v as f64) as void {
+    verts[at].x = px; verts[at].y = py; verts[at].z = pz;
+    verts[at].r = 1.0; verts[at].g = 1.0; verts[at].b = 1.0; verts[at].a = 1.0;
+    verts[at].u = u;  verts[at].v = v;
+}
+
+fn build_cube() as void {
+    // -X
+    put( 0, 0.0-1.0, 0.0-1.0, 0.0-1.0,   0.0, 1.0);
+    put( 1, 0.0-1.0, 0.0-1.0,     1.0,   1.0, 1.0);
+    put( 2, 0.0-1.0,     1.0,     1.0,   1.0, 0.0);
+    put( 3, 0.0-1.0,     1.0,     1.0,   1.0, 0.0);
+    put( 4, 0.0-1.0,     1.0, 0.0-1.0,   0.0, 0.0);
+    put( 5, 0.0-1.0, 0.0-1.0, 0.0-1.0,   0.0, 1.0);
+    // -Z
+    put( 6, 0.0-1.0, 0.0-1.0, 0.0-1.0,   1.0, 1.0);
+    put( 7,     1.0,     1.0, 0.0-1.0,   0.0, 0.0);
+    put( 8,     1.0, 0.0-1.0, 0.0-1.0,   0.0, 1.0);
+    put( 9, 0.0-1.0, 0.0-1.0, 0.0-1.0,   1.0, 1.0);
+    put(10, 0.0-1.0,     1.0, 0.0-1.0,   1.0, 0.0);
+    put(11,     1.0,     1.0, 0.0-1.0,   0.0, 0.0);
+    // -Y
+    put(12, 0.0-1.0, 0.0-1.0, 0.0-1.0,   1.0, 0.0);
+    put(13,     1.0, 0.0-1.0, 0.0-1.0,   1.0, 1.0);
+    put(14,     1.0, 0.0-1.0,     1.0,   0.0, 1.0);
+    put(15, 0.0-1.0, 0.0-1.0, 0.0-1.0,   1.0, 0.0);
+    put(16,     1.0, 0.0-1.0,     1.0,   0.0, 1.0);
+    put(17, 0.0-1.0, 0.0-1.0,     1.0,   0.0, 0.0);
+    // +Y
+    put(18, 0.0-1.0,     1.0, 0.0-1.0,   1.0, 0.0);
+    put(19, 0.0-1.0,     1.0,     1.0,   0.0, 0.0);
+    put(20,     1.0,     1.0,     1.0,   0.0, 1.0);
+    put(21, 0.0-1.0,     1.0, 0.0-1.0,   1.0, 0.0);
+    put(22,     1.0,     1.0,     1.0,   0.0, 1.0);
+    put(23,     1.0,     1.0, 0.0-1.0,   1.0, 1.0);
+    // +X
+    put(24,     1.0,     1.0, 0.0-1.0,   1.0, 0.0);
+    put(25,     1.0,     1.0,     1.0,   0.0, 0.0);
+    put(26,     1.0, 0.0-1.0,     1.0,   0.0, 1.0);
+    put(27,     1.0, 0.0-1.0,     1.0,   0.0, 1.0);
+    put(28,     1.0, 0.0-1.0, 0.0-1.0,   1.0, 1.0);
+    put(29,     1.0,     1.0, 0.0-1.0,   1.0, 0.0);
+    // +Z
+    put(30, 0.0-1.0,     1.0,     1.0,   0.0, 0.0);
+    put(31, 0.0-1.0, 0.0-1.0,     1.0,   0.0, 1.0);
+    put(32,     1.0,     1.0,     1.0,   1.0, 0.0);
+    put(33, 0.0-1.0, 0.0-1.0,     1.0,   0.0, 1.0);
+    put(34,     1.0, 0.0-1.0,     1.0,   1.0, 1.0);
+    put(35,     1.0,     1.0,     1.0,   1.0, 0.0);
+}
+
+// --- The texture ---
+//
+// vkcube loads lunarg.ppm: a grey field with a teal panel inset in it, a word in
+// small spaced capitals, and a large circular letter to their right. This draws
+// the same composition with this project's name, because the LunarG mark
+// belongs to LunarG and reproducing a company's logo to test our own rasterizer
+// is borrowing the wrong thing.
+//
+// Everything else about the picture is vkcube's: the grey, the teal, the inset
+// panel, the spaced capitals, the oversized letter beside them.
+//
+// It is also still a test. A texture that is flat over large areas would hide a
+// UV error; the panel edges, the letterforms and the ring all put hard edges at
+// known places, so a flipped or rotated coordinate shows rather than hides.
+fn tex_set(px as i64, py as i64, c as math.color.Color) as void {
+    if (px < 0 || py < 0 || px >= TEX_SIZE || py >= TEX_SIZE) { return; }
+    *cast(*i32, cast(i64, &texels) + (py * TEX_SIZE + px) * 4) =
+        cast(i32, math.color.pack_rgba8(c));
+}
+
+fn tex_rect(x0 as i64, y0 as i64, x1 as i64, y1 as i64, c as math.color.Color) as void {
+    let is i64 as y with mut = y0;
+    while (y < y1) {
+        let is i64 as x with mut = x0;
+        while (x < x1) { tex_set(x, y, c); x = x + 1; }
+        y = y + 1;
+    }
+}
+
+// A 5x7 capital, one bit per pixel, most significant bit leftmost.
+fn glyph_row(ch as i64, row as i64) as i64 {
+    if (ch == 0) {
+        if (row == 0) { return 14; }
+        if (row == 5) { return 17; }
+        if (row == 1) { return 17; }
+        if (row == 6) { return 14; }
+        return 16;
+    }
+    if (ch == 1) {
+        if (row == 0) { return 14; }
+        if (row == 3) { return 31; }
+        return 17;
+    }
+    if (ch == 2) {
+        if (row == 6) { return 14; }
+        return 17;
+    }
+    if (ch == 3) {
+        if (row == 0) { return 15; }
+        if (row == 1) { return 16; }
+        if (row == 2) { return 16; }
+        if (row == 3) { return 14; }
+        if (row == 6) { return 30; }
+        return 1;
+    }
+    if (ch == 4) {
+        if (row == 0) { return 31; }
+        return 4;
+    }
+    if (ch == 5) {
+        if (row == 0) { return 31; }
+        if (row == 6) { return 31; }
+        return 4;
+    }
+    return 0;
+}
+
+fn draw_glyph(ch as i64, x as i64, y as i64, scale as i64, c as math.color.Color) as void {
+    let is i64 as row with mut = 0;
+    while (row < 7) {
+        let is i64 as bits = glyph_row(ch, row);
+        let is i64 as col with mut = 0;
+        while (col < 5) {
+            if ((bits & (1 << (4 - col))) != 0) {
+                tex_rect(x + col * scale, y + row * scale,
+                         x + col * scale + scale, y + row * scale + scale, c);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+// The large letter, drawn analytically so it has the smooth ring vkcube's has:
+// a thick annulus with a wedge taken out of one side.
+fn draw_big_c(cx as i64, cy as i64, r_out as i64, r_in as i64, c as math.color.Color) as void {
+    let is i64 as y with mut = cy - r_out;
+    while (y <= cy + r_out) {
+        let is i64 as x with mut = cx - r_out;
+        while (x <= cx + r_out) {
+            let is f64 as dx = cast(f64, x - cx);
+            let is f64 as dy = cast(f64, y - cy);
+            let is f64 as d = fm.sqrt(dx * dx + dy * dy);
+            if (d <= cast(f64, r_out) && d >= cast(f64, r_in)) {
+                let is i32 as gap with mut = 0;
+                if (dx > 0.0) {
+                    let is f64 as ang = fm.atan2(dy, dx);
+                    if (ang > 0.0 - 0.62 && ang < 0.62) { gap = 1; }
+                }
+                if (gap == 0) { tex_set(x, y, c); }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn make_texture() as void {
+    let is math.color.Color as grey  = math.color.from_hex(0x9A9A9A);
+    let is math.color.Color as teal  = math.color.from_hex(0x14707C);
+    let is math.color.Color as deep  = math.color.from_hex(0x0A4B55);
+    let is math.color.Color as light = math.color.from_hex(0xE9EEF0);
+
+    tex_rect(0, 0, TEX_SIZE, TEX_SIZE, grey);
+
+    let is i64 as px0 = 16;
+    let is i64 as px1 = TEX_SIZE - 16;
+    let is i64 as py0 = 64;
+    let is i64 as py1 = TEX_SIZE - 64;
+    tex_rect(px0, py0, px1, py1, teal);
+
+    // The darker lobe, which is what gives vkcube's panel its two-tone look
+    // instead of a flat fill.
+    let is i64 as cy = (py0 + py1) / 2;
+    let is i64 as y with mut = py0;
+    while (y < py1) {
+        let is i64 as x with mut = px0;
+        while (x < px1) {
+            let is f64 as dx = cast(f64, x - (px1 - 48));
+            let is f64 as dy = cast(f64, y - cy);
+            if (fm.sqrt(dx * dx + dy * dy) < 58.0) { tex_set(x, y, deep); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    draw_big_c(px1 - 50, cy, 44, 29, light);
+
+    let is [7]i64 as word;
+    word[0] = 0; word[1] = 1; word[2] = 2; word[3] = 3;
+    word[4] = 4; word[5] = 5; word[6] = 0;
+    let is i64 as scale = 2;
+    let is i64 as advance = 5 * scale + 6;
+    let is i64 as tx with mut = px0 + 12;
+    let is i64 as ty = cy - (7 * scale) / 2;
+    let is i64 as i with mut = 0;
+    while (i < 7) {
+        draw_glyph(word[i], tx, ty, scale, light);
+        tx = tx + advance;
+        i = i + 1;
+    }
+}
+
+// --- The camera ---
+//
+// vkcube's, unchanged: the eye above and behind the origin, 45 degrees, and an
+// aspect of 1.0 whatever the window does. The model matrix is the only thing
+// that moves.
+fn vkcube_mvp(angle as f64) as math.mat.Mat4 {
+    let is math.mat.Mat4 as model = math.mat.m4_rotation_y(angle);
+    let is math.mat.Mat4 as view = math.mat.m4_look_at(
+        math.vec.v3(0.0, 3.0, 5.0), math.vec.v3_zero(), math.vec.v3_up());
+    let is math.mat.Mat4 as proj = math.mat.m4_perspective(
+        math.scalar.radians(45.0), 1.0, 0.1, 100.0);
+    return math.mat.m4_mul(proj, math.mat.m4_mul(view, model));
+}
+
+fn arg_number(a as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (a[i] >= 48 && a[i] <= 57) { n = n * 10 + cast(i64, a[i]) - 48; i = i + 1; }
+    return n;
+}
+
+// --- Is every face there? ---
+//
+// Run with --check and it draws each of the six faces ON ITS OWN, with the
+// camera placed square in front of it, and asserts that something appeared.
+//
+// The obvious version of this test does not work, and it is worth saying why
+// because it looked convincing: render the whole cube from four angles and
+// count what is not background. That passes whatever the winding is. A face
+// wound backwards is culled, but the face behind it was hidden anyway, so the
+// silhouette never changes — and a cube is symmetric every 90 degrees about Y,
+// so all four counts come out identical to the pixel. The first version of this
+// function did exactly that, reported 18054 pixels four times, and could not
+// have failed.
+//
+// One face at a time is decisive. With CULL_BACK, a face wound the wrong way
+// and pointed straight at the camera draws nothing at all.
+let is [6]f64 as eye_x;
+let is [6]f64 as eye_y;
+let is [6]f64 as eye_z;
+let is [6]f64 as up_y;
+let is [6]f64 as up_z;
+
+fn face_cameras() as void {
+    // The faces in the order build_cube writes them, which is vkcube's:
+    // -X, -Z, -Y, +Y, +X, +Z. The camera goes on the same axis as the face,
+    // outside it, looking back at the origin.
+    eye_x[0] = 0.0 - 4.0; eye_y[0] = 0.0;       eye_z[0] = 0.0;
+    eye_x[1] = 0.0;       eye_y[1] = 0.0;       eye_z[1] = 0.0 - 4.0;
+    eye_x[2] = 0.0;       eye_y[2] = 0.0 - 4.0; eye_z[2] = 0.0;
+    eye_x[3] = 0.0;       eye_y[3] = 4.0;       eye_z[3] = 0.0;
+    eye_x[4] = 4.0;       eye_y[4] = 0.0;       eye_z[4] = 0.0;
+    eye_x[5] = 0.0;       eye_y[5] = 0.0;       eye_z[5] = 4.0;
+    let is i64 as i with mut = 0;
+    while (i < 6) {
+        // Looking along Y needs a different up vector: the usual one is
+        // parallel to the view direction there and the matrix degenerates.
+        if (i == 2 || i == 3) { up_y[i] = 0.0; up_z[i] = 1.0; }
+        else { up_y[i] = 1.0; up_z[i] = 0.0; }
+        i = i + 1;
+    }
+}
+
+fn face_name(i as i64) as *u8 {
+    if (i == 0) { return "-X"; }
+    if (i == 1) { return "-Z"; }
+    if (i == 2) { return "-Y"; }
+    if (i == 3) { return "+Y"; }
+    if (i == 4) { return "+X"; }
+    return "+Z";
+}
+
+fn face_mvp(i as i64) as math.mat.Mat4 {
+    let is math.mat.Mat4 as view = math.mat.m4_look_at(
+        math.vec.v3(eye_x[i], eye_y[i], eye_z[i]),
+        math.vec.v3_zero(),
+        math.vec.v3(0.0, up_y[i], up_z[i]));
+    let is math.mat.Mat4 as proj = math.mat.m4_perspective(
+        math.scalar.radians(45.0), 1.0, 0.1, 100.0);
+    return math.mat.m4_mul(proj, view);
+}
+
+fn check() as i32 {
+    let is i64 as W = 256;
+    let is i64 as H = 256;
+    let is gpu.device.Device as d = gpu.open_headless(W, H, gpu.AUTO);
+    if (gpu.device.is_open(&d) == 0) { io.printf("no device\n"); return 1; }
+
+    build_cube();
+    make_texture();
+    face_cameras();
+
+    let is i64 as vb = gpu.buffer.create(&d, sizeof(Vtx) * 36, gpu.buffer.VERTEX);
+    gpu.buffer.upload(&d, vb, 0, cast(*u8, &verts), sizeof(Vtx) * 36);
+
+    let is gpu.texture.Desc as td = gpu.texture.desc(TEX_SIZE, TEX_SIZE,
+                                                     gpu.texture.RGBA8, gpu.texture.SAMPLED);
+    let is i64 as tex = gpu.texture.create(&d, &td);
+    gpu.texture.upload(&d, tex, cast(*u8, &texels), TEX_SIZE * TEX_SIZE * 4);
+    let is i64 as samp = gpu.texture.sampler(&d, gpu.texture.LINEAR, gpu.texture.CLAMP);
+
+    let is gpu.texture.Desc as cd = gpu.texture.desc(W, H, gpu.texture.RGBA8,
+                                                     gpu.texture.RENDER_TARGET | gpu.texture.SAMPLED);
+    let is i64 as color = gpu.texture.create(&d, &cd);
+    let is gpu.texture.Desc as dd = gpu.texture.desc(W, H, gpu.texture.DEPTH,
+                                                     gpu.texture.RENDER_TARGET);
+    let is i64 as depth = gpu.texture.create(&d, &dd);
+
+    let is i64 as sh = gpu.shader.builtin(&d, gpu.shader.TEXTURED);
+    let is gpu.pipeline.Desc as pd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color_uv());
+    let is i64 as pl = gpu.pipeline.create(&d, &pd);
+    let is i64 as cb = gpu.command.create(&d);
+
+    if (vb == 0 || tex == 0 || samp == 0 || color == 0 || depth == 0
+        || sh == 0 || pl == 0 || cb == 0) {
+        io.printf("setup failed: %s\n", gpu.error_name(gpu.last_error(&d)));
+        gpu.close(&d);
+        return 1;
+    }
+
+    let is math.color.Color as bg = math.color.from_hex(0x333333);
+    let is i64 as bg_packed = math.color.pack_rgba8(bg);
+    let is i64 as fails with mut = 0;
+
+    let is i64 as f with mut = 0;
+    while (f < 6) {
+        let is gpu.shader.BuiltinUniforms as un = gpu.shader.uniforms_mvp(face_mvp(f));
+
+        gpu.command.begin(&d, cb);
+        let is gpu.command.Pass as ps = gpu.command.pass(color, depth, bg);
+        gpu.command.begin_pass(&d, cb, &ps);
+        gpu.command.bind_pipeline(&d, cb, pl);
+        gpu.command.bind_vertex_buffer(&d, cb, vb);
+        gpu.command.bind_texture(&d, cb, 0, tex, samp);
+        gpu.command.set_uniforms(&d, cb, cast(*u8, &un), sizeof(gpu.shader.BuiltinUniforms));
+        // This face and no other.
+        gpu.command.draw(&d, cb, f * 6, 6);
+        gpu.command.end_pass(&d, cb);
+        gpu.command.end(&d, cb);
+        gpu.command.submit(&d, cb);
+
+        if (gpu.texture.read(&d, color, cast(*u8, &readback), W * H * 4) == 0) {
+            io.printf("  FALHA %s: readback recusado\n", face_name(f));
+            fails = fails + 1;
+            f = f + 1;
+            continue;
+        }
+        // Count what was drawn, and how many distinct colours came back. A face
+        // that drew but sampled nothing would be one flat colour; the texture
+        // has a border, a checkerboard and a mark, so a real one has many.
+        // Counting DISTINCT colours rather than looking for particular ones.
+        //
+        // The first version checked for the texture's border and mark by their
+        // exact hex values, and it failed the moment the model came from
+        // cube.cst: those faces carry a colour per face, and the TEXTURED
+        // material multiplies the texture by it — so an orange border tinted
+        // red is no longer orange. The test was wrong, not the picture.
+        //
+        // Variety is the property that actually distinguishes the two cases. An
+        // untextured face is flat: exactly two colours, the face colour and the
+        // darker one the second triangle gets. A textured one has dozens.
+        let is i64 as drawn with mut = 0;
+        let is i64 as distinct with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < W * H) {
+            let is i64 as px2 = cast(i64, *cast(*i32, cast(i64, &readback) + k * 4)) & 16777215;
+            if (px2 != (bg_packed & 16777215)) {
+                drawn = drawn + 1;
+                if (distinct < 64) {
+                    let is i32 as isnew with mut = 1;
+                    let is i64 as s with mut = 0;
+                    while (s < distinct) {
+                        if (seen[s] == px2) { isnew = 0; }
+                        s = s + 1;
+                    }
+                    if (isnew == 1) { seen[distinct] = px2; distinct = distinct + 1; }
+                }
+            }
+            k = k + 1;
+        }
+
+        io.printf("  face %s: %d pixels, %d cores distintas\n",
+                  face_name(f), drawn, distinct);
+
+        // A single face square-on fills a large part of the frame. Nothing at
+        // all means it was culled, which means it is wound the wrong way.
+        if (drawn < (W * H) / 16) {
+            io.printf("    FALHA: face %s nao desenhou — enrolamento invertido?\n", face_name(f));
+            fails = fails + 1;
+        }
+        // Flat means untextured. Two colours is what this model produces with
+        // no texture at all, so anything at or below that failed to sample.
+        if (drawn >= (W * H) / 16 && distinct <= 4) {
+            io.printf("    FALHA: face %s desenhou chapada, sem amostrar a textura\n",
+                      face_name(f));
+            fails = fails + 1;
+        }
+        f = f + 1;
+    }
+
+    gpu.command.destroy(&d, cb);
+    gpu.pipeline.destroy(&d, pl);
+    gpu.shader.destroy(&d, sh);
+    gpu.texture.sampler_destroy(&d, samp);
+    gpu.texture.destroy(&d, tex);
+    gpu.texture.destroy(&d, depth);
+    gpu.texture.destroy(&d, color);
+    gpu.buffer.destroy(&d, vb);
+    gpu.close(&d);
+
+    if (fails == 0) { io.printf("vkcube: as seis faces desenham e amostram a textura\n"); }
+    return cast(i32, fails);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+
+    let is i64 as max_frames with mut = 0;
+    if (env.argc() > 1) {
+        let is *u8 as a = env.argv(1);
+        // --check renders headless and verifies the geometry instead of
+        // opening a window, so CI can run it.
+        if (a[0] == cast(u8, 45)) { return check(); }
+        max_frames = arg_number(a);
+    }
+
+    build_cube();
+    make_texture();
+
+    let is x11.window.Window as win = x11.open("caustic-media — vkcube", WIDTH, HEIGHT);
+    if (x11.is_open(&win) == 0) {
+        io.printf("could not open a window: %s\n", x11.error_name(x11.last_error(&win)));
+        return 1;
+    }
+
+    // The zero-copy seam: the swapchain draws into the window's own buffer, so
+    // no framebuffer crosses between the two layers.
+    let is gpu.swapchain.Surface as surf = x11.surface_for_gpu_shared(&win);
+
+    let is gpu.device.Device as d = gpu.open(&surf, gpu.AUTO);
+    if (gpu.device.is_open(&d) == 0) {
+        io.printf("could not open a device: %s\n", gpu.error_name(gpu.last_error(&d)));
+        x11.close(&win);
+        return 1;
+    }
+    io.printf("device: %s\n", gpu.caps(&d).name);
+
+    let is i64 as sc = gpu.swapchain.create(&d, &surf, WIDTH, HEIGHT, 1);
+    let is gpu.texture.Desc as dtd with mut = gpu.texture.desc(WIDTH, HEIGHT, gpu.texture.DEPTH,
+                                                               gpu.texture.RENDER_TARGET);
+    let is i64 as depth with mut = gpu.texture.create(&d, &dtd);
+
+    let is i64 as vb = gpu.buffer.create(&d, sizeof(Vtx) * 36, gpu.buffer.VERTEX);
+    gpu.buffer.upload(&d, vb, 0, cast(*u8, &verts), sizeof(Vtx) * 36);
+
+    let is gpu.texture.Desc as td = gpu.texture.desc(TEX_SIZE, TEX_SIZE,
+                                                     gpu.texture.RGBA8, gpu.texture.SAMPLED);
+    let is i64 as tex = gpu.texture.create(&d, &td);
+    gpu.texture.upload(&d, tex, cast(*u8, &texels), TEX_SIZE * TEX_SIZE * 4);
+    // CLAMP, not REPEAT: every UV in the model is inside [0,1], so wrapping
+    // would only ever hide a bug rather than do anything useful.
+    let is i64 as samp = gpu.texture.sampler(&d, gpu.texture.LINEAR, gpu.texture.CLAMP);
+
+    let is i64 as sh = gpu.shader.builtin(&d, gpu.shader.TEXTURED);
+    let is gpu.pipeline.Desc as pd = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color_uv());
+    let is i64 as pl = gpu.pipeline.create(&d, &pd);
+    let is i64 as cb = gpu.command.create(&d);
+
+    if (sc == 0 || depth == 0 || vb == 0 || tex == 0 || samp == 0
+        || sh == 0 || pl == 0 || cb == 0) {
+        io.printf("setup failed: %s\n", gpu.error_name(gpu.last_error(&d)));
+        gpu.close(&d);
+        x11.close(&win);
+        return 1;
+    }
+
+    // vkcube clears to a flat dark grey.
+    let is math.color.Color as bg = math.color.from_hex(0x333333);
+    let is i64 as start = time.now_ns();
+    let is i64 as frames with mut = 0;
+
+    while (x11.next_frame(&win) == 1) {
+        if (x11.resized(&win) == 1) {
+            if (gpu.swapchain.resize(&d, sc, x11.width(&win), x11.height(&win)) == 0) { break; }
+            gpu.texture.destroy(&d, depth);
+            dtd = gpu.texture.desc(x11.width(&win), x11.height(&win), gpu.texture.DEPTH,
+                                   gpu.texture.RENDER_TARGET);
+            depth = gpu.texture.create(&d, &dtd);
+            if (depth == 0) { break; }
+        }
+
+        // vkcube advances a fixed amount per frame; driving it from the clock
+        // instead means the cube turns at the same rate whatever the frame rate
+        // turns out to be, which matters a great deal more on a software
+        // rasterizer than it did on a GPU.
+        let is f64 as elapsed = cast(f64, time.now_ns() - start) / 1000000000.0;
+
+        let is i64 as img = gpu.swapchain.acquire(&d, sc);
+        if (img < 0) { continue; }
+        let is i64 as color = gpu.swapchain.image(&d, sc, img);
+
+        let is gpu.shader.BuiltinUniforms as un =
+            gpu.shader.uniforms_mvp(vkcube_mvp(elapsed * 0.8));
+
+        gpu.command.begin(&d, cb);
+        let is gpu.command.Pass as ps = gpu.command.pass(color, depth, bg);
+        gpu.command.begin_pass(&d, cb, &ps);
+        gpu.command.bind_pipeline(&d, cb, pl);
+        gpu.command.bind_vertex_buffer(&d, cb, vb);
+        gpu.command.bind_texture(&d, cb, 0, tex, samp);
+        gpu.command.set_uniforms(&d, cb, cast(*u8, &un), sizeof(gpu.shader.BuiltinUniforms));
+        gpu.command.draw(&d, cb, 0, 36);
+        gpu.command.end_pass(&d, cb);
+        gpu.command.end(&d, cb);
+        gpu.command.submit(&d, cb);
+
+        gpu.swapchain.present(&d, sc);
+
+        frames = frames + 1;
+        if (max_frames > 0 && frames >= max_frames) { break; }
+    }
+
+    let is i64 as total_ns = time.now_ns() - start;
+
+    gpu.command.destroy(&d, cb);
+    gpu.pipeline.destroy(&d, pl);
+    gpu.shader.destroy(&d, sh);
+    gpu.texture.sampler_destroy(&d, samp);
+    gpu.texture.destroy(&d, tex);
+    gpu.buffer.destroy(&d, vb);
+    gpu.texture.destroy(&d, depth);
+    gpu.swapchain.destroy(&d, sc);
+    gpu.close(&d);
+    x11.close(&win);
+
+    if (total_ns > 0) {
+        io.printf("%d frames in %d ms\n", frames, total_ns / 1000000);
+    }
+    return 0;
+}
