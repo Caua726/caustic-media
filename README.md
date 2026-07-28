@@ -1,15 +1,44 @@
 # caustic-media
 
-Windowing, input, graphics and audio for [Caustic](https://github.com/Caua726/Caustic).
+**Windowing, input, graphics and audio for [Caustic](https://github.com/Caua726/Caustic) — roughly what SDL is for C, plus a renderer and a UI layer.**
 
-Roughly what SDL is for C, plus a renderer and a UI layer: one library rather
-than a repository per platform API.
+![version](https://img.shields.io/badge/version-0.1.0-blue)
+![status](https://img.shields.io/badge/status-3%20of%2010%20layers%20started-yellow)
+![license](https://img.shields.io/badge/license-MIT-blue)
+
+> **This repository is mostly a design, not an implementation.** Three of the ten
+> layers have code: `math/` (complete and tested), `gpu/software/` (a working
+> software rasteriser, tested) and `window/x11.cst` (X11 only). The other seven
+> — input, render, 3d, image, text, audio, ui — are **design notes with no code
+> behind them**, and several backends named below (Wayland, KMS, Win32, Vulkan,
+> OpenGL, D3D, ALSA, WASAPI) are not written either.
+>
+> The API examples further down describe the **designed** interface. They will
+> not compile today. The design is the point of the repository at this stage —
+> it is written down so the implementation has something to be measured against
+> — but nobody should mistake it for a library they can use.
 
 ## Layers
 
-Each layer stands on its own and hands out the handle of the layer below it, so
-a program can take the whole stack, take part of it, or take a window and drive
-the GPU itself.
+Each layer is meant to stand on its own and hand out the handle of the layer
+below it, so a program can take the whole stack, take part of it, or take a
+window and drive the GPU itself.
+
+| Layer | Holds | State |
+|---|---|---|
+| `math/` | vectors, matrices, quaternions, geometry, colour, curves — pure | **done**, 2,500 lines, two test suites |
+| `gpu/software/` | the software rasteriser | **done**, tested |
+| `window/` | window, display, platform | **X11 only** (`window/x11.cst`); wayland, kms, win32 designed |
+| `gpu/` (device) | the portable device, in the shape of wgpu | in progress; vk, gl, d3d designed |
+| `input/` | keyboard, mouse, touch, pen, gamepad, haptics, sensors | design note only |
+| `render/` | the framework: meshes, sprites, materials, cameras, a frame | design note only |
+| `3d/` | models, meshes, skeletons, animation | design note only |
+| `image/` | pixels on the CPU: load, save, transform, generate, atlas | design note only |
+| `text/` | fonts, glyph atlases, shaping, layout | design note only |
+| `audio/` | device, mixer, music, positional | design note only |
+| `ui/` | immediate-mode widgets, drawn through `render/` | design note only |
+
+The shape the whole thing is aiming at:
 
 ```
 math/     vectors, matrices, quaternions, geometry, colour, curves   — pure
@@ -124,9 +153,8 @@ transforms images links no decoder.
 
 ## Building
 
-```
-caustic -q math/math_test.cst -o build/math_test && ./build/math_test
-caustic -q math/geom_test.cst -o build/geom_test && ./build/geom_test
+```sh
+caustic-mk run test     # the three suites that exist: math, geometry, rasteriser
 ```
 
 Needs a standard library new enough to carry the float functions in
