@@ -1,0 +1,445 @@
+// ui/scroll_test.cst — a viewport onto content larger than it.
+//
+// Layout, offsets, bars and their thumbs, the wheel and its hand-off to an
+// outer area, dragging and paging, keys, bringing the focused widget into
+// view, right to left, physical pixels, and the damage a scroll leaves —
+// all with synthetic events, nothing drawn.
+use "std/io.cst" as io;
+use "std/math.cst" as fm;
+use "../math/math.cst" as math;
+use "../window/keys.cst" as keys;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "event.cst" as event;
+use "router.cst" as router;
+use "signal.cst" as signal;
+use "damage.cst" as damage;
+use "scroll.cst" as scroll;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn near(name as *u8, got as f64, want as f64) as void {
+    let is f64 as d = got - want;
+    if (d > 0.000001 || d < 0.0 - 0.000001) {
+        io.printf("FAIL: %s: got %d/1000, want %d/1000\n", name,
+                  cast(i64, got * 1000.0), cast(i64, want * 1000.0));
+        fails = fails + 1;
+    }
+}
+
+fn is_rect(name as *u8, r as math.rect.Rect, x as f64, y as f64, w as f64, h as f64) as void {
+    if (r.x != x || r.y != y || r.w != w || r.h != h) {
+        io.printf("FAIL: %s: got %d,%d %dx%d, want %d,%d %dx%d\n", name,
+                  cast(i64, r.x), cast(i64, r.y), cast(i64, r.w), cast(i64, r.h),
+                  cast(i64, x), cast(i64, y), cast(i64, w), cast(i64, h));
+        fails = fails + 1;
+    }
+}
+
+// --- Leaves ---
+
+// A fixed preferred size, or with wrap > 0 a paragraph of `wrap` square units
+// of text, 10 tall per line, as wide as it is given. Counts the presses it
+// handles, and handles them only when asked to.
+struct Leaf {
+    w       as f64;
+    h       as f64;
+    min     as f64;
+    wrap    as f64;
+    presses as i64;
+    grab    as i64;
+}
+
+fn leaf_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Leaf as d = cast(*Leaf, data);
+    out.min_w = d.min;
+    out.min_h = d.min;
+    out.pref_w = d.w;
+    out.pref_h = d.h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+    if (d.wrap > 0.0) {
+        let is f64 as width with mut = d.w;
+        if (c.w < width) { width = c.w; }
+        if (width < 1.0) { width = 1.0; }
+        out.pref_h = fm.ceil(d.wrap / width) * 10.0;
+        out.min_h = out.pref_h;
+    }
+}
+
+fn leaf_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    layout.overlay_arrange(t, w, r);
+}
+
+fn leaf_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Leaf as d = cast(*Leaf, data);
+    if (e.kind == event.POINTER_DOWN && e.phase == event.TARGET) {
+        d.presses = d.presses + 1;
+        return d.grab;
+    }
+    return 0;
+}
+
+let is tree.Kind as leaf_kind with mut;
+
+fn leaf(t as *tree.Tree, parent as i64, w as f64, h as f64) as i64 {
+    let is i64 as k = tree.create(t, &leaf_kind, parent);
+    let is *Leaf as d = cast(*Leaf, tree.data(t, k));
+    d.w = w;
+    d.h = h;
+    return k;
+}
+
+fn leaf_data(t as *tree.Tree, w as i64) as *Leaf { return cast(*Leaf, tree.data(t, w)); }
+
+// A widget at x, y of its parent, w by h.
+fn at(t as *tree.Tree, parent as i64, x as f64, y as f64, w as f64, h as f64) as i64 {
+    let is i64 as k = leaf(t, parent, w, h);
+    layout.set_align(t, k, layout.START, layout.START);
+    layout.set_margin(t, k, x, y, 0.0, 0.0);
+    return k;
+}
+
+// A scroll area at x, y of its parent, exactly w by h.
+fn area(t as *tree.Tree, parent as i64, x as f64, y as f64, w as f64, h as f64) as i64 {
+    let is i64 as s = scroll.create(t, parent);
+    layout.set_align(t, s, layout.START, layout.START);
+    layout.set_margin(t, s, x, y, 0.0, 0.0);
+    layout.set_min_size(t, s, w, h);
+    layout.set_max_size(t, s, w, h);
+    return s;
+}
+
+let is i64 as changes with mut = 0;
+
+fn on_changed(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    changes = changes + 1;
+}
+
+fn press(t as *tree.Tree, r as *router.Router, x as f64, y as f64) as void {
+    router.pointer_move(t, r, x, y, 0);
+    router.pointer_button(t, r, 1, 1, x, y, 0);
+}
+
+fn release(t as *tree.Tree, r as *router.Router, x as f64, y as f64) as void {
+    router.pointer_button(t, r, 1, 0, x, y, 0);
+}
+
+fn main() as i32 {
+    leaf_kind = widget.kind("leaf", sizeof(Leaf));
+    leaf_kind.measure = fn_ptr(leaf_measure);
+    leaf_kind.arrange = fn_ptr(leaf_arrange);
+    leaf_kind.event = fn_ptr(leaf_event);
+
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    let is i64 as root = tree.root(&t);
+    let is router.Router as r = router.init(router.settings_default());
+
+    // --- Measured as the content, able to shrink to nothing ---
+    let is i64 as free = scroll.create(&t, root);
+    let is i64 as fc = leaf(&t, free, 300.0, 500.0);
+    leaf_data(&t, fc).min = 50.0;
+    let is geom.Constraint as unb = geom.unbounded();
+    let is geom.Size as fs;
+    layout.measure(&t, free, &unb, &fs);
+    near("measure: preferred width is the content's", fs.pref_w, 300.0);
+    near("measure: preferred height is the content's", fs.pref_h, 500.0);
+    near("measure: no minimum width", fs.min_w, 0.0);
+    near("measure: no minimum height", fs.min_h, 0.0);
+    scroll.set_policy(&t, free, scroll.NEVER, scroll.NEVER);
+    layout.measure(&t, free, &unb, &fs);
+    near("measure: not scrolling, the content's minimum", fs.min_w, 50.0);
+    tree.destroy(&t, free);
+
+    // --- Content larger than the view keeps its size; the view is the area ---
+    let is i64 as s = area(&t, root, 0.0, 0.0, 100.0, 80.0);
+    let is i64 as content = leaf(&t, s, 300.0, 500.0);
+    layout.run(&t, 400.0, 300.0);
+    check("the content is the first child", scroll.content(&t, s) == content);
+    is_rect("large: content keeps its size", layout.rect(&t, content), 0.0, 0.0, 300.0, 500.0);
+    is_rect("overlay bars: the view is the whole area", scroll.view_rect(&t, s), 0.0, 0.0, 100.0, 80.0);
+    check("large: both bars", scroll.bar_shown(&t, s, scroll.X) == 1 && scroll.bar_shown(&t, s, scroll.Y) == 1);
+
+    // --- Offsets move the content and are clamped to it ---
+    signal.connect(&t, s, signal.VALUE_CHANGED, fn_ptr(on_changed), cast(*u8, 0));
+    scroll.set_offset(&t, s, 50.0, 1000.0);
+    near("clamped: x as asked", scroll.offset_x(&t, s), 50.0);
+    near("clamped: y to the end", scroll.offset_y(&t, s), 420.0);
+    is_rect("offset: content moved", layout.rect(&t, content), 0.0 - 50.0, 0.0 - 420.0, 300.0, 500.0);
+    check("offset: told once", changes == 1);
+    scroll.set_offset(&t, s, 50.0, 420.0);
+    check("same offset: not told again", changes == 1);
+    scroll.set_offset(&t, s, 0.0 - 30.0, 0.0 - 5.0);
+    near("clamped: x to the start", scroll.offset_x(&t, s), 0.0);
+    near("clamped: y to the start", scroll.offset_y(&t, s), 0.0);
+    check("not a pointer into the content: outside the view is not hit",
+          router.hit(&t, 150.0, 40.0) != content);
+
+    // --- The wheel: a notch is a line; Shift turns it sideways ---
+    router.scroll(&t, &r, 50.0, 40.0, 0.0, 1.0, 1, 0);
+    near("wheel: one notch down", scroll.offset_y(&t, s), scroll.line(&t, s));
+    router.scroll(&t, &r, 50.0, 40.0, 0.0, 0.0 - 1.0, 1, 0);
+    near("wheel: one notch up", scroll.offset_y(&t, s), 0.0);
+    router.scroll(&t, &r, 50.0, 40.0, 0.0, 25.0, 0, 0);
+    near("touchpad: pixels as they come", scroll.offset_y(&t, s), 25.0);
+    router.key(&t, &r, keys.SHIFT_L, keys.MOD_SHIFT, 1, 0, 0);
+    router.scroll(&t, &r, 50.0, 40.0, 0.0, 1.0, 1, 0);
+    near("shift: sideways", scroll.offset_x(&t, s), scroll.line(&t, s));
+    near("shift: not down", scroll.offset_y(&t, s), 25.0);
+    router.key(&t, &r, keys.SHIFT_L, 0, 0, 0, 0);
+    scroll.set_offset(&t, s, 0.0, 0.0);
+
+    // --- An inner area at its end hands the wheel to the outer one ---
+    let is i64 as outer = area(&t, root, 200.0, 0.0, 150.0, 150.0);
+    let is i64 as col = box.create(&t, outer, box.COLUMN);
+    leaf(&t, col, 150.0, 100.0);
+    let is i64 as inner = area(&t, col, 0.0, 0.0, 100.0, 80.0);
+    leaf(&t, inner, 100.0, 200.0);
+    leaf(&t, col, 150.0, 300.0);
+    layout.run(&t, 400.0, 300.0);
+    router.scroll(&t, &r, 250.0, 140.0, 0.0, 1.0, 1, 0);
+    near("nested: the inner one scrolls first", scroll.offset_y(&t, inner), scroll.line(&t, inner));
+    near("nested: the outer one stays", scroll.offset_y(&t, outer), 0.0);
+    scroll.set_offset(&t, inner, 0.0, 120.0);
+    router.scroll(&t, &r, 250.0, 140.0, 0.0, 1.0, 1, 0);
+    near("nested: the inner one is at its end", scroll.offset_y(&t, inner), 120.0);
+    near("nested: so the outer one scrolls", scroll.offset_y(&t, outer), scroll.line(&t, outer));
+    scroll.set_offset(&t, outer, 0.0, 0.0);
+    scroll.set_offset(&t, inner, 0.0, 0.0);
+
+    // --- Content smaller than the view fills it ---
+    let is i64 as small = area(&t, root, 0.0, 200.0, 100.0, 80.0);
+    let is i64 as tiny = leaf(&t, small, 50.0, 40.0);
+    layout.run(&t, 400.0, 300.0);
+    is_rect("small: content fills the view", layout.rect(&t, tiny), 0.0, 0.0, 100.0, 80.0);
+    check("small: no bars", scroll.bar_shown(&t, small, scroll.X) == 0 && scroll.bar_shown(&t, small, scroll.Y) == 0);
+    check("small: a bar not shown has no rectangle",
+          math.rect.rect_is_empty(scroll.bar_rect(&t, small, scroll.Y)) == 1
+          && math.rect.rect_is_empty(scroll.bar_rect(&t, small, scroll.X)) == 1);
+    check("small: so the edge is the content's", router.hit(&t, 95.0, 275.0) == tiny);
+    scroll.set_offset(&t, small, 10.0, 10.0);
+    near("small: nothing to scroll", scroll.offset_y(&t, small), 0.0);
+    tree.destroy(&t, small);
+
+    // --- An axis that does not scroll gives the content the view's size ---
+    let is i64 as wrapped = area(&t, root, 0.0, 200.0, 100.0, 80.0);
+    scroll.set_policy(&t, wrapped, scroll.NEVER, scroll.AUTO);
+    let is i64 as para = leaf(&t, wrapped, 300.0, 10.0);
+    leaf_data(&t, para).wrap = 1000.0;
+    layout.run(&t, 400.0, 300.0);
+    is_rect("never: width is the view's, height wraps to it", layout.rect(&t, para), 0.0, 0.0, 100.0, 100.0);
+    check("never: no horizontal bar", scroll.bar_shown(&t, wrapped, scroll.X) == 0);
+    check("never: a vertical one", scroll.bar_shown(&t, wrapped, scroll.Y) == 1);
+    tree.destroy(&t, wrapped);
+
+    // --- Classic bars take room; each can bring on the other ---
+    let is i64 as cl = area(&t, root, 0.0, 200.0, 100.0, 80.0);
+    scroll.set_bars(&t, cl, scroll.CLASSIC);
+    scroll.set_bar_size(&t, cl, 10.0);
+    let is i64 as cc = leaf(&t, cl, 85.0, 500.0);
+    layout.run(&t, 400.0, 300.0);
+    is_rect("classic, tall: the vertical bar takes its width", scroll.view_rect(&t, cl), 0.0, 0.0, 90.0, 80.0);
+    check("classic, tall: no horizontal bar", scroll.bar_shown(&t, cl, scroll.X) == 0);
+    is_rect("classic, tall: content fills the narrower view", layout.rect(&t, cc), 0.0, 0.0, 90.0, 500.0);
+    is_rect("classic: the vertical bar", scroll.bar_rect(&t, cl, scroll.Y), 90.0, 0.0, 10.0, 80.0);
+    leaf_data(&t, cc).w = 95.0;
+    layout.invalidate(&t, cc);
+    layout.run(&t, 400.0, 300.0);
+    check("classic: the vertical bar brought on the horizontal one", scroll.bar_shown(&t, cl, scroll.X) == 1);
+    is_rect("classic, both: the view", scroll.view_rect(&t, cl), 0.0, 0.0, 90.0, 70.0);
+    is_rect("classic, both: the vertical bar stops at the corner", scroll.bar_rect(&t, cl, scroll.Y), 90.0, 0.0, 10.0, 70.0);
+    is_rect("classic, both: the horizontal bar", scroll.bar_rect(&t, cl, scroll.X), 0.0, 70.0, 90.0, 10.0);
+    scroll.set_policy(&t, cl, scroll.ALWAYS, scroll.ALWAYS);
+    leaf_data(&t, cc).w = 10.0;
+    leaf_data(&t, cc).h = 10.0;
+    layout.invalidate(&t, cc);
+    layout.run(&t, 400.0, 300.0);
+    check("always: both bars with nothing to scroll",
+          scroll.bar_shown(&t, cl, scroll.X) == 1 && scroll.bar_shown(&t, cl, scroll.Y) == 1);
+    is_rect("always: the view", scroll.view_rect(&t, cl), 0.0, 0.0, 90.0, 70.0);
+    tree.destroy(&t, cl);
+    let is i64 as bare = scroll.create(&t, root);
+    scroll.set_bars(&t, bare, scroll.CLASSIC);
+    scroll.set_policy(&t, bare, scroll.ALWAYS, scroll.ALWAYS);
+    scroll.set_bar_size(&t, bare, 10.0);
+    leaf(&t, bare, 10.0, 10.0);
+    let is geom.Size as cs;
+    layout.measure(&t, bare, &unb, &cs);
+    near("always, classic: the bars are the minimum width", cs.min_w, 10.0);
+    near("always, classic: and height", cs.min_h, 10.0);
+    near("always, classic: and part of the preferred", cs.pref_w, 20.0);
+    tree.destroy(&t, bare);
+
+    // --- Thumbs: length from the share in view, position from the offset ---
+    scroll.set_bar_size(&t, s, 10.0);
+    layout.run(&t, 400.0, 300.0);
+    is_rect("overlay: the vertical bar stops at the corner", scroll.bar_rect(&t, s, scroll.Y), 90.0, 0.0, 10.0, 70.0);
+    let is math.rect.Rect as th0 = scroll.thumb_rect(&t, s, scroll.Y);
+    is_rect("thumb: at the top, at its shortest", th0, 90.0, 0.0, 10.0, scroll.min_thumb(&t, s));
+    scroll.set_offset(&t, s, 0.0, 420.0);
+    let is math.rect.Rect as th1 = scroll.thumb_rect(&t, s, scroll.Y);
+    near("thumb: at the end, against the corner", th1.y + th1.h, 70.0);
+    scroll.set_offset(&t, s, 0.0, 0.0);
+
+    // --- Overlay bars are above the content: a press there is the bar's ---
+    let is *Leaf as cd = leaf_data(&t, content);
+    cd.grab = 1;
+    press(&t, &r, 50.0, 40.0);
+    release(&t, &r, 50.0, 40.0);
+    check("a press on the content reaches it", cd.presses == 1);
+    press(&t, &r, 95.0, 60.0);
+    release(&t, &r, 95.0, 60.0);
+    check("a press on the bar does not", cd.presses == 1);
+    // That press was on the track below the thumb: a page down.
+    near("track: a page down", scroll.offset_y(&t, s), scroll.page(&t, s, scroll.Y));
+    scroll.set_offset(&t, s, 0.0, 420.0);
+    press(&t, &r, 95.0, 10.0);
+    release(&t, &r, 95.0, 10.0);
+    near("track: above the thumb, a page up", scroll.offset_y(&t, s), 420.0 - scroll.page(&t, s, scroll.Y));
+    scroll.set_offset(&t, s, 0.0, 0.0);
+
+    // --- Dragging the thumb: track pixels to content pixels ---
+    press(&t, &r, 95.0, 10.0);
+    check("thumb: the press captures", router.capture(&r) == s);
+    router.pointer_move(&t, &r, 95.0, 35.0, 0);
+    // 25 pixels of a 70 - 20 track over 500 - 80 of content.
+    near("thumb: dragged", scroll.offset_y(&t, s), 25.0 * 420.0 / 50.0);
+    router.pointer_move(&t, &r, 95.0, 400.0, 0);
+    near("thumb: dragged past the end stops at it", scroll.offset_y(&t, s), 420.0);
+    release(&t, &r, 95.0, 400.0);
+    router.pointer_move(&t, &r, 95.0, 10.0, 0);
+    near("thumb: released, the pointer no longer drags", scroll.offset_y(&t, s), 420.0);
+    scroll.set_offset(&t, s, 0.0, 0.0);
+
+    // --- Keys nobody below wanted scroll the area ---
+    tree.destroy(&t, content);
+    let is i64 as page = leaf(&t, s, 300.0, 500.0);
+    let is i64 as first = at(&t, page, 10.0, 10.0, 20.0, 20.0);
+    let is i64 as deep = at(&t, page, 10.0, 300.0, 20.0, 20.0);
+    tree.set_focusable(&t, first, 1);
+    tree.set_focusable(&t, deep, 1);
+    layout.run(&t, 400.0, 300.0);
+    router.focus(&t, &r, first, 0);
+    router.key(&t, &r, keys.PAGE_DOWN, 0, 1, 0, 0);
+    near("page down", scroll.offset_y(&t, s), scroll.page(&t, s, scroll.Y));
+    router.key(&t, &r, keys.END, 0, 1, 0, 0);
+    near("end", scroll.offset_y(&t, s), 420.0);
+    router.key(&t, &r, keys.HOME, 0, 1, 0, 0);
+    near("home", scroll.offset_y(&t, s), 0.0);
+    router.key(&t, &r, keys.DOWN, 0, 1, 0, 0);
+    near("down: a line", scroll.offset_y(&t, s), scroll.line(&t, s));
+    router.key(&t, &r, keys.RIGHT, 0, 1, 0, 0);
+    near("right: a line", scroll.offset_x(&t, s), scroll.line(&t, s));
+    scroll.set_offset(&t, s, 0.0, 0.0);
+    router.key(&t, &r, keys.PAGE_DOWN, keys.MOD_CONTROL, 1, 0, 0);
+    near("ctrl+page down: not the area's", scroll.offset_y(&t, s), 0.0);
+    router.key(&t, &r, keys.PAGE_DOWN, keys.MOD_LOCK, 1, 0, 0);
+    near("caps lock does not count", scroll.offset_y(&t, s), scroll.page(&t, s, scroll.Y));
+    scroll.set_offset(&t, s, 0.0, 0.0);
+
+    // Content that shrinks under the offset pulls it back.
+    scroll.set_offset(&t, s, 0.0, 420.0);
+    leaf_data(&t, page).h = 300.0;
+    layout.invalidate(&t, page);
+    layout.run(&t, 400.0, 300.0);
+    near("shrunk: the offset follows the end", scroll.offset_y(&t, s), 220.0);
+    leaf_data(&t, page).h = 500.0;
+    layout.invalidate(&t, page);
+    layout.run(&t, 400.0, 300.0);
+    scroll.set_offset(&t, s, 0.0, 0.0);
+
+    // --- Focus by keyboard brings the widget into view, no further ---
+    router.focus(&t, &r, deep, 1);
+    near("revealed: just enough to show it", scroll.offset_y(&t, s), 320.0 - 80.0);
+    router.focus(&t, &r, first, 1);
+    near("revealed upwards: its top at the top", scroll.offset_y(&t, s), 10.0);
+    scroll.set_offset(&t, s, 0.0, 0.0);
+    router.focus(&t, &r, deep, 0);
+    near("focus by pointer: no scrolling", scroll.offset_y(&t, s), 0.0);
+    router.focus(&t, &r, 0, 0);
+    // Taller than the view: its start is what shows.
+    let is math.rect.Rect as tall = math.rect.rect(10.0, 200.0, 20.0, 150.0);
+    router.reveal_rect(&t, deep, &tall);
+    near("taller than the view: its top at the top", scroll.offset_y(&t, s), 200.0);
+    scroll.set_offset(&t, s, 0.0, 0.0);
+
+    // Through two areas: each brings it as far as its own view.
+    let is i64 as ip = leaf(&t, inner, 100.0, 10.0);
+    tree.destroy(&t, scroll.content(&t, inner));
+    let is i64 as ipage = scroll.content(&t, inner);
+    check("the inner area's content", ipage == ip);
+    leaf_data(&t, ip).h = 200.0;
+    let is i64 as target = at(&t, ip, 10.0, 150.0, 20.0, 20.0);
+    tree.set_focusable(&t, target, 1);
+    layout.run(&t, 400.0, 300.0);
+    router.focus(&t, &r, target, 1);
+    let is math.rect.Rect as tw = layout.window_rect(&t, target);
+    let is math.rect.Rect as iw = layout.window_rect(&t, inner);
+    let is math.rect.Rect as ow = layout.window_rect(&t, outer);
+    check("two areas: inside the inner view", math.rect.rect_contains_rect(iw, tw));
+    check("two areas: inside the outer view", math.rect.rect_contains_rect(ow, tw));
+    near("two areas: the inner one just enough", scroll.offset_y(&t, inner), 170.0 - 80.0);
+    near("two areas: the outer one just enough", scroll.offset_y(&t, outer), 30.0);
+    router.focus(&t, &r, 0, 0);
+
+    // --- Right to left: offset 0 shows the right end; the bar is on the left ---
+    let is i64 as rtl = area(&t, root, 0.0, 200.0, 100.0, 80.0);
+    layout.set_direction(&t, rtl, layout.RTL);
+    scroll.set_bar_size(&t, rtl, 10.0);
+    let is i64 as rc = leaf(&t, rtl, 300.0, 500.0);
+    layout.run(&t, 400.0, 300.0);
+    near("rtl: the right end in view", layout.rect(&t, rc).x, 0.0 - 200.0);
+    scroll.set_offset(&t, rtl, 50.0, 0.0);
+    near("rtl: scrolled toward the start", layout.rect(&t, rc).x, 0.0 - 150.0);
+    near("rtl: the vertical bar on the left", scroll.bar_rect(&t, rtl, scroll.Y).x, 0.0);
+    let is i64 as rkid = at(&t, rc, 250.0, 10.0, 20.0, 20.0);
+    tree.set_focusable(&t, rkid, 1);
+    layout.run(&t, 400.0, 300.0);
+    scroll.set_offset(&t, rtl, 0.0, 0.0);
+    router.focus(&t, &r, rkid, 0);
+    router.key(&t, &r, keys.LEFT, 0, 1, 0, 0);
+    near("rtl: left goes towards the end", scroll.offset_x(&t, rtl), scroll.line(&t, rtl));
+    router.key(&t, &r, keys.RIGHT, 0, 1, 0, 0);
+    near("rtl: right comes back", scroll.offset_x(&t, rtl), 0.0);
+    router.focus(&t, &r, 0, 0);
+    tree.destroy(&t, rtl);
+
+    // --- Offsets on physical pixels ---
+    layout.set_scale(&t, 1.5);
+    layout.run(&t, 400.0, 300.0);
+    scroll.set_offset(&t, s, 10.1, 0.0);
+    let is f64 as phys = scroll.offset_x(&t, s) * 1.5;
+    check("scale: the offset is whole physical pixels", phys == fm.floor(phys));
+    layout.set_scale(&t, 1.0);
+    scroll.set_offset(&t, s, 0.0, 0.0);
+    layout.run(&t, 400.0, 300.0);
+
+    // --- Scrolling repaints the view, not the content's whole extent ---
+    damage.collect(&t);
+    tree.damage_clear(&t);
+    scroll.set_offset(&t, s, 0.0, 100.0);
+    damage.collect(&t);
+    check("scrolled: something to repaint", tree.damage_count(&t) > 0);
+    check("scrolled: no more than the view",
+          math.rect.rect_contains_rect(layout.window_rect(&t, s), damage.bounds(&t)));
+    tree.damage_clear(&t);
+
+    tree.close(&t);
+    if (fails > 0) {
+        io.printf("scroll: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("scroll: all checks passed\n");
+    return 0;
+}

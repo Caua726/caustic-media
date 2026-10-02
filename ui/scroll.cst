@@ -1,0 +1,578 @@
+// ui/scroll.cst — a viewport onto content larger than it.
+//
+// A scroll area shows part of its first child, the content. Along an axis
+// that scrolls, the content is measured without a limit and keeps the size it
+// asks for — at least the view's, so content smaller than the view fills it.
+// Along an axis that does not, the content gets the view's size, which is what
+// lets a column of wrapped text grow downwards to the width it is given.
+//
+// The offset says how far the content is scrolled: 0 shows its start, which is
+// the top, and the left — or the right, when the area is right to left. It is
+// clamped to the content and lands on whole physical pixels, and changing it
+// moves the content without laying anything out: rectangles are relative to
+// the parent, so moving one moves everything in it. Each change emits
+// VALUE_CHANGED, for whatever follows it — a header above a table.
+//
+// Bars. Per axis, a policy — NEVER, AUTO (when the content is larger) or
+// ALWAYS — and for the area, a style: OVERLAY bars sit over the edge of the
+// content and take no room, as GTK 4, macOS and Windows 11 draw them; CLASSIC
+// bars take room beside it, and showing one can narrow the view enough to
+// bring on the other. Either way a bar is the area's own: its kind claims the
+// points on a bar (the tree's hit entry), so a press there never reaches the
+// content beneath. The bars' and thumbs' rectangles are here for the painter.
+//
+// Input, all of it bubbling up from whatever is under the pointer or focused:
+// the wheel scrolls a line per notch (Shift turns it sideways) and a touchpad
+// by its pixels, and an area already at its end leaves the rest to an outer
+// one. A press on a thumb drags it; on the track, pages towards the press.
+// Keys nobody below wanted — the arrows, Page Up and Down, Home and End —
+// scroll. REVEAL, which the router sends when focus moves by keyboard, scrolls
+// just far enough to show the rectangle it names.
+//
+// After the content moves under a pointer that did not, the window calls
+// router.refresh_hover; this has no router to call it with.
+use "std/math.cst" as fm;
+use "../math/math.cst" as math;
+use "../window/keys.cst" as keys;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "event.cst" as event;
+use "signal.cst" as signal;
+
+// Axes.
+let is i32 as X with imut = 0;
+let is i32 as Y with imut = 1;
+
+// Policies, per axis.
+let is i32 as NEVER  with imut = 0;   // the content gets the view's size
+let is i32 as AUTO   with imut = 1;   // scrolls, with a bar, when the content is larger
+let is i32 as ALWAYS with imut = 2;   // scrolls, and the bar is always there
+
+// Bar styles.
+let is i32 as OVERLAY with imut = 0;
+let is i32 as CLASSIC with imut = 1;
+
+struct Data {
+    policy_x  as i32;
+    policy_y  as i32;
+    bars      as i32;
+    drag      as i32;   // the axis whose thumb is held, -1 for none
+    show_x    as i32;
+    show_y    as i32;
+    bar       as f64;   // a bar's thickness
+    min_thumb as f64;   // the shortest a thumb gets
+    line      as f64;   // one notch of the wheel, one arrow key
+    ox        as f64;   // the offset
+    oy        as f64;
+    content_w as f64;   // as last arranged
+    content_h as f64;
+    view_x    as f64;   // the view within the area: classic bars take room
+    view_w    as f64;
+    view_h    as f64;
+    drag_from as f64;   // where the held thumb was pressed, along its axis
+    drag_off  as f64;   // the offset then
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("scroll", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.event = fn_ptr(_event);
+    _kind.hit = fn_ptr(_hit);
+    _ready = 1;
+}
+
+// A new scroll area as the last child of parent; its first child is the
+// content. Returns its handle, or 0 with the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.policy_x = AUTO;
+    d.policy_y = AUTO;
+    d.bars = OVERLAY;
+    d.drag = cast(i32, 0 - 1);
+    d.bar = 10.0;
+    d.min_thumb = 20.0;
+    d.line = 40.0;
+    return w;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn _null(d as *Data) as i32 {
+    if (cast(i64, d) == 0) { return 1; }
+    return 0;
+}
+
+// The content: the first child, 0 for none.
+fn content(t as *tree.Tree, w as i64) as i64 { return tree.first_child(t, w); }
+
+// --- Settings ---
+
+fn set_policy(t as *tree.Tree, w as i64, horizontal as i32, vertical as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return; }
+    d.policy_x = horizontal;
+    d.policy_y = vertical;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn set_bars(t as *tree.Tree, w as i64, style as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return; }
+    d.bars = style;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn set_bar_size(t as *tree.Tree, w as i64, thickness as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || thickness < 0.0) { return; }
+    d.bar = thickness;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn set_min_thumb(t as *tree.Tree, w as i64, length as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || length < 0.0) { return; }
+    d.min_thumb = length;
+    tree.invalidate_paint(t, w);
+}
+
+// How far a notch of the wheel and an arrow key go — the window sets it from
+// the system's lines per notch.
+fn set_line(t as *tree.Tree, w as i64, step as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || step <= 0.0) { return; }
+    d.line = step;
+}
+
+fn line(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0.0; }
+    return d.line;
+}
+
+fn min_thumb(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0.0; }
+    return d.min_thumb;
+}
+
+// A page: most of the view, so a line of context stays in sight.
+fn page(t as *tree.Tree, w as i64, axis as i32) as f64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0.0; }
+    if (axis == X) { return d.view_w * 0.9; }
+    return d.view_h * 0.9;
+}
+
+// --- Measuring and arranging ---
+
+fn _scrolls(policy as i32) as i32 {
+    if (policy == NEVER) { return 0; }
+    return 1;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    geom.size_zero(out);
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+    // Classic bars that are always there are part of every size.
+    let is f64 as bar_w with mut = 0.0;
+    let is f64 as bar_h with mut = 0.0;
+    if (d.bars == CLASSIC && d.policy_y == ALWAYS) { bar_w = d.bar; }
+    if (d.bars == CLASSIC && d.policy_x == ALWAYS) { bar_h = d.bar; }
+    let is i64 as ch = content(t, w);
+    if (ch != 0) {
+        let is f64 as cw with mut = layout.UNBOUNDED;
+        let is f64 as chh with mut = layout.UNBOUNDED;
+        if (_scrolls(d.policy_x) == 0 && c.w < layout.UNBOUNDED) { cw = _max(0.0, c.w - bar_w); }
+        if (_scrolls(d.policy_y) == 0 && c.h < layout.UNBOUNDED) { chh = _max(0.0, c.h - bar_h); }
+        let is geom.Constraint as cc = geom.constraint(cw, chh);
+        let is geom.Size as s;
+        layout.measure(t, ch, &cc, &s);
+        out.pref_w = s.pref_w;
+        out.pref_h = s.pref_h;
+        // A scrolling axis can shrink to nothing; one that does not needs the
+        // content's minimum.
+        if (_scrolls(d.policy_x) == 0) { out.min_w = s.min_w; }
+        if (_scrolls(d.policy_y) == 0) { out.min_h = s.min_h; }
+    }
+    out.min_w = out.min_w + bar_w;
+    out.min_h = out.min_h + bar_h;
+    out.pref_w = out.pref_w + bar_w;
+    out.pref_h = out.pref_h + bar_h;
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _rtl(t as *tree.Tree, w as i64) as i32 {
+    if (layout.direction(t, w) == layout.RTL) { return 1; }
+    return 0;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as classic with mut = 0;
+    if (d.bars == CLASSIC) { classic = 1; }
+    let is i32 as sx with mut = 0;
+    let is i32 as sy with mut = 0;
+    if (d.policy_x == ALWAYS) { sx = 1; }
+    if (d.policy_y == ALWAYS) { sy = 1; }
+    let is i64 as ch = content(t, w);
+    let is f64 as vw with mut = r.w;
+    let is f64 as vh with mut = r.h;
+    let is f64 as cw with mut = r.w;
+    let is f64 as chh with mut = r.h;
+    // A classic bar narrows the view, which can make the content overflow the
+    // other way: settle it in at most three rounds — a bar, once needed, stays.
+    let is i32 as round with mut = 0;
+    while (round < 3) {
+        vw = r.w;
+        vh = r.h;
+        if (classic == 1 && sy == 1) { vw = _max(0.0, vw - d.bar); }
+        if (classic == 1 && sx == 1) { vh = _max(0.0, vh - d.bar); }
+        cw = vw;
+        chh = vh;
+        if (ch != 0) {
+            // Width first, then height at that width: wrapped text is taller
+            // the narrower it is.
+            let is f64 as room_h with mut = vh;
+            if (_scrolls(d.policy_y) == 1) { room_h = layout.UNBOUNDED; }
+            if (_scrolls(d.policy_x) == 1) {
+                let is geom.Constraint as c1 = geom.constraint(layout.UNBOUNDED, room_h);
+                let is geom.Size as s1;
+                layout.measure(t, ch, &c1, &s1);
+                cw = _max(vw, s1.pref_w);
+            }
+            if (_scrolls(d.policy_y) == 1) {
+                let is geom.Constraint as c2 = geom.constraint(cw, layout.UNBOUNDED);
+                let is geom.Size as s2;
+                layout.measure(t, ch, &c2, &s2);
+                chh = _max(vh, s2.pref_h);
+            }
+        }
+        let is i32 as nx with mut = sx;
+        let is i32 as ny with mut = sy;
+        if (d.policy_x == AUTO && cw > vw) { nx = 1; }
+        if (d.policy_y == AUTO && chh > vh) { ny = 1; }
+        if (nx == sx && ny == sy) { round = 3; }
+        sx = nx;
+        sy = ny;
+        round = round + 1;
+    }
+    d.show_x = sx;
+    d.show_y = sy;
+    d.view_x = 0.0;
+    if (classic == 1 && sy == 1 && _rtl(t, w) == 1) { d.view_x = d.bar; }
+    d.view_w = vw;
+    d.view_h = vh;
+    d.content_w = cw;
+    d.content_h = chh;
+    d.ox = _clamp_off(d.ox, cw - vw);
+    d.oy = _clamp_off(d.oy, chh - vh);
+    _place(t, w, d);
+}
+
+fn _clamp_off(v as f64, range as f64) as f64 {
+    let is f64 as hi = _max(0.0, range);
+    if (v < 0.0) { return 0.0; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// The content where the offset puts it. In right to left the start is the
+// right end, so offset 0 shows that.
+fn _place(t as *tree.Tree, w as i64, d as *Data) as void {
+    let is i64 as ch = content(t, w);
+    if (ch == 0) { return; }
+    let is f64 as x with mut = d.view_x - d.ox;
+    if (_rtl(t, w) == 1) { x = d.view_x + d.view_w - d.content_w + d.ox; }
+    let is math.rect.Rect as a = math.rect.rect(x, 0.0 - d.oy, d.content_w, d.content_h);
+    layout.place(t, ch, &a);
+}
+
+// --- The offset ---
+
+fn offset_x(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0.0; }
+    return d.ox;
+}
+
+fn offset_y(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0.0; }
+    return d.oy;
+}
+
+fn _snap(t as *tree.Tree, v as f64) as f64 {
+    let is f64 as s = layout.scale(t);
+    return fm.floor(v * s + 0.5) / s;
+}
+
+// Scrolls to x, y — clamped to the content, on whole physical pixels. Returns
+// 1 if the offset changed.
+fn set_offset(t as *tree.Tree, w as i64, x as f64, y as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0; }
+    let is f64 as nx = _clamp_off(_snap(t, x), d.content_w - d.view_w);
+    let is f64 as ny = _clamp_off(_snap(t, y), d.content_h - d.view_h);
+    if (nx == d.ox && ny == d.oy) { return 0; }
+    d.ox = nx;
+    d.oy = ny;
+    _place(t, w, d);
+    tree.want_paint(t);
+    signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, 0));
+    return 1;
+}
+
+fn scroll_by(t as *tree.Tree, w as i64, dx as f64, dy as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0; }
+    return set_offset(t, w, d.ox + dx, d.oy + dy);
+}
+
+// --- Bars and thumbs, in the area's coordinates ---
+
+fn bar_shown(t as *tree.Tree, w as i64, axis as i32) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0; }
+    if (axis == X) { return d.show_x; }
+    return d.show_y;
+}
+
+// The view: all of the area, less what classic bars take.
+fn view_rect(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return math.rect.rect_zero(); }
+    return math.rect.rect(d.view_x, 0.0, d.view_w, d.view_h);
+}
+
+// A bar runs along the far edge — the left one for a vertical bar in right to
+// left — and stops short of the corner when both are shown. Empty when it is
+// not shown.
+fn bar_rect(t as *tree.Tree, w as i64, axis as i32) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return math.rect.rect_zero(); }
+    let is math.rect.Rect as r = layout.rect(t, w);
+    let is i32 as rtl = _rtl(t, w);
+    if (axis == Y) {
+        if (d.show_y == 0) { return math.rect.rect_zero(); }
+        let is f64 as x with mut = r.w - d.bar;
+        if (rtl == 1) { x = 0.0; }
+        let is f64 as h with mut = r.h;
+        if (d.show_x == 1) { h = r.h - d.bar; }
+        return math.rect.rect(x, 0.0, d.bar, _max(0.0, h));
+    }
+    if (d.show_x == 0) { return math.rect.rect_zero(); }
+    let is f64 as x0 with mut = 0.0;
+    let is f64 as len with mut = r.w;
+    if (d.show_y == 1) {
+        len = r.w - d.bar;
+        if (rtl == 1) { x0 = d.bar; }
+    }
+    return math.rect.rect(x0, r.h - d.bar, _max(0.0, len), d.bar);
+}
+
+// The thumb's length along the track is the share of the content in view, no
+// shorter than min_thumb; its position, how far the offset has gone.
+fn _thumb(d as *Data, axis as i32, track as f64, rtl as i32, len as *f64, pos as *f64) as void {
+    let is f64 as view with mut = d.view_h;
+    let is f64 as all with mut = d.content_h;
+    let is f64 as off with mut = d.oy;
+    if (axis == X) {
+        view = d.view_w;
+        all = d.content_w;
+        off = d.ox;
+    }
+    let is f64 as l with mut = track;
+    if (all > 0.0) { l = track * view / all; }
+    if (l < d.min_thumb) { l = d.min_thumb; }
+    if (l > track) { l = track; }
+    let is f64 as p with mut = 0.0;
+    if (all - view > 0.0) { p = (track - l) * off / (all - view); }
+    // Right to left, a horizontal offset of 0 is the right end.
+    if (axis == X && rtl == 1) { p = track - l - p; }
+    *len = l;
+    *pos = p;
+}
+
+fn thumb_rect(t as *tree.Tree, w as i64, axis as i32) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return math.rect.rect_zero(); }
+    let is math.rect.Rect as b = bar_rect(t, w, axis);
+    if (math.rect.rect_is_empty(b) == 1) { return b; }
+    let is f64 as len with mut = 0.0;
+    let is f64 as pos with mut = 0.0;
+    if (axis == Y) {
+        _thumb(d, Y, b.h, 0, &len, &pos);
+        return math.rect.rect(b.x, b.y + pos, b.w, len);
+    }
+    _thumb(d, X, b.w, _rtl(t, w), &len, &pos);
+    return math.rect.rect(b.x + pos, b.y, len, b.h);
+}
+
+// --- Input ---
+
+fn _in(r as math.rect.Rect, x as f64, y as f64) as i32 {
+    if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) { return 1; }
+    return 0;
+}
+
+// Points on a shown bar are the area's own.
+fn _hit(t as *tree.Tree, w as i64, data as *u8, p as *math.vec.Vec2) as i32 {
+    if (_in(bar_rect(t, w, Y), p.x, p.y) == 1) { return 1; }
+    if (_in(bar_rect(t, w, X), p.x, p.y) == 1) { return 1; }
+    return 0;
+}
+
+// A horizontal amount as an offset change: right to left, the offset grows
+// towards the left.
+fn _hdelta(t as *tree.Tree, w as i64, dx as f64) as f64 {
+    if (_rtl(t, w) == 1) { return 0.0 - dx; }
+    return dx;
+}
+
+fn _wheel(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    let is f64 as dx with mut = e.dx;
+    let is f64 as dy with mut = e.dy;
+    if (e.discrete == 1) {
+        dx = dx * d.line;
+        dy = dy * d.line;
+        if ((e.mods & keys.MOD_SHIFT) != 0 && dx == 0.0) {
+            dx = dy;
+            dy = 0.0;
+        }
+    }
+    // An axis that does not scroll has nothing beyond the view, so the clamp
+    // keeps it at 0 and the wheel passes on to an outer area.
+    return cast(i64, scroll_by(t, w, _hdelta(t, w, dx), dy));
+}
+
+fn _press(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    if (e.button != 1) { return 0; }
+    let is i32 as axis with mut = Y;
+    while (axis >= X) {
+        let is math.rect.Rect as b = bar_rect(t, w, axis);
+        if (_in(b, e.local_x, e.local_y) == 1) {
+            let is math.rect.Rect as th = thumb_rect(t, w, axis);
+            if (_in(th, e.local_x, e.local_y) == 1) {
+                d.drag = axis;
+                d.drag_from = e.y;
+                d.drag_off = d.oy;
+                if (axis == X) {
+                    d.drag_from = e.x;
+                    d.drag_off = d.ox;
+                }
+                return 1;
+            }
+            // On the track: a page towards the press.
+            let is f64 as step with mut = page(t, w, axis);
+            if (axis == Y) {
+                if (e.local_y < th.y) { step = 0.0 - step; }
+                scroll_by(t, w, 0.0, step);
+            } else {
+                if (e.local_x < th.x) { step = 0.0 - step; }
+                scroll_by(t, w, _hdelta(t, w, step), 0.0);
+            }
+            return 1;
+        }
+        axis = axis - 1;
+    }
+    return 0;
+}
+
+// The held thumb follows the pointer: a pixel of track is as many pixels of
+// content as the content has beyond the view, over the track the thumb can
+// travel.
+fn _drag(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    let is math.rect.Rect as b = bar_rect(t, w, d.drag);
+    let is f64 as len with mut = 0.0;
+    let is f64 as pos with mut = 0.0;
+    if (d.drag == Y) {
+        _thumb(d, Y, b.h, 0, &len, &pos);
+        let is f64 as travel = b.h - len;
+        if (travel <= 0.0) { return 1; }
+        set_offset(t, w, d.ox, d.drag_off + (e.y - d.drag_from) * (d.content_h - d.view_h) / travel);
+        return 1;
+    }
+    _thumb(d, X, b.w, 0, &len, &pos);
+    let is f64 as travel = b.w - len;
+    if (travel <= 0.0) { return 1; }
+    let is f64 as moved = (e.x - d.drag_from) * (d.content_w - d.view_w) / travel;
+    set_offset(t, w, d.drag_off + _hdelta(t, w, moved), d.oy);
+    return 1;
+}
+
+fn _key(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    let is i32 as plain = (e.mods | keys.MOD_LOCK) - keys.MOD_LOCK;
+    if (plain != 0) { return 0; }
+    // A key that moves nothing — at the end already, or on an axis that does
+    // not scroll — is left for an outer area.
+    let is i32 as k = e.key;
+    if (k == keys.PAGE_DOWN) { return cast(i64, scroll_by(t, w, 0.0, page(t, w, Y))); }
+    if (k == keys.PAGE_UP) { return cast(i64, scroll_by(t, w, 0.0, 0.0 - page(t, w, Y))); }
+    if (k == keys.DOWN) { return cast(i64, scroll_by(t, w, 0.0, d.line)); }
+    if (k == keys.UP) { return cast(i64, scroll_by(t, w, 0.0, 0.0 - d.line)); }
+    if (k == keys.HOME) { return cast(i64, set_offset(t, w, d.ox, 0.0)); }
+    if (k == keys.END) { return cast(i64, set_offset(t, w, d.ox, d.content_h)); }
+    if (k == keys.RIGHT) { return cast(i64, scroll_by(t, w, _hdelta(t, w, d.line), 0.0)); }
+    if (k == keys.LEFT) { return cast(i64, scroll_by(t, w, _hdelta(t, w, 0.0 - d.line), 0.0)); }
+    return 0;
+}
+
+// Scrolls just enough to show the rectangle — its start, if it is larger than
+// the view — and moves the rectangle in the event to where it now is, for the
+// areas further up. Never handled, so every one of them hears it.
+fn _reveal(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    let is f64 as vx = wr.x + d.view_x;
+    let is f64 as vy = wr.y;
+    let is f64 as dy with mut = 0.0;
+    if (e.y < vy) {
+        dy = e.y - vy;
+    } else if (e.y + e.height > vy + d.view_h) {
+        dy = _min(e.y + e.height - (vy + d.view_h), e.y - vy);
+    }
+    let is f64 as dx with mut = 0.0;
+    if (e.x < vx) {
+        dx = e.x - vx;
+    } else if (e.x + e.width > vx + d.view_w) {
+        dx = _min(e.x + e.width - (vx + d.view_w), e.x - vx);
+    }
+    let is i64 as ch = content(t, w);
+    let is math.rect.Rect as before = layout.rect(t, ch);
+    scroll_by(t, w, _hdelta(t, w, dx), dy);
+    let is math.rect.Rect as after = layout.rect(t, ch);
+    e.x = e.x + after.x - before.x;
+    e.y = e.y + after.y - before.y;
+    return 0;
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind == event.SCROLL) { return _wheel(t, w, d, e); }
+    if (e.kind == event.POINTER_DOWN) { return _press(t, w, d, e); }
+    if (e.kind == event.POINTER_MOVE && d.drag >= 0) { return _drag(t, w, d, e); }
+    if (e.kind == event.POINTER_UP && d.drag >= 0) {
+        d.drag = cast(i32, 0 - 1);
+        return 1;
+    }
+    if (e.kind == event.KEY_DOWN) { return _key(t, w, d, e); }
+    if (e.kind == event.REVEAL) { return _reveal(t, w, d, e); }
+    return 0;
+}

@@ -15,6 +15,8 @@ ui/
   box.cst         rows and columns
   grid.cst        rows and columns at once
   stack.cst       one page at a time; children layered on each other
+  scroll.cst      a viewport onto content larger than it
+  splitter.cst    panes divided by handles the user drags
   event.cst       what a widget receives
   router.cst      where events go: hit-testing, capture, bubbling, hover,
                   focus, shortcuts, mnemonics, the modal scope
@@ -170,8 +172,9 @@ The containers are **box** (a row or column, with spacing and stretch factors),
 **grid** (forms), **stack** (one visible child: tabs, wizards), **overlay**
 (children layered, each aligned on its own), **scroll area** and **splitter**.
 That set covers what GTK's and Qt's layouts are used for in practice. The last
-two are interactive — scrollbars, a draggable handle — so they arrive with the
-widgets, on the same protocol.
+two are interactive — scrollbars, a draggable handle — and take their input on
+the same protocol as any widget; what they look like comes with painting and
+the theme.
 
 **Height for width.** Wrapped text is taller the narrower it is, so a widget's
 height is measured again at the width it is actually given, and a row or grid
@@ -335,6 +338,22 @@ scale, and every rectangle's edges — not its size — are rounded to that grid
 relative to a parent already on it, so 100 split three ways at scale 1 is 33,
 34 and 33 edge to edge, and at 1.5 is 50 physical pixels each (`snap_test`). The tests were checked against deliberate breakages — each rule
 removed in turn — and catch every one.
+
+**Scroll areas** (`scroll.cst`, tested by `scroll_test`): content measured
+without a limit along an axis that scrolls and given the view's size along one
+that does not; offsets clamped and on physical pixels, moving the content
+without a layout pass and emitting `VALUE_CHANGED`; bars per axis NEVER, AUTO or
+ALWAYS, overlay or classic — classic ones taking room, and settling which are
+needed when one narrows the view for the other; thumbs sized by the share in
+view. The wheel scrolls by lines and a touchpad by pixels, Shift turns it
+sideways, and an area at its end hands the rest to an outer one; a press on a
+thumb drags it, on the track pages; unwanted keys scroll; right to left starts
+at the right with the bar on the left. Two things it needed from below arrived
+with it: a kind can claim points before its children (the `hit` entry, so a
+press on an overlay bar is the bar's), and `router.reveal` asks every ancestor
+to bring a rectangle into view — sent when focus moves by keyboard. Damage is
+clipped to the ancestors, so scrolling repaints the view, not the content's
+whole extent.
 
 **Events** (`event.cst`, `router.cst`, `timer.cst`, tested by `router_test`,
 `focus_test`, `shortcut_test` and `timer_test` with synthetic events): hit-testing
