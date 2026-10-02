@@ -35,6 +35,8 @@ use "../gpu/command.cst" as command;
 let is i32 as KIND_COLOR with imut = 0;   // vertex colour
 let is i32 as KIND_IMAGE with imut = 1;   // texture times vertex colour
 let is i32 as KIND_GLYPH with imut = 2;   // coverage texture scaling vertex alpha
+let is i32 as KIND_IMAGE_PREMUL with imut = 3;   // a texture whose colours carry their alpha
+let is i64 as KINDS with imut = 4;
 
 let is i64 as MAX_CLIP_DEPTH with imut = 32;
 
@@ -88,13 +90,15 @@ struct Canvas {
     bcap        as i64;
     bcount      as i64;
     vbuf        as i64;
-    shaders     as [3]i64;
-    pipes       as [3]i64;
+    shaders     as [4]i64;
+    pipes       as [4]i64;
     linear      as i64;      // samplers
     nearest     as i64;
     width       as f64;      // the target, physical pixels
     height      as f64;
     scale       as f64;      // logical to physical
+    origin_x    as f64;      // logical; see set_origin
+    origin_y    as f64;
     layer       as i64;
     clips       as [32]Clip;
     clip_n      as i64;
@@ -125,6 +129,8 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
     c.block_bytes = 0;
     c.vbuf = 0;
     c.scale = 1.0;
+    c.origin_x = 0.0;
+    c.origin_y = 0.0;
     c.layer = 0;
     c.clip_n = 0;
     if (c.vcap < 3 || c.bcap < 1) { return c; }
@@ -140,15 +146,17 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
     c.shaders[0] = shader.builtin(d, shader.UNLIT_COLOR);
     c.shaders[1] = shader.builtin(d, shader.TEXTURED);
     c.shaders[2] = shader.builtin(d, shader.COVERAGE);
+    c.shaders[3] = shader.builtin(d, shader.TEXTURED);
     let is i64 as k with mut = 0;
-    while (k < 3) {
-        let is pipeline.Desc as pd = pipeline.desc_blended(c.shaders[k], pipeline.layout_pos_color_uv());
+    while (k < KINDS) {
+        let is pipeline.Desc as pd with mut = pipeline.desc_blended(c.shaders[k], pipeline.layout_pos_color_uv());
+        if (k == KIND_IMAGE_PREMUL) { pd.blend = pipeline.BLEND_PREMULTIPLIED; }
         c.pipes[k] = pipeline.create(d, &pd);
         k = k + 1;
     }
     c.linear = texture.sampler(d, texture.LINEAR, texture.CLAMP);
     c.nearest = texture.sampler(d, texture.NEAREST, texture.CLAMP);
-    if (c.vbuf == 0 || c.pipes[0] == 0 || c.pipes[1] == 0 || c.pipes[2] == 0
+    if (c.vbuf == 0 || c.pipes[0] == 0 || c.pipes[1] == 0 || c.pipes[2] == 0 || c.pipes[3] == 0
         || c.linear == 0 || c.nearest == 0) {
         close(&c);
         return c;
@@ -159,7 +167,7 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
 
 fn close(c as *Canvas) as void {
     let is i64 as k with mut = 0;
-    while (k < 3) {
+    while (k < KINDS) {
         if (c.pipes[k] != 0) { pipeline.destroy(c.d, c.pipes[k]); }
         if (c.shaders[k] != 0) { shader.destroy(c.d, c.shaders[k]); }
         c.pipes[k] = 0;
@@ -190,6 +198,8 @@ fn begin(c as *Canvas, width as f64, height as f64, scale as f64) as void {
     c.height = height;
     c.scale = scale;
     if (c.scale <= 0.0) { c.scale = 1.0; }
+    c.origin_x = 0.0;
+    c.origin_y = 0.0;
     c.layer = 0;
     c.clip_n = 0;
     c.overflowed = 0;
@@ -198,6 +208,15 @@ fn begin(c as *Canvas, width as f64, height as f64, scale as f64) as void {
 // One physical pixel in logical units: the width of an anti-aliasing fringe.
 fn pixel(c as *Canvas) as f64 { return 1.0 / c.scale; }
 fn scale(c as *Canvas) as f64 { return c.scale; }
+
+// What is drawn at x, y (logical) lands at the target's top-left corner, and
+// everything else as far from it — for painting part of a window into a
+// texture of its own, at the coordinates it would have had in the window.
+// Clips pushed afterwards are in the same coordinates. begin resets it to 0, 0.
+fn set_origin(c as *Canvas, x as f64, y as f64) as void {
+    c.origin_x = x;
+    c.origin_y = y;
+}
 
 // Later layers draw over earlier ones, whatever order things are drawn in.
 fn set_layer(c as *Canvas, layer as i64) as void { c.layer = layer; }
@@ -229,10 +248,12 @@ fn _mini(a as i64, b as i64) as i64 { if (a < b) { return a; } return b; }
 fn push_clip(c as *Canvas, x as f64, y as f64, w as f64, h as f64) as void {
     if (c.clip_n >= MAX_CLIP_DEPTH) { c.overflowed = 1; return; }
     let is Clip as k;
-    k.x0 = cast(i64, fm.floor(x * c.scale));
-    k.y0 = cast(i64, fm.floor(y * c.scale));
-    k.x1 = cast(i64, fm.ceil((x + w) * c.scale));
-    k.y1 = cast(i64, fm.ceil((y + h) * c.scale));
+    let is f64 as lx = x - c.origin_x;
+    let is f64 as ly = y - c.origin_y;
+    k.x0 = cast(i64, fm.floor(lx * c.scale));
+    k.y0 = cast(i64, fm.floor(ly * c.scale));
+    k.x1 = cast(i64, fm.ceil((lx + w) * c.scale));
+    k.y1 = cast(i64, fm.ceil((ly + h) * c.scale));
     if (c.clip_n > 0) {
         let is Clip as o = c.clips[c.clip_n - 1];
         k.x0 = _maxi(k.x0, o.x0);
@@ -287,8 +308,8 @@ fn _reserve(c as *Canvas, kind as i32, tex as i64, samp as i64) as i32 {
 
 fn _put(c as *Canvas, x as f64, y as f64, col as math.color.Color, u as f64, v as f64) as void {
     let is *Vertex as p = _vertex_at(c, c.vcount);
-    p.x = x * c.scale;
-    p.y = y * c.scale;
+    p.x = (x - c.origin_x) * c.scale;
+    p.y = (y - c.origin_y) * c.scale;
     p.z = 0.0;
     p.r = col.r;
     p.g = col.g;
@@ -329,6 +350,17 @@ fn image(c as *Canvas, tex as i64, smooth as i32, x as f64, y as f64, w as f64, 
     let is i64 as samp with mut = c.nearest;
     if (smooth == 1) { samp = c.linear; }
     _quad(c, KIND_IMAGE, tex, samp, x, y, w, h, u0, v0, u1, v1, tint);
+}
+
+// The same for a texture whose colours already carry their alpha — a layer
+// painted onto transparency, which painting it again with image() would
+// darken at every soft edge. tint multiplies all four channels, so an opacity
+// o is rgba(o, o, o, o).
+fn image_premultiplied(c as *Canvas, tex as i64, smooth as i32, x as f64, y as f64, w as f64, h as f64,
+                       u0 as f64, v0 as f64, u1 as f64, v1 as f64, tint as math.color.Color) as void {
+    let is i64 as samp with mut = c.nearest;
+    if (smooth == 1) { samp = c.linear; }
+    _quad(c, KIND_IMAGE_PREMUL, tex, samp, x, y, w, h, u0, v0, u1, v1, tint);
 }
 
 // A glyph from a coverage atlas (an R8 texture), in colour. Sampled nearest:

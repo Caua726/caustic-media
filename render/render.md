@@ -294,9 +294,13 @@ declared at creation. Drawing into it is `pass_begin` with a different target.
 
 ## Current state
 
-`render/software/` holds a working rasterizer — target, triangle fill, depth
-buffer, perspective-correct interpolation, top-left fill rule. Under the
-structure above it belongs to `gpu/software` as the implementation of a device
-backend, with a device-shaped surface around it: buffers, pipelines, submission.
-
-Moving it is the first piece of work here.
+The rasterizer lives in `gpu/software` as a device backend, and this layer sits
+on the device: `renderer`, `mesh`, `material`, `texture` and `camera` for 3D,
+and the 2D family — `draw2d` (a canvas that batches by kind, texture, layer and
+clip, with nested scissor, layers, an origin for painting into a texture,
+images straight or premultiplied, glyphs from a coverage atlas) and `shapes2d`
+(rectangles, rounded rectangles with per-corner radii and gradients, borders,
+circles, lines, convex polygons and soft shadows, anti-aliased by a one-pixel
+fringe and exact on whole pixels). `draw2d_test` checks them as pixels through
+a headless software device. `frame` and `queue` as separate modules are not
+there: a canvas is the 2D queue, and the frame is the caller's pass.

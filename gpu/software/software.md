@@ -31,7 +31,14 @@ slow, that is a fact to state, not a feature to withhold.
 - Triangle fill with a depth buffer, back-face culling, bounding-box traversal
 - **Perspective-correct interpolation** — weights divided by w and renormalised
 - **Top-left fill rule**, so a shared edge is covered exactly once
+- **Vertices on a 1/256-pixel grid** after projection, as GPUs rasterize in
+  fixed point: whether a pixel centre lies inside a triangle does not depend on
+  how a division by the target's width rounded, so a layer painted into a
+  texture of its own size and put back matches painting it directly
 - Near-plane rejection for triangles crossing the eye
+- Blending: none, straight alpha, and **premultiplied** — for what a layer
+  painted onto transparency holds — on packed 8-bit pixels; a scissor; an R8
+  coverage material for glyphs; partial texture uploads
 
 The tests check invariants rather than pixels: coverage against area, a seam
 covered once, the nearer surface winning either submission order, one winding
