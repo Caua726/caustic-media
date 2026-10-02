@@ -355,6 +355,17 @@ to bring a rectangle into view — sent when focus moves by keyboard. Damage is
 clipped to the ancestors, so scrolling repaints the view, not the content's
 whole extent.
 
+**Splitters** (`splitter.cst`, tested by `splitter_test`): any number of panes
+in a row or a column with a handle between each two. Each pane's size is kept
+(in its layout record's `slot`), so a pane dragged wider stays wider; when the
+splitter changes size the difference is shared from the kept sizes by stretch,
+equally when nothing stretches. A handle moves only its two neighbours, never
+past a minimum or maximum, and a press within `grab` of it takes it — the
+splitter claims those points from the panes. It takes focus: the arrows along
+its axis move the current handle, Home and End as far as it goes, F8 and
+Shift+F8 go round the handles. Right to left puts the first pane on the right
+and counts positions from there.
+
 **Events** (`event.cst`, `router.cst`, `timer.cst`, tested by `router_test`,
 `focus_test`, `shortcut_test` and `timer_test` with synthetic events): hit-testing
 that respects clipping, bubbling, capture by whoever handles the press,

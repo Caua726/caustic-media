@@ -1,0 +1,506 @@
+// ui/splitter.cst — panes divided by handles the user drags.
+//
+// The visible children are panes, side by side in a ROW or stacked in a
+// COLUMN, with a handle between each two. What makes it a splitter rather than
+// a box is memory: the size each pane was given is kept (in the pane's
+// geom.Item slot), so a pane the user dragged wider stays wider. When the
+// splitter itself changes size, the difference is shared out from the kept
+// sizes the way a box shares spare room — by stretch, and equally when no pane
+// stretches, since a splitter's panes always fill it — and in shrinking, each
+// gives up in proportion to what it can.
+//
+// A handle's position is where it starts, measured from the start edge: the
+// left, or the right in right to left, or the top. Moving a handle moves only
+// its two neighbours, and never past either one's minimum or maximum.
+//
+// Input: a press on a handle — or within `grab` of it, since a thin handle is
+// hard to hit; the splitter's hit entry claims those points from the panes —
+// captures the pointer and the handle follows it. The splitter takes focus,
+// and then the arrows along its axis move the current handle a step, Home and
+// End move it as far as it goes, and F8 and Shift+F8 pick the next or the
+// previous handle. Each move emits VALUE_CHANGED.
+use "../math/math.cst" as math;
+use "../window/keys.cst" as keys;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "event.cst" as event;
+use "signal.cst" as signal;
+
+let is i32 as ROW    with imut = 0;
+let is i32 as COLUMN with imut = 1;
+
+struct Data {
+    orientation as i32;
+    drag        as i32;   // the handle held, -1 for none
+    current     as i32;   // the handle the keyboard moves
+    _pad0       as i32;
+    handle      as f64;   // a handle's thickness
+    grab        as f64;   // how far either side of it a press still takes it
+    step        as f64;   // an arrow key's move
+    drag_from   as f64;   // the pointer along the axis at the press
+    drag_pos    as f64;   // the handle's position then
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("splitter", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.event = fn_ptr(_event);
+    _kind.hit = fn_ptr(_hit);
+    _ready = 1;
+}
+
+// A new splitter as the last child of parent. Returns its handle, or 0 with
+// the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64, orientation as i32) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.orientation = orientation;
+    d.drag = cast(i32, 0 - 1);
+    d.current = 0;
+    d.handle = 6.0;
+    d.grab = 3.0;
+    d.step = 10.0;
+    tree.set_focusable(t, w, 1);
+    return w;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn _null(d as *Data) as i32 {
+    if (cast(i64, d) == 0) { return 1; }
+    return 0;
+}
+
+fn set_handle_size(t as *tree.Tree, w as i64, thickness as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || thickness < 0.0) { return; }
+    d.handle = thickness;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn set_grab(t as *tree.Tree, w as i64, reach as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || reach < 0.0) { return; }
+    d.grab = reach;
+}
+
+fn set_step(t as *tree.Tree, w as i64, step as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || step <= 0.0) { return; }
+    d.step = step;
+}
+
+fn step(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0.0; }
+    return d.step;
+}
+
+fn current_handle(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0; }
+    return cast(i64, d.current);
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _add(a as f64, b as f64) as f64 {
+    if (a >= layout.UNBOUNDED || b >= layout.UNBOUNDED) { return layout.UNBOUNDED; }
+    return a + b;
+}
+
+fn _rtl(t as *tree.Tree, w as i64, d as *Data) as i32 {
+    if (d.orientation == ROW && layout.direction(t, w) == layout.RTL) { return 1; }
+    return 0;
+}
+
+// --- The panes ---
+
+// The visible children, measured along the axis with cross the room across.
+struct Panes {
+    n       as i64;
+    kids    as *i64;
+    pref    as *f64;
+    size    as *f64;
+    mins    as *f64;
+    maxs    as *f64;
+    stretch as *f64;
+}
+
+fn _count(t as *tree.Tree, w as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        if (tree.is_visible(t, ch) == 1) { n = n + 1; }
+        ch = tree.next_sibling(t, ch);
+    }
+    return n;
+}
+
+// The i-th visible child, 0 for none.
+fn _pane(t as *tree.Tree, w as i64, i as i64) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        if (tree.is_visible(t, ch) == 1) {
+            if (k == i) { return ch; }
+            k = k + 1;
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    return 0;
+}
+
+// Fills p from the tree's scratch; the caller releases it. 0 with the tree's
+// error set when there is not room.
+fn _collect(t as *tree.Tree, w as i64, d as *Data, cross as f64, p as *Panes) as i32 {
+    let is i64 as n = _count(t, w);
+    p.n = 0;
+    p.kids = cast(*i64, tree.scratch_alloc(t, n * 8));
+    p.pref = cast(*f64, tree.scratch_alloc(t, n * 8));
+    p.size = cast(*f64, tree.scratch_alloc(t, n * 8));
+    p.mins = cast(*f64, tree.scratch_alloc(t, n * 8));
+    p.maxs = cast(*f64, tree.scratch_alloc(t, n * 8));
+    p.stretch = cast(*f64, tree.scratch_alloc(t, n * 8));
+    if (cast(i64, p.stretch) == 0) { return 0; }
+    let is geom.Constraint as cc with mut = geom.constraint(cross, layout.UNBOUNDED);
+    if (d.orientation == ROW) { cc = geom.constraint(layout.UNBOUNDED, cross); }
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        if (tree.is_visible(t, ch) == 1) {
+            let is geom.Size as s;
+            layout.measure(t, ch, &cc, &s);
+            let is *geom.Item as it = tree.item(t, ch);
+            let is i64 as i = p.n;
+            p.kids[i] = ch;
+            if (d.orientation == ROW) {
+                p.pref[i] = s.pref_w; p.mins[i] = s.min_w; p.maxs[i] = s.max_w;
+                p.stretch[i] = it.hstretch;
+            } else {
+                p.pref[i] = s.pref_h; p.mins[i] = s.min_h; p.maxs[i] = s.max_h;
+                p.stretch[i] = it.vstretch;
+            }
+            // The kept size, or the preferred one for a pane never sized.
+            p.size[i] = p.pref[i];
+            if (it.slot >= 0.0) { p.size[i] = it.slot; }
+            p.n = p.n + 1;
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    return 1;
+}
+
+fn _handles(d as *Data, n as i64) as f64 {
+    if (n < 2) { return 0.0; }
+    return d.handle * cast(f64, n - 1);
+}
+
+// Decides the sizes for room along the axis, handles already taken off: the
+// kept sizes, each within its minimum and maximum, then the difference shared
+// by stretch — equally when nothing stretches, since the panes fill the
+// splitter.
+fn _share(p as *Panes, room as f64) as void {
+    let is f64 as total with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < p.n) {
+        if (p.size[i] > p.maxs[i]) { p.size[i] = p.maxs[i]; }
+        if (p.size[i] < p.mins[i]) { p.size[i] = p.mins[i]; }
+        if (p.stretch[i] > 0.0) { total = total + p.stretch[i]; }
+        i = i + 1;
+    }
+    if (total <= 0.0) {
+        i = 0;
+        while (i < p.n) { p.stretch[i] = 1.0; i = i + 1; }
+    }
+    layout.distribute(p.n, p.size, p.mins, p.maxs, p.stretch, room);
+}
+
+// --- Measuring ---
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is f64 as cross with mut = c.w;
+    let is f64 as main with mut = c.h;
+    if (d.orientation == ROW) {
+        cross = c.h;
+        main = c.w;
+    }
+    let is i64 as mark = tree.scratch_mark(t);
+    let is Panes as p;
+    if (_collect(t, w, d, cross, &p) == 0) {
+        tree.scratch_release(t, mark);
+        geom.size_zero(out);
+        return;
+    }
+    let is f64 as hs = _handles(d, p.n);
+    let is f64 as m_min with mut = hs;
+    let is f64 as m_pref with mut = hs;
+    let is f64 as m_max with mut = hs;
+    let is i64 as i with mut = 0;
+    while (i < p.n) {
+        m_min = m_min + p.mins[i];
+        m_pref = m_pref + p.pref[i];
+        m_max = _add(m_max, p.maxs[i]);
+        i = i + 1;
+    }
+    // Across, each pane at the size it will get when the room along the axis
+    // is known — wrapped text in a pane is taller the narrower it is.
+    let is i32 as known with mut = 0;
+    if (main < layout.UNBOUNDED && p.n > 0) {
+        _share(&p, _max(0.0, main - hs));
+        known = 1;
+    }
+    let is f64 as x_min with mut = 0.0;
+    let is f64 as x_pref with mut = 0.0;
+    i = 0;
+    while (i < p.n) {
+        let is geom.Size as s;
+        let is geom.Constraint as at with mut = geom.constraint(cross, layout.UNBOUNDED);
+        if (d.orientation == ROW) { at = geom.constraint(layout.UNBOUNDED, cross); }
+        if (known == 1) {
+            if (d.orientation == ROW) { at.w = p.size[i]; } else { at.h = p.size[i]; }
+        }
+        layout.measure(t, p.kids[i], &at, &s);
+        if (d.orientation == ROW) {
+            x_min = _max(x_min, s.min_h);
+            x_pref = _max(x_pref, s.pref_h);
+        } else {
+            x_min = _max(x_min, s.min_w);
+            x_pref = _max(x_pref, s.pref_w);
+        }
+        i = i + 1;
+    }
+    if (p.n == 0) { m_max = layout.UNBOUNDED; }
+    if (d.orientation == ROW) {
+        out.min_w = m_min; out.pref_w = m_pref; out.max_w = m_max;
+        out.min_h = x_min; out.pref_h = x_pref; out.max_h = layout.UNBOUNDED;
+    } else {
+        out.min_h = m_min; out.pref_h = m_pref; out.max_h = m_max;
+        out.min_w = x_min; out.pref_w = x_pref; out.max_w = layout.UNBOUNDED;
+    }
+    tree.scratch_release(t, mark);
+}
+
+// --- Arranging ---
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as row with mut = 0;
+    if (d.orientation == ROW) { row = 1; }
+    let is f64 as main with mut = r.h;
+    let is f64 as cross with mut = r.w;
+    if (row == 1) {
+        main = r.w;
+        cross = r.h;
+    }
+    let is i64 as mark = tree.scratch_mark(t);
+    let is Panes as p;
+    if (_collect(t, w, d, cross, &p) == 0 || p.n == 0) {
+        tree.scratch_release(t, mark);
+        return;
+    }
+    _share(&p, _max(0.0, main - _handles(d, p.n)));
+    let is i32 as rtl = _rtl(t, w, d);
+    let is f64 as pos with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < p.n) {
+        let is f64 as size = p.size[i];
+        let is math.rect.Rect as at with mut = math.rect.rect(0.0, pos, cross, size);
+        if (row == 1) {
+            at = math.rect.rect(pos, 0.0, size, cross);
+            if (rtl == 1) { at.x = r.w - pos - size; }
+        }
+        layout.place(t, p.kids[i], &at);
+        tree.item(t, p.kids[i]).slot = size;
+        pos = pos + size + d.handle;
+        i = i + 1;
+    }
+    tree.scratch_release(t, mark);
+}
+
+// --- Handles ---
+
+fn handle_count(t as *tree.Tree, w as i64) as i64 {
+    let is i64 as n = _count(t, w);
+    if (n < 2) { return 0; }
+    return n - 1;
+}
+
+// Handle i: the gap between the i-th and the next visible pane, in the
+// splitter's coordinates. Empty when there is no such handle.
+fn handle_rect(t as *tree.Tree, w as i64, i as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || i < 0 || i >= handle_count(t, w)) { return math.rect.rect_zero(); }
+    let is math.rect.Rect as a = layout.rect(t, _pane(t, w, i));
+    let is math.rect.Rect as b = layout.rect(t, _pane(t, w, i + 1));
+    let is math.rect.Rect as r = layout.rect(t, w);
+    if (d.orientation == ROW) {
+        if (a.x <= b.x) { return math.rect.rect(a.x + a.w, 0.0, b.x - a.x - a.w, r.h); }
+        return math.rect.rect(b.x + b.w, 0.0, a.x - b.x - b.w, r.h);
+    }
+    return math.rect.rect(0.0, a.y + a.h, r.w, b.y - a.y - a.h);
+}
+
+// Where handle i starts, measured from the start edge.
+fn position(t as *tree.Tree, w as i64, i as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1) { return 0.0; }
+    let is math.rect.Rect as h = handle_rect(t, w, i);
+    if (d.orientation == COLUMN) { return h.y; }
+    if (_rtl(t, w, d) == 1) { return layout.rect(t, w).w - h.x - h.w; }
+    return h.x;
+}
+
+fn _along(d as *Data, r as math.rect.Rect) as f64 {
+    if (d.orientation == ROW) { return r.w; }
+    return r.h;
+}
+
+// Moves handle i to pos, as far as its two neighbours allow: neither below its
+// minimum nor past its maximum. Takes effect at the next layout pass. Returns
+// 1 if it moved.
+fn set_position(t as *tree.Tree, w as i64, i as i64, pos as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || i < 0 || i >= handle_count(t, w)) { return 0; }
+    let is i64 as pa = _pane(t, w, i);
+    let is i64 as pb = _pane(t, w, i + 1);
+    let is f64 as a = _along(d, layout.rect(t, pa));
+    let is f64 as b = _along(d, layout.rect(t, pb));
+    let is f64 as total = a + b;
+    let is f64 as start = position(t, w, i) - a;
+    let is geom.Constraint as cc = geom.unbounded();
+    let is geom.Size as sa;
+    let is geom.Size as sb;
+    layout.measure(t, pa, &cc, &sa);
+    layout.measure(t, pb, &cc, &sb);
+    let is f64 as min_a with mut = sa.min_h;
+    let is f64 as max_a with mut = sa.max_h;
+    let is f64 as min_b with mut = sb.min_h;
+    let is f64 as max_b with mut = sb.max_h;
+    if (d.orientation == ROW) {
+        min_a = sa.min_w; max_a = sa.max_w;
+        min_b = sb.min_w; max_b = sb.max_w;
+    }
+    let is f64 as lo = _max(min_a, total - max_b);
+    let is f64 as hi = _min(max_a, total - min_b);
+    let is f64 as na with mut = pos - start;
+    if (na > hi) { na = hi; }
+    if (na < lo) { na = lo; }
+    if (na == a) { return 0; }
+    tree.item(t, pa).slot = na;
+    tree.item(t, pb).slot = total - na;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, 0));
+    return 1;
+}
+
+// --- Input ---
+
+// The handle under p, reaching grab either side along the axis; -1 for none.
+fn _handle_at(t as *tree.Tree, w as i64, d as *Data, x as f64, y as f64) as i64 {
+    let is i64 as n = handle_count(t, w);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is math.rect.Rect as h with mut = handle_rect(t, w, i);
+        if (d.orientation == ROW) {
+            h.x = h.x - d.grab;
+            h.w = h.w + 2.0 * d.grab;
+        } else {
+            h.y = h.y - d.grab;
+            h.h = h.h + 2.0 * d.grab;
+        }
+        if (x >= h.x && x < h.x + h.w && y >= h.y && y < h.y + h.h) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _hit(t as *tree.Tree, w as i64, data as *u8, p as *math.vec.Vec2) as i32 {
+    let is *Data as d = cast(*Data, data);
+    if (_handle_at(t, w, d, p.x, p.y) >= 0) { return 1; }
+    return 0;
+}
+
+fn _axis_pos(d as *Data, e as *event.Event) as f64 {
+    if (d.orientation == ROW) { return e.x; }
+    return e.y;
+}
+
+fn _key(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    // Only when the splitter itself has focus: keys in a pane are the pane's.
+    if (e.phase != event.TARGET) { return 0; }
+    let is i64 as n = handle_count(t, w);
+    if (n == 0) { return 0; }
+    if (cast(i64, d.current) >= n) { d.current = 0; }
+    let is i32 as plain = (e.mods | keys.MOD_LOCK) - keys.MOD_LOCK;
+    let is i64 as cur = cast(i64, d.current);
+    if (e.key == keys.F8 && (plain == 0 || plain == keys.MOD_SHIFT)) {
+        if (plain == 0) { d.current = cast(i32, (cur + 1) % n); }
+        else { d.current = cast(i32, (cur + n - 1) % n); }
+        tree.invalidate_paint(t, w);
+        return 1;
+    }
+    if (plain != 0) { return 0; }
+    let is f64 as at = position(t, w, cur);
+    let is f64 as fwd with mut = 0.0;
+    if (d.orientation == ROW) {
+        if (e.key == keys.RIGHT) { fwd = d.step; }
+        if (e.key == keys.LEFT) { fwd = 0.0 - d.step; }
+        // Positions run from the right in right to left.
+        if (_rtl(t, w, d) == 1) { fwd = 0.0 - fwd; }
+    } else {
+        if (e.key == keys.DOWN) { fwd = d.step; }
+        if (e.key == keys.UP) { fwd = 0.0 - d.step; }
+    }
+    if (fwd != 0.0) {
+        set_position(t, w, cur, at + fwd);
+        return 1;
+    }
+    if (e.key == keys.HOME) {
+        set_position(t, w, cur, 0.0 - layout.UNBOUNDED);
+        return 1;
+    }
+    if (e.key == keys.END) {
+        set_position(t, w, cur, layout.UNBOUNDED);
+        return 1;
+    }
+    return 0;
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind == event.POINTER_DOWN && e.button == 1) {
+        let is i64 as h = _handle_at(t, w, d, e.local_x, e.local_y);
+        if (h < 0) { return 0; }
+        d.drag = cast(i32, h);
+        d.current = cast(i32, h);
+        d.drag_from = _axis_pos(d, e);
+        d.drag_pos = position(t, w, h);
+        return 1;
+    }
+    if (e.kind == event.POINTER_MOVE && d.drag >= 0) {
+        let is f64 as moved with mut = _axis_pos(d, e) - d.drag_from;
+        if (_rtl(t, w, d) == 1) { moved = 0.0 - moved; }
+        set_position(t, w, cast(i64, d.drag), d.drag_pos + moved);
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP && d.drag >= 0) {
+        d.drag = cast(i32, 0 - 1);
+        return 1;
+    }
+    if (e.kind == event.KEY_DOWN) { return _key(t, w, d, e); }
+    return 0;
+}
