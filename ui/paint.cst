@@ -1,0 +1,212 @@
+// ui/paint.cst — drawing the tree, region by region, through render/'s 2D family.
+//
+// A frame repaints what damage.collect found and nothing else. For each
+// rectangle of the region, the window's background is laid down and the tree
+// walked: every visible widget that reaches the rectangle is handed a
+// painter.Painter and its paint entry draws, parent before children, so
+// children draw over their parent and later siblings over earlier ones.
+//
+// Clipping is the canvas's scissor. A widget draws inside its own rectangle,
+// cut down by every ancestor's and by the region — so what it draws outside
+// itself is never seen, and a partial repaint draws exactly what a full one
+// would there. Only one clip is kept on the canvas's stack at a time, already
+// intersected all the way down, so a tree deeper than the stack still clips
+// right. A subtree entirely outside the region is not walked at all.
+//
+// A widget on a higher layer (tree.set_layer) escapes its ancestors' clips and
+// draws on that canvas layer, above everything below it whatever the order —
+// a popup inside the window. While any widget is layered, subtrees outside the
+// region are still walked for them.
+//
+// The keyboard focus ring is drawn after the focused widget's subtree, inside
+// its edge, from the theme — unless the widget drew its own and set
+// focus_drawn.
+//
+// The caller owns the frame around it: draw2d.begin on the target's size, this,
+// draw2d.flush into a pass that loads what the target already holds, present
+// the region, tree.damage_clear.
+use "../math/math.cst" as math;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
+use "tree.cst" as tree;
+use "layout.cst" as layout;
+use "router.cst" as router;
+use "painter.cst" as painter;
+use "style.cst" as style;
+
+struct Options {
+    router as *router.Router;   // hover, press and focus; null paints every widget at rest
+    theme  as *style.Theme;
+    time   as i64;              // milliseconds, handed to every paint entry
+    active as i32;              // the window has the keyboard focus
+    _pad0  as i32;
+}
+
+fn options(theme as *style.Theme) as Options {
+    let is Options as o;
+    o.router = cast(*router.Router, 0);
+    o.theme = theme;
+    o.time = 0;
+    o.active = 1;
+    o._pad0 = 0;
+    return o;
+}
+
+// What a frame did, for tests and for anyone measuring.
+struct Stats {
+    regions as i64;   // rectangles repainted
+    walked  as i64;   // widgets visited, painted or not
+    painted as i64;   // paint entries called
+    rings   as i64;   // focus rings drawn
+}
+
+struct _Walk {
+    t       as *tree.Tree;
+    c       as *draw2d.Canvas;
+    o       as *Options;
+    st      as *Stats;
+    region  as math.rect.Rect;
+    focus   as i64;
+    clip_on as i32;
+    _pad0   as i32;
+}
+
+// The canvas clips to r, replacing the clip the walk set before.
+fn _clip(k as *_Walk, r as math.rect.Rect) as void {
+    if (k.clip_on == 1) { draw2d.pop_clip(k.c); }
+    draw2d.push_clip(k.c, r.x, r.y, r.w, r.h);
+    k.clip_on = 1;
+}
+
+fn _focus_within(k as *_Walk, w as i64) as i32 {
+    let is i64 as a with mut = k.focus;
+    while (a != 0) {
+        if (a == w) { return 1; }
+        a = tree.parent(k.t, a);
+    }
+    return 0;
+}
+
+fn _state(k as *_Walk, w as i64, disabled as i32) as i64 {
+    let is i64 as s with mut = 0;
+    let is *router.Router as r = k.o.router;
+    if (cast(i64, r) != 0) {
+        if (router.hovered(k.t, r, w) == 1) { s = s | painter.S_HOVER; }
+        if (router.capture(r) == w && r.buttons != 0) { s = s | painter.S_PRESSED; }
+        if (k.focus == w) {
+            s = s | painter.S_FOCUSED;
+            if (router.focus_visible(r) == 1) { s = s | painter.S_FOCUS_VISIBLE; }
+        }
+        if (k.focus != 0 && _focus_within(k, w) == 1) { s = s | painter.S_FOCUS_WITHIN; }
+    }
+    if (disabled == 1) { s = s | painter.S_DISABLED; }
+    if (k.o.active == 0) { s = s | painter.S_BACKDROP; }
+    return s;
+}
+
+fn _ring(k as *_Walk, r as math.rect.Rect) as void {
+    let is *style.Theme as th = k.o.theme;
+    let is f64 as in = th.focus_offset;
+    let is f64 as rad = th.focus_radius;
+    shapes.stroke_rounded(k.c, r.x + in, r.y + in, r.w - 2.0 * in, r.h - 2.0 * in,
+                          rad, rad, rad, rad, th.focus_width, th.focus_color);
+    k.st.rings = k.st.rings + 1;
+}
+
+// w at window position ox, oy (its parent's), inside clip, on layer.
+fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
+          layer0 as i64, disabled0 as i32) as void {
+    if (tree.is_hidden_here(k.t, w) == 1) { return; }
+    k.st.walked = k.st.walked + 1;
+    let is math.rect.Rect as r = layout.rect(k.t, w);
+    let is math.rect.Rect as wr = math.rect.rect(ox + r.x, oy + r.y, r.w, r.h);
+    let is math.rect.Rect as clip with mut = clip0;
+    let is i64 as layer with mut = layer0;
+    if (tree.layer(k.t, w) > layer0) {
+        layer = tree.layer(k.t, w);
+        clip = k.region;
+    }
+    let is i32 as disabled with mut = disabled0;
+    if (tree.is_enabled_here(k.t, w) == 0) { disabled = 1; }
+    let is math.rect.Rect as vis = math.rect.rect_intersect(wr, clip);
+    let is i32 as shown = 1 - math.rect.rect_is_empty(vis);
+    if (shown == 0 && tree.layered_count(k.t) == 0) { return; }
+
+    let is painter.Painter as p;
+    p.focus_drawn = 0;
+    p.state = 0;
+    if (shown == 1) {
+        draw2d.set_layer(k.c, layer);
+        _clip(k, vis);
+        p.canvas = k.c;
+        p.theme = k.o.theme;
+        p.rect = wr;
+        p.clip = vis;
+        p.state = _state(k, w, disabled);
+        p.time = k.o.time;
+        p.rtl = 0;
+        if (layout.direction(k.t, w) == layout.RTL) { p.rtl = 1; }
+        let is *tree.Kind as kd = tree.kind(k.t, w);
+        if (cast(i64, kd.paint) != 0) {
+            // A paint entry that leaves clips of its own pushed would take
+            // the walk's clip with them; whatever it left is undone.
+            let is i64 as depth = k.c.clip_n;
+            call(kd.paint, k.t, w, tree.data(k.t, w), &p);
+            while (k.c.clip_n > depth) { draw2d.pop_clip(k.c); }
+            k.st.painted = k.st.painted + 1;
+        }
+    }
+    let is i64 as ch with mut = tree.first_child(k.t, w);
+    while (ch != 0) {
+        _visit(k, ch, wr.x, wr.y, vis, layer, disabled);
+        ch = tree.next_sibling(k.t, ch);
+    }
+    if (shown == 1 && (p.state & painter.S_FOCUS_VISIBLE) != 0 && p.focus_drawn == 0) {
+        draw2d.set_layer(k.c, layer);
+        _clip(k, vis);
+        _ring(k, wr);
+    }
+}
+
+// Paints every rectangle of the tree's damage region on c, which the caller
+// has begun. Returns how many there were; st, if not null, is filled in.
+fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64 {
+    let is Stats as local;
+    let is *Stats as s with mut = st;
+    if (cast(i64, s) == 0) { s = &local; }
+    s.regions = 0;
+    s.walked = 0;
+    s.painted = 0;
+    s.rings = 0;
+    let is _Walk as k;
+    k.t = t;
+    k.c = c;
+    k.o = o;
+    k.st = s;
+    k.clip_on = 0;
+    k._pad0 = 0;
+    k.focus = 0;
+    if (cast(i64, o.router) != 0) { k.focus = router.focused(t, o.router); }
+    let is i64 as root = tree.root(t);
+    let is i64 as n = tree.damage_count(t);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is math.rect.Rect as d = tree.damage_at(t, i);
+        k.region = d;
+        draw2d.set_layer(c, 0);
+        _clip(&k, d);
+        // A pixel past each edge: the scissor cuts it back to exactly the
+        // region, with no fringe left half covered.
+        shapes.fill_rect(c, d.x - 1.0, d.y - 1.0, d.w + 2.0, d.h + 2.0, o.theme.window_bg);
+        let is i64 as ch with mut = tree.first_child(t, root);
+        while (ch != 0) {
+            _visit(&k, ch, 0.0, 0.0, d, 0, 0);
+            ch = tree.next_sibling(t, ch);
+        }
+        s.regions = s.regions + 1;
+        i = i + 1;
+    }
+    if (k.clip_on == 1) { draw2d.pop_clip(c); }
+    draw2d.set_layer(c, 0);
+    return n;
+}

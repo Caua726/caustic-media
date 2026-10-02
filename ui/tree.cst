@@ -17,6 +17,7 @@ use "std/mem.cst" as mem;
 use "../math/math.cst" as math;
 use "geom.cst" as geom;
 use "event.cst" as event;
+use "painter.cst" as painter;
 
 // --- Errors ---
 
@@ -37,6 +38,10 @@ let is i64 as F_DISABLED     with imut = 2;
 let is i64 as F_NEEDS_LAYOUT with imut = 4;
 let is i64 as F_FOCUSABLE    with imut = 8;
 let is i64 as F_NEEDS_PAINT  with imut = 16;
+// Repaint when the focus enters or leaves the subtree — a frame that lights up
+// while a field inside it has focus. Opt-in, so a Tab does not repaint every
+// ancestor up to the window.
+let is i64 as F_FOCUS_WITHIN_LOOK with imut = 32;
 
 // --- Damage ---
 //
@@ -97,6 +102,7 @@ type MeasureFn = fn(*Tree, i64, *u8, *geom.Constraint, *geom.Size) as void;
 type ArrangeFn = fn(*Tree, i64, *u8, *math.rect.Rect) as void;
 type EventFn   = fn(*Tree, i64, *u8, *event.Event) as i64;
 type HitFn     = fn(*Tree, i64, *u8, *math.vec.Vec2) as i32;
+type PaintFn   = fn(*Tree, i64, *u8, *painter.Painter) as void;
 
 struct Kind {
     name       as *u8;
@@ -106,6 +112,7 @@ struct Kind {
     arrange    as ArrangeFn;
     event      as EventFn;
     hit        as HitFn;
+    paint      as PaintFn;
 }
 
 // A signal callback: cb(tree, widget, arg, user). See signal.cst.
@@ -135,6 +142,7 @@ struct Node {
     // Where it was laid out then — the same, unclipped by its ancestors. A
     // change here is what says it moved.
     placed  as math.rect.Rect;
+    layer   as i64;   // 0, or above everything at lower layers; see set_layer
 }
 
 struct Tree {
@@ -160,6 +168,7 @@ struct Tree {
     damage_n      as i64;
     paint_wanted  as i64;   // anything changed since damage_clear
     scale         as f64;   // physical pixels per logical one; layout.set_scale
+    layered       as i64;   // widgets with a layer above 0
     err         as i32;
     ok          as i32;
 }
@@ -231,6 +240,7 @@ fn open(l as *Limits) as Tree {
     t.damage_n = 0;
     t.paint_wanted = 0;
     t.scale = 1.0;
+    t.layered = 0;
     t.cap = 0;
     t.live = 0;
     t.next_free = 0;
@@ -276,6 +286,7 @@ fn open(l as *Limits) as Tree {
     _root_kind.arrange = cast(ArrangeFn, 0);
     _root_kind.event = cast(EventFn, 0);
     _root_kind.hit = cast(HitFn, 0);
+    _root_kind.paint = cast(PaintFn, 0);
     t.root = _claim(&t, &_root_kind);
     return t;
 }
@@ -350,6 +361,7 @@ fn _claim(t as *Tree, k as *Kind) as i64 {
             n.item = geom.item_default();
             n.painted = math.rect.rect_zero();
             n.placed = math.rect.rect_zero();
+            n.layer = 0;
             if (t.stride > 0) { mem.core.memzero(_data_at(t, i), t.stride); }
             t.live = t.live + 1;
             t.next_free = i + 1;
@@ -369,6 +381,8 @@ fn _release(t as *Tree, i as i64) as void {
     // own: a child is normally inside its parent and adds nothing, but not
     // always.
     damage_add(t, &n.painted);
+    if (n.layer > 0) { t.layered = t.layered - 1; }
+    n.layer = 0;
     if (cast(i64, n.kind) != 0 && cast(i64, n.kind.destroy) != 0) {
         call(n.kind.destroy, t, _handle(t, i), _data_at(t, i));
     }
@@ -667,6 +681,21 @@ fn set_focusable(t as *Tree, w as i64, on as i32) as void {
     n.flags = _set(n.flags, F_FOCUSABLE, on);
 }
 
+// The flags a program may set itself: F_FOCUS_WITHIN_LOOK.
+fn set_flag(t as *Tree, w as i64, bit as i64, on as i32) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0 || bit != F_FOCUS_WITHIN_LOOK) { return; }
+    let is *Node as n = _node(t, i);
+    n.flags = _set(n.flags, bit, on);
+}
+
+fn has_flag(t as *Tree, w as i64, bit as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    if ((_node(t, i).flags & bit) != 0) { return 1; }
+    return 0;
+}
+
 fn is_focusable(t as *Tree, w as i64) as i32 {
     let is i64 as i = _index(t, w);
     if (i < 0) { return 0; }
@@ -817,6 +846,15 @@ fn clear_paint(t as *Tree, w as i64) as void {
     n.flags = _set(n.flags, F_NEEDS_PAINT, 0);
 }
 
+// Its own disabled flag, ancestors aside; painting walks down and carries
+// theirs.
+fn is_enabled_here(t as *Tree, w as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    if ((_node(t, i).flags & F_DISABLED) != 0) { return 0; }
+    return 1;
+}
+
 // Its own hidden flag, ancestors aside; damage.cst walks down and carries
 // theirs.
 fn is_hidden_here(t as *Tree, w as i64) as i32 {
@@ -942,3 +980,35 @@ fn damage_clear(t as *Tree) as void {
     t.damage_n = 0;
     t.paint_wanted = 0;
 }
+
+// --- Layers ---
+//
+// A widget on a layer above 0 — a popup drawn inside the window, a drag's
+// image, a toast — is drawn above everything on lower layers wherever it sits
+// in the tree, and is not clipped by its ancestors: it may reach past its
+// parent's edge, as a dropdown below its button does. Hit-testing looks at it
+// first. Its subtree is on its layer, or a higher one of its own.
+
+fn set_layer(t as *Tree, w as i64, layer as i64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0 || i == t.root || layer < 0) { return; }
+    let is *Node as n = _node(t, i);
+    if (n.layer == layer) { return; }
+    if (n.layer > 0) { t.layered = t.layered - 1; }
+    if (layer > 0) { t.layered = t.layered + 1; }
+    n.layer = layer;
+    // Where it was drawn under the old clip, and the whole of it under the new.
+    damage_add(t, &n.painted);
+    _mark_paint(t, i);
+    n.placed = math.rect.rect_zero();
+}
+
+fn layer(t as *Tree, w as i64) as i64 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    return _node(t, i).layer;
+}
+
+// How many widgets are on a layer above 0; with none, painting and
+// hit-testing skip looking for them.
+fn layered_count(t as *Tree) as i64 { return t.layered; }

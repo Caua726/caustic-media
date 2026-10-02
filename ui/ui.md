@@ -26,6 +26,7 @@ ui/
   model.cst       row and cell models behind lists, trees and tables
   damage.cst      what a frame has to repaint, found from the tree
   paint.cst       drawing the tree through render/'s 2D family
+  painter.cst     what a widget's paint entry is handed
   style.cst       the theme: colours, metrics, fonts, per-state variants
   a11y.cst        role, name and state per widget; the platform bridges
   widgets/        label, button, check, radio, entry, slider, progress,
@@ -415,7 +416,23 @@ overlapping and bordering ones merge, and past the limit a rectangle goes into
 the one it enlarges least, so it can cover more than changed but never less.
 `tree.paint_wanted` says whether a frame has anything to collect at all.
 
-Nothing is drawn yet: painting is next, through `render/`'s 2D family.
+**Painting** (`paint.cst`, `painter.cst`, the `paint` entry, tested by
+`paint_test` on a headless software device): each damage rectangle gets the
+theme's window background and a walk of the tree — parent before children, a
+subtree outside the rectangle not walked at all. Every widget is clipped to its
+own rectangle cut by its ancestors' and the region, with one clip on the
+canvas's stack at a time, so a tree forty deep clips right and a partial
+repaint is pixel for pixel what a full one would be. A paint entry gets the
+canvas, the theme, its rectangle, its clip and its state — hover, pressed,
+focused, focus visible, focus within, disabled, backdrop — and the router
+repaints whatever widget those change for (focus within only for widgets that
+ask, with `tree.F_FOCUS_WITHIN_LOOK`). A widget on a higher layer
+(`tree.set_layer`) escapes its ancestors' clips, draws above everything below
+it and is hit-tested first: a popup inside the window. The focus ring is drawn
+after the subtree, inside the edge, unless the widget drew its own. A clip a
+paint entry forgets to pop is popped for it. `app.paint` paints a window with
+its own router and active state; `style.cst` holds the theme, with colours in
+sRGB as written.
 
 ## For scale
 

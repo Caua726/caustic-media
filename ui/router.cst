@@ -168,14 +168,64 @@ fn init(s as Settings) as Router {
 // first because later children are drawn above earlier ones. A child is only
 // searched inside its parent, so what a container clips away cannot be hit,
 // and a widget whose kind claims the point (its hit entry) keeps it from its
-// children. 0 outside the window.
+// children. A widget on a higher layer is drawn above the rest and outside its
+// parent's clip, so it is looked for first. 0 outside the window.
 fn hit(t as *tree.Tree, x as f64, y as f64) as i64 {
     let is i64 as root = tree.root(t);
     let is math.rect.Rect as rr = layout.rect(t, root);
     if (x < 0.0 || y < 0.0 || x >= rr.w || y >= rr.h) { return 0; }
-    let is i64 as cur with mut = root;
-    let is f64 as ox with mut = 0.0;
-    let is f64 as oy with mut = 0.0;
+    if (tree.layered_count(t) > 0) {
+        let is Layered as best;
+        best.w = 0;
+        best.layer = 0;
+        _find_layered(t, root, 0.0, 0.0, 0, x, y, &best);
+        if (best.w != 0) { return _descend(t, best.w, best.ox, best.oy, x, y); }
+    }
+    return _descend(t, root, 0.0, 0.0, x, y);
+}
+
+// The topmost layered widget under the point: the highest layer, and of
+// those the last in tree order, which is the last drawn.
+struct Layered {
+    w     as i64;
+    layer as i64;
+    ox    as f64;
+    oy    as f64;
+}
+
+fn _find_layered(t as *tree.Tree, w as i64, ox as f64, oy as f64, eff as i64,
+                 x as f64, y as f64, best as *Layered) as void {
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        if (tree.is_hidden_here(t, ch) == 0) {
+            let is math.rect.Rect as cr = layout.rect(t, ch);
+            let is f64 as cx = ox + cr.x;
+            let is f64 as cy = oy + cr.y;
+            let is i64 as cl = tree.layer(t, ch);
+            let is i64 as ce with mut = eff;
+            if (cl > eff) {
+                ce = cl;
+                if (x >= cx && x < cx + cr.w && y >= cy && y < cy + cr.h && cl >= best.layer) {
+                    best.w = ch;
+                    best.layer = cl;
+                    best.ox = cx;
+                    best.oy = cy;
+                }
+            }
+            _find_layered(t, ch, cx, cy, ce, x, y, best);
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+}
+
+// Down from top, at window position ox0, oy0, to the deepest widget under the
+// point. A layered child it passes through cannot be under the point: the
+// layered search would have found it, or one above it, first.
+fn _descend(t as *tree.Tree, top as i64, ox0 as f64, oy0 as f64, x as f64, y as f64) as i64 {
+    let is i64 as root = tree.root(t);
+    let is i64 as cur with mut = top;
+    let is f64 as ox with mut = ox0;
+    let is f64 as oy with mut = oy0;
     while (1 == 1) {
         if (cur != root) {
             let is *tree.Kind as k = tree.kind(t, cur);
@@ -277,6 +327,7 @@ fn _update_hover(t as *tree.Tree, r as *Router, w as i64, time as i64) as void {
     while (k >= 0) {
         let is i64 as h = r.chain[k];
         if (_in(cast(*i64, &next), n, h) == 0) {
+            tree.invalidate_paint(t, h);
             let is event.Event as e = event.make(event.POINTER_LEAVE, time);
             e.x = r.pointer_x;
             e.y = r.pointer_y;
@@ -289,6 +340,7 @@ fn _update_hover(t as *tree.Tree, r as *Router, w as i64, time as i64) as void {
     while (k < n) {
         let is i64 as h = next[k];
         if (_in(cast(*i64, &r.chain), r.chain_n, h) == 0) {
+            tree.invalidate_paint(t, h);
             let is event.Event as e = event.make(event.POINTER_ENTER, time);
             e.x = r.pointer_x;
             e.y = r.pointer_y;
@@ -447,6 +499,7 @@ fn pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
             let is i64 as f = _focusable_from(t, r, target);
             if (f != 0) { focus(t, r, f, 0); }
             r.capture = _dispatch(t, &e, target);
+            tree.invalidate_paint(t, r.capture);
             r.press_x = x;
             r.press_y = y;
             r.dragging = 0;
@@ -480,6 +533,7 @@ fn pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
         _dispatch(t, &e, _hit_scoped(t, r, x, y));
     }
     if (r.buttons == 0) {
+        tree.invalidate_paint(t, r.capture);
         r.capture = 0;
         r.dragging = 0;
         // The hover catches up with wherever the pointer went meanwhile.
@@ -618,6 +672,13 @@ fn focus_visible(r as *Router) as i32 { return r.focus_visible; }
 fn focus(t as *tree.Tree, r as *Router, w as i64, by_keyboard as i32) as i32 {
     if (w != 0 && _can_focus(t, r, w) == 0) { return 0; }
     let is i64 as old = focused(t, r);
+    // Focus and its ring change how both widgets look.
+    if (old != w || r.focus_visible != by_keyboard) {
+        tree.invalidate_paint(t, old);
+        tree.invalidate_paint(t, w);
+        _repaint_within(t, old);
+        _repaint_within(t, w);
+    }
     r.focus_visible = by_keyboard;
     if (old != w) {
         r.focus = w;
@@ -636,6 +697,18 @@ fn focus(t as *tree.Tree, r as *Router, w as i64, by_keyboard as i32) as i32 {
     // aimed at something already in view.
     if (w != 0 && by_keyboard == 1) { reveal(t, w); }
     return 1;
+}
+
+// The ancestors of w that look different with the focus inside them — those
+// that asked, with tree.F_FOCUS_WITHIN_LOOK. Repainting every ancestor would
+// repaint the whole window on every Tab.
+fn _repaint_within(t as *tree.Tree, w as i64) as void {
+    if (w == 0) { return; }
+    let is i64 as a with mut = tree.parent(t, w);
+    while (a != 0) {
+        if (tree.has_flag(t, a, tree.F_FOCUS_WITHIN_LOOK) == 1) { tree.invalidate_paint(t, a); }
+        a = tree.parent(t, a);
+    }
 }
 
 // --- Bringing into view ---

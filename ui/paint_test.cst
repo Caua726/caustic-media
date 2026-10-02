@@ -1,0 +1,382 @@
+// ui/paint_test.cst — the tree drawn, region by region, read back as pixels.
+//
+// A headless software device renders into a texture that keeps what it holds
+// between frames, as a window's buffer does, so a frame that repaints only its
+// damage leaves the rest as it was — and is checked against a frame painted
+// from nothing.
+use "std/io.cst" as io;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "event.cst" as event;
+use "router.cst" as router;
+use "damage.cst" as damage;
+use "painter.cst" as painter;
+use "style.cst" as style;
+use "paint.cst" as paint;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as W with imut = 64;
+let is i64 as H with imut = 48;
+let is [3072]i32 as px with mut;
+let is [3072]i32 as px2 with mut;
+
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as target2 with mut = 0;
+let is i64 as cmd with mut = 0;
+
+fn pixel(x as i64, y as i64) as i64 { return cast(i64, px[y * W + x]) & 4294967295; }
+
+// What 0xRRGGBB looks like in an RGBA8 pixel read back as a little-endian i32.
+fn as_px(hex as i64) as i64 {
+    let is i64 as r = (hex >> 16) & 255;
+    let is i64 as g = (hex >> 8) & 255;
+    let is i64 as b = hex & 255;
+    return 4278190080 | (b << 16) | (g << 8) | r;
+}
+
+fn is_px(name as *u8, x as i64, y as i64, hex as i64) as void {
+    if (pixel(x, y) != as_px(hex)) {
+        io.printf("FAIL: %s: pixel %d,%d is %x, want %x\n", name, x, y,
+                  cast(i32, pixel(x, y)), cast(i32, as_px(hex)));
+        fails = fails + 1;
+    }
+}
+
+let is i64 as BG     with imut = 1052688;    // 0x101010
+let is i64 as RED    with imut = 16711680;   // 0xFF0000
+let is i64 as BLUE   with imut = 255;        // 0x0000FF
+let is i64 as CYAN   with imut = 65535;      // 0x00FFFF
+let is i64 as YELLOW with imut = 16776960;   // 0xFFFF00
+let is i64 as GREEN  with imut = 65280;      // 0x00FF00
+let is i64 as WHITE  with imut = 16777215;   // 0xFFFFFF
+let is i64 as PINK   with imut = 16711935;   // 0xFF00FF
+
+// --- Widgets ---
+
+// A filled rectangle that remembers how it was painted.
+struct Box {
+    w         as f64;
+    h         as f64;
+    color     as i64;
+    paints    as i64;
+    state     as i64;
+    rect      as math.rect.Rect;
+    clip      as math.rect.Rect;
+    own_focus as i64;   // draws its own focus and says so
+    leak      as i64;   // pushes a clip and forgets it
+    grab      as i64;   // captures presses
+    within    as i64;   // the colour while the focus is inside it, 0 for none
+}
+
+fn box_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Box as b = cast(*Box, data);
+    out.min_w = b.w;
+    out.min_h = b.h;
+    out.pref_w = b.w;
+    out.pref_h = b.h;
+    out.max_w = b.w;
+    out.max_h = b.h;
+}
+
+fn box_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    layout.overlay_arrange(t, w, r);
+}
+
+fn box_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Box as b = cast(*Box, data);
+    b.paints = b.paints + 1;
+    b.state = p.state;
+    b.rect = p.rect;
+    b.clip = p.clip;
+    let is i64 as col with mut = b.color;
+    if (b.within != 0 && (p.state & painter.S_FOCUS_WITHIN) != 0) { col = b.within; }
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, style.hex(col));
+    if (b.own_focus == 1) { p.focus_drawn = 1; }
+    if (b.leak == 1) { draw2d.push_clip(p.canvas, p.rect.x, p.rect.y, 1.0, 1.0); }
+}
+
+fn box_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Box as b = cast(*Box, data);
+    if (e.kind == event.POINTER_DOWN) { return b.grab; }
+    return 0;
+}
+
+let is tree.Kind as box_kind with mut;
+
+// An anchor places its one child just past its own right edge, as a dropdown
+// sits below its button: outside the anchor's rectangle.
+fn anchor_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is i64 as ch = tree.first_child(t, w);
+    if (ch == 0) { return; }
+    let is *Box as b = cast(*Box, tree.data(t, ch));
+    let is math.rect.Rect as at = math.rect.rect(r.w, 0.0, b.w, b.h);
+    layout.place(t, ch, &at);
+}
+
+let is tree.Kind as anchor_kind with mut;
+
+fn box_at(t as *tree.Tree, k as *tree.Kind, parent as i64, x as f64, y as f64, w as f64, h as f64, color as i64) as i64 {
+    let is i64 as b = tree.create(t, k, parent);
+    let is *Box as d = cast(*Box, tree.data(t, b));
+    d.w = w;
+    d.h = h;
+    d.color = color;
+    layout.set_align(t, b, layout.START, layout.START);
+    layout.set_margin(t, b, x, y, 0.0, 0.0);
+    return b;
+}
+
+fn data(t as *tree.Tree, w as i64) as *Box { return cast(*Box, tree.data(t, w)); }
+
+// --- Frames ---
+
+let is style.Theme as theme with mut;
+let is paint.Stats as stats with mut;
+
+// Lays out, collects, paints the damage onto what tg already holds, reads it
+// back into px.
+fn frame_into(t as *tree.Tree, c as *draw2d.Canvas, o as *paint.Options, tg as i64, dst as *u8) as i64 {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    damage.collect(t);
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    let is i64 as n = paint.frame(t, c, o, &stats);
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass_load(tg, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, tg, dst, W * H * 4);
+    tree.damage_clear(t);
+    return n;
+}
+
+fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *paint.Options) as i64 {
+    return frame_into(t, c, o, target, cast(*u8, &px));
+}
+
+fn main() as i32 {
+    box_kind = widget.kind("box", sizeof(Box));
+    box_kind.measure = fn_ptr(box_measure);
+    box_kind.arrange = fn_ptr(box_arrange);
+    box_kind.paint = fn_ptr(box_paint);
+    box_kind.event = fn_ptr(box_event);
+    anchor_kind = box_kind;
+    anchor_kind.name = "anchor";
+    anchor_kind.arrange = fn_ptr(anchor_arrange);
+
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    target2 = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as dl = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &dl);
+
+    theme = style.light();
+    theme.window_bg = style.hex(BG);
+    theme.focus_color = style.hex(GREEN);
+    theme.focus_width = 2.0;
+    theme.focus_offset = 0.0;
+    theme.focus_radius = 0.0;
+
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    let is i64 as root = tree.root(&t);
+    let is router.Router as r = router.init(router.settings_default());
+    let is paint.Options as o = paint.options(&theme);
+    o.router = &r;
+
+    let is i64 as a = box_at(&t, &box_kind, root, 4.0, 4.0, 20.0, 12.0, RED);
+    let is i64 as a1 = box_at(&t, &box_kind, a, 10.0, 0.0, 40.0, 5.0, BLUE);
+    let is i64 as b = box_at(&t, &box_kind, root, 40.0, 4.0, 16.0, 16.0, CYAN);
+    let is i64 as cw = box_at(&t, &box_kind, root, 4.0, 30.0, 12.0, 12.0, YELLOW);
+    tree.set_focusable(&t, cw, 1);
+
+    // --- The first frame: the background, every widget, children over parents ---
+    check("first frame: one region", frame(&t, &c, &o) == 1);
+    check("first frame: every widget painted", stats.painted == 4);
+    is_px("background", 60, 44, BG);
+    is_px("a parent", 6, 10, RED);
+    is_px("its child over it", 15, 5, BLUE);
+    is_px("the child cut at the parent's edge", 26, 5, BG);
+    is_px("a sibling", 45, 10, CYAN);
+    check("the painter's rectangle: the window's",
+          data(&t, a1).rect.x == 14.0 && data(&t, a1).rect.y == 4.0 && data(&t, a1).rect.w == 40.0);
+    check("the painter's clip: cut by the parent",
+          data(&t, a1).clip.x == 14.0 && data(&t, a1).clip.w == 10.0 && data(&t, a1).clip.h == 5.0);
+
+    // --- A change repaints its own rectangle, and only what reaches it ---
+    data(&t, b).color = PINK;
+    tree.invalidate_paint(&t, b);
+    let is i64 as a_before = data(&t, a).paints;
+    frame(&t, &c, &o);
+    check("changed: only it painted", stats.painted == 1);
+    // The three at the top are looked at — a, b and the yellow one — but a's
+    // child is not: its parent lies outside the region.
+    check("changed: subtrees outside not even walked", stats.walked == 3);
+    check("changed: the far widget not called", data(&t, a).paints == a_before);
+    is_px("changed: its new colour", 45, 10, PINK);
+    is_px("changed: the rest as it was", 6, 10, RED);
+
+    // --- Hidden: the place it left shows what is behind ---
+    tree.set_visible(&t, b, 0);
+    frame(&t, &c, &o);
+    is_px("hidden: the background where it was", 45, 10, BG);
+    tree.set_visible(&t, b, 1);
+    frame(&t, &c, &o);
+    is_px("shown again", 45, 10, PINK);
+
+    // --- A layered child escapes its parent's clip and draws above later siblings ---
+    let is i64 as q = box_at(&t, &anchor_kind, root, 4.0, 20.0, 10.0, 6.0, WHITE);
+    let is i64 as pop = tree.create(&t, &box_kind, q);
+    data(&t, pop).w = 12.0;
+    data(&t, pop).h = 6.0;
+    data(&t, pop).color = BLUE;
+    let is i64 as s = box_at(&t, &box_kind, root, 18.0, 18.0, 6.0, 10.0, CYAN);
+    frame(&t, &c, &o);
+    is_px("not layered: cut off outside its parent", 15, 22, BG);
+    is_px("not layered: under the later sibling", 20, 22, CYAN);
+    tree.set_layer(&t, pop, 1);
+    frame(&t, &c, &o);
+    is_px("layered: outside its parent", 15, 22, BLUE);
+    is_px("layered: above the later sibling", 20, 22, BLUE);
+    check("layered: hit first", router.hit(&t, 20.0, 22.0) == pop);
+    check("layered: elsewhere the sibling is hit", router.hit(&t, 20.0, 27.0) == s);
+    tree.set_layer(&t, pop, 0);
+    frame(&t, &c, &o);
+    is_px("back on layer 0: cut off again", 15, 22, BG);
+    check("back on layer 0: not hit", router.hit(&t, 20.0, 22.0) == s);
+
+    // --- A partial repaint draws what a full one would ---
+    data(&t, a).color = YELLOW;
+    tree.invalidate_paint(&t, a);
+    frame(&t, &c, &o);
+    let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, cast(f64, W), cast(f64, H));
+    tree.damage_add(&t, &all);
+    frame_into(&t, &c, &o, target2, cast(*u8, &px2));
+    let is i64 as diff with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        if (px[i] != px2[i]) { diff = diff + 1; }
+        i = i + 1;
+    }
+    check("partial repaints equal a full frame", diff == 0);
+
+    // --- The focus ring: by keyboard only, and not where the widget drew its own ---
+    router.focus(&t, &r, cw, 1);
+    frame(&t, &c, &o);
+    check("keyboard focus: a ring", stats.rings == 1);
+    is_px("keyboard focus: the ring at the edge", 4, 30, GREEN);
+    is_px("keyboard focus: the widget inside it", 9, 35, YELLOW);
+    check("keyboard focus: the state says so",
+          (data(&t, cw).state & painter.S_FOCUS_VISIBLE) != 0 && (data(&t, cw).state & painter.S_FOCUSED) != 0);
+    router.focus(&t, &r, cw, 0);
+    frame(&t, &c, &o);
+    check("pointer focus: no ring", stats.rings == 0);
+    is_px("pointer focus: the edge is the widget's", 4, 30, YELLOW);
+    check("pointer focus: focused, not visibly", (data(&t, cw).state & painter.S_FOCUS_VISIBLE) == 0
+          && (data(&t, cw).state & painter.S_FOCUSED) != 0);
+    data(&t, cw).own_focus = 1;
+    router.focus(&t, &r, cw, 1);
+    frame(&t, &c, &o);
+    check("its own focus: no ring from the painter", stats.rings == 0);
+    is_px("its own focus: the edge is the widget's", 4, 30, YELLOW);
+    router.focus(&t, &r, 0, 0);
+    frame(&t, &c, &o);
+    // The ring goes round the whole widget, drawn after its children and
+    // clipped to it, not to the last child drawn.
+    tree.set_focusable(&t, a, 1);
+    router.focus(&t, &r, a, 1);
+    frame(&t, &c, &o);
+    is_px("a parent's ring: its left edge, away from its child", 4, 10, GREEN);
+    router.focus(&t, &r, 0, 0);
+    tree.set_focusable(&t, a, 0);
+    frame(&t, &c, &o);
+
+    // --- States reach the paint entry ---
+    router.pointer_move(&t, &r, 45.0, 10.0, 0);
+    frame(&t, &c, &o);
+    check("hover", (data(&t, b).state & painter.S_HOVER) != 0);
+    data(&t, b).grab = 1;
+    router.pointer_button(&t, &r, 1, 1, 45.0, 10.0, 0);
+    frame(&t, &c, &o);
+    check("pressed", (data(&t, b).state & painter.S_PRESSED) != 0);
+    router.pointer_button(&t, &r, 1, 0, 45.0, 10.0, 0);
+    frame(&t, &c, &o);
+    check("released", (data(&t, b).state & painter.S_PRESSED) == 0);
+    router.pointer_move(&t, &r, 60.0, 44.0, 0);
+    frame(&t, &c, &o);
+    check("left", (data(&t, b).state & painter.S_HOVER) == 0);
+    tree.set_enabled(&t, a, 0);
+    frame(&t, &c, &o);
+    check("disabled: the child too", (data(&t, a1).state & painter.S_DISABLED) != 0);
+    tree.set_enabled(&t, a, 1);
+    frame(&t, &c, &o);
+    check("enabled again", (data(&t, a1).state & painter.S_DISABLED) == 0);
+    tree.set_flag(&t, a, tree.F_FOCUS_WITHIN_LOOK, 1);
+    data(&t, a).within = GREEN;
+    tree.set_focusable(&t, a1, 1);
+    router.focus(&t, &r, a1, 1);
+    frame(&t, &c, &o);
+    check("focus within: the state says so", (data(&t, a).state & painter.S_FOCUS_WITHIN) != 0);
+    is_px("focus within: all of the parent repainted, not just round the child", 6, 12, GREEN);
+    router.focus(&t, &r, 0, 0);
+    frame(&t, &c, &o);
+    check("focus left: not within", (data(&t, a).state & painter.S_FOCUS_WITHIN) == 0);
+    is_px("focus left: the parent as it was", 6, 12, YELLOW);
+    data(&t, a).within = 0;
+    o.active = 0;
+    tree.invalidate_paint(&t, b);
+    frame(&t, &c, &o);
+    check("backdrop", (data(&t, b).state & painter.S_BACKDROP) != 0);
+    o.active = 1;
+    tree.invalidate_paint(&t, b);
+    frame(&t, &c, &o);
+
+    // --- A paint entry that leaves a clip behind does not cut its siblings ---
+    data(&t, a).leak = 1;
+    data(&t, b).color = WHITE;
+    tree.invalidate_paint(&t, a);
+    tree.invalidate_paint(&t, b);
+    frame(&t, &c, &o);
+    is_px("after a leaky sibling: still whole", 54, 18, WHITE);
+    data(&t, a).leak = 0;
+
+    // --- Deeper than the canvas's clip stack ---
+    let is i64 as deep with mut = box_at(&t, &box_kind, root, 30.0, 26.0, 30.0, 20.0, WHITE);
+    let is i64 as level with mut = 0;
+    while (level < 40) {
+        deep = box_at(&t, &box_kind, deep, 0.0, 0.0, 30.0, 20.0, WHITE);
+        level = level + 1;
+    }
+    data(&t, deep).color = PINK;
+    frame(&t, &c, &o);
+    check("forty deep: the canvas did not overflow", draw2d.overflowed(&c) == 0);
+    is_px("forty deep: the deepest drawn", 45, 36, PINK);
+
+    draw2d.close(&c);
+    tree.close(&t);
+    if (fails > 0) {
+        io.printf("paint: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("paint: all checks passed\n");
+    return 0;
+}
