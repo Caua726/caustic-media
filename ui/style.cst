@@ -1,44 +1,797 @@
 // ui/style.cst — the theme: what every widget's look is made of.
 //
-// One struct, as ui.md decides — not CSS. A window paints with one theme, and
-// a widget reads what it needs from the painter's.
+// One struct, as ui.md decides, not CSS. A theme is TOKENS — a palette of
+// colours by role, a typographic scale, spacing, radii, borders, shadows and
+// durations — and, derived from them, the VARIANTS a widget picks from by the
+// state it is in: a button's colours at rest, hovered, pressed, checked,
+// disabled, in a window that is not active. A widget never writes a colour
+// down; it asks for its role's, so a theme switched at run time — light to
+// dark, the user's accent, high contrast — reaches every widget there is.
 //
-// Colours are sRGB, as written: 0x3584E4 is the blue a designer picked, and it
-// is what lands in the pixel. Blending happens between those values too — the
-// way browsers and the platform toolkits blend — so a theme's colours come out
-// exactly as specified. (math.color.from_hex converts to linear light for
-// lighting maths; a theme must not go through it, or every colour is drawn
-// darker than it was chosen.)
+// Colours are sRGB as written: #3584E4 is the blue that lands in the pixel,
+// and blending happens between those values, as browsers and the platform
+// toolkits blend. Every theme is finished the same way: whatever colour a
+// palette or a preference asked for, text is nudged until it can be read —
+// 4.5 to 1 against what it sits on, 7 in high contrast, 3 for the focus ring
+// and what only has to be seen — so a user's yellow accent gets dark text on
+// it rather than white.
+//
+// Following the system: Prefs carries what the platform reports — dark or
+// light, high contrast, an accent colour, the interface font and its size, a
+// text scale, reduced motion — and for_prefs builds the theme from it. Where
+// the values come from is window/'s concern.
+//
+// A widget, or a whole subtree, can override parts of the theme by role
+// (Overrides): a red accent for a dangerous panel, larger text for a reading
+// view. What depends on what was overridden — the buttons drawn in the accent,
+// the ring — is derived again.
 use "../math/math.cst" as math;
+use "painter.cst" as painter;
 
-struct Theme {
-    window_bg    as math.color.Color;   // behind everything
-    focus_color  as math.color.Color;   // the keyboard focus ring
-    focus_width  as f64;
-    focus_offset as f64;                // the ring's distance inside the widget's edge
-    focus_radius as f64;
-}
+// --- Colours ---
 
 // 0xRRGGBB as written, opaque.
-fn hex(v as i64) as math.color.Color {
-    return math.color.rgba(cast(f64, (v >> 16) & 255) / 255.0,
-                           cast(f64, (v >> 8) & 255) / 255.0,
-                           cast(f64, v & 255) / 255.0, 1.0);
-}
+fn hex(v as i64) as math.color.Color { return math.color.hex(v); }
 
 // The same with an alpha, 0 to 255.
 fn hexa(v as i64, alpha as i64) as math.color.Color {
-    let is math.color.Color as c with mut = hex(v);
+    let is math.color.Color as c with mut = math.color.hex(v);
     c.a = cast(f64, alpha) / 255.0;
     return c;
 }
 
-fn light() as Theme {
+fn with_alpha(c as math.color.Color, a as f64) as math.color.Color {
+    return math.color.rgba(c.r, c.g, c.b, a);
+}
+
+// a to b by t, channel by channel, alpha too.
+fn mix(a as math.color.Color, b as math.color.Color, t as f64) as math.color.Color {
+    return math.color.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+                           a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t);
+}
+
+// top laid over bottom, as the blending puts it on the screen.
+fn over(top as math.color.Color, bottom as math.color.Color) as math.color.Color {
+    let is f64 as ta = top.a;
+    let is f64 as a = ta + bottom.a * (1.0 - ta);
+    if (a <= 0.0) { return math.color.rgba(0.0, 0.0, 0.0, 0.0); }
+    let is f64 as kb = bottom.a * (1.0 - ta);
+    return math.color.rgba((top.r * ta + bottom.r * kb) / a, (top.g * ta + bottom.g * kb) / a,
+                           (top.b * ta + bottom.b * kb) / a, a);
+}
+
+// Relative luminance, as WCAG defines it: linear light, weighted for the eye.
+fn luminance(c as math.color.Color) as f64 {
+    let is math.color.Color as l = math.color.srgb_to_linear(c);
+    return 0.2126 * l.r + 0.7152 * l.g + 0.0722 * l.b;
+}
+
+// The WCAG contrast ratio, 1 to 21, the same whichever way round.
+fn contrast(a as math.color.Color, b as math.color.Color) as f64 {
+    let is f64 as la = luminance(a);
+    let is f64 as lb = luminance(b);
+    if (la > lb) { return (la + 0.05) / (lb + 0.05); }
+    return (lb + 0.05) / (la + 0.05);
+}
+
+// Black or white, whichever reads better on bg. One of them always reaches
+// 4.5 to 1.
+fn text_on(bg as math.color.Color) as math.color.Color {
+    if (contrast(math.color.hex(0x000000), bg) >= contrast(math.color.hex(0xFFFFFF), bg)) {
+        return math.color.hex(0x000000);
+    }
+    return math.color.hex(0xFFFFFF);
+}
+
+fn _min2(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _worst(c as math.color.Color, bg1 as math.color.Color, bg2 as math.color.Color) as f64 {
+    return _min2(contrast(c, bg1), contrast(c, bg2));
+}
+
+// c moved towards black or white — whichever reads better on both
+// backgrounds — in small steps until it reaches ratio against both, keeping as
+// much of its hue as it can.
+fn _readable(c as math.color.Color, bg1 as math.color.Color, bg2 as math.color.Color, ratio as f64) as math.color.Color {
+    if (_worst(c, bg1, bg2) >= ratio) { return c; }
+    let is math.color.Color as to with mut = math.color.hex(0x000000);
+    if (_worst(math.color.hex(0xFFFFFF), bg1, bg2) > _worst(to, bg1, bg2)) { to = math.color.hex(0xFFFFFF); }
+    let is f64 as k with mut = 0.05;
+    while (k < 1.0001) {
+        let is math.color.Color as m = mix(c, to, k);
+        if (_worst(m, bg1, bg2) >= ratio) { return m; }
+        k = k + 0.05;
+    }
+    return to;
+}
+
+// A background for text: moved away from whichever of black and white reads
+// better on it, in small steps, until that one reaches ratio.
+fn _bg_for_text(bg as math.color.Color, ratio as f64) as math.color.Color {
+    let is math.color.Color as text = text_on(bg);
+    if (contrast(text, bg) >= ratio) { return bg; }
+    let is math.color.Color as to with mut = math.color.hex(0xFFFFFF);
+    if (text.r > 0.5) { to = math.color.hex(0x000000); }
+    let is f64 as k with mut = 0.05;
+    while (k < 1.0001) {
+        let is math.color.Color as m = mix(bg, to, k);
+        if (contrast(text, m) >= ratio) { return m; }
+        k = k + 0.05;
+    }
+    return to;
+}
+
+// --- Tokens ---
+
+struct Palette {
+    window_bg      as math.color.Color;   // behind everything
+    view_bg        as math.color.Color;   // lists, text fields, content
+    card_bg        as math.color.Color;
+    popover_bg     as math.color.Color;   // menus, popovers
+    headerbar_bg   as math.color.Color;
+    fg             as math.color.Color;   // text
+    fg_dim         as math.color.Color;   // secondary text
+    border         as math.color.Color;
+    separator      as math.color.Color;
+    accent         as math.color.Color;   // the default button, a checked box
+    accent_fg      as math.color.Color;
+    selection_bg   as math.color.Color;
+    selection_fg   as math.color.Color;
+    focus          as math.color.Color;   // the keyboard focus ring
+    destructive    as math.color.Color;
+    destructive_fg as math.color.Color;
+    success        as math.color.Color;
+    warning        as math.color.Color;
+    error          as math.color.Color;
+    link           as math.color.Color;
+    shadow         as math.color.Color;
+    tooltip_bg     as math.color.Color;
+    tooltip_fg     as math.color.Color;
+}
+
+struct TextStyle {
+    size   as f64;   // logical pixels
+    weight as i64;   // 100 to 900; 400 regular, 700 bold
+}
+
+struct Fonts {
+    family      as *u8;   // the interface font's family name
+    mono        as *u8;
+    caption     as TextStyle;
+    body        as TextStyle;
+    body_strong as TextStyle;
+    heading     as TextStyle;
+    title       as TextStyle;
+    large_title as TextStyle;
+    mono_body   as TextStyle;
+    line_height as f64;   // as a multiple of the size
+}
+
+struct Shadow {
+    x     as f64;
+    y     as f64;
+    blur  as f64;
+    color as math.color.Color;
+}
+
+struct Metrics {
+    space_xs as f64;
+    space_s  as f64;
+    space_m  as f64;
+    space_l  as f64;
+    space_xl as f64;
+    radius_s as f64;   // small things: a check box
+    radius_m as f64;   // controls
+    radius_l as f64;   // cards, popovers, dialogs
+    border_width   as f64;
+    focus_width    as f64;
+    focus_offset   as f64;   // the ring's distance inside the widget's edge
+    focus_radius   as f64;
+    control_height as f64;   // a button, an entry
+    control_pad_x  as f64;
+    control_pad_y  as f64;
+    indicator      as f64;   // a check box or radio's side
+    switch_w       as f64;
+    switch_h       as f64;
+    scrollbar_overlay as f64;
+    scrollbar_classic as f64;
+    handle         as f64;   // a splitter's
+    shadow_s as Shadow;
+    shadow_m as Shadow;
+    shadow_l as Shadow;
+}
+
+struct Motion {
+    fast    as i64;   // milliseconds
+    normal  as i64;
+    slow    as i64;
+    reduced as i32;   // the user asked for less motion: every duration is 0
+    _pad0   as i32;
+}
+
+// --- States ---
+
+// What a widget is drawn in: its background, its text and its border.
+struct Look {
+    bg     as math.color.Color;
+    fg     as math.color.Color;
+    border as math.color.Color;
+}
+
+// The variants of one class of widget. Hover and press are overlays laid on
+// whichever background applies, the way GTK 4 and Windows 11 do it, so a
+// checked toggle hovered is the checked colour, a little changed.
+struct Variants {
+    normal          as Look;
+    checked         as Look;   // on, selected, the current tab
+    hover_overlay   as math.color.Color;
+    pressed_overlay as math.color.Color;
+    disabled_alpha  as f64;
+}
+
+// The look for a painter's state; checked for widgets that are on.
+// Disabled wins over everything and fades it; pressed over hover; a window in
+// the backdrop quiets its text.
+fn pick(v as *Variants, state as i64, checked as i32) as Look {
+    let is Look as l with mut = v.normal;
+    if (checked == 1) { l = v.checked; }
+    if ((state & painter.S_DISABLED) != 0) {
+        l.bg = with_alpha(l.bg, l.bg.a * v.disabled_alpha);
+        l.fg = with_alpha(l.fg, l.fg.a * v.disabled_alpha);
+        l.border = with_alpha(l.border, l.border.a * v.disabled_alpha);
+        return l;
+    }
+    if ((state & painter.S_PRESSED) != 0) {
+        l.bg = over(v.pressed_overlay, l.bg);
+    } else if ((state & painter.S_HOVER) != 0) {
+        l.bg = over(v.hover_overlay, l.bg);
+    }
+    // Towards the background it sits on; on none of its own, fainter.
+    if ((state & painter.S_BACKDROP) != 0) {
+        if (l.bg.a < 0.5) {
+            l.fg = with_alpha(l.fg, l.fg.a * 0.6);
+        } else {
+            l.fg = mix(l.fg, l.bg, 0.3);
+        }
+    }
+    return l;
+}
+
+// --- The theme ---
+
+struct Theme {
+    name          as *u8;
+    dark          as i32;
+    high_contrast as i32;
+    text_ratio    as f64;   // what finish() holds text to
+    ui_ratio      as f64;   // and what only has to be seen
+    palette       as Palette;
+    fonts         as Fonts;
+    metrics       as Metrics;
+    motion        as Motion;
+    control       as Variants;   // buttons, toggles
+    suggested     as Variants;   // the default action, in the accent
+    destructive   as Variants;
+    field         as Variants;   // entries, spin boxes; checked is focused
+    row           as Variants;   // list rows, menu items; checked is selected
+    indicator     as Variants;   // check boxes, radios, switches; checked is on
+    track         as Variants;   // sliders, progress, scroll bars; checked is the filled part
+}
+
+fn _look(bg as math.color.Color, fg as math.color.Color, border as math.color.Color) as Look {
+    let is Look as l;
+    l.bg = bg;
+    l.fg = fg;
+    l.border = border;
+    return l;
+}
+
+fn _variants(normal as Look, checked as Look, hover as math.color.Color, pressed as math.color.Color) as Variants {
+    let is Variants as v;
+    v.normal = normal;
+    v.checked = checked;
+    v.hover_overlay = hover;
+    v.pressed_overlay = pressed;
+    v.disabled_alpha = 0.5;
+    return v;
+}
+
+fn _clear() as math.color.Color { return math.color.rgba(0.0, 0.0, 0.0, 0.0); }
+
+// What depends on the accent: its text, the selection, the ring, links.
+fn _finish_accent(th as *Theme) as void {
+    let is *Palette as p = &th.palette;
+    p.accent_fg = text_on(p.accent);
+    p.selection_bg = _bg_for_text(p.accent, th.text_ratio);
+    p.selection_fg = text_on(p.selection_bg);
+    p.focus = _readable(p.accent, p.window_bg, p.view_bg, th.ui_ratio);
+    p.link = _readable(p.accent, p.view_bg, p.window_bg, th.text_ratio);
+}
+
+// Every theme ends here: text made readable, the accent's dependants, and the
+// variants derived from the palette.
+fn finish(th as *Theme) as void {
+    let is *Palette as p = &th.palette;
+    p.fg = _readable(p.fg, p.window_bg, p.view_bg, th.text_ratio);
+    p.fg = _readable(p.fg, p.card_bg, p.view_bg, th.text_ratio);
+    p.fg_dim = _readable(p.fg_dim, p.window_bg, p.view_bg, th.ui_ratio + 1.0);
+    p.destructive_fg = text_on(p.destructive);
+    p.tooltip_fg = text_on(p.tooltip_bg);
+    _finish_accent(th);
+    derive(th);
+}
+
+// The variants from the palette. Called by finish and after overrides.
+fn derive(th as *Theme) as void {
+    let is *Palette as p = &th.palette;
+    let is math.color.Color as faint = with_alpha(p.fg, 0.06);
+    let is math.color.Color as press = with_alpha(p.fg, 0.16);
+    let is math.color.Color as edge with mut = _clear();
+    if (th.high_contrast == 1) { edge = p.border; }
+    th.control = _variants(_look(mix(p.window_bg, p.fg, 0.10), p.fg, edge),
+                           _look(mix(p.window_bg, p.fg, 0.28), p.fg, edge), faint, press);
+    th.suggested = _variants(_look(p.accent, p.accent_fg, edge), _look(p.accent, p.accent_fg, edge),
+                             with_alpha(p.accent_fg, 0.10), with_alpha(p.accent_fg, 0.22));
+    th.destructive = _variants(_look(p.destructive, p.destructive_fg, edge),
+                               _look(p.destructive, p.destructive_fg, edge),
+                               with_alpha(p.destructive_fg, 0.10), with_alpha(p.destructive_fg, 0.22));
+    th.field = _variants(_look(p.view_bg, p.fg, p.border), _look(p.view_bg, p.fg, p.focus), faint, faint);
+    th.row = _variants(_look(_clear(), p.fg, _clear()), _look(p.selection_bg, p.selection_fg, _clear()),
+                       faint, press);
+    th.indicator = _variants(_look(p.view_bg, p.fg, p.border), _look(p.accent, p.accent_fg, p.accent),
+                             faint, press);
+    th.track = _variants(_look(mix(p.window_bg, p.fg, 0.15), p.fg, edge), _look(p.accent, p.accent_fg, edge),
+                         faint, press);
+}
+
+fn _text(size as f64, weight as i64) as TextStyle {
+    let is TextStyle as s;
+    s.size = size;
+    s.weight = weight;
+    return s;
+}
+
+fn _shadow(y as f64, blur as f64, alpha as f64) as Shadow {
+    let is Shadow as s;
+    s.x = 0.0;
+    s.y = y;
+    s.blur = blur;
+    s.color = math.color.rgba(0.0, 0.0, 0.0, alpha);
+    return s;
+}
+
+// The neutral starting point every theme here is built from.
+fn _base(dark as i32) as Theme {
     let is Theme as th;
-    th.window_bg = hex(16448250);      // 0xFAFAFA
-    th.focus_color = hex(3507428);     // 0x3584E4
-    th.focus_width = 2.0;
-    th.focus_offset = 1.0;
-    th.focus_radius = 4.0;
+    th.name = "caustic";
+    th.dark = dark;
+    th.high_contrast = 0;
+    th.text_ratio = 4.5;
+    th.ui_ratio = 3.0;
+    let is *Palette as p = &th.palette;
+    if (dark == 0) {
+        p.window_bg = hex(0xFAFAFA);
+        p.view_bg = hex(0xFFFFFF);
+        p.card_bg = hex(0xFFFFFF);
+        p.popover_bg = hex(0xFFFFFF);
+        p.headerbar_bg = hex(0xEBEBEB);
+        p.fg = hex(0x1E1E1E);
+        p.fg_dim = hex(0x5E5E5E);
+        p.border = hex(0xD0D0D0);
+        p.separator = hex(0xE0E0E0);
+        p.destructive = hex(0xE01B24);
+        p.success = hex(0x1A8B79);
+        p.warning = hex(0x995800);
+        p.error = hex(0xE01B24);
+        p.shadow = math.color.rgba(0.0, 0.0, 0.0, 0.2);
+        p.tooltip_bg = hex(0x1F1F1F);
+    } else {
+        p.window_bg = hex(0x242424);
+        p.view_bg = hex(0x1E1E1E);
+        p.card_bg = hex(0x303030);
+        p.popover_bg = hex(0x383838);
+        p.headerbar_bg = hex(0x303030);
+        p.fg = hex(0xFFFFFF);
+        p.fg_dim = hex(0xA8A8A8);
+        p.border = hex(0x5E5E5E);
+        p.separator = hex(0x3A3A3A);
+        p.destructive = hex(0xC01C28);
+        p.success = hex(0x26C27E);
+        p.warning = hex(0xCD9A1B);
+        p.error = hex(0xFF6464);
+        p.shadow = math.color.rgba(0.0, 0.0, 0.0, 0.45);
+        p.tooltip_bg = hex(0x141414);
+    }
+    p.accent = hex(0x3584E4);
+    let is *Fonts as f = &th.fonts;
+    f.family = "Noto Sans";
+    f.mono = "Noto Sans Mono";
+    f.caption = _text(12.0, 400);
+    f.body = _text(14.0, 400);
+    f.body_strong = _text(14.0, 700);
+    f.heading = _text(15.0, 700);
+    f.title = _text(20.0, 700);
+    f.large_title = _text(26.0, 800);
+    f.mono_body = _text(14.0, 400);
+    f.line_height = 1.4;
+    let is *Metrics as m = &th.metrics;
+    m.space_xs = 2.0;
+    m.space_s = 4.0;
+    m.space_m = 8.0;
+    m.space_l = 12.0;
+    m.space_xl = 18.0;
+    m.radius_s = 4.0;
+    m.radius_m = 6.0;
+    m.radius_l = 12.0;
+    m.border_width = 1.0;
+    m.focus_width = 2.0;
+    m.focus_offset = 1.0;
+    m.focus_radius = 6.0;
+    m.control_height = 34.0;
+    m.control_pad_x = 12.0;
+    m.control_pad_y = 6.0;
+    m.indicator = 16.0;
+    m.switch_w = 44.0;
+    m.switch_h = 24.0;
+    m.scrollbar_overlay = 8.0;
+    m.scrollbar_classic = 14.0;
+    m.handle = 6.0;
+    m.shadow_s = _shadow(1.0, 3.0, 0.15);
+    m.shadow_m = _shadow(2.0, 8.0, 0.2);
+    m.shadow_l = _shadow(6.0, 24.0, 0.25);
+    th.motion.fast = 100;
+    th.motion.normal = 200;
+    th.motion.slow = 300;
+    th.motion.reduced = 0;
+    th.motion._pad0 = 0;
     return th;
+}
+
+fn light() as Theme {
+    let is Theme as th = _base(0);
+    finish(&th);
+    return th;
+}
+
+fn dark() as Theme {
+    let is Theme as th = _base(1);
+    finish(&th);
+    return th;
+}
+
+// For low vision: black and white, borders on everything, text at 7 to 1.
+fn high_contrast(dark as i32) as Theme {
+    let is Theme as th = _base(dark);
+    th.name = "high contrast";
+    th.high_contrast = 1;
+    th.text_ratio = 7.0;
+    th.ui_ratio = 4.5;
+    let is *Palette as p = &th.palette;
+    if (dark == 0) {
+        p.window_bg = hex(0xFFFFFF);
+        p.view_bg = hex(0xFFFFFF);
+        p.card_bg = hex(0xFFFFFF);
+        p.popover_bg = hex(0xFFFFFF);
+        p.headerbar_bg = hex(0xFFFFFF);
+        p.fg = hex(0x000000);
+        p.fg_dim = hex(0x333333);
+        p.border = hex(0x000000);
+        p.separator = hex(0x000000);
+        p.accent = hex(0x0040A0);
+        p.destructive = hex(0xA00000);
+        p.tooltip_bg = hex(0x000000);
+    } else {
+        p.window_bg = hex(0x000000);
+        p.view_bg = hex(0x000000);
+        p.card_bg = hex(0x000000);
+        p.popover_bg = hex(0x000000);
+        p.headerbar_bg = hex(0x000000);
+        p.fg = hex(0xFFFFFF);
+        p.fg_dim = hex(0xE0E0E0);
+        p.border = hex(0xFFFFFF);
+        p.separator = hex(0xFFFFFF);
+        p.accent = hex(0x80C0FF);
+        p.destructive = hex(0xFF6060);
+        p.tooltip_bg = hex(0xFFFFFF);
+    }
+    th.metrics.border_width = 2.0;
+    th.metrics.focus_width = 3.0;
+    finish(&th);
+    return th;
+}
+
+// --- Changing a theme ---
+
+fn with_accent(th as *Theme, c as math.color.Color) as void {
+    th.palette.accent = with_alpha(c, 1.0);
+    _finish_accent(th);
+    derive(th);
+}
+
+fn _scale_text(f as *Fonts, k as f64) as void {
+    f.caption.size = f.caption.size * k;
+    f.body.size = f.body.size * k;
+    f.body_strong.size = f.body_strong.size * k;
+    f.heading.size = f.heading.size * k;
+    f.title.size = f.title.size * k;
+    f.large_title.size = f.large_title.size * k;
+    f.mono_body.size = f.mono_body.size * k;
+}
+
+// The interface font, and its size for body text: every other size keeps its
+// proportion to it. A null family or a size of 0 keeps the theme's.
+fn with_font(th as *Theme, family as *u8, size as f64) as void {
+    if (cast(i64, family) != 0) { th.fonts.family = family; }
+    if (size > 0.0 && th.fonts.body.size > 0.0) { _scale_text(&th.fonts, size / th.fonts.body.size); }
+}
+
+// Larger or smaller text everywhere — the platform's text scaling.
+fn with_text_scale(th as *Theme, k as f64) as void {
+    if (k > 0.0) { _scale_text(&th.fonts, k); }
+}
+
+fn with_reduced_motion(th as *Theme, on as i32) as void {
+    th.motion.reduced = on;
+    if (on == 1) {
+        th.motion.fast = 0;
+        th.motion.normal = 0;
+        th.motion.slow = 0;
+    }
+}
+
+// --- Following the system ---
+
+struct Prefs {
+    dark          as i32;
+    high_contrast as i32;
+    reduce_motion as i32;
+    has_accent    as i32;
+    accent        as math.color.Color;
+    font_family   as *u8;   // null: the theme's
+    mono_family   as *u8;
+    font_size     as f64;   // body text, logical pixels; 0: the theme's
+    text_scale    as f64;   // 1 for none
+}
+
+fn prefs_default() as Prefs {
+    let is Prefs as p;
+    p.dark = 0;
+    p.high_contrast = 0;
+    p.reduce_motion = 0;
+    p.has_accent = 0;
+    p.accent = hex(0x3584E4);
+    p.font_family = cast(*u8, 0);
+    p.mono_family = cast(*u8, 0);
+    p.font_size = 0.0;
+    p.text_scale = 1.0;
+    return p;
+}
+
+fn for_prefs(p as *Prefs) as Theme {
+    let is Theme as th with mut = light();
+    if (p.high_contrast == 1) {
+        th = high_contrast(p.dark);
+    } else if (p.dark == 1) {
+        th = dark();
+    }
+    // High contrast keeps its own accent: a user's pastel would not meet it.
+    if (p.has_accent == 1 && p.high_contrast == 0) { with_accent(&th, p.accent); }
+    with_font(&th, p.font_family, p.font_size);
+    if (cast(i64, p.mono_family) != 0) { th.fonts.mono = p.mono_family; }
+    with_text_scale(&th, p.text_scale);
+    with_reduced_motion(&th, p.reduce_motion);
+    return th;
+}
+
+// --- Themes that look like the platforms' ---
+//
+// Close to GNOME's Adwaita, KDE's Breeze and Windows 11 in colour, type,
+// corners and size — not copies of them: drawn by this toolkit, so a program
+// can sit among the platform's own without looking out of place. Text that
+// the original draws below the contrast floors here is nudged up to them.
+
+fn adwaita(dark as i32) as Theme {
+    let is Theme as th = _base(dark);
+    th.name = "adwaita";
+    let is *Palette as p = &th.palette;
+    if (dark == 0) {
+        p.window_bg = hex(0xFAFAFA);
+        p.view_bg = hex(0xFFFFFF);
+        p.card_bg = hex(0xFFFFFF);
+        p.headerbar_bg = hex(0xEBEBEB);
+        p.fg = hex(0x323232);   // black at 80% on the window
+        p.fg_dim = hex(0x5C5C5C);
+        p.destructive = hex(0xE01B24);
+    } else {
+        p.window_bg = hex(0x242424);
+        p.view_bg = hex(0x1E1E1E);
+        p.card_bg = hex(0x353535);
+        p.headerbar_bg = hex(0x303030);
+        p.fg = hex(0xFFFFFF);
+        p.fg_dim = hex(0xB2B2B2);
+        p.destructive = hex(0xC01C28);
+    }
+    p.accent = hex(0x3584E4);
+    th.fonts.family = "Cantarell";
+    th.fonts.mono = "Monospace";
+    _scale_text(&th.fonts, 14.666666666666666 / th.fonts.body.size);   // 11 pt
+    th.metrics.radius_s = 4.0;
+    th.metrics.radius_m = 6.0;
+    th.metrics.radius_l = 12.0;
+    th.metrics.focus_radius = 6.0;
+    th.metrics.control_height = 34.0;
+    finish(&th);
+    return th;
+}
+
+fn breeze(dark as i32) as Theme {
+    let is Theme as th = _base(dark);
+    th.name = "breeze";
+    let is *Palette as p = &th.palette;
+    if (dark == 0) {
+        p.window_bg = hex(0xEFF0F1);
+        p.view_bg = hex(0xFCFCFC);
+        p.card_bg = hex(0xFCFCFC);
+        p.headerbar_bg = hex(0xDDDEDF);
+        p.fg = hex(0x232629);
+        p.fg_dim = hex(0x555657);
+        p.border = hex(0xB8BCC3);
+        p.destructive = hex(0xDA4453);
+    } else {
+        p.window_bg = hex(0x31363B);
+        p.view_bg = hex(0x232629);
+        p.card_bg = hex(0x2A2E32);
+        p.headerbar_bg = hex(0x2A2E32);
+        p.fg = hex(0xEFF0F1);
+        p.fg_dim = hex(0xC0C0C0);
+        p.border = hex(0x4D4959);
+        p.destructive = hex(0xDA4453);
+    }
+    p.accent = hex(0x3DAEE9);
+    th.fonts.family = "Noto Sans";
+    th.fonts.mono = "Hack";
+    _scale_text(&th.fonts, 13.333333333333334 / th.fonts.body.size);   // 10 pt
+    th.metrics.radius_s = 2.0;
+    th.metrics.radius_m = 3.0;
+    th.metrics.radius_l = 5.0;
+    th.metrics.focus_radius = 3.0;
+    th.metrics.control_height = 30.0;
+    th.metrics.control_pad_x = 8.0;
+    finish(&th);
+    return th;
+}
+
+fn windows11(dark as i32) as Theme {
+    let is Theme as th = _base(dark);
+    th.name = "windows 11";
+    let is *Palette as p = &th.palette;
+    if (dark == 0) {
+        p.window_bg = hex(0xF3F3F3);
+        p.view_bg = hex(0xFBFBFB);
+        p.card_bg = hex(0xFBFBFB);
+        p.headerbar_bg = hex(0xF3F3F3);
+        p.fg = hex(0x1B1B1B);
+        p.fg_dim = hex(0x5E5E5E);
+        p.border = hex(0xD6D6D6);
+        p.accent = hex(0x005FB8);
+        p.destructive = hex(0xC42B1C);
+    } else {
+        p.window_bg = hex(0x202020);
+        p.view_bg = hex(0x1C1C1C);
+        p.card_bg = hex(0x2B2B2B);
+        p.headerbar_bg = hex(0x202020);
+        p.fg = hex(0xFFFFFF);
+        p.fg_dim = hex(0xCCCCCC);
+        p.border = hex(0x404040);
+        p.accent = hex(0x60CDFF);
+        p.destructive = hex(0xFF99A2);
+    }
+    th.fonts.family = "Segoe UI Variable";
+    th.fonts.mono = "Cascadia Mono";
+    th.fonts.caption = _text(12.0, 400);
+    th.fonts.body = _text(14.0, 400);
+    th.fonts.body_strong = _text(14.0, 600);
+    th.fonts.heading = _text(20.0, 600);
+    th.fonts.title = _text(28.0, 600);
+    th.fonts.large_title = _text(40.0, 600);
+    th.fonts.mono_body = _text(14.0, 400);
+    th.metrics.radius_s = 2.0;
+    th.metrics.radius_m = 4.0;
+    th.metrics.radius_l = 8.0;
+    th.metrics.focus_radius = 4.0;
+    th.metrics.control_height = 32.0;
+    th.metrics.control_pad_x = 11.0;
+    th.metrics.indicator = 20.0;
+    th.metrics.switch_w = 40.0;
+    th.metrics.switch_h = 20.0;
+    th.motion.fast = 83;
+    th.motion.normal = 167;
+    th.motion.slow = 250;
+    finish(&th);
+    return th;
+}
+
+// --- Overrides ---
+
+let is i32 as ROLE_WINDOW_BG   with imut = 0;
+let is i32 as ROLE_VIEW_BG     with imut = 1;
+let is i32 as ROLE_CARD_BG     with imut = 2;
+let is i32 as ROLE_FG          with imut = 3;
+let is i32 as ROLE_FG_DIM      with imut = 4;
+let is i32 as ROLE_BORDER      with imut = 5;
+let is i32 as ROLE_ACCENT      with imut = 6;
+let is i32 as ROLE_DESTRUCTIVE with imut = 7;
+let is i32 as ROLE_SUCCESS     with imut = 8;
+let is i32 as ROLE_WARNING     with imut = 9;
+let is i32 as ROLE_ERROR       with imut = 10;
+let is i32 as ROLE_COUNT       with imut = 11;
+
+// Parts of a theme a widget changes for itself and everything under it. The
+// program owns it; tree.set_overrides points a widget at it.
+struct Overrides {
+    set        as [11]i64;   // by role: 1 when colors holds one
+    colors     as [11]math.color.Color;
+    radius     as f64;   // controls' corner radius, the others in proportion; < 0 for none
+    text_scale as f64;   // 0 for none
+}
+
+fn overrides() as Overrides {
+    let is Overrides as o;
+    let is i64 as i with mut = 0;
+    while (i < ROLE_COUNT) {
+        o.set[i] = 0;
+        i = i + 1;
+    }
+    o.radius = 0.0 - 1.0;
+    o.text_scale = 0.0;
+    return o;
+}
+
+// Sets role to c, replacing what it was set to. Returns 0 for a role that
+// does not exist.
+fn override_color(o as *Overrides, role as i32, c as math.color.Color) as i32 {
+    if (role < 0 || role >= ROLE_COUNT) { return 0; }
+    o.set[role] = 1;
+    o.colors[role] = c;
+    return 1;
+}
+
+fn override_radius(o as *Overrides, r as f64) as void { o.radius = r; }
+fn override_text_scale(o as *Overrides, k as f64) as void { o.text_scale = k; }
+
+fn _set_role(p as *Palette, role as i32, c as math.color.Color) as void {
+    if (role == ROLE_WINDOW_BG) { p.window_bg = c; }
+    if (role == ROLE_VIEW_BG) { p.view_bg = c; }
+    if (role == ROLE_CARD_BG) { p.card_bg = c; }
+    if (role == ROLE_FG) { p.fg = c; }
+    if (role == ROLE_FG_DIM) { p.fg_dim = c; }
+    if (role == ROLE_BORDER) { p.border = c; }
+    if (role == ROLE_ACCENT) { p.accent = c; }
+    if (role == ROLE_DESTRUCTIVE) { p.destructive = c; }
+    if (role == ROLE_SUCCESS) { p.success = c; }
+    if (role == ROLE_WARNING) { p.warning = c; }
+    if (role == ROLE_ERROR) { p.error = c; }
+}
+
+// th with o laid on it: the roles set, then what depends on them derived
+// again — the accent's dependants when the accent changed, the variants
+// always. The colours asked for are used as given.
+fn apply(th as *Theme, o as *Overrides) as void {
+    let is i32 as role with mut = 0;
+    while (role < ROLE_COUNT) {
+        if (o.set[role] == 1) { _set_role(&th.palette, role, o.colors[role]); }
+        role = role + 1;
+    }
+    th.palette.destructive_fg = text_on(th.palette.destructive);
+    if (o.set[ROLE_ACCENT] == 1) { _finish_accent(th); }
+    if (o.radius >= 0.0) {
+        let is f64 as k with mut = 1.0;
+        if (th.metrics.radius_m > 0.0) { k = o.radius / th.metrics.radius_m; }
+        th.metrics.radius_s = th.metrics.radius_s * k;
+        th.metrics.radius_l = th.metrics.radius_l * k;
+        th.metrics.radius_m = o.radius;
+        th.metrics.focus_radius = o.radius;
+    }
+    if (o.text_scale > 0.0) { _scale_text(&th.fonts, o.text_scale); }
+    derive(th);
 }

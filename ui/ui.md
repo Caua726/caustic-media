@@ -272,8 +272,11 @@ own.
 matching and invalidation that CSS engines are built around. Most of what an
 application changes is a colour or a spacing, and a struct does that.
 
-Two themes ship, light and dark, chosen from the platform's preference and
-switchable at run time.
+Light, dark and high contrast ship, with Adwaita-, Breeze- and Windows 11-like
+themes beside them, chosen from the platform's preferences and switchable at run
+time. Every theme holds its text to WCAG contrast — 4.5 to 1, 7 in high
+contrast — whatever accent the user picked: text, the ring and the selection
+are moved towards black or white until they read.
 
 ---
 
@@ -431,8 +434,7 @@ ask, with `tree.F_FOCUS_WITHIN_LOOK`). A widget on a higher layer
 it and is hit-tested first: a popup inside the window. The focus ring is drawn
 after the subtree, inside the edge, unless the widget drew its own. A clip a
 paint entry forgets to pop is popped for it. `app.paint` paints a window with
-its own router and active state; `style.cst` holds the theme, with colours in
-sRGB as written.
+its own router and active state, in the application's theme.
 
 A widget with `tree.F_CACHE`, given a `paint.Cache`, is painted once into a
 texture and put back while nothing inside it changes — moved as a whole, it
@@ -442,6 +444,28 @@ repaints the places it left and reached without one paint entry inside it
 than moving along with it. The texture holds premultiplied colour and goes back
 with a premultiplied blend, so soft edges match painting directly; a cache
 inside a cache, or one with a layered widget inside, is painted directly.
+
+**The theme** (`style.cst`, tested by `style_test`): tokens — a palette by role,
+a type scale, spacing, radii, borders, shadows, durations — and the variants a
+widget picks from by its painter state (`style.pick`): controls, the suggested
+and destructive actions, fields, rows, indicators and tracks, with hover and
+press laid over whichever background applies, disabled fading everything and a
+window in the backdrop quieting its text. Colours are sRGB as written
+(`math.color.hex`). `style.finish` holds any palette — a preset, the user's
+accent, the program's own colours — to the contrast floors; `style_test` checks
+every theme against them. `style.Prefs` carries what the platform reports (dark,
+high contrast, accent, the interface and monospace fonts, body size, text scale,
+reduced motion) and `style.for_prefs` builds the theme from it; high contrast
+keeps its own accent. Each tree has a theme (`tree.set_theme`, light when none
+is set) and any widget can lay `style.Overrides` on its subtree — colours by
+role, corner radius, text scale — with what depends on them derived again
+(`tree.set_overrides`; `widget.theme` resolves a widget's). Painting resolves
+the same on its way down, so every paint entry gets its widget's theme, and a
+cached subtree too. `app.set_theme` and `app.set_prefs` switch every window at
+once; the theme lives in the application's mapping, so the trees' pointers to
+it survive the `App` being returned by value. Reading the preferences from the
+platform — XSETTINGS, the settings portal, the registry — is `window/`'s, and
+not written yet.
 
 ## For scale
 

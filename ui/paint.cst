@@ -22,6 +22,11 @@
 // its edge, from the theme — unless the widget drew its own and set
 // focus_drawn.
 //
+// Every paint entry is handed the theme that applies to its widget: the
+// options', or the tree's when that is null, with the overrides of the widget
+// and its ancestors laid on (tree.set_overrides). Resolved on the way down,
+// once per widget that has overrides, so the rest share their parent's.
+//
 // A widget with tree.F_CACHE, given a Cache in the options, is painted once
 // into a texture of its own — its whole subtree, onto transparency — and while
 // nothing inside it changes that texture is put back instead: moving the
@@ -143,7 +148,7 @@ fn _entry(cc as *Cache, t as *tree.Tree, w as i64) as *CacheEntry {
 struct Options {
     router as *router.Router;   // hover, press and focus; null paints every widget at rest
     cache  as *Cache;           // null paints cached widgets directly
-    theme  as *style.Theme;
+    theme  as *style.Theme;     // null: the tree's
     time   as i64;              // milliseconds, handed to every paint entry
     active as i32;              // the window has the keyboard focus
     _pad0  as i32;
@@ -216,19 +221,39 @@ fn _state(k as *_Walk, w as i64, disabled as i32) as i64 {
     return s;
 }
 
-fn _ring(k as *_Walk, r as math.rect.Rect) as void {
-    let is *style.Theme as th = k.o.theme;
-    let is f64 as in = th.focus_offset;
-    let is f64 as rad = th.focus_radius;
+fn _ring(k as *_Walk, r as math.rect.Rect, th as *style.Theme) as void {
+    let is f64 as in = th.metrics.focus_offset;
+    let is f64 as rad = th.metrics.focus_radius;
     shapes.stroke_rounded(k.c, r.x + in, r.y + in, r.w - 2.0 * in, r.h - 2.0 * in,
-                          rad, rad, rad, rad, th.focus_width, th.focus_color);
+                          rad, rad, rad, rad, th.metrics.focus_width, th.palette.focus);
     k.st.rings = k.st.rings + 1;
 }
 
-// w at window position ox, oy (its parent's), inside clip, on layer.
+// w at window position ox, oy (its parent's), inside clip, on layer, in the
+// theme its parent was painted in.
 fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
-          layer0 as i64, disabled0 as i32) as void {
+          layer0 as i64, disabled0 as i32, th0 as *style.Theme) as void {
     if (tree.is_hidden_here(k.t, w) == 1) { return; }
+    let is *style.Overrides as ov = tree.overrides(k.t, w);
+    if (cast(i64, ov) != 0) {
+        _visit_over(k, w, ox, oy, clip0, layer0, disabled0, th0, ov);
+        return;
+    }
+    _visit_as(k, w, ox, oy, clip0, layer0, disabled0, th0);
+}
+
+// A theme of its own, for w and its subtree. Its own function, so only the
+// widgets with overrides pay for a theme on the stack.
+fn _visit_over(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
+               layer0 as i64, disabled0 as i32, th0 as *style.Theme, ov as *style.Overrides) as void {
+    let is style.Theme as own = *th0;
+    style.apply(&own, ov);
+    _visit_as(k, w, ox, oy, clip0, layer0, disabled0, &own);
+}
+
+// w in th, which already holds its own overrides.
+fn _visit_as(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
+             layer0 as i64, disabled0 as i32, th as *style.Theme) as void {
     k.st.walked = k.st.walked + 1;
     let is math.rect.Rect as r = layout.rect(k.t, w);
     let is math.rect.Rect as wr = math.rect.rect(ox + r.x, oy + r.y, r.w, r.h);
@@ -243,7 +268,7 @@ fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
     let is math.rect.Rect as vis = math.rect.rect_intersect(wr, clip);
     let is i32 as shown = 1 - math.rect.rect_is_empty(vis);
     if (shown == 0 && tree.layered_count(k.t) == 0) { return; }
-    if (shown == 1 && _cached(k, w, ox, oy, wr, vis, layer, disabled) == 1) { return; }
+    if (shown == 1 && _cached(k, w, ox, oy, wr, vis, layer, disabled, th) == 1) { return; }
 
     let is painter.Painter as p;
     p.focus_drawn = 0;
@@ -252,7 +277,7 @@ fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
         draw2d.set_layer(k.c, layer);
         _clip(k, vis);
         p.canvas = k.c;
-        p.theme = k.o.theme;
+        p.theme = th;
         p.rect = wr;
         p.clip = vis;
         p.state = _state(k, w, disabled);
@@ -271,13 +296,13 @@ fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
     }
     let is i64 as ch with mut = tree.first_child(k.t, w);
     while (ch != 0) {
-        _visit(k, ch, wr.x, wr.y, vis, layer, disabled);
+        _visit(k, ch, wr.x, wr.y, vis, layer, disabled, th);
         ch = tree.next_sibling(k.t, ch);
     }
     if (shown == 1 && (p.state & painter.S_FOCUS_VISIBLE) != 0 && p.focus_drawn == 0 && w != k.no_ring) {
         draw2d.set_layer(k.c, layer);
         _clip(k, vis);
-        _ring(k, wr);
+        _ring(k, wr, th);
     }
 }
 
@@ -293,7 +318,7 @@ fn _has_layered(t as *tree.Tree, w as i64) as i32 {
 // w from its cache, painting the cache first if it is stale. 0 when w is not
 // to be cached here, and the walk paints it directly.
 fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
-           vis as math.rect.Rect, layer as i64, disabled as i32) as i32 {
+           vis as math.rect.Rect, layer as i64, disabled as i32, th as *style.Theme) as i32 {
     if (cast(i64, k.cache) == 0 || k.cache.ok == 0) { return 0; }
     if (tree.has_flag(k.t, w, tree.F_CACHE) == 0) { return 0; }
     if (tree.layered_count(k.t) > 0 && _has_layered(k.t, w) == 1) { return 0; }
@@ -313,7 +338,7 @@ fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
         tree.set_flag(k.t, w, tree.F_CACHE_DIRTY, 1);
     }
     if (tree.has_flag(k.t, w, tree.F_CACHE_DIRTY) == 1) {
-        _render(k, e, w, ox, oy, wr, layer, disabled);
+        _render(k, e, w, ox, oy, wr, layer, disabled, th);
         tree.set_flag(k.t, w, tree.F_CACHE_DIRTY, 0);
     }
     draw2d.set_layer(k.c, layer);
@@ -324,7 +349,7 @@ fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
     // Its own ring goes on top, after everything in it, as it would have
     // without a cache.
     if (k.focus == w && cast(i64, k.o.router) != 0 && router.focus_visible(k.o.router) == 1) {
-        _ring(k, wr);
+        _ring(k, wr, th);
     }
     return 1;
 }
@@ -332,7 +357,7 @@ fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
 // The whole of w's subtree into its texture, on transparency, at the
 // coordinates it has in the window.
 fn _render(k as *_Walk, e as *CacheEntry, w as i64, ox as f64, oy as f64,
-           wr as math.rect.Rect, layer as i64, disabled as i32) as void {
+           wr as math.rect.Rect, layer as i64, disabled as i32, th as *style.Theme) as void {
     let is *Cache as cc = k.cache;
     let is *draw2d.Canvas as oc = &cc.canvas;
     draw2d.begin(oc, cast(f64, e.pw), cast(f64, e.ph), k.c.scale);
@@ -348,7 +373,8 @@ fn _render(k as *_Walk, e as *CacheEntry, w as i64, ox as f64, oy as f64,
     k2.no_ring = w;
     k2.clip_on = 0;
     k2._pad0 = 0;
-    _visit(&k2, w, ox, oy, wr, layer, disabled);
+    // th already holds w's own overrides: in from _visit_as, not _visit.
+    _visit_as(&k2, w, ox, oy, wr, layer, disabled, th);
     if (k2.clip_on == 1) { draw2d.pop_clip(oc); }
     command.begin(cc.d, cc.cmd);
     let is command.Pass as ps = command.pass(e.tex, 0, math.color.rgba(0.0, 0.0, 0.0, 0.0));
@@ -383,6 +409,8 @@ fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i
     k.cache = o.cache;
     k.no_ring = 0;
     if (cast(i64, o.router) != 0) { k.focus = router.focused(t, o.router); }
+    let is *style.Theme as th with mut = o.theme;
+    if (cast(i64, th) == 0) { th = tree.theme(t); }
     let is i64 as root = tree.root(t);
     let is i64 as n = tree.damage_count(t);
     let is i64 as i with mut = 0;
@@ -393,10 +421,10 @@ fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i
         _clip(&k, d);
         // A pixel past each edge: the scissor cuts it back to exactly the
         // region, with no fringe left half covered.
-        shapes.fill_rect(c, d.x - 1.0, d.y - 1.0, d.w + 2.0, d.h + 2.0, o.theme.window_bg);
+        shapes.fill_rect(c, d.x - 1.0, d.y - 1.0, d.w + 2.0, d.h + 2.0, th.palette.window_bg);
         let is i64 as ch with mut = tree.first_child(t, root);
         while (ch != 0) {
-            _visit(&k, ch, 0.0, 0.0, d, 0, 0);
+            _visit(&k, ch, 0.0, 0.0, d, 0, 0, th);
             ch = tree.next_sibling(t, ch);
         }
         s.regions = s.regions + 1;
