@@ -1,0 +1,768 @@
+// ui/router.cst — where each event goes.
+//
+// input/ (or a test) calls in with what the platform reported — the pointer
+// moved, a button went down, a key — and the router turns it into events for
+// widgets. One router per window, beside its tree.
+//
+// Pointer events are aimed at the deepest visible widget under the pointer and
+// BUBBLE: the target gets the event first, then its parent, and so on up until
+// one handles it. Whoever handles a press CAPTURES the pointer until the last
+// button is released: every motion and the release go to the captor alone,
+// wherever the pointer is, so a slider dragged off its track keeps following,
+// and nothing enters or leaves meanwhile. A press nobody handles captures
+// nothing.
+//
+// Entering and leaving are per widget, not per target: moving from a child to
+// its parent leaves the child and does not leave the parent. The router keeps
+// the chain of widgets under the pointer, root first, and compares chains —
+// which also keeps working when a widget in the chain is destroyed, since its
+// ancestors are still in the chain to compare against.
+//
+// A disabled widget swallows what is aimed at it: nothing reaches it, and
+// nothing bubbles past it to a container that might react instead.
+//
+// Times are the platform's, in milliseconds; distances are logical pixels.
+// Double-click time and distance and the drag threshold come from Settings,
+// which the window fills from the system's own values.
+use "../math/math.cst" as math;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "layout.cst" as layout;
+use "event.cst" as event;
+use "../window/keys.cst" as keys;
+
+// Deepest tree the hover chain follows. Past it, the innermost widgets are
+// still hit and still receive events; they just do not get ENTER and LEAVE.
+let is i64 as MAX_DEPTH with imut = 128;
+
+// The window's shortcuts and the widgets' mnemonics are fixed tables, sized
+// here: a window rarely has a few dozen of either, and a table that grows on
+// its own is the hidden allocation the philosophy forbids. Adding past the end
+// returns 0.
+let is i64 as MAX_SHORTCUTS with imut = 64;
+let is i64 as MAX_MNEMONICS with imut = 128;
+
+// A key combination and what to run for it: cb(user), synchronously.
+struct Shortcut {
+    key  as i32;   // lowercase for letters; 0 for a free slot
+    mods as i32;
+    cb   as *u8;
+    user as *u8;
+}
+
+struct Settings {
+    double_click_ms       as i64;
+    double_click_distance as f64;
+    drag_threshold        as f64;
+    // Windows opens a context menu when the right button comes up; GTK and Qt
+    // on X11 and Wayland, when it goes down.
+    context_on_release    as i32;
+    _pad0                 as i32;
+}
+
+fn settings_default() as Settings {
+    let is Settings as s;
+    s.double_click_ms = 400;
+    s.double_click_distance = 4.0;
+    s.drag_threshold = 8.0;
+    s.context_on_release = 0;
+    s._pad0 = 0;
+    return s;
+}
+
+struct Router {
+    settings        as Settings;
+    chain           as [128]i64;   // under the pointer, root first
+    chain_n         as i64;
+    capture         as i64;
+    buttons         as i32;        // held, one bit per button
+    dragging        as i32;
+    mods            as i32;        // as of the last key event
+    pointer_in      as i32;
+    pointer_x       as f64;
+    pointer_y       as f64;
+    press_x         as f64;
+    press_y         as f64;
+    clicks          as i32;
+    last_button     as i32;
+    last_click_time as i64;
+    last_click_x    as f64;
+    last_click_y    as f64;
+    focus           as i64;
+    focus_visible   as i32;        // focus last moved by keyboard
+    _pad1           as i32;
+    scope           as i64;        // modal subtree, 0 for none
+    shortcuts       as [64]Shortcut;
+    mnemonic_w      as [128]i64;   // widget, 0 for a free slot
+    mnemonic_key    as [128]i32;
+}
+
+fn init(s as Settings) as Router {
+    let is Router as r;
+    r.settings = s;
+    r.chain_n = 0;
+    r.capture = 0;
+    r.buttons = 0;
+    r.dragging = 0;
+    r.mods = 0;
+    r.pointer_in = 0;
+    r.pointer_x = 0.0;
+    r.pointer_y = 0.0;
+    r.press_x = 0.0;
+    r.press_y = 0.0;
+    r.clicks = 0;
+    r.last_button = 0;
+    r.last_click_time = 0 - 1000000000;
+    r.last_click_x = 0.0;
+    r.last_click_y = 0.0;
+    r.focus = 0;
+    r.focus_visible = 0;
+    r._pad1 = 0;
+    r.scope = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_SHORTCUTS) {
+        r.shortcuts[i].key = 0;
+        r.shortcuts[i].mods = 0;
+        r.shortcuts[i].cb = cast(*u8, 0);
+        r.shortcuts[i].user = cast(*u8, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < MAX_MNEMONICS) {
+        r.mnemonic_w[i] = 0;
+        r.mnemonic_key[i] = 0;
+        i = i + 1;
+    }
+    return r;
+}
+
+// --- Hit-testing ---
+
+// The deepest visible widget containing the point, searching children last to
+// first because later children are drawn above earlier ones. A child is only
+// searched inside its parent, so what a container clips away cannot be hit.
+// 0 outside the window.
+fn hit(t as *tree.Tree, x as f64, y as f64) as i64 {
+    let is i64 as root = tree.root(t);
+    let is math.rect.Rect as rr = layout.rect(t, root);
+    if (x < 0.0 || y < 0.0 || x >= rr.w || y >= rr.h) { return 0; }
+    let is i64 as cur with mut = root;
+    let is f64 as ox with mut = 0.0;
+    let is f64 as oy with mut = 0.0;
+    while (1 == 1) {
+        let is i64 as found with mut = 0;
+        let is i64 as ch with mut = tree.last_child(t, cur);
+        while (ch != 0 && found == 0) {
+            if (tree.is_visible(t, ch) == 1) {
+                let is math.rect.Rect as cr = layout.rect(t, ch);
+                let is f64 as cx = ox + cr.x;
+                let is f64 as cy = oy + cr.y;
+                if (x >= cx && x < cx + cr.w && y >= cy && y < cy + cr.h) {
+                    found = ch;
+                    ox = cx;
+                    oy = cy;
+                }
+            }
+            ch = tree.prev_sibling(t, ch);
+        }
+        if (found == 0) { return cur; }
+        cur = found;
+    }
+    return cur;
+}
+
+// --- Delivering ---
+
+// Hands e to one widget, in that widget's coordinates. 1 if it handled it.
+// The root belongs to the tree and has no behaviour; a widget without an
+// event entry handles nothing.
+fn _deliver(t as *tree.Tree, w as i64, e as *event.Event) as i64 {
+    if (w == 0 || w == tree.root(t) || tree.is_valid(t, w) == 0) { return 0; }
+    let is *widget.Kind as k = tree.kind(t, w);
+    if (cast(i64, k.event) == 0) { return 0; }
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    e.local_x = e.x - wr.x;
+    e.local_y = e.y - wr.y;
+    return call(k.event, cast(*u8, t), w, tree.data(t, w), cast(*u8, e));
+}
+
+// To one widget only, at TARGET — entering, leaving, the captor's events.
+fn _direct(t as *tree.Tree, w as i64, e as *event.Event) as i64 {
+    if (tree.is_valid(t, w) == 0 || tree.is_enabled(t, w) == 0) { return 0; }
+    e.target = w;
+    e.phase = event.TARGET;
+    return _deliver(t, w, e);
+}
+
+// Up the tree from start until someone handles e. Returns who did, or 0.
+fn _dispatch(t as *tree.Tree, e as *event.Event, start as i64) as i64 {
+    if (start == 0 || tree.is_valid(t, start) == 0) { return 0; }
+    if (tree.is_enabled(t, start) == 0) { return 0; }
+    e.target = start;
+    let is i64 as cur with mut = start;
+    while (cur != 0) {
+        e.phase = event.BUBBLE;
+        if (cur == start) { e.phase = event.TARGET; }
+        if (_deliver(t, cur, e) == 1) { return cur; }
+        cur = tree.parent(t, cur);
+    }
+    return 0;
+}
+
+// --- Hover ---
+
+fn _in(list as *i64, n as i64, w as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (list[i] == w) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Leaves what is no longer under the pointer, innermost first; enters what
+// newly is, outermost first. w is the new deepest widget, 0 for none.
+fn _update_hover(t as *tree.Tree, r as *Router, w as i64, time as i64) as void {
+    let is [128]i64 as next;
+    let is i64 as n with mut = 0;
+    if (w != 0) {
+        // The chain from w up, then reversed so the root comes first.
+        let is [128]i64 as up;
+        let is i64 as a with mut = w;
+        while (a != 0) {
+            if (n < MAX_DEPTH) { up[n] = a; n = n + 1; }
+            a = tree.parent(t, a);
+        }
+        let is i64 as i with mut = 0;
+        while (i < n) { next[i] = up[n - 1 - i]; i = i + 1; }
+    }
+
+    let is i64 as old_deepest with mut = 0;
+    if (r.chain_n > 0) { old_deepest = r.chain[r.chain_n - 1]; }
+    let is i64 as k with mut = r.chain_n - 1;
+    while (k >= 0) {
+        let is i64 as h = r.chain[k];
+        if (_in(cast(*i64, &next), n, h) == 0) {
+            let is event.Event as e = event.make(event.POINTER_LEAVE, time);
+            e.x = r.pointer_x;
+            e.y = r.pointer_y;
+            e.related = w;
+            _direct(t, h, &e);
+        }
+        k = k - 1;
+    }
+    k = 0;
+    while (k < n) {
+        let is i64 as h = next[k];
+        if (_in(cast(*i64, &r.chain), r.chain_n, h) == 0) {
+            let is event.Event as e = event.make(event.POINTER_ENTER, time);
+            e.x = r.pointer_x;
+            e.y = r.pointer_y;
+            e.related = old_deepest;
+            _direct(t, h, &e);
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while (k < n) { r.chain[k] = next[k]; k = k + 1; }
+    r.chain_n = n;
+}
+
+// The deepest widget under the pointer, 0 for none.
+fn hover(r as *Router) as i64 {
+    if (r.chain_n == 0) { return 0; }
+    return r.chain[r.chain_n - 1];
+}
+
+// Whether w is under the pointer — itself or through a descendant.
+fn hovered(t as *tree.Tree, r as *Router, w as i64) as i32 {
+    if (w == 0 || tree.is_valid(t, w) == 0) { return 0; }
+    return _in(cast(*i64, &r.chain), r.chain_n, w);
+}
+
+// The widget holding the pointer, 0 for none.
+fn capture(r as *Router) as i64 { return r.capture; }
+
+// For when widgets moved under a pointer that did not: after a layout pass, a
+// scroll, a widget shown or hidden.
+fn refresh_hover(t as *tree.Tree, r as *Router, time as i64) as void {
+    if (r.pointer_in == 0 || r.capture != 0) { return; }
+    _update_hover(t, r, _hit_scoped(t, r, r.pointer_x, r.pointer_y), time);
+}
+
+fn _captor(t as *tree.Tree, r as *Router) as i64 {
+    if (r.capture != 0 && tree.is_valid(t, r.capture) == 0) {
+        // Destroyed mid-gesture: the gesture is over.
+        r.capture = 0;
+        r.dragging = 0;
+    }
+    return r.capture;
+}
+
+// --- From the platform ---
+
+fn pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as void {
+    r.pointer_x = x;
+    r.pointer_y = y;
+    r.pointer_in = 1;
+    let is i64 as captor = _captor(t, r);
+    if (captor != 0) {
+        if (r.buttons != 0 && r.dragging == 0) {
+            let is f64 as ddx = x - r.press_x;
+            let is f64 as ddy = y - r.press_y;
+            let is f64 as th = r.settings.drag_threshold;
+            if (ddx * ddx + ddy * ddy > th * th) {
+                r.dragging = 1;
+                let is event.Event as ds = event.make(event.DRAG_START, time);
+                ds.x = x;
+                ds.y = y;
+                ds.mods = r.mods;
+                _direct(t, captor, &ds);
+            }
+        }
+        let is event.Event as e = event.make(event.POINTER_MOVE, time);
+        e.x = x;
+        e.y = y;
+        e.mods = r.mods;
+        _direct(t, captor, &e);
+        return;
+    }
+    _update_hover(t, r, _hit_scoped(t, r, x, y), time);
+    let is event.Event as e = event.make(event.POINTER_MOVE, time);
+    e.x = x;
+    e.y = y;
+    e.mods = r.mods;
+    _dispatch(t, &e, hover(r));
+}
+
+// The pointer left the window. While a button is held the captor keeps the
+// pointer — the platform goes on reporting motion outside — so nothing leaves
+// until the release.
+fn pointer_leave(t as *tree.Tree, r as *Router, time as i64) as void {
+    r.pointer_in = 0;
+    if (_captor(t, r) != 0) { return; }
+    _update_hover(t, r, 0, time);
+}
+
+fn _context(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as void {
+    let is event.Event as e = event.make(event.CONTEXT_MENU, time);
+    e.x = x;
+    e.y = y;
+    e.button = 3;
+    e.mods = r.mods;
+    _dispatch(t, &e, _hit_scoped(t, r, x, y));
+}
+
+// button is 1 left, 2 middle, 3 right; pressed is 1 down, 0 up.
+fn pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
+                  x as f64, y as f64, time as i64) as void {
+    r.pointer_x = x;
+    r.pointer_y = y;
+    r.pointer_in = 1;
+    let is i32 as bit = 1 << cast(i32, button - 1);
+
+    if (pressed == 1) {
+        // Another click of the same button, soon enough and close enough to
+        // the last, counts up to three; a fourth starts again at one.
+        let is f64 as ddx = x - r.last_click_x;
+        let is f64 as ddy = y - r.last_click_y;
+        let is f64 as near = r.settings.double_click_distance;
+        if (button == r.last_button && time - r.last_click_time <= r.settings.double_click_ms
+            && ddx * ddx + ddy * ddy <= near * near && r.clicks < 3) {
+            r.clicks = r.clicks + 1;
+        } else {
+            r.clicks = 1;
+        }
+        r.last_button = button;
+        r.last_click_time = time;
+        r.last_click_x = x;
+        r.last_click_y = y;
+
+        let is event.Event as e = event.make(event.POINTER_DOWN, time);
+        e.x = x;
+        e.y = y;
+        e.button = button;
+        e.clicks = r.clicks;
+        e.mods = r.mods;
+        let is i64 as captor = _captor(t, r);
+        if (captor != 0) {
+            _direct(t, captor, &e);
+        } else {
+            let is i64 as target = _hit_scoped(t, r, x, y);
+            _update_hover(t, r, target, time);
+            // A click moves focus to the nearest widget that can take it, and
+            // hides the focus ring: it is for whoever is using the keyboard.
+            r.focus_visible = 0;
+            let is i64 as f = _focusable_from(t, r, target);
+            if (f != 0) { focus(t, r, f, 0); }
+            r.capture = _dispatch(t, &e, target);
+            r.press_x = x;
+            r.press_y = y;
+            r.dragging = 0;
+        }
+        r.buttons = r.buttons | bit;
+        if (button == 3 && r.settings.context_on_release == 0) { _context(t, r, x, y, time); }
+        return;
+    }
+
+    r.buttons = (r.buttons | bit) - bit;
+    let is event.Event as e = event.make(event.POINTER_UP, time);
+    e.x = x;
+    e.y = y;
+    e.button = button;
+    e.mods = r.mods;
+    let is i64 as captor = _captor(t, r);
+    if (captor != 0) {
+        _direct(t, captor, &e);
+    } else {
+        _dispatch(t, &e, _hit_scoped(t, r, x, y));
+    }
+    if (r.buttons == 0) {
+        r.capture = 0;
+        r.dragging = 0;
+        // The hover catches up with wherever the pointer went meanwhile.
+        if (r.pointer_in == 1) { _update_hover(t, r, _hit_scoped(t, r, x, y), time); }
+    }
+    if (button == 3 && r.settings.context_on_release == 1) { _context(t, r, x, y, time); }
+}
+
+// dx, dy: how far, in logical pixels, or in notches when discrete is 1.
+// To the widget under the pointer, bubbling, so an inner scroll area that is
+// already at its end can leave the rest to an outer one.
+fn scroll(t as *tree.Tree, r as *Router, x as f64, y as f64, dx as f64, dy as f64,
+          discrete as i32, time as i64) as void {
+    r.pointer_x = x;
+    r.pointer_y = y;
+    r.pointer_in = 1;
+    let is i64 as target = _hit_scoped(t, r, x, y);
+    if (_captor(t, r) == 0) { _update_hover(t, r, target, time); }
+    let is event.Event as e = event.make(event.SCROLL, time);
+    e.x = x;
+    e.y = y;
+    e.dx = dx;
+    e.dy = dy;
+    e.discrete = discrete;
+    e.mods = r.mods;
+    _dispatch(t, &e, target);
+}
+
+// --- Modal scope ---
+//
+// While a scope is set — a dialog drawn inside the window — only its subtree
+// reacts: the pointer reaches nothing outside it, focus cannot leave it, and
+// Tab cycles within it. Setting one takes focus inside if it was outside and
+// drops the hover from everything behind.
+
+fn _in_scope(t as *tree.Tree, r as *Router, w as i64) as i32 {
+    if (r.scope == 0) { return 1; }
+    let is i64 as a with mut = w;
+    while (a != 0) {
+        if (a == r.scope) { return 1; }
+        a = tree.parent(t, a);
+    }
+    return 0;
+}
+
+fn _hit_scoped(t as *tree.Tree, r as *Router, x as f64, y as f64) as i64 {
+    let is i64 as h = hit(t, x, y);
+    if (h != 0 && _in_scope(t, r, h) == 0) { return 0; }
+    return h;
+}
+
+fn set_scope(t as *tree.Tree, r as *Router, w as i64) as void {
+    r.scope = w;
+    if (r.scope != 0 && tree.is_valid(t, r.scope) == 0) { r.scope = 0; }
+    if (r.capture != 0 && _in_scope(t, r, r.capture) == 0) {
+        r.capture = 0;
+        r.dragging = 0;
+    }
+    if (focused(t, r) == 0) { focus_next(t, r, 1); }
+    if (r.pointer_in == 1 && r.capture == 0) {
+        _update_hover(t, r, _hit_scoped(t, r, r.pointer_x, r.pointer_y), 0);
+    }
+}
+
+fn scope(r as *Router) as i64 { return r.scope; }
+
+// --- Focus ---
+
+fn _can_focus(t as *tree.Tree, r as *Router, w as i64) as i32 {
+    if (w == 0 || tree.is_valid(t, w) == 0) { return 0; }
+    if (tree.is_focusable(t, w) == 0) { return 0; }
+    if (tree.is_visible(t, w) == 0 || tree.is_enabled(t, w) == 0) { return 0; }
+    return _in_scope(t, r, w);
+}
+
+// The nearest widget at or above w that can take focus, 0 for none.
+fn _focusable_from(t as *tree.Tree, r as *Router, w as i64) as i64 {
+    let is i64 as a with mut = w;
+    while (a != 0) {
+        if (_can_focus(t, r, a) == 1) { return a; }
+        a = tree.parent(t, a);
+    }
+    return 0;
+}
+
+// The focused widget, or 0 — also when the one that had focus has since been
+// destroyed, hidden or disabled, or is outside the scope.
+fn focused(t as *tree.Tree, r as *Router) as i64 {
+    if (_can_focus(t, r, r.focus) == 0) { return 0; }
+    return r.focus;
+}
+
+// Whether to draw the focus ring: focus last moved by keyboard.
+fn focus_visible(r as *Router) as i32 { return r.focus_visible; }
+
+// Gives w the keyboard focus; 0 clears it. Returns 0 when w cannot take it.
+// The widget losing focus hears FOCUS_OUT, the one gaining it FOCUS_IN, each
+// naming the other.
+fn focus(t as *tree.Tree, r as *Router, w as i64, by_keyboard as i32) as i32 {
+    if (w != 0 && _can_focus(t, r, w) == 0) { return 0; }
+    let is i64 as old = focused(t, r);
+    r.focus_visible = by_keyboard;
+    if (old == w) { return 1; }
+    r.focus = w;
+    if (old != 0) {
+        let is event.Event as out = event.make(event.FOCUS_OUT, 0);
+        out.related = w;
+        _direct(t, old, &out);
+    }
+    if (w != 0) {
+        let is event.Event as in = event.make(event.FOCUS_IN, 0);
+        in.related = old;
+        _direct(t, w, &in);
+    }
+    return 1;
+}
+
+// The next widget in tree order after w within top, without descending into
+// hidden widgets — nothing under them can take focus.
+fn _next_in_order(t as *tree.Tree, w as i64, top as i64) as i64 {
+    if (tree.is_visible(t, w) == 1 || w == top) {
+        let is i64 as c = tree.first_child(t, w);
+        if (c != 0) { return c; }
+    }
+    let is i64 as cur with mut = w;
+    while (cur != top && cur != 0) {
+        let is i64 as s = tree.next_sibling(t, cur);
+        if (s != 0) { return s; }
+        cur = tree.parent(t, cur);
+    }
+    return 0;
+}
+
+// Moves focus to the next (dir 1) or previous (dir -1) widget that can take
+// it, in tree order within the scope, wrapping. With nothing focused, Tab
+// starts at the first and Shift+Tab at the last. Returns 0 if nothing in
+// scope can take focus.
+fn focus_next(t as *tree.Tree, r as *Router, dir as i32) as i32 {
+    let is i64 as top with mut = r.scope;
+    if (top == 0) { top = tree.root(t); }
+    let is i64 as mark = tree.scratch_mark(t);
+    let is *i64 as list = cast(*i64, tree.scratch_alloc(t, tree.live_count(t) * 8));
+    if (cast(i64, list) == 0) { tree.scratch_release(t, mark); return 0; }
+    let is i64 as n with mut = 0;
+    let is i64 as w with mut = top;
+    while (w != 0) {
+        if (_can_focus(t, r, w) == 1) { list[n] = w; n = n + 1; }
+        w = _next_in_order(t, w, top);
+    }
+    if (n == 0) { tree.scratch_release(t, mark); return 0; }
+
+    let is i64 as cur = focused(t, r);
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (list[i] == cur) { at = i; }
+        i = i + 1;
+    }
+    let is i64 as pick with mut = 0;
+    if (at < 0) {
+        if (dir < 0) { pick = n - 1; }
+    } else if (dir < 0) {
+        pick = (at + n - 1) % n;
+    } else {
+        pick = (at + 1) % n;
+    }
+    let is i64 as chosen = list[pick];
+    tree.scratch_release(t, mark);
+    focus(t, r, chosen, 1);
+    return 1;
+}
+
+// --- Keys and text ---
+
+fn _plain(mods as i32) as i32 { return (mods | keys.MOD_LOCK) - keys.MOD_LOCK; }
+
+// key from window/keys.cst; pressed 1 down, 0 up; repeat 1 when the platform
+// generated it from a held key. Returns 1 if something handled it.
+//
+// A key press goes, in order:
+//   1. to the focused widget as SHORTCUT_OVERRIDE — a widget that wants the
+//      key itself (an entry wanting Ctrl+A) claims it there, and gets it;
+//   2. to the window's shortcuts and mnemonics;
+//   3. as CONTEXT_MENU, for the Menu key and Shift+F10;
+//   4. to the focused widget as KEY_DOWN, bubbling;
+//   5. if nobody took it, Tab and Shift+Tab move focus.
+fn key(t as *tree.Tree, r as *Router, k as i32, mods as i32, pressed as i32,
+       repeat as i32, time as i64) as i32 {
+    r.mods = mods;
+    let is i64 as f = focused(t, r);
+    let is event.Event as e = event.make(event.KEY_DOWN, time);
+    e.key = k;
+    e.mods = mods;
+    e.repeat = repeat;
+    e.x = r.pointer_x;
+    e.y = r.pointer_y;
+    if (pressed == 0) {
+        e.kind = event.KEY_UP;
+        if (f != 0 && _dispatch(t, &e, f) != 0) { return 1; }
+        return 0;
+    }
+
+    if (f != 0) {
+        let is event.Event as o = e;
+        o.kind = event.SHORTCUT_OVERRIDE;
+        if (_direct(t, f, &o) == 1) {
+            _dispatch(t, &e, f);
+            return 1;
+        }
+    }
+
+    let is i32 as plain = _plain(mods);
+    if (_run_shortcut(r, k, mods) == 1) { return 1; }
+    if (plain == keys.MOD_ALT && _run_mnemonic(t, r, k, time) == 1) { return 1; }
+    if ((k == keys.MENU && plain == 0) || (k == keys.F10 && plain == keys.MOD_SHIFT)) {
+        if (f != 0) {
+            // Where a pointer would have been: the middle of the widget.
+            let is math.rect.Rect as fr = layout.window_rect(t, f);
+            let is event.Event as c = event.make(event.CONTEXT_MENU, time);
+            c.x = fr.x + fr.w * 0.5;
+            c.y = fr.y + fr.h * 0.5;
+            c.mods = mods;
+            if (_dispatch(t, &c, f) != 0) { return 1; }
+        }
+    }
+
+    if (f != 0 && _dispatch(t, &e, f) != 0) { return 1; }
+
+    if (k == keys.TAB && (plain == 0 || plain == keys.MOD_SHIFT)) {
+        let is i32 as dir with mut = 1;
+        if (plain == keys.MOD_SHIFT) { dir = 0 - 1; }
+        focus_next(t, r, dir);
+        return 1;
+    }
+    return 0;
+}
+
+// Text the user typed, UTF-8 and already composed — dead keys and input
+// methods have done their work below. To the focused widget, bubbling.
+fn text(t as *tree.Tree, r as *Router, s as *u8, len as i64, time as i64) as i32 {
+    let is i64 as f = focused(t, r);
+    if (f == 0) { return 0; }
+    let is event.Event as e = event.make(event.TEXT, time);
+    e.text = s;
+    e.text_len = len;
+    e.mods = r.mods;
+    if (_dispatch(t, &e, f) != 0) { return 1; }
+    return 0;
+}
+
+// --- Shortcuts ---
+//
+// Letters match regardless of case and Caps Lock; the other modifiers must
+// match exactly, so Ctrl+Shift+S is not Ctrl+S.
+
+fn _norm_key(k as i32) as i32 {
+    if (k >= 65 && k <= 90) { return k + 32; }
+    return k;
+}
+
+// Returns an id for remove_shortcut, or 0 when the table is full.
+fn add_shortcut(r as *Router, k as i32, mods as i32, cb as *u8, user as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SHORTCUTS) {
+        if (r.shortcuts[i].key == 0) {
+            r.shortcuts[i].key = _norm_key(k);
+            r.shortcuts[i].mods = _plain(mods);
+            r.shortcuts[i].cb = cb;
+            r.shortcuts[i].user = user;
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn remove_shortcut(r as *Router, id as i64) as void {
+    if (id < 1 || id > MAX_SHORTCUTS) { return; }
+    r.shortcuts[id - 1].key = 0;
+}
+
+fn _run_shortcut(r as *Router, k as i32, mods as i32) as i32 {
+    let is i32 as nk = _norm_key(k);
+    let is i32 as pm = _plain(mods);
+    let is i64 as i with mut = 0;
+    while (i < MAX_SHORTCUTS) {
+        if (r.shortcuts[i].key == nk && r.shortcuts[i].mods == pm) {
+            call(r.shortcuts[i].cb, r.shortcuts[i].user);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- Mnemonics ---
+//
+// Alt and a letter activate the widget that registered the letter — the
+// underlined letter of a button or menu: it receives ACTIVATE and decides what
+// that means. Hidden, disabled and out-of-scope widgets are passed over.
+
+// Returns 1, or 0 when w is stale or the table is full.
+fn add_mnemonic(t as *tree.Tree, r as *Router, w as i64, letter as i32) as i32 {
+    if (tree.is_valid(t, w) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < MAX_MNEMONICS) {
+        if (r.mnemonic_w[i] == 0 || tree.is_valid(t, r.mnemonic_w[i]) == 0) {
+            r.mnemonic_w[i] = w;
+            r.mnemonic_key[i] = _norm_key(letter);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn remove_mnemonics(r as *Router, w as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_MNEMONICS) {
+        if (r.mnemonic_w[i] == w) { r.mnemonic_w[i] = 0; }
+        i = i + 1;
+    }
+}
+
+fn _run_mnemonic(t as *tree.Tree, r as *Router, k as i32, time as i64) as i32 {
+    let is i32 as nk = _norm_key(k);
+    let is i64 as i with mut = 0;
+    while (i < MAX_MNEMONICS) {
+        let is i64 as w = r.mnemonic_w[i];
+        if (w != 0 && r.mnemonic_key[i] == nk && tree.is_valid(t, w) == 1
+            && tree.is_visible(t, w) == 1 && tree.is_enabled(t, w) == 1 && _in_scope(t, r, w) == 1) {
+            let is event.Event as e = event.make(event.ACTIVATE, time);
+            e.key = k;
+            e.mods = r.mods;
+            _direct(t, w, &e);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Whether to draw the mnemonic underlines: while Alt is held. mods passed to
+// key() are the modifiers in effect after that key event.
+fn mnemonics_visible(r as *Router) as i32 {
+    if ((r.mods & keys.MOD_ALT) != 0) { return 1; }
+    return 0;
+}

@@ -15,7 +15,10 @@ ui/
   box.cst         rows and columns
   grid.cst        rows and columns at once
   stack.cst       one page at a time; children layered on each other
-  event.cst       routing: hit-testing, capture, bubbling, focus, shortcuts
+  event.cst       what a widget receives
+  router.cst      where events go: hit-testing, capture, bubbling, hover,
+                  focus, shortcuts, mnemonics, the modal scope
+  timer.cst       things that happen later, on an explicit clock
   signal.cst      connecting a callback to what a widget emits
   model.cst       row and cell models behind lists, trees and tables
   paint.cst       damage tracking, drawing through render/'s 2D family
@@ -197,9 +200,12 @@ be lost. The toolkit routes them:
 - **pointer**: hit-test the tree top-down, deliver to the deepest widget, bubble
   to its ancestors until one handles it. A press *captures* the pointer, so a
   drag that leaves the slider stays with the slider.
-- **keyboard**: to the focused widget, then up the tree. Tab and Shift+Tab walk
-  the focus chain; shortcuts and mnemonics are resolved at the window before the
-  focused widget sees the key.
+- **keyboard**: the window's shortcuts and mnemonics are resolved before the
+  focused widget sees the key — except that the focused widget is asked first,
+  with `SHORTCUT_OVERRIDE`, whether it wants the key itself, which is how an
+  entry keeps Ctrl+A while the window has a shortcut for it. Then the context
+  menu keys, then the key to the focused widget and up the tree, and only if
+  nobody took it do Tab and Shift+Tab walk the focus chain.
 - **text**: composed text and the IME's pre-edit string from `input/`'s
   `text.cst`, to the focused entry.
 
@@ -326,8 +332,18 @@ grid too sparse to fit says so with `LAYOUT_TOO_LARGE` instead of dropping
 cells. The tests were checked against deliberate breakages — each rule
 removed in turn — and catch every one.
 
-Nothing is drawn yet; event routing and signals come next, testable with
-synthetic events alone.
+**Events** (`event.cst`, `router.cst`, `timer.cst`, tested by `router_test`,
+`focus_test`, `shortcut_test` and `timer_test` with synthetic events): hit-testing
+that respects clipping, bubbling, capture by whoever handles the press,
+per-widget enter and leave kept as a chain so a destroyed widget does not
+confuse it, click counting and the drag threshold from settings, scrolling that
+bubbles, context menus by right click, Menu key or Shift+F10, focus with Tab
+order, focus ring only after keyboard use, a modal scope, window shortcuts with
+the override, mnemonics, and timers with ids that stay dead once cancelled. The
+router is fed by plain calls — `pointer_move`, `pointer_button`, `key`, `text` —
+which is what `input/` will call.
+
+Nothing is drawn yet; signals and models come next.
 
 ## For scale
 

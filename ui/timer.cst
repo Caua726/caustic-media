@@ -1,0 +1,138 @@
+// ui/timer.cst — things that happen later: the caret blinking, a tooltip
+// appearing after a pause, a list scrolling while a drag holds at its edge.
+//
+// No clock is read here. The caller passes the time — the same milliseconds
+// events carry — so a test can step through time exactly, and the event loop
+// asks next_due() how long it may sleep before something needs doing.
+//
+// Ids carry an era like widget handles: cancelling with an id whose timer has
+// already fired or been cancelled does nothing, even after its slot has gone to
+// another timer.
+//
+// A repeating timer that missed several intervals — the program was busy —
+// fires once and is rescheduled from now, rather than firing once per missed
+// interval in a burst.
+
+let is i64 as MAX_TIMERS with imut = 64;
+
+struct Timer {
+    due      as i64;
+    interval as i64;   // 0: once
+    cb       as *u8;   // cb(user), synchronously
+    user     as *u8;
+    era      as i32;
+    used     as i32;
+}
+
+struct Timers {
+    slots as [64]Timer;
+}
+
+fn init() as Timers {
+    let is Timers as ts;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TIMERS) {
+        ts.slots[i].due = 0;
+        ts.slots[i].interval = 0;
+        ts.slots[i].cb = cast(*u8, 0);
+        ts.slots[i].user = cast(*u8, 0);
+        ts.slots[i].era = 1;
+        ts.slots[i].used = 0;
+        i = i + 1;
+    }
+    return ts;
+}
+
+fn _id(ts as *Timers, i as i64) as i64 {
+    return (cast(i64, ts.slots[i].era) << 32) | (i + 1);
+}
+
+// The slot an id names while its timer is pending, -1 otherwise.
+fn _slot(ts as *Timers, id as i64) as i64 {
+    if (id == 0) { return 0 - 1; }
+    let is i64 as i = (id & 4294967295) - 1;
+    if (i < 0 || i >= MAX_TIMERS) { return 0 - 1; }
+    if (ts.slots[i].used == 0) { return 0 - 1; }
+    if (cast(i64, ts.slots[i].era) != ((id >> 32) & 4294967295)) { return 0 - 1; }
+    return i;
+}
+
+fn _free(ts as *Timers, i as i64) as void {
+    ts.slots[i].used = 0;
+    ts.slots[i].era = ts.slots[i].era + 1;
+    if (ts.slots[i].era == 0) { ts.slots[i].era = 1; }
+}
+
+// Runs cb(user) delay milliseconds after now, then every interval if interval
+// is above 0. Returns an id for cancel, or 0 when the table is full.
+fn add(ts as *Timers, now as i64, delay as i64, interval as i64, cb as *u8, user as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_TIMERS) {
+        if (ts.slots[i].used == 0) {
+            ts.slots[i].used = 1;
+            ts.slots[i].due = now + delay;
+            ts.slots[i].interval = interval;
+            ts.slots[i].cb = cb;
+            ts.slots[i].user = user;
+            return _id(ts, i);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn cancel(ts as *Timers, id as i64) as void {
+    let is i64 as i = _slot(ts, id);
+    if (i < 0) { return; }
+    _free(ts, i);
+}
+
+// When the earliest pending timer is due, or -1 when none is pending.
+fn next_due(ts as *Timers) as i64 {
+    let is i64 as best with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TIMERS) {
+        if (ts.slots[i].used == 1 && (best < 0 || ts.slots[i].due < best)) { best = ts.slots[i].due; }
+        i = i + 1;
+    }
+    return best;
+}
+
+// Runs every timer due at or before now, once each, and returns how many ran.
+// A timer added by a callback during this pass waits for a later one, even if
+// it is already due, so a callback that reschedules itself cannot spin.
+fn fire(ts as *Timers, now as i64) as i64 {
+    // What is due is decided before anything runs.
+    let is [64]i64 as due_ids;
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TIMERS) {
+        if (ts.slots[i].used == 1 && ts.slots[i].due <= now) {
+            due_ids[n] = _id(ts, i);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    let is i64 as ran with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        // Still pending? An earlier callback in this pass may have cancelled it.
+        let is i64 as s = _slot(ts, due_ids[k]);
+        if (s >= 0) {
+            let is *u8 as cb = ts.slots[s].cb;
+            let is *u8 as user = ts.slots[s].user;
+            if (ts.slots[s].interval > 0) {
+                let is i64 as next with mut = ts.slots[s].due + ts.slots[s].interval;
+                if (next <= now) { next = now + ts.slots[s].interval; }
+                ts.slots[s].due = next;
+            } else {
+                // Freed before it runs, so the callback may add timers into it.
+                _free(ts, s);
+            }
+            call(cb, user);
+            ran = ran + 1;
+        }
+        k = k + 1;
+    }
+    return ran;
+}
