@@ -53,6 +53,11 @@ struct Shortcut {
     user as *u8;
 }
 
+// What the pointer is, as the platform says; input/ sets it before each event.
+let is i32 as MOUSE with imut = 0;
+let is i32 as TOUCH with imut = 1;
+let is i32 as PEN   with imut = 2;
+
 struct Settings {
     double_click_ms       as i64;
     double_click_distance as f64;
@@ -60,7 +65,10 @@ struct Settings {
     // Windows opens a context menu when the right button comes up; GTK and Qt
     // on X11 and Wayland, when it goes down.
     context_on_release    as i32;
-    _pad0                 as i32;
+    // A long press opens it on a touch screen and with a pen; with a mouse only
+    // when this is 1 — desktops have a right button for it.
+    long_press_mouse      as i32;
+    long_press_ms         as i64;   // how long a press is held still; 0 is never
 }
 
 fn settings_default() as Settings {
@@ -69,7 +77,8 @@ fn settings_default() as Settings {
     s.double_click_distance = 4.0;
     s.drag_threshold = 8.0;
     s.context_on_release = 0;
-    s._pad0 = 0;
+    s.long_press_mouse = 0;
+    s.long_press_ms = 500;
     return s;
 }
 
@@ -95,6 +104,13 @@ struct Router {
     focus_visible   as i32;        // focus last moved by keyboard
     _pad1           as i32;
     scope           as i64;        // modal subtree, 0 for none
+    source          as i32;        // MOUSE, TOUCH or PEN: what the pointer is
+    lp_armed        as i32;        // a long press is pending
+    lp_due          as i64;
+    lp_x            as f64;
+    lp_y            as f64;
+    swallow         as i32;        // the next release follows a long press: no click
+    _pad2           as i32;
     shortcuts       as [64]Shortcut;
     mnemonic_w      as [128]i64;   // widget, 0 for a free slot
     mnemonic_key    as [128]i32;
@@ -122,6 +138,13 @@ fn init(s as Settings) as Router {
     r.focus_visible = 0;
     r._pad1 = 0;
     r.scope = 0;
+    r.source = MOUSE;
+    r.lp_armed = 0;
+    r.lp_due = 0;
+    r.lp_x = 0.0;
+    r.lp_y = 0.0;
+    r.swallow = 0;
+    r._pad2 = 0;
     let is i64 as i with mut = 0;
     while (i < MAX_SHORTCUTS) {
         r.shortcuts[i].key = 0;
@@ -316,6 +339,12 @@ fn pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) 
     r.pointer_x = x;
     r.pointer_y = y;
     r.pointer_in = 1;
+    if (r.lp_armed == 1) {
+        let is f64 as lx = x - r.lp_x;
+        let is f64 as ly = y - r.lp_y;
+        let is f64 as th = r.settings.drag_threshold;
+        if (lx * lx + ly * ly > th * th) { r.lp_armed = 0; }
+    }
     let is i64 as captor = _captor(t, r);
     if (captor != 0) {
         if (r.buttons != 0 && r.dragging == 0) {
@@ -389,6 +418,17 @@ fn pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
         r.last_click_x = x;
         r.last_click_y = y;
 
+        // The primary button held still is a long press — from a finger or a
+        // pen, or a mouse when the settings ask. Any other press disarms it.
+        r.lp_armed = 0;
+        if (button == 1 && r.settings.long_press_ms > 0
+            && (r.source != MOUSE || r.settings.long_press_mouse == 1)) {
+            r.lp_armed = 1;
+            r.lp_due = time + r.settings.long_press_ms;
+            r.lp_x = x;
+            r.lp_y = y;
+        }
+
         let is event.Event as e = event.make(event.POINTER_DOWN, time);
         e.x = x;
         e.y = y;
@@ -417,6 +457,17 @@ fn pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
     }
 
     r.buttons = (r.buttons | bit) - bit;
+    r.lp_armed = 0;
+    if (r.swallow == 1 && button == 1) {
+        // The long press already answered this press with a menu.
+        r.swallow = 0;
+        if (r.buttons == 0) {
+            r.capture = 0;
+            r.dragging = 0;
+            if (r.pointer_in == 1) { _update_hover(t, r, _hit_scoped(t, r, x, y), time); }
+        }
+        return;
+    }
     let is event.Event as e = event.make(event.POINTER_UP, time);
     e.x = x;
     e.y = y;
@@ -455,6 +506,43 @@ fn scroll(t as *tree.Tree, r as *Router, x as f64, y as f64, dx as f64, dy as f6
     e.discrete = discrete;
     e.mods = r.mods;
     _dispatch(t, &e, target);
+}
+
+// --- Long press ---
+
+fn set_source(r as *Router, source as i32) as void { r.source = source; }
+
+// When a pending long press is due, or -1 — for the loop to wake by, since
+// nothing arrives while a finger is held still.
+fn next_due(r as *Router) as i64 {
+    if (r.lp_armed == 0) { return 0 - 1; }
+    return r.lp_due;
+}
+
+// Fires a long press due by now: the widget that captured the press hears
+// POINTER_CANCEL and loses the pointer, since what it was pressed for is not
+// happening, and CONTEXT_MENU goes where the press was, bubbling, with button
+// 1. The release that follows is eaten. Returns 1 if it fired.
+fn tick(t as *tree.Tree, r as *Router, now as i64) as i32 {
+    if (r.lp_armed == 0 || now < r.lp_due) { return 0; }
+    r.lp_armed = 0;
+    r.swallow = 1;
+    let is i64 as captor = _captor(t, r);
+    if (captor != 0) {
+        let is event.Event as c = event.make(event.POINTER_CANCEL, now);
+        c.x = r.lp_x;
+        c.y = r.lp_y;
+        _direct(t, captor, &c);
+        r.capture = 0;
+        r.dragging = 0;
+    }
+    let is event.Event as e = event.make(event.CONTEXT_MENU, now);
+    e.x = r.lp_x;
+    e.y = r.lp_y;
+    e.button = 1;
+    e.mods = r.mods;
+    _dispatch(t, &e, _hit_scoped(t, r, r.lp_x, r.lp_y));
+    return 1;
 }
 
 // --- Modal scope ---

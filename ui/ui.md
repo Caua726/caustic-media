@@ -383,7 +383,14 @@ per-widget enter and leave kept as a chain so a destroyed widget does not
 confuse it, click counting and the drag threshold from settings, scrolling that
 bubbles, context menus by right click, Menu key or Shift+F10, focus with Tab
 order, focus ring only after keyboard use, a modal scope, window shortcuts with
-the override, mnemonics, and timers with ids that stay dead once cancelled. The
+the override, mnemonics, and timers with ids that stay dead once cancelled.
+A long press — a finger or pen held still for `long_press_ms`, or a mouse when
+the settings ask — opens the context menu where the press was: the widget that
+captured the press hears `POINTER_CANCEL`, and the release that follows is no
+click. The router says when one is due and the application's loop ticks it,
+since nothing arrives while a finger is still (`longpress_test`); the touch and
+pen events themselves come from `input/`, which says which the pointer is with
+`router.set_source`. The
 router is fed by plain calls — `pointer_move`, `pointer_button`, `key`, `text` —
 which is what `input/` will call.
 
