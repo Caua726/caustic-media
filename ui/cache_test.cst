@@ -1,0 +1,326 @@
+// ui/cache_test.cst — a subtree painted once, put back while it moves.
+//
+// Every frame here is checked against the same tree painted with no cache at
+// all, into a second target from nothing: a cache that changes what is seen
+// is wrong however fast it is. Soft edges — rounded corners, a shape at half a
+// pixel — go through the texture's premultiplied colour, so they are compared
+// to within a step of rounding per channel; everything else exactly.
+use "std/io.cst" as io;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "event.cst" as event;
+use "router.cst" as router;
+use "damage.cst" as damage;
+use "painter.cst" as painter;
+use "style.cst" as style;
+use "paint.cst" as paint;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as W with imut = 64;
+let is i64 as H with imut = 48;
+let is [3072]i32 as px with mut;
+let is [3072]i32 as ref with mut;
+
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as target2 with mut = 0;
+let is i64 as cmd with mut = 0;
+
+let is i64 as BG     with imut = 1052688;    // 0x101010
+let is i64 as RED    with imut = 16711680;
+let is i64 as BLUE   with imut = 255;
+let is i64 as WHITE  with imut = 16777215;
+let is i64 as GREEN  with imut = 65280;
+
+struct Box {
+    w      as f64;
+    h      as f64;
+    color  as i64;
+    round  as f64;   // corner radius: soft edges
+    paints as i64;
+}
+
+fn box_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Box as b = cast(*Box, data);
+    out.min_w = b.w;
+    out.min_h = b.h;
+    out.pref_w = b.w;
+    out.pref_h = b.h;
+    out.max_w = b.w;
+    out.max_h = b.h;
+}
+
+fn box_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    layout.overlay_arrange(t, w, r);
+}
+
+fn box_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Box as b = cast(*Box, data);
+    b.paints = b.paints + 1;
+    let is math.color.Color as col with mut = style.hex(b.color);
+    if (painter.has(p, painter.S_HOVER) == 1) { col = style.hex(GREEN); }
+    let is f64 as rr = b.round;
+    shapes.fill_rounded(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, rr, rr, rr, rr, col);
+}
+
+let is tree.Kind as box_kind with mut;
+
+fn box_at(t as *tree.Tree, parent as i64, x as f64, y as f64, w as f64, h as f64, color as i64) as i64 {
+    let is i64 as b = tree.create(t, &box_kind, parent);
+    let is *Box as d = cast(*Box, tree.data(t, b));
+    d.w = w;
+    d.h = h;
+    d.color = color;
+    layout.set_align(t, b, layout.START, layout.START);
+    layout.set_margin(t, b, x, y, 0.0, 0.0);
+    return b;
+}
+
+fn data(t as *tree.Tree, w as i64) as *Box { return cast(*Box, tree.data(t, w)); }
+
+let is style.Theme as theme with mut;
+let is paint.Stats as stats with mut;
+
+fn paint_into(t as *tree.Tree, c as *draw2d.Canvas, o as *paint.Options, tg as i64, dst as *u8, st as *paint.Stats) as void {
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    paint.frame(t, c, o, st);
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass_load(tg, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, tg, dst, W * H * 4);
+}
+
+// A frame with the cache into target; then the whole tree with none into
+// target2, as the reference. The damage is collected once, for the first.
+fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *paint.Options) as void {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    damage.collect(t);
+    paint_into(t, c, o, target, cast(*u8, &px), &stats);
+    tree.damage_clear(t);
+    let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, cast(f64, W), cast(f64, H));
+    tree.damage_add(t, &all);
+    damage.collect(t);
+    let is paint.Options as plain = *o;
+    plain.cache = cast(*paint.Cache, 0);
+    let is paint.Stats as ignore;
+    paint_into(t, c, &plain, target2, cast(*u8, &ref), &ignore);
+    tree.damage_clear(t);
+}
+
+fn _chan(v as i64, shift as i64) as i64 { return (v >> shift) & 255; }
+
+// Pixels further than tolerance from the reference in any channel.
+fn differing(tolerance as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        let is i64 as a = cast(i64, px[i]) & 4294967295;
+        let is i64 as b = cast(i64, ref[i]) & 4294967295;
+        let is i64 as k with mut = 0;
+        let is i32 as off with mut = 0;
+        while (k < 32) {
+            let is i64 as d with mut = _chan(a, k) - _chan(b, k);
+            if (d < 0) { d = 0 - d; }
+            if (d > tolerance) { off = 1; }
+            k = k + 8;
+        }
+        if (off == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn as_px(hex as i64) as i64 {
+    return 4278190080 | ((hex & 255) << 16) | (((hex >> 8) & 255) << 8) | ((hex >> 16) & 255);
+}
+
+fn pixel(x as i64, y as i64) as i64 { return cast(i64, px[y * W + x]) & 4294967295; }
+
+fn main() as i32 {
+    box_kind = widget.kind("box", sizeof(Box));
+    box_kind.measure = fn_ptr(box_measure);
+    box_kind.arrange = fn_ptr(box_arrange);
+    box_kind.paint = fn_ptr(box_paint);
+
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    target2 = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as dl = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &dl);
+    let is paint.Cache as cc = paint.cache_open(&dv, &dl);
+    check("cache open", cc.ok == 1);
+
+    theme = style.light();
+    theme.window_bg = style.hex(BG);
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    let is i64 as root = tree.root(&t);
+    let is router.Router as r = router.init(router.settings_default());
+    let is paint.Options as o = paint.options(&theme);
+    o.router = &r;
+    o.cache = &cc;
+
+    // A card with a square child and a rounded one, cached.
+    let is i64 as card = box_at(&t, root, 4.0, 4.0, 28.0, 20.0, WHITE);
+    // Rounded, so its own corners are soft and translucent in the texture.
+    data(&t, card).round = 4.0;
+    // Something painted before it, so the clip the walk last set is not the
+    // card's.
+    let is i64 as before = tree.create_before(&t, &box_kind, root, card);
+    data(&t, before).w = 3.0;
+    data(&t, before).h = 3.0;
+    data(&t, before).color = BLUE;
+    layout.set_align(&t, before, layout.END, layout.END);
+    let is i64 as sq = box_at(&t, card, 2.0, 2.0, 8.0, 8.0, RED);
+    let is i64 as rd = box_at(&t, card, 12.0, 2.0, 12.0, 12.0, BLUE);
+    data(&t, rd).round = 3.5;
+    tree.set_flag(&t, card, tree.F_CACHE, 1);
+
+    // --- The first frame paints it into its texture and puts that back ---
+    frame(&t, &c, &o);
+    check("first: painted into the cache once", stats.cache_renders == 1);
+    check("first: put back once", stats.cache_blits == 1);
+    check("first: one entry", paint.cache_used(&cc, &t) == 1);
+    check("first: exact where the edges are hard", pixel(7, 7) == as_px(RED) && pixel(14, 22) == as_px(WHITE));
+    check("first: as if painted directly", differing(1) == 0);
+
+    // --- Moved as a whole: put back where it is, nothing inside painted ---
+    let is i64 as sq_calls = data(&t, sq).paints;
+    layout.set_margin(&t, card, 30.0, 20.0, 0.0, 0.0);
+    frame(&t, &c, &o);
+    check("moved: the texture is still good", stats.cache_renders == 0);
+    check("moved: put back", stats.cache_blits == 1);
+    check("moved: nothing inside painted", data(&t, sq).paints == sq_calls + 1);
+    check("moved: where it was is the background", pixel(7, 7) == as_px(BG));
+    check("moved: there", pixel(33, 23) == as_px(RED));
+    check("moved: as if painted directly", differing(1) == 0);
+
+    // --- Something inside changed: painted again ---
+    data(&t, sq).color = GREEN;
+    tree.invalidate_paint(&t, sq);
+    frame(&t, &c, &o);
+    check("changed inside: painted again", stats.cache_renders == 1);
+    check("changed inside: shows", pixel(33, 23) == as_px(GREEN));
+    check("changed inside: as if painted directly", differing(1) == 0);
+
+    // Its own look changed.
+    data(&t, card).color = BLUE;
+    tree.invalidate_paint(&t, card);
+    frame(&t, &c, &o);
+    check("its own look changed: painted again", stats.cache_renders == 1);
+    check("its own look changed: as if painted directly", differing(1) == 0);
+    data(&t, card).color = WHITE;
+    tree.invalidate_paint(&t, card);
+    frame(&t, &c, &o);
+
+    // A child growing where it is.
+    data(&t, sq).w = 6.0;
+    layout.invalidate(&t, sq);
+    frame(&t, &c, &o);
+    check("a child resized in place: painted again", stats.cache_renders == 1);
+    check("a child resized in place: as if painted directly", differing(1) == 0);
+    data(&t, sq).w = 8.0;
+    layout.invalidate(&t, sq);
+    frame(&t, &c, &o);
+
+    // A child moving within it, its size, a child hidden — each makes it stale.
+    layout.set_margin(&t, sq, 3.0, 2.0, 0.0, 0.0);
+    frame(&t, &c, &o);
+    check("a child moved within: painted again", stats.cache_renders == 1);
+    check("a child moved within: as if painted directly", differing(1) == 0);
+    data(&t, card).w = 30.0;
+    layout.invalidate(&t, card);
+    frame(&t, &c, &o);
+    check("resized: painted again", stats.cache_renders == 1);
+    check("resized: as if painted directly", differing(1) == 0);
+    tree.set_visible(&t, rd, 0);
+    frame(&t, &c, &o);
+    check("a child hidden: painted again", stats.cache_renders == 1);
+    check("a child hidden: as if painted directly", differing(1) == 0);
+    tree.set_visible(&t, rd, 1);
+    frame(&t, &c, &o);
+    check("shown again: painted again", stats.cache_renders == 1);
+
+    // Hovering a child inside changes how it looks.
+    let is math.rect.Rect as rw = layout.window_rect(&t, rd);
+    router.pointer_move(&t, &r, rw.x + 6.0, rw.y + 6.0, 0);
+    frame(&t, &c, &o);
+    check("hover inside: painted again", stats.cache_renders == 1);
+    check("hover inside: shows", pixel(cast(i64, rw.x) + 6, cast(i64, rw.y) + 6) == as_px(GREEN));
+    router.pointer_leave(&t, &r, 0);
+    frame(&t, &c, &o);
+
+    // A child destroyed.
+    let is i64 as extra = box_at(&t, card, 2.0, 12.0, 4.0, 4.0, BLUE);
+    frame(&t, &c, &o);
+    tree.destroy(&t, extra);
+    frame(&t, &c, &o);
+    check("a child destroyed: painted again", stats.cache_renders == 1);
+    check("a child destroyed: as if painted directly", differing(1) == 0);
+
+    // --- Unchanged and still: nothing to do at all ---
+    frame(&t, &c, &o);
+    check("idle: nothing painted into it", stats.cache_renders == 0);
+
+    // --- Cached inside cached: the inner one is painted directly into the outer ---
+    tree.set_flag(&t, rd, tree.F_CACHE, 1);
+    frame(&t, &c, &o);
+    check("nested: one texture", paint.cache_used(&cc, &t) == 1);
+    check("nested: as if painted directly", differing(1) == 0);
+    tree.set_flag(&t, rd, tree.F_CACHE, 0);
+
+    // --- A layered widget inside: not cached, so it can escape ---
+    let is i64 as pop = box_at(&t, card, 26.0, 0.0, 10.0, 6.0, RED);
+    tree.set_layer(&t, pop, 1);
+    frame(&t, &c, &o);
+    check("layered inside: not put back from a texture", stats.cache_blits == 0);
+    check("layered inside: as if painted directly", differing(0) == 0);
+    tree.destroy(&t, pop);
+    frame(&t, &c, &o);
+    check("layer gone: cached again", stats.cache_blits == 1);
+
+    // --- Destroyed: its entry goes to the next one ---
+    tree.destroy(&t, card);
+    frame(&t, &c, &o);
+    check("destroyed: no entry in use", paint.cache_used(&cc, &t) == 0);
+    let is i64 as n with mut = 0;
+    let is [20]i64 as many;
+    while (n < 20) {
+        many[n] = box_at(&t, root, cast(f64, (n % 5) * 12), cast(f64, (n / 5) * 12), 10.0, 10.0, RED);
+        tree.set_flag(&t, many[n], tree.F_CACHE, 1);
+        n = n + 1;
+    }
+    frame(&t, &c, &o);
+    check("past the limit: as many textures as there are entries", paint.cache_used(&cc, &t) == paint.MAX_CACHED);
+    check("past the limit: the rest painted directly", differing(0) == 0);
+
+    paint.cache_close(&cc);
+    draw2d.close(&c);
+    tree.close(&t);
+    if (fails > 0) {
+        io.printf("cache: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("cache: all checks passed\n");
+    return 0;
+}

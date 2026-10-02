@@ -22,10 +22,24 @@
 // its edge, from the theme — unless the widget drew its own and set
 // focus_drawn.
 //
+// A widget with tree.F_CACHE, given a Cache in the options, is painted once
+// into a texture of its own — its whole subtree, onto transparency — and while
+// nothing inside it changes that texture is put back instead: moving the
+// widget repaints the places it left and reached without calling one paint
+// entry inside it. damage.collect says when the texture is stale. The texture
+// holds premultiplied colour, so it goes back with draw2d.image_premultiplied
+// and its soft edges come out as they would have been drawn directly. A cached
+// widget inside another, or with a layered widget inside it, is painted
+// directly: one texture cannot hold what has to escape it.
+//
 // The caller owns the frame around it: draw2d.begin on the target's size, this,
 // draw2d.flush into a pass that loads what the target already holds, present
 // the region, tree.damage_clear.
+use "std/math.cst" as fm;
 use "../math/math.cst" as math;
+use "../gpu/device.cst" as dev;
+use "../gpu/texture.cst" as texture;
+use "../gpu/command.cst" as command;
 use "../render/draw2d.cst" as draw2d;
 use "../render/shapes2d.cst" as shapes;
 use "tree.cst" as tree;
@@ -34,8 +48,101 @@ use "router.cst" as router;
 use "painter.cst" as painter;
 use "style.cst" as style;
 
+// --- The cache ---
+
+let is i64 as MAX_CACHED with imut = 16;
+
+struct CacheEntry {
+    w   as i64;   // the cached widget; 0 for a free entry
+    tex as i64;
+    pw  as i64;   // the texture's size, physical pixels
+    ph  as i64;
+}
+
+// Textures for cached widgets, and the canvas and command buffer that paint
+// into them. On the device the window paints with; MAX_CACHED widgets at once,
+// and a cached widget past that is painted directly.
+struct Cache {
+    d       as *dev.Device;
+    canvas  as draw2d.Canvas;
+    cmd     as i64;
+    entries as [16]CacheEntry;
+    ok      as i32;
+    _pad0   as i32;
+}
+
+fn cache_open(d as *dev.Device, l as *draw2d.Limits) as Cache {
+    let is Cache as cc;
+    cc.d = d;
+    cc.ok = 0;
+    cc._pad0 = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_CACHED) {
+        cc.entries[i].w = 0;
+        cc.entries[i].tex = 0;
+        cc.entries[i].pw = 0;
+        cc.entries[i].ph = 0;
+        i = i + 1;
+    }
+    cc.canvas = draw2d.open(d, l);
+    cc.cmd = command.create(d);
+    if (draw2d.is_open(&cc.canvas) == 1 && cc.cmd != 0) { cc.ok = 1; }
+    return cc;
+}
+
+fn cache_close(cc as *Cache) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CACHED) {
+        if (cc.entries[i].tex != 0) { texture.destroy(cc.d, cc.entries[i].tex); }
+        cc.entries[i].tex = 0;
+        cc.entries[i].w = 0;
+        i = i + 1;
+    }
+    draw2d.close(&cc.canvas);
+    if (cc.cmd != 0) { command.destroy(cc.d, cc.cmd); }
+    cc.cmd = 0;
+    cc.ok = 0;
+}
+
+// How many entries hold a texture for a widget still alive.
+fn cache_used(cc as *Cache, t as *tree.Tree) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_CACHED) {
+        if (cc.entries[i].w != 0 && tree.is_valid(t, cc.entries[i].w) == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The entry for w: its own, or one that is free or whose widget is gone —
+// whose texture is released. Null when every entry is in use.
+fn _entry(cc as *Cache, t as *tree.Tree, w as i64) as *CacheEntry {
+    let is i64 as i with mut = 0;
+    while (i < MAX_CACHED) {
+        if (cc.entries[i].w == w) { return &cc.entries[i]; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < MAX_CACHED) {
+        let is *CacheEntry as e = &cc.entries[i];
+        if (e.w == 0 || tree.is_valid(t, e.w) == 0 || tree.has_flag(t, e.w, tree.F_CACHE) == 0) {
+            if (e.tex != 0) { texture.destroy(cc.d, e.tex); }
+            e.tex = 0;
+            e.pw = 0;
+            e.ph = 0;
+            e.w = w;
+            tree.set_flag(t, w, tree.F_CACHE_DIRTY, 1);
+            return e;
+        }
+        i = i + 1;
+    }
+    return cast(*CacheEntry, 0);
+}
+
 struct Options {
     router as *router.Router;   // hover, press and focus; null paints every widget at rest
+    cache  as *Cache;           // null paints cached widgets directly
     theme  as *style.Theme;
     time   as i64;              // milliseconds, handed to every paint entry
     active as i32;              // the window has the keyboard focus
@@ -45,6 +152,7 @@ struct Options {
 fn options(theme as *style.Theme) as Options {
     let is Options as o;
     o.router = cast(*router.Router, 0);
+    o.cache = cast(*Cache, 0);
     o.theme = theme;
     o.time = 0;
     o.active = 1;
@@ -58,6 +166,8 @@ struct Stats {
     walked  as i64;   // widgets visited, painted or not
     painted as i64;   // paint entries called
     rings   as i64;   // focus rings drawn
+    cache_renders as i64;   // cached subtrees painted into their textures
+    cache_blits   as i64;   // cached textures put back
 }
 
 struct _Walk {
@@ -67,6 +177,8 @@ struct _Walk {
     st      as *Stats;
     region  as math.rect.Rect;
     focus   as i64;
+    cache   as *Cache;   // null while painting into a cache
+    no_ring as i64;      // a widget whose ring is drawn outside its texture
     clip_on as i32;
     _pad0   as i32;
 }
@@ -131,6 +243,7 @@ fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
     let is math.rect.Rect as vis = math.rect.rect_intersect(wr, clip);
     let is i32 as shown = 1 - math.rect.rect_is_empty(vis);
     if (shown == 0 && tree.layered_count(k.t) == 0) { return; }
+    if (shown == 1 && _cached(k, w, ox, oy, wr, vis, layer, disabled) == 1) { return; }
 
     let is painter.Painter as p;
     p.focus_drawn = 0;
@@ -161,11 +274,90 @@ fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
         _visit(k, ch, wr.x, wr.y, vis, layer, disabled);
         ch = tree.next_sibling(k.t, ch);
     }
-    if (shown == 1 && (p.state & painter.S_FOCUS_VISIBLE) != 0 && p.focus_drawn == 0) {
+    if (shown == 1 && (p.state & painter.S_FOCUS_VISIBLE) != 0 && p.focus_drawn == 0 && w != k.no_ring) {
         draw2d.set_layer(k.c, layer);
         _clip(k, vis);
         _ring(k, wr);
     }
+}
+
+fn _has_layered(t as *tree.Tree, w as i64) as i32 {
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        if (tree.layer(t, ch) > 0 || _has_layered(t, ch) == 1) { return 1; }
+        ch = tree.next_sibling(t, ch);
+    }
+    return 0;
+}
+
+// w from its cache, painting the cache first if it is stale. 0 when w is not
+// to be cached here, and the walk paints it directly.
+fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
+           vis as math.rect.Rect, layer as i64, disabled as i32) as i32 {
+    if (cast(i64, k.cache) == 0 || k.cache.ok == 0) { return 0; }
+    if (tree.has_flag(k.t, w, tree.F_CACHE) == 0) { return 0; }
+    if (tree.layered_count(k.t) > 0 && _has_layered(k.t, w) == 1) { return 0; }
+    let is *CacheEntry as e = _entry(k.cache, k.t, w);
+    if (cast(i64, e) == 0) { return 0; }
+    let is f64 as s = k.c.scale;
+    let is i64 as pw = cast(i64, fm.ceil(wr.w * s));
+    let is i64 as ph = cast(i64, fm.ceil(wr.h * s));
+    if (pw <= 0 || ph <= 0) { return 0; }
+    if (e.tex == 0 || e.pw != pw || e.ph != ph) {
+        if (e.tex != 0) { texture.destroy(k.cache.d, e.tex); }
+        let is texture.Desc as td = texture.desc(pw, ph, texture.RGBA8, texture.SAMPLED | texture.RENDER_TARGET);
+        e.tex = texture.create(k.cache.d, &td);
+        e.pw = pw;
+        e.ph = ph;
+        if (e.tex == 0) { e.w = 0; return 0; }
+        tree.set_flag(k.t, w, tree.F_CACHE_DIRTY, 1);
+    }
+    if (tree.has_flag(k.t, w, tree.F_CACHE_DIRTY) == 1) {
+        _render(k, e, w, ox, oy, wr, layer, disabled);
+        tree.set_flag(k.t, w, tree.F_CACHE_DIRTY, 0);
+    }
+    draw2d.set_layer(k.c, layer);
+    _clip(k, vis);
+    draw2d.image_premultiplied(k.c, e.tex, 0, wr.x, wr.y, wr.w, wr.h, 0.0, 0.0, 1.0, 1.0,
+                               math.color.rgba(1.0, 1.0, 1.0, 1.0));
+    k.st.cache_blits = k.st.cache_blits + 1;
+    // Its own ring goes on top, after everything in it, as it would have
+    // without a cache.
+    if (k.focus == w && cast(i64, k.o.router) != 0 && router.focus_visible(k.o.router) == 1) {
+        _ring(k, wr);
+    }
+    return 1;
+}
+
+// The whole of w's subtree into its texture, on transparency, at the
+// coordinates it has in the window.
+fn _render(k as *_Walk, e as *CacheEntry, w as i64, ox as f64, oy as f64,
+           wr as math.rect.Rect, layer as i64, disabled as i32) as void {
+    let is *Cache as cc = k.cache;
+    let is *draw2d.Canvas as oc = &cc.canvas;
+    draw2d.begin(oc, cast(f64, e.pw), cast(f64, e.ph), k.c.scale);
+    draw2d.set_origin(oc, wr.x, wr.y);
+    let is _Walk as k2;
+    k2.t = k.t;
+    k2.c = oc;
+    k2.o = k.o;
+    k2.st = k.st;
+    k2.region = wr;
+    k2.focus = k.focus;
+    k2.cache = cast(*Cache, 0);
+    k2.no_ring = w;
+    k2.clip_on = 0;
+    k2._pad0 = 0;
+    _visit(&k2, w, ox, oy, wr, layer, disabled);
+    if (k2.clip_on == 1) { draw2d.pop_clip(oc); }
+    command.begin(cc.d, cc.cmd);
+    let is command.Pass as ps = command.pass(e.tex, 0, math.color.rgba(0.0, 0.0, 0.0, 0.0));
+    command.begin_pass(cc.d, cc.cmd, &ps);
+    draw2d.flush(oc, cc.cmd);
+    command.end_pass(cc.d, cc.cmd);
+    command.end(cc.d, cc.cmd);
+    command.submit(cc.d, cc.cmd);
+    k.st.cache_renders = k.st.cache_renders + 1;
 }
 
 // Paints every rectangle of the tree's damage region on c, which the caller
@@ -178,6 +370,8 @@ fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i
     s.walked = 0;
     s.painted = 0;
     s.rings = 0;
+    s.cache_renders = 0;
+    s.cache_blits = 0;
     let is _Walk as k;
     k.t = t;
     k.c = c;
@@ -186,6 +380,8 @@ fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i
     k.clip_on = 0;
     k._pad0 = 0;
     k.focus = 0;
+    k.cache = o.cache;
+    k.no_ring = 0;
     if (cast(i64, o.router) != 0) { k.focus = router.focused(t, o.router); }
     let is i64 as root = tree.root(t);
     let is i64 as n = tree.damage_count(t);

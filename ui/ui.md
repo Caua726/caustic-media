@@ -434,6 +434,15 @@ paint entry forgets to pop is popped for it. `app.paint` paints a window with
 its own router and active state; `style.cst` holds the theme, with colours in
 sRGB as written.
 
+A widget with `tree.F_CACHE`, given a `paint.Cache`, is painted once into a
+texture and put back while nothing inside it changes — moved as a whole, it
+repaints the places it left and reached without one paint entry inside it
+(`cache_test`, every frame compared with the same tree painted with no cache).
+`damage.collect` makes the texture stale when anything inside changes other
+than moving along with it. The texture holds premultiplied colour and goes back
+with a premultiplied blend, so soft edges match painting directly; a cache
+inside a cache, or one with a layered widget inside, is painted directly.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
