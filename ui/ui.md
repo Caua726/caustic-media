@@ -10,7 +10,11 @@ ui/
   ui.cst          hub
   tree.cst        widgets as nodes in a window's tree, and the handles to them
   widget.cst      the table of functions every kind of widget fills in
-  layout.cst      measure and arrange: box, grid, stack, size policies
+  geom.cst        sizes, constraints, and the layout record each widget carries
+  layout.cst      measure, place, the pass, sharing room along an axis
+  box.cst         rows and columns
+  grid.cst        rows and columns at once
+  stack.cst       one page at a time; children layered on each other
   event.cst       routing: hit-testing, capture, bubbling, focus, shortcuts
   signal.cst      connecting a callback to what a widget emits
   model.cst       row and cell models behind lists, trees and tables
@@ -159,9 +163,19 @@ Two passes, run only over subtrees marked dirty:
 2. **arrange**, top-down: each container hands its children their rectangles.
 
 The containers are **box** (a row or column, with spacing and stretch factors),
-**grid** (forms), **stack** (one visible child: tabs, wizards), **scroll area**
-and **splitter**. That set covers what GTK's and Qt's layouts are used for in
-practice.
+**grid** (forms), **stack** (one visible child: tabs, wizards), **overlay**
+(children layered, each aligned on its own), **scroll area** and **splitter**.
+That set covers what GTK's and Qt's layouts are used for in practice. The last
+two are interactive — scrollbars, a draggable handle — so they arrive with the
+widgets, on the same protocol.
+
+**Height for width.** Wrapped text is taller the narrower it is, so a widget's
+height is measured again at the width it is actually given, and a row or grid
+that knows its width shares it out before asking its children how tall they
+need to be. Without that, a paragraph in a row is measured on one line.
+
+Rectangles are **relative to the parent**: moving a container — scrolling it,
+moving the window — moves everything in it without laying anything out again.
 
 Units are logical pixels. [`window/`](../window/window.md)'s `display.cst`
 supplies the scale per monitor, and everything — theme metrics, font sizes,
@@ -297,12 +311,20 @@ has no code. What can be built without them is built first.
 
 ## Current state
 
-**`tree.cst` and `widget.cst` exist and are tested** (`tree_test.cst`): handles
+**The tree** (`tree.cst`, `widget.cst`, tested by `tree_test.cst`): handles
 with an era, the tree sized at open and never grown, children kept in order,
 recursive destruction children-first with each kind's `destroy` entry, reparent
 refusing cycles, hidden and disabled inherited from ancestors, and layout
-invalidation that climbs to the root. Nothing is drawn yet; layout, routing and
-signals come next, testable with geometry and synthetic events alone.
+invalidation that climbs to the root.
+
+**Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
+with its test): margins, alignment, minimum and maximum, right to left,
+height for width, a pass that skips what did not change, and box, grid, stack
+and overlay. The tests were checked against deliberate breakages — each rule
+removed in turn — and catch every one.
+
+Nothing is drawn yet; event routing and signals come next, testable with
+synthetic events alone.
 
 ## For scale
 

@@ -1,0 +1,293 @@
+// ui/box.cst — a row or a column of widgets.
+//
+// The container most layouts are made of. Along the main axis each child gets
+// its preferred size; what is left over goes to the children that stretch, in
+// proportion to their stretch, and a child that reaches its maximum hands its
+// share back to the others. With too little room each child gives up space in
+// proportion to how much it can — preferred minus minimum — and below the sum
+// of minimums every child is at its minimum and the box overflows.
+//
+// Across, every child is offered the whole height of a row (width of a
+// column) and aligns within it by its own alignment.
+//
+// Right to left reverses a row: the first child sits at the right. Padding is
+// physical — left is left in either direction — the same as margins.
+//
+// The sharing along the main axis is layout.distribute, the same a grid uses
+// for its columns and rows.
+//
+// A box arranges at most MAX_CHILDREN visible children; the sizes live on the
+// stack for the duration of one arrange. A list long enough to exceed that is
+// a list view's job, which creates widgets only for the rows on screen.
+use "../math/math.cst" as math;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+
+let is i32 as ROW    with imut = 0;
+let is i32 as COLUMN with imut = 1;
+
+let is i64 as MAX_CHILDREN with imut = 256;
+
+struct Data {
+    orientation as i32;
+    homogeneous as i32;
+    spacing     as f64;
+    pad_l       as f64;
+    pad_t       as f64;
+    pad_r       as f64;
+    pad_b       as f64;
+}
+
+let is widget.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("box", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _ready = 1;
+}
+
+// A new box as the last child of parent. Returns its handle, or 0 with the
+// tree's last_error set.
+fn create(t as *tree.Tree, parent as i64, orientation as i32) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.orientation = orientation;
+    return w;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn set_spacing(t as *tree.Tree, w as i64, spacing as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.spacing = spacing;
+    tree.invalidate_layout(t, w);
+}
+
+fn set_padding(t as *tree.Tree, w as i64, left as f64, top as f64, right as f64, bottom as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.pad_l = left;
+    d.pad_t = top;
+    d.pad_r = right;
+    d.pad_b = bottom;
+    tree.invalidate_layout(t, w);
+}
+
+// Every visible child gets the same share of the main axis, whatever it
+// prefers — a row of buttons that should match. No child goes below its
+// minimum to make the shares equal.
+fn set_homogeneous(t as *tree.Tree, w as i64, on as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.homogeneous = on;
+    tree.invalidate_layout(t, w);
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _add(a as f64, b as f64) as f64 {
+    if (a >= layout.UNBOUNDED || b >= layout.UNBOUNDED) { return layout.UNBOUNDED; }
+    return a + b;
+}
+
+// --- One line of children ---
+//
+// The visible children with their sizes along the main axis, measured with the
+// cross-axis room given. Measuring and arranging both start from it.
+struct Line {
+    n       as i64;
+    kids    as [256]i64;
+    size    as [256]f64;   // preferred on collection, decided after _share
+    mins    as [256]f64;
+    maxs    as [256]f64;
+    stretch as [256]f64;
+}
+
+fn _collect(t as *tree.Tree, w as i64, d as *Data, cc as *geom.Constraint, line as *Line) as void {
+    line.n = 0;
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0 && line.n < MAX_CHILDREN) {
+        if (tree.is_visible(t, ch) == 1) {
+            let is geom.Size as s;
+            layout.measure(t, ch, cc, &s);
+            let is *geom.Item as it = tree.item(t, ch);
+            let is i64 as i = line.n;
+            line.kids[i] = ch;
+            if (d.orientation == ROW) {
+                line.size[i] = s.pref_w; line.mins[i] = s.min_w; line.maxs[i] = s.max_w;
+                line.stretch[i] = it.hstretch;
+            } else {
+                line.size[i] = s.pref_h; line.mins[i] = s.min_h; line.maxs[i] = s.max_h;
+                line.stretch[i] = it.vstretch;
+            }
+            line.n = line.n + 1;
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+}
+
+// Decides the main-axis sizes for `room`, gaps already taken off.
+fn _share(d as *Data, line as *Line, room as f64) as void {
+    if (line.n == 0) { return; }
+    if (d.homogeneous == 1) {
+        let is f64 as each = _max(0.0, room) / cast(f64, line.n);
+        let is i64 as i with mut = 0;
+        while (i < line.n) { line.size[i] = _max(each, line.mins[i]); i = i + 1; }
+        return;
+    }
+    layout.distribute(line.n, cast(*f64, &line.size), cast(*f64, &line.mins), cast(*f64, &line.maxs),
+                      cast(*f64, &line.stretch), room);
+}
+
+fn _gaps(d as *Data, n as i64) as f64 {
+    if (n < 2) { return 0.0; }
+    return d.spacing * cast(f64, n - 1);
+}
+
+// --- Measuring ---
+//
+// Children are asked for their natural size along the main axis and offered
+// the box's cross-axis room, so a wrapping label in a column reports its height
+// for the column's width.
+//
+// A row offered a known width does more: it shares that width out exactly as
+// arranging will, and reports the height its children need at the widths they
+// will actually get. Otherwise a paragraph in a row would be measured on one
+// line and the row would come out too short for it.
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is f64 as ph = d.pad_l + d.pad_r;
+    let is f64 as pv = d.pad_t + d.pad_b;
+    let is geom.Constraint as cc with mut = geom.unbounded();
+    if (d.orientation == ROW) {
+        if (c.h < layout.UNBOUNDED) { cc.h = _max(0.0, c.h - pv); }
+    } else {
+        if (c.w < layout.UNBOUNDED) { cc.w = _max(0.0, c.w - ph); }
+    }
+
+    let is Line as line;
+    _collect(t, w, d, &cc, &line);
+    let is i64 as n = line.n;
+
+    let is f64 as main_min with mut = 0.0;
+    let is f64 as main_pref with mut = 0.0;
+    let is f64 as main_max with mut = 0.0;
+    let is f64 as widest_pref with mut = 0.0;   // for homogeneous
+    let is f64 as widest_min with mut = 0.0;
+    let is f64 as cross_min with mut = 0.0;
+    let is f64 as cross_pref with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        main_min = main_min + line.mins[i];
+        main_pref = main_pref + line.size[i];
+        main_max = _add(main_max, line.maxs[i]);
+        widest_pref = _max(widest_pref, line.size[i]);
+        widest_min = _max(widest_min, line.mins[i]);
+        i = i + 1;
+    }
+    if (d.homogeneous == 1) {
+        main_min = widest_min * cast(f64, n);
+        main_pref = widest_pref * cast(f64, n);
+    }
+
+    // The cross axis: each child at the main-axis size it will get when that
+    // is known, at its natural size otherwise.
+    let is i32 as known with mut = 0;
+    if (d.orientation == ROW && c.w < layout.UNBOUNDED && n > 0) {
+        _share(d, &line, _max(0.0, c.w - ph) - _gaps(d, n));
+        known = 1;
+    }
+    i = 0;
+    while (i < n) {
+        let is geom.Size as s;
+        if (known == 1) {
+            let is geom.Constraint as at = geom.constraint(line.size[i], cc.h);
+            layout.measure(t, line.kids[i], &at, &s);
+        } else {
+            layout.measure(t, line.kids[i], &cc, &s);
+        }
+        if (d.orientation == ROW) {
+            cross_min = _max(cross_min, s.min_h);
+            cross_pref = _max(cross_pref, s.pref_h);
+        } else {
+            cross_min = _max(cross_min, s.min_w);
+            cross_pref = _max(cross_pref, s.pref_w);
+        }
+        i = i + 1;
+    }
+
+    let is f64 as gaps = _gaps(d, n);
+    if (d.orientation == ROW) {
+        out.min_w = main_min + gaps + ph;
+        out.pref_w = main_pref + gaps + ph;
+        out.max_w = _add(main_max, gaps + ph);
+        out.min_h = cross_min + pv;
+        out.pref_h = cross_pref + pv;
+        out.max_h = layout.UNBOUNDED;
+    } else {
+        out.min_h = main_min + gaps + pv;
+        out.pref_h = main_pref + gaps + pv;
+        out.max_h = _add(main_max, gaps + pv);
+        out.min_w = cross_min + ph;
+        out.pref_w = cross_pref + ph;
+        out.max_w = layout.UNBOUNDED;
+    }
+    if (n == 0) {
+        out.max_w = layout.UNBOUNDED;
+        out.max_h = layout.UNBOUNDED;
+    }
+}
+
+// --- Arranging ---
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as row with mut = 0;
+    if (d.orientation == ROW) { row = 1; }
+
+    let is f64 as main_room with mut = r.h - d.pad_t - d.pad_b;
+    let is f64 as cross_room with mut = r.w - d.pad_l - d.pad_r;
+    if (row == 1) {
+        main_room = r.w - d.pad_l - d.pad_r;
+        cross_room = r.h - d.pad_t - d.pad_b;
+    }
+    cross_room = _max(0.0, cross_room);
+
+    let is geom.Constraint as cc with mut = geom.constraint(cross_room, layout.UNBOUNDED);
+    if (row == 1) { cc = geom.constraint(layout.UNBOUNDED, cross_room); }
+    let is Line as line;
+    _collect(t, w, d, &cc, &line);
+    let is i64 as n = line.n;
+    if (n == 0) { return; }
+    _share(d, &line, main_room - _gaps(d, n));
+
+    let is i32 as rtl with mut = 0;
+    if (row == 1 && layout.direction(t, w) == layout.RTL) { rtl = 1; }
+    let is f64 as pos with mut = d.pad_t;
+    if (row == 1) { pos = d.pad_l; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is f64 as size = line.size[i];
+        let is math.rect.Rect as slot with mut = math.rect.rect(d.pad_l, pos, cross_room, size);
+        if (row == 1) {
+            slot = math.rect.rect(pos, d.pad_t, size, cross_room);
+            // Mirrored: the same distance from the right edge's padding as
+            // it would have had from the left's.
+            if (rtl == 1) { slot.x = (r.w - d.pad_r) - (pos - d.pad_l) - size; }
+        }
+        layout.place(t, line.kids[i], &slot);
+        pos = pos + size + d.spacing;
+        i = i + 1;
+    }
+}

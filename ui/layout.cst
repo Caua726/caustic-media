@@ -1,0 +1,431 @@
+// ui/layout.cst — measure, place, and the pass that runs them.
+//
+// Two passes, as ui.md decides: measure bottom-up, each widget reporting the
+// least, the preferred and the most it can use for the room on offer; then
+// arrange top-down, each container handing its children rectangles. This file
+// is the protocol between them. Containers live in box.cst, grid.cst and
+// stack.cst and use nothing here that a program's own container could not.
+//
+//   layout.measure(t, w, c, out)   a widget's OUTER size: what its kind
+//                                  reports for c minus its margins, raised to
+//                                  its minimum, lowered to its maximum, plus
+//                                  the margins back on.
+//   layout.place(t, w, area)       gives w the area (in its parent's
+//                                  coordinates) minus margins, sized and
+//                                  positioned by its alignment, and arranges
+//                                  it if that is needed.
+//   layout.run(t, w, h)            the pass, for a window w by h.
+//
+// Rectangles are relative to the parent. Moving a container moves everything
+// in it without touching it, which is what lets a scroll area scroll and a
+// window move without laying anything out again; window_rect adds the chain
+// up when absolute coordinates are wanted.
+//
+// What did not change is skipped. A widget is arranged only when it is marked
+// (tree.invalidate_layout and everything that calls it) or its size changed;
+// a new position alone just updates the rectangle. Measures are cached per
+// widget against the constraint they answered, and dropped when the widget or
+// anything under it is invalidated.
+use "../math/math.cst" as math;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+
+// Same value as geom.UNBOUNDED.
+let is f64 as UNBOUNDED with imut = 1000000000000000000000000000000.0;
+
+// Alignment within the area a widget is offered. FILL takes all of it, up to
+// the widget's maximum; the others take the preferred size and put the spare
+// room before it, around it or after it.
+let is i32 as FILL   with imut = 0;
+let is i32 as START  with imut = 1;
+let is i32 as CENTER with imut = 2;
+let is i32 as END    with imut = 3;
+
+// Writing direction. Inherited unless set, left to right at the root. Right
+// to left mirrors START and END horizontally — never vertically.
+let is i32 as INHERIT with imut = 0;
+let is i32 as LTR     with imut = 1;
+let is i32 as RTL     with imut = 2;
+
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+// The minimum wins over the maximum and over the room on offer: a widget that
+// cannot be smaller overflows rather than lying about its size.
+fn _clamp(v as f64, lo as f64, hi as f64) as f64 {
+    let is f64 as r with mut = v;
+    if (r > hi) { r = hi; }
+    if (r < lo) { r = lo; }
+    return r;
+}
+
+fn _shrink(v as f64, by as f64) as f64 {
+    if (v >= UNBOUNDED) { return UNBOUNDED; }
+    return _max(0.0, v - by);
+}
+
+fn _grow(v as f64, by as f64) as f64 {
+    if (v >= UNBOUNDED) { return UNBOUNDED; }
+    return v + by;
+}
+
+// --- Measuring ---
+
+fn measure(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0 || tree.is_visible(t, w) == 0) {
+        geom.size_zero(out);
+        return;
+    }
+    _measure(t, w, it, c, out);
+}
+
+// The same, for a widget that is hidden but still has to be accounted for —
+// a stack sizes itself to its largest page, shown or not.
+fn measure_hidden(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { geom.size_zero(out); return; }
+    _measure(t, w, it, c, out);
+}
+
+fn _measure(t as *tree.Tree, w as i64, it as *geom.Item, c as *geom.Constraint, out as *geom.Size) as void {
+    if (it.cache_ok == 1 && it.cache_c.w == c.w && it.cache_c.h == c.h) {
+        *out = it.cache;
+        return;
+    }
+    let is f64 as mh = it.margin_l + it.margin_r;
+    let is f64 as mv = it.margin_t + it.margin_b;
+    let is geom.Constraint as inner = geom.constraint(_shrink(c.w, mh), _shrink(c.h, mv));
+
+    let is geom.Size as s;
+    s.min_w = 0.0;
+    s.min_h = 0.0;
+    s.pref_w = 0.0;
+    s.pref_h = 0.0;
+    s.max_w = UNBOUNDED;
+    s.max_h = UNBOUNDED;
+    if (w == tree.root(t)) {
+        overlay_measure(t, w, &inner, &s);
+    } else {
+        let is *widget.Kind as k = tree.kind(t, w);
+        if (cast(i64, k.measure) != 0) {
+            call(k.measure, cast(*u8, t), w, tree.data(t, w), cast(*u8, &inner), cast(*u8, &s));
+        }
+    }
+
+    s.min_w = _max(s.min_w, it.min_w);
+    s.min_h = _max(s.min_h, it.min_h);
+    s.max_w = _max(_min(s.max_w, it.max_w), s.min_w);
+    s.max_h = _max(_min(s.max_h, it.max_h), s.min_h);
+    s.pref_w = _clamp(s.pref_w, s.min_w, s.max_w);
+    s.pref_h = _clamp(s.pref_h, s.min_h, s.max_h);
+
+    s.min_w = s.min_w + mh;
+    s.min_h = s.min_h + mv;
+    s.pref_w = s.pref_w + mh;
+    s.pref_h = s.pref_h + mv;
+    s.max_w = _grow(s.max_w, mh);
+    s.max_h = _grow(s.max_h, mv);
+
+    it.cache = s;
+    it.cache_c = *c;
+    it.cache_ok = 1;
+    *out = s;
+}
+
+// --- The overlay rule ---
+//
+// Every visible child gets the whole area and aligns within it on its own;
+// later children sit above earlier ones. The root follows it — that is where
+// popups and dialogs drawn inside the window will go, above the content — and
+// so does stack.cst's overlay kind. Measured as the largest child.
+fn overlay_measure(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.max_w = UNBOUNDED;
+    out.max_h = UNBOUNDED;
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is geom.Size as s;
+        measure(t, ch, c, &s);
+        out.min_w = _max(out.min_w, s.min_w);
+        out.min_h = _max(out.min_h, s.min_h);
+        out.pref_w = _max(out.pref_w, s.pref_w);
+        out.pref_h = _max(out.pref_h, s.pref_h);
+        ch = tree.next_sibling(t, ch);
+    }
+}
+
+fn overlay_arrange(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void {
+    let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, r.w, r.h);
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        place(t, ch, &all);
+        ch = tree.next_sibling(t, ch);
+    }
+}
+
+// --- Placing ---
+
+// Where in `room` a span of `size` goes for an alignment. Spare room never
+// goes negative: a widget larger than its area overflows to the end, it is
+// never pushed out before the start.
+fn _offset(align as i32, room as f64, size as f64) as f64 {
+    let is f64 as spare = _max(0.0, room - size);
+    if (align == CENTER) { return spare * 0.5; }
+    if (align == END) { return spare; }
+    return 0.0;
+}
+
+fn _span(align as i32, room as f64, min as f64, pref as f64, max as f64) as f64 {
+    if (align == FILL) { return _clamp(room, min, max); }
+    return _clamp(_min(pref, room), min, max);
+}
+
+fn place(t as *tree.Tree, w as i64, area as *math.rect.Rect) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0 || tree.is_visible(t, w) == 0) { return; }
+
+    let is f64 as mh = it.margin_l + it.margin_r;
+    let is f64 as mv = it.margin_t + it.margin_b;
+    let is f64 as room_w = _max(0.0, area.w - mh);
+    let is f64 as room_h = _max(0.0, area.h - mv);
+
+    // Width first, from a measure against the whole area.
+    let is geom.Constraint as c = geom.constraint(area.w, area.h);
+    let is geom.Size as s;
+    _measure(t, w, it, &c, &s);
+    let is f64 as rw = _span(it.align_h, room_w, s.min_w - mh, s.pref_w - mh, _shrink(s.max_w, mh));
+
+    // Then height, measured again at the width just decided: wrapped text is
+    // taller the narrower it is, and only now is its width known.
+    let is geom.Constraint as c2 = geom.constraint(rw + mh, area.h);
+    let is geom.Size as s2;
+    _measure(t, w, it, &c2, &s2);
+    let is f64 as rh = _span(it.align_v, room_h, s2.min_h - mv, s2.pref_h - mv, _shrink(s2.max_h, mv));
+
+    let is i32 as ah with mut = it.align_h;
+    if (ah == FILL) { ah = START; }
+    if (direction(t, w) == RTL) {
+        if (ah == START) { ah = END; } else if (ah == END) { ah = START; }
+    }
+    let is f64 as x = area.x + it.margin_l + _offset(ah, room_w, rw);
+    let is f64 as y = area.y + it.margin_t + _offset(it.align_v, room_h, rh);
+
+    let is i32 as resized with mut = 0;
+    if (it.rect.w != rw || it.rect.h != rh) { resized = 1; }
+    it.rect = math.rect.rect(x, y, rw, rh);
+    if (resized == 1 || tree.needs_layout(t, w) == 1) {
+        _arrange(t, w, it);
+    }
+}
+
+fn _arrange(t as *tree.Tree, w as i64, it as *geom.Item) as void {
+    if (w == tree.root(t)) {
+        overlay_arrange(t, w, &it.rect);
+    } else {
+        let is *widget.Kind as k = tree.kind(t, w);
+        if (cast(i64, k.arrange) != 0) {
+            call(k.arrange, cast(*u8, t), w, tree.data(t, w), cast(*u8, &it.rect));
+        }
+    }
+    tree.clear_layout(t, w);
+}
+
+// --- The pass ---
+
+// Lays out the whole tree for a window of w by h logical pixels. Cheap when
+// nothing changed: a clean root of the same size returns at once.
+fn run(t as *tree.Tree, w as f64, h as f64) as void {
+    let is i64 as root = tree.root(t);
+    let is *geom.Item as it = tree.item(t, root);
+    if (cast(i64, it) == 0) { return; }
+    let is i32 as resized with mut = 0;
+    if (it.rect.w != w || it.rect.h != h) { resized = 1; }
+    it.rect = math.rect.rect(0.0, 0.0, w, h);
+    if (resized == 1 || tree.needs_layout(t, root) == 1) {
+        _arrange(t, root, it);
+    }
+}
+
+// The smallest window the content fits in: the root's minimum.
+fn min_size(t as *tree.Tree, out as *geom.Size) as void {
+    let is geom.Constraint as c = geom.unbounded();
+    measure(t, tree.root(t), &c, out);
+}
+
+// --- Sharing room along one axis ---
+//
+// What a box does along its main axis and a grid does for its columns and
+// rows, so it is here once. size holds the preferred sizes on entry and the
+// decided ones on return; mins, maxs and stretch are per entry; n is at most
+// MAX_SHARE.
+//
+// With room to spare it goes by stretch, and an entry that would pass its
+// maximum takes only what fits and drops out, the rest shared again among the
+// others. With too little room every entry gives up the same fraction of what
+// it could give — preferred minus minimum. Below the sum of minimums, every
+// entry is at its minimum and the caller overflows.
+let is i64 as MAX_SHARE with imut = 1024;
+
+fn distribute(n as i64, size as *f64, mins as *f64, maxs as *f64, stretch as *f64, room as f64) as void {
+    if (n <= 0 || n > MAX_SHARE) { return; }
+    let is f64 as sum_pref with mut = 0.0;
+    let is f64 as sum_min with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        sum_pref = sum_pref + size[i];
+        sum_min = sum_min + mins[i];
+        i = i + 1;
+    }
+
+    if (room >= sum_pref) {
+        let is [1024]i32 as capped;
+        i = 0;
+        while (i < n) { capped[i] = 0; i = i + 1; }
+        let is f64 as spare with mut = room - sum_pref;
+        let is i32 as again with mut = 1;
+        while (again == 1 && spare > 0.0000001) {
+            again = 0;
+            let is f64 as total with mut = 0.0;
+            i = 0;
+            while (i < n) {
+                if (capped[i] == 0) { total = total + stretch[i]; }
+                i = i + 1;
+            }
+            if (total > 0.0) {
+                let is f64 as given with mut = 0.0;
+                i = 0;
+                while (i < n) {
+                    if (capped[i] == 0 && stretch[i] > 0.0) {
+                        let is f64 as add with mut = spare * stretch[i] / total;
+                        if (size[i] + add >= maxs[i]) {
+                            add = _max(0.0, maxs[i] - size[i]);
+                            capped[i] = 1;
+                            again = 1;
+                        }
+                        size[i] = size[i] + add;
+                        given = given + add;
+                    }
+                    i = i + 1;
+                }
+                spare = spare - given;
+            }
+        }
+    } else if (room > sum_min) {
+        let is f64 as deficit = sum_pref - room;
+        let is f64 as slack = sum_pref - sum_min;
+        i = 0;
+        while (i < n) {
+            size[i] = size[i] - deficit * (size[i] - mins[i]) / slack;
+            i = i + 1;
+        }
+    } else {
+        i = 0;
+        while (i < n) { size[i] = mins[i]; i = i + 1; }
+    }
+}
+
+// --- Results ---
+
+fn rect(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return math.rect.rect_zero(); }
+    return it.rect;
+}
+
+// The rectangle in window coordinates: the parents' offsets added up.
+fn window_rect(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is math.rect.Rect as r with mut = rect(t, w);
+    let is i64 as p with mut = tree.parent(t, w);
+    while (p != 0) {
+        let is math.rect.Rect as pr = rect(t, p);
+        r.x = r.x + pr.x;
+        r.y = r.y + pr.y;
+        p = tree.parent(t, p);
+    }
+    return r;
+}
+
+fn direction(t as *tree.Tree, w as i64) as i32 {
+    let is i64 as a with mut = w;
+    while (a != 0) {
+        let is *geom.Item as it = tree.item(t, a);
+        if (it.dir != INHERIT) { return it.dir; }
+        a = tree.parent(t, a);
+    }
+    return LTR;
+}
+
+// --- Properties ---
+//
+// Every setter invalidates, since every one of them can change a size.
+
+fn invalidate(t as *tree.Tree, w as i64) as void { tree.invalidate_layout(t, w); }
+
+fn set_margin(t as *tree.Tree, w as i64, left as f64, top as f64, right as f64, bottom as f64) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return; }
+    it.margin_l = left;
+    it.margin_t = top;
+    it.margin_r = right;
+    it.margin_b = bottom;
+    tree.invalidate_layout(t, w);
+}
+
+fn set_align(t as *tree.Tree, w as i64, horizontal as i32, vertical as i32) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return; }
+    it.align_h = horizontal;
+    it.align_v = vertical;
+    tree.invalidate_layout(t, w);
+}
+
+fn set_min_size(t as *tree.Tree, w as i64, mw as f64, mh as f64) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return; }
+    it.min_w = mw;
+    it.min_h = mh;
+    tree.invalidate_layout(t, w);
+}
+
+fn set_max_size(t as *tree.Tree, w as i64, mw as f64, mh as f64) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return; }
+    it.max_w = mw;
+    it.max_h = mh;
+    tree.invalidate_layout(t, w);
+}
+
+// The share of spare room a container gives w, per axis: a row reads the
+// horizontal one, a column the vertical one, a grid both. Zero takes none.
+fn set_stretch(t as *tree.Tree, w as i64, horizontal as f64, vertical as f64) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return; }
+    it.hstretch = horizontal;
+    it.vstretch = vertical;
+    tree.invalidate_layout(t, w);
+}
+
+// Where w sits in a grid: its row and column, and how many of each it spans.
+// Spans below 1 are taken as 1. Ignored by every container but a grid.
+fn set_cell(t as *tree.Tree, w as i64, row as i32, col as i32, row_span as i32, col_span as i32) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return; }
+    it.row = row;
+    it.col = col;
+    it.row_span = row_span;
+    it.col_span = col_span;
+    if (it.row_span < 1) { it.row_span = 1; }
+    if (it.col_span < 1) { it.col_span = 1; }
+    tree.invalidate_layout(t, w);
+}
+
+// The direction changes how a whole subtree arranges, so the whole subtree is
+// invalidated, not just the path to the root.
+fn set_direction(t as *tree.Tree, w as i64, dir as i32) as void {
+    let is *geom.Item as it = tree.item(t, w);
+    if (cast(i64, it) == 0) { return; }
+    it.dir = dir;
+    tree.invalidate_subtree(t, w);
+}

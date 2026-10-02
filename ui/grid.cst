@@ -1,0 +1,312 @@
+// ui/grid.cst — rows and columns at once.
+//
+// What forms are made of: labels in one column lining up, fields in the next
+// taking the spare width. Each child names its cell with layout.set_cell — row,
+// column, and how many of each it spans.
+//
+// A column is as wide as its widest single-column child, a row as tall as its
+// tallest single-row child. A child spanning several columns that needs more
+// than they add up to shares what it lacks evenly among them; the same for rows.
+// Spare room goes to the columns (and rows) holding a child that stretches in
+// that axis, by layout.distribute, the same rule a box uses.
+//
+// Heights are worked out after widths. A row's height is measured with each
+// child at the width its cell will actually have, so text that wraps in a
+// narrow column makes its row taller — when the grid knows its width, measuring
+// does this too, not only arranging.
+//
+// Right to left puts column 0 at the right. Padding is physical, as in box.
+//
+// At most MAX_COLS columns and MAX_ROWS rows; a child outside them is not
+// placed.
+use "../math/math.cst" as math;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+
+let is i64 as MAX_COLS with imut = 64;
+let is i64 as MAX_ROWS with imut = 256;
+
+struct Data {
+    col_spacing as f64;
+    row_spacing as f64;
+    pad_l       as f64;
+    pad_t       as f64;
+    pad_r       as f64;
+    pad_b       as f64;
+}
+
+let is widget.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("grid", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _ready = 1;
+}
+
+fn create(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    return tree.create(t, &_kind, parent);
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn set_spacing(t as *tree.Tree, w as i64, columns as f64, rows as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.col_spacing = columns;
+    d.row_spacing = rows;
+    tree.invalidate_layout(t, w);
+}
+
+fn set_padding(t as *tree.Tree, w as i64, left as f64, top as f64, right as f64, bottom as f64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.pad_l = left;
+    d.pad_t = top;
+    d.pad_r = right;
+    d.pad_b = bottom;
+    tree.invalidate_layout(t, w);
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+// --- Tracks ---
+//
+// A track is the columns or the rows: per entry the minimum, the preferred
+// size (the decided one after _decide) and the stretch.
+struct Track {
+    n       as i64;
+    size    as [256]f64;
+    mins    as [256]f64;
+    maxs    as [256]f64;
+    stretch as [256]f64;
+}
+
+fn _track_clear(k as *Track, n as i64) as void {
+    k.n = n;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        k.size[i] = 0.0;
+        k.mins[i] = 0.0;
+        k.maxs[i] = layout.UNBOUNDED;
+        k.stretch[i] = 0.0;
+        i = i + 1;
+    }
+}
+
+fn _gaps(spacing as f64, n as i64) as f64 {
+    if (n < 2) { return 0.0; }
+    return spacing * cast(f64, n - 1);
+}
+
+// The extent of the grid: one past the last row and column any visible child
+// reaches, within the limits.
+fn _extent(t as *tree.Tree, w as i64, rows as *i64, cols as *i64) as void {
+    *rows = 0;
+    *cols = 0;
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        if (tree.is_visible(t, ch) == 1) {
+            let is *geom.Item as it = tree.item(t, ch);
+            let is i64 as re = cast(i64, it.row + it.row_span);
+            let is i64 as ce = cast(i64, it.col + it.col_span);
+            if (re > *rows) { *rows = re; }
+            if (ce > *cols) { *cols = ce; }
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    if (*rows > MAX_ROWS) { *rows = MAX_ROWS; }
+    if (*cols > MAX_COLS) { *cols = MAX_COLS; }
+}
+
+fn _fits(it as *geom.Item, rows as i64, cols as i64) as i32 {
+    if (it.row < 0 || it.col < 0) { return 0; }
+    if (cast(i64, it.row + it.row_span) > rows) { return 0; }
+    if (cast(i64, it.col + it.col_span) > cols) { return 0; }
+    return 1;
+}
+
+// Adds one child's need to a track: entries [first, first + span). A single
+// entry takes the largest; a span shares out evenly what the entries it covers
+// lack. Spans are applied after every single entry, which is why this runs in
+// two passes — single == 1, then single == 0.
+fn _need(k as *Track, first as i64, span as i64, spacing as f64,
+         min as f64, pref as f64, stretch as f64, single as i32) as void {
+    if (span == 1) {
+        if (single == 0) { return; }
+        k.mins[first] = _max(k.mins[first], min);
+        k.size[first] = _max(k.size[first], pref);
+        k.stretch[first] = _max(k.stretch[first], stretch);
+        return;
+    }
+    if (single == 1) { return; }
+    let is f64 as have_min with mut = _gaps(spacing, span);
+    let is f64 as have_pref with mut = have_min;
+    let is i64 as i with mut = first;
+    while (i < first + span) {
+        have_min = have_min + k.mins[i];
+        have_pref = have_pref + k.size[i];
+        i = i + 1;
+    }
+    let is f64 as add_min = _max(0.0, min - have_min) / cast(f64, span);
+    let is f64 as add_pref = _max(0.0, pref - have_pref) / cast(f64, span);
+    i = first;
+    while (i < first + span) {
+        k.mins[i] = k.mins[i] + add_min;
+        k.size[i] = k.size[i] + add_pref;
+        if (k.size[i] < k.mins[i]) { k.size[i] = k.mins[i]; }
+        i = i + 1;
+    }
+}
+
+// The columns, from every child at its natural width.
+fn _columns(t as *tree.Tree, w as i64, d as *Data, rows as i64, cols as *Track) as void {
+    let is geom.Constraint as free = geom.unbounded();
+    let is i32 as pass with mut = 1;
+    while (pass >= 0) {
+        let is i64 as ch with mut = tree.first_child(t, w);
+        while (ch != 0) {
+            let is *geom.Item as it = tree.item(t, ch);
+            if (tree.is_visible(t, ch) == 1 && _fits(it, rows, cols.n) == 1) {
+                let is geom.Size as s;
+                layout.measure(t, ch, &free, &s);
+                _need(cols, cast(i64, it.col), cast(i64, it.col_span), d.col_spacing,
+                      s.min_w, s.pref_w, it.hstretch, pass);
+            }
+            ch = tree.next_sibling(t, ch);
+        }
+        pass = pass - 1;
+    }
+}
+
+// The width a child's cell has once the columns are decided.
+fn _cell_width(cols as *Track, first as i64, span as i64, spacing as f64) as f64 {
+    let is f64 as wsum with mut = _gaps(spacing, span);
+    let is i64 as i with mut = first;
+    while (i < first + span) {
+        wsum = wsum + cols.size[i];
+        i = i + 1;
+    }
+    return wsum;
+}
+
+// The rows, from every child at the width of its cell.
+fn _rows(t as *tree.Tree, w as i64, d as *Data, cols as *Track, rows as *Track) as void {
+    let is i32 as pass with mut = 1;
+    while (pass >= 0) {
+        let is i64 as ch with mut = tree.first_child(t, w);
+        while (ch != 0) {
+            let is *geom.Item as it = tree.item(t, ch);
+            if (tree.is_visible(t, ch) == 1 && _fits(it, rows.n, cols.n) == 1) {
+                let is f64 as cw = _cell_width(cols, cast(i64, it.col), cast(i64, it.col_span), d.col_spacing);
+                let is geom.Constraint as at = geom.constraint(cw, layout.UNBOUNDED);
+                let is geom.Size as s;
+                layout.measure(t, ch, &at, &s);
+                _need(rows, cast(i64, it.row), cast(i64, it.row_span), d.row_spacing,
+                      s.min_h, s.pref_h, it.vstretch, pass);
+            }
+            ch = tree.next_sibling(t, ch);
+        }
+        pass = pass - 1;
+    }
+}
+
+fn _sum(k as *Track, mins as i32) as f64 {
+    let is f64 as total with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < k.n) {
+        if (mins == 1) { total = total + k.mins[i]; } else { total = total + k.size[i]; }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn _decide(k as *Track, room as f64) as void {
+    if (k.n == 0) { return; }
+    layout.distribute(k.n, cast(*f64, &k.size), cast(*f64, &k.mins), cast(*f64, &k.maxs),
+                      cast(*f64, &k.stretch), room);
+}
+
+// --- Measuring ---
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is f64 as ph = d.pad_l + d.pad_r;
+    let is f64 as pv = d.pad_t + d.pad_b;
+    let is i64 as nrows with mut = 0;
+    let is i64 as ncols with mut = 0;
+    _extent(t, w, &nrows, &ncols);
+
+    let is Track as cols;
+    let is Track as rows;
+    _track_clear(&cols, ncols);
+    _track_clear(&rows, nrows);
+    _columns(t, w, d, nrows, &cols);
+    let is f64 as gaps_w = _gaps(d.col_spacing, ncols);
+    out.min_w = _sum(&cols, 1) + gaps_w + ph;
+    out.pref_w = _sum(&cols, 0) + gaps_w + ph;
+    out.max_w = layout.UNBOUNDED;
+
+    // Rows at the widths the columns will have: decided from the width on
+    // offer when there is one, natural otherwise.
+    if (c.w < layout.UNBOUNDED) { _decide(&cols, _max(0.0, c.w - ph) - gaps_w); }
+    _rows(t, w, d, &cols, &rows);
+    let is f64 as gaps_h = _gaps(d.row_spacing, nrows);
+    out.min_h = _sum(&rows, 1) + gaps_h + pv;
+    out.pref_h = _sum(&rows, 0) + gaps_h + pv;
+    out.max_h = layout.UNBOUNDED;
+}
+
+// --- Arranging ---
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is i64 as nrows with mut = 0;
+    let is i64 as ncols with mut = 0;
+    _extent(t, w, &nrows, &ncols);
+    if (nrows == 0 || ncols == 0) { return; }
+
+    let is Track as cols;
+    let is Track as rows;
+    _track_clear(&cols, ncols);
+    _track_clear(&rows, nrows);
+    _columns(t, w, d, nrows, &cols);
+    _decide(&cols, r.w - d.pad_l - d.pad_r - _gaps(d.col_spacing, ncols));
+    _rows(t, w, d, &cols, &rows);
+    _decide(&rows, r.h - d.pad_t - d.pad_b - _gaps(d.row_spacing, nrows));
+
+    // Where each column and row starts.
+    let is [257]f64 as colx;
+    let is [257]f64 as rowy;
+    colx[0] = d.pad_l;
+    let is i64 as i with mut = 0;
+    while (i < ncols) { colx[i + 1] = colx[i] + cols.size[i] + d.col_spacing; i = i + 1; }
+    rowy[0] = d.pad_t;
+    i = 0;
+    while (i < nrows) { rowy[i + 1] = rowy[i] + rows.size[i] + d.row_spacing; i = i + 1; }
+
+    let is i32 as rtl with mut = 0;
+    if (layout.direction(t, w) == layout.RTL) { rtl = 1; }
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is *geom.Item as it = tree.item(t, ch);
+        if (tree.is_visible(t, ch) == 1 && _fits(it, nrows, ncols) == 1) {
+            let is i64 as c0 = cast(i64, it.col);
+            let is i64 as r0 = cast(i64, it.row);
+            let is f64 as cw = _cell_width(&cols, c0, cast(i64, it.col_span), d.col_spacing);
+            let is f64 as rh = _cell_width(&rows, r0, cast(i64, it.row_span), d.row_spacing);
+            let is math.rect.Rect as cell with mut = math.rect.rect(colx[c0], rowy[r0], cw, rh);
+            if (rtl == 1) { cell.x = (r.w - d.pad_r) - (colx[c0] - d.pad_l) - cw; }
+            layout.place(t, ch, &cell);
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+}
