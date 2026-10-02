@@ -1,0 +1,184 @@
+// audio/alsa/backend.cst — Linux ALSA PCM backend implementation.
+
+use "std/os/linux.cst" as os;
+use "pcm.cst" as pcm;
+use "../device.cst" as dev;
+
+fn format_pcm_path(buf as *u8, card as i32, dev_num as i32) as void {
+    let is *u8 as prefix = "/dev/snd/pcmC";
+    let is i64 as i with mut = 0;
+    while (prefix[i] != 0) {
+        buf[i] = prefix[i];
+        i = i + 1;
+    }
+    // card digit
+    buf[i] = cast(u8, 48 + card);
+    i = i + 1;
+    buf[i] = 68; // 'D'
+    i = i + 1;
+    if (dev_num >= 10) {
+        buf[i] = cast(u8, 48 + (dev_num / 10));
+        i = i + 1;
+        buf[i] = cast(u8, 48 + (dev_num % 10));
+        i = i + 1;
+    } else {
+        buf[i] = cast(u8, 48 + dev_num);
+        i = i + 1;
+    }
+    buf[i] = 112; // 'p'
+    i = i + 1;
+    buf[i] = 0;
+}
+
+fn try_open_path(path as *u8, cfg as *dev.Config, d as *dev.Device) as i32 {
+    let is i64 as fd = os.open(path, os.O_RDWR, 0);
+    if (fd < 0) { return 0; }
+
+    let is pcm.SndPcmHwParams as params;
+    pcm.init_hw_params(&params);
+    if (pcm.ioctl_hw_refine(fd, &params) != 0) {
+        os.close(fd);
+        return 0;
+    }
+
+    pcm.mask_set(&params.masks[pcm.HW_PARAM_ACCESS - pcm.HW_PARAM_FIRST_MASK],
+                 pcm.ACCESS_RW_INTERLEAVED);
+    pcm.mask_set(&params.masks[pcm.HW_PARAM_FORMAT - pcm.HW_PARAM_FIRST_MASK],
+                 pcm.FORMAT_S16_LE);
+    pcm.mask_set(&params.masks[pcm.HW_PARAM_SUBFORMAT - pcm.HW_PARAM_FIRST_MASK], 0);
+
+    pcm.interval_set(&params.intervals[pcm.HW_PARAM_CHANNELS - pcm.HW_PARAM_FIRST_INTERVAL],
+                     cast(u32, cfg.channels));
+    pcm.interval_set(&params.intervals[pcm.HW_PARAM_RATE - pcm.HW_PARAM_FIRST_INTERVAL],
+                     cast(u32, cfg.sample_rate));
+
+    if (pcm.ioctl_hw_params(fd, &params) != 0) {
+        // If exact rate failed, try fallback (48000 or 44100)
+        pcm.init_hw_params(&params);
+        pcm.mask_set(&params.masks[pcm.HW_PARAM_ACCESS - pcm.HW_PARAM_FIRST_MASK],
+                     pcm.ACCESS_RW_INTERLEAVED);
+        pcm.mask_set(&params.masks[pcm.HW_PARAM_FORMAT - pcm.HW_PARAM_FIRST_MASK],
+                     pcm.FORMAT_S16_LE);
+        pcm.mask_set(&params.masks[pcm.HW_PARAM_SUBFORMAT - pcm.HW_PARAM_FIRST_MASK], 0);
+        pcm.interval_set(&params.intervals[pcm.HW_PARAM_CHANNELS - pcm.HW_PARAM_FIRST_INTERVAL],
+                         cast(u32, cfg.channels));
+
+        let is u32 as fallback_rate with mut = 44100;
+        if (cfg.sample_rate == 44100) { fallback_rate = 48000; }
+        pcm.interval_set(&params.intervals[pcm.HW_PARAM_RATE - pcm.HW_PARAM_FIRST_INTERVAL], fallback_rate);
+
+        if (pcm.ioctl_hw_params(fd, &params) != 0) {
+            os.close(fd);
+            return 0;
+        }
+    }
+
+    let is u32 as actual_rate = params.intervals[pcm.HW_PARAM_RATE - pcm.HW_PARAM_FIRST_INTERVAL].min;
+    let is u32 as actual_period = params.intervals[pcm.HW_PARAM_PERIOD_SIZE - pcm.HW_PARAM_FIRST_INTERVAL].min;
+    let is u32 as actual_buffer = params.intervals[pcm.HW_PARAM_BUFFER_SIZE - pcm.HW_PARAM_FIRST_INTERVAL].min;
+
+    // Configure SW params
+    let is pcm.SndPcmSwParams as sw;
+    let is *u8 as sw_ptr = cast(*u8, &sw);
+    let is i64 as si with mut = 0;
+    while (si < sizeof(pcm.SndPcmSwParams)) {
+        sw_ptr[si] = 0;
+        si = si + 1;
+    }
+
+    sw.tstamp_mode = 0;
+    sw.period_step = 1;
+    sw.avail_min = cast(u64, actual_period);
+    sw.start_threshold = cast(u64, actual_period);
+    sw.stop_threshold = cast(u64, actual_buffer);
+    let is u64 as bnd with mut = cast(u64, actual_buffer);
+    while (bnd * 2 <= 0x7fffffff) {
+        bnd = bnd * 2;
+    }
+    sw.boundary = bnd;
+
+    if (pcm.ioctl_sw_params(fd, &sw) != 0) {
+        os.close(fd);
+        return 0;
+    }
+
+    if (pcm.ioctl_prepare(fd) != 0) {
+        os.close(fd);
+        return 0;
+    }
+
+    d.fd = fd;
+    d.ok = 1;
+    d.sample_rate = cast(i32, actual_rate);
+    d.channels = cfg.channels;
+    d.period_size = cast(i64, actual_period);
+    d.buffer_size = cast(i64, actual_buffer);
+    return 1;
+}
+
+fn open(cfg as *dev.Config) as dev.Device {
+    let is dev.Device as d;
+    d.fd = 0 - 1;
+    d.ok = 0;
+    d.sample_rate = 0;
+    d.channels = 0;
+    d.period_size = 0;
+    d.buffer_size = 0;
+
+    let is [64]u8 as path_buf;
+
+    if (cfg.card >= 0 && cfg.device >= 0) {
+        format_pcm_path(cast(*u8, &path_buf), cfg.card, cfg.device);
+        try_open_path(cast(*u8, &path_buf), cfg, &d);
+        return d;
+    }
+
+    // Autodiscover: scan cards 0..3 and devices 0..15
+    let is i32 as c with mut = 0;
+    while (c < 4) {
+        let is i32 as dev_num with mut = 0;
+        while (dev_num < 16) {
+            format_pcm_path(cast(*u8, &path_buf), c, dev_num);
+            if (try_open_path(cast(*u8, &path_buf), cfg, &d) == 1) {
+                return d;
+            }
+            dev_num = dev_num + 1;
+        }
+        c = c + 1;
+    }
+
+    return d;
+}
+
+fn write_frames(d as *dev.Device, frames_ptr as *u8, frame_count as i64) as i64 {
+    if (d.ok == 0 || d.fd < 0) { return 0; }
+
+    let is pcm.SndXferi as xferi;
+    xferi.result = 0;
+    xferi.buf = frames_ptr;
+    xferi.frames = cast(u64, frame_count);
+
+    let is i64 as r with mut = pcm.ioctl_writei(d.fd, &xferi);
+    if (r < 0) {
+        // Recover from XRUN
+        pcm.ioctl_prepare(d.fd);
+        r = pcm.ioctl_writei(d.fd, &xferi);
+        if (r < 0) { return 0; }
+    }
+    return xferi.result;
+}
+
+fn prepare(d as *dev.Device) as i32 {
+    if (d.ok == 0 || d.fd < 0) { return 0; }
+    if (pcm.ioctl_prepare(d.fd) == 0) { return 1; }
+    return 0;
+}
+
+fn close(d as *dev.Device) as void {
+    if (d.fd >= 0) {
+        pcm.ioctl_drop(d.fd);
+        os.close(d.fd);
+        d.fd = 0 - 1;
+    }
+    d.ok = 0;
+}
