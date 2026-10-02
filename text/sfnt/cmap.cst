@@ -1,0 +1,251 @@
+// text/sfnt/cmap.cst — which glyph draws a character.
+//
+// One table, several subtables, each for a platform and encoding and in one
+// of several formats. The face's Unicode mapping is the first present of
+// (3,10), (0,6), (0,4), (3,1), (0,3), (0,2), (0,1), (0,0) in a format read
+// here — fontTools' order, and the one that keeps characters beyond U+FFFF
+// from silently mapping to nothing when a font has a 32-bit table beside its
+// 16-bit one. A font with only Windows Symbol (3,0) maps its characters into
+// U+F000..F0FF, and a character below U+0100 is looked up there too.
+//
+// Format 14 is separate: variation sequences, a base character and a
+// selector, mapped to a glyph of their own or to the base's default glyph.
+//
+// Every subtable is reachable (count, at, lookup) — the face's choice is one
+// of them — so each format can be checked on its own.
+use "table.cst" as table;
+
+struct Subtable {
+    platform as i64;
+    encoding as i64;
+    format   as i64;
+    off      as i64;   // absolute
+}
+
+fn count(f as *table.Face) as i64 {
+    if (table.inside(f.cmap, f.cmap.off, 4) == 0) { return 0; }
+    let is i64 as n = table.u16_at(f, f.cmap.off + 2);
+    if (table.inside(f.cmap, f.cmap.off + 4, n * 8) == 0) { return 0; }
+    return n;
+}
+
+// Subtable i in the table's order; format 0 and off 0 past the end.
+fn at(f as *table.Face, i as i64) as Subtable {
+    let is Subtable as s;
+    s.platform = 0;
+    s.encoding = 0;
+    s.format = 0 - 1;
+    s.off = 0;
+    if (i < 0 || i >= count(f)) { return s; }
+    let is i64 as rec = f.cmap.off + 4 + i * 8;
+    s.platform = table.u16_at(f, rec);
+    s.encoding = table.u16_at(f, rec + 2);
+    let is i64 as off = f.cmap.off + table.u32_at(f, rec + 4);
+    if (table.inside(f.cmap, off, 2) == 0) { return s; }
+    s.off = off;
+    s.format = table.u16_at(f, off);
+    return s;
+}
+
+fn _readable(fmt as i64) as i32 {
+    if (fmt == 0 || fmt == 4 || fmt == 6 || fmt == 10 || fmt == 12 || fmt == 13) { return 1; }
+    return 0;
+}
+
+// Picks the face's Unicode subtable and its variation sequences; done by
+// sfnt.open.
+fn select(f as *table.Face) as void {
+    f.cmap_sub = 0;
+    f.cmap_fmt = 0;
+    f.uvs_sub = 0;
+    f.symbol = 0;
+    let is [9]i64 as pref;
+    pref[0] = (3 << 16) | 10;
+    pref[1] = (0 << 16) | 6;
+    pref[2] = (0 << 16) | 4;
+    pref[3] = (3 << 16) | 1;
+    pref[4] = (0 << 16) | 3;
+    pref[5] = (0 << 16) | 2;
+    pref[6] = (0 << 16) | 1;
+    pref[7] = (0 << 16) | 0;
+    pref[8] = (3 << 16) | 0;
+    let is i64 as best with mut = 9;
+    let is i64 as n = count(f);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is Subtable as s = at(f, i);
+        if (s.format == 14 && s.platform == 0 && s.encoding == 5 && f.uvs_sub == 0) { f.uvs_sub = s.off; }
+        if (_readable(s.format) == 1) {
+            let is i64 as key = (s.platform << 16) | s.encoding;
+            let is i64 as k with mut = 0;
+            while (k < best) {
+                if (pref[k] == key) {
+                    best = k;
+                    f.cmap_sub = s.off;
+                    f.cmap_fmt = s.format;
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (best == 8) { f.symbol = 1; }
+}
+
+// --- The formats ---
+
+fn _f0(f as *table.Face, s as i64, cp as i64) as i64 {
+    if (cp < 0 || cp > 255) { return 0; }
+    return table.u8_at(f, s + 6 + cp);
+}
+
+// No range check on cp: no segment ends past U+FFFF or starts below 0.
+fn _f4(f as *table.Face, s as i64, cp as i64) as i64 {
+    let is i64 as segs = table.u16_at(f, s + 6) / 2;
+    let is i64 as ends = s + 14;
+    let is i64 as starts = ends + segs * 2 + 2;
+    let is i64 as deltas = starts + segs * 2;
+    let is i64 as ranges = deltas + segs * 2;
+    if (table.inside(f.cmap, ends, segs * 8 + 2) == 0) { return 0; }
+    // The first segment whose end is at or past cp.
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = segs;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        if (table.u16_at(f, ends + mid * 2) < cp) { lo = mid + 1; } else { hi = mid; }
+    }
+    if (lo >= segs) { return 0; }
+    let is i64 as start = table.u16_at(f, starts + lo * 2);
+    if (cp < start) { return 0; }
+    let is i64 as delta = table.u16_at(f, deltas + lo * 2);
+    let is i64 as ro = table.u16_at(f, ranges + lo * 2);
+    if (ro == 0) { return (cp + delta) & 65535; }
+    // An offset from where it is stored into the glyph array after it.
+    let is i64 as g = table.u16_at(f, ranges + lo * 2 + ro + (cp - start) * 2);
+    if (g == 0) { return 0; }
+    return (g + delta) & 65535;
+}
+
+fn _f6(f as *table.Face, s as i64, cp as i64) as i64 {
+    let is i64 as first = table.u16_at(f, s + 6);
+    let is i64 as n = table.u16_at(f, s + 8);
+    if (cp < first || cp >= first + n) { return 0; }
+    return table.u16_at(f, s + 10 + (cp - first) * 2);
+}
+
+fn _f10(f as *table.Face, s as i64, cp as i64) as i64 {
+    let is i64 as first = table.u32_at(f, s + 12);
+    let is i64 as n = table.u32_at(f, s + 16);
+    if (cp < first || cp >= first + n) { return 0; }
+    return table.u16_at(f, s + 20 + (cp - first) * 2);
+}
+
+// Formats 12 and 13: sorted groups of start, end and a glyph — the first of
+// a run for 12, the one glyph of every character in it for 13.
+fn _f12(f as *table.Face, s as i64, cp as i64, same as i32) as i64 {
+    let is i64 as n = table.u32_at(f, s + 12);
+    let is i64 as groups = s + 16;
+    if (table.inside(f.cmap, groups, n * 12) == 0) { return 0; }
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = n;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as g = groups + mid * 12;
+        if (table.u32_at(f, g + 4) < cp) { lo = mid + 1; }
+        else if (table.u32_at(f, g) > cp) { hi = mid; }
+        else {
+            if (same == 1) { return table.u32_at(f, g + 8); }
+            return table.u32_at(f, g + 8) + (cp - table.u32_at(f, g));
+        }
+    }
+    return 0;
+}
+
+// The glyph s maps cp to; 0 for none, or one past the face's glyphs.
+fn lookup(f as *table.Face, s as *Subtable, cp as i64) as i64 {
+    let is i64 as g with mut = 0;
+    if (s.off == 0) { return 0; }
+    if (s.format == 0) { g = _f0(f, s.off, cp); }
+    if (s.format == 4) { g = _f4(f, s.off, cp); }
+    if (s.format == 6) { g = _f6(f, s.off, cp); }
+    if (s.format == 10) { g = _f10(f, s.off, cp); }
+    if (s.format == 12) { g = _f12(f, s.off, cp, 0); }
+    if (s.format == 13) { g = _f12(f, s.off, cp, 1); }
+    if (g < 0 || g >= f.glyphs) { return 0; }
+    return g;
+}
+
+// The glyph for character cp, 0 — the notdef glyph — for none.
+fn glyph(f as *table.Face, cp as i64) as i64 {
+    let is Subtable as s;
+    s.off = f.cmap_sub;
+    s.format = f.cmap_fmt;
+    let is i64 as g = lookup(f, &s, cp);
+    if (g == 0 && f.symbol == 1 && cp >= 0 && cp < 256) { return lookup(f, &s, cp + 61440); }
+    return g;
+}
+
+// --- Variation sequences ---
+
+// What format 14 subtable s says of cp followed by selector vs: a glyph, -1
+// for the base character's default glyph, 0 for nothing.
+// s 0 — no such subtable — finds nothing: offset 0 is not in the cmap.
+fn sequence(f as *table.Face, s as i64, cp as i64, vs as i64) as i64 {
+    // The records are not checked as a block: the one found is followed only
+    // into tables that are, and those lie after it.
+    let is i64 as n = table.u32_at(f, s + 6);
+    let is i64 as recs = s + 10;
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = n;
+    let is i64 as rec with mut = 0 - 1;
+    while (lo < hi && rec < 0) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as sel = table.u24_at(f, recs + mid * 11);
+        if (sel < vs) { lo = mid + 1; } else if (sel > vs) { hi = mid; } else { rec = recs + mid * 11; }
+    }
+    if (rec < 0) { return 0; }
+    let is i64 as def = table.u32_at(f, rec + 3);
+    let is i64 as nondef = table.u32_at(f, rec + 7);
+    if (nondef != 0) {
+        let is i64 as t = s + nondef;
+        let is i64 as m = table.u32_at(f, t);
+        if (table.inside(f.cmap, t + 4, m * 5) == 1) {
+            lo = 0;
+            hi = m;
+            while (lo < hi) {
+                let is i64 as mid = (lo + hi) / 2;
+                let is i64 as u = table.u24_at(f, t + 4 + mid * 5);
+                if (u < cp) { lo = mid + 1; } else if (u > cp) { hi = mid; }
+                else {
+                    let is i64 as g = table.u16_at(f, t + 4 + mid * 5 + 3);
+                    if (g >= f.glyphs) { return 0; }
+                    return g;
+                }
+            }
+        }
+    }
+    if (def != 0) {
+        let is i64 as t = s + def;
+        let is i64 as m = table.u32_at(f, t);
+        if (table.inside(f.cmap, t + 4, m * 4) == 1) {
+            lo = 0;
+            hi = m;
+            while (lo < hi) {
+                let is i64 as mid = (lo + hi) / 2;
+                let is i64 as start = table.u24_at(f, t + 4 + mid * 4);
+                let is i64 as more = table.u8_at(f, t + 4 + mid * 4 + 3);
+                if (start + more < cp) { lo = mid + 1; } else if (start > cp) { hi = mid; } else { return 0 - 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+// The glyph for cp followed by selector vs: the sequence's own glyph, or the
+// character's when the sequence is its default; 0 when the face does not
+// know the sequence, and the shaper draws the character as if it had none.
+fn variant(f as *table.Face, cp as i64, vs as i64) as i64 {
+    let is i64 as g = sequence(f, f.uvs_sub, cp, vs);
+    if (g < 0) { return glyph(f, cp); }
+    return g;
+}

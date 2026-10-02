@@ -1,0 +1,258 @@
+// text/sfnt/table.cst — the container: a directory of tables, each found by
+// its four-byte tag, in a file that may hold one face or a collection of them.
+//
+// A font is data from a file, so every read here is checked against the
+// file's length and answers 0 past it: a malformed font reads as zeros, never
+// as memory beyond it. Tables are checked to lie within the file when the
+// directory is read; one that does not is treated as absent. The parsers above
+// check their own counts against their table's length before they loop.
+//
+// Nothing is copied: a Face points into the bytes it was opened on, which must
+// outlive it.
+
+// --- Errors ---
+
+let is i32 as OK            with imut = 0;
+let is i32 as NOT_A_FONT    with imut = 1;   // no sfnt or collection header
+let is i32 as BAD_INDEX     with imut = 2;   // no such face in the collection
+let is i32 as TRUNCATED     with imut = 3;   // the directory runs past the end
+let is i32 as MISSING_TABLE with imut = 4;   // head, maxp, hhea, hmtx or cmap
+let is i32 as BAD_TABLE     with imut = 5;   // one of them is not what it says
+
+// --- Outlines ---
+
+let is i32 as OUTLINE_NONE with imut = 0;   // bitmaps only, or nothing
+let is i32 as OUTLINE_GLYF with imut = 1;   // TrueType: glyf and loca
+let is i32 as OUTLINE_CFF  with imut = 2;   // PostScript: CFF
+let is i32 as OUTLINE_CFF2 with imut = 3;   // the variable form: CFF2
+
+// --- Tags ---
+
+let is i64 as TAG_TTCF with imut = 0x74746366;   // 'ttcf'
+let is i64 as TAG_OTTO with imut = 0x4F54544F;   // 'OTTO'
+let is i64 as TAG_TRUE with imut = 0x74727565;   // 'true', old Apple TrueType
+let is i64 as TAG_HEAD with imut = 0x68656164;
+let is i64 as TAG_HHEA with imut = 0x68686561;
+let is i64 as TAG_MAXP with imut = 0x6D617870;
+let is i64 as TAG_OS2  with imut = 0x4F532F32;   // 'OS/2'
+let is i64 as TAG_POST with imut = 0x706F7374;
+let is i64 as TAG_CMAP with imut = 0x636D6170;
+let is i64 as TAG_HMTX with imut = 0x686D7478;
+let is i64 as TAG_NAME with imut = 0x6E616D65;
+let is i64 as TAG_KERN with imut = 0x6B65726E;
+let is i64 as TAG_LOCA with imut = 0x6C6F6361;
+let is i64 as TAG_GLYF with imut = 0x676C7966;
+let is i64 as TAG_CFF  with imut = 0x43464620;   // 'CFF '
+let is i64 as TAG_CFF2 with imut = 0x43464632;
+let is i64 as TAG_GSUB with imut = 0x47535542;
+let is i64 as TAG_GPOS with imut = 0x47504F53;
+let is i64 as TAG_GDEF with imut = 0x47444546;
+let is i64 as TAG_FVAR with imut = 0x66766172;
+let is i64 as TAG_AVAR with imut = 0x61766172;
+let is i64 as TAG_GVAR with imut = 0x67766172;
+let is i64 as TAG_HVAR with imut = 0x48564152;
+let is i64 as TAG_MVAR with imut = 0x4D564152;
+
+// Where a table lies in the file; len 0 for one the face does not have.
+struct Table {
+    off as i64;
+    len as i64;
+}
+
+struct Face {
+    data      as *u8;
+    size      as i64;
+    index     as i64;   // in its collection; 0 for a single face
+    dir       as i64;   // the table records
+    tables    as i64;   // how many
+    head      as Table;
+    hhea      as Table;
+    maxp      as Table;
+    os2       as Table;
+    post      as Table;
+    cmap      as Table;
+    hmtx      as Table;
+    name      as Table;
+    kern      as Table;
+    loca      as Table;
+    glyf      as Table;
+    cff       as Table;
+    cff2      as Table;
+    gsub      as Table;
+    gpos      as Table;
+    gdef      as Table;
+    fvar      as Table;
+    avar      as Table;
+    gvar      as Table;
+    hvar      as Table;
+    mvar      as Table;
+    // What every lookup needs, read once.
+    upem      as i64;
+    glyphs    as i64;   // maxp's numGlyphs
+    hmetrics  as i64;   // hhea's numberOfHMetrics
+    loc_long  as i64;   // loca's offsets are 32-bit
+    cmap_sub  as i64;   // the Unicode subtable chosen, absolute; 0 for none
+    cmap_fmt  as i64;
+    uvs_sub   as i64;   // the variation-sequence subtable (format 14); 0 for none
+    symbol    as i32;   // the chosen subtable is Windows Symbol (3, 0)
+    outline   as i32;
+    ok        as i32;
+    err       as i32;
+}
+
+// --- Reading, checked ---
+
+fn _byte(f as *Face, at as i64) as i64 {
+    return cast(i64, *cast(*u8, cast(i64, f.data) + at));
+}
+
+// Whether n bytes at at lie within the file.
+fn has(f as *Face, at as i64, n as i64) as i32 {
+    if (at < 0 || n < 0 || n > f.size - at) { return 0; }
+    return 1;
+}
+
+fn u8_at(f as *Face, at as i64) as i64 {
+    if (has(f, at, 1) == 0) { return 0; }
+    return _byte(f, at);
+}
+
+fn u16_at(f as *Face, at as i64) as i64 {
+    if (has(f, at, 2) == 0) { return 0; }
+    return (_byte(f, at) << 8) | _byte(f, at + 1);
+}
+
+fn i16_at(f as *Face, at as i64) as i64 {
+    let is i64 as v = u16_at(f, at);
+    if (v >= 32768) { return v - 65536; }
+    return v;
+}
+
+fn u24_at(f as *Face, at as i64) as i64 {
+    if (has(f, at, 3) == 0) { return 0; }
+    return (_byte(f, at) << 16) | (_byte(f, at + 1) << 8) | _byte(f, at + 2);
+}
+
+fn u32_at(f as *Face, at as i64) as i64 {
+    if (has(f, at, 4) == 0) { return 0; }
+    return (_byte(f, at) << 24) | (_byte(f, at + 1) << 16) | (_byte(f, at + 2) << 8) | _byte(f, at + 3);
+}
+
+fn i32_at(f as *Face, at as i64) as i64 {
+    let is i64 as v = u32_at(f, at);
+    if (v >= 2147483648) { return v - 4294967296; }
+    return v;
+}
+
+// Whether n bytes at at lie within table t.
+fn inside(t as Table, at as i64, n as i64) as i32 {
+    if (t.len <= 0 || at < t.off || n < 0 || n > t.off + t.len - at) { return 0; }
+    return 1;
+}
+
+// --- The directory ---
+
+fn _blob(data as *u8, size as i64) as Face {
+    let is Face as f;
+    f.data = data;
+    f.size = size;
+    if (size < 0) { f.size = 0; }
+    return f;
+}
+
+// How many faces the bytes hold: 1 for a single font, the count for a
+// collection, 0 for neither.
+fn face_count(data as *u8, size as i64) as i64 {
+    let is Face as f = _blob(data, size);
+    let is i64 as tag = u32_at(&f, 0);
+    if (tag == TAG_TTCF) {
+        let is i64 as n = u32_at(&f, 8);
+        if (has(&f, 12, n * 4) == 0) { return 0; }
+        return n;
+    }
+    if (tag == 0x00010000 || tag == TAG_OTTO || tag == TAG_TRUE) { return 1; }
+    return 0;
+}
+
+// The table with tag, found in the directory; absent when the face has none
+// or it does not lie within the file.
+fn find(f as *Face, tag as i64) as Table {
+    let is Table as t;
+    t.off = 0;
+    t.len = 0;
+    let is i64 as i with mut = 0;
+    while (i < f.tables) {
+        let is i64 as rec = f.dir + i * 16;
+        if (u32_at(f, rec) == tag) {
+            let is i64 as off = u32_at(f, rec + 8);
+            let is i64 as len = u32_at(f, rec + 12);
+            // Length 0 leaves it absent as well.
+            if (has(f, off, len) == 1) {
+                t.off = off;
+                t.len = len;
+            }
+            return t;
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+// Face index of the bytes, its directory read and its tables located; the
+// tables' contents are the other modules' to read (sfnt.open does it all).
+fn directory(data as *u8, size as i64, index as i64) as Face {
+    let is Face as f with mut = _blob(data, size);
+    f.index = index;
+    f.ok = 0;
+    f.err = OK;
+    f.tables = 0;
+    f.dir = 0;
+    f.outline = OUTLINE_NONE;
+    f.symbol = 0;
+    f.cmap_sub = 0;
+    f.cmap_fmt = 0;
+    f.uvs_sub = 0;
+    let is i64 as n = face_count(data, size);
+    if (n == 0) { f.err = NOT_A_FONT; return f; }
+    if (index < 0 || index >= n) { f.err = BAD_INDEX; return f; }
+    let is i64 as base with mut = 0;
+    if (u32_at(&f, 0) == TAG_TTCF) { base = u32_at(&f, 12 + index * 4); }
+    let is i64 as version = u32_at(&f, base);
+    if (version != 0x00010000 && version != TAG_OTTO && version != TAG_TRUE) { f.err = NOT_A_FONT; return f; }
+    f.tables = u16_at(&f, base + 4);
+    f.dir = base + 12;
+    if (has(&f, f.dir, f.tables * 16) == 0) { f.err = TRUNCATED; f.tables = 0; return f; }
+    f.head = find(&f, TAG_HEAD);
+    f.hhea = find(&f, TAG_HHEA);
+    f.maxp = find(&f, TAG_MAXP);
+    f.os2 = find(&f, TAG_OS2);
+    f.post = find(&f, TAG_POST);
+    f.cmap = find(&f, TAG_CMAP);
+    f.hmtx = find(&f, TAG_HMTX);
+    f.name = find(&f, TAG_NAME);
+    f.kern = find(&f, TAG_KERN);
+    f.loca = find(&f, TAG_LOCA);
+    f.glyf = find(&f, TAG_GLYF);
+    f.cff = find(&f, TAG_CFF);
+    f.cff2 = find(&f, TAG_CFF2);
+    f.gsub = find(&f, TAG_GSUB);
+    f.gpos = find(&f, TAG_GPOS);
+    f.gdef = find(&f, TAG_GDEF);
+    f.fvar = find(&f, TAG_FVAR);
+    f.avar = find(&f, TAG_AVAR);
+    f.gvar = find(&f, TAG_GVAR);
+    f.hvar = find(&f, TAG_HVAR);
+    f.mvar = find(&f, TAG_MVAR);
+    if (f.glyf.len > 0 && f.loca.len > 0) {
+        f.outline = OUTLINE_GLYF;
+    } else if (f.cff2.len > 0) {
+        f.outline = OUTLINE_CFF2;
+    } else if (f.cff.len > 0) {
+        f.outline = OUTLINE_CFF;
+    }
+    if (f.head.len == 0 || f.hhea.len == 0 || f.maxp.len == 0 || f.hmtx.len == 0 || f.cmap.len == 0) {
+        f.err = MISSING_TABLE;
+        return f;
+    }
+    return f;
+}

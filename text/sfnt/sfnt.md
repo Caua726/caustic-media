@@ -76,6 +76,21 @@ is unusual and worth taking advantage of.
 
 ---
 
+## Current state
+
+`table.cst` (the directory, single faces and `.ttc` collections, reads checked
+against the file), `head.cst` (`head`, `hhea`, `maxp`, `OS/2`, `post`, and the
+line metrics by the browsers' convention), `hmtx.cst`, `cmap.cst` (formats 0, 4,
+6, 10, 12 and 13, Windows Symbol, and format 14's variation sequences), `name.cst`
+(UTF-16 and Mac Roman to UTF-8, the record an English-reading user should see)
+and the legacy `kern.cst`; `sfnt.open` does it all. `sfnt_test` holds every face
+of the fonts in [`../testdata`](../testdata/README.md) to what fontTools reads
+from them — every table field, name, subtable mapping, advance and kerning pair,
+and for the mappings every character of Unicode not listed mapping to nothing —
+then reads fonts cut at every length and with their counts corrupted, laid
+against an unreadable page so a read one byte too far faults. Mutation-tested:
+every mutant killed, the checks no test could tell apart removed.
+
 ## Order of work
 
 First of the layer — nothing else can start without a table directory and a

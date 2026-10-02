@@ -1,0 +1,1101 @@
+// text/sfnt/sfnt_test.cst — the container read from the test fonts and held
+// to what fontTools reads from them (text/testdata/*.sfnt.ref, written by
+// text/tools/sfnt_reference.py): every face's tables, names, every cmap
+// subtable's mappings and the face's chosen one, every glyph's metrics, every
+// kerning pair — and, for the mappings, every character not listed mapping to
+// nothing, all of Unicode for the face's. Then malformed input: truncated,
+// cut and nonsense bytes read as zeros or are refused, never past the end.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "sfnt.cst" as sfnt;
+
+let is i32 as fails with mut = 0;
+let is *u8 as current with mut;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s (%s)\n", name, current);
+        fails = fails + 1;
+    }
+}
+
+// --- Files ---
+
+let is i64 as loaded with mut = 0;
+
+// The whole file, mapped; 0 when it cannot be read.
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+// --- The reference, a token at a time ---
+
+let is *u8 as ref with mut;
+let is i64 as ref_len with mut = 0;
+let is i64 as pos with mut = 0;
+
+fn _c(i as i64) as i64 { return cast(i64, *cast(*u8, cast(i64, ref) + i)); }
+
+fn _skip() as void {
+    while (pos < ref_len && (_c(pos) == 32 || _c(pos) == 10)) { pos = pos + 1; }
+}
+
+let is [512]u8 as word;
+
+// The next word into word; 0 at the end.
+fn next_word() as i32 {
+    _skip();
+    if (pos >= ref_len) { return 0; }
+    let is i64 as n with mut = 0;
+    while (pos < ref_len && _c(pos) != 32 && _c(pos) != 10 && n < 511) {
+        word[n] = cast(u8, _c(pos));
+        n = n + 1;
+        pos = pos + 1;
+    }
+    word[n] = 0;
+    return 1;
+}
+
+fn is_word(w as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (1 == 1) {
+        let is i64 as a = cast(i64, word[i]);
+        let is i64 as b = cast(i64, *cast(*u8, cast(i64, w) + i));
+        if (a != b) { return 0; }
+        if (a == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn num() as i64 {
+    _skip();
+    let is i64 as neg with mut = 0;
+    if (_c(pos) == 45) { neg = 1; pos = pos + 1; }
+    let is i64 as v with mut = 0;
+    while (pos < ref_len && _c(pos) >= 48 && _c(pos) <= 57) {
+        v = v * 10 + (_c(pos) - 48);
+        pos = pos + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+fn _hex(c as i64) as i64 {
+    if (c >= 97) { return c - 87; }
+    return c - 48;
+}
+
+// --- Mappings listed, for the characters not listed ---
+
+let is [4096]i64 as listed_cp;
+let is [4096]i64 as listed_gid;
+let is i64 as listed with mut = 0;
+
+// Every character from 0 to last maps as listed, 0 if not listed — through
+// the subtable when sub is not null, through the face's choice otherwise.
+fn exhaust(f as *sfnt.table.Face, sub as *sfnt.cmap.Subtable, last as i64) as i32 {
+    let is i64 as k with mut = 0;
+    let is i64 as cp with mut = 0;
+    while (cp <= last) {
+        let is i64 as want with mut = 0;
+        while (k < listed && listed_cp[k] < cp) { k = k + 1; }
+        if (k < listed && listed_cp[k] == cp) { want = listed_gid[k]; }
+        let is i64 as got with mut = 0;
+        if (cast(i64, sub) == 0) { got = sfnt.cmap.glyph(f, cp); } else { got = sfnt.cmap.lookup(f, sub, cp); }
+        if (got != want) {
+            io.printf("  U+%x: %d, want %d\n", cp, got, want);
+            return 0;
+        }
+        cp = cp + 1;
+    }
+    return 1;
+}
+
+// --- Kerning pairs ---
+
+let is [8192]i64 as kern_l;
+let is [8192]i64 as kern_r;
+let is [8192]i64 as kern_v;
+let is i64 as kerns with mut = 0;
+
+fn kern_ref(l as i64, r as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < kerns) {
+        if (kern_l[i] == l && kern_r[i] == r) { return kern_v[i]; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- One font file ---
+
+// Where the last subtable's or the face's mappings end: none, a subtable, the
+// face's choice.
+let is i64 as section with mut = 0;
+let is sfnt.cmap.Subtable as sec_sub with mut;
+
+fn end_section(f as *sfnt.table.Face) as void {
+    if (section == 1 && sec_sub.format != 14) {
+        check("a subtable maps nothing else", exhaust(f, &sec_sub, 200000));
+        check("nor at the top of Unicode", exhaust(f, &sec_sub, 1114111));
+    }
+    if (section == 2) { check("the face maps nothing else, in all of Unicode", exhaust(f, cast(*sfnt.cmap.Subtable, 0), 1114111)); }
+    section = 0;
+    listed = 0;
+}
+
+fn end_face(f as *sfnt.table.Face) as void {
+    end_section(f);
+    if (kerns > 0) {
+        // Every pair whose left glyph kerns with anything, against every right.
+        let is i32 as all with mut = 1;
+        let is i64 as i with mut = 0;
+        while (i < kerns && all == 1) {
+            let is i64 as r with mut = 0;
+            while (r < f.glyphs && all == 1) {
+                if (sfnt.kern.pair(f, kern_l[i], r) != kern_ref(kern_l[i], r)) {
+                    io.printf("  kern %d %d: %d\n", kern_l[i], r, sfnt.kern.pair(f, kern_l[i], r));
+                    all = 0;
+                }
+                r = r + 1;
+            }
+            i = i + 1;
+        }
+        check("kerning: every pair, and none else", all);
+    }
+    kerns = 0;
+}
+
+fn font(path as *u8, refpath as *u8) as void {
+    current = path;
+    let is *u8 as data = load(path);
+    let is i64 as size = loaded;
+    check("the font read", cast(i64, data) != 0 && size > 0);
+    ref = load(refpath);
+    ref_len = loaded;
+    check("the reference read", ref_len > 0);
+    pos = 0;
+    section = 0;
+    listed = 0;
+    kerns = 0;
+    let is sfnt.table.Face as f with mut;
+    let is i32 as have with mut = 0;
+    let is [512]u8 as buf;
+    let is i64 as subtables with mut = 0;
+    while (next_word() == 1) {
+        if (is_word("faces") == 1) {
+            check("face count", sfnt.table.face_count(data, size) == num());
+        } else if (is_word("face") == 1) {
+            if (have == 1) { end_face(&f); }
+            f = sfnt.open(data, size, num());
+            check("opens", f.ok == 1 && f.err == sfnt.table.OK);
+            have = 1;
+            subtables = 0;
+        } else if (is_word("tables") == 1) {
+            check("table count", f.tables == num());
+        } else if (is_word("outline") == 1) {
+            next_word();
+            let is i32 as want with mut = sfnt.table.OUTLINE_CFF;
+            if (is_word("glyf") == 1) { want = sfnt.table.OUTLINE_GLYF; }
+            if (is_word("cff2") == 1) { want = sfnt.table.OUTLINE_CFF2; }
+            check("outline kind", f.outline == want);
+        } else if (is_word("upem") == 1) {
+            check("units per em", f.upem == num());
+        } else if (is_word("glyphs") == 1) {
+            check("glyph count", f.glyphs == num());
+        } else if (is_word("head") == 1) {
+            let is sfnt.head.Head as h = sfnt.head.head(&f);
+            check("head bbox", h.x_min == num() && h.y_min == num() && h.x_max == num() && h.y_max == num());
+            check("head style and loca", h.mac_style == num() && h.loc_format == num());
+            check("loca width", f.loc_long == h.loc_format);
+        } else if (is_word("hhea") == 1) {
+            let is sfnt.head.Hhea as h = sfnt.head.hhea(&f);
+            check("hhea", h.ascender == num() && h.descender == num() && h.line_gap == num() && h.hmetrics == num());
+        } else if (is_word("os2") == 1) {
+            let is sfnt.head.Os2 as s = sfnt.head.os2(&f);
+            check("os2 version, weight, width", s.version == num() && s.weight == num() && s.width == num());
+            check("os2 selection", s.fs_selection == num());
+            check("os2 typographic", s.typo_asc == num() && s.typo_desc == num() && s.typo_gap == num());
+            check("os2 windows", s.win_asc == num() && s.win_desc == num());
+            check("os2 heights", s.x_height == num() && s.cap_height == num());
+            check("os2 strikeout", s.strike_size == num() && s.strike_pos == num());
+        } else if (is_word("post") == 1) {
+            let is sfnt.head.Post as p = sfnt.head.post(&f);
+            check("post", p.underline_pos == num() && p.underline_thickness == num()
+                  && p.italic_angle == num() && p.fixed_pitch == num());
+        } else if (is_word("metrics") == 1) {
+            let is sfnt.head.Metrics as m = sfnt.head.metrics(&f);
+            check("line metrics", m.ascender == num() && m.descender == num() && m.line_gap == num());
+            check("heights", m.x_height == num() && m.cap_height == num());
+            check("underline", m.underline_pos == num() && m.underline_thickness == num());
+            check("strikeout", m.strike_pos == num() && m.strike_size == num());
+            check("weight and width", m.weight == num() && m.width == num());
+            check("italic, bold, fixed pitch", m.italic == cast(i32, num()) && m.bold == cast(i32, num())
+                  && m.fixed_pitch == cast(i32, num()));
+            check("italic angle", m.italic_angle * 65536.0 == cast(f64, sfnt.head.post(&f).italic_angle));
+            check("metrics' units", m.upem == f.upem);
+        } else if (is_word("name") == 1) {
+            let is i64 as id = num();
+            next_word();
+            let is i64 as n = sfnt.name.get(&f, id, cast(*u8, &buf), 512);
+            let is i32 as same with mut = 1;
+            let is i64 as k with mut = 0;
+            if (is_word("-") == 0) {
+                while (word[k * 2] != 0) {
+                    let is i64 as b = _hex(cast(i64, word[k * 2])) * 16 + _hex(cast(i64, word[k * 2 + 1]));
+                    if (k >= n || cast(i64, buf[k]) != b) { same = 0; }
+                    k = k + 1;
+                }
+            }
+            check("a name", same == 1 && n == k && buf[n] == 0);
+        } else if (is_word("subtable") == 1) {
+            end_section(&f);
+            sec_sub = sfnt.cmap.at(&f, subtables);
+            check("subtable's platform, encoding, format",
+                  sec_sub.platform == num() && sec_sub.encoding == num() && sec_sub.format == num());
+            subtables = subtables + 1;
+            section = 1;
+        } else if (is_word("map") == 1) {
+            let is i64 as cp = num();
+            let is i64 as g = num();
+            check("a subtable's mapping", sfnt.cmap.lookup(&f, &sec_sub, cp) == g);
+            if (listed < 4096) {
+                listed_cp[listed] = cp;
+                listed_gid[listed] = g;
+                listed = listed + 1;
+            }
+        } else if (is_word("uvs") == 1) {
+            let is i64 as cp = num();
+            let is i64 as vs = num();
+            let is i64 as g = num();
+            check("a variation sequence", sfnt.cmap.sequence(&f, sec_sub.off, cp, vs) == g);
+            let is i64 as want with mut = g;
+            if (g < 0) { want = sfnt.cmap.glyph(&f, cp); }
+            check("its glyph", sfnt.cmap.variant(&f, cp, vs) == want);
+            check("not with another selector", sfnt.cmap.sequence(&f, sec_sub.off, cp, vs + 13) == 0);
+        } else if (is_word("cmap") == 1) {
+            if (section != 2) {
+                end_section(&f);
+                section = 2;
+            }
+            let is i64 as cp = num();
+            let is i64 as g = num();
+            check("the face's mapping", sfnt.cmap.glyph(&f, cp) == g);
+            if (listed < 4096) {
+                listed_cp[listed] = cp;
+                listed_gid[listed] = g;
+                listed = listed + 1;
+            }
+        } else if (is_word("hmtx") == 1) {
+            end_section(&f);
+            let is i64 as g = num();
+            let is i64 as adv = num();
+            let is i64 as lsb = num();
+            check("advance", sfnt.hmtx.advance(&f, g) == adv);
+            check("side bearing", sfnt.hmtx.lsb(&f, g) == lsb);
+        } else if (is_word("kern") == 1) {
+            if (kerns < 8192) {
+                kern_l[kerns] = num();
+                kern_r[kerns] = num();
+                kern_v[kerns] = num();
+                check("a kerning pair", sfnt.kern.pair(&f, kern_l[kerns], kern_r[kerns]) == kern_v[kerns]);
+                kerns = kerns + 1;
+            }
+        } else {
+            io.printf("  unknown record %s\n", cast(*u8, &word));
+            check("the reference understood", 0);
+        }
+    }
+    if (have == 1) {
+        end_face(&f);
+        check("past the last glyph: nothing", sfnt.hmtx.advance(&f, f.glyphs) == 0 && sfnt.hmtx.lsb(&f, f.glyphs) == 0
+              && sfnt.hmtx.advance(&f, 0 - 1) == 0);
+        check("no subtable past the last", sfnt.cmap.at(&f, subtables).off == 0
+              && sfnt.cmap.at(&f, 0 - 1).off == 0);
+        check("no such name", sfnt.name.get(&f, 999, cast(*u8, &buf), 512) == 0 - 1);
+    }
+}
+
+// --- Malformed input ---
+
+// A mapping whose last page cannot be read: bytes laid just before it are
+// read past their end only into a fault.
+let is *u8 as guard with mut;
+
+fn guarded(src as *u8, n as i64) as *u8 {
+    let is *u8 as at = cast(*u8, cast(i64, guard) + 1048576 - n);
+    if (n > 0) { mem.memcpy(at, src, n); }
+    return at;
+}
+
+fn wb16(p as *u8, at as i64, v as i64) as void {
+    *cast(*u8, cast(i64, p) + at) = cast(u8, (v >> 8) & 255);
+    *cast(*u8, cast(i64, p) + at + 1) = cast(u8, v & 255);
+}
+
+fn wb32(p as *u8, at as i64, v as i64) as void {
+    wb16(p, at, (v >> 16) & 65535);
+    wb16(p, at + 2, v & 65535);
+}
+
+// Whatever a face opened from n bytes answers, it reads nothing past them.
+fn poke(data as *u8, n as i64) as i32 {
+    let is *u8 as at = guarded(data, n);
+    let is i64 as faces = sfnt.table.face_count(at, n);
+    let is sfnt.table.Face as f = sfnt.open(at, n, 0);
+    if (f.ok == 1) {
+        let is [64]u8 as buf;
+        sfnt.cmap.glyph(&f, 65);
+        sfnt.cmap.glyph(&f, 19968);
+        sfnt.cmap.glyph(&f, 128512);
+        sfnt.cmap.variant(&f, 33883, 917760);
+        sfnt.hmtx.advance(&f, f.glyphs - 1);
+        sfnt.hmtx.lsb(&f, f.glyphs - 1);
+        sfnt.name.get(&f, 1, cast(*u8, &buf), 64);
+        sfnt.head.metrics(&f);
+        sfnt.kern.pair(&f, 36, 57);
+        let is i64 as k with mut = 0;
+        while (k < sfnt.cmap.count(&f)) {
+            let is sfnt.cmap.Subtable as s = sfnt.cmap.at(&f, k);
+            sfnt.cmap.lookup(&f, &s, 66);
+            k = k + 1;
+        }
+    }
+    if (faces < 0) { return 0; }
+    return 1;
+}
+
+fn malformed() as void {
+    current = "malformed";
+    guard = linux.mmap(cast(*u8, 0), 1048576 + 4096, 3, 34, 0 - 1, 0);
+    linux.mprotect(cast(*u8, cast(i64, guard) + 1048576), 4096, 0);
+    let is *u8 as data = load("text/testdata/cid.otf");
+    let is i64 as size = loaded;
+    check("nothing is no font", sfnt.table.face_count(data, 0) == 0 && sfnt.open(data, 0, 0).err == sfnt.table.NOT_A_FONT);
+    check("nor is text", sfnt.table.face_count("hello, world", 12) == 0);
+    check("no second face in a single font", sfnt.open(data, size, 1).err == sfnt.table.BAD_INDEX
+          && sfnt.open(data, size, 0 - 1).err == sfnt.table.BAD_INDEX);
+    check("a directory cut short", sfnt.open(data, 40, 0).err == sfnt.table.TRUNCATED);
+    // Cut anywhere: every length up to the whole file, against the guard.
+    let is i64 as n with mut = 0;
+    let is i32 as fine with mut = 1;
+    while (n <= size) {
+        fine = poke(data, n);
+        n = n + 37;
+    }
+    check("cut anywhere, read only within", fine);
+    let is i64 as cut = size - 600;
+    let is sfnt.table.Face as short = sfnt.open(data, cut, 0);
+    check("a table running past the end is not there", short.ok == 0 || short.cff.len == 0 || short.cff.off + short.cff.len <= cut);
+
+    // Corrupted counts and offsets, in a copy.
+    let is *u8 as c = mem.core.mmap_anon(size + 16);
+    let is sfnt.table.Face as good = sfnt.open(data, size, 0);
+    mem.memcpy(c, data, size);
+    wb32(c, good.head.off + 12, 0);
+    check("head's magic number", sfnt.open(c, size, 0).err == sfnt.table.BAD_TABLE && sfnt.open(c, size, 0).ok == 0);
+    mem.memcpy(c, data, size);
+    wb16(c, good.head.off + 18, 0);
+    check("no units per em", sfnt.open(c, size, 0).err == sfnt.table.BAD_TABLE);
+    mem.memcpy(c, data, size);
+    wb16(c, good.hhea.off + 34, 0);
+    check("no metrics", sfnt.open(c, size, 0).err == sfnt.table.BAD_TABLE);
+    mem.memcpy(c, data, size);
+    wb16(c, good.hhea.off + 34, good.glyphs + 1);
+    check("more metrics than glyphs", sfnt.open(c, size, 0).err == sfnt.table.BAD_TABLE);
+    mem.memcpy(c, data, size);
+    wb16(c, good.maxp.off + 4, 0);
+    check("no glyphs", sfnt.open(c, size, 0).err == sfnt.table.BAD_TABLE);
+    mem.memcpy(c, data, size);
+    wb16(c, good.cmap.off + 2, 65535);
+    let is sfnt.table.Face as many = sfnt.open(c, size, 0);
+    check("subtables past the table: none", many.ok == 1 && sfnt.cmap.count(&many) == 0
+          && sfnt.cmap.glyph(&many, 65) == 0);
+    // Every subtable's counts at their largest: answers, and nothing past.
+    let is i64 as k with mut = 0;
+    while (k < sfnt.cmap.count(&good)) {
+        let is sfnt.cmap.Subtable as s = sfnt.cmap.at(&good, k);
+        mem.memcpy(c, data, size);
+        if (s.format == 4) { wb16(c, s.off + 6, 65534); }
+        if (s.format == 12) { wb32(c, s.off + 12, 268435455); }
+        if (s.format == 14) { wb32(c, s.off + 6, 268435455); }
+        let is sfnt.table.Face as bad = sfnt.open(c, size, 0);
+        let is sfnt.cmap.Subtable as bs = sfnt.cmap.at(&bad, k);
+        check("a subtable too long for its table maps nothing",
+              sfnt.cmap.lookup(&bad, &bs, 65) == 0 && sfnt.cmap.sequence(&bad, bs.off, 33883, 917760) == 0);
+        k = k + 1;
+    }
+    // A glyph past the face's last is no glyph.
+    mem.memcpy(c, data, size);
+    wb16(c, good.maxp.off + 4, 3);
+    wb16(c, good.hhea.off + 34, 3);
+    let is sfnt.table.Face as few = sfnt.open(c, size, 0);
+    check("a mapping past the glyphs: none", few.ok == 1 && sfnt.cmap.glyph(&good, 28450) > 3
+          && sfnt.cmap.glyph(&few, 28450) == 0 && sfnt.cmap.variant(&few, 33883, 917760) == 0);
+}
+
+// --- Tables made by hand: what no test font has ---
+
+let is [4096]u8 as fab;
+let is i64 as fab_n with mut = 0;
+
+fn f8(v as i64) as void { fab[fab_n] = cast(u8, v & 255); fab_n = fab_n + 1; }
+fn f16(v as i64) as void { f8(v >> 8); f8(v); }
+fn f24(v as i64) as void { f8(v >> 16); f16(v); }
+fn f32(v as i64) as void { f16(v >> 16); f16(v); }
+fn put16(at as i64, v as i64) as void {
+    fab[at] = cast(u8, (v >> 8) & 255);
+    fab[at + 1] = cast(u8, v & 255);
+}
+
+// A face over fab's bytes, every table absent until the caller sets one.
+fn crafted() as sfnt.table.Face {
+    let is sfnt.table.Face as f with mut = sfnt.table.directory(cast(*u8, &fab), 0, 0);
+    f.data = cast(*u8, &fab);
+    f.size = fab_n;
+    f.glyphs = 1000;
+    f.hmetrics = 1;
+    f.upem = 1000;
+    f.cmap.off = 0;
+    f.cmap.len = 0;
+    f.name.off = 0;
+    f.name.len = 0;
+    f.kern.off = 0;
+    f.kern.len = 0;
+    return f;
+}
+
+// Name records written in order, their strings after them.
+let is i64 as name_count with mut = 0;
+let is i64 as name_rec with mut = 0;
+let is i64 as name_str with mut = 0;
+
+fn name_begin(n as i64) as void {
+    fab_n = 0;
+    f16(0);
+    f16(n);
+    f16(6 + n * 12);
+    name_count = n;
+    name_rec = 6;
+    name_str = 6 + n * 12;
+    fab_n = name_str;
+}
+
+// A record whose string is the bytes s, n long.
+fn name_add(platform as i64, encoding as i64, language as i64, id as i64, s as *u8, n as i64) as void {
+    let is i64 as keep = fab_n;
+    fab_n = name_rec;
+    f16(platform);
+    f16(encoding);
+    f16(language);
+    f16(id);
+    f16(n);
+    f16(keep - (6 + name_count * 12));
+    name_rec = fab_n;
+    fab_n = keep;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        f8(cast(i64, *cast(*u8, cast(i64, s) + i)));
+        i = i + 1;
+    }
+}
+
+// UTF-16BE of ASCII s, into utf16.
+let is [64]u8 as utf16;
+fn wide(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (*cast(*u8, cast(i64, s) + i) != 0) {
+        utf16[i * 2] = 0;
+        utf16[i * 2 + 1] = *cast(*u8, cast(i64, s) + i);
+        i = i + 1;
+    }
+    return i * 2;
+}
+
+let is [64]u8 as got;
+
+fn name_is(f as *sfnt.table.Face, want as *u8) as i32 {
+    let is i64 as n = sfnt.name.get(f, 1, cast(*u8, &got), 64);
+    let is i64 as i with mut = 0;
+    while (*cast(*u8, cast(i64, want) + i) != 0) {
+        if (i >= n || got[i] != *cast(*u8, cast(i64, want) + i)) { return 0; }
+        i = i + 1;
+    }
+    if (n != i) { return 0; }
+    return 1;
+}
+
+// One full set of records for name 1, of which the first `skip` kinds are
+// left out — US English, other English, other Windows, Unicode, Mac — so
+// each level of the preference is seen winning. Written worst first: a
+// better record has to beat the ones before it, not merely come first.
+fn names(skip as i64) as sfnt.table.Face {
+    name_begin(5 - skip);
+    let is i64 as k with mut = 4;
+    while (k >= skip) {
+        if (k == 0) { name_add(3, 1, 1033, 1, cast(*u8, &utf16), wide("US")); }
+        if (k == 1) { name_add(3, 10, 2057, 1, cast(*u8, &utf16), wide("British")); }
+        if (k == 2) { name_add(3, 1, 1031, 1, cast(*u8, &utf16), wide("Deutsch")); }
+        if (k == 3) { name_add(0, 3, 0, 1, cast(*u8, &utf16), wide("Unicode")); }
+        if (k == 4) { name_add(1, 0, 0, 1, "Mac", 3); }
+        k = k - 1;
+    }
+    let is sfnt.table.Face as f with mut = crafted();
+    f.name.len = fab_n;
+    return f;
+}
+
+fn by_hand() as void {
+    current = "by hand";
+    // Format 10: a run of 32-bit characters, 16-bit glyphs.
+    // After four bytes: a subtable is never at the cmap's start.
+    fab_n = 0;
+    f32(0);
+    f16(10); f16(0); f32(26); f32(0); f32(65536); f32(3); f16(7); f16(0); f16(9); f16(11);
+    let is sfnt.table.Face as f with mut = crafted();
+    f.cmap.len = fab_n;
+    let is sfnt.cmap.Subtable as s;
+    s.format = 10;
+    s.off = 4;
+    check("format 10", sfnt.cmap.lookup(&f, &s, 65536) == 7 && sfnt.cmap.lookup(&f, &s, 65537) == 0
+          && sfnt.cmap.lookup(&f, &s, 65538) == 9 && sfnt.cmap.lookup(&f, &s, 65535) == 0
+          && sfnt.cmap.lookup(&f, &s, 65539) == 0);
+    // Format 0 never looks past its 256 bytes.
+    s.format = 0;
+    check("format 0: one byte per character", sfnt.cmap.lookup(&f, &s, 256) == 0 && sfnt.cmap.lookup(&f, &s, 0 - 1) == 0);
+
+    // Windows Symbol alone: characters below 256 are looked up at U+F000 up.
+    fab_n = 0;
+    f16(0); f16(1); f16(3); f16(0); f32(12);
+    f16(4); f16(32); f16(0); f16(4); f16(4); f16(1); f16(0);
+    f16(61506); f16(65535); f16(0); f16(61505); f16(65535);
+    f16((5 - 61505) & 65535); f16(1); f16(0); f16(0);
+    f = crafted();
+    f.cmap.len = fab_n;
+    sfnt.cmap.select(&f);
+    check("symbol: chosen", f.symbol == 1 && f.cmap_fmt == 4 && f.cmap_sub == 12);
+    check("symbol: where it maps", sfnt.cmap.glyph(&f, 61505) == 5 && sfnt.cmap.glyph(&f, 61506) == 6);
+    check("symbol: from below 256", sfnt.cmap.glyph(&f, 65) == 5 && sfnt.cmap.glyph(&f, 66) == 6);
+    check("symbol: not past 255", sfnt.cmap.glyph(&f, 321) == 0 && sfnt.cmap.glyph(&f, 67) == 0);
+    // With Windows Unicode beside it, that is chosen, and nothing moves.
+    fab_n = 0;
+    f16(0); f16(2); f16(3); f16(0); f32(20); f16(3); f16(1); f32(20);
+    f16(4); f16(32); f16(0); f16(4); f16(4); f16(1); f16(0);
+    f16(61506); f16(65535); f16(0); f16(61505); f16(65535);
+    f16((5 - 61505) & 65535); f16(1); f16(0); f16(0);
+    f = crafted();
+    f.cmap.len = fab_n;
+    sfnt.cmap.select(&f);
+    check("a Unicode subtable before symbol", f.symbol == 0 && sfnt.cmap.glyph(&f, 65) == 0 && sfnt.cmap.glyph(&f, 61505) == 5);
+
+    // Names: each level of the preference.
+    f = names(0);
+    check("names: US English first", name_is(&f, "US"));
+    f = names(1);
+    check("names: then any English", name_is(&f, "British"));
+    f = names(2);
+    check("names: then any Windows", name_is(&f, "Deutsch"));
+    f = names(3);
+    check("names: then Unicode", name_is(&f, "Unicode"));
+    f = names(4);
+    check("names: then Mac Roman", name_is(&f, "Mac"));
+    name_begin(1);
+    name_add(1, 0, 3, 1, "Mac", 3);
+    f = crafted();
+    f.name.len = fab_n;
+    check("names: Mac in another language is not read", sfnt.name.get(&f, 1, cast(*u8, &got), 64) == 0 - 1);
+    // Mac Roman's upper half; UTF-16's surrogates, paired and not.
+    name_begin(1);
+    let is [3]u8 as mac;
+    mac[0] = 142;
+    mac[1] = 65;
+    mac[2] = 219;
+    name_add(1, 0, 0, 1, cast(*u8, &mac), 3);
+    f = crafted();
+    f.name.len = fab_n;
+    check("Mac Roman", name_is(&f, "\xC3\xA9A\xE2\x82\xAC"));
+    let is [10]u8 as w16;
+    w16[0] = 216; w16[1] = 61; w16[2] = 222; w16[3] = 0;
+    w16[4] = 216; w16[5] = 0; w16[6] = 0; w16[7] = 65;
+    w16[8] = 220; w16[9] = 0;
+    name_begin(1);
+    name_add(3, 1, 1033, 1, cast(*u8, &w16), 10);
+    f = crafted();
+    f.name.len = fab_n;
+    check("UTF-16: a pair, and halves alone", name_is(&f, "\xF0\x9F\x98\x80\xEF\xBF\xBDA\xEF\xBF\xBD"));
+    // Cut to fit, never inside a character, and NUL-terminated.
+    let is i64 as cut = sfnt.name.get(&f, 1, cast(*u8, &got), 6);
+    check("cut at a character", cut == 4 && got[4] == 0);
+    check("no room at all", sfnt.name.get(&f, 1, cast(*u8, &got), 0) == 0 - 1);
+    check("room for the NUL only", sfnt.name.get(&f, 1, cast(*u8, &got), 1) == 0 && got[0] == 0);
+
+    // Kerning: summed, cross-stream and vertical left out, an override
+    // replacing, other formats skipped.
+    fab_n = 0;
+    f16(0); f16(5);
+    // Horizontal: 1,2 -50 and 3,4 20.
+    f16(0); f16(26); f16(1); f16(2); f16(12); f16(1); f16(0); f16(1); f16(2); f16(65486); f16(3); f16(4); f16(20);
+    // A second: 1,2 -5 more.
+    f16(0); f16(20); f16(1); f16(1); f16(6); f16(0); f16(0); f16(1); f16(2); f16(65531);
+    // Cross-stream, and vertical: neither counts.
+    f16(0); f16(20); f16(5); f16(1); f16(6); f16(0); f16(0); f16(1); f16(2); f16(1000);
+    f16(0); f16(20); f16(0); f16(1); f16(6); f16(0); f16(0); f16(3); f16(4); f16(1000);
+    // Format 2, skipped by its length.
+    f16(0); f16(10); f16(513); f16(9); f16(9);
+    f = crafted();
+    f.kern.len = fab_n;
+    check("kerning summed", sfnt.kern.pair(&f, 1, 2) == 0 - 55 && sfnt.kern.pair(&f, 3, 4) == 20);
+    check("kerning: neither cross-stream nor vertical", sfnt.kern.pair(&f, 2, 1) == 0);
+    put16(4 + 26 + 20 + 4, 9);
+    f = crafted();
+    f.kern.len = fab_n;
+    check("kerning: an override replaces", sfnt.kern.pair(&f, 1, 2) == 1000);
+    put16(0, 1);
+    check("Apple's kern table: nothing here", sfnt.kern.pair(&f, 1, 2) == 0);
+
+    // When hhea says nothing: OS/2's typographic metrics, then its Windows ones.
+    let is *u8 as data = load("text/testdata/vf.ttf");
+    let is i64 as size = loaded;
+    let is sfnt.table.Face as good = sfnt.open(data, size, 0);
+    let is sfnt.head.Os2 as o = sfnt.head.os2(&good);
+    let is *u8 as c = mem.core.mmap_anon(size + 16);
+    mem.memcpy(c, data, size);
+    wb16(c, good.os2.off + 62, 0);
+    wb16(c, good.hhea.off + 4, 0);
+    wb16(c, good.hhea.off + 6, 0);
+    let is sfnt.table.Face as quiet with mut = sfnt.open(c, size, 0);
+    let is sfnt.head.Metrics as m with mut = sfnt.head.metrics(&quiet);
+    check("hhea silent: OS/2's typographic", m.ascender == o.typo_asc && m.descender == o.typo_desc && m.line_gap == o.typo_gap);
+    wb16(c, good.os2.off + 68, 0);
+    wb16(c, good.os2.off + 70, 0);
+    wb16(c, good.os2.off + 72, 33);
+    quiet = sfnt.open(c, size, 0);
+    m = sfnt.head.metrics(&quiet);
+    check("and that silent: its Windows ones", m.ascender == o.win_asc && m.descender == 0 - o.win_desc && m.line_gap == 0);
+    // An ascender of 0 alone is still hhea saying something.
+    mem.memcpy(c, data, size);
+    wb16(c, good.os2.off + 62, 0);
+    wb16(c, good.hhea.off + 4, 0);
+    quiet = sfnt.open(c, size, 0);
+    m = sfnt.head.metrics(&quiet);
+    check("hhea with only a descender", m.ascender == 0 && m.descender == sfnt.head.hhea(&good).descender);
+    // Not asking for the typographic ones: hhea's.
+    mem.memcpy(c, data, size);
+    wb16(c, good.os2.off + 62, 0);
+    quiet = sfnt.open(c, size, 0);
+    m = sfnt.head.metrics(&quiet);
+    let is sfnt.head.Hhea as hh = sfnt.head.hhea(&good);
+    check("without USE_TYPO_METRICS: hhea's", m.ascender == hh.ascender && m.descender == hh.descender);
+    // An OS/2 too short for version 0, or version 1: no heights.
+    mem.memcpy(c, data, size);
+    wb16(c, good.os2.off, 1);
+    quiet = sfnt.open(c, size, 0);
+    check("OS/2 version 1: no heights", sfnt.head.os2(&quiet).x_height == 0 && sfnt.head.os2(&quiet).cap_height == 0
+          && sfnt.head.os2(&quiet).weight == o.weight);
+    wb16(c, good.os2.off, 2);
+    quiet = sfnt.open(c, size, 0);
+    check("OS/2 version 2: heights", sfnt.head.os2(&quiet).x_height == o.x_height && o.x_height != 0);
+    quiet.os2.len = 78;
+    check("OS/2 of version 0's length: read, no heights", sfnt.head.os2(&quiet).weight == o.weight
+          && sfnt.head.os2(&quiet).x_height == 0 && sfnt.head.os2(&quiet).win_desc == o.win_desc);
+    quiet.os2.len = 77;
+    check("OS/2 cut short: the defaults", sfnt.head.os2(&quiet).weight == 400 && sfnt.head.os2(&quiet).width == 5
+          && sfnt.head.os2(&quiet).typo_asc == 0);
+    quiet.post.len = 15;
+    check("post cut short: zeros", sfnt.head.post(&quiet).underline_thickness == 0);
+    // Bold and italic from head's style bits alone.
+    mem.memcpy(c, data, size);
+    wb16(c, good.os2.off + 62, 0);
+    wb16(c, good.head.off + 44, 3);
+    quiet = sfnt.open(c, size, 0);
+    m = sfnt.head.metrics(&quiet);
+    check("head's style bits", m.bold == 1 && m.italic == 1);
+    wb16(c, good.head.off + 44, 0);
+    wb16(c, good.os2.off + 62, 512);
+    quiet = sfnt.open(c, size, 0);
+    check("oblique is italic", sfnt.head.metrics(&quiet).italic == 1 && sfnt.head.metrics(&quiet).bold == 0);
+}
+
+// --- The readers, at the edges of memory ---
+
+fn readers() as void {
+    current = "readers";
+    // Eight bytes ending where an unreadable page begins.
+    let is *u8 as end = linux.mmap(cast(*u8, 0), 8192, 3, 34, 0 - 1, 0);
+    linux.mprotect(cast(*u8, cast(i64, end) + 4096), 4096, 0);
+    let is *u8 as at = cast(*u8, cast(i64, end) + 4088);
+    let is [8]i64 as b;
+    b[0] = 128; b[1] = 0; b[2] = 1; b[3] = 2; b[4] = 255; b[5] = 254; b[6] = 127; b[7] = 255;
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        *cast(*u8, cast(i64, at) + i) = cast(u8, b[i]);
+        i = i + 1;
+    }
+    let is sfnt.table.Face as f with mut = crafted();
+    f.data = at;
+    f.size = 8;
+    check("u8", sfnt.table.u8_at(&f, 7) == 255 && sfnt.table.u8_at(&f, 8) == 0);
+    check("u16", sfnt.table.u16_at(&f, 6) == 32767 && sfnt.table.u16_at(&f, 7) == 0);
+    check("i16 at its least", sfnt.table.i16_at(&f, 0) == 0 - 32768 && sfnt.table.i16_at(&f, 4) == 0 - 2);
+    check("u24", sfnt.table.u24_at(&f, 5) == 16678911 && sfnt.table.u24_at(&f, 6) == 0);
+    check("u32", sfnt.table.u32_at(&f, 4) == 4294868991 && sfnt.table.u32_at(&f, 5) == 0);
+    check("i32 at its least, and negative", sfnt.table.i32_at(&f, 0) == 0 - 2147483648 + 258
+          && sfnt.table.i32_at(&f, 4) == 0 - 98305);
+    check("has", sfnt.table.has(&f, 8, 0) == 1 && sfnt.table.has(&f, 8, 1) == 0 && sfnt.table.has(&f, 0, 9) == 0
+          && sfnt.table.has(&f, 0 - 1, 1) == 0 && sfnt.table.has(&f, 0, 0 - 1) == 0 && sfnt.table.has(&f, 9, 0) == 0);
+    // Eight bytes starting where an unreadable page ends: nothing before them.
+    let is *u8 as start = linux.mmap(cast(*u8, 0), 8192, 3, 34, 0 - 1, 0);
+    linux.mprotect(start, 4096, 0);
+    f.data = cast(*u8, cast(i64, start) + 4096);
+    check("nothing before the start", sfnt.table.u8_at(&f, 0 - 1) == 0 && sfnt.table.u16_at(&f, 0 - 1) == 0
+          && sfnt.table.u32_at(&f, 0 - 3) == 0 && sfnt.table.u24_at(&f, 0 - 2) == 0);
+    // Within a table: not before it, not past it, and nothing in an absent one.
+    let is sfnt.table.Table as t;
+    t.off = 10;
+    t.len = 20;
+    check("inside", sfnt.table.inside(t, 10, 20) == 1 && sfnt.table.inside(t, 30, 0) == 1);
+    check("not before", sfnt.table.inside(t, 9, 1) == 0);
+    check("not past", sfnt.table.inside(t, 10, 21) == 0 && sfnt.table.inside(t, 31, 0) == 0
+          && sfnt.table.inside(t, 29, 2) == 0);
+    check("nor a negative length", sfnt.table.inside(t, 12, 0 - 1) == 0);
+    t.len = 0;
+    check("an absent table holds nothing", sfnt.table.inside(t, 10, 0) == 0);
+}
+
+// --- Directories made by hand ---
+
+// An sfnt of n tables, tags[i] each, 64 zero bytes apiece; cut short of the
+// last table by `short` bytes. Into fab.
+fn fake(tags as *i64, n as i64, short as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 4096) { fab[i] = 0; i = i + 1; }
+    fab_n = 0;
+    f32(1330926671);
+    f16(n); f16(0); f16(0); f16(0);
+    i = 0;
+    while (i < n) {
+        f32(*cast(*i64, cast(i64, tags) + i * 8));
+        f32(0);
+        f32(12 + n * 16 + i * 64);
+        f32(64);
+        i = i + 1;
+    }
+    fab_n = 12 + n * 16 + n * 64 - short;
+}
+
+fn directories() as void {
+    current = "directories";
+    let is [8]i64 as tags;
+    tags[0] = sfnt.table.TAG_HEAD;
+    tags[1] = sfnt.table.TAG_HHEA;
+    tags[2] = sfnt.table.TAG_MAXP;
+    tags[3] = sfnt.table.TAG_HMTX;
+    tags[4] = sfnt.table.TAG_CMAP;
+    tags[5] = sfnt.table.TAG_CFF;
+    tags[6] = sfnt.table.TAG_CFF2;
+    tags[7] = sfnt.table.TAG_GLYF;
+    fake(cast(*i64, &tags), 7, 0);
+    let is sfnt.table.Face as f with mut = sfnt.table.directory(cast(*u8, &fab), fab_n, 0);
+    check("every required table", f.err == sfnt.table.OK && f.tables == 7);
+    check("CFF2 before CFF", f.outline == sfnt.table.OUTLINE_CFF2);
+    fake(cast(*i64, &tags), 6, 0);
+    f = sfnt.table.directory(cast(*u8, &fab), fab_n, 0);
+    check("CFF alone", f.outline == sfnt.table.OUTLINE_CFF);
+    tags[5] = sfnt.table.TAG_GLYF;
+    fake(cast(*i64, &tags), 6, 0);
+    f = sfnt.table.directory(cast(*u8, &fab), fab_n, 0);
+    check("glyf without loca: no outlines", f.outline == sfnt.table.OUTLINE_NONE);
+    // Each required table missing in turn: put last, cut off.
+    let is i64 as k with mut = 0;
+    while (k < 5) {
+        let is [5]i64 as req;
+        req[0] = sfnt.table.TAG_HEAD;
+        req[1] = sfnt.table.TAG_HHEA;
+        req[2] = sfnt.table.TAG_MAXP;
+        req[3] = sfnt.table.TAG_HMTX;
+        req[4] = sfnt.table.TAG_CMAP;
+        let is i64 as keep = req[k];
+        req[k] = req[4];
+        req[4] = keep;
+        fake(cast(*i64, &req), 5, 1);
+        f = sfnt.table.directory(cast(*u8, &fab), fab_n, 0);
+        check("a required table missing", f.err == sfnt.table.MISSING_TABLE && sfnt.open(cast(*u8, &fab), fab_n, 0).ok == 0);
+        k = k + 1;
+    }
+    // A table of length 0 is not there either.
+    fake(cast(*i64, &tags), 5, 0);
+    fab[12 + 4 * 16 + 15] = 0;
+    check("a table of no length", sfnt.table.directory(cast(*u8, &fab), fab_n, 0).err == sfnt.table.MISSING_TABLE);
+    // A collection claiming more faces than its bytes hold.
+    fab_n = 0;
+    f32(sfnt.table.TAG_TTCF); f32(65536); f32(1000); f32(12);
+    check("a collection too short for its faces", sfnt.table.face_count(cast(*u8, &fab), fab_n) == 0);
+
+    // A collection whose second face is not one.
+    let is *u8 as data with mut = load("text/testdata/pair.ttc");
+    let is i64 as size with mut = loaded;
+    let is *u8 as c with mut = mem.core.mmap_anon(size + 16);
+    mem.memcpy(c, data, size);
+    let is sfnt.table.Face as two = sfnt.open(data, size, 1);
+    wb32(c, two.dir - 12, 0);
+    check("a face that is not one", sfnt.open(c, size, 1).err == sfnt.table.NOT_A_FONT && sfnt.open(c, size, 0).ok == 1);
+
+    // Records: a table running past the file, an hmtx too short.
+    data = load("text/testdata/glyf.ttf");
+    size = loaded;
+    let is sfnt.table.Face as good = sfnt.open(data, size, 0);
+    c = mem.core.mmap_anon(size + 16);
+    let is i64 as cmap_rec = record(&good, sfnt.table.TAG_CMAP);
+    let is i64 as hmtx_rec = record(&good, sfnt.table.TAG_HMTX);
+    mem.memcpy(c, data, size);
+    wb32(c, cmap_rec + 12, size);
+    check("a table past the end", sfnt.open(c, size, 0).err == sfnt.table.MISSING_TABLE);
+    mem.memcpy(c, data, size);
+    wb32(c, hmtx_rec + 12, good.hmetrics * 4 - 2);
+    let is sfnt.table.Face as short = sfnt.open(c, size, 0);
+    check("an hmtx too short for its metrics", short.err == sfnt.table.BAD_TABLE && short.ok == 0);
+    // Exactly the metrics and no side bearings after: those read as 0.
+    mem.memcpy(c, data, size);
+    wb32(c, hmtx_rec + 12, good.hmetrics * 4);
+    let is sfnt.table.Face as bare = sfnt.open(c, size, 0);
+    check("side bearings cut off", bare.ok == 1 && good.glyphs > good.hmetrics
+          && sfnt.hmtx.lsb(&bare, good.glyphs - 1) == 0 && sfnt.hmtx.lsb(&good, good.glyphs - 1) != 0);
+    // Longer than it needs: still nothing past the last glyph.
+    mem.memcpy(c, data, size);
+    wb32(c, hmtx_rec + 12, good.hmetrics * 4 + (good.glyphs - good.hmetrics) * 2 + 32);
+    let is i64 as pad with mut = 0;
+    while (pad < 32) {
+        *cast(*u8, cast(i64, c) + good.hmtx.off + good.hmtx.len + pad) = 85;
+        pad = pad + 1;
+    }
+    let is sfnt.table.Face as roomy = sfnt.open(c, size, 0);
+    check("past the last glyph, even with room", roomy.ok == 1 && sfnt.hmtx.lsb(&roomy, good.glyphs) == 0
+          && sfnt.hmtx.lsb(&roomy, good.glyphs + 3) == 0);
+    // A subtable record pointing past the cmap.
+    mem.memcpy(c, data, size);
+    wb32(c, good.cmap.off + 8, 16777215);
+    let is sfnt.table.Face as far = sfnt.open(c, size, 0);
+    check("a subtable past its table", sfnt.cmap.at(&far, 0).off == 0 && sfnt.cmap.at(&far, 0).format == 0 - 1);
+    // More metrics than glyphs, where hmtx has the room.
+    mem.memcpy(c, data, size);
+    wb16(c, good.maxp.off + 4, 3);
+    wb16(c, good.hhea.off + 34, 4);
+    check("more metrics than glyphs", sfnt.open(c, size, 0).err == sfnt.table.BAD_TABLE);
+}
+
+// Where the directory record for tag lies in the face's file; -1 for none.
+fn record(f as *sfnt.table.Face, tag as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < f.tables) {
+        if (sfnt.table.u32_at(f, f.dir + i * 16) == tag) { return f.dir + i * 16; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// --- Choosing among subtables, and the formats' corners ---
+
+fn choosing() as void {
+    current = "choosing";
+    let is *u8 as data = load("text/testdata/cmaps.ttf");
+    let is i64 as size = loaded;
+    let is sfnt.table.Face as good = sfnt.open(data, size, 0);
+    let is *u8 as c = mem.core.mmap_anon(size + 16);
+    // Records: (0,3,4) (0,5,14) (0,6,13) (1,0,0) (1,1,6) (3,10,12), in that order.
+    let is i64 as rec = good.cmap.off + 4;
+    mem.memcpy(c, data, size);
+    wb16(c, rec + 5 * 8 + 2, 11);
+    let is sfnt.table.Face as f with mut = sfnt.open(c, size, 0);
+    check("without (3,10): (0,6), format 13", f.cmap_fmt == 13 && sfnt.cmap.glyph(&f, 8192) == 27);
+    // (0,6) gone too: the 16-bit table before the Mac ones.
+    wb16(c, rec + 2 * 8 + 2, 7);
+    f = sfnt.open(c, size, 0);
+    check("then (0,3)", f.cmap_fmt == 4 && sfnt.cmap.glyph(&f, 65) == 1);
+    // (0,4) wins over (3,1), with (0,6) out of the way.
+    mem.memcpy(c, data, size);
+    wb16(c, rec + 2, 4);
+    wb16(c, rec + 2 * 8 + 2, 7);
+    wb16(c, rec + 5 * 8 + 2, 1);
+    f = sfnt.open(c, size, 0);
+    check("(0,4) before (3,1)", f.cmap_fmt == 4 && sfnt.cmap.glyph(&f, 128512) == 0);
+    // A format 14 subtable is never the character map, whatever it claims.
+    mem.memcpy(c, data, size);
+    wb16(c, rec + 1 * 8, 3);
+    wb16(c, rec + 1 * 8 + 2, 10);
+    wb16(c, rec + 5 * 8 + 2, 11);
+    f = sfnt.open(c, size, 0);
+    check("format 14 claiming (3,10) is not chosen", f.cmap_fmt == 13 && sfnt.cmap.glyph(&f, 8192) == 27);
+    check("nor taken for sequences, under another platform", f.uvs_sub == 0 && sfnt.cmap.variant(&f, 19968, 65024) == 0);
+    // Variation sequences only under (0,5).
+    mem.memcpy(c, data, size);
+    wb16(c, rec + 1 * 8 + 2, 4);
+    f = sfnt.open(c, size, 0);
+    check("sequences under (0,4) are not read", f.uvs_sub == 0 && sfnt.cmap.variant(&f, 19968, 65024) == 0);
+
+    current = "formats by hand";
+    // Format 0 never reads past its 256 glyphs, though bytes follow.
+    fab_n = 0;
+    f32(0);
+    f16(0); f16(262); f16(0);
+    let is i64 as i with mut = 0;
+    while (i < 256) { f8(i & 63); i = i + 1; }
+    f8(9); f8(9);
+    let is sfnt.table.Face as h with mut = crafted();
+    h.cmap.len = fab_n;
+    let is sfnt.cmap.Subtable as s;
+    s.format = 0;
+    s.off = 4;
+    check("format 0", sfnt.cmap.lookup(&h, &s, 65) == 1 && sfnt.cmap.lookup(&h, &s, 255) == 63
+          && sfnt.cmap.lookup(&h, &s, 256) == 0);
+    // Format 4 through idRangeOffset: A..C at glyphs 5, 0, 7 plus a delta of
+    // 10 — and 0 stays 0, the delta not applied to it.
+    fab_n = 0;
+    f32(0);
+    f16(4); f16(40); f16(0); f16(4); f16(4); f16(1); f16(0);
+    f16(67); f16(65535); f16(0); f16(65); f16(65535);
+    f16(10); f16(1);
+    f16(4); f16(0);
+    f16(5); f16(0); f16(7);
+    h = crafted();
+    h.cmap.len = fab_n;
+    s.format = 4;
+    check("format 4 through its glyph array", sfnt.cmap.lookup(&h, &s, 65) == 15 && sfnt.cmap.lookup(&h, &s, 66) == 0
+          && sfnt.cmap.lookup(&h, &s, 67) == 17 && sfnt.cmap.lookup(&h, &s, 68) == 0 && sfnt.cmap.lookup(&h, &s, 64) == 0);
+    // Its arrays running a byte past the table: the subtable maps nothing.
+    h.cmap.len = 4 + 14 + 2 * 8 + 2 - 1;
+    check("format 4 overrunning its table", sfnt.cmap.lookup(&h, &s, 65) == 0);
+    // Format 12, a group more than the table holds, laid in the bytes after.
+    fab_n = 0;
+    f32(0);
+    f16(12); f16(0); f32(40); f32(0); f32(2);
+    f32(65); f32(70); f32(3);
+    f32(128512); f32(128515); f32(20);
+    h = crafted();
+    h.cmap.len = fab_n;
+    s.format = 12;
+    check("format 12", sfnt.cmap.lookup(&h, &s, 66) == 4 && sfnt.cmap.lookup(&h, &s, 128513) == 21);
+    h.cmap.len = fab_n - 12;
+    check("format 12 overrunning its table", sfnt.cmap.lookup(&h, &s, 66) == 0);
+    // Variation sequences: a default range, a record and mappings past the table.
+    fab_n = 0;
+    f32(0);
+    f16(14); f32(0); f32(2);
+    f24(65024); f32(32); f32(0);
+    f24(917760); f32(0); f32(40);
+    f32(1); f24(65); f8(2);
+    f32(1); f24(19968); f16(30);
+    h = crafted();
+    h.cmap.len = fab_n;
+    check("a default range", sfnt.cmap.sequence(&h, 4, 66, 65024) == 0 - 1 && sfnt.cmap.sequence(&h, 4, 67, 65024) == 0 - 1
+          && sfnt.cmap.sequence(&h, 4, 68, 65024) == 0 && sfnt.cmap.sequence(&h, 4, 64, 65024) == 0);
+    check("a mapping", sfnt.cmap.sequence(&h, 4, 19968, 917760) == 30);
+    h.cmap.len = fab_n - 1;
+    check("mappings overrunning the table", sfnt.cmap.sequence(&h, 4, 19968, 917760) == 0);
+    h.cmap.len = fab_n - 10;
+    check("ranges overrunning the table", sfnt.cmap.sequence(&h, 4, 66, 65024) == 0);
+    h.cmap.len = 4 + 10 + 11;
+    check("records overrunning the table", sfnt.cmap.sequence(&h, 4, 66, 65024) == 0);
+
+    // Symbol maps below 256 only: U+0141 is not U+F141.
+    fab_n = 0;
+    f16(0); f16(1); f16(3); f16(0); f32(12);
+    f16(4); f16(40); f16(0); f16(6); f16(4); f16(2); f16(2);
+    f16(61506); f16(61761); f16(65535); f16(0); f16(61505); f16(61761); f16(65535);
+    f16((5 - 61505) & 65535); f16((8 - 61761) & 65535); f16(1); f16(0); f16(0); f16(0);
+    h = crafted();
+    h.cmap.len = fab_n;
+    sfnt.cmap.select(&h);
+    check("symbol: only below 256", sfnt.cmap.glyph(&h, 61761) == 8 && sfnt.cmap.glyph(&h, 321) == 0
+          && sfnt.cmap.glyph(&h, 65) == 5);
+
+    current = "names by hand";
+    // UTF-8 at each length's edges.
+    let is [12]u8 as w;
+    w[0] = 0; w[1] = 128; w[2] = 7; w[3] = 255; w[4] = 8; w[5] = 0; w[6] = 219; w[7] = 255; w[8] = 223; w[9] = 253;
+    name_begin(1);
+    name_add(3, 1, 1033, 1, cast(*u8, &w), 10);
+    h = crafted();
+    h.name.len = fab_n;
+    check("UTF-8 at its edges", name_is(&h, "\xC2\x80\xDF\xBF\xE0\xA0\x80\xF4\x8F\xBF\xBD"));
+    // Room for the 2-byte character but not its NUL: it is left out.
+    check("no room for the NUL", sfnt.name.get(&h, 1, cast(*u8, &got), 4) == 2 && got[2] == 0);
+    // A record past the table, and a string past it.
+    name_begin(2);
+    name_add(1, 0, 0, 1, "Mac", 3);
+    name_add(3, 1, 1033, 1, cast(*u8, &utf16), wide("US"));
+    h = crafted();
+    h.name.len = fab_n;
+    check("two records", name_is(&h, "US"));
+    h.name.len = 6 + 12 + 4;
+    check("records overrunning the table: none", sfnt.name.get(&h, 1, cast(*u8, &got), 64) == 0 - 1);
+    h.name.len = fab_n - 1;
+    check("a string overrunning the table: not read", sfnt.name.get(&h, 1, cast(*u8, &got), 64) == 0 - 1);
+
+    current = "kerning by hand";
+    // Five subtables: the first's length overflowed, as in big fonts, so its
+    // pair count finds the next; a format 2 one whose bytes look like pairs;
+    // and the last, which the table's length may leave out.
+    fab_n = 0;
+    f16(0); f16(5);
+    f16(0); f16(6); f16(1); f16(2); f16(12); f16(1); f16(0); f16(1); f16(2); f16(65486); f16(3); f16(4); f16(20);
+    f16(0); f16(20); f16(1); f16(1); f16(6); f16(0); f16(0); f16(1); f16(2); f16(65531);
+    f16(0); f16(20); f16(513); f16(1); f16(6); f16(0); f16(0); f16(1); f16(2); f16(300);
+    let is i64 as fourth = fab_n;
+    f16(0); f16(26); f16(1); f16(2); f16(12); f16(1); f16(0); f16(5); f16(6); f16(4); f16(7); f16(8); f16(99);
+    let is i64 as fifth = fab_n;
+    f16(0); f16(20); f16(1); f16(1); f16(6); f16(0); f16(0); f16(1); f16(2); f16(77);
+    h = crafted();
+    h.kern.len = fab_n;
+    check("by pair count, not length", sfnt.kern.pair(&h, 3, 4) == 20 && sfnt.kern.pair(&h, 5, 6) == 4);
+    check("format 2 is not pairs", sfnt.kern.pair(&h, 1, 2) == 0 - 55 + 77);
+    h.kern.len = fifth;
+    check("a subtable past the table: not read", sfnt.kern.pair(&h, 1, 2) == 0 - 55);
+    // Even one that would override everything before it.
+    put16(fifth + 4, 9);
+    check("an override past the table: not read either", sfnt.kern.pair(&h, 1, 2) == 0 - 55);
+    // The fourth claiming a third pair, which lies past the table.
+    put16(fourth + 6, 3);
+    check("pairs past the table: the subtable is not read", sfnt.kern.pair(&h, 5, 6) == 0 && sfnt.kern.pair(&h, 7, 8) == 0);
+}
+
+fn main() as i32 {
+    readers();
+    directories();
+    choosing();
+    font("text/testdata/cmaps.ttf", "text/testdata/cmaps.ttf.sfnt.ref");
+    font("text/testdata/glyf.ttf", "text/testdata/glyf.ttf.sfnt.ref");
+    font("text/testdata/cff.otf", "text/testdata/cff.otf.sfnt.ref");
+    font("text/testdata/cff2.otf", "text/testdata/cff2.otf.sfnt.ref");
+    font("text/testdata/vf.ttf", "text/testdata/vf.ttf.sfnt.ref");
+    font("text/testdata/kern.ttf", "text/testdata/kern.ttf.sfnt.ref");
+    font("text/testdata/cid.otf", "text/testdata/cid.otf.sfnt.ref");
+    font("text/testdata/pair.ttc", "text/testdata/pair.ttc.sfnt.ref");
+    malformed();
+    by_hand();
+
+    if (fails > 0) {
+        io.printf("sfnt: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("sfnt: all checks passed\n");
+    return 0;
+}
