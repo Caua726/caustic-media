@@ -15,7 +15,13 @@
 #                              only catch after a much slower build.
 #   MANIFEST not in EXPORTED   fail. The contract promises something this
 #                              machine's libX11 cannot provide, so the link
-#                              test cannot pass.
+#                              test cannot pass. Except where the manifest
+#                              names the release that introduced the symbol
+#                              and the library has none of that release:
+#                              then it is an older library, not a broken
+#                              contract, and the symbols are skipped — their
+#                              link test is a separate binary that runs only
+#                              where they exist.
 #   EXPORTED not in MANIFEST   warn. CI runs Ubuntu's libX11 and a developer may
 #                              run Arch's; the two legitimately differ. The
 #                              manifest is the contract, not the machine.
@@ -45,7 +51,11 @@ grep -h '^extern "' bind/*.cst 2>/dev/null \
   | sed -n 's/^extern "\([^"]*\)" fn \([A-Za-z_][A-Za-z0-9_]*\).*/\1 \2/p' \
   | sort -u > "$TMP/declared"
 
-grep -v '^#' "$MANIFEST" | grep -v '^[[:space:]]*$' | sort -u > "$TMP/manifest"
+# A manifest line is `<soname> <name> [<since>]`. The sets compare the first two
+# fields; the third is kept apart for the release check below.
+grep -v '^#' "$MANIFEST" | grep -v '^[[:space:]]*$' > "$TMP/manifest_raw"
+awk '{print $1, $2}' "$TMP/manifest_raw" | sort -u > "$TMP/manifest"
+awk 'NF >= 3 {print $1, $2, $3}' "$TMP/manifest_raw" | sort -u > "$TMP/since"
 
 : > "$TMP/exported"
 for so in $(awk '{print $1}' "$TMP/manifest" | sort -u); do
@@ -73,6 +83,25 @@ if [ -s "$TMP/undeclared" ]; then
 fi
 
 comm -23 "$TMP/manifest" "$TMP/exported" > "$TMP/missing"
+
+# Symbols newer than this machine's library. Grouped by soname and release,
+# because a release lands whole: if every symbol of the group is missing the
+# library predates it, and the group is skipped. If only some are, one of the
+# names is wrong, and it stays in `missing` to fail like any other.
+: > "$TMP/skipped"
+awk '{print $1, $3}' "$TMP/since" | sort -u | while read -r so ver; do
+    awk -v s="$so" -v v="$ver" '$1==s && $3==v {print $1, $2}' "$TMP/since" \
+      | sort > "$TMP/group"
+    if [ -z "$(comm -12 "$TMP/group" "$TMP/exported")" ]; then
+        sed "s/\$/ $ver/" "$TMP/group" >> "$TMP/skipped"
+    fi
+done
+if [ -s "$TMP/skipped" ]; then
+    awk '{print $1, $2}' "$TMP/skipped" | sort > "$TMP/skipped_names"
+    comm -23 "$TMP/missing" "$TMP/skipped_names" > "$TMP/missing_left"
+    mv "$TMP/missing_left" "$TMP/missing"
+fi
+
 if [ -s "$TMP/missing" ]; then
     echo "FAIL  no manifesto mas ausente das .so desta maquina:"
     sed 's/^/        /' "$TMP/missing"
@@ -103,7 +132,14 @@ if ls ./*_link_test.cst >/dev/null 2>&1; then
     fi
 fi
 
-# --- The warning ---
+# --- The warnings ---
+
+if [ -s "$TMP/skipped" ]; then
+    awk '{print $1, $3}' "$TMP/skipped" | sort -u | while read -r so ver; do
+        echo "aviso $so desta maquina e anterior a $ver — pulados:"
+        awk -v s="$so" -v v="$ver" '$1==s && $3==v {print "        " $2}' "$TMP/skipped"
+    done
+fi
 
 comm -13 "$TMP/manifest" "$TMP/exported" > "$TMP/extra"
 if [ -s "$TMP/extra" ]; then
