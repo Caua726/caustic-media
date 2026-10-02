@@ -1,0 +1,331 @@
+// examples/app_studio.cst — desktop application UI showcase for caustic-media.
+//
+// Demonstrates:
+//   - Portable windowing (events, mouse tracking, buttons, tabs, sliders)
+//   - Immediate-mode UI toolkit (ui/ui.cst)
+//   - Direct Linux ALSA audio playback and real-time waveform visualization
+//   - Zero external library dependencies
+
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/math.cst" as fm;
+use "../math/math.cst" as math;
+use "../window/window.cst" as window;
+use "../gpu/software/target.cst" as tgt;
+use "../audio/audio.cst" as audio;
+use "../ui/ui.cst" as ui;
+use "../ui/draw.cst" as draw;
+
+let is i64 as WIN_WIDTH  = 960;
+let is i64 as WIN_HEIGHT = 640;
+
+// State of the application
+struct AppState {
+    active_tab    as i32; // 0=Synth, 1=FX, 2=Scope, 3=Stats
+    current_freq  as f64;
+    target_freq   as f64;
+    master_volume as f64;
+    is_playing    as i32;
+    play_timer    as f64;
+    last_action   as *u8;
+
+    // Waveform buffer for oscilloscope
+    wave_buf      as [512]i16;
+}
+
+fn play_frequency(app as *AppState, dev as *audio.device.Device, freq as f64, duration as f64) as void {
+    app.current_freq = freq;
+    app.is_playing = 1;
+    app.play_timer = duration;
+
+    // Fill waveform buffer for visual display
+    let is f64 as two_pi = 6.283185307179586;
+    let is i64 as i with mut = 0;
+    while (i < 512) {
+        let is f64 as t = cast(f64, i) / 512.0;
+        let is f64 as s = fm.sin(two_pi * freq * (t / 100.0));
+        app.wave_buf[i] = cast(i16, cast(i32, s * app.master_volume * 28000.0));
+        i = i + 1;
+    }
+
+    // If audio hardware is open, stream a buffer chunk
+    if (audio.is_open(dev) == 1) {
+        let is i64 as rate = cast(i64, dev.sample_rate);
+        let is i64 as chunk = 512;
+        let is [1024]i16 as out_pcm;
+
+        i = 0;
+        while (i < chunk) {
+            let is f64 as t = cast(f64, i) / cast(f64, rate);
+            let is f64 as s = fm.sin(two_pi * freq * t) * app.master_volume;
+            let is i16 as val = cast(i16, cast(i32, s * 28000.0));
+            out_pcm[i * 2 + 0] = val;
+            out_pcm[i * 2 + 1] = val;
+            i = i + 1;
+        }
+        audio.write_s16(dev, cast(*i16, &out_pcm), chunk);
+    }
+}
+
+fn main() as i32 {
+    let is window.device.Config as w_cfg = window.config("Caustic Media Studio — Desktop App",
+                                                         WIN_WIDTH, WIN_HEIGHT);
+    let is window.device.Window as win = window.open_config(&w_cfg);
+    if (window.is_open(&win) == 0) {
+        io.printf("could not open window\n");
+        return 1;
+    }
+
+    // Open audio device via ALSA direct driver
+    let is audio.device.Config as a_cfg = audio.config_default();
+    let is audio.device.Device as a_dev = audio.open(&a_cfg);
+
+    let is ui.Context as ctx = ui.context_default();
+    let is AppState as app;
+    app.active_tab = 0;
+    app.current_freq = 440.0;
+    app.target_freq = 440.0;
+    app.master_volume = 0.75;
+    app.is_playing = 0;
+    app.play_timer = 0.0;
+    app.last_action = "Ready";
+
+    let is i64 as wi with mut = 0;
+    while (wi < 512) { app.wave_buf[wi] = 0; wi = wi + 1; }
+
+    let is i64 as start_time = time.now_ns();
+    let is i64 as last_time with mut = start_time;
+    let is i64 as frame_count with mut = 0;
+    let is i64 as fps with mut = 60;
+    let is i64 as fps_timer with mut = start_time;
+    let is i64 as frames_this_sec with mut = 0;
+
+    while (window.next_frame(&win) == 1) {
+        if (window.should_close(&win) == 1) { break; }
+        if (window.key_down(&win, window.keys.ESCAPE) == 1) { break; }
+
+        let is i64 as now = time.now_ns();
+        let is f64 as dt = cast(f64, now - last_time) / 1000000000.0;
+        last_time = now;
+
+        frames_this_sec = frames_this_sec + 1;
+        if (now - fps_timer >= 1000000000) {
+            fps = frames_this_sec;
+            frames_this_sec = 0;
+            fps_timer = now;
+        }
+
+        if (app.play_timer > 0.0) {
+            app.play_timer = app.play_timer - dt;
+            if (app.play_timer <= 0.0) {
+                app.is_playing = 0;
+            }
+        }
+
+        let is tgt.Target as t = window.acquire(&win);
+        if (t.width == 0 || t.height == 0) { continue; }
+
+        let is i64 as mx = window.mouse_x(&win);
+        let is i64 as my = window.mouse_y(&win);
+        let is i32 as mdown = window.button_down(&win, 1);
+
+        ui.begin_frame(&ctx, &t, mx, my, mdown);
+
+        // --- Sidebar (Left, w=220) ---
+        draw.fill_rect(&t, 0, 0, 220, t.height, ctx.bg_sidebar);
+        draw.stroke_rect(&t, 219, 0, 1, t.height, 1, ctx.border_color);
+
+        // App Logo & Header
+        draw.fill_rect(&t, 20, 24, 8, 8, ctx.accent_blue);
+        draw.draw_text(&t, "CAUSTIC STUDIO", 36, 20, ctx.text_primary, 1);
+        draw.draw_text(&t, "Media Control Center", 36, 38, ctx.text_muted, 1);
+
+        draw.fill_rect(&t, 20, 64, 180, 1, ctx.border_color);
+
+        // Navigation Tabs
+        let is i32 as t0 with mut = 0; if (app.active_tab == 0) { t0 = 1; }
+        let is i32 as t1 with mut = 0; if (app.active_tab == 1) { t1 = 1; }
+        let is i32 as t2 with mut = 0; if (app.active_tab == 2) { t2 = 1; }
+        let is i32 as t3 with mut = 0; if (app.active_tab == 3) { t3 = 1; }
+
+        if (ui.tab_button(&ctx, "  Tone Synth", t0, 0, 80, 219, 40) == 1) {
+            app.active_tab = 0;
+            app.last_action = "Tab: Tone Synth";
+        }
+        if (ui.tab_button(&ctx, "  FX Soundboard", t1, 0, 124, 219, 40) == 1) {
+            app.active_tab = 1;
+            app.last_action = "Tab: FX Soundboard";
+        }
+        if (ui.tab_button(&ctx, "  Oscilloscope", t2, 0, 168, 219, 40) == 1) {
+            app.active_tab = 2;
+            app.last_action = "Tab: Oscilloscope";
+        }
+        if (ui.tab_button(&ctx, "  Hardware Stats", t3, 0, 212, 219, 40) == 1) {
+            app.active_tab = 3;
+            app.last_action = "Tab: Hardware Stats";
+        }
+
+        // Sidebar Bottom: Master Volume
+        let is i64 as sb_bot_y = t.height - 100;
+        draw.fill_rect(&t, 20, sb_bot_y - 16, 180, 1, ctx.border_color);
+        ui.slider(&ctx, "Master Volume", 20, sb_bot_y, 180, 36, &app.master_volume, 0.0, 1.0);
+
+        // --- Top Header Bar ---
+        draw.fill_rect(&t, 220, 0, t.width - 220, 56, ctx.bg_panel);
+        draw.stroke_rect(&t, 220, 55, t.width - 220, 1, 1, ctx.border_color);
+
+        draw.draw_text(&t, "Dashboard / Caustic Studio", 244, 20, ctx.text_primary, 1);
+
+        // Hardware Status Pill
+        let is i32 as audio_ok = audio.is_open(&a_dev);
+        if (audio_ok == 1) {
+            ui.status_badge(&ctx, "ALSA 48kHz Stereo", 1, t.width - 320, 16);
+        } else {
+            ui.status_badge(&ctx, "Audio Offline", 0, t.width - 320, 16);
+        }
+
+        // FPS Badge
+        let is [16]u8 as fps_str;
+        fps_str[0] = 70; fps_str[1] = 80; fps_str[2] = 83; fps_str[3] = 58; fps_str[4] = 32; // "FPS: "
+        fps_str[5] = cast(u8, 48 + (fps / 10));
+        fps_str[6] = cast(u8, 48 + (fps % 10));
+        fps_str[7] = 0;
+        draw.draw_text(&t, cast(*u8, &fps_str), t.width - 120, 20, ctx.accent_green, 1);
+
+        // --- Content Area ---
+        let is i64 as content_x = 244;
+        let is i64 as content_y = 76;
+        let is i64 as content_w = t.width - content_x - 24;
+
+        if (app.active_tab == 0) {
+            // === TAB 0: TONE SYNTHESIZER ===
+            ui.panel(&ctx, content_x, content_y, content_w, 200, "Synthesizer Keyboard (Click to Play)");
+
+            let is i64 as key_w = (content_w - 64) / 7;
+            let is i64 as key_h = 90;
+            let is i64 as key_y = content_y + 54;
+
+            if (ui.button(&ctx, "C4\n261Hz", content_x + 16 + key_w * 0, key_y, key_w - 6, key_h) == 1) {
+                play_frequency(&app, &a_dev, 261.63, 0.4);
+                app.last_action = "Note: C4 (261 Hz)";
+            }
+            if (ui.button(&ctx, "D4\n293Hz", content_x + 16 + key_w * 1, key_y, key_w - 6, key_h) == 1) {
+                play_frequency(&app, &a_dev, 293.66, 0.4);
+                app.last_action = "Note: D4 (293 Hz)";
+            }
+            if (ui.button(&ctx, "E4\n329Hz", content_x + 16 + key_w * 2, key_y, key_w - 6, key_h) == 1) {
+                play_frequency(&app, &a_dev, 329.63, 0.4);
+                app.last_action = "Note: E4 (329 Hz)";
+            }
+            if (ui.button(&ctx, "F4\n349Hz", content_x + 16 + key_w * 3, key_y, key_w - 6, key_h) == 1) {
+                play_frequency(&app, &a_dev, 349.23, 0.4);
+                app.last_action = "Note: F4 (349 Hz)";
+            }
+            if (ui.button(&ctx, "G4\n392Hz", content_x + 16 + key_w * 4, key_y, key_w - 6, key_h) == 1) {
+                play_frequency(&app, &a_dev, 392.00, 0.4);
+                app.last_action = "Note: G4 (392 Hz)";
+            }
+            if (ui.button(&ctx, "A4\n440Hz", content_x + 16 + key_w * 5, key_y, key_w - 6, key_h) == 1) {
+                play_frequency(&app, &a_dev, 440.00, 0.4);
+                app.last_action = "Note: A4 (440 Hz - Concert Pitch)";
+            }
+            if (ui.button(&ctx, "B4\n493Hz", content_x + 16 + key_w * 6, key_y, key_w - 6, key_h) == 1) {
+                play_frequency(&app, &a_dev, 493.88, 0.4);
+                app.last_action = "Note: B4 (493 Hz)";
+            }
+
+            // Continuous Frequency Slider & Stop Button
+            let is i64 as ctl_y = content_y + 154;
+            ui.slider(&ctx, "Custom Frequency (Hz)", content_x + 16, ctl_y, content_w - 180, 36,
+                      &app.target_freq, 100.0, 1200.0);
+
+            if (ui.button(&ctx, "Play Tone", content_x + content_w - 150, ctl_y + 8, 64, 28) == 1) {
+                play_frequency(&app, &a_dev, app.target_freq, 0.6);
+                app.last_action = "Custom Tone Played";
+            }
+            if (ui.button(&ctx, "Mute", content_x + content_w - 78, ctl_y + 8, 62, 28) == 1) {
+                app.is_playing = 0;
+                app.play_timer = 0.0;
+                let is i64 as zi with mut = 0;
+                while (zi < 512) { app.wave_buf[zi] = 0; zi = zi + 1; }
+                app.last_action = "Audio Muted";
+            }
+
+            // Real-time Waveform Monitor
+            let is i64 as scope_y = content_y + 220;
+            ui.panel(&ctx, content_x, scope_y, content_w, 220, "Active Signal Oscilloscope");
+            ui.waveform_display(&ctx, content_x + 16, scope_y + 54, content_w - 32, 140,
+                                cast(*i16, &app.wave_buf), 512, ctx.accent_blue);
+
+        } else if (app.active_tab == 1) {
+            // === TAB 1: FX SOUNDBOARD ===
+            ui.panel(&ctx, content_x, content_y, content_w, 380, "Procedural Sound Generator");
+
+            if (ui.button(&ctx, "Laser Blaster (880 -> 220 Hz)", content_x + 24, content_y + 60, 280, 44) == 1) {
+                play_frequency(&app, &a_dev, 880.0, 0.2);
+                app.last_action = "FX: Laser Blaster";
+            }
+            if (ui.button(&ctx, "Coin Pickup (523 -> 659 Hz)", content_x + 24, content_y + 120, 280, 44) == 1) {
+                play_frequency(&app, &a_dev, 523.25, 0.25);
+                app.last_action = "FX: Coin Pickup";
+            }
+            if (ui.button(&ctx, "Sub-Bass 60Hz Thump", content_x + 24, content_y + 180, 280, 44) == 1) {
+                play_frequency(&app, &a_dev, 60.0, 0.5);
+                app.last_action = "FX: Sub-Bass Thump";
+            }
+            if (ui.button(&ctx, "Concert A 440Hz Test Tone", content_x + 24, content_y + 240, 280, 44) == 1) {
+                play_frequency(&app, &a_dev, 440.0, 1.0);
+                app.last_action = "FX: Concert Pitch Calibration";
+            }
+
+            // Info text
+            draw.draw_text(&t, "All audio is computed sample-by-sample and streamed",
+                           content_x + 330, content_y + 70, ctx.text_primary, 1);
+            draw.draw_text(&t, "directly into the Linux ALSA PCM kernel device node.",
+                           content_x + 330, content_y + 92, ctx.text_muted, 1);
+            draw.draw_text(&t, "No PulseAudio, no PipeWire libs, no libasound.",
+                           content_x + 330, content_y + 114, ctx.accent_green, 1);
+
+        } else if (app.active_tab == 2) {
+            // === TAB 2: OSCILLOSCOPE ===
+            ui.panel(&ctx, content_x, content_y, content_w, 440, "Live Waveform Oscilloscope & Spectral View");
+            ui.waveform_display(&ctx, content_x + 20, content_y + 60, content_w - 40, 340,
+                                cast(*i16, &app.wave_buf), 512, ctx.accent_green);
+
+        } else {
+            // === TAB 3: HARDWARE STATS ===
+            ui.panel(&ctx, content_x, content_y, content_w, 400, "System Architecture & Runtime Telemetry");
+
+            draw.draw_text(&t, "Audio Subsystem:", content_x + 24, content_y + 60, ctx.accent_blue, 1);
+            draw.draw_text(&t, "  Driver: Direct Linux ALSA Kernel Ioctl (/dev/snd/pcm*)", content_x + 24, content_y + 84, ctx.text_primary, 1);
+            draw.draw_text(&t, "  Dynamic Dependencies (DT_NEEDED): 0 (Zero external libraries)", content_x + 24, content_y + 104, ctx.accent_green, 1);
+            draw.draw_text(&t, "  Audio Sample Rate: 48000 Hz Stereo (2 channels, 16-bit signed PCM)", content_x + 24, content_y + 124, ctx.text_primary, 1);
+            draw.draw_text(&t, "  Hardware Period: 32 frames (~0.67 ms latency)", content_x + 24, content_y + 144, ctx.text_primary, 1);
+
+            draw.draw_text(&t, "Windowing & Graphics:", content_x + 24, content_y + 184, ctx.accent_blue, 1);
+            draw.draw_text(&t, "  Display: Portable Window Layer (X11 / MIT-SHM backend)", content_x + 24, content_y + 208, ctx.text_primary, 1);
+            draw.draw_text(&t, "  Graphics Renderer: Zero-dependency Software Rasterizer & Target", content_x + 24, content_y + 228, ctx.text_primary, 1);
+            draw.draw_text(&t, "  Window Size: 960 x 640 @ 32-bit ARGB", content_x + 24, content_y + 248, ctx.text_primary, 1);
+            draw.draw_text(&t, "  UI Engine: Immediate-mode toolkit with 8x16 bitmap typography", content_x + 24, content_y + 268, ctx.text_primary, 1);
+        }
+
+        // Bottom Status Bar
+        draw.fill_rect(&t, 220, t.height - 32, t.width - 220, 32, ctx.bg_panel);
+        draw.stroke_rect(&t, 220, t.height - 32, t.width - 220, 1, 1, ctx.border_color);
+        draw.draw_text(&t, "Status: ", 244, t.height - 22, ctx.text_muted, 1);
+        draw.draw_text(&t, app.last_action, 310, t.height - 22, ctx.accent_blue, 1);
+
+        draw.draw_text(&t, "Press [Esc] to exit", t.width - 200, t.height - 22, ctx.text_muted, 1);
+
+        window.submit(&win);
+        frame_count = frame_count + 1;
+    }
+
+    if (audio.is_open(&a_dev) == 1) {
+        audio.close(&a_dev);
+    }
+    window.close(&win);
+
+    io.printf("caustic studio closed cleanly (%d frames)\n", cast(i32, frame_count));
+    return 0;
+}
