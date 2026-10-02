@@ -330,7 +330,10 @@ height for width, a pass that skips what did not change, and box, grid, stack
 and overlay. No container has a fixed ceiling on children: they work in a
 scratch area that is part of the tree's mapping, sized from its capacity, and a
 grid too sparse to fit says so with `LAYOUT_TOO_LARGE` instead of dropping
-cells. The tests were checked against deliberate breakages — each rule
+cells. Edges land on physical pixels: `layout.set_scale` gives the window's
+scale, and every rectangle's edges — not its size — are rounded to that grid
+relative to a parent already on it, so 100 split three ways at scale 1 is 33,
+34 and 33 edge to edge, and at 1.5 is 50 physical pixels each (`snap_test`). The tests were checked against deliberate breakages — each rule
 removed in turn — and catch every one.
 
 **Events** (`event.cst`, `router.cst`, `timer.cst`, tested by `router_test`,
