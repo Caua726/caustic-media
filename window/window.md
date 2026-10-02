@@ -27,9 +27,11 @@ window/
   event.cst       raw platform events and the queue they arrive in
   cursor.cst      shape, visibility, capture
   clipboard.cst   text and data
+  settings.cst    the desktop's settings: dark, accent, fonts, timings
   native.cst      native handle accessors — the public contract
 
   x11/      done — 8 modules over bind/, see x11/x11.md
+  linux/    what every Linux backend shares: GTK's settings.ini, the portal
   wayland/  protocol.cst  + backend.cst      see wayland/wayland.md
   kms/      drm.cst       + backend.cst      see kms/kms.md
   win32/    user32.cst gdi32.cst + backend.cst   see win32/win32.md
@@ -368,6 +370,30 @@ of their functions. Every module is its own object file, so it took one module
 that large to hit it. `x11/all_link_test.cst` links all seven X libraries —
 1161 imports — and `check_needed.sh` asserts every soname is recorded.
 
+**The desktop's settings** (`settings.cst`) are one record — dark, high
+contrast, the accent, the interface and monospace fonts, text scaling,
+animations, double-click time and distance, the drag threshold, the caret's
+blink, the cursor theme, the title bar's buttons — filled by whatever the
+platform has, each source marking what it reported so they merge field by
+field in order of trust:
+
+- `linux/gtk_ini.cst`: GTK's `settings.ini` files, gtk-3.0's then gtk-4.0's
+  (`settings_test`);
+- `x11/xsettings.cst`: XSETTINGS, followed through the daemon starting,
+  changing its property and quitting, with every length checked against a
+  guard page (`xsettings_test`, `settings_x11_test` under Xvfb);
+- `linux/portal.cst`: org.freedesktop.portal.Settings over D-Bus (`../dbus/`),
+  GNOME's and KDE's keys under the cross-desktop org.freedesktop.appearance,
+  tested against a fake portal on a private bus (`portal_test`) and read from
+  this desktop's own by `linux/portal_check.cst`.
+
+`window.read_settings` gives the files and XSETTINGS, and starts watching:
+from then on a change arrives as a `SETTINGS` event in the window's queue —
+the pump hands every event to the watcher first, since the daemon's window and
+the root belong to no window here. The portal needs a D-Bus connection, so it
+is read by whoever holds one (the toolkit). The Windows registry comes with
+the Win32 backend, whose WM_SETTINGCHANGE is a window message.
+
 ---
 
 ## Order of work, from here
@@ -380,5 +406,6 @@ that large to hit it. `x11/all_link_test.cst` links all seven X libraries —
 3. **The C header generator.** `bind/` was written by hand; the layout table and
    the symbol manifest are already the shape a generator would consume, and DRM
    and Win32 would come out of the same tool.
-4. **The Wayland XML generator**, plus the `sendmsg`/`memfd` syscalls.
+4. **The Wayland XML generator.** The `sendmsg`/`memfd` syscalls it needs are in
+   `../sys/linux.cst`, written for D-Bus.
 5. **Win32**, through the same header generator, verified under wine.

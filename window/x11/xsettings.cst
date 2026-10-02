@@ -1,0 +1,229 @@
+// window/x11/xsettings.cst — XSETTINGS: the desktop's settings, on X11.
+//
+// A settings daemon — gsd-xsettings under GNOME, xsettingsd, xfsettingsd —
+// owns the selection _XSETTINGS_S<screen> with a window of its own, and keeps
+// every setting in one property of that window, _XSETTINGS_SETTINGS. Reading
+// is one GetProperty; a change is a PropertyNotify on that window, which this
+// client asks for. A daemon that starts later announces itself with a MANAGER
+// message on the root window, and one that quits destroys its window — both
+// are watched, so a program follows the desktop through either.
+//
+// The property's format, from the XSETTINGS specification: a byte order, a
+// serial, a count, then for each setting its type (integer, string, colour),
+// its name, the serial it last changed in, and its value, everything padded
+// to 4. Read here with every length checked against the property's size.
+use "bind/xlib.cst" as xlib;
+use "bind/x.cst" as x;
+use "bind/xevent.cst" as xev;
+use "../settings.cst" as settings;
+
+struct Watch {
+    display   as *u8;
+    root      as i64;
+    selection as i64;   // _XSETTINGS_S<screen>
+    property  as i64;   // _XSETTINGS_SETTINGS
+    manager   as i64;   // MANAGER
+    owner     as i64;   // the daemon's window; 0 while none runs
+}
+
+fn _at(b as *u8, i as i64) as i64 { return cast(i64, *cast(*u8, cast(i64, b) + i)) & 255; }
+
+fn _card16(b as *u8, i as i64, big as i32) as i64 {
+    if (big == 1) { return (_at(b, i) << 8) | _at(b, i + 1); }
+    return _at(b, i) | (_at(b, i + 1) << 8);
+}
+
+fn _card32(b as *u8, i as i64, big as i32) as i64 {
+    if (big == 1) { return (_at(b, i) << 24) | (_at(b, i + 1) << 16) | (_at(b, i + 2) << 8) | _at(b, i + 3); }
+    return _at(b, i) | (_at(b, i + 1) << 8) | (_at(b, i + 2) << 16) | (_at(b, i + 3) << 24);
+}
+
+fn _int32(b as *u8, i as i64, big as i32) as i64 {
+    let is i64 as v = _card32(b, i, big);
+    if (v >= 2147483648) { return v - 4294967296; }
+    return v;
+}
+
+fn _pad4(n as i64) as i64 { return (n + 3) / 4 * 4; }
+
+fn _is(b as *u8, at as i64, n as i64, name as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (_at(name, i) != _at(b, at + i)) { return 0; }
+        i = i + 1;
+    }
+    if (_at(name, n) == 0) { return 1; }
+    return 0;
+}
+
+fn _ptr(b as *u8, i as i64) as *u8 { return cast(*u8, cast(i64, b) + i); }
+
+fn _int_setting(s as *settings.Settings, b as *u8, at as i64, n as i64, v as i64) as void {
+    if (_is(b, at, n, "Xft/DPI") == 1) {
+        if (v > 0) { s.dpi = cast(f64, v) / 1024.0; s.known = s.known | settings.K_DPI; }
+    } else if (_is(b, at, n, "Net/DoubleClickTime") == 1) {
+        if (v > 0) { s.double_click_ms = v; s.known = s.known | settings.K_DOUBLE_CLICK_MS; }
+    } else if (_is(b, at, n, "Net/DoubleClickDistance") == 1) {
+        if (v >= 0) { s.double_click_px = v; s.known = s.known | settings.K_DOUBLE_CLICK_PX; }
+    } else if (_is(b, at, n, "Net/CursorBlink") == 1) {
+        s.blink = 0;
+        if (v != 0) { s.blink = 1; }
+        s.known = s.known | settings.K_BLINK;
+    } else if (_is(b, at, n, "Net/CursorBlinkTime") == 1) {
+        if (v > 0) { s.blink_ms = v; s.known = s.known | settings.K_BLINK_MS; }
+    } else if (_is(b, at, n, "Net/DndDragThreshold") == 1) {
+        if (v > 0) { s.drag_px = v; s.known = s.known | settings.K_DRAG; }
+    } else if (_is(b, at, n, "Gtk/CursorThemeSize") == 1) {
+        if (v > 0) { s.cursor_size = v; s.known = s.known | settings.K_CURSOR_SIZE; }
+    } else if (_is(b, at, n, "Gtk/EnableAnimations") == 1) {
+        s.animations = 0;
+        if (v != 0) { s.animations = 1; }
+        s.known = s.known | settings.K_ANIMATIONS;
+    }
+}
+
+fn _string_setting(s as *settings.Settings, b as *u8, at as i64, n as i64, v as *u8, vn as i64) as void {
+    if (_is(b, at, n, "Net/ThemeName") == 1) { settings.theme_name(s, v, vn); }
+    else if (_is(b, at, n, "Gtk/FontName") == 1) { settings.set_font(s, v, vn, 0); }
+    else if (_is(b, at, n, "Gtk/MonospaceFontName") == 1) { settings.set_font(s, v, vn, 1); }
+    else if (_is(b, at, n, "Gtk/CursorThemeName") == 1) {
+        settings.set_text(cast(*u8, &s.cursor_theme), 64, v, vn);
+        s.known = s.known | settings.K_CURSOR_THEME;
+    } else if (_is(b, at, n, "Gtk/DecorationLayout") == 1) {
+        settings.set_text(cast(*u8, &s.button_layout), 96, v, vn);
+        s.known = s.known | settings.K_BUTTON_LAYOUT;
+    }
+}
+
+// The settings in the n bytes of an _XSETTINGS_SETTINGS property, into s. The
+// property's serial, or -1 when it is not one — in which case s holds what
+// was read before the fault.
+fn parse(b as *u8, n as i64, s as *settings.Settings) as i64 {
+    if (n < 12) { return 0 - 1; }
+    let is i32 as big with mut = 0;
+    if (_at(b, 0) == 1) { big = 1; }
+    else if (_at(b, 0) != 0) { return 0 - 1; }
+    let is i64 as serial = _card32(b, 4, big);
+    let is i64 as count = _card32(b, 8, big);
+    let is i64 as i with mut = 12;
+    let is i64 as k with mut = 0;
+    while (k < count) {
+        if (i + 4 > n) { return 0 - 1; }
+        let is i64 as kind = _at(b, i);
+        let is i64 as nlen = _card16(b, i + 2, big);
+        let is i64 as name = i + 4;
+        // The name, then the last-change serial. Each kind checks its value
+        // ends inside the property before reading it, or the name.
+        i = name + _pad4(nlen) + 4;
+        if (kind == 0) {
+            if (i + 4 > n) { return 0 - 1; }
+            _int_setting(s, b, name, nlen, _int32(b, i, big));
+            i = i + 4;
+        } else if (kind == 1) {
+            if (i + 4 > n) { return 0 - 1; }
+            let is i64 as vlen = _card32(b, i, big);
+            if (i + 4 + _pad4(vlen) > n) { return 0 - 1; }
+            _string_setting(s, b, name, nlen, _ptr(b, i + 4), vlen);
+            i = i + 4 + _pad4(vlen);
+        } else if (kind == 2) {
+            if (i + 8 > n) { return 0 - 1; }
+            i = i + 8;   // no colour setting is read here
+        } else {
+            return 0 - 1;
+        }
+        k = k + 1;
+    }
+    return serial;
+}
+
+// --- From the server ---
+
+fn _select_owner(w as *Watch) as void {
+    w.owner = xlib.XGetSelectionOwner(w.display, w.selection);
+    if (w.owner != 0) {
+        // Its property changing, and its window going away.
+        xlib.XSelectInput(w.display, w.owner, x.PropertyChangeMask | x.StructureNotifyMask);
+    }
+}
+
+// Starts watching screen's settings on display. 1 when a daemon is running
+// now; either way, one that starts later is noticed.
+fn watch(w as *Watch, display as *u8, screen as i32) as i32 {
+    w.display = display;
+    w.root = xlib.XRootWindow(display, screen);
+    let is [24]u8 as name;
+    let is *u8 as base = "_XSETTINGS_S";
+    let is i64 as i with mut = 0;
+    while (i < 12) { name[i] = *cast(*u8, cast(i64, base) + i); i = i + 1; }
+    // The screen number in decimal.
+    let is [8]u8 as dec;
+    let is i64 as sn with mut = cast(i64, screen);
+    let is i64 as nd with mut = 0;
+    if (sn == 0) { dec[0] = 48; nd = 1; }
+    while (sn > 0) { dec[nd] = cast(u8, 48 + sn % 10); sn = sn / 10; nd = nd + 1; }
+    while (nd > 0) { nd = nd - 1; name[i] = dec[nd]; i = i + 1; }
+    name[i] = 0;
+    w.selection = xlib.XInternAtom(display, cast(*u8, &name), 0);
+    w.property = xlib.XInternAtom(display, "_XSETTINGS_SETTINGS", 0);
+    w.manager = xlib.XInternAtom(display, "MANAGER", 0);
+    // MANAGER arrives on the root with StructureNotifyMask; added to whatever
+    // this client already asked of the root, never replacing it.
+    let is xlib.XWindowAttributes as wa;
+    xlib.XGetWindowAttributes(display, w.root, cast(*u8, &wa));
+    xlib.XSelectInput(display, w.root, wa.your_event_mask | x.StructureNotifyMask);
+    _select_owner(w);
+    if (w.owner != 0) { return 1; }
+    return 0;
+}
+
+// The daemon's settings into s. 1 when there was a daemon and its property
+// read whole.
+fn read(w as *Watch, s as *settings.Settings) as i32 {
+    if (w.owner == 0) { return 0; }
+    let is i64 as kind with mut = 0;
+    let is i32 as format with mut = 0;
+    let is i64 as nitems with mut = 0;
+    let is i64 as after with mut = 0;
+    let is *u8 as data with mut = cast(*u8, 0);
+    // Asked for its own type: a property of another is returned empty, its
+    // whole length left in after.
+    xlib.XGetWindowProperty(w.display, w.owner, w.property, 0, 65536, 0, w.property,
+                            cast(*u8, &kind), cast(*u8, &format), cast(*u8, &nitems),
+                            cast(*u8, &after), cast(*u8, &data));
+    // No such property comes back with format 0 and data null, which XFree
+    // takes.
+    let is i32 as ok with mut = 0;
+    if (format == 8 && after == 0) {
+        if (parse(data, nitems, s) >= 0) { ok = 1; }
+    }
+    xlib.XFree(data);
+    return ok;
+}
+
+// Whether e says the settings changed: the property, a daemon starting, or
+// one quitting. Events that are not about XSETTINGS answer 0, so a pump can
+// offer it every event.
+fn handle(w as *Watch, e as *xev.XEvent) as i32 {
+    let is i32 as k = xev.kind(e);
+    if (k == x.PropertyNotify) {
+        let is *xev.XPropertyEvent as p = xev.property(e);
+        if (w.owner != 0 && p.window == w.owner && p.atom == w.property) { return 1; }
+        return 0;
+    }
+    if (k == x.DestroyNotify) {
+        if (w.owner != 0 && xev.destroy_window(e).window == w.owner) {
+            // Gone; another may already have taken its place.
+            _select_owner(w);
+            return 1;
+        }
+        return 0;
+    }
+    if (k == x.ClientMessage) {
+        let is *xev.XClientMessageEvent as c = xev.client(e);
+        if (c.window == w.root && c.message_type == w.manager && c.data[1] == w.selection) {
+            _select_owner(w);
+            return 1;
+        }
+    }
+    return 0;
+}

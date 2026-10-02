@@ -1,0 +1,160 @@
+// window/settings_x11_test.cst — the desktop's settings through the portable
+// window: read_settings, and a SETTINGS event when XSETTINGS changes.
+//
+// Needs an X server, and GTK's files from window/testdata rather than this
+// machine's:
+//   XDG_CONFIG_HOME=window/testdata/xdg sh window/x11/tools/run_headless.sh ./build/settings_x11_test
+// The settings daemon is played on a second connection, as in xsettings_test.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "window.cst" as window;
+use "event.cst" as event;
+use "settings.cst" as settings;
+use "x11/bind/xlib.cst" as xlib;
+use "x11/bind/x.cst" as x;
+use "x11/bind/xevent.cst" as xev;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is [512]u8 as prop with mut;
+let is i64 as plen with mut = 0;
+let is i64 as pcount with mut = 0;
+
+fn b8(v as i64) as void { prop[plen] = cast(u8, v & 255); plen = plen + 1; }
+fn b16(v as i64) as void { b8(v); b8(v >> 8); }
+fn b32(v as i64) as void { b8(v); b8(v >> 8); b8(v >> 16); b8(v >> 24); }
+fn pad() as void { while ((plen % 4) != 0) { b8(0); } }
+fn len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (*cast(*u8, cast(i64, s) + n) != 0) { n = n + 1; }
+    return n;
+}
+fn text(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < len(s)) { b8(cast(i64, *cast(*u8, cast(i64, s) + i))); i = i + 1; }
+}
+fn head(kind as i64, name as *u8) as void {
+    b8(kind); b8(0); b16(len(name)); text(name); pad(); b32(1);
+    pcount = pcount + 1;
+}
+
+// A property: the theme, the font, the DPI in 1024ths.
+fn build(serial as i64, theme as *u8, font as *u8, dpi as i64) as void {
+    plen = 0;
+    pcount = 0;
+    b8(0); b8(0); b8(0); b8(0);
+    b32(serial);
+    b32(0);
+    head(1, "Net/ThemeName"); b32(len(theme)); text(theme); pad();
+    head(1, "Gtk/FontName"); b32(len(font)); text(font); pad();
+    head(0, "Xft/DPI"); b32(dpi);
+    let is i64 as keep = plen;
+    plen = 8;
+    b32(pcount);
+    plen = keep;
+}
+
+// Frames until a SETTINGS event comes, or a few dozen pass. How many came.
+fn settings_events(w as *window.device.Window) as i64 {
+    let is i64 as got with mut = 0;
+    let is i64 as frames with mut = 0;
+    while (frames < 30 && got == 0) {
+        window.next_frame(w);
+        let is event.Event as e;
+        while (window.poll_event(w, &e) == 1) {
+            if (e.kind == event.SETTINGS) { got = got + 1; }
+        }
+        frames = frames + 1;
+    }
+    return got;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is window.device.Window as w with mut = window.open("settings", 64, 64);
+    if (window.is_open(&w) == 0) {
+        io.printf("settings x11: no X server — run under window/x11/tools/run_headless.sh\n");
+        return 1;
+    }
+    let is settings.Settings as s with mut = settings.defaults();
+    s.text_scale = 7.0;   // whatever was in out before is not kept
+    let is i32 as before = window.read_settings(&w, &s);
+    check("the test's file, and no daemon", before == 1);
+    check("the file's values", s.cursor_size == 40 && s.double_click_ms == 333 && s.font_size == 10.0);
+    check("from the defaults up, not over what was there", s.text_scale == 1.0);
+
+    // A daemon starts.
+    let is *u8 as dd = xlib.XOpenDisplay(cast(*u8, 0));
+    let is i64 as root = xlib.XDefaultRootWindow(dd);
+    let is i64 as sel = xlib.XInternAtom(dd, "_XSETTINGS_S0", 0);
+    let is i64 as patom = xlib.XInternAtom(dd, "_XSETTINGS_SETTINGS", 0);
+    let is i64 as dwin = xlib.XCreateSimpleWindow(dd, root, 0, 0, 1, 1, 0, 0, 0);
+    build(1, "Adwaita-dark", "Inter 10", 147456);
+    xlib.XChangeProperty(dd, dwin, patom, patom, 8, x.PropModeReplace, cast(*u8, &prop), cast(i32, plen));
+    xlib.XSetSelectionOwner(dd, sel, dwin, 0);
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    let is *xev.XClientMessageEvent as cm = xev.client(&m);
+    cm.kind = x.ClientMessage;
+    cm.window = root;
+    cm.message_type = xlib.XInternAtom(dd, "MANAGER", 0);
+    cm.format = 32;
+    cm.data[1] = sel;
+    cm.data[2] = dwin;
+    xlib.XSendEvent(dd, root, 0, x.StructureNotifyMask, cast(*u8, &m));
+    xlib.XSync(dd, 0);
+    check("a SETTINGS event when the daemon starts", settings_events(&w) == 1);
+    check("read through the window", window.read_settings(&w, &s) == before + 1);
+    check("its values over the file's", s.dark == 1 && s.dpi == 144.0 && s.font_size == 10.0
+          && mem.memcmp(cast(*u8, &s.font), "Inter", 6) == 0);
+    check("and the file's where it says nothing", s.cursor_size == 40 && s.double_click_ms == 333);
+
+    // It changes them.
+    build(2, "Adwaita", "Cantarell 11", 98304);
+    xlib.XChangeProperty(dd, dwin, patom, patom, 8, x.PropModeReplace, cast(*u8, &prop), cast(i32, plen));
+    xlib.XSync(dd, 0);
+    check("a SETTINGS event when they change", settings_events(&w) == 1);
+    window.read_settings(&w, &s);
+    check("the new values", s.dpi == 96.0 && s.font_size == 11.0 && mem.memcmp(cast(*u8, &s.font), "Cantarell", 10) == 0);
+
+    // Nothing changing, nothing said.
+    check("no change, no event", settings_events(&w) == 0);
+
+    xlib.XDestroyWindow(dd, dwin);
+    xlib.XSync(dd, 0);
+    check("its going is a change too", settings_events(&w) == 1);
+    window.close(&w);
+    check("a closed window: the files only", window.read_settings(&w, &s) == 1 && s.cursor_size == 40);
+
+    // A window opened later, on a connection of its own, watches afresh.
+    let is i64 as dwin2 = xlib.XCreateSimpleWindow(dd, root, 0, 0, 1, 1, 0, 0, 0);
+    build(3, "Adwaita-dark", "Inter 9", 98304);
+    xlib.XChangeProperty(dd, dwin2, patom, patom, 8, x.PropModeReplace, cast(*u8, &prop), cast(i32, plen));
+    xlib.XSetSelectionOwner(dd, sel, dwin2, 0);
+    xlib.XSync(dd, 0);
+    let is window.device.Window as w2 with mut = window.open("again", 64, 64);
+    let is settings.Settings as s2 with mut = settings.defaults();
+    check("read on a new connection", window.read_settings(&w2, &s2) >= 1 && s2.font_size == 9.0);
+    build(4, "Adwaita", "Inter 8", 98304);
+    xlib.XChangeProperty(dd, dwin2, patom, patom, 8, x.PropModeReplace, cast(*u8, &prop), cast(i32, plen));
+    xlib.XSync(dd, 0);
+    check("and followed there", settings_events(&w2) == 1);
+    window.read_settings(&w2, &s2);
+    check("its new values", s2.font_size == 8.0);
+    window.close(&w2);
+    xlib.XCloseDisplay(dd);
+    if (fails > 0) {
+        io.printf("settings x11: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("settings x11: all checks passed\n");
+    return 0;
+}

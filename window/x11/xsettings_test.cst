@@ -1,0 +1,328 @@
+// window/x11/xsettings_test.cst — XSETTINGS: the property's format, and a
+// daemon's settings followed as it starts, changes them and quits.
+//
+// Needs an X server: sh window/x11/tools/run_headless.sh ./build/xsettings_test.
+// The "daemon" is this test on a second connection, doing what gsd-xsettings
+// and xsettingsd do: own _XSETTINGS_S0, keep the settings in a property, say
+// MANAGER on the root.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "bind/xlib.cst" as xlib;
+use "bind/x.cst" as x;
+use "bind/xevent.cst" as xev;
+use "xsettings.cst" as xsettings;
+use "../settings.cst" as settings;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (*cast(*u8, cast(i64, s) + n) != 0) { n = n + 1; }
+    return n;
+}
+
+fn eq(a as *u8, b as *u8) as i32 {
+    let is i64 as n = len(b);
+    if (len(a) != n || mem.memcmp(a, b, n) != 0) { return 0; }
+    return 1;
+}
+
+// --- Writing a property, in either byte order ---
+
+let is [2048]u8 as prop with mut;
+let is i64 as plen with mut = 0;
+let is i32 as pbig with mut = 0;
+let is i64 as pcount with mut = 0;
+
+fn b8(v as i64) as void { prop[plen] = cast(u8, v & 255); plen = plen + 1; }
+fn b16(v as i64) as void {
+    if (pbig == 1) { b8(v >> 8); b8(v); } else { b8(v); b8(v >> 8); }
+}
+fn b32(v as i64) as void {
+    if (pbig == 1) { b8(v >> 24); b8(v >> 16); b8(v >> 8); b8(v); }
+    else { b8(v); b8(v >> 8); b8(v >> 16); b8(v >> 24); }
+}
+fn pad() as void { while ((plen % 4) != 0) { b8(0); } }
+fn text(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (*cast(*u8, cast(i64, s) + i) != 0) { b8(cast(i64, *cast(*u8, cast(i64, s) + i))); i = i + 1; }
+}
+
+fn begin(big as i32, serial as i64) as void {
+    plen = 0;
+    pbig = big;
+    pcount = 0;
+    b8(cast(i64, big)); b8(0); b8(0); b8(0);
+    b32(serial);
+    b32(0);   // the count, filled in by finish
+}
+
+fn head(kind as i64, name as *u8) as void {
+    b8(kind); b8(0);
+    b16(len(name));
+    text(name);
+    pad();
+    b32(7);   // the serial it last changed in
+    pcount = pcount + 1;
+}
+
+fn int_setting(name as *u8, v as i64) as void { head(0, name); b32(v); }
+fn string_setting(name as *u8, v as *u8) as void { head(1, name); b32(len(v)); text(v); pad(); }
+fn color_setting(name as *u8) as void { head(2, name); b16(65535); b16(0); b16(0); b16(65535); }
+
+fn finish() as void {
+    let is i64 as keep = plen;
+    plen = 8;
+    b32(pcount);
+    plen = keep;
+}
+
+fn full_property(big as i32, serial as i64, theme as *u8, font as *u8) as void {
+    begin(big, serial);
+    string_setting("Net/ThemeName", theme);
+    color_setting("Gtk/ColorPalette");   // a colour, skipped
+    string_setting("Gtk/FontName", font);
+    string_setting("Gtk/MonospaceFontName", "Hack 9");
+    int_setting("Xft/DPI", 147456);   // 144 dpi, in 1024ths
+    int_setting("Net/DoubleClickTime", 250);
+    int_setting("Net/DoubleClickDistance", 8);
+    int_setting("Net/DndDragThreshold", 11);
+    int_setting("Xft", 999999);   // a prefix of a name, not the name
+    string_setting("Net/ThemeNameX", "Adwaita-dark");
+    int_setting("Net/CursorBlink", 0);
+    int_setting("Net/CursorBlinkTime", 1000);
+    string_setting("Gtk/CursorThemeName", "Adwaita");
+    int_setting("Gtk/CursorThemeSize", 48);
+    int_setting("Gtk/EnableAnimations", 0);
+    string_setting("Gtk/DecorationLayout", "close,minimize:");
+    string_setting("Net/IconThemeName", "Adwaita");   // not one read here
+    finish();
+}
+
+// Two pages, the second unreadable: the property is copied to end exactly at
+// the boundary, so a parser reading one byte past it faults instead of
+// reading whatever came next.
+let is *u8 as guard with mut = cast(*u8, 0);
+
+fn parsed(s as *settings.Settings) as i64 {
+    *s = settings.defaults();
+    if (cast(i64, guard) == 0) {
+        guard = linux.mmap(cast(*u8, 0), 8192, 3, 34, 0 - 1, 0);   // PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS
+        linux.mprotect(cast(*u8, cast(i64, guard) + 4096), 4096, 0);
+    }
+    let is *u8 as at = cast(*u8, cast(i64, guard) + 4096 - plen);
+    mem.memcpy(at, cast(*u8, &prop), plen);
+    return xsettings.parse(at, plen, s);
+}
+
+// Every event the client's connection has, offered to the watch; how many it
+// said changed something.
+fn pump(d as *u8, w as *xsettings.Watch) as i64 {
+    xlib.XSync(d, 0);
+    let is xev.XEvent as e;
+    let is i64 as changed with mut = 0;
+    while (xlib.XPending(d) > 0) {
+        xlib.XNextEvent(d, cast(*u8, &e));
+        changed = changed + cast(i64, xsettings.handle(w, &e));
+    }
+    return changed;
+}
+
+fn main() as i32 {
+    // --- The format ---
+    let is settings.Settings as s with mut = settings.defaults();
+    full_property(0, 3, "Adwaita-dark", "Cantarell 11");
+    check("parsed, its serial", parsed(&s) == 3);
+    check("the theme says dark", s.dark == 1);
+    full_property(0, 3, "Adwaita", "Cantarell 11");
+    parsed(&s);
+    check("only the name itself: not one that starts with it, nor one it starts", s.dark == 0 && s.dpi == 144.0);
+    check("the fonts", eq(cast(*u8, &s.font), "Cantarell") == 1 && s.font_size == 11.0
+          && eq(cast(*u8, &s.mono), "Hack") == 1 && s.mono_size == 9.0);
+    check("the DPI", s.dpi == 144.0);
+    check("double click", s.double_click_ms == 250 && s.double_click_px == 8);
+    check("the drag threshold", s.drag_px == 11);
+    check("the caret", s.blink == 0 && s.blink_ms == 1000);
+    check("the cursor", eq(cast(*u8, &s.cursor_theme), "Adwaita") == 1 && s.cursor_size == 48);
+    check("animations", s.animations == 0);
+    check("the buttons", eq(cast(*u8, &s.button_layout), "close,minimize:") == 1);
+    full_property(1, 4, "HighContrast", "Noto Sans 12");
+    check("big-endian", parsed(&s) == 4 && s.high_contrast == 1 && s.font_size == 12.0 && s.dpi == 144.0
+          && s.double_click_ms == 250);
+    begin(0, 1);
+    int_setting("Net/CursorBlink", 5);
+    int_setting("Gtk/EnableAnimations", 1);
+    int_setting("Xft/DPI", 0 - 1);
+    int_setting("Net/DoubleClickTime", 0);
+    finish();
+    check("non-zero is on; -1 and 0 are not values", parsed(&s) == 1 && s.blink == 1 && s.animations == 1
+          && s.dpi == 96.0 && s.double_click_ms == 400 && (s.known & (settings.K_DPI | settings.K_DOUBLE_CLICK_MS)) == 0);
+    begin(0, 2);
+    finish();
+    check("no settings", parsed(&s) == 2 && s.known == 0);
+    plen = 11;
+    check("shorter than its header", parsed(&s) == 0 - 1);
+    begin(0, 2);
+    head(9, "X");
+    finish();
+    check("a type there is not, last", parsed(&s) == 0 - 1);
+    begin(0, 2);
+    pcount = 1;
+    finish();
+    b8(0); b8(0);
+    check("a setting's header cut short", parsed(&s) == 0 - 1);
+    // What is refused.
+    full_property(0, 3, "Adwaita", "Cantarell 11");
+    let is i64 as whole = plen;
+    plen = whole - 1;
+    check("cut short", parsed(&s) == 0 - 1);
+    plen = whole;
+    prop[0] = 2;
+    check("no such byte order", parsed(&s) == 0 - 1);
+    prop[0] = 0;
+    prop[12] = 9;
+    check("no such type", parsed(&s) == 0 - 1);
+    prop[12] = 1;
+    // A string whose length runs past the end.
+    begin(0, 1);
+    head(1, "Net/ThemeName");
+    b32(4000);
+    text("abcd");
+    finish();
+    check("a string past the end", parsed(&s) == 0 - 1);
+    begin(0, 1);
+    head(1, "Net/ThemeName");
+    b32(4294967295);
+    finish();
+    check("a length that wraps", parsed(&s) == 0 - 1);
+    begin(0, 1);
+    b8(0); b8(0); b16(1000); text("Xft");
+    pcount = 1;
+    finish();
+    check("a name past the end", parsed(&s) == 0 - 1);
+    begin(0, 1);
+    head(0, "Xft/DPI");
+    finish();
+    check("an integer past the end", parsed(&s) == 0 - 1);
+    begin(0, 1);
+    head(2, "Gtk/Color");
+    b16(1);
+    finish();
+    check("a colour past the end", parsed(&s) == 0 - 1);
+    begin(0, 1);
+    head(1, "Net/ThemeName");
+    finish();
+    check("a string's length past the end", parsed(&s) == 0 - 1);
+    begin(0, 1);
+    b8(0);
+    finish();
+    plen = 13;
+    prop[8] = 1;
+    check("a setting cut in its header", parsed(&s) == 0 - 1);
+
+    // --- A daemon, live ---
+    let is *u8 as dd = xlib.XOpenDisplay(cast(*u8, 0));   // the daemon's connection
+    let is *u8 as cd = xlib.XOpenDisplay(cast(*u8, 0));   // the client's
+    if (cast(i64, dd) == 0 || cast(i64, cd) == 0) {
+        io.printf("xsettings: no X server — run under tools/run_headless.sh\n");
+        return 1;
+    }
+    let is i64 as root = xlib.XDefaultRootWindow(dd);
+    let is i64 as sel = xlib.XInternAtom(dd, "_XSETTINGS_S0", 0);
+    let is i64 as patom = xlib.XInternAtom(dd, "_XSETTINGS_SETTINGS", 0);
+    let is i64 as manager = xlib.XInternAtom(dd, "MANAGER", 0);
+
+    // The client starts first: no daemon yet.
+    let is xsettings.Watch as w with mut;
+    xlib.XSelectInput(cd, xlib.XDefaultRootWindow(cd), x.PropertyChangeMask);
+    check("no daemon yet", xsettings.watch(&w, cd, 0) == 0);
+    let is settings.Settings as got with mut = settings.defaults();
+    check("nothing to read", xsettings.read(&w, &got) == 0);
+
+    // The daemon starts: owns the selection, sets the property, says MANAGER.
+    let is i64 as dwin = xlib.XCreateSimpleWindow(dd, root, 0, 0, 1, 1, 0, 0, 0);
+    full_property(0, 1, "Adwaita", "Cantarell 11");
+    xlib.XChangeProperty(dd, dwin, patom, patom, 8, x.PropModeReplace, cast(*u8, &prop), cast(i32, plen));
+    xlib.XSetSelectionOwner(dd, sel, dwin, 0);
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    let is *xev.XClientMessageEvent as cm = xev.client(&m);
+    cm.kind = x.ClientMessage;
+    cm.window = root;
+    cm.message_type = manager;
+    cm.format = 32;
+    cm.data[0] = 0;
+    cm.data[1] = sel;
+    cm.data[2] = dwin;
+    xlib.XSendEvent(dd, root, 0, x.StructureNotifyMask, cast(*u8, &m));
+    xlib.XSync(dd, 0);
+    check("the daemon announced itself", pump(cd, &w) >= 1 && w.owner == dwin);
+    check("its settings", xsettings.read(&w, &got) == 1 && eq(cast(*u8, &got.font), "Cantarell") == 1 && got.dark == 0);
+
+    // It changes them.
+    full_property(0, 2, "Adwaita-dark", "Inter 10");
+    xlib.XChangeProperty(dd, dwin, patom, patom, 8, x.PropModeReplace, cast(*u8, &prop), cast(i32, plen));
+    xlib.XSync(dd, 0);
+    check("a change is noticed", pump(cd, &w) == 1);
+    got = settings.defaults();
+    check("and read", xsettings.read(&w, &got) == 1 && got.dark == 1 && eq(cast(*u8, &got.font), "Inter") == 1);
+
+    // Another property of its window is not a change.
+    let is i64 as other = xlib.XInternAtom(dd, "SOMETHING_ELSE", 0);
+    xlib.XChangeProperty(dd, dwin, other, other, 8, x.PropModeReplace, "x", 1);
+    xlib.XSync(dd, 0);
+    check("another property is not", pump(cd, &w) == 0);
+
+    // A property that is not in the format.
+    xlib.XChangeProperty(dd, dwin, patom, patom, 8, x.PropModeReplace, "nonsense", 8);
+    xlib.XSync(dd, 0);
+    pump(cd, &w);
+    check("a broken property is not read", xsettings.read(&w, &got) == 0);
+    xlib.XChangeProperty(dd, dwin, patom, other, 8, x.PropModeReplace, cast(*u8, &prop), cast(i32, plen));
+    xlib.XSync(dd, 0);
+    pump(cd, &w);
+    check("nor one of another type", xsettings.read(&w, &got) == 0);
+
+    // A second client, starting while the daemon runs, finds it at once.
+    let is *u8 as cd2 = xlib.XOpenDisplay(cast(*u8, 0));
+    let is xsettings.Watch as w2 with mut;
+    check("a daemon already running", xsettings.watch(&w2, cd2, 0) == 1 && w2.owner == dwin);
+    xlib.XCloseDisplay(cd2);
+
+    // The daemon quits.
+    xlib.XDestroyWindow(dd, dwin);
+    xlib.XSync(dd, 0);
+    check("its going is noticed", pump(cd, &w) == 1 && w.owner == 0);
+    check("nothing to read after", xsettings.read(&w, &got) == 0);
+
+    // A MANAGER for another selection is not ours.
+    let is i64 as dwin2 = xlib.XCreateSimpleWindow(dd, root, 0, 0, 1, 1, 0, 0, 0);
+    cm.data[1] = xlib.XInternAtom(dd, "_NET_SYSTEM_TRAY_S0", 0);
+    cm.data[2] = dwin2;
+    xlib.XSendEvent(dd, root, 0, x.StructureNotifyMask, cast(*u8, &m));
+    xlib.XSync(dd, 0);
+    check("another manager is not", pump(cd, &w) == 0 && w.owner == 0);
+
+    // The root's other events, as this client asked for them, still come.
+    let is xlib.XWindowAttributes as wa;
+    xlib.XGetWindowAttributes(cd, xlib.XDefaultRootWindow(cd), cast(*u8, &wa));
+    check("the root's mask kept, and added to", (wa.your_event_mask & x.StructureNotifyMask) != 0
+          && (wa.your_event_mask & x.PropertyChangeMask) != 0);
+
+    xlib.XCloseDisplay(cd);
+    xlib.XCloseDisplay(dd);
+    if (fails > 0) {
+        io.printf("xsettings: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("xsettings: all checks passed\n");
+    return 0;
+}

@@ -1,0 +1,308 @@
+// window/linux/portal.cst — the desktop's settings from the XDG settings
+// portal, org.freedesktop.portal.Settings, over D-Bus.
+//
+// Every modern Linux desktop answers here, under X11 and Wayland alike: GNOME,
+// KDE, and the others through xdg-desktop-portal-gtk or -gnome. ReadAll hands
+// back every key of the namespaces asked for, and a SettingChanged signal
+// says one changed.
+//
+// What is read, by trust, lowest first — each tier merged over the one below:
+//
+//   1. a GTK theme's name ("Adwaita-dark"), the oldest way to say dark;
+//   2. the desktops' own keys: GNOME's org.gnome.desktop.* (the interface and
+//      monospace fonts, text scaling, animations, the caret, the cursor,
+//      double-click time, the drag threshold, the title bar's buttons, high
+//      contrast) and KDE's kdeglobals (fonts, animation speed, double-click,
+//      drag distance);
+//   3. org.freedesktop.appearance, the cross-desktop standard: colour scheme,
+//      accent colour, contrast, reduced motion.
+//
+// A value of a type other than the one expected is skipped, not misread. A
+// change is only noted — a signal handler may not make the blocking call a
+// read is — and the program reads again.
+use "../../dbus/dbus.cst" as dbus;
+use "../settings.cst" as settings;
+
+let is *u8 as DESKTOP with imut = "org.freedesktop.portal.Desktop";
+let is *u8 as PATH    with imut = "/org/freedesktop/portal/desktop";
+let is *u8 as IFACE   with imut = "org.freedesktop.portal.Settings";
+
+struct _Tiers {
+    legacy     as settings.Settings;
+    desktop    as settings.Settings;
+    appearance as settings.Settings;
+    reduce     as i32;   // GNOME's a11y said reduce motion
+    _pad0      as i32;
+}
+
+fn _named(s as *u8, t as *u8) as i32 { return dbus.message.named(s, t); }
+
+fn _prefix(s as *u8, p as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (*cast(*u8, cast(i64, p) + i) != 0) {
+        if (*cast(*u8, cast(i64, s) + i) != *cast(*u8, cast(i64, p) + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The value, when its type is the one expected; otherwise skipped, and 0. A
+// variant's signature is zero-terminated in the message, so it compares whole.
+fn _sig(r as *dbus.wire.Reader, sig as *u8, n as i64, want as *u8) as i32 {
+    if (dbus.message.named(sig, want) == 1) { return 1; }
+    dbus.wire.skip(r, sig, n);
+    return 0;
+}
+
+// Qt's font form, which KDE keeps: "Noto Sans,10,-1,5,50,0,0,0,0,0" — the
+// family, then the size in points.
+fn _qt_font(s as *settings.Settings, v as *u8, n as i64, mono as i32) as void {
+    let is i64 as c with mut = 0;
+    while (c < n && *cast(*u8, cast(i64, v) + c) != 44) { c = c + 1; }
+    if (c == 0) { return; }
+    let is f64 as size with mut = 0.0;
+    let is i64 as i with mut = c + 1;
+    let is f64 as scale with mut = 0.0;
+    while (i < n && *cast(*u8, cast(i64, v) + i) != 44) {
+        let is u8 as ch = *cast(*u8, cast(i64, v) + i);
+        if (ch == 46) { scale = 1.0; }
+        else if (ch >= 48 && ch <= 57) {
+            let is f64 as d = cast(f64, cast(i64, ch) - 48);
+            if (scale > 0.0) { scale = scale / 10.0; size = size + d * scale; } else { size = size * 10.0 + d; }
+        }
+        i = i + 1;
+    }
+    if (mono == 1) {
+        settings.set_text(cast(*u8, &s.mono), 128, v, c);
+        s.mono_size = size;
+        s.known = s.known | settings.K_MONO;
+    } else {
+        settings.set_text(cast(*u8, &s.font), 128, v, c);
+        s.font_size = size;
+        s.known = s.known | settings.K_FONT;
+    }
+}
+
+fn _appearance(t as *_Tiers, key as *u8, r as *dbus.wire.Reader, sig as *u8, n as i64) as void {
+    let is *settings.Settings as s = &t.appearance;
+    if (_named(key, "color-scheme") == 1) {
+        if (_sig(r, sig, n, "u") == 0) { return; }
+        let is i64 as v = dbus.wire.get_u32(r);
+        // 0 is no preference, and says nothing.
+        if (v == 1) { s.dark = 1; s.known = s.known | settings.K_DARK; }
+        if (v == 2) { s.dark = 0; s.known = s.known | settings.K_DARK; }
+    } else if (_named(key, "contrast") == 1) {
+        if (_sig(r, sig, n, "u") == 0) { return; }
+        s.high_contrast = 0;
+        if (dbus.wire.get_u32(r) == 1) { s.high_contrast = 1; }
+        s.known = s.known | settings.K_HIGH_CONTRAST;
+    } else if (_named(key, "reduced-motion") == 1) {
+        if (_sig(r, sig, n, "u") == 0) { return; }
+        if (dbus.wire.get_u32(r) == 1) { s.animations = 0; s.known = s.known | settings.K_ANIMATIONS; }
+    } else if (_named(key, "accent-color") == 1) {
+        if (_sig(r, sig, n, "(ddd)") == 0) { return; }
+        dbus.wire.get_struct(r);
+        let is f64 as cr = dbus.wire.get_double(r);
+        let is f64 as cg = dbus.wire.get_double(r);
+        let is f64 as cb = dbus.wire.get_double(r);
+        // Outside 0..1 is "no accent".
+        if (cr >= 0.0 && cr <= 1.0 && cg >= 0.0 && cg <= 1.0 && cb >= 0.0 && cb <= 1.0) {
+            s.accent_r = cr;
+            s.accent_g = cg;
+            s.accent_b = cb;
+            s.known = s.known | settings.K_ACCENT;
+        }
+    } else {
+        dbus.wire.skip(r, sig, n);
+    }
+}
+
+fn _int(r as *dbus.wire.Reader, sig as *u8, n as i64) as i64 {
+    if (_sig(r, sig, n, "i") == 0) { return 0 - 1; }
+    return dbus.wire.get_i32(r);
+}
+
+fn _bool(r as *dbus.wire.Reader, sig as *u8, n as i64) as i32 {
+    if (_sig(r, sig, n, "b") == 0) { return 0 - 1; }
+    return dbus.wire.get_bool(r);
+}
+
+fn _string(r as *dbus.wire.Reader, sig as *u8, n as i64, len as *i64) as *u8 {
+    *len = 0;
+    if (_sig(r, sig, n, "s") == 0) { return cast(*u8, 0); }
+    return dbus.wire.get_string(r, len);
+}
+
+fn _gnome(t as *_Tiers, ns as *u8, key as *u8, r as *dbus.wire.Reader, sig as *u8, n as i64) as void {
+    let is *settings.Settings as s = &t.desktop;
+    let is i64 as len with mut = 0;
+    if (_named(ns, "org.gnome.desktop.interface") == 1) {
+        if (_named(key, "color-scheme") == 1) {
+            let is *u8 as v = _string(r, sig, n, &len);
+            if (_named(v, "prefer-dark") == 1) { s.dark = 1; s.known = s.known | settings.K_DARK; }
+            if (_named(v, "prefer-light") == 1) { s.dark = 0; s.known = s.known | settings.K_DARK; }
+        } else if (_named(key, "gtk-theme") == 1) {
+            let is *u8 as v = _string(r, sig, n, &len);
+            if (len > 0) { settings.theme_name(&t.legacy, v, len); }
+        } else if (_named(key, "font-name") == 1) {
+            let is *u8 as v = _string(r, sig, n, &len);
+            if (len > 0) { settings.set_font(s, v, len, 0); }
+        } else if (_named(key, "monospace-font-name") == 1) {
+            let is *u8 as v = _string(r, sig, n, &len);
+            if (len > 0) { settings.set_font(s, v, len, 1); }
+        } else if (_named(key, "text-scaling-factor") == 1) {
+            if (_sig(r, sig, n, "d") == 0) { return; }
+            let is f64 as k = dbus.wire.get_double(r);
+            if (k > 0.0) { s.text_scale = k; s.known = s.known | settings.K_TEXT_SCALE; }
+        } else if (_named(key, "enable-animations") == 1) {
+            let is i32 as b = _bool(r, sig, n);
+            if (b >= 0) { s.animations = b; s.known = s.known | settings.K_ANIMATIONS; }
+        } else if (_named(key, "cursor-blink") == 1) {
+            let is i32 as b = _bool(r, sig, n);
+            if (b >= 0) { s.blink = b; s.known = s.known | settings.K_BLINK; }
+        } else if (_named(key, "cursor-blink-time") == 1) {
+            let is i64 as v = _int(r, sig, n);
+            if (v > 0) { s.blink_ms = v; s.known = s.known | settings.K_BLINK_MS; }
+        } else if (_named(key, "cursor-theme") == 1) {
+            let is *u8 as v = _string(r, sig, n, &len);
+            if (len > 0) { settings.set_text(cast(*u8, &s.cursor_theme), 64, v, len); s.known = s.known | settings.K_CURSOR_THEME; }
+        } else if (_named(key, "cursor-size") == 1) {
+            let is i64 as v = _int(r, sig, n);
+            if (v > 0) { s.cursor_size = v; s.known = s.known | settings.K_CURSOR_SIZE; }
+        } else {
+            dbus.wire.skip(r, sig, n);
+        }
+    } else if (_named(ns, "org.gnome.desktop.a11y.interface") == 1) {
+        if (_named(key, "high-contrast") == 1) {
+            let is i32 as b = _bool(r, sig, n);
+            if (b >= 0) { s.high_contrast = b; s.known = s.known | settings.K_HIGH_CONTRAST; }
+        } else if (_named(key, "reduced-motion") == 1) {
+            let is *u8 as v = _string(r, sig, n, &len);
+            if (_named(v, "reduce") == 1) { t.reduce = 1; }
+        } else {
+            dbus.wire.skip(r, sig, n);
+        }
+    } else if (_named(ns, "org.gnome.desktop.peripherals.mouse") == 1) {
+        if (_named(key, "double-click") == 1) {
+            let is i64 as v = _int(r, sig, n);
+            if (v > 0) { s.double_click_ms = v; s.known = s.known | settings.K_DOUBLE_CLICK_MS; }
+        } else if (_named(key, "drag-threshold") == 1) {
+            let is i64 as v = _int(r, sig, n);
+            if (v > 0) { s.drag_px = v; s.known = s.known | settings.K_DRAG; }
+        } else {
+            dbus.wire.skip(r, sig, n);
+        }
+    } else if (_named(ns, "org.gnome.desktop.wm.preferences") == 1 && _named(key, "button-layout") == 1) {
+        let is *u8 as v = _string(r, sig, n, &len);
+        if (len > 0) { settings.set_text(cast(*u8, &s.button_layout), 96, v, len); s.known = s.known | settings.K_BUTTON_LAYOUT; }
+    } else {
+        dbus.wire.skip(r, sig, n);
+    }
+}
+
+fn _kde(t as *_Tiers, ns as *u8, key as *u8, r as *dbus.wire.Reader, sig as *u8, n as i64) as void {
+    let is *settings.Settings as s = &t.desktop;
+    let is i64 as len with mut = 0;
+    if (_named(ns, "org.kde.kdeglobals.General") == 1 && (_named(key, "font") == 1 || _named(key, "fixed") == 1)) {
+        let is i32 as mono with mut = 0;
+        if (_named(key, "fixed") == 1) { mono = 1; }
+        let is *u8 as v = _string(r, sig, n, &len);
+        if (len > 0) { _qt_font(s, v, len, mono); }
+    } else if (_named(ns, "org.kde.kdeglobals.KDE") == 1 && _named(key, "AnimationDurationFactor") == 1) {
+        if (_sig(r, sig, n, "d") == 0) { return; }
+        s.animations = 1;
+        if (dbus.wire.get_double(r) <= 0.0) { s.animations = 0; }
+        s.known = s.known | settings.K_ANIMATIONS;
+    } else if (_named(ns, "org.kde.kdeglobals.KDE") == 1 && _named(key, "DoubleClickInterval") == 1) {
+        let is i64 as v = _int(r, sig, n);
+        if (v > 0) { s.double_click_ms = v; s.known = s.known | settings.K_DOUBLE_CLICK_MS; }
+    } else if (_named(ns, "org.kde.kdeglobals.KDE") == 1 && _named(key, "StartDragDist") == 1) {
+        let is i64 as v = _int(r, sig, n);
+        if (v > 0) { s.drag_px = v; s.known = s.known | settings.K_DRAG; }
+    } else {
+        dbus.wire.skip(r, sig, n);
+    }
+}
+
+fn _one(t as *_Tiers, ns as *u8, key as *u8, r as *dbus.wire.Reader, sig as *u8, n as i64) as void {
+    if (_named(ns, "org.freedesktop.appearance") == 1) { _appearance(t, key, r, sig, n); return; }
+    if (_prefix(ns, "org.kde.") == 1) { _kde(t, ns, key, r, sig, n); return; }
+    _gnome(t, ns, key, r, sig, n);
+}
+
+// The answer to ReadAll, a{sa{sv}}, merged into out. 1 when it read whole.
+fn parse_all(m as *dbus.message.Message, out as *settings.Settings) as i32 {
+    if (dbus.message.named(m.signature, "a{sa{sv}}") == 0) { return 0; }
+    let is _Tiers as t;
+    t.legacy = settings.defaults();
+    t.desktop = settings.defaults();
+    t.appearance = settings.defaults();
+    t.reduce = 0;
+    t._pad0 = 0;
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as n with mut = 0;
+    let is i64 as end = dbus.wire.get_array(&r, 8);
+    while (r.err == 0 && r.pos < end) {
+        dbus.wire.get_struct(&r);
+        let is *u8 as ns = dbus.wire.get_string(&r, &n);
+        let is i64 as inner = dbus.wire.get_array(&r, 8);
+        while (r.err == 0 && r.pos < inner) {
+            dbus.wire.get_struct(&r);
+            let is *u8 as key = dbus.wire.get_string(&r, &n);
+            let is *u8 as sig = dbus.wire.get_variant(&r, &n);
+            if (r.err == 0) { _one(&t, ns, key, &r, sig, n); }
+        }
+    }
+    if (r.err != 0) { return 0; }
+    // GNOME's accessibility setting outranks its animations switch.
+    if (t.reduce == 1) {
+        t.desktop.animations = 0;
+        t.desktop.known = t.desktop.known | settings.K_ANIMATIONS;
+    }
+    settings.merge(out, &t.legacy);
+    settings.merge(out, &t.desktop);
+    settings.merge(out, &t.appearance);
+    return 1;
+}
+
+let is [7]*u8 as _spaces with mut;
+
+// Reads every setting from the portal at dest — DESKTOP, or a test's — into
+// out. 1 when it answered; 0 when there is no portal, or it said no.
+fn read(c as *dbus.conn.Conn, dest as *u8, out as *settings.Settings) as i32 {
+    _spaces[0] = "org.freedesktop.appearance";
+    _spaces[1] = "org.gnome.desktop.interface";
+    _spaces[2] = "org.gnome.desktop.a11y.interface";
+    _spaces[3] = "org.gnome.desktop.peripherals.mouse";
+    _spaces[4] = "org.gnome.desktop.wm.preferences";
+    _spaces[5] = "org.kde.kdeglobals.General";
+    _spaces[6] = "org.kde.kdeglobals.KDE";
+    let is dbus.message.Message as m with mut = dbus.message.method_call(dest, PATH, IFACE, "ReadAll");
+    m.signature = "as";
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    let is i64 as at = dbus.wire.put_array(w, 4);
+    let is i64 as i with mut = 0;
+    while (i < 7) {
+        dbus.wire.put_string(w, _spaces[i]);
+        i = i + 1;
+    }
+    dbus.wire.put_array_end(w, at, 4);
+    // No portal, an error or a timeout leaves rep without a{sa{sv}}, which
+    // parse_all refuses.
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    dbus.conn.call_method(c, &m, 2000, &rep);
+    return parse_all(&rep, out);
+}
+
+// --- Changes ---
+
+fn _changed(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    *cast(*i32, user) = 1;
+}
+
+// Sets *flag to 1 whenever the portal at dest says a setting changed; the
+// program clears it, and reads again. A handle for dbus.conn.remove_match, or
+// minus an error.
+fn watch(c as *dbus.conn.Conn, dest as *u8, flag as *i32) as i64 {
+    return dbus.conn.add_match(c, dest, PATH, IFACE, "SettingChanged", fn_ptr(_changed), cast(*u8, flag));
+}
