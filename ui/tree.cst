@@ -36,6 +36,17 @@ let is i64 as F_HIDDEN       with imut = 1;
 let is i64 as F_DISABLED     with imut = 2;
 let is i64 as F_NEEDS_LAYOUT with imut = 4;
 let is i64 as F_FOCUSABLE    with imut = 8;
+let is i64 as F_NEEDS_PAINT  with imut = 16;
+
+// --- Damage ---
+//
+// What has to be repainted, as a few rectangles in window coordinates. Kept in
+// the tree because a widget whose look changes only has the tree in hand, and
+// bounded because a frame never needs more: a rectangle that would not fit is
+// merged into the one it grows least, so the region can cover more than
+// changed but never less. damage.cst brings it up to date with the tree; the
+// painter reads it; whoever presented the frame clears it.
+let is i64 as MAX_DAMAGE with imut = 16;
 
 // --- How much a tree may hold ---
 
@@ -114,6 +125,10 @@ struct Node {
     count  as i64;
     flags  as i64;
     item   as geom.Item;   // layout's, see geom.cst
+    // Where it was last painted, in window coordinates; empty while it has
+    // never been on screen or is hidden. damage.cst compares it with where the
+    // widget is now, and the place it leaves is repainted from it.
+    painted as math.rect.Rect;
 }
 
 struct Tree {
@@ -135,6 +150,9 @@ struct Tree {
     conn_seq      as i64;
     emit_serial   as i64;
     emitting      as i64;   // emissions in progress, nested
+    damage        as [16]math.rect.Rect;
+    damage_n      as i64;
+    paint_wanted  as i64;   // anything changed since damage_clear
     err         as i32;
     ok          as i32;
 }
@@ -203,6 +221,8 @@ fn open(l as *Limits) as Tree {
     t.conn_seq = 0;
     t.emit_serial = 0;
     t.emitting = 0;
+    t.damage_n = 0;
+    t.paint_wanted = 0;
     t.cap = 0;
     t.live = 0;
     t.next_free = 0;
@@ -319,6 +339,7 @@ fn _claim(t as *Tree, k as *Kind) as i64 {
             // A widget nobody has measured yet needs layout by definition.
             n.flags = F_NEEDS_LAYOUT;
             n.item = geom.item_default();
+            n.painted = math.rect.rect_zero();
             if (t.stride > 0) { mem.core.memzero(_data_at(t, i), t.stride); }
             t.live = t.live + 1;
             t.next_free = i + 1;
@@ -334,6 +355,10 @@ fn _claim(t as *Tree, k as *Kind) as i64 {
 // every handle to it stale.
 fn _release(t as *Tree, i as i64) as void {
     let is *Node as n = _node(t, i);
+    // Where it was is uncovered now. Every node of a destroyed subtree adds its
+    // own: a child is normally inside its parent and adds nothing, but not
+    // always.
+    damage_add(t, &n.painted);
     if (cast(i64, n.kind) != 0 && cast(i64, n.kind.destroy) != 0) {
         call(n.kind.destroy, t, _handle(t, i), _data_at(t, i));
     }
@@ -532,6 +557,8 @@ fn set_enabled(t as *Tree, w as i64, on as i32) as void {
     if (i < 0) { return; }
     let is *Node as n = _node(t, i);
     n.flags = _set(n.flags, F_DISABLED, 1 - on);
+    // Disabled is inherited, so the whole subtree looks different now.
+    invalidate_paint_subtree(t, w);
 }
 
 fn is_enabled(t as *Tree, w as i64) as i32 {
@@ -580,6 +607,8 @@ fn item(t as *Tree, w as i64) as *geom.Item {
 // Whatever is marked also loses its cached measure: the cache answered for a
 // widget that has since changed, or whose descendants have.
 fn _invalidate_from(t as *Tree, i as i64) as void {
+    // A layout pass may move anything, and damage.cst finds what moved.
+    t.paint_wanted = 1;
     let is i64 as a with mut = i;
     while (a != 0 - 1) {
         let is *Node as n = _node(t, a);
@@ -637,4 +666,183 @@ fn clear_layout(t as *Tree, w as i64) as void {
     if (i < 0) { return; }
     let is *Node as n = _node(t, i);
     n.flags = _set(n.flags, F_NEEDS_LAYOUT, 0);
+}
+
+// --- Paint invalidation ---
+//
+// Marking a widget repaints it when damage.cst next collects — which is after
+// layout, so a widget that both changed and moved repaints both places. A widget that only moved, or was
+// hidden, shown or reparented, needs no mark: collecting compares every
+// rectangle with where it was painted, and invalidating its layout already
+// said there is something to collect. Destroying is the exception, done in
+// _release: once the node is gone there is nothing left to compare.
+
+fn _mark_paint(t as *Tree, i as i64) as void {
+    let is *Node as n = _node(t, i);
+    n.flags = n.flags | F_NEEDS_PAINT;
+    t.paint_wanted = 1;
+}
+
+fn invalidate_paint(t as *Tree, w as i64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    _mark_paint(t, i);
+}
+
+// w and everything under it — for a change every descendant shows, such as
+// being disabled.
+fn invalidate_paint_subtree(t as *Tree, w as i64) as void {
+    let is i64 as top = _index(t, w);
+    if (top < 0) { return; }
+    _mark_paint(t, top);
+    let is i64 as cur with mut = _node(t, top).first;
+    while (cur != 0 - 1) {
+        _mark_paint(t, cur);
+        let is *Node as n = _node(t, cur);
+        if (n.first != 0 - 1) {
+            cur = n.first;
+        } else {
+            let is i64 as up with mut = cur;
+            cur = 0 - 1;
+            while (up != top && cur == 0 - 1) {
+                if (_node(t, up).next != 0 - 1) {
+                    cur = _node(t, up).next;
+                } else {
+                    up = _node(t, up).parent;
+                }
+            }
+        }
+    }
+}
+
+fn needs_paint(t as *Tree, w as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    if ((_node(t, i).flags & F_NEEDS_PAINT) != 0) { return 1; }
+    return 0;
+}
+
+fn clear_paint(t as *Tree, w as i64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    let is *Node as n = _node(t, i);
+    n.flags = _set(n.flags, F_NEEDS_PAINT, 0);
+}
+
+// Its own hidden flag, ancestors aside; damage.cst walks down and carries
+// theirs.
+fn is_hidden_here(t as *Tree, w as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 1; }
+    if ((_node(t, i).flags & F_HIDDEN) != 0) { return 1; }
+    return 0;
+}
+
+fn painted(t as *Tree, w as i64) as math.rect.Rect {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return math.rect.rect_zero(); }
+    return _node(t, i).painted;
+}
+
+fn set_painted(t as *Tree, w as i64, r as math.rect.Rect) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    _node(t, i).painted = r;
+}
+
+// --- The damage region ---
+
+fn _area(r as math.rect.Rect) as f64 { return r.w * r.h; }
+
+// Whether two rectangles overlap or share a stretch of edge — merging those
+// costs nothing extra. Touching at a corner only does not count: the box
+// around two such rectangles is twice what they cover.
+fn _joinable(a as math.rect.Rect, b as math.rect.Rect) as i32 {
+    let is f64 as ox = _minf(a.x + a.w, b.x + b.w) - _maxf(a.x, b.x);
+    let is f64 as oy = _minf(a.y + a.h, b.y + b.h) - _maxf(a.y, b.y);
+    if (ox < 0.0 || oy < 0.0) { return 0; }
+    if (ox > 0.0 || oy > 0.0) { return 1; }
+    return 0;
+}
+
+fn _minf(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+fn _maxf(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _take(t as *Tree, i as i64) as math.rect.Rect {
+    let is math.rect.Rect as r = t.damage[i];
+    t.damage_n = t.damage_n - 1;
+    t.damage[i] = t.damage[t.damage_n];
+    return r;
+}
+
+// Adds r to what has to be repainted. One that overlaps or borders another is
+// merged with it — a rectangle already covered merges into the one covering
+// it, unchanged — and the merge repeated while the result reaches others;
+// when the region is full, it goes into whichever rectangle it enlarges
+// least.
+fn damage_add(t as *Tree, r as *math.rect.Rect) as void {
+    if (t.ok == 0 || r.w <= 0.0 || r.h <= 0.0) { return; }
+    t.paint_wanted = 1;
+    let is math.rect.Rect as cur with mut = *r;
+    while (1 == 1) {
+        let is i64 as hit with mut = 0 - 1;
+        let is i64 as i with mut = 0;
+        while (i < t.damage_n && hit < 0) {
+            if (_joinable(t.damage[i], cur) == 1) { hit = i; }
+            i = i + 1;
+        }
+        if (hit < 0 && t.damage_n < MAX_DAMAGE) {
+            t.damage[t.damage_n] = cur;
+            t.damage_n = t.damage_n + 1;
+            return;
+        }
+        if (hit < 0) {
+            let is f64 as best with mut = 0.0;
+            i = 0;
+            while (i < t.damage_n) {
+                let is f64 as grow = _area(math.rect.rect_union(t.damage[i], cur)) - _area(t.damage[i]);
+                if (hit < 0 || grow < best) { hit = i; best = grow; }
+                i = i + 1;
+            }
+        }
+        cur = math.rect.rect_union(_take(t, hit), cur);
+    }
+}
+
+// Keeps only what lies inside r — the window, at collection.
+fn damage_clip(t as *Tree, r as math.rect.Rect) as void {
+    let is i64 as i with mut = 0;
+    while (i < t.damage_n) {
+        let is math.rect.Rect as c = math.rect.rect_intersect(t.damage[i], r);
+        if (math.rect.rect_is_empty(c) == 1) {
+            _take(t, i);
+        } else {
+            t.damage[i] = c;
+            i = i + 1;
+        }
+    }
+}
+
+fn damage_count(t as *Tree) as i64 { return t.damage_n; }
+
+fn damage_at(t as *Tree, i as i64) as math.rect.Rect {
+    if (i < 0 || i >= t.damage_n) { return math.rect.rect_zero(); }
+    return t.damage[i];
+}
+
+// Whether anything may need repainting: damage added, a widget marked, a
+// layout invalidated, a widget destroyed. Painting an idle window is skipped
+// on this.
+fn paint_wanted(t as *Tree) as i32 {
+    if (t.paint_wanted != 0) { return 1; }
+    return 0;
+}
+
+// For a change the tree cannot see: layout moved something, a scale changed.
+fn want_paint(t as *Tree) as void { t.paint_wanted = 1; }
+
+// After the frame is presented: nothing is owed any more.
+fn damage_clear(t as *Tree) as void {
+    t.damage_n = 0;
+    t.paint_wanted = 0;
 }

@@ -21,7 +21,8 @@ ui/
   timer.cst       things that happen later, on an explicit clock
   signal.cst      connecting a callback to what a widget emits
   model.cst       row and cell models behind lists, trees and tables
-  paint.cst       damage tracking, drawing through render/'s 2D family
+  damage.cst      what a frame has to repaint, found from the tree
+  paint.cst       drawing the tree through render/'s 2D family
   style.cst       the theme: colours, metrics, fonts, per-state variants
   a11y.cst        role, name and state per widget; the platform bridges
   widgets/        label, button, check, radio, entry, slider, progress,
@@ -351,7 +352,19 @@ connections of destroyed widgets reclaimed when the table fills. Models name
 rows by stable ids the program chooses, answer by role, may be editable, and
 tell their observers about inserts, removals, changes and resets.
 
-Nothing is drawn yet: painting waits for `render/`'s 2D family, which is next.
+**Damage** (`damage.cst`, the bookkeeping in `tree.cst`, tested by
+`damage_test`): every widget remembers where it was last painted, and after
+layout `damage.collect` compares that with where it is — so a widget that moved,
+appeared, was hidden or reparented repaints both places without saying so, and
+one whose look changed says so with `tree.invalidate_paint` or, from a setter,
+`widget.changed(t, w, CHANGED_LAYOUT | CHANGED_PAINT)`. Destroying, disabling
+and resizing the window are accounted for. The region is at most
+`tree.MAX_DAMAGE` rectangles in window coordinates, clipped to the window:
+overlapping and bordering ones merge, and past the limit a rectangle goes into
+the one it enlarges least, so it can cover more than changed but never less.
+`tree.paint_wanted` says whether a frame has anything to collect at all.
+
+Nothing is drawn yet: painting is next, through `render/`'s 2D family.
 
 ## For scale
 
