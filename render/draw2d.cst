@@ -1,0 +1,416 @@
+// render/draw2d.cst — the 2D family: a canvas that batches, clips and layers.
+//
+// What render.md decides for 2D: ordering by LAYER, batching by texture,
+// clipping by nested SCISSOR rectangles. A canvas collects triangles in
+// logical coordinates for one frame and records them into a command buffer at
+// flush, as few draws as the state allows.
+//
+//   draw2d.begin(&c, width_px, height_px, scale)
+//   shapes.fill_rounded(&c, ...);        // shapes2d.cst draws on a canvas
+//   draw2d.glyph(&c, atlas, ...);        // text, from a coverage atlas
+//   draw2d.flush(&c, cmd);               // inside a pass the caller began
+//
+// Coordinates are logical pixels; scale turns them into the target's physical
+// pixels, so an interface laid out once draws at any display scale.
+//
+// A batch is a run of triangles sharing a kind (plain colour, image, glyph),
+// a texture, a layer and a clip. Drawing with the same state extends the last
+// batch; anything else starts one. At flush the batches are drawn layer by
+// layer, lowest first and in the order they were made within a layer, so a
+// popup on layer 1 covers what layer 0 drew after it.
+//
+// Sized at open, like everything that holds per-frame data here: vertices and
+// batches have capacities, and running out is reported by overflowed() and by
+// flush returning 0 — never by writing past the end.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../math/math.cst" as math;
+use "../gpu/device.cst" as dev;
+use "../gpu/buffer.cst" as buffer;
+use "../gpu/texture.cst" as texture;
+use "../gpu/shader.cst" as shader;
+use "../gpu/pipeline.cst" as pipeline;
+use "../gpu/command.cst" as command;
+
+let is i32 as KIND_COLOR with imut = 0;   // vertex colour
+let is i32 as KIND_IMAGE with imut = 1;   // texture times vertex colour
+let is i32 as KIND_GLYPH with imut = 2;   // coverage texture scaling vertex alpha
+
+let is i64 as MAX_CLIP_DEPTH with imut = 32;
+
+struct Limits {
+    vertices as i64;
+    batches  as i64;
+}
+
+fn limits_default() as Limits {
+    let is Limits as l;
+    l.vertices = 65536;
+    l.batches = 4096;
+    return l;
+}
+
+// layout_pos_color_uv: position, colour, uv — 72 bytes.
+struct Vertex {
+    x as f64; y as f64; z as f64;
+    r as f64; g as f64; b as f64; a as f64;
+    u as f64; v as f64;
+}
+
+// A clip in physical pixels: x0, y0 inclusive, x1, y1 exclusive. x1 < 0 means
+// no clip.
+struct Clip {
+    x0 as i64;
+    y0 as i64;
+    x1 as i64;
+    y1 as i64;
+}
+
+struct Batch {
+    kind    as i32;
+    _pad0   as i32;
+    texture as i64;
+    sampler as i64;
+    layer   as i64;
+    clip    as Clip;
+    first   as i64;
+    count   as i64;
+}
+
+struct Canvas {
+    d           as *dev.Device;
+    block       as *u8;
+    block_bytes as i64;
+    verts       as *u8;
+    vcap        as i64;
+    vcount      as i64;
+    batches     as *u8;
+    bcap        as i64;
+    bcount      as i64;
+    vbuf        as i64;
+    shaders     as [3]i64;
+    pipes       as [3]i64;
+    linear      as i64;      // samplers
+    nearest     as i64;
+    width       as f64;      // the target, physical pixels
+    height      as f64;
+    scale       as f64;      // logical to physical
+    layer       as i64;
+    clips       as [32]Clip;
+    clip_n      as i64;
+    overflowed  as i32;
+    ok          as i32;
+}
+
+fn _vertex_at(c as *Canvas, i as i64) as *Vertex {
+    return cast(*Vertex, cast(i64, c.verts) + i * sizeof(Vertex));
+}
+
+fn _batch_at(c as *Canvas, i as i64) as *Batch {
+    return cast(*Batch, cast(i64, c.batches) + i * sizeof(Batch));
+}
+
+// --- Opening ---
+
+fn open(d as *dev.Device, l as *Limits) as Canvas {
+    let is Canvas as c;
+    c.d = d;
+    c.ok = 0;
+    c.overflowed = 0;
+    c.vcount = 0;
+    c.bcount = 0;
+    c.vcap = l.vertices;
+    c.bcap = l.batches;
+    c.block = cast(*u8, 0);
+    c.block_bytes = 0;
+    c.vbuf = 0;
+    c.scale = 1.0;
+    c.layer = 0;
+    c.clip_n = 0;
+    if (c.vcap < 3 || c.bcap < 1) { return c; }
+
+    let is i64 as vbytes = c.vcap * sizeof(Vertex);
+    c.block_bytes = vbytes + c.bcap * sizeof(Batch);
+    c.block = mem.core.mmap_anon(c.block_bytes);
+    if (cast(i64, c.block) == 0) { return c; }
+    c.verts = c.block;
+    c.batches = cast(*u8, cast(i64, c.block) + vbytes);
+
+    c.vbuf = buffer.create(d, vbytes, buffer.VERTEX);
+    c.shaders[0] = shader.builtin(d, shader.UNLIT_COLOR);
+    c.shaders[1] = shader.builtin(d, shader.TEXTURED);
+    c.shaders[2] = shader.builtin(d, shader.COVERAGE);
+    let is i64 as k with mut = 0;
+    while (k < 3) {
+        let is pipeline.Desc as pd = pipeline.desc_blended(c.shaders[k], pipeline.layout_pos_color_uv());
+        c.pipes[k] = pipeline.create(d, &pd);
+        k = k + 1;
+    }
+    c.linear = texture.sampler(d, texture.LINEAR, texture.CLAMP);
+    c.nearest = texture.sampler(d, texture.NEAREST, texture.CLAMP);
+    if (c.vbuf == 0 || c.pipes[0] == 0 || c.pipes[1] == 0 || c.pipes[2] == 0
+        || c.linear == 0 || c.nearest == 0) {
+        close(&c);
+        return c;
+    }
+    c.ok = 1;
+    return c;
+}
+
+fn close(c as *Canvas) as void {
+    let is i64 as k with mut = 0;
+    while (k < 3) {
+        if (c.pipes[k] != 0) { pipeline.destroy(c.d, c.pipes[k]); }
+        if (c.shaders[k] != 0) { shader.destroy(c.d, c.shaders[k]); }
+        c.pipes[k] = 0;
+        c.shaders[k] = 0;
+        k = k + 1;
+    }
+    if (c.linear != 0) { texture.sampler_destroy(c.d, c.linear); }
+    if (c.nearest != 0) { texture.sampler_destroy(c.d, c.nearest); }
+    if (c.vbuf != 0) { buffer.destroy(c.d, c.vbuf); }
+    c.linear = 0;
+    c.nearest = 0;
+    c.vbuf = 0;
+    if (cast(i64, c.block) != 0) { mem.core.munmap(c.block, c.block_bytes); }
+    c.block = cast(*u8, 0);
+    c.ok = 0;
+}
+
+fn is_open(c as *Canvas) as i32 { return c.ok; }
+
+// --- A frame ---
+
+// Starts a frame for a target of width by height physical pixels, drawing at
+// scale physical pixels per logical one.
+fn begin(c as *Canvas, width as f64, height as f64, scale as f64) as void {
+    c.vcount = 0;
+    c.bcount = 0;
+    c.width = width;
+    c.height = height;
+    c.scale = scale;
+    if (c.scale <= 0.0) { c.scale = 1.0; }
+    c.layer = 0;
+    c.clip_n = 0;
+    c.overflowed = 0;
+}
+
+// One physical pixel in logical units: the width of an anti-aliasing fringe.
+fn pixel(c as *Canvas) as f64 { return 1.0 / c.scale; }
+fn scale(c as *Canvas) as f64 { return c.scale; }
+
+// Later layers draw over earlier ones, whatever order things are drawn in.
+fn set_layer(c as *Canvas, layer as i64) as void { c.layer = layer; }
+fn layer(c as *Canvas) as i64 { return c.layer; }
+
+fn batch_count(c as *Canvas) as i64 { return c.bcount; }
+fn vertex_count(c as *Canvas) as i64 { return c.vcount; }
+fn overflowed(c as *Canvas) as i32 { return c.overflowed; }
+
+// --- Clipping ---
+
+fn _no_clip() as Clip {
+    let is Clip as k;
+    k.x0 = 0; k.y0 = 0; k.x1 = 0 - 1; k.y1 = 0 - 1;
+    return k;
+}
+
+fn _current_clip(c as *Canvas) as Clip {
+    if (c.clip_n == 0) { return _no_clip(); }
+    return c.clips[c.clip_n - 1];
+}
+
+fn _maxi(a as i64, b as i64) as i64 { if (a > b) { return a; } return b; }
+fn _mini(a as i64, b as i64) as i64 { if (a < b) { return a; } return b; }
+
+// Clips everything drawn until the matching pop_clip to the rectangle, and to
+// every clip already pushed. Logical coordinates; the clip covers every
+// physical pixel the rectangle touches.
+fn push_clip(c as *Canvas, x as f64, y as f64, w as f64, h as f64) as void {
+    if (c.clip_n >= MAX_CLIP_DEPTH) { c.overflowed = 1; return; }
+    let is Clip as k;
+    k.x0 = cast(i64, fm.floor(x * c.scale));
+    k.y0 = cast(i64, fm.floor(y * c.scale));
+    k.x1 = cast(i64, fm.ceil((x + w) * c.scale));
+    k.y1 = cast(i64, fm.ceil((y + h) * c.scale));
+    if (c.clip_n > 0) {
+        let is Clip as o = c.clips[c.clip_n - 1];
+        k.x0 = _maxi(k.x0, o.x0);
+        k.y0 = _maxi(k.y0, o.y0);
+        k.x1 = _mini(k.x1, o.x1);
+        k.y1 = _mini(k.y1, o.y1);
+    }
+    if (k.x1 < k.x0) { k.x1 = k.x0; }
+    if (k.y1 < k.y0) { k.y1 = k.y0; }
+    c.clips[c.clip_n] = k;
+    c.clip_n = c.clip_n + 1;
+}
+
+fn pop_clip(c as *Canvas) as void {
+    if (c.clip_n > 0) { c.clip_n = c.clip_n - 1; }
+}
+
+// --- Triangles ---
+
+fn _same_clip(a as Clip, b as Clip) as i32 {
+    if (a.x0 == b.x0 && a.y0 == b.y0 && a.x1 == b.x1 && a.y1 == b.y1) { return 1; }
+    return 0;
+}
+
+// Room for three vertices in a batch with this state, or 0.
+fn _reserve(c as *Canvas, kind as i32, tex as i64, samp as i64) as i32 {
+    if (c.ok == 0) { return 0; }
+    if (c.vcount + 3 > c.vcap) { c.overflowed = 1; return 0; }
+    let is Clip as clip = _current_clip(c);
+    if (c.bcount > 0) {
+        let is *Batch as last = _batch_at(c, c.bcount - 1);
+        if (last.kind == kind && last.texture == tex && last.sampler == samp
+            && last.layer == c.layer && _same_clip(last.clip, clip) == 1
+            && last.first + last.count == c.vcount) {
+            last.count = last.count + 3;
+            return 1;
+        }
+    }
+    if (c.bcount >= c.bcap) { c.overflowed = 1; return 0; }
+    let is *Batch as b = _batch_at(c, c.bcount);
+    b.kind = kind;
+    b._pad0 = 0;
+    b.texture = tex;
+    b.sampler = samp;
+    b.layer = c.layer;
+    b.clip = clip;
+    b.first = c.vcount;
+    b.count = 3;
+    c.bcount = c.bcount + 1;
+    return 1;
+}
+
+fn _put(c as *Canvas, x as f64, y as f64, col as math.color.Color, u as f64, v as f64) as void {
+    let is *Vertex as p = _vertex_at(c, c.vcount);
+    p.x = x * c.scale;
+    p.y = y * c.scale;
+    p.z = 0.0;
+    p.r = col.r;
+    p.g = col.g;
+    p.b = col.b;
+    p.a = col.a;
+    p.u = u;
+    p.v = v;
+    c.vcount = c.vcount + 1;
+}
+
+// A triangle in plain colours, one per corner, interpolated between.
+fn triangle(c as *Canvas, x0 as f64, y0 as f64, c0 as math.color.Color,
+            x1 as f64, y1 as f64, c1 as math.color.Color,
+            x2 as f64, y2 as f64, c2 as math.color.Color) as void {
+    if (_reserve(c, KIND_COLOR, 0, 0) == 0) { return; }
+    _put(c, x0, y0, c0, 0.0, 0.0);
+    _put(c, x1, y1, c1, 0.0, 0.0);
+    _put(c, x2, y2, c2, 0.0, 0.0);
+}
+
+fn _quad(c as *Canvas, kind as i32, tex as i64, samp as i64,
+         x as f64, y as f64, w as f64, h as f64,
+         u0 as f64, v0 as f64, u1 as f64, v1 as f64, col as math.color.Color) as void {
+    if (_reserve(c, kind, tex, samp) == 0) { return; }
+    _put(c, x, y, col, u0, v0);
+    _put(c, x, y + h, col, u0, v1);
+    _put(c, x + w, y + h, col, u1, v1);
+    if (_reserve(c, kind, tex, samp) == 0) { return; }
+    _put(c, x, y, col, u0, v0);
+    _put(c, x + w, y + h, col, u1, v1);
+    _put(c, x + w, y, col, u1, v0);
+}
+
+// A rectangle of texture, tinted. smooth 1 filters between texels, 0 takes
+// the nearest — what pixel art and an image drawn at its own size want.
+fn image(c as *Canvas, tex as i64, smooth as i32, x as f64, y as f64, w as f64, h as f64,
+         u0 as f64, v0 as f64, u1 as f64, v1 as f64, tint as math.color.Color) as void {
+    let is i64 as samp with mut = c.nearest;
+    if (smooth == 1) { samp = c.linear; }
+    _quad(c, KIND_IMAGE, tex, samp, x, y, w, h, u0, v0, u1, v1, tint);
+}
+
+// A glyph from a coverage atlas (an R8 texture), in colour. Sampled nearest:
+// glyphs are rasterized at the size they are drawn, one texel to one pixel.
+fn glyph(c as *Canvas, atlas as i64, x as f64, y as f64, w as f64, h as f64,
+         u0 as f64, v0 as f64, u1 as f64, v1 as f64, col as math.color.Color) as void {
+    _quad(c, KIND_GLYPH, atlas, c.nearest, x, y, w, h, u0, v0, u1, v1, col);
+}
+
+// --- Recording ---
+
+// Records the frame into cmd, inside a pass the caller has begun on a target
+// the size begin() was told. Returns 1, or 0 if the frame overflowed — what
+// did fit is still drawn.
+fn flush(c as *Canvas, cmd as i64) as i32 {
+    if (c.ok == 0) { return 0; }
+    let is i32 as result with mut = 1;
+    if (c.overflowed == 1) { result = 0; }
+    if (c.vcount == 0) { return result; }
+
+    buffer.upload(c.d, c.vbuf, 0, c.verts, c.vcount * sizeof(Vertex));
+    // Physical pixels to clip space, y down.
+    let is math.mat.Mat4 as proj = math.mat.m4_ortho(0.0, c.width, c.height, 0.0, 0.0 - 1.0, 1.0);
+    let is shader.BuiltinUniforms as un = shader.uniforms_mvp(proj);
+    command.set_uniforms(c.d, cmd, cast(*u8, &un), sizeof(shader.BuiltinUniforms));
+    command.bind_vertex_buffer(c.d, cmd, c.vbuf);
+
+    let is i32 as bound_kind with mut = cast(i32, 0 - 1);
+    let is i64 as bound_tex with mut = 0 - 1;
+    let is i64 as bound_samp with mut = 0 - 1;
+    let is Clip as bound_clip with mut = _no_clip();
+    let is i32 as clip_known with mut = 0;
+
+    // Layer by layer, lowest first; within a layer, in the order made.
+    let is i64 as have with mut = 0;
+    let is i64 as current with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < c.bcount) {
+        let is i64 as lay = _batch_at(c, i).layer;
+        if (have == 0 || lay < current) { current = lay; have = 1; }
+        i = i + 1;
+    }
+    while (have == 1) {
+        i = 0;
+        while (i < c.bcount) {
+            let is *Batch as b = _batch_at(c, i);
+            if (b.layer == current) {
+                if (b.kind != bound_kind) {
+                    command.bind_pipeline(c.d, cmd, c.pipes[b.kind]);
+                    bound_kind = b.kind;
+                }
+                if (b.kind != KIND_COLOR && (b.texture != bound_tex || b.sampler != bound_samp)) {
+                    command.bind_texture(c.d, cmd, 0, b.texture, b.sampler);
+                    bound_tex = b.texture;
+                    bound_samp = b.sampler;
+                }
+                if (clip_known == 0 || _same_clip(b.clip, bound_clip) == 0) {
+                    if (b.clip.x1 < 0) {
+                        command.clear_scissor(c.d, cmd);
+                    } else {
+                        command.set_scissor(c.d, cmd, b.clip.x0, b.clip.y0,
+                                            b.clip.x1 - b.clip.x0, b.clip.y1 - b.clip.y0);
+                    }
+                    bound_clip = b.clip;
+                    clip_known = 1;
+                }
+                command.draw(c.d, cmd, b.first, b.count);
+            }
+            i = i + 1;
+        }
+        // The next layer up, if any.
+        let is i64 as next with mut = 0;
+        let is i64 as found with mut = 0;
+        i = 0;
+        while (i < c.bcount) {
+            let is i64 as lay = _batch_at(c, i).layer;
+            if (lay > current && (found == 0 || lay < next)) { next = lay; found = 1; }
+            i = i + 1;
+        }
+        have = found;
+        current = next;
+    }
+    command.clear_scissor(c.d, cmd);
+    return result;
+}

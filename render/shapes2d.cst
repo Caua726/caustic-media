@@ -1,0 +1,438 @@
+// render/shapes2d.cst — rectangles, rounded rectangles, borders, circles,
+// lines, convex polygons and soft shadows, drawn on a draw2d canvas.
+//
+// Anti-aliased by a fringe, the way NanoVG does it: the shape is filled
+// inset by half a physical pixel at full colour, and a one-pixel band around
+// it fades from full to transparent. Only vertex colours are involved, so
+// every backend draws it with the plain colour material, and a pixel's
+// coverage comes out as the band's alpha at the pixel's centre — which for an
+// edge on a pixel boundary is exactly 0 outside and 1 inside, so an edge on a
+// whole pixel stays crisp.
+//
+// A rectangle whose edges all fall on whole physical pixels needs no fringe
+// at all and is drawn as two triangles: the common case in an interface, and
+// the cheapest.
+//
+// A soft shadow is the same fringe, as wide as twice the blur: full colour
+// blur inside the edge, transparent blur outside it.
+//
+// All coordinates are logical, as on the canvas.
+use "std/math.cst" as fm;
+use "../math/math.cst" as math;
+use "draw2d.cst" as draw2d;
+
+// Points an outline may have: four corners of up to MAX_CORNER_SEGMENTS + 1
+// points each.
+let is i64 as MAX_CORNER_SEGMENTS with imut = 64;
+let is i64 as MAX_POINTS with imut = 260;
+
+fn _with_alpha(c as math.color.Color, a as f64) as math.color.Color {
+    return math.color.rgba(c.r, c.g, c.b, c.a * a);
+}
+
+fn _whole(v as f64) as i32 {
+    let is f64 as d = v - fm.floor(v + 0.5);
+    if (d < 0.000001 && d > 0.0 - 0.000001) { return 1; }
+    return 0;
+}
+
+// Whether every edge of the rectangle lands on a whole physical pixel.
+fn _aligned(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64) as i32 {
+    let is f64 as s = draw2d.scale(c);
+    if (_whole(x * s) == 1 && _whole(y * s) == 1 && _whole((x + w) * s) == 1 && _whole((y + h) * s) == 1) {
+        return 1;
+    }
+    return 0;
+}
+
+fn _rect_solid(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64,
+               top as math.color.Color, bottom as math.color.Color) as void {
+    if (w <= 0.0 || h <= 0.0) { return; }
+    draw2d.triangle(c, x, y, top, x, y + h, bottom, x + w, y + h, bottom);
+    draw2d.triangle(c, x, y, top, x + w, y + h, bottom, x + w, y, top);
+}
+
+// --- Filling a convex outline with a fringe ---
+//
+// The colour at a point is top, or a vertical blend from top at gy to bottom
+// at gy + gh when gh > 0.
+fn _color_at(top as math.color.Color, bottom as math.color.Color, gy as f64, gh as f64, y as f64) as math.color.Color {
+    if (gh <= 0.0) { return top; }
+    let is f64 as t with mut = (y - gy) / gh;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    return math.color.col_lerp(top, bottom, t);
+}
+
+// Per point, the offset that moves both of its edges outward by one unit:
+// the edges' normals summed and scaled by the cosine between them. Written to
+// mx, my. Zero-length edges take their neighbour's normal.
+fn _miters(xs as *f64, ys as *f64, n as i64, mx as *f64, my as *f64) as void {
+    let is f64 as area with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as j = (i + 1) % n;
+        area = area + xs[i] * ys[j] - xs[j] * ys[i];
+        i = i + 1;
+    }
+    let is f64 as side with mut = 1.0;
+    if (area < 0.0) { side = 0.0 - 1.0; }
+
+    // Edge normals, carried forward over zero-length edges.
+    let is [260]f64 as ex;
+    let is [260]f64 as ey;
+    let is f64 as lx with mut = 0.0;
+    let is f64 as ly with mut = 0.0;
+    let is i32 as have with mut = 0;
+    let is i64 as pass with mut = 0;
+    while (pass < 2) {
+        i = 0;
+        while (i < n) {
+            let is i64 as j = (i + 1) % n;
+            let is f64 as dx = xs[j] - xs[i];
+            let is f64 as dy = ys[j] - ys[i];
+            let is f64 as len = fm.sqrt(dx * dx + dy * dy);
+            if (len > 0.0000001) {
+                lx = side * dy / len;
+                ly = 0.0 - side * dx / len;
+                have = 1;
+            }
+            ex[i] = lx;
+            ey[i] = ly;
+            i = i + 1;
+        }
+        // A second pass fills the leading zero-length edges with the last
+        // normal found, now that it is known.
+        if (have == 0) { pass = 2; } else { pass = pass + 1; }
+    }
+    i = 0;
+    while (i < n) {
+        let is i64 as p = (i + n - 1) % n;
+        let is f64 as sx = ex[p] + ex[i];
+        let is f64 as sy = ey[p] + ey[i];
+        let is f64 as d with mut = 1.0 + ex[p] * ex[i] + ey[p] * ey[i];
+        // A spike past this miter is cut, so a sharp corner does not shoot a
+        // fringe across the screen.
+        if (d < 0.25) { d = 0.25; }
+        mx[i] = sx / d;
+        my[i] = sy / d;
+        i = i + 1;
+    }
+}
+
+fn _fill_convex(c as *draw2d.Canvas, xs as *f64, ys as *f64, n as i64, fringe as f64,
+                top as math.color.Color, bottom as math.color.Color, gy as f64, gh as f64) as void {
+    if (n < 3 || n > MAX_POINTS) { return; }
+    let is [260]f64 as mx;
+    let is [260]f64 as my;
+    _miters(xs, ys, n, cast(*f64, &mx), cast(*f64, &my));
+    let is f64 as half = fringe * 0.5;
+    let is [260]f64 as ix;
+    let is [260]f64 as iy;
+    let is [260]f64 as ox;
+    let is [260]f64 as oy;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        ix[i] = xs[i] - mx[i] * half;
+        iy[i] = ys[i] - my[i] * half;
+        ox[i] = xs[i] + mx[i] * half;
+        oy[i] = ys[i] + my[i] * half;
+        i = i + 1;
+    }
+    // The inside, at full colour.
+    i = 1;
+    while (i + 1 < n) {
+        draw2d.triangle(c, ix[0], iy[0], _color_at(top, bottom, gy, gh, iy[0]),
+                        ix[i], iy[i], _color_at(top, bottom, gy, gh, iy[i]),
+                        ix[i + 1], iy[i + 1], _color_at(top, bottom, gy, gh, iy[i + 1]));
+        i = i + 1;
+    }
+    // The fringe, fading out.
+    i = 0;
+    while (i < n) {
+        let is i64 as j = (i + 1) % n;
+        let is math.color.Color as ci = _color_at(top, bottom, gy, gh, iy[i]);
+        let is math.color.Color as cj = _color_at(top, bottom, gy, gh, iy[j]);
+        let is math.color.Color as oi = _with_alpha(_color_at(top, bottom, gy, gh, oy[i]), 0.0);
+        let is math.color.Color as oj = _with_alpha(_color_at(top, bottom, gy, gh, oy[j]), 0.0);
+        draw2d.triangle(c, ix[i], iy[i], ci, ix[j], iy[j], cj, ox[j], oy[j], oj);
+        draw2d.triangle(c, ix[i], iy[i], ci, ox[j], oy[j], oj, ox[i], oy[i], oi);
+        i = i + 1;
+    }
+}
+
+// A convex polygon, anti-aliased. xs and ys hold n points in order, either way
+// round.
+fn fill_convex(c as *draw2d.Canvas, xs as *f64, ys as *f64, n as i64, col as math.color.Color) as void {
+    _fill_convex(c, xs, ys, n, draw2d.pixel(c), col, col, 0.0, 0.0);
+}
+
+// --- Rounded outlines ---
+
+fn _segments(c as *draw2d.Canvas, r as f64) as i64 {
+    if (r <= 0.0) { return 0; }
+    let is f64 as px = r * draw2d.scale(c);
+    let is i64 as k with mut = cast(i64, fm.sqrt(px) * 2.5) + 1;
+    if (k < 2) { k = 2; }
+    if (k > MAX_CORNER_SEGMENTS) { k = MAX_CORNER_SEGMENTS; }
+    return k;
+}
+
+fn _clamp_radius(r as f64, w as f64, h as f64) as f64 {
+    let is f64 as most with mut = w * 0.5;
+    if (h * 0.5 < most) { most = h * 0.5; }
+    if (r < 0.0) { return 0.0; }
+    if (r > most) { return most; }
+    return r;
+}
+
+// One corner: k + 1 points from angle a0 to a0 + 90 degrees around (cx, cy).
+// With k = 0, the corner point itself.
+fn _corner(xs as *f64, ys as *f64, at as i64, cx as f64, cy as f64, r as f64, a0 as f64, k as i64) as i64 {
+    if (k == 0) {
+        xs[at] = cx;
+        ys[at] = cy;
+        return at + 1;
+    }
+    let is i64 as i with mut = 0;
+    let is i64 as p with mut = at;
+    while (i <= k) {
+        let is f64 as a = a0 + (fm.PI * 0.5) * cast(f64, i) / cast(f64, k);
+        xs[p] = cx + r * fm.cos(a);
+        ys[p] = cy + r * fm.sin(a);
+        p = p + 1;
+        i = i + 1;
+    }
+    return p;
+}
+
+// The outline of a rounded rectangle, clockwise on screen, with k[0..3]
+// segments per corner — top-left, top-right, bottom-right, bottom-left — so
+// two outlines built with the same k match point for point.
+fn _outline(xs as *f64, ys as *f64, x as f64, y as f64, w as f64, h as f64,
+            rtl as f64, rtr as f64, rbr as f64, rbl as f64, k as *i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is f64 as pi = fm.PI;
+    n = _corner(xs, ys, n, x + rtl, y + rtl, rtl, pi, k[0]);
+    n = _corner(xs, ys, n, x + w - rtr, y + rtr, rtr, pi * 1.5, k[1]);
+    n = _corner(xs, ys, n, x + w - rbr, y + h - rbr, rbr, 0.0, k[2]);
+    n = _corner(xs, ys, n, x + rbl, y + h - rbl, rbl, pi * 0.5, k[3]);
+    return n;
+}
+
+// --- Public shapes ---
+
+fn fill_rect(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64, col as math.color.Color) as void {
+    if (w <= 0.0 || h <= 0.0) { return; }
+    if (_aligned(c, x, y, w, h) == 1) {
+        _rect_solid(c, x, y, w, h, col, col);
+        return;
+    }
+    let is [4]f64 as xs;
+    let is [4]f64 as ys;
+    xs[0] = x;     ys[0] = y;
+    xs[1] = x + w; ys[1] = y;
+    xs[2] = x + w; ys[2] = y + h;
+    xs[3] = x;     ys[3] = y + h;
+    _fill_convex(c, cast(*f64, &xs), cast(*f64, &ys), 4, draw2d.pixel(c), col, col, 0.0, 0.0);
+}
+
+// A rounded rectangle filled with a vertical gradient from top to bottom.
+// Radii are per corner — top-left, top-right, bottom-right, bottom-left — and
+// no larger than half the shorter side.
+fn fill_rounded_gradient(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64,
+                         rtl as f64, rtr as f64, rbr as f64, rbl as f64,
+                         top as math.color.Color, bottom as math.color.Color) as void {
+    if (w <= 0.0 || h <= 0.0) { return; }
+    let is f64 as a = _clamp_radius(rtl, w, h);
+    let is f64 as b = _clamp_radius(rtr, w, h);
+    let is f64 as d = _clamp_radius(rbr, w, h);
+    let is f64 as e = _clamp_radius(rbl, w, h);
+    if (a == 0.0 && b == 0.0 && d == 0.0 && e == 0.0 && _aligned(c, x, y, w, h) == 1) {
+        _rect_solid(c, x, y, w, h, top, bottom);
+        return;
+    }
+    let is [4]i64 as k;
+    k[0] = _segments(c, a);
+    k[1] = _segments(c, b);
+    k[2] = _segments(c, d);
+    k[3] = _segments(c, e);
+    let is [260]f64 as xs;
+    let is [260]f64 as ys;
+    let is i64 as n = _outline(cast(*f64, &xs), cast(*f64, &ys), x, y, w, h, a, b, d, e, cast(*i64, &k));
+    _fill_convex(c, cast(*f64, &xs), cast(*f64, &ys), n, draw2d.pixel(c), top, bottom, y, h);
+}
+
+fn fill_rounded(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64,
+                rtl as f64, rtr as f64, rbr as f64, rbl as f64, col as math.color.Color) as void {
+    fill_rounded_gradient(c, x, y, w, h, rtl, rtr, rbr, rbl, col, col);
+}
+
+fn fill_circle(c as *draw2d.Canvas, cx as f64, cy as f64, r as f64, col as math.color.Color) as void {
+    fill_rounded(c, cx - r, cy - r, r * 2.0, r * 2.0, r, r, r, r, col);
+}
+
+// A border of the given width just inside the edge of the rounded rectangle —
+// where a border drawn around a widget's own rectangle belongs.
+fn stroke_rounded(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64,
+                  rtl as f64, rtr as f64, rbr as f64, rbl as f64,
+                  width as f64, col as math.color.Color) as void {
+    if (w <= 0.0 || h <= 0.0 || width <= 0.0) { return; }
+    let is f64 as bw with mut = width;
+    if (bw * 2.0 > w) { bw = w * 0.5; }
+    if (bw * 2.0 > h) { bw = h * 0.5; }
+    let is f64 as a = _clamp_radius(rtl, w, h);
+    let is f64 as b = _clamp_radius(rtr, w, h);
+    let is f64 as d = _clamp_radius(rbr, w, h);
+    let is f64 as e = _clamp_radius(rbl, w, h);
+
+    // Square and on whole pixels: four crisp rectangles.
+    if (a == 0.0 && b == 0.0 && d == 0.0 && e == 0.0
+        && _aligned(c, x, y, w, h) == 1 && _aligned(c, x, y, bw, bw) == 1) {
+        _rect_solid(c, x, y, w, bw, col, col);
+        _rect_solid(c, x, y + h - bw, w, bw, col, col);
+        _rect_solid(c, x, y + bw, bw, h - bw * 2.0, col, col);
+        _rect_solid(c, x + w - bw, y + bw, bw, h - bw * 2.0, col, col);
+        return;
+    }
+
+    // A border thinner than a pixel is drawn a pixel wide and faint, rather
+    // than as two fringes overlapping into nothing.
+    let is f64 as px = draw2d.pixel(c);
+    let is math.color.Color as fill with mut = col;
+    if (bw < px) {
+        fill = _with_alpha(col, bw / px);
+        bw = px;
+    }
+
+    let is [4]i64 as k;
+    k[0] = _segments(c, a);
+    k[1] = _segments(c, b);
+    k[2] = _segments(c, d);
+    k[3] = _segments(c, e);
+    let is [260]f64 as pxs;
+    let is [260]f64 as pys;
+    let is [260]f64 as qxs;
+    let is [260]f64 as qys;
+    let is i64 as n = _outline(cast(*f64, &pxs), cast(*f64, &pys), x, y, w, h, a, b, d, e, cast(*i64, &k));
+    let is f64 as ia with mut = a - bw;
+    if (ia < 0.0) { ia = 0.0; }
+    let is f64 as ib with mut = b - bw;
+    if (ib < 0.0) { ib = 0.0; }
+    let is f64 as id with mut = d - bw;
+    if (id < 0.0) { id = 0.0; }
+    let is f64 as ie with mut = e - bw;
+    if (ie < 0.0) { ie = 0.0; }
+    // The inner outline with the outer's segment counts, so the two match
+    // point for point even where an inner corner has gone square.
+    _inner_outline(cast(*f64, &qxs), cast(*f64, &qys), x + bw, y + bw, w - bw * 2.0, h - bw * 2.0,
+                   ia, ib, id, ie, cast(*i64, &k));
+    if (n < 3 || n > MAX_POINTS) { return; }
+
+    let is [260]f64 as mx;
+    let is [260]f64 as my;
+    _miters(cast(*f64, &pxs), cast(*f64, &pys), n, cast(*f64, &mx), cast(*f64, &my));
+    let is f64 as half = px * 0.5;
+    let is math.color.Color as clear = _with_alpha(fill, 0.0);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as j = (i + 1) % n;
+        // Outer fringe, band, inner fringe — each a quad between the same
+        // pair of points on the two outlines, moved along the outer normals.
+        let is f64 as po_xi = pxs[i] + mx[i] * half;
+        let is f64 as po_yi = pys[i] + my[i] * half;
+        let is f64 as po_xj = pxs[j] + mx[j] * half;
+        let is f64 as po_yj = pys[j] + my[j] * half;
+        let is f64 as pi_xi = pxs[i] - mx[i] * half;
+        let is f64 as pi_yi = pys[i] - my[i] * half;
+        let is f64 as pi_xj = pxs[j] - mx[j] * half;
+        let is f64 as pi_yj = pys[j] - my[j] * half;
+        let is f64 as qi_xi = qxs[i] + mx[i] * half;
+        let is f64 as qi_yi = qys[i] + my[i] * half;
+        let is f64 as qi_xj = qxs[j] + mx[j] * half;
+        let is f64 as qi_yj = qys[j] + my[j] * half;
+        let is f64 as qo_xi = qxs[i] - mx[i] * half;
+        let is f64 as qo_yi = qys[i] - my[i] * half;
+        let is f64 as qo_xj = qxs[j] - mx[j] * half;
+        let is f64 as qo_yj = qys[j] - my[j] * half;
+        draw2d.triangle(c, pi_xi, pi_yi, fill, pi_xj, pi_yj, fill, po_xj, po_yj, clear);
+        draw2d.triangle(c, pi_xi, pi_yi, fill, po_xj, po_yj, clear, po_xi, po_yi, clear);
+        draw2d.triangle(c, qi_xi, qi_yi, fill, qi_xj, qi_yj, fill, pi_xj, pi_yj, fill);
+        draw2d.triangle(c, qi_xi, qi_yi, fill, pi_xj, pi_yj, fill, pi_xi, pi_yi, fill);
+        draw2d.triangle(c, qo_xi, qo_yi, clear, qo_xj, qo_yj, clear, qi_xj, qi_yj, fill);
+        draw2d.triangle(c, qo_xi, qo_yi, clear, qi_xj, qi_yj, fill, qi_xi, qi_yi, fill);
+        i = i + 1;
+    }
+}
+
+// Like _outline, but a corner whose radius has gone to zero still produces
+// k + 1 points — all at the corner — so it matches the outer outline.
+fn _inner_outline(xs as *f64, ys as *f64, x as f64, y as f64, w as f64, h as f64,
+                  rtl as f64, rtr as f64, rbr as f64, rbl as f64, k as *i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is f64 as pi = fm.PI;
+    n = _corner_k(xs, ys, n, x + rtl, y + rtl, rtl, pi, k[0]);
+    n = _corner_k(xs, ys, n, x + w - rtr, y + rtr, rtr, pi * 1.5, k[1]);
+    n = _corner_k(xs, ys, n, x + w - rbr, y + h - rbr, rbr, 0.0, k[2]);
+    n = _corner_k(xs, ys, n, x + rbl, y + h - rbl, rbl, pi * 0.5, k[3]);
+    return n;
+}
+
+fn _corner_k(xs as *f64, ys as *f64, at as i64, cx as f64, cy as f64, r as f64, a0 as f64, k as i64) as i64 {
+    if (k == 0) {
+        xs[at] = cx;
+        ys[at] = cy;
+        return at + 1;
+    }
+    return _corner(xs, ys, at, cx, cy, r, a0, k);
+}
+
+// A straight line of the given width, with square ends at the points.
+fn line(c as *draw2d.Canvas, x0 as f64, y0 as f64, x1 as f64, y1 as f64, width as f64, col as math.color.Color) as void {
+    let is f64 as dx = x1 - x0;
+    let is f64 as dy = y1 - y0;
+    let is f64 as len = fm.sqrt(dx * dx + dy * dy);
+    if (len <= 0.0 || width <= 0.0) { return; }
+    let is f64 as hw = width * 0.5;
+    if (dy == 0.0) {
+        let is f64 as left with mut = x0;
+        if (x1 < left) { left = x1; }
+        fill_rect(c, left, y0 - hw, len, width, col);
+        return;
+    }
+    if (dx == 0.0) {
+        let is f64 as up with mut = y0;
+        if (y1 < up) { up = y1; }
+        fill_rect(c, x0 - hw, up, width, len, col);
+        return;
+    }
+    let is f64 as nx = 0.0 - dy / len * hw;
+    let is f64 as ny = dx / len * hw;
+    let is [4]f64 as xs;
+    let is [4]f64 as ys;
+    xs[0] = x0 + nx; ys[0] = y0 + ny;
+    xs[1] = x1 + nx; ys[1] = y1 + ny;
+    xs[2] = x1 - nx; ys[2] = y1 - ny;
+    xs[3] = x0 - nx; ys[3] = y0 - ny;
+    fill_convex(c, cast(*f64, &xs), cast(*f64, &ys), 4, col);
+}
+
+// The soft shadow of a rounded rectangle: col at full strength blur inside the
+// edge, fading to nothing blur outside it. The 50% line is the edge itself.
+fn shadow(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64,
+          radius as f64, blur as f64, col as math.color.Color) as void {
+    if (blur <= 0.0) {
+        fill_rounded(c, x, y, w, h, radius, radius, radius, radius, col);
+        return;
+    }
+    let is f64 as r = _clamp_radius(radius, w, h);
+    let is [4]i64 as k;
+    k[0] = _segments(c, r);
+    k[1] = k[0];
+    k[2] = k[0];
+    k[3] = k[0];
+    let is [260]f64 as xs;
+    let is [260]f64 as ys;
+    let is i64 as n = _outline(cast(*f64, &xs), cast(*f64, &ys), x, y, w, h, r, r, r, r, cast(*i64, &k));
+    _fill_convex(c, cast(*f64, &xs), cast(*f64, &ys), n, blur * 2.0, col, col, 0.0, 0.0);
+}

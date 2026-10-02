@@ -1,0 +1,243 @@
+// render/draw2d_test.cst — the 2D family: a canvas that batches, clips and
+// layers, and the shapes drawn on it.
+//
+// Everything is drawn through a headless software device and read back, so
+// what is checked is pixels.
+use "std/io.cst" as io;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "draw2d.cst" as draw2d;
+use "shapes2d.cst" as shapes;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn eq(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        io.printf("FAIL: %s: got %x, want %x\n", name, cast(i32, got), cast(i32, want));
+        fails = fails + 1;
+    }
+}
+
+let is i64 as W with imut = 32;
+let is i64 as H with imut = 32;
+let is [1024]i32 as px with mut;
+
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as cmd with mut = 0;
+
+fn pixel(x as i64, y as i64) as i64 { return cast(i64, px[y * W + x]) & 4294967295; }
+fn red_of(x as i64, y as i64) as i64 { return pixel(x, y) & 255; }
+fn green_of(x as i64, y as i64) as i64 { return (pixel(x, y) >> 8) & 255; }
+fn blue_of(x as i64, y as i64) as i64 { return (pixel(x, y) >> 16) & 255; }
+
+// Records the canvas into a pass that clears to black, submits, reads back.
+fn present(c as *draw2d.Canvas) as i32 {
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass(target, 0, math.color.black());
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    let is i32 as ok = draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    return ok;
+}
+
+let is i64 as RED   with imut = 4278190335;   // 0xFF0000FF
+let is i64 as BLACK with imut = 4278190080;   // 0xFF000000
+let is i64 as BLUE  with imut = 4294901760;   // 0xFFFF0000
+
+fn main() as i32 {
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as l = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &l);
+    check("canvas open", draw2d.is_open(&c));
+    let is math.color.Color as red = math.color.red();
+
+    // --- A rectangle on whole pixels has crisp edges ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.fill_rect(&c, 4.0, 4.0, 8.0, 8.0, red);
+    present(&c);
+    eq("inside, top-left", pixel(4, 4), RED);
+    eq("inside, bottom-right", pixel(11, 11), RED);
+    eq("left neighbour untouched", pixel(3, 8), BLACK);
+    eq("right neighbour untouched", pixel(12, 8), BLACK);
+    eq("below untouched", pixel(8, 12), BLACK);
+
+    // --- Half a pixel: half the colour ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.fill_rect(&c, 4.5, 4.0, 8.0, 8.0, red);
+    present(&c);
+    let is i64 as edge = red_of(4, 8);
+    check("half-covered pixel is half red", edge >= 115 && edge <= 140);
+    eq("fully covered after it", pixel(5, 8), RED);
+
+    // --- Logical units are scaled to pixels ---
+    draw2d.begin(&c, 32.0, 32.0, 2.0);
+    shapes.fill_rect(&c, 1.0, 1.0, 2.0, 2.0, red);
+    present(&c);
+    eq("scaled: starts at 2", pixel(2, 2), RED);
+    eq("scaled: ends at 5", pixel(5, 5), RED);
+    eq("scaled: stops at 6", pixel(6, 4), BLACK);
+
+    // --- Clipping, nested ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    draw2d.push_clip(&c, 0.0, 0.0, 8.0, 32.0);
+    shapes.fill_rect(&c, 0.0, 0.0, 32.0, 2.0, red);
+    draw2d.push_clip(&c, 4.0, 0.0, 16.0, 32.0);
+    shapes.fill_rect(&c, 0.0, 4.0, 32.0, 2.0, red);
+    draw2d.pop_clip(&c);
+    shapes.fill_rect(&c, 0.0, 8.0, 32.0, 2.0, red);
+    draw2d.pop_clip(&c);
+    shapes.fill_rect(&c, 0.0, 12.0, 32.0, 2.0, red);
+    present(&c);
+    eq("outer clip: inside", pixel(7, 0), RED);
+    eq("outer clip: outside", pixel(8, 0), BLACK);
+    eq("nested clip: before its start", pixel(3, 4), BLACK);
+    eq("nested clip: inside both", pixel(5, 4), RED);
+    eq("nested clip: outside the outer", pixel(9, 4), BLACK);
+    eq("popped: outer clip again", pixel(3, 8), RED);
+    eq("popped: still clipped by outer", pixel(8, 8), BLACK);
+    eq("all popped: unclipped", pixel(30, 12), RED);
+
+    // --- Layers decide what is on top, not the order drawn ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    draw2d.set_layer(&c, 1);
+    shapes.fill_rect(&c, 0.0, 0.0, 4.0, 4.0, math.color.blue());
+    draw2d.set_layer(&c, 0);
+    shapes.fill_rect(&c, 0.0, 0.0, 4.0, 4.0, red);
+    present(&c);
+    eq("higher layer on top", pixel(1, 1), BLUE);
+
+    // --- Batching: one batch until something changes ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.fill_rect(&c, 0.0, 0.0, 4.0, 4.0, red);
+    shapes.fill_rect(&c, 8.0, 0.0, 4.0, 4.0, red);
+    eq("same state, one batch", draw2d.batch_count(&c), 1);
+    draw2d.push_clip(&c, 0.0, 0.0, 16.0, 16.0);
+    shapes.fill_rect(&c, 0.0, 8.0, 4.0, 4.0, red);
+    eq("a new clip, a new batch", draw2d.batch_count(&c), 2);
+    draw2d.pop_clip(&c);
+
+    // --- Rounded corners ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.fill_rounded(&c, 4.0, 4.0, 16.0, 16.0, 6.0, 6.0, 6.0, 6.0, red);
+    present(&c);
+    check("corner cut away", red_of(4, 4) < 40);
+    eq("middle solid", pixel(12, 12), RED);
+    eq("edge middle solid", pixel(4, 12), RED);
+    let is i64 as corner_diff = red_of(4, 4) - red_of(19, 19);
+    check("corners alike", corner_diff >= 0 - 3 && corner_diff <= 3);
+
+    // --- A border inside the shape's edge ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.stroke_rounded(&c, 4.0, 4.0, 16.0, 16.0, 0.0, 0.0, 0.0, 0.0, 2.0, red);
+    present(&c);
+    eq("border outer row", pixel(10, 4), RED);
+    eq("border inner row", pixel(10, 5), RED);
+    eq("inside the border untouched", pixel(10, 6), BLACK);
+    eq("outside the border untouched", pixel(10, 3), BLACK);
+    eq("left border", pixel(4, 10), RED);
+    eq("right border", pixel(19, 10), RED);
+
+    // --- A circle covers about pi r squared ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.fill_circle(&c, 16.0, 16.0, 10.0, red);
+    present(&c);
+    let is i64 as covered with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        covered = covered + (cast(i64, px[i]) & 255);
+        i = i + 1;
+    }
+    // pi * 100 = 314.16 pixels, counted as total red / 255.
+    let is i64 as area = covered / 255;
+    check("circle area within 2%", area >= 308 && area <= 320);
+
+    // --- A line, two pixels wide ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.line(&c, 2.0, 10.0, 30.0, 10.0, 2.0, red);
+    present(&c);
+    eq("line covers row 9", pixel(16, 9), RED);
+    eq("line covers row 10", pixel(16, 10), RED);
+    eq("not row 8", pixel(16, 8), BLACK);
+    eq("not row 11", pixel(16, 11), BLACK);
+
+    // --- A glyph: coverage from an R8 atlas, in the colour asked for ---
+    let is gpu.texture.Desc as gd = gpu.texture.desc(2, 1, gpu.texture.R8, gpu.texture.SAMPLED);
+    let is i64 as atlas = gpu.texture.create(&dv, &gd);
+    let is [2]u8 as cov;
+    cov[0] = 255;
+    cov[1] = 0;
+    gpu.texture.upload(&dv, atlas, cast(*u8, &cov), 2);
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    draw2d.glyph(&c, atlas, 0.0, 0.0, 8.0, 8.0, 0.0, 0.0, 0.5, 1.0, math.color.blue());
+    draw2d.glyph(&c, atlas, 8.0, 0.0, 8.0, 8.0, 0.5, 0.0, 1.0, 1.0, math.color.blue());
+    present(&c);
+    eq("covered texel: the colour", pixel(3, 3), BLUE);
+    eq("uncovered texel: nothing", pixel(11, 3), BLACK);
+
+    // --- An image, sampled without smoothing ---
+    let is gpu.texture.Desc as id = gpu.texture.desc(2, 1, gpu.texture.RGBA8, gpu.texture.SAMPLED);
+    let is i64 as img = gpu.texture.create(&dv, &id);
+    let is [2]i32 as two;
+    two[0] = cast(i32, RED);
+    two[1] = cast(i32, BLUE);
+    gpu.texture.upload(&dv, img, cast(*u8, &two), 8);
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    draw2d.image(&c, img, 0, 0.0, 0.0, 16.0, 8.0, 0.0, 0.0, 1.0, 1.0, math.color.white());
+    present(&c);
+    eq("image left half", pixel(3, 3), RED);
+    eq("image right half", pixel(12, 3), BLUE);
+
+    // --- A vertical gradient ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.fill_rounded_gradient(&c, 0.0, 0.0, 32.0, 32.0, 0.0, 0.0, 0.0, 0.0, red, math.color.blue());
+    present(&c);
+    check("top is red", red_of(16, 0) > 240 && blue_of(16, 0) < 15);
+    check("bottom is blue", blue_of(16, 31) > 240 && red_of(16, 31) < 15);
+    check("middle is between", red_of(16, 16) > 100 && blue_of(16, 16) > 100);
+    // The same through the fringed path a rounded shape takes.
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.fill_rounded_gradient(&c, 0.0, 0.0, 32.0, 32.0, 4.0, 4.0, 4.0, 4.0, red, math.color.blue());
+    present(&c);
+    check("rounded: top is red", red_of(16, 1) > 230 && blue_of(16, 1) < 25);
+    check("rounded: bottom is blue", blue_of(16, 30) > 230 && red_of(16, 30) < 25);
+
+    // --- A soft shadow fades outward ---
+    draw2d.begin(&c, 32.0, 32.0, 1.0);
+    shapes.shadow(&c, 8.0, 8.0, 16.0, 16.0, 0.0, 4.0, red);
+    present(&c);
+    check("shadow solid well inside", red_of(16, 16) > 240);
+    check("shadow half at the edge", red_of(7, 16) > 90 && red_of(7, 16) < 165);
+    check("shadow fading outside", red_of(5, 16) < red_of(7, 16));
+    check("shadow gone past the blur", red_of(2, 16) == 0);
+
+    // --- Running out of room is reported, not overrun ---
+    let is draw2d.Limits as tiny = draw2d.limits_default();
+    tiny.vertices = 6;
+    let is draw2d.Canvas as small = draw2d.open(&dv, &tiny);
+    draw2d.begin(&small, 32.0, 32.0, 1.0);
+    shapes.fill_rect(&small, 0.0, 0.0, 4.0, 4.0, red);
+    shapes.fill_rect(&small, 8.0, 8.0, 4.0, 4.0, red);
+    check("overflow noticed", draw2d.overflowed(&small));
+    check("and flush reports it", present(&small) == 0);
+    draw2d.close(&small);
+
+    draw2d.close(&c);
+    gpu.close(&dv);
+    if (fails != 0) { return 1; }
+    io.printf("render 2d: all checks passed\n");
+    return 0;
+}
