@@ -17,16 +17,15 @@
 //
 // Right to left puts column 0 at the right. Padding is physical, as in box.
 //
-// At most MAX_COLS columns and MAX_ROWS rows; a child outside them is not
-// placed.
+// The columns and rows are worked out in the tree's scratch, as many as the
+// highest cell named. A grid so sparse that its tracks do not fit — a cell at
+// column 100000 in a tree of a few thousand widgets — is not laid out and sets
+// LAYOUT_TOO_LARGE on the tree, rather than quietly dropping cells.
 use "../math/math.cst" as math;
 use "tree.cst" as tree;
 use "widget.cst" as widget;
 use "geom.cst" as geom;
 use "layout.cst" as layout;
-
-let is i64 as MAX_COLS with imut = 64;
-let is i64 as MAX_ROWS with imut = 256;
 
 struct Data {
     col_spacing as f64;
@@ -84,13 +83,21 @@ fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
 // size (the decided one after _decide) and the stretch.
 struct Track {
     n       as i64;
-    size    as [256]f64;
-    mins    as [256]f64;
-    maxs    as [256]f64;
-    stretch as [256]f64;
+    size    as *f64;
+    mins    as *f64;
+    maxs    as *f64;
+    stretch as *f64;
 }
 
-fn _track_clear(k as *Track, n as i64) as void {
+// Takes n entries from the tree's scratch and clears them. 0, with the tree's
+// error set, when they do not fit.
+fn _track_alloc(t as *tree.Tree, k as *Track, n as i64) as i32 {
+    k.n = 0;
+    k.size = cast(*f64, tree.scratch_alloc(t, n * 8));
+    k.mins = cast(*f64, tree.scratch_alloc(t, n * 8));
+    k.maxs = cast(*f64, tree.scratch_alloc(t, n * 8));
+    k.stretch = cast(*f64, tree.scratch_alloc(t, n * 8));
+    if (cast(i64, k.stretch) == 0) { return 0; }
     k.n = n;
     let is i64 as i with mut = 0;
     while (i < n) {
@@ -100,6 +107,7 @@ fn _track_clear(k as *Track, n as i64) as void {
         k.stretch[i] = 0.0;
         i = i + 1;
     }
+    return 1;
 }
 
 fn _gaps(spacing as f64, n as i64) as f64 {
@@ -123,8 +131,6 @@ fn _extent(t as *tree.Tree, w as i64, rows as *i64, cols as *i64) as void {
         }
         ch = tree.next_sibling(t, ch);
     }
-    if (*rows > MAX_ROWS) { *rows = MAX_ROWS; }
-    if (*cols > MAX_COLS) { *cols = MAX_COLS; }
 }
 
 fn _fits(it as *geom.Item, rows as i64, cols as i64) as i32 {
@@ -231,8 +237,7 @@ fn _sum(k as *Track, mins as i32) as f64 {
 
 fn _decide(k as *Track, room as f64) as void {
     if (k.n == 0) { return; }
-    layout.distribute(k.n, cast(*f64, &k.size), cast(*f64, &k.mins), cast(*f64, &k.maxs),
-                      cast(*f64, &k.stretch), room);
+    layout.distribute(k.n, k.size, k.mins, k.maxs, k.stretch, room);
 }
 
 // --- Measuring ---
@@ -245,10 +250,14 @@ fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out a
     let is i64 as ncols with mut = 0;
     _extent(t, w, &nrows, &ncols);
 
+    let is i64 as mark = tree.scratch_mark(t);
     let is Track as cols;
     let is Track as rows;
-    _track_clear(&cols, ncols);
-    _track_clear(&rows, nrows);
+    if (_track_alloc(t, &cols, ncols) == 0 || _track_alloc(t, &rows, nrows) == 0) {
+        tree.scratch_release(t, mark);
+        geom.size_zero(out);
+        return;
+    }
     _columns(t, w, d, nrows, &cols);
     let is f64 as gaps_w = _gaps(d.col_spacing, ncols);
     out.min_w = _sum(&cols, 1) + gaps_w + ph;
@@ -263,6 +272,7 @@ fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out a
     out.min_h = _sum(&rows, 1) + gaps_h + pv;
     out.pref_h = _sum(&rows, 0) + gaps_h + pv;
     out.max_h = layout.UNBOUNDED;
+    tree.scratch_release(t, mark);
 }
 
 // --- Arranging ---
@@ -274,18 +284,23 @@ fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as voi
     _extent(t, w, &nrows, &ncols);
     if (nrows == 0 || ncols == 0) { return; }
 
+    let is i64 as mark = tree.scratch_mark(t);
     let is Track as cols;
     let is Track as rows;
-    _track_clear(&cols, ncols);
-    _track_clear(&rows, nrows);
+    let is i32 as ok with mut = 1;
+    if (_track_alloc(t, &cols, ncols) == 0 || _track_alloc(t, &rows, nrows) == 0) { ok = 0; }
+    // Where each column and row starts.
+    let is *f64 as colx = cast(*f64, tree.scratch_alloc(t, (ncols + 1) * 8));
+    let is *f64 as rowy = cast(*f64, tree.scratch_alloc(t, (nrows + 1) * 8));
+    if (ok == 0 || cast(i64, rowy) == 0) {
+        tree.scratch_release(t, mark);
+        return;
+    }
     _columns(t, w, d, nrows, &cols);
     _decide(&cols, r.w - d.pad_l - d.pad_r - _gaps(d.col_spacing, ncols));
     _rows(t, w, d, &cols, &rows);
     _decide(&rows, r.h - d.pad_t - d.pad_b - _gaps(d.row_spacing, nrows));
 
-    // Where each column and row starts.
-    let is [257]f64 as colx;
-    let is [257]f64 as rowy;
     colx[0] = d.pad_l;
     let is i64 as i with mut = 0;
     while (i < ncols) { colx[i + 1] = colx[i] + cols.size[i] + d.col_spacing; i = i + 1; }
@@ -309,4 +324,5 @@ fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as voi
         }
         ch = tree.next_sibling(t, ch);
     }
+    tree.scratch_release(t, mark);
 }

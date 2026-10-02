@@ -25,6 +25,7 @@ let is i32 as INVALID_HANDLE with imut = 2;
 let is i32 as BAD_ARGUMENT   with imut = 3;
 let is i32 as DATA_TOO_BIG   with imut = 4;
 let is i32 as OUT_OF_MEMORY  with imut = 5;
+let is i32 as LAYOUT_TOO_LARGE with imut = 6;   // a container needed more scratch than there is
 
 // --- Flags ---
 //
@@ -76,9 +77,26 @@ struct Tree {
     root        as i64;   // slot index of the root
     block       as *u8;
     block_bytes as i64;
+    scratch       as *u8;   // see scratch_alloc
+    scratch_bytes as i64;
+    scratch_used  as i64;
     err         as i32;
     ok          as i32;
 }
+
+// --- Scratch ---
+//
+// Room containers work in while they measure and arrange — the sizes of their
+// children, the widths of a grid's columns — taken in stack order and given
+// back before they return. It is part of the tree's one mapping, sized from
+// the capacity, so laying out allocates nothing.
+//
+// Two entries per widget is enough for any tree: the containers active at once
+// form a path from the root, and the children of different containers on one
+// path are different widgets. A grid is the exception — its tracks run to the
+// highest row and column named, which a sparse grid can push past that — and a
+// grid that needs more says so with LAYOUT_TOO_LARGE rather than dropping cells.
+let is i64 as SCRATCH_ENTRY_BYTES with imut = 48;
 
 // The root's kind. Module scope rather than inside the Tree, because a Tree
 // is returned by value and a pointer into it would not survive the copy.
@@ -121,6 +139,9 @@ fn open(l as *Limits) as Tree {
     t.data = cast(*u8, 0);
     t.block = cast(*u8, 0);
     t.block_bytes = 0;
+    t.scratch = cast(*u8, 0);
+    t.scratch_bytes = 0;
+    t.scratch_used = 0;
     t.cap = 0;
     t.live = 0;
     t.next_free = 0;
@@ -134,7 +155,10 @@ fn open(l as *Limits) as Tree {
     t.stride = (l.data_bytes + 7) / 8 * 8;
     t.cap = l.widgets;
     let is i64 as node_bytes = t.cap * sizeof(Node);
-    let is i64 as total = node_bytes + t.cap * t.stride;
+    let is i64 as data_bytes = t.cap * t.stride;
+    t.scratch_bytes = (2 * t.cap + 64) * SCRATCH_ENTRY_BYTES;
+    t.scratch_used = 0;
+    let is i64 as total = node_bytes + data_bytes + t.scratch_bytes;
     let is *u8 as block = mem.core.mmap_anon(total);
     if (cast(i64, block) == 0) { t.err = OUT_OF_MEMORY; return t; }
     mem.core.memzero(block, total);
@@ -142,6 +166,7 @@ fn open(l as *Limits) as Tree {
     t.block_bytes = total;
     t.nodes = block;
     t.data = cast(*u8, cast(i64, block) + node_bytes);
+    t.scratch = cast(*u8, cast(i64, block) + node_bytes + data_bytes);
 
     // Eras start at 1 so the null handle can never match slot 0.
     let is i64 as i with mut = 0;
@@ -170,6 +195,27 @@ fn close(t as *Tree) as void {
 }
 
 fn is_open(t as *Tree) as i32 { return t.ok; }
+
+// Where the scratch stack stands now, to hand back to scratch_release.
+fn scratch_mark(t as *Tree) as i64 { return t.scratch_used; }
+
+// bytes of scratch, 8-aligned, or null with LAYOUT_TOO_LARGE when there is not
+// enough left. Not zeroed.
+fn scratch_alloc(t as *Tree, bytes as i64) as *u8 {
+    let is i64 as n = (bytes + 7) / 8 * 8;
+    if (n < 0 || t.scratch_used + n > t.scratch_bytes) {
+        t.err = LAYOUT_TOO_LARGE;
+        return cast(*u8, 0);
+    }
+    let is *u8 as p = cast(*u8, cast(i64, t.scratch) + t.scratch_used);
+    t.scratch_used = t.scratch_used + n;
+    return p;
+}
+
+// Gives back everything taken since mark.
+fn scratch_release(t as *Tree, mark as i64) as void {
+    if (mark >= 0 && mark <= t.scratch_used) { t.scratch_used = mark; }
+}
 fn root(t as *Tree) as i64 { return _handle(t, t.root); }
 fn live_count(t as *Tree) as i64 { return t.live; }
 fn capacity(t as *Tree) as i64 { return t.cap; }

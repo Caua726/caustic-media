@@ -14,11 +14,9 @@
 // physical — left is left in either direction — the same as margins.
 //
 // The sharing along the main axis is layout.distribute, the same a grid uses
-// for its columns and rows.
-//
-// A box arranges at most MAX_CHILDREN visible children; the sizes live on the
-// stack for the duration of one arrange. A list long enough to exceed that is
-// a list view's job, which creates widgets only for the rows on screen.
+// for its columns and rows. The children's sizes are kept in the tree's
+// scratch for the length of one measure or arrange, so a box takes as many
+// children as the tree holds.
 use "../math/math.cst" as math;
 use "tree.cst" as tree;
 use "widget.cst" as widget;
@@ -27,8 +25,6 @@ use "layout.cst" as layout;
 
 let is i32 as ROW    with imut = 0;
 let is i32 as COLUMN with imut = 1;
-
-let is i64 as MAX_CHILDREN with imut = 256;
 
 struct Data {
     orientation as i32;
@@ -107,17 +103,32 @@ fn _add(a as f64, b as f64) as f64 {
 // cross-axis room given. Measuring and arranging both start from it.
 struct Line {
     n       as i64;
-    kids    as [256]i64;
-    size    as [256]f64;   // preferred on collection, decided after _share
-    mins    as [256]f64;
-    maxs    as [256]f64;
-    stretch as [256]f64;
+    kids    as *i64;
+    size    as *f64;   // preferred on collection, decided after _share
+    mins    as *f64;
+    maxs    as *f64;
+    stretch as *f64;
 }
 
-fn _collect(t as *tree.Tree, w as i64, d as *Data, cc as *geom.Constraint, line as *Line) as void {
+// Fills line from the tree's scratch; the caller releases it. Returns 0, with
+// the tree's error set, when there is not room for the children.
+fn _collect(t as *tree.Tree, w as i64, d as *Data, cc as *geom.Constraint, line as *Line) as i32 {
+    let is i64 as count with mut = 0;
+    let is i64 as c0 with mut = tree.first_child(t, w);
+    while (c0 != 0) {
+        if (tree.is_visible(t, c0) == 1) { count = count + 1; }
+        c0 = tree.next_sibling(t, c0);
+    }
     line.n = 0;
+    line.kids = cast(*i64, tree.scratch_alloc(t, count * 8));
+    line.size = cast(*f64, tree.scratch_alloc(t, count * 8));
+    line.mins = cast(*f64, tree.scratch_alloc(t, count * 8));
+    line.maxs = cast(*f64, tree.scratch_alloc(t, count * 8));
+    line.stretch = cast(*f64, tree.scratch_alloc(t, count * 8));
+    if (cast(i64, line.stretch) == 0) { return 0; }
+
     let is i64 as ch with mut = tree.first_child(t, w);
-    while (ch != 0 && line.n < MAX_CHILDREN) {
+    while (ch != 0) {
         if (tree.is_visible(t, ch) == 1) {
             let is geom.Size as s;
             layout.measure(t, ch, cc, &s);
@@ -135,6 +146,7 @@ fn _collect(t as *tree.Tree, w as i64, d as *Data, cc as *geom.Constraint, line 
         }
         ch = tree.next_sibling(t, ch);
     }
+    return 1;
 }
 
 // Decides the main-axis sizes for `room`, gaps already taken off.
@@ -146,8 +158,7 @@ fn _share(d as *Data, line as *Line, room as f64) as void {
         while (i < line.n) { line.size[i] = _max(each, line.mins[i]); i = i + 1; }
         return;
     }
-    layout.distribute(line.n, cast(*f64, &line.size), cast(*f64, &line.mins), cast(*f64, &line.maxs),
-                      cast(*f64, &line.stretch), room);
+    layout.distribute(line.n, line.size, line.mins, line.maxs, line.stretch, room);
 }
 
 fn _gaps(d as *Data, n as i64) as f64 {
@@ -176,8 +187,13 @@ fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out a
         if (c.w < layout.UNBOUNDED) { cc.w = _max(0.0, c.w - ph); }
     }
 
+    let is i64 as mark = tree.scratch_mark(t);
     let is Line as line;
-    _collect(t, w, d, &cc, &line);
+    if (_collect(t, w, d, &cc, &line) == 0) {
+        tree.scratch_release(t, mark);
+        geom.size_zero(out);
+        return;
+    }
     let is i64 as n = line.n;
 
     let is f64 as main_min with mut = 0.0;
@@ -247,6 +263,7 @@ fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out a
         out.max_w = layout.UNBOUNDED;
         out.max_h = layout.UNBOUNDED;
     }
+    tree.scratch_release(t, mark);
 }
 
 // --- Arranging ---
@@ -266,10 +283,13 @@ fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as voi
 
     let is geom.Constraint as cc with mut = geom.constraint(cross_room, layout.UNBOUNDED);
     if (row == 1) { cc = geom.constraint(layout.UNBOUNDED, cross_room); }
+    let is i64 as mark = tree.scratch_mark(t);
     let is Line as line;
-    _collect(t, w, d, &cc, &line);
+    if (_collect(t, w, d, &cc, &line) == 0 || line.n == 0) {
+        tree.scratch_release(t, mark);
+        return;
+    }
     let is i64 as n = line.n;
-    if (n == 0) { return; }
     _share(d, &line, main_room - _gaps(d, n));
 
     let is i32 as rtl with mut = 0;
@@ -290,4 +310,5 @@ fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as voi
         pos = pos + size + d.spacing;
         i = i + 1;
     }
+    tree.scratch_release(t, mark);
 }

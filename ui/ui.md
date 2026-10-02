@@ -320,7 +320,10 @@ invalidation that climbs to the root.
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
 with its test): margins, alignment, minimum and maximum, right to left,
 height for width, a pass that skips what did not change, and box, grid, stack
-and overlay. The tests were checked against deliberate breakages — each rule
+and overlay. No container has a fixed ceiling on children: they work in a
+scratch area that is part of the tree's mapping, sized from its capacity, and a
+grid too sparse to fit says so with `LAYOUT_TOO_LARGE` instead of dropping
+cells. The tests were checked against deliberate breakages — each rule
 removed in turn — and catch every one.
 
 Nothing is drawn yet; event routing and signals come next, testable with
