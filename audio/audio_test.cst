@@ -1,10 +1,35 @@
 // audio/audio_test.cst — unit and integration tests for audio layer.
 
 use "std/io.cst" as io;
+use "std/os/linux.cst" as os;
+use "std/time.cst" as time;
 use "audio.cst" as audio;
 use "convert.cst" as conv;
 use "alsa/pcm.cst" as pcm;
 use "alsa/backend.cst" as backend;
+
+// Finds a playback device nothing holds and opens it non-blocking, which is
+// enough to make it busy for everyone else. Returns the fd, or -1 when this
+// machine has none free; card and device come back through the pointers.
+fn hold_free_device(card as *i32, dev_num as *i32) as i64 {
+    let is [32]u8 as path;
+    let is i32 as c with mut = 0;
+    while (c < 4) {
+        let is i32 as dn with mut = 0;
+        while (dn < 32) {
+            backend.format_pcm_path(cast(*u8, &path), c, dn);
+            let is i64 as fd = os.open(cast(*u8, &path), os.O_RDWR | os.O_NONBLOCK, 0);
+            if (fd >= 0) {
+                *card = c;
+                *dev_num = dn;
+                return fd;
+            }
+            dn = dn + 1;
+        }
+        c = c + 1;
+    }
+    return 0 - 1;
+}
 
 fn main() as i32 {
     io.printf("testing audio layer...\n");
@@ -77,6 +102,18 @@ fn main() as i32 {
         io.printf("audio hardware detected: rate=%d, channels=%d, period=%d, buffer=%d\n",
                   d.sample_rate, d.channels, cast(i32, d.period_size), cast(i32, d.buffer_size));
 
+        // The sizes the Config asks for are the sizes the device gets. Left to
+        // itself the kernel picks the smallest period the hardware allows — 32
+        // frames, two thirds of a millisecond, on the machine this was found on.
+        // 512 and 2048 are the defaults and every PCM in common use takes them.
+        if (d.period_size != cast(i64, cfg.period_size) || d.buffer_size != cast(i64, cfg.buffer_size)) {
+            io.printf("FAIL: asked for period=%d buffer=%d, got period=%d buffer=%d\n",
+                      cfg.period_size, cfg.buffer_size,
+                      cast(i32, d.period_size), cast(i32, d.buffer_size));
+            audio.close(&d);
+            return 11;
+        }
+
         // Write a small buffer of silence
         let is [1024]i16 as silence;
         let is i64 as si with mut = 0;
@@ -88,8 +125,67 @@ fn main() as i32 {
             return 9;
         }
         audio.close(&d);
+
+        // A size no hardware takes still opens, with what the kernel chose:
+        // the Config is a request, and failing to open over a period size
+        // would be worse than the period it gets.
+        let is audio.device.Config as odd = audio.config_default();
+        odd.period_size = 3;
+        odd.buffer_size = 5;
+        let is audio.device.Device as od = audio.open(&odd);
+        let is i32 as odd_open = audio.is_open(&od);
+        audio.close(&od);
+        if (odd_open == 0) {
+            io.printf("FAIL: period=3 buffer=5 refused to open instead of falling back\n");
+            return 12;
+        }
+
+        // close() plays out what was written instead of discarding it. With the
+        // buffer full, a DROP returns at once and the last ~40 ms never reach
+        // the speaker; a DRAIN waits for them. When writei returns, at least
+        // buffer minus one period is still queued — 32 ms at 48 kHz — so a
+        // close of a full buffer that takes under half of that dropped it.
+        let is audio.device.Device as dd = audio.open(&cfg);
+        if (audio.is_open(&dd) == 1) {
+            let is [4096]i16 as quiet;
+            let is i64 as qi with mut = 0;
+            while (qi < 4096) { quiet[qi] = 0; qi = qi + 1; }
+            let is i64 as frames with mut = dd.buffer_size;
+            if (frames > 2048) { frames = 2048; }
+            audio.write_s16(&dd, cast(*i16, &quiet), frames);
+            let is i64 as t0 = time.now_ns();
+            audio.close(&dd);
+            let is i64 as close_ms = time.elapsed_ms(t0);
+            if (close_ms < 16) {
+                io.printf("FAIL: close of a full buffer took %d ms — the queued audio was dropped\n",
+                          cast(i32, close_ms));
+                return 13;
+            }
+        }
     } else {
         io.printf("note: no physical audio output accessible in this environment (skipped)\n");
+    }
+
+    // 6. A device something else holds is reported as not open, not waited for.
+    //
+    // The kernel's PCM open sleeps until a busy device is released unless the
+    // file is opened O_NONBLOCK — so with PipeWire or another program playing,
+    // audio.open() never returned. Hold a device and ask for exactly that one.
+    let is i32 as busy_card with mut = 0;
+    let is i32 as busy_dev with mut = 0;
+    let is i64 as held = hold_free_device(&busy_card, &busy_dev);
+    if (held >= 0) {
+        let is audio.device.Config as bcfg = audio.config_default();
+        bcfg.card = busy_card;
+        bcfg.device = busy_dev;
+        let is audio.device.Device as bd = audio.open(&bcfg);
+        let is i32 as opened = audio.is_open(&bd);
+        audio.close(&bd);
+        os.close(held);
+        if (opened == 1) {
+            io.printf("FAIL: opened pcmC%dD%dp while another fd held it\n", busy_card, busy_dev);
+            return 10;
+        }
     }
 
     io.printf("audio layer: all checks passed\n");

@@ -30,9 +30,39 @@ fn format_pcm_path(buf as *u8, card as i32, dev_num as i32) as void {
     buf[i] = 0;
 }
 
+// One hw_params request: interleaved S16_LE at the given channels and rate. A
+// period or buffer of 0 leaves that size to the kernel, which picks the
+// smallest period the hardware allows.
+fn fill_hw_params(p as *pcm.SndPcmHwParams, channels as u32, rate as u32,
+                  period as u32, buffer as u32) as void {
+    pcm.init_hw_params(p);
+    pcm.mask_set(&p.masks[pcm.HW_PARAM_ACCESS - pcm.HW_PARAM_FIRST_MASK],
+                 pcm.ACCESS_RW_INTERLEAVED);
+    pcm.mask_set(&p.masks[pcm.HW_PARAM_FORMAT - pcm.HW_PARAM_FIRST_MASK],
+                 pcm.FORMAT_S16_LE);
+    pcm.mask_set(&p.masks[pcm.HW_PARAM_SUBFORMAT - pcm.HW_PARAM_FIRST_MASK], 0);
+    pcm.interval_set(&p.intervals[pcm.HW_PARAM_CHANNELS - pcm.HW_PARAM_FIRST_INTERVAL], channels);
+    pcm.interval_set(&p.intervals[pcm.HW_PARAM_RATE - pcm.HW_PARAM_FIRST_INTERVAL], rate);
+    if (period > 0) {
+        pcm.interval_set(&p.intervals[pcm.HW_PARAM_PERIOD_SIZE - pcm.HW_PARAM_FIRST_INTERVAL], period);
+    }
+    if (buffer > 0) {
+        pcm.interval_set(&p.intervals[pcm.HW_PARAM_BUFFER_SIZE - pcm.HW_PARAM_FIRST_INTERVAL], buffer);
+    }
+}
+
 fn try_open_path(path as *u8, cfg as *dev.Config, d as *dev.Device) as i32 {
-    let is i64 as fd = os.open(path, os.O_RDWR, 0);
+    // O_NONBLOCK, because without it the kernel's PCM open sleeps until a busy
+    // device is released — with PipeWire or another program playing, that is
+    // forever. Busy has to fail here so the scan moves on. The flag comes off
+    // once the device is ours: write_frames relies on writei blocking.
+    let is i64 as fd = os.open(path, os.O_RDWR | os.O_NONBLOCK, 0);
     if (fd < 0) { return 0; }
+    let is i64 as fl = os.fcntl(fd, os.F_GETFL, 0);
+    if (fl < 0 || os.fcntl(fd, os.F_SETFL, fl & (0 - 1 - os.O_NONBLOCK)) < 0) {
+        os.close(fd);
+        return 0;
+    }
 
     let is pcm.SndPcmHwParams as params;
     pcm.init_hw_params(&params);
@@ -41,36 +71,34 @@ fn try_open_path(path as *u8, cfg as *dev.Config, d as *dev.Device) as i32 {
         return 0;
     }
 
-    pcm.mask_set(&params.masks[pcm.HW_PARAM_ACCESS - pcm.HW_PARAM_FIRST_MASK],
-                 pcm.ACCESS_RW_INTERLEAVED);
-    pcm.mask_set(&params.masks[pcm.HW_PARAM_FORMAT - pcm.HW_PARAM_FIRST_MASK],
-                 pcm.FORMAT_S16_LE);
-    pcm.mask_set(&params.masks[pcm.HW_PARAM_SUBFORMAT - pcm.HW_PARAM_FIRST_MASK], 0);
+    // Four attempts, rate first: the rate asked for with the period and buffer
+    // asked for, then that rate with the sizes left to the kernel, then the
+    // same two at the other common rate. The sizes are what the Config says,
+    // but hardware that cannot do them should still open — d reports what it
+    // actually got.
+    let is u32 as period with mut = 0;
+    if (cfg.period_size > 0) { period = cast(u32, cfg.period_size); }
+    let is u32 as buffer with mut = 0;
+    if (cfg.buffer_size > 0) { buffer = cast(u32, cfg.buffer_size); }
+    let is u32 as fallback_rate with mut = 44100;
+    if (cfg.sample_rate == 44100) { fallback_rate = 48000; }
 
-    pcm.interval_set(&params.intervals[pcm.HW_PARAM_CHANNELS - pcm.HW_PARAM_FIRST_INTERVAL],
-                     cast(u32, cfg.channels));
-    pcm.interval_set(&params.intervals[pcm.HW_PARAM_RATE - pcm.HW_PARAM_FIRST_INTERVAL],
-                     cast(u32, cfg.sample_rate));
-
-    if (pcm.ioctl_hw_params(fd, &params) != 0) {
-        // If exact rate failed, try fallback (48000 or 44100)
-        pcm.init_hw_params(&params);
-        pcm.mask_set(&params.masks[pcm.HW_PARAM_ACCESS - pcm.HW_PARAM_FIRST_MASK],
-                     pcm.ACCESS_RW_INTERLEAVED);
-        pcm.mask_set(&params.masks[pcm.HW_PARAM_FORMAT - pcm.HW_PARAM_FIRST_MASK],
-                     pcm.FORMAT_S16_LE);
-        pcm.mask_set(&params.masks[pcm.HW_PARAM_SUBFORMAT - pcm.HW_PARAM_FIRST_MASK], 0);
-        pcm.interval_set(&params.intervals[pcm.HW_PARAM_CHANNELS - pcm.HW_PARAM_FIRST_INTERVAL],
-                         cast(u32, cfg.channels));
-
-        let is u32 as fallback_rate with mut = 44100;
-        if (cfg.sample_rate == 44100) { fallback_rate = 48000; }
-        pcm.interval_set(&params.intervals[pcm.HW_PARAM_RATE - pcm.HW_PARAM_FIRST_INTERVAL], fallback_rate);
-
-        if (pcm.ioctl_hw_params(fd, &params) != 0) {
-            os.close(fd);
-            return 0;
+    let is i32 as attempt with mut = 0;
+    let is i32 as configured with mut = 0;
+    while (attempt < 4 && configured == 0) {
+        let is u32 as rate with mut = cast(u32, cfg.sample_rate);
+        if (attempt >= 2) { rate = fallback_rate; }
+        if (attempt % 2 == 0) {
+            fill_hw_params(&params, cast(u32, cfg.channels), rate, period, buffer);
+        } else {
+            fill_hw_params(&params, cast(u32, cfg.channels), rate, 0, 0);
         }
+        if (pcm.ioctl_hw_params(fd, &params) == 0) { configured = 1; }
+        attempt = attempt + 1;
+    }
+    if (configured == 0) {
+        os.close(fd);
+        return 0;
     }
 
     let is u32 as actual_rate = params.intervals[pcm.HW_PARAM_RATE - pcm.HW_PARAM_FIRST_INTERVAL].min;
@@ -174,9 +202,15 @@ fn prepare(d as *dev.Device) as i32 {
     return 0;
 }
 
+// Plays out what is still queued, then closes. DRAIN on a blocking fd waits for
+// the buffer to empty — at most buffer_size frames — where DROP would discard
+// the end of whatever was playing. DROP stays as the fallback for a stream
+// DRAIN refuses, such as one stopped by an underrun.
 fn close(d as *dev.Device) as void {
     if (d.fd >= 0) {
-        pcm.ioctl_drop(d.fd);
+        if (pcm.ioctl_drain(d.fd) != 0) {
+            pcm.ioctl_drop(d.fd);
+        }
         os.close(d.fd);
         d.fd = 0 - 1;
     }
