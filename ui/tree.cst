@@ -1,0 +1,454 @@
+// ui/tree.cst — widgets as nodes in a window's tree, and the handles to them.
+//
+// A program never holds a pointer to a widget. It holds a handle — the same
+// (era << 32) | (index + 1) that gpu/device.cst gives its resources — so a
+// widget that has been destroyed fails a check instead of pointing into a slot
+// some other widget now occupies. Zero is never a valid handle.
+//
+// The tree is sized when it is opened and never grows on its own: one mapping
+// holds every node and every widget's data. Running out is reported as FULL,
+// because a table that grows behind the program's back is the hidden
+// allocation the philosophy forbids.
+//
+// Errors follow gpu/'s split. The setup path — create, reparent — reports
+// through last_error(). Queries on a stale handle quietly answer 0 or null,
+// because by the time a frame walks the tree a dead handle is ordinary.
+use "std/mem.cst" as mem;
+use "widget.cst" as widget;
+
+// --- Errors ---
+
+let is i32 as OK             with imut = 0;
+let is i32 as FULL           with imut = 1;
+let is i32 as INVALID_HANDLE with imut = 2;
+let is i32 as BAD_ARGUMENT   with imut = 3;
+let is i32 as DATA_TOO_BIG   with imut = 4;
+let is i32 as OUT_OF_MEMORY  with imut = 5;
+
+// --- Flags ---
+//
+// Hidden and disabled rather than visible and enabled, so a zeroed node is the
+// default state and nothing has to remember to switch a widget on.
+let is i64 as F_HIDDEN       with imut = 1;
+let is i64 as F_DISABLED     with imut = 2;
+let is i64 as F_NEEDS_LAYOUT with imut = 4;
+
+// --- How much a tree may hold ---
+
+struct Limits {
+    widgets    as i64;   // alive at once, the root included
+    data_bytes as i64;   // the largest per-widget data any kind may ask for
+}
+
+fn limits_default() as Limits {
+    let is Limits as l;
+    l.widgets = 4096;
+    l.data_bytes = 256;
+    return l;
+}
+
+// --- Nodes ---
+//
+// Links are slot indices, -1 for none: inside the tree an index is enough,
+// and handles are only made at the boundary.
+struct Node {
+    era    as i32;
+    used   as i32;
+    kind   as *widget.Kind;
+    parent as i64;
+    first  as i64;
+    last   as i64;
+    next   as i64;
+    prev   as i64;
+    count  as i64;
+    flags  as i64;
+}
+
+struct Tree {
+    nodes       as *u8;   // cap * sizeof(Node)
+    data        as *u8;   // cap * stride
+    stride      as i64;
+    cap         as i64;
+    live        as i64;
+    next_free   as i64;   // where the next search for a free slot starts
+    root        as i64;   // slot index of the root
+    block       as *u8;
+    block_bytes as i64;
+    err         as i32;
+    ok          as i32;
+}
+
+// The root's kind. Module scope rather than inside the Tree, because a Tree
+// is returned by value and a pointer into it would not survive the copy.
+let is widget.Kind as _root_kind with mut;
+
+fn _node(t as *Tree, i as i64) as *Node {
+    return cast(*Node, cast(i64, t.nodes) + i * sizeof(Node));
+}
+
+fn _data_at(t as *Tree, i as i64) as *u8 {
+    return cast(*u8, cast(i64, t.data) + i * t.stride);
+}
+
+fn _handle(t as *Tree, i as i64) as i64 {
+    if (i < 0) { return 0; }
+    return (cast(i64, _node(t, i).era) << 32) | (i + 1);
+}
+
+// The slot a handle names, or -1 when it names nothing alive.
+fn _index(t as *Tree, h as i64) as i64 {
+    if (t.ok == 0 || h == 0) { return 0 - 1; }
+    let is i64 as i = (h & 4294967295) - 1;
+    if (i < 0 || i >= t.cap) { return 0 - 1; }
+    let is *Node as n = _node(t, i);
+    if (n.used == 0) { return 0 - 1; }
+    if (n.era != cast(i32, (h >> 32) & 4294967295)) { return 0 - 1; }
+    return i;
+}
+
+fn _set(flags as i64, bit as i64, on as i32) as i64 {
+    if (on == 1) { return flags | bit; }
+    return (flags | bit) - bit;
+}
+
+// --- Opening and closing ---
+
+fn open(l as *Limits) as Tree {
+    let is Tree as t;
+    t.nodes = cast(*u8, 0);
+    t.data = cast(*u8, 0);
+    t.block = cast(*u8, 0);
+    t.block_bytes = 0;
+    t.cap = 0;
+    t.live = 0;
+    t.next_free = 0;
+    t.root = 0 - 1;
+    t.ok = 0;
+    t.err = OK;
+    if (l.widgets < 1 || l.data_bytes < 0) { t.err = BAD_ARGUMENT; return t; }
+
+    // Data rounded up to 8 bytes, so every widget's data is aligned for
+    // whatever struct the kind keeps in it.
+    t.stride = (l.data_bytes + 7) / 8 * 8;
+    t.cap = l.widgets;
+    let is i64 as node_bytes = t.cap * sizeof(Node);
+    let is i64 as total = node_bytes + t.cap * t.stride;
+    let is *u8 as block = mem.core.mmap_anon(total);
+    if (cast(i64, block) == 0) { t.err = OUT_OF_MEMORY; return t; }
+    mem.core.memzero(block, total);
+    t.block = block;
+    t.block_bytes = total;
+    t.nodes = block;
+    t.data = cast(*u8, cast(i64, block) + node_bytes);
+
+    // Eras start at 1 so the null handle can never match slot 0.
+    let is i64 as i with mut = 0;
+    while (i < t.cap) {
+        _node(&t, i).era = 1;
+        i = i + 1;
+    }
+    t.ok = 1;
+
+    _root_kind = widget.kind("root", 0);
+    t.root = _claim(&t, &_root_kind);
+    return t;
+}
+
+// Destroys every widget still alive, children first, then releases the
+// mapping. Their destroy entries run, so a kind that owns memory outside the
+// tree gets it back even from a program that forgot to destroy its widgets.
+fn close(t as *Tree) as void {
+    if (t.ok == 0) { return; }
+    _release_subtree(t, t.root);
+    mem.core.munmap(t.block, t.block_bytes);
+    t.block = cast(*u8, 0);
+    t.nodes = cast(*u8, 0);
+    t.data = cast(*u8, 0);
+    t.ok = 0;
+}
+
+fn is_open(t as *Tree) as i32 { return t.ok; }
+fn root(t as *Tree) as i64 { return _handle(t, t.root); }
+fn live_count(t as *Tree) as i64 { return t.live; }
+fn capacity(t as *Tree) as i64 { return t.cap; }
+fn last_error(t as *Tree) as i32 { return t.err; }
+fn clear_error(t as *Tree) as void { t.err = OK; }
+
+// --- Slots ---
+
+// Claims a free slot for a widget of kind k, or returns -1. The search starts
+// where the last one ended, so creating and destroying in a loop does not
+// rescan the whole table each time.
+fn _claim(t as *Tree, k as *widget.Kind) as i64 {
+    let is i64 as scanned with mut = 0;
+    let is i64 as i with mut = t.next_free;
+    while (scanned < t.cap) {
+        if (i >= t.cap) { i = 0; }
+        let is *Node as n = _node(t, i);
+        if (n.used == 0) {
+            n.used = 1;
+            n.kind = k;
+            n.parent = 0 - 1;
+            n.first = 0 - 1;
+            n.last = 0 - 1;
+            n.next = 0 - 1;
+            n.prev = 0 - 1;
+            n.count = 0;
+            // A widget nobody has measured yet needs layout by definition.
+            n.flags = F_NEEDS_LAYOUT;
+            if (t.stride > 0) { mem.core.memzero(_data_at(t, i), t.stride); }
+            t.live = t.live + 1;
+            t.next_free = i + 1;
+            return i;
+        }
+        i = i + 1;
+        scanned = scanned + 1;
+    }
+    return 0 - 1;
+}
+
+// Runs the kind's destroy, then frees the slot. Bumping the era is what makes
+// every handle to it stale.
+fn _release(t as *Tree, i as i64) as void {
+    let is *Node as n = _node(t, i);
+    if (cast(i64, n.kind) != 0 && cast(i64, n.kind.destroy) != 0) {
+        call(n.kind.destroy, cast(*u8, t), _handle(t, i), _data_at(t, i));
+    }
+    n.used = 0;
+    n.kind = cast(*widget.Kind, 0);
+    n.era = n.era + 1;
+    if (n.era == 0) { n.era = 1; }
+    t.live = t.live - 1;
+}
+
+// Releases i and everything under it, children before parents. Iterative,
+// descending through first children and peeling leaves off the front, so a
+// deep tree costs no stack and every destroy entry sees its parent alive.
+fn _release_subtree(t as *Tree, top as i64) as void {
+    let is i64 as cur with mut = top;
+    while (1 == 1) {
+        while (_node(t, cur).first != 0 - 1) { cur = _node(t, cur).first; }
+        if (cur == top) {
+            _release(t, cur);
+            return;
+        }
+        let is i64 as leaf = cur;
+        let is i64 as par = _node(t, leaf).parent;
+        let is i64 as nxt = _node(t, leaf).next;
+        let is *Node as pn = _node(t, par);
+        pn.first = nxt;
+        pn.count = pn.count - 1;
+        if (nxt == 0 - 1) {
+            pn.last = 0 - 1;
+            cur = par;
+        } else {
+            _node(t, nxt).prev = 0 - 1;
+            cur = nxt;
+        }
+        _release(t, leaf);
+    }
+}
+
+// --- Links ---
+
+fn _link_last(t as *Tree, p as i64, i as i64) as void {
+    let is *Node as n = _node(t, i);
+    let is *Node as pn = _node(t, p);
+    n.parent = p;
+    n.prev = pn.last;
+    n.next = 0 - 1;
+    if (pn.last != 0 - 1) {
+        _node(t, pn.last).next = i;
+    } else {
+        pn.first = i;
+    }
+    pn.last = i;
+    pn.count = pn.count + 1;
+}
+
+fn _unlink(t as *Tree, i as i64) as void {
+    let is *Node as n = _node(t, i);
+    let is i64 as p = n.parent;
+    if (p == 0 - 1) { return; }
+    let is *Node as pn = _node(t, p);
+    if (n.prev != 0 - 1) { _node(t, n.prev).next = n.next; } else { pn.first = n.next; }
+    if (n.next != 0 - 1) { _node(t, n.next).prev = n.prev; } else { pn.last = n.prev; }
+    pn.count = pn.count - 1;
+    n.parent = 0 - 1;
+    n.prev = 0 - 1;
+    n.next = 0 - 1;
+}
+
+// --- Building the tree ---
+
+// Adds a widget of kind k as the last child of parent. Returns its handle, or
+// 0 with last_error() set.
+fn create(t as *Tree, k as *widget.Kind, parent as i64) as i64 {
+    if (t.ok == 0) { t.err = BAD_ARGUMENT; return 0; }
+    let is i64 as p = _index(t, parent);
+    if (p < 0) { t.err = INVALID_HANDLE; return 0; }
+    if (k.data_bytes > t.stride) { t.err = DATA_TOO_BIG; return 0; }
+    let is i64 as i = _claim(t, k);
+    if (i < 0) { t.err = FULL; return 0; }
+    _link_last(t, p, i);
+    _invalidate_from(t, p);
+    return _handle(t, i);
+}
+
+// Destroys w and everything under it. The root belongs to the tree and is
+// refused; a stale handle is ignored, since destroying twice is harmless.
+fn destroy(t as *Tree, w as i64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    if (i == t.root) { t.err = BAD_ARGUMENT; return; }
+    let is i64 as p = _node(t, i).parent;
+    _unlink(t, i);
+    if (p != 0 - 1) { _invalidate_from(t, p); }
+    _release_subtree(t, i);
+}
+
+// Moves w, with its subtree, to the end of new_parent's children. Refuses to
+// move the root, and to move a widget under itself or its own descendant,
+// which would detach the subtree into a cycle nothing could reach.
+fn reparent(t as *Tree, w as i64, new_parent as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    let is i64 as p = _index(t, new_parent);
+    if (i < 0 || p < 0) { t.err = INVALID_HANDLE; return 0; }
+    if (i == t.root) { t.err = BAD_ARGUMENT; return 0; }
+    let is i64 as a with mut = p;
+    while (a != 0 - 1) {
+        if (a == i) { t.err = BAD_ARGUMENT; return 0; }
+        a = _node(t, a).parent;
+    }
+    let is i64 as old = _node(t, i).parent;
+    _unlink(t, i);
+    _link_last(t, p, i);
+    if (old != 0 - 1) { _invalidate_from(t, old); }
+    _invalidate_from(t, i);
+    return 1;
+}
+
+// --- Walking the tree ---
+
+fn is_valid(t as *Tree, w as i64) as i32 {
+    if (_index(t, w) < 0) { return 0; }
+    return 1;
+}
+
+fn _link(t as *Tree, w as i64, which as i32) as i64 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    let is *Node as n = _node(t, i);
+    let is i64 as j with mut = n.parent;
+    if (which == 1) { j = n.first; }
+    if (which == 2) { j = n.last; }
+    if (which == 3) { j = n.next; }
+    if (which == 4) { j = n.prev; }
+    if (j == 0 - 1) { return 0; }
+    return _handle(t, j);
+}
+
+fn parent(t as *Tree, w as i64) as i64       { return _link(t, w, 0); }
+fn first_child(t as *Tree, w as i64) as i64  { return _link(t, w, 1); }
+fn last_child(t as *Tree, w as i64) as i64   { return _link(t, w, 2); }
+fn next_sibling(t as *Tree, w as i64) as i64 { return _link(t, w, 3); }
+fn prev_sibling(t as *Tree, w as i64) as i64 { return _link(t, w, 4); }
+
+fn child_count(t as *Tree, w as i64) as i64 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    return _node(t, i).count;
+}
+
+fn kind(t as *Tree, w as i64) as *widget.Kind {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return cast(*widget.Kind, 0); }
+    return _node(t, i).kind;
+}
+
+// The widget's data, zeroed at creation; null for a stale handle or a kind
+// that asked for none.
+fn data(t as *Tree, w as i64) as *u8 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return cast(*u8, 0); }
+    if (_node(t, i).kind.data_bytes == 0) { return cast(*u8, 0); }
+    return _data_at(t, i);
+}
+
+// --- Visibility and enablement ---
+//
+// A widget is shown only if it and every ancestor are; the same for enabled.
+// Hiding changes how much room the parent hands out, so it invalidates
+// layout; disabling changes only how the widget looks and answers.
+
+fn _any_up(t as *Tree, i as i64, bit as i64) as i32 {
+    let is i64 as a with mut = i;
+    while (a != 0 - 1) {
+        if ((_node(t, a).flags & bit) != 0) { return 1; }
+        a = _node(t, a).parent;
+    }
+    return 0;
+}
+
+fn set_visible(t as *Tree, w as i64, on as i32) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    let is *Node as n = _node(t, i);
+    n.flags = _set(n.flags, F_HIDDEN, 1 - on);
+    _invalidate_from(t, i);
+}
+
+fn is_visible(t as *Tree, w as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    return 1 - _any_up(t, i, F_HIDDEN);
+}
+
+fn set_enabled(t as *Tree, w as i64, on as i32) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    let is *Node as n = _node(t, i);
+    n.flags = _set(n.flags, F_DISABLED, 1 - on);
+}
+
+fn is_enabled(t as *Tree, w as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    return 1 - _any_up(t, i, F_DISABLED);
+}
+
+// --- Layout invalidation ---
+//
+// A widget that changes size can change every ancestor's, so the mark climbs
+// to the root. It does not stop at an ancestor already marked: a layout pass
+// that clears top-down may have left a marked node under a cleared one, and
+// stopping early there would leave the root believing nothing changed.
+
+fn _invalidate_from(t as *Tree, i as i64) as void {
+    let is i64 as a with mut = i;
+    while (a != 0 - 1) {
+        let is *Node as n = _node(t, a);
+        n.flags = n.flags | F_NEEDS_LAYOUT;
+        a = n.parent;
+    }
+}
+
+fn invalidate_layout(t as *Tree, w as i64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    _invalidate_from(t, i);
+}
+
+fn needs_layout(t as *Tree, w as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    if ((_node(t, i).flags & F_NEEDS_LAYOUT) != 0) { return 1; }
+    return 0;
+}
+
+fn clear_layout(t as *Tree, w as i64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    let is *Node as n = _node(t, i);
+    n.flags = _set(n.flags, F_NEEDS_LAYOUT, 0);
+}

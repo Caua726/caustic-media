@@ -292,8 +292,17 @@ touching every widget.
 | `render/` | `draw2d`, `shapes2d`, scissor, layers | the 3D path is started; the 2D family is not |
 | `text/` | shaping, layout, caret, hit-testing | design notes only |
 
-Three of the four foundations do not exist yet, which is why the toolkit has no
-code.
+Three of the four foundations do not exist yet, which is why most of the toolkit
+has no code. What can be built without them is built first.
+
+## Current state
+
+**`tree.cst` and `widget.cst` exist and are tested** (`tree_test.cst`): handles
+with an era, the tree sized at open and never grown, children kept in order,
+recursive destruction children-first with each kind's `destroy` entry, reparent
+refusing cycles, hidden and disabled inherited from ancestors, and layout
+invalidation that climbs to the root. Nothing is drawn yet; layout, routing and
+signals come next, testable with geometry and synthetic events alone.
 
 ## For scale
 

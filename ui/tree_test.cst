@@ -1,0 +1,223 @@
+// ui/tree_test.cst — the widget tree: handles, structure, destruction, flags.
+//
+// Everything here is geometry-free on purpose. The tree is what every later
+// part of the toolkit assumes — layout walks it, events route through it, the
+// accessibility bridge exposes it — so it is tested on its own, before any of
+// them exists to hide a mistake in it.
+use "std/io.cst" as io;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn eq(name as *u8, got as i64, want as i64) as void {
+    if (got != want) {
+        io.printf("FAIL: %s: got %d, want %d\n", name, cast(i32, got), cast(i32, want));
+        fails = fails + 1;
+    }
+}
+
+// --- A kind that records its destruction ---
+//
+// Each widget's data holds a tag; destroy appends the tag to a log, so a test
+// can see both that every widget was released and in what order.
+let is [64]i64 as destroyed_log with mut;
+let is i64 as destroyed_count with mut = 0;
+
+struct Tagged {
+    tag as i64;
+}
+
+fn tagged_destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Tagged as d = cast(*Tagged, data);
+    if (destroyed_count < 64) { destroyed_log[destroyed_count] = d.tag; }
+    destroyed_count = destroyed_count + 1;
+}
+
+fn make(t as *tree.Tree, k as *widget.Kind, parent as i64, tag as i64) as i64 {
+    let is i64 as w = tree.create(t, k, parent);
+    if (w != 0) {
+        let is *Tagged as d = cast(*Tagged, tree.data(t, w));
+        d.tag = tag;
+    }
+    return w;
+}
+
+fn reset_log() as void { destroyed_count = 0; }
+
+fn small_limits(widgets as i64) as tree.Limits {
+    let is tree.Limits as l = tree.limits_default();
+    l.widgets = widgets;
+    return l;
+}
+
+fn main() as i32 {
+    let is widget.Kind as k = widget.kind("tagged", sizeof(Tagged));
+    k.destroy = fn_ptr(tagged_destroy);
+
+    // --- A new tree is a root and nothing else ---
+    let is tree.Limits as l = small_limits(16);
+    let is tree.Tree as t = tree.open(&l);
+    check("open", tree.is_open(&t));
+    let is i64 as root = tree.root(&t);
+    check("root is valid", tree.is_valid(&t, root));
+    eq("root has no parent", tree.parent(&t, root), 0);
+    eq("root has no children", tree.child_count(&t, root), 0);
+    eq("live after open", tree.live_count(&t), 1);
+
+    // --- Children keep the order they were added in ---
+    let is i64 as a = make(&t, &k, root, 1);
+    let is i64 as b = make(&t, &k, root, 2);
+    let is i64 as c = make(&t, &k, root, 3);
+    check("children created", a != 0 && b != 0 && c != 0);
+    eq("child count", tree.child_count(&t, root), 3);
+    eq("first child", tree.first_child(&t, root), a);
+    eq("last child", tree.last_child(&t, root), c);
+    eq("a -> b", tree.next_sibling(&t, a), b);
+    eq("b -> c", tree.next_sibling(&t, b), c);
+    eq("c -> none", tree.next_sibling(&t, c), 0);
+    eq("c <- b", tree.prev_sibling(&t, c), b);
+    eq("a <- none", tree.prev_sibling(&t, a), 0);
+    eq("parent of b", tree.parent(&t, b), root);
+    check("kind is kept", cast(i64, tree.kind(&t, b)) == cast(i64, &k));
+
+    // --- Per-widget data starts zeroed and belongs to one widget ---
+    let is i64 as z = tree.create(&t, &k, root);
+    eq("data starts zeroed", (cast(*Tagged, tree.data(&t, z))).tag, 0);
+    eq("data is per widget", (cast(*Tagged, tree.data(&t, b))).tag, 2);
+
+    // --- Destroying unlinks, calls destroy, and kills the handle ---
+    reset_log();
+    tree.destroy(&t, z);
+    check("destroyed handle is invalid", tree.is_valid(&t, z) == 0);
+    check("destroyed handle has no data", cast(i64, tree.data(&t, z)) == 0);
+    eq("destroy called once", destroyed_count, 1);
+    eq("child count after destroy", tree.child_count(&t, root), 3);
+
+    reset_log();
+    tree.destroy(&t, b);
+    eq("a -> c after b goes", tree.next_sibling(&t, a), c);
+    eq("c <- a after b goes", tree.prev_sibling(&t, c), a);
+
+    // A slot that is reused hands out a different handle, so the old one keeps
+    // failing instead of quietly naming the new widget. A tree with room for
+    // the root and one widget leaves the second create no slot but the first.
+    let is tree.Limits as one = small_limits(2);
+    let is tree.Tree as solo = tree.open(&one);
+    let is i64 as x = tree.create(&solo, &k, tree.root(&solo));
+    tree.destroy(&solo, x);
+    let is i64 as y = tree.create(&solo, &k, tree.root(&solo));
+    check("reused slot was reused", (x & 4294967295) == (y & 4294967295));
+    check("reused slot gets a new handle", y != 0 && y != x);
+    check("old handle invalid after reuse", tree.is_valid(&solo, x) == 0);
+    check("new handle valid", tree.is_valid(&solo, y));
+    tree.close(&solo);
+
+    // --- Destruction is recursive and post-order ---
+    //
+    //   a(1) ── a1(11) ── a11(111)
+    //        └─ a2(12)
+    reset_log();
+    let is i64 as a1 = make(&t, &k, a, 11);
+    let is i64 as a11 = make(&t, &k, a1, 111);
+    let is i64 as a2 = make(&t, &k, a, 12);
+    eq("live before subtree destroy", tree.live_count(&t), 6);
+    tree.destroy(&t, a);
+    eq("whole subtree destroyed", destroyed_count, 4);
+    eq("post-order 1", destroyed_log[0], 111);
+    eq("post-order 2", destroyed_log[1], 11);
+    eq("post-order 3", destroyed_log[2], 12);
+    eq("post-order 4", destroyed_log[3], 1);
+    check("descendants invalid", tree.is_valid(&t, a11) == 0 && tree.is_valid(&t, a2) == 0);
+    eq("live after subtree destroy", tree.live_count(&t), 2);
+    eq("root keeps the rest", tree.first_child(&t, root), c);
+
+    // --- The root is not the program's to destroy ---
+    tree.destroy(&t, root);
+    check("root survives destroy", tree.is_valid(&t, root));
+    eq("root destroy is refused", cast(i64, tree.last_error(&t)), cast(i64, tree.BAD_ARGUMENT));
+    tree.clear_error(&t);
+
+    // --- Reparenting moves a subtree and refuses cycles ---
+    let is i64 as p = make(&t, &k, root, 4);
+    let is i64 as q = make(&t, &k, p, 5);
+    let is i64 as r = make(&t, &k, q, 6);
+    check("reparent ok", tree.reparent(&t, q, c));
+    eq("q now under c", tree.parent(&t, q), c);
+    eq("p lost its child", tree.child_count(&t, p), 0);
+    eq("r came along", tree.parent(&t, r), q);
+    check("into own descendant refused", tree.reparent(&t, c, r) == 0);
+    eq("cycle error", cast(i64, tree.last_error(&t)), cast(i64, tree.BAD_ARGUMENT));
+    tree.clear_error(&t);
+    check("into itself refused", tree.reparent(&t, q, q) == 0);
+    check("root cannot move", tree.reparent(&t, root, p) == 0);
+    tree.clear_error(&t);
+
+    // --- A stale handle is an error on the setup path, not a crash ---
+    eq("create under dead parent", tree.create(&t, &k, z), 0);
+    eq("dead parent error", cast(i64, tree.last_error(&t)), cast(i64, tree.INVALID_HANDLE));
+    tree.clear_error(&t);
+
+    // --- Flags ---
+    check("visible by default", tree.is_visible(&t, q));
+    check("enabled by default", tree.is_enabled(&t, r));
+    tree.set_enabled(&t, c, 0);
+    check("disabled itself", tree.is_enabled(&t, c) == 0);
+    check("descendant disabled through ancestor", tree.is_enabled(&t, r) == 0);
+    tree.set_enabled(&t, c, 1);
+    check("re-enabled", tree.is_enabled(&t, r));
+    tree.set_visible(&t, q, 0);
+    check("hidden", tree.is_visible(&t, q) == 0);
+    check("descendant hidden through ancestor", tree.is_visible(&t, r) == 0);
+    tree.set_visible(&t, q, 1);
+
+    // Layout invalidation climbs to the root, because a child that changes
+    // size can change every ancestor's.
+    tree.clear_layout(&t, root);
+    tree.clear_layout(&t, c);
+    tree.clear_layout(&t, q);
+    tree.clear_layout(&t, r);
+    tree.clear_layout(&t, p);
+    check("a new widget needs layout", tree.needs_layout(&t, make(&t, &k, p, 7)));
+    tree.clear_layout(&t, p);
+    tree.invalidate_layout(&t, r);
+    check("r needs layout", tree.needs_layout(&t, r));
+    check("q needs layout", tree.needs_layout(&t, q));
+    check("root needs layout", tree.needs_layout(&t, root));
+    check("sibling subtree untouched", tree.needs_layout(&t, p) == 0);
+
+    // --- Capacity is declared, and running out is reported ---
+    let is tree.Limits as tl = small_limits(3);
+    let is tree.Tree as tiny = tree.open(&tl);
+    let is i64 as t1 = tree.create(&tiny, &k, tree.root(&tiny));
+    let is i64 as t2 = tree.create(&tiny, &k, tree.root(&tiny));
+    let is i64 as t3 = tree.create(&tiny, &k, tree.root(&tiny));
+    check("fits", t1 != 0 && t2 != 0);
+    eq("full", t3, 0);
+    eq("full error", cast(i64, tree.last_error(&tiny)), cast(i64, tree.FULL));
+    tree.close(&tiny);
+
+    // Data larger than the tree's declared per-widget size is refused.
+    let is widget.Kind as big = widget.kind("big", 100000);
+    eq("data too big", tree.create(&t, &big, root), 0);
+    eq("data too big error", cast(i64, tree.last_error(&t)), cast(i64, tree.DATA_TOO_BIG));
+    tree.clear_error(&t);
+
+    // --- close releases every widget still alive ---
+    reset_log();
+    let is i64 as live_before = tree.live_count(&t) - 1;   // everything but the root
+    tree.close(&t);
+    eq("close destroys what is left", destroyed_count, live_before);
+    check("closed", tree.is_open(&t) == 0);
+
+    if (fails != 0) { return 1; }
+    io.printf("ui tree: all checks passed\n");
+    return 0;
+}
