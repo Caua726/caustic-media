@@ -1,0 +1,137 @@
+// gpu/vk/bind/loader.cst — how a command becomes callable.
+//
+// libvulkan.so.1 exports 269 of Vulkan's 775 commands. The other 506 —
+// including every extension, and the swapchain is an extension — exist only as
+// something vkGetInstanceProcAddr or vkGetDeviceProcAddr hands back at run
+// time. So a Vulkan binding is not 775 extern declarations the way
+// window/x11/bind is 1163 of them. It is a handful of externs plus a table of
+// function pointers filled in after there is something to ask.
+//
+// --- Why every command is still a real function ---
+//
+// The table could be a struct of function-pointer fields, which is what volk
+// does for C. It cannot be that here: a call in Caustic resolves by looking up
+// a FUNCTION, not a variable, so a struct of fields would force every call site
+// to read
+//
+//     call(tbl.vkCreateBuffer, dev, &ci, 0, &buf)
+//
+// and would make the caller carry the right table for each command. That is not
+// a binding, it is an abstraction with the parameter list of one.
+//
+// So each command is a module-scope typed pointer plus a thin function wearing
+// the Vulkan name:
+//
+//     type PFN_vkCreateBuffer = fn(*u8, *u8, *u8, *u8) as i32;
+//     let is PFN_vkCreateBuffer as _p_vkCreateBuffer with mut;
+//
+//     fn vkCreateBuffer(device as *u8, pCreateInfo as *u8,
+//                       pAllocator as *u8, pBuffer as *u8) as i32 {
+//         return call(_p_vkCreateBuffer, device, pCreateInfo, pAllocator, pBuffer);
+//     }
+//
+// The call site is then vk.vkCreateBuffer(dev, &ci, 0, &buf) — what the
+// specification says to write. The pointer being TYPED rather than *u8 is what
+// makes call() check the argument count and types instead of accepting anything
+// and corrupting memory quietly.
+//
+// --- The two levels, and why they are two functions ---
+//
+//     loader     resolvable with a null instance, so these are plain externs
+//     instance   vkEnumeratePhysicalDevices, vkCreateDevice, surface commands
+//     device     vkQueueSubmit, vkCmdDraw, everything in the hot path
+//
+// A device-level command fetched through vkGetInstanceProcAddr still works, but
+// it reaches the driver through a loader trampoline that dispatches on the
+// handle at every single call. Fetched through vkGetDeviceProcAddr it is
+// direct. That difference is invisible until it is in every vkCmdDraw, which is
+// why the split is two named functions rather than one convenient one — the
+// registry says which command is which level, and tools/symbols.txt records it.
+//
+// load_instance and load_device are the ONLY two functions in this directory
+// that do not carry a Vulkan command name. volk has the same two, for the same
+// reason.
+//
+// --- One device per process ---
+//
+// The pointers are module scope, so one Vulkan device at a time. Two live
+// devices would need tables passed by hand, which is volk's second mode, and it
+// arrives when something needs it. gpu/'s promise is that DIFFERENT backends
+// coexist, and that is unaffected.
+
+// --- The bootstrap ---
+//
+// These are exported by libvulkan.so.1, so they are declared rather than
+// resolved, and they are what everything else is resolved through. One soname,
+// a handful of symbols: far below the count where caustic-ld's DT_NEEDED
+// handling gets interesting.
+extern "libvulkan.so.1" fn vkGetInstanceProcAddr(instance as *u8, pName as *u8) as *u8;
+extern "libvulkan.so.1" fn vkGetDeviceProcAddr(device as *u8, pName as *u8) as *u8;
+extern "libvulkan.so.1" fn vkCreateInstance(pCreateInfo as *u8, pAllocator as *u8, pInstance as *u8) as i32;
+extern "libvulkan.so.1" fn vkEnumerateInstanceVersion(pApiVersion as *u8) as i32;
+extern "libvulkan.so.1" fn vkEnumerateInstanceLayerProperties(pPropertyCount as *u8, pProperties as *u8) as i32;
+extern "libvulkan.so.1" fn vkEnumerateInstanceExtensionProperties(pLayerName as *u8, pPropertyCount as *u8, pProperties as *u8) as i32;
+
+// --- Instance level ---
+
+type PFN_vkDestroyInstance = fn(*u8, *u8) as i64;
+type PFN_vkEnumeratePhysicalDevices = fn(*u8, *u8, *u8) as i32;
+type PFN_vkGetPhysicalDeviceProperties = fn(*u8, *u8) as i64;
+type PFN_vkEnumerateDeviceExtensionProperties = fn(*u8, *u8, *u8, *u8) as i32;
+
+let is PFN_vkDestroyInstance                    as _p_vkDestroyInstance                    with mut;
+let is PFN_vkEnumeratePhysicalDevices           as _p_vkEnumeratePhysicalDevices           with mut;
+let is PFN_vkGetPhysicalDeviceProperties        as _p_vkGetPhysicalDeviceProperties        with mut;
+let is PFN_vkEnumerateDeviceExtensionProperties as _p_vkEnumerateDeviceExtensionProperties with mut;
+
+// A void-returning Vulkan command is declared here as returning i64 and the
+// wrapper discards it. Nothing reads the value; the shape just has to agree
+// with what the pointer was declared as, and giving these `void` would mean a
+// second call() form for no gain.
+fn vkDestroyInstance(instance as *u8, pAllocator as *u8) as void {
+    call(_p_vkDestroyInstance, instance, pAllocator);
+}
+
+fn vkEnumeratePhysicalDevices(instance as *u8, pPhysicalDeviceCount as *u8,
+                              pPhysicalDevices as *u8) as i32 {
+    return call(_p_vkEnumeratePhysicalDevices, instance, pPhysicalDeviceCount, pPhysicalDevices);
+}
+
+fn vkGetPhysicalDeviceProperties(physicalDevice as *u8, pProperties as *u8) as void {
+    call(_p_vkGetPhysicalDeviceProperties, physicalDevice, pProperties);
+}
+
+fn vkEnumerateDeviceExtensionProperties(physicalDevice as *u8, pLayerName as *u8,
+                                        pPropertyCount as *u8, pProperties as *u8) as i32 {
+    return call(_p_vkEnumerateDeviceExtensionProperties, physicalDevice, pLayerName,
+                pPropertyCount, pProperties);
+}
+
+// --- Filling the table ---
+//
+// Returns the number of commands that did NOT resolve. Zero means every name
+// this build knows about is callable.
+//
+// A name that fails to resolve leaves its pointer null, and calling through it
+// crashes. That is deliberate and it is what C does: the alternative is a null
+// check on every call, which is a branch in the hot path to catch a mistake
+// that belongs at startup. A program that enables an extension gets its
+// commands; one that does not and calls anyway is asking for it. The count is
+// returned so the decision can be made at load time instead.
+fn load_instance(instance as *u8) as i32 {
+    let is i32 as missing with mut = 0;
+
+    _p_vkDestroyInstance = vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+    if (cast(i64, _p_vkDestroyInstance) == 0) { missing = missing + 1; }
+
+    _p_vkEnumeratePhysicalDevices = vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices");
+    if (cast(i64, _p_vkEnumeratePhysicalDevices) == 0) { missing = missing + 1; }
+
+    _p_vkGetPhysicalDeviceProperties = vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties");
+    if (cast(i64, _p_vkGetPhysicalDeviceProperties) == 0) { missing = missing + 1; }
+
+    _p_vkEnumerateDeviceExtensionProperties = vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties");
+    if (cast(i64, _p_vkEnumerateDeviceExtensionProperties) == 0) { missing = missing + 1; }
+
+    return missing;
+}
