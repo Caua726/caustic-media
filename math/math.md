@@ -13,14 +13,14 @@ math/
   rect.cst      axis-aligned 2D rectangles, layout splitting
   color.cst     linear colour, the sRGB transfer, packing, HSV, compositing
   geom.cst      ray, plane, AABB, sphere, triangle, frustum, intersection
-  curve.cst     easing functions and splines
+  curve.cst     easing — by name too, CSS's and Fluent's cubic Béziers — and splines
 ```
 
 Pure: it imports `std/math` for the scalar transcendentals and nothing else. No
 allocator, no syscalls, no external library — it builds and runs on every Caustic
 target, including wasm and CausticOS.
 
-2516 lines, and 85 checks across two test files.
+2737 lines, and 120 checks across two test files.
 
 ---
 
@@ -89,7 +89,11 @@ So the tests assert properties: a transform composed with its inverse is the
 identity, x cross y is z, a rotation preserves length, a quaternion and the matrix
 built from it move a vector identically, slerp lands on its endpoints, a ray hit
 put back into the ray lands on the surface, a colour conversion returns where it
-started, a normal stays perpendicular to a squashed face.
+started, a normal stays perpendicular to a squashed face. A cubic Bézier whose x
+runs evenly is a polynomial, so CSS's timing function is checked against t² and
+t³ rather than a table, and its ease-out against its ease-in turned through the
+centre; the one number remembered is `ease` at a half, 0.8024, which every
+browser agrees on.
 
 Two of the failures they produced were **wrong expectations rather than wrong
 code** — the sign of an orthographic projection's depth, and where the middle of a
@@ -119,6 +123,8 @@ putting the packer somewhere with no relationship to its own output.
 ## Status
 
 Done, and used. `gpu/software`'s rasterizer, the X11 backend and the cube example
-all run on it. Additions will come from the layers above asking — noise for
-procedural generation, and whatever `ui/` needs for layout arithmetic — rather
-than from a plan here.
+all run on it. Additions come from the layers above asking rather than from a
+plan here: `ui/`'s animations asked for CSS's `cubic-bezier` — solved by
+bisection, since Newton's method needs it behind anyway where a curve is nearly
+flat — and for easing by name (`curve.ease(id, t)`), so a theme can say which
+curve it moves along. Noise for procedural generation is still to come.
