@@ -39,15 +39,33 @@ let is i64 as F_FOCUSABLE    with imut = 8;
 // --- How much a tree may hold ---
 
 struct Limits {
-    widgets    as i64;   // alive at once, the root included
-    data_bytes as i64;   // the largest per-widget data any kind may ask for
+    widgets     as i64;   // alive at once, the root included
+    data_bytes  as i64;   // the largest per-widget data any kind may ask for
+    connections as i64;   // signal connections, see signal.cst
 }
 
 fn limits_default() as Limits {
     let is Limits as l;
     l.widgets = 4096;
     l.data_bytes = 256;
+    l.connections = 4096;
     return l;
+}
+
+// --- Signal connections ---
+//
+// Stored here because a widget that emits only has the tree in hand; what
+// connecting and emitting mean is signal.cst's. Kept in the order they were
+// made — a connection is appended, and the table is compacted when it fills —
+// so emitting calls them in that order.
+struct Connection {
+    widget as i64;
+    seq    as i64;   // its id, and its place in connection order
+    made   as i64;   // the emission count when it was made
+    cb     as *u8;   // null once disconnected
+    user   as *u8;
+    signal as i32;
+    _pad0  as i32;
 }
 
 // --- Nodes ---
@@ -81,6 +99,12 @@ struct Tree {
     scratch       as *u8;   // see scratch_alloc
     scratch_bytes as i64;
     scratch_used  as i64;
+    conns         as *u8;   // conn_cap Connections
+    conn_cap      as i64;
+    conn_used     as i64;
+    conn_seq      as i64;
+    emit_serial   as i64;
+    emitting      as i64;   // emissions in progress, nested
     err         as i32;
     ok          as i32;
 }
@@ -143,6 +167,12 @@ fn open(l as *Limits) as Tree {
     t.scratch = cast(*u8, 0);
     t.scratch_bytes = 0;
     t.scratch_used = 0;
+    t.conns = cast(*u8, 0);
+    t.conn_cap = 0;
+    t.conn_used = 0;
+    t.conn_seq = 0;
+    t.emit_serial = 0;
+    t.emitting = 0;
     t.cap = 0;
     t.live = 0;
     t.next_free = 0;
@@ -159,7 +189,10 @@ fn open(l as *Limits) as Tree {
     let is i64 as data_bytes = t.cap * t.stride;
     t.scratch_bytes = (2 * t.cap + 64) * SCRATCH_ENTRY_BYTES;
     t.scratch_used = 0;
-    let is i64 as total = node_bytes + data_bytes + t.scratch_bytes;
+    if (l.connections < 0) { t.err = BAD_ARGUMENT; return t; }
+    t.conn_cap = l.connections;
+    let is i64 as conn_bytes = t.conn_cap * sizeof(Connection);
+    let is i64 as total = node_bytes + data_bytes + t.scratch_bytes + conn_bytes;
     let is *u8 as block = mem.core.mmap_anon(total);
     if (cast(i64, block) == 0) { t.err = OUT_OF_MEMORY; return t; }
     mem.core.memzero(block, total);
@@ -168,6 +201,7 @@ fn open(l as *Limits) as Tree {
     t.nodes = block;
     t.data = cast(*u8, cast(i64, block) + node_bytes);
     t.scratch = cast(*u8, cast(i64, block) + node_bytes + data_bytes);
+    t.conns = cast(*u8, cast(i64, t.scratch) + t.scratch_bytes);
 
     // Eras start at 1 so the null handle can never match slot 0.
     let is i64 as i with mut = 0;
@@ -196,6 +230,10 @@ fn close(t as *Tree) as void {
 }
 
 fn is_open(t as *Tree) as i32 { return t.ok; }
+
+fn connection_at(t as *Tree, i as i64) as *Connection {
+    return cast(*Connection, cast(i64, t.conns) + i * sizeof(Connection));
+}
 
 // Where the scratch stack stands now, to hand back to scratch_release.
 fn scratch_mark(t as *Tree) as i64 { return t.scratch_used; }

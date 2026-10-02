@@ -1,0 +1,272 @@
+// ui/model.cst — how lists, trees and tables read the program's data.
+//
+// A view of ten thousand rows does not hold ten thousand widgets, nor a copy
+// of the data. It asks a model — functions the program supplies over its own
+// data — how many rows there are and what is in the ones on screen, and the
+// program tells the model's observers when something changed. Qt's model/view
+// and GTK 4's list models, for the same reason.
+//
+// --- Rows ---
+//
+// A row is named by an id the program chooses: nonzero, and stable for as
+// long as the row exists — a record id, a pointer, an index that never
+// shifts. Stable ids are what let a selection, an expanded branch or a scroll
+// position survive rows being inserted above them. Rows are reached as the
+// index-th child of a parent; the top level is parent 0. A flat list is a
+// tree whose rows have no children.
+//
+// --- What the program supplies ---
+//
+// Required:
+//   count(self, parent) -> i64                 rows under parent
+//   row_id(self, parent, index) -> i64         the id of the index-th row
+//   cell(self, id, column, role, out *Value) -> i64
+//       Fill out with the row's value for that column and role, return 1;
+//       or return 0 for "nothing here".
+//
+// Optional — null takes the default:
+//   columns(self) -> i64                       1
+//   parent_of(self, id) -> i64                 0: every row is top-level
+//   index_of(self, id) -> i64                  found by searching the parent
+//   has_children(self, id) -> i64              count(id) > 0. A lazy tree
+//                                              answers this without loading.
+//   set_cell(self, id, column, role, v *Value) -> i64
+//                                              0: read-only
+//
+// self is the program's pointer, handed back untouched. The Model value must
+// stay where it is while views observe it — they keep a pointer to it.
+//
+// --- Telling views ---
+//
+// After changing its data the program calls inserted, removed, changed or
+// reset, and every observer is told, in the order they began observing.
+
+// --- Roles: which value of a cell ---
+let is i32 as TEXT    with imut = 1;   // what is displayed
+let is i32 as CHECKED with imut = 2;   // a check box: BOOL, or INT 0/1/2 for tri-state
+let is i32 as ICON    with imut = 3;   // HANDLE of an image
+let is i32 as TOOLTIP with imut = 4;
+let is i32 as ENABLED with imut = 5;   // BOOL; a disabled row cannot be selected
+let is i32 as SORT    with imut = 6;   // what sorting compares, when TEXT is not it
+let is i32 as EDIT    with imut = 7;   // the value an editor starts from
+let is i32 as USER    with imut = 1000;
+
+// --- Values ---
+let is i32 as V_NONE   with imut = 0;
+let is i32 as V_TEXT   with imut = 1;   // p, len: UTF-8, not terminated, owned by the model
+let is i32 as V_INT    with imut = 2;   // i
+let is i32 as V_FLOAT  with imut = 3;   // f
+let is i32 as V_BOOL   with imut = 4;   // i: 0 or 1
+let is i32 as V_HANDLE with imut = 5;   // i
+
+struct Value {
+    kind  as i32;
+    _pad0 as i32;
+    i     as i64;
+    f     as f64;
+    p     as *u8;
+    len   as i64;
+}
+
+fn none() as Value {
+    let is Value as v;
+    v.kind = V_NONE;
+    v._pad0 = 0;
+    v.i = 0;
+    v.f = 0.0;
+    v.p = cast(*u8, 0);
+    v.len = 0;
+    return v;
+}
+
+fn text(p as *u8, len as i64) as Value {
+    let is Value as v = none();
+    v.kind = V_TEXT;
+    v.p = p;
+    v.len = len;
+    return v;
+}
+
+fn integer(i as i64) as Value {
+    let is Value as v = none();
+    v.kind = V_INT;
+    v.i = i;
+    return v;
+}
+
+fn float(f as f64) as Value {
+    let is Value as v = none();
+    v.kind = V_FLOAT;
+    v.f = f;
+    return v;
+}
+
+fn boolean(b as i32) as Value {
+    let is Value as v = none();
+    v.kind = V_BOOL;
+    v.i = cast(i64, b);
+    return v;
+}
+
+fn handle(h as i64) as Value {
+    let is Value as v = none();
+    v.kind = V_HANDLE;
+    v.i = h;
+    return v;
+}
+
+// --- Changes ---
+let is i32 as INSERTED with imut = 1;   // count rows now at first..first+count-1 under parent
+let is i32 as REMOVED  with imut = 2;   // count rows that were at first.. under parent are gone
+let is i32 as CHANGED  with imut = 3;   // their values changed; the rows are the same rows
+let is i32 as RESET    with imut = 4;   // anything may have changed; start over
+
+struct Change {
+    kind   as i32;
+    _pad0  as i32;
+    parent as i64;
+    first  as i64;
+    count  as i64;
+}
+
+// A view or two per model is usual; sixteen is generous, and the table does
+// not grow on its own.
+let is i64 as MAX_OBSERVERS with imut = 16;
+
+struct Model {
+    self         as *u8;
+    count        as *u8;
+    row_id       as *u8;
+    cell         as *u8;
+    columns      as *u8;
+    parent_of    as *u8;
+    index_of     as *u8;
+    has_children as *u8;
+    set_cell     as *u8;
+    obs_cb       as [16]i64;   // observer callbacks, 0 for a free slot
+    obs_user     as [16]i64;
+}
+
+fn make(self as *u8, count as *u8, row_id as *u8, cell as *u8) as Model {
+    let is Model as m;
+    m.self = self;
+    m.count = count;
+    m.row_id = row_id;
+    m.cell = cell;
+    m.columns = cast(*u8, 0);
+    m.parent_of = cast(*u8, 0);
+    m.index_of = cast(*u8, 0);
+    m.has_children = cast(*u8, 0);
+    m.set_cell = cast(*u8, 0);
+    let is i64 as i with mut = 0;
+    while (i < MAX_OBSERVERS) {
+        m.obs_cb[i] = 0;
+        m.obs_user[i] = 0;
+        i = i + 1;
+    }
+    return m;
+}
+
+// --- Asking ---
+
+fn count(m as *Model, parent as i64) as i64 {
+    return call(m.count, m.self, parent);
+}
+
+fn row_id(m as *Model, parent as i64, index as i64) as i64 {
+    return call(m.row_id, m.self, parent, index);
+}
+
+fn columns(m as *Model) as i64 {
+    if (cast(i64, m.columns) == 0) { return 1; }
+    return call(m.columns, m.self);
+}
+
+fn parent_of(m as *Model, id as i64) as i64 {
+    if (cast(i64, m.parent_of) == 0) { return 0; }
+    return call(m.parent_of, m.self, id);
+}
+
+// The row's position under its parent, or -1 when the model does not know the
+// id. Without index_of this searches the parent's rows, so a model with long
+// lists of children should supply it.
+fn index_of(m as *Model, id as i64) as i64 {
+    if (cast(i64, m.index_of) != 0) { return call(m.index_of, m.self, id); }
+    let is i64 as parent = parent_of(m, id);
+    let is i64 as n = count(m, parent);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (row_id(m, parent, i) == id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn has_children(m as *Model, id as i64) as i32 {
+    if (cast(i64, m.has_children) != 0) {
+        if (call(m.has_children, m.self, id) != 0) { return 1; }
+        return 0;
+    }
+    if (count(m, id) > 0) { return 1; }
+    return 0;
+}
+
+// Fills out with the cell's value for role and returns 1, or leaves it V_NONE
+// and returns 0.
+fn cell(m as *Model, id as i64, column as i64, role as i32, out as *Value) as i32 {
+    *out = none();
+    if (call(m.cell, m.self, id, column, cast(i64, role), cast(*u8, out)) != 0) { return 1; }
+    *out = none();
+    return 0;
+}
+
+// 1 if the model took the value, 0 if it refused or is read-only.
+fn set_cell(m as *Model, id as i64, column as i64, role as i32, v as *Value) as i32 {
+    if (cast(i64, m.set_cell) == 0) { return 0; }
+    if (call(m.set_cell, m.self, id, column, cast(i64, role), cast(*u8, v)) != 0) { return 1; }
+    return 0;
+}
+
+// --- Observing ---
+
+// cb(user, change *Change) is called for every change. Returns an id for
+// unobserve, or 0 when MAX_OBSERVERS are already observing.
+fn observe(m as *Model, cb as *u8, user as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_OBSERVERS) {
+        if (m.obs_cb[i] == 0) {
+            m.obs_cb[i] = cast(i64, cb);
+            m.obs_user[i] = cast(i64, user);
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn unobserve(m as *Model, id as i64) as void {
+    if (id < 1 || id > MAX_OBSERVERS) { return; }
+    m.obs_cb[id - 1] = 0;
+}
+
+fn _tell(m as *Model, kind as i32, parent as i64, first as i64, n as i64) as void {
+    let is Change as c;
+    c.kind = kind;
+    c._pad0 = 0;
+    c.parent = parent;
+    c.first = first;
+    c.count = n;
+    let is i64 as i with mut = 0;
+    while (i < MAX_OBSERVERS) {
+        // Read each slot as it is reached: an observer may remove itself, or
+        // another, while being told.
+        let is i64 as cb = m.obs_cb[i];
+        if (cb != 0) { call(cast(*u8, cb), cast(*u8, m.obs_user[i]), cast(*u8, &c)); }
+        i = i + 1;
+    }
+}
+
+fn inserted(m as *Model, parent as i64, first as i64, n as i64) as void { _tell(m, INSERTED, parent, first, n); }
+fn removed(m as *Model, parent as i64, first as i64, n as i64) as void  { _tell(m, REMOVED, parent, first, n); }
+fn changed(m as *Model, parent as i64, first as i64, n as i64) as void  { _tell(m, CHANGED, parent, first, n); }
+fn reset(m as *Model) as void                                            { _tell(m, RESET, 0, 0, 0); }

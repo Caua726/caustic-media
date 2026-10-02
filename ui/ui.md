@@ -343,7 +343,15 @@ the override, mnemonics, and timers with ids that stay dead once cancelled. The
 router is fed by plain calls — `pointer_move`, `pointer_button`, `key`, `text` —
 which is what `input/` will call.
 
-Nothing is drawn yet; signals and models come next.
+**Signals and models** (`signal.cst`, `model.cst`, tested by `signal_test` and
+`model_test`): callbacks connected per widget and signal, called in connection
+order, with what happens mid-emission decided — connected then is not called,
+disconnected then is not called, a destroyed widget ends the emission — and
+connections of destroyed widgets reclaimed when the table fills. Models name
+rows by stable ids the program chooses, answer by role, may be editable, and
+tell their observers about inserts, removals, changes and resets.
+
+Nothing is drawn yet: painting waits for `render/`'s 2D family, which is next.
 
 ## For scale
 
