@@ -325,7 +325,8 @@ has no code. What can be built without them is built first.
 **The tree** (`tree.cst`, `widget.cst`, tested by `tree_test.cst`): handles
 with an era, the tree sized at open and never grown, children kept in order,
 recursive destruction children-first with each kind's `destroy` entry, reparent
-refusing cycles, hidden and disabled inherited from ancestors, and layout
+refusing cycles, inserting before a given sibling and moving among siblings
+(`create_before`, `insert`, `move_before`, with `index_of` and `child_at`), hidden and disabled inherited from ancestors, and layout
 invalidation that climbs to the root.
 
 **The application** (`app.cst`, tested by `app_test`): one per program,
