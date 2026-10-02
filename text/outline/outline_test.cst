@@ -1,0 +1,977 @@
+// text/outline/outline_test.cst — every glyph of every test font drawn and
+// held, segment by segment, to fontTools' drawing of it
+// (text/testdata/*.outline.ref, written by text/tools/outline_reference.py):
+// TrueType's simple and composite glyphs, CFF's charstrings with their
+// subroutines, CID-keyed CFF, CFF2 at its default instance, and synthetic
+// fonts for what the real ones do not use. Then malformed glyphs and
+// charstrings: refused, bounded, never read past their data.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../sfnt/sfnt.cst" as sfnt;
+use "outline.cst" as outline;
+
+let is i32 as fails with mut = 0;
+let is *u8 as current with mut;
+let is i64 as current_glyph with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s (%s, glyph %d)\n", name, current, current_glyph);
+        fails = fails + 1;
+    }
+}
+
+// --- Files ---
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+// --- The reference ---
+
+let is *u8 as ref with mut;
+let is i64 as ref_len with mut = 0;
+let is i64 as pos with mut = 0;
+
+fn _c(i as i64) as i64 {
+    if (i >= ref_len) { return 0; }
+    return cast(i64, *cast(*u8, cast(i64, ref) + i));
+}
+
+fn _skip() as void {
+    while (pos < ref_len && (_c(pos) == 32 || _c(pos) == 10)) { pos = pos + 1; }
+}
+
+let is [64]u8 as word;
+
+fn next_word() as i32 {
+    _skip();
+    if (pos >= ref_len) { return 0; }
+    let is i64 as n with mut = 0;
+    while (pos < ref_len && _c(pos) != 32 && _c(pos) != 10 && n < 63) {
+        word[n] = cast(u8, _c(pos));
+        n = n + 1;
+        pos = pos + 1;
+    }
+    word[n] = 0;
+    return 1;
+}
+
+fn is_word(w as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (1 == 1) {
+        let is i64 as a = cast(i64, word[i]);
+        let is i64 as b = cast(i64, *cast(*u8, cast(i64, w) + i));
+        if (a != b) { return 0; }
+        if (a == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _peek_word() as i64 {
+    _skip();
+    return _c(pos);
+}
+
+// A decimal number as Python writes it: sign, digits, a fraction, an exponent.
+fn num() as f64 {
+    _skip();
+    let is f64 as sign with mut = 1.0;
+    if (_c(pos) == 45) { sign = 0.0 - 1.0; pos = pos + 1; }
+    let is f64 as v with mut = 0.0;
+    while (_c(pos) >= 48 && _c(pos) <= 57) {
+        v = v * 10.0 + cast(f64, _c(pos) - 48);
+        pos = pos + 1;
+    }
+    if (_c(pos) == 46) {
+        pos = pos + 1;
+        let is f64 as scale with mut = 0.1;
+        while (_c(pos) >= 48 && _c(pos) <= 57) {
+            v = v + cast(f64, _c(pos) - 48) * scale;
+            scale = scale / 10.0;
+            pos = pos + 1;
+        }
+    }
+    if (_c(pos) == 101) {
+        pos = pos + 1;
+        let is i64 as es with mut = 1;
+        if (_c(pos) == 45) { es = 0 - 1; pos = pos + 1; }
+        let is i64 as e with mut = 0;
+        while (_c(pos) >= 48 && _c(pos) <= 57) {
+            e = e * 10 + (_c(pos) - 48);
+            pos = pos + 1;
+        }
+        while (e > 0) {
+            if (es > 0) { v = v * 10.0; } else { v = v / 10.0; }
+            e = e - 1;
+        }
+    }
+    return sign * v;
+}
+
+fn inum() as i64 { return cast(i64, num()); }
+
+// Within a millionth — written with >= alone, which a NaN fails.
+fn near(a as f64, b as f64) as i32 {
+    let is f64 as d = a - b;
+    if (d >= 0.0 - 0.000001 && 0.000001 >= d) { return 1; }
+    return 0;
+}
+
+// --- One font ---
+
+let is outline.path.Path as p with mut;
+let is i64 as glyphs_checked with mut = 0;
+
+// The reference's segments for the glyph, against the path drawn for it.
+fn compare(r as *outline.Reader, gid as i64) as void {
+    current_glyph = gid;
+    check("drawn", outline.glyph(r, gid, &p) == 1);
+    let is outline.path.Cursor as cur = outline.path.cursor();
+    let is outline.path.Seg as s;
+    let is i32 as same with mut = 1;
+    let is f64 as sx with mut = 0.0;
+    let is f64 as sy with mut = 0.0;
+    let is f64 as ex with mut = 0.0;
+    let is f64 as ey with mut = 0.0;
+    while (_peek_word() != 0 && _peek_word() != 103 && _peek_word() != 102) {
+        next_word();
+        let is i32 as got = outline.path.next(&p, &cur, &s);
+        if (got == 0) { same = 0; }
+        // Each segment starts where the one before ended.
+        if (near(s.x0, ex) == 0 || near(s.y0, ey) == 0) { same = 0; }
+        if (is_word("M") == 1) {
+            let is f64 as x = num();
+            let is f64 as y = num();
+            if (s.kind != outline.path.MOVE || near(s.x1, x) == 0 || near(s.y1, y) == 0) { same = 0; }
+            sx = x;
+            sy = y;
+            ex = x;
+            ey = y;
+        } else if (is_word("L") == 1) {
+            let is f64 as x = num();
+            let is f64 as y = num();
+            if (s.kind != outline.path.LINE || near(s.x1, x) == 0 || near(s.y1, y) == 0) { same = 0; }
+            ex = x;
+            ey = y;
+        } else if (is_word("Q") == 1) {
+            let is f64 as cx = num();
+            let is f64 as cy = num();
+            let is f64 as x = num();
+            let is f64 as y = num();
+            if (s.kind != outline.path.QUAD || near(s.x1, cx) == 0 || near(s.y1, cy) == 0
+                || near(s.x2, x) == 0 || near(s.y2, y) == 0) { same = 0; }
+            ex = x;
+            ey = y;
+        } else if (is_word("C") == 1) {
+            let is f64 as a = num();
+            let is f64 as b = num();
+            let is f64 as c = num();
+            let is f64 as d = num();
+            let is f64 as x = num();
+            let is f64 as y = num();
+            if (s.kind != outline.path.CUBIC || near(s.x1, a) == 0 || near(s.y1, b) == 0 || near(s.x2, c) == 0
+                || near(s.y2, d) == 0 || near(s.x3, x) == 0 || near(s.y3, y) == 0) { same = 0; }
+            ex = x;
+            ey = y;
+        } else if (is_word("Z") == 1) {
+            // Back to the contour's start.
+            if (s.kind != outline.path.CLOSE || near(s.x1, sx) == 0 || near(s.y1, sy) == 0) { same = 0; }
+            ex = sx;
+            ey = sy;
+        } else {
+            same = 0;
+        }
+        if (same == 0) {
+            io.printf("  segment %s differs: got kind %d\n", cast(*u8, &word), s.kind);
+            // Skip the rest of this glyph's reference.
+            while (_peek_word() != 0 && _peek_word() != 103 && _peek_word() != 102) { next_word(); }
+        }
+    }
+    check("every segment as fontTools draws it", same);
+    check("and no more", outline.path.next(&p, &cur, &s) == 0);
+    glyphs_checked = glyphs_checked + 1;
+}
+
+fn font(file as *u8, refpath as *u8) as void {
+    current = file;
+    let is *u8 as data = load(file);
+    let is i64 as size = loaded;
+    ref = load(refpath);
+    ref_len = loaded;
+    check("the font and its reference", size > 0 && ref_len > 0);
+    pos = 0;
+    let is sfnt.table.Face as f with mut;
+    let is outline.Reader as r with mut;
+    let is i32 as have with mut = 0;
+    while (next_word() == 1) {
+        if (is_word("faces") == 1) {
+            num();
+        } else if (is_word("face") == 1) {
+            if (have == 1) { outline.close(&r); }
+            f = sfnt.open(data, size, inum());
+            r = outline.open(&f);
+            check("opens", f.ok == 1 && r.ok == 1);
+            have = 1;
+        } else if (is_word("glyph") == 1) {
+            compare(&r, inum());
+        } else {
+            io.printf("  unknown record %s\n", cast(*u8, &word));
+            check("the reference understood", 0);
+        }
+    }
+    if (have == 1) {
+        current_glyph = f.glyphs;
+        check("no glyph past the last", outline.glyph(&r, f.glyphs, &p) == 0 && outline.path.count(&p) == 0);
+        check("nor before the first", outline.glyph(&r, 0 - 1, &p) == 0);
+        outline.close(&r);
+    }
+}
+
+// --- Malformed ---
+
+let is *u8 as copy with mut;
+let is i64 as copy_size with mut = 0;
+
+fn fresh(file as *u8) as void {
+    let is *u8 as data = load(file);
+    copy_size = loaded;
+    copy = mem.core.mmap_anon(copy_size + 4096);
+    mem.memcpy(copy, data, copy_size);
+}
+
+fn poke8(at as i64, v as i64) as void { *cast(*u8, cast(i64, copy) + at) = cast(u8, v & 255); }
+fn poke16(at as i64, v as i64) as void { poke8(at, v >> 8); poke8(at + 1, v); }
+
+// Charstring bytes written over glyph gid's own, which must be long enough;
+// what follows the program is never reached.
+let is [256]i64 as prog;
+let is i64 as prog_n with mut = 0;
+fn b(v as i64) as void { prog[prog_n] = v; prog_n = prog_n + 1; }
+fn zeros(n as i64) as void { let is i64 as i with mut = 0; while (i < n) { b(139); i = i + 1; } }
+
+// The program into glyph gid's charstring, run; what glyph() says.
+fn run(r as *outline.Reader, gid as i64) as i32 {
+    let is i64 as len with mut = 0;
+    let is i64 as at = outline.cff.item(r.face, &r.cff.charstrings, gid, &len);
+    if (at < 0 || prog_n > len) {
+        io.printf("  program of %d bytes does not fit glyph %d (%d)\n", prog_n, gid, len);
+        return 0 - 1;
+    }
+    let is i64 as i with mut = 0;
+    while (i < prog_n) {
+        poke8(at + i, prog[i]);
+        i = i + 1;
+    }
+    prog_n = 0;
+    return outline.glyph(r, gid, &p);
+}
+
+// The program filling glyph gid's charstring exactly: lines up to the last
+// `tail` bytes, which are what is being tried.
+fn run_at_end(r as *outline.Reader, gid as i64, tail as *i64, n as i64) as i32 {
+    let is i64 as len with mut = 0;
+    outline.cff.item(r.face, &r.cff.charstrings, gid, &len);
+    prog_n = 0;
+    let is i64 as room with mut = len - n;
+    // 0 0 rlineto, three bytes; 0 hlineto, two.
+    while (room > 0) {
+        if (room == 2 || room == 4) { b(139); b(6); room = room - 2; }
+        else { b(139); b(139); b(5); room = room - 3; }
+    }
+    let is i64 as i with mut = 0;
+    while (i < n) { b(*cast(*i64, cast(i64, tail) + i * 8)); i = i + 1; }
+    return run(r, gid);
+}
+
+// Where operator op — 12 x as 1200 + x — sits in the DICT at at, len long:
+// the operator's first byte; 0 when it is not there.
+fn find_op(f as *sfnt.table.Face, at as i64, len as i64, op as i64) as i64 {
+    let is i64 as q with mut = at;
+    let is i64 as end = at + len;
+    while (q < end) {
+        let is i64 as v = sfnt.table.u8_at(f, q);
+        if (v <= 27) {
+            let is i64 as code with mut = v;
+            if (v == 12) { code = 1200 + sfnt.table.u8_at(f, q + 1); }
+            if (code == op) { return q; }
+            if (v == 12) { q = q + 2; } else { q = q + 1; }
+        } else if (v == 28) { q = q + 3; }
+        else if (v == 29) { q = q + 5; }
+        else if (v == 30) {
+            q = q + 1;
+            while (q < end && (sfnt.table.u8_at(f, q) & 15) != 15) { q = q + 1; }
+            q = q + 1;
+        } else if (v >= 247 && v <= 254) { q = q + 2; }
+        else { q = q + 1; }
+    }
+    return 0;
+}
+
+// Two paths alike, segment by segment.
+fn same_path(a as *outline.path.Path, b as *outline.path.Path) as i32 {
+    let is outline.path.Cursor as ca = outline.path.cursor();
+    let is outline.path.Cursor as cb = outline.path.cursor();
+    let is outline.path.Seg as sa;
+    let is outline.path.Seg as sb;
+    while (outline.path.next(a, &ca, &sa) == 1) {
+        if (outline.path.next(b, &cb, &sb) == 0) { return 0; }
+        if (sa.kind != sb.kind || near(sa.x1, sb.x1) == 0 || near(sa.y1, sb.y1) == 0) { return 0; }
+    }
+    if (outline.path.next(b, &cb, &sb) == 1) { return 0; }
+    return 1;
+}
+
+fn glyf_cases() as void {
+    current = "glyf, malformed";
+    current_glyph = 0;
+    // Too many points for the path: refused, and nothing left in it.
+    let is outline.path.Path as small with mut = outline.path.open(4);
+    fresh("text/testdata/composite.ttf");
+    let is sfnt.table.Face as f with mut = sfnt.open(copy, copy_size, 0);
+    let is outline.Reader as r with mut = outline.open(&f);
+    check("too big for the path", outline.glyph(&r, 1, &small) == 0 && outline.path.count(&small) == 0);
+    check("one that fits", outline.glyph(&r, 2, &small) == 1 && outline.path.count(&small) == 4);
+    outline.path.close(&small);
+    small = outline.path.open(3);
+    check("one point short", outline.glyph(&r, 2, &small) == 0);
+    outline.path.close(&small);
+    small = outline.path.open(0);
+    check("a path for no points is none", outline.path.ok(&small) == 0);
+    // loca: out of order, past glyf, too short for a header.
+    let is i64 as loca = f.loca.off;
+    let is i64 as wide with mut = 2;
+    if (f.loc_long == 1) { wide = 4; }
+    let is i64 as unused with mut = 0;
+    let is i64 as a1 = outline.glyf.extent(&f, 1, &unused);
+    if (wide == 2) {
+        let is i64 as keep = sfnt.table.u16_at(&f, loca + 4);
+        poke16(loca + 4, sfnt.table.u16_at(&f, loca + 2) - 1);
+        check("loca out of order", outline.glyph(&r, 1, &p) == 0);
+        poke16(loca + 4, f.glyf.len / 2 + 1);
+        check("loca past glyf", outline.glyph(&r, 1, &p) == 0);
+        poke16(loca + 4, sfnt.table.u16_at(&f, loca + 2) + 4);
+        check("too short for a header", outline.glyph(&r, 1, &p) == 0);
+        poke16(loca + 4, keep);
+    }
+    check("restored", outline.glyph(&r, 1, &p) == 1);
+    let is i64 as len1 with mut = 0;
+    if (wide == 2) {
+        let is i64 as keep = sfnt.table.u16_at(&f, loca + 4);
+        poke16(loca + 4, sfnt.table.u16_at(&f, loca + 2) - 1);
+        check("extent: out of order", outline.glyf.extent(&f, 1, &len1) == 0 - 1);
+        poke16(loca + 4, keep);
+    }
+    // Contour ends going backwards, or standing still.
+    poke16(a1 + 12, 3);
+    check("contours ending out of order", outline.glyph(&r, 1, &p) == 0);
+    poke16(a1 + 12, 4);
+    check("a contour of no points", outline.glyph(&r, 1, &p) == 0);
+    poke16(a1 + 12, 8);
+    // A header and no more: no contours, drawn; too short for the header, not.
+    if (wide == 2) {
+        let is i64 as keep2 = sfnt.table.u16_at(&f, loca + 4);
+        let is i64 as nc0 = sfnt.table.u16_at(&f, a1);
+        poke16(a1, 0);
+        poke16(loca + 4, sfnt.table.u16_at(&f, loca + 2) + 5);
+        check("no contours, a header: drawn", outline.glyph(&r, 1, &p) == 1 && outline.path.count(&p) == 0);
+        poke16(loca + 4, sfnt.table.u16_at(&f, loca + 2) + 4);
+        check("no contours, short of a header: not", outline.glyph(&r, 1, &p) == 0);
+        poke16(a1, nc0);
+        poke16(loca + 4, keep2);
+    }
+    // Both offset conventions claimed: the component's offset is not scaled.
+    let is i64 as ap = outline.glyf.extent(&f, 5, &unused);
+    let is i64 as apfl = sfnt.table.u16_at(&f, ap + 10);
+    poke16(ap + 10, apfl | 4096);
+    let is outline.path.Path as q = outline.path.open(256);
+    outline.glyph(&r, 4, &q);
+    outline.glyph(&r, 5, &p);
+    check("scaled and unscaled: unscaled", same_path(&p, &q) == 1);
+    poke16(ap + 10, apfl);
+    outline.glyph(&r, 5, &p);
+    check("scaled alone: not the same", same_path(&p, &q) == 0);
+    outline.path.close(&q);
+    // A flag repeated past the points.
+    let is i64 as flags = a1 + 16;
+    let is i64 as fl0 = sfnt.table.u8_at(&f, flags);
+    let is i64 as fl1 = sfnt.table.u8_at(&f, flags + 1);
+    poke8(flags, fl0 | 8);
+    poke8(flags + 1, 200);
+    check("flags repeated past the points", outline.glyph(&r, 1, &p) == 0);
+    poke8(flags, fl0);
+    poke8(flags + 1, fl1);
+    check("restored again", outline.glyph(&r, 1, &p) == 1);
+    // A matched point that is not there, on either side.
+    let is i64 as m = outline.glyf.extent(&f, 8, &unused);
+    let is i64 as fl = sfnt.table.u16_at(&f, m + 10);
+    let is i64 as second with mut = m + 10 + 4 + 2;
+    if ((fl & 1) != 0) { second = m + 10 + 4 + 4; }
+    let is i64 as pa = sfnt.table.u8_at(&f, second + 4);
+    let is i64 as pb = sfnt.table.u8_at(&f, second + 5);
+    check("points matched", outline.glyph(&r, 8, &p) == 1);
+    poke8(second + 4, 9);
+    check("the composite's point not there", outline.glyph(&r, 8, &p) == 0);
+    poke8(second + 4, pa);
+    poke8(second + 5, 4);
+    check("the component's point not there", outline.glyph(&r, 8, &p) == 0);
+    poke8(second + 5, pb);
+    check("matched again", outline.glyph(&r, 8, &p) == 1);
+    outline.close(&r);
+
+    // Glyphs past the face's count, though loca has them; loca short of the
+    // count. Both loca forms.
+    let is i32 as form with mut = 0;
+    while (form < 2) {
+        if (form == 0) { fresh("text/testdata/composite.ttf"); } else { fresh("text/testdata/cmaps.ttf"); }
+        f = sfnt.open(copy, copy_size, 0);
+        let is i64 as all = f.glyphs;
+        poke16(f.maxp.off + 4, 3);
+        poke16(f.hhea.off + 34, 3);
+        f = sfnt.open(copy, copy_size, 0);
+        r = outline.open(&f);
+        check("past maxp's count", outline.glyph(&r, 2, &p) == 1 && outline.glyph(&r, 4, &p) == 0);
+        outline.close(&r);
+        poke16(f.maxp.off + 4, all + 8);
+        f = sfnt.open(copy, copy_size, 0);
+        r = outline.open(&f);
+        check("past loca's end", outline.glyph(&r, all + 3, &p) == 0);
+        // The last entry's end read from just past the table, made to look
+        // like an empty glyph's.
+        let is i64 as lend = f.loca.off + f.loca.len;
+        if (f.loc_long == 1) {
+            poke16(lend, sfnt.table.u16_at(&f, lend - 4));
+            poke16(lend + 2, sfnt.table.u16_at(&f, lend - 2));
+        } else {
+            poke16(lend, sfnt.table.u16_at(&f, lend - 2));
+        }
+        check("an entry ending past loca", outline.glyph(&r, all, &p) == 0);
+        outline.close(&r);
+        form = form + 1;
+    }
+
+    // Fan-out and loops.
+    current = "bomb.ttf";
+    let is *u8 as data = load("text/testdata/bomb.ttf");
+    let is sfnt.table.Face as bf = sfnt.open(data, loaded, 0);
+    let is outline.Reader as br = outline.open(&bf);
+    current_glyph = 2;
+    check("a composite holding itself", outline.glyph(&br, 2, &p) == 0);
+    current_glyph = 3;
+    check("32766 components", outline.glyph(&br, 3, &p) == 0);
+    current_glyph = 5;
+    check("8190 components", outline.glyph(&br, 5, &p) == 0);
+    current_glyph = 6;
+    check("4094 components: drawn, and empty", outline.glyph(&br, 6, &p) == 1 && outline.path.count(&p) == 0);
+    // Depth: 17 below the top is too deep, 16 is not.
+    current_glyph = 18;
+    check("composites 17 deep", outline.glyph(&br, 18, &p) == 0);
+    current_glyph = 19;
+    check("composites 16 deep", outline.glyph(&br, 19, &p) == 1);
+    // 40000 points draw; twice that does not fit.
+    current_glyph = 35;
+    check("40000 points", outline.glyph(&br, 35, &p) == 1 && outline.path.points(&p) == 40000);
+    current_glyph = 36;
+    check("80000 points", outline.glyph(&br, 36, &p) == 0);
+    outline.close(&br);
+    // A glyph whose flag lies just past its end: not read.
+    current_glyph = 37;
+    let is *u8 as bd = load("text/testdata/bomb.ttf");
+    copy = mem.core.mmap_anon(loaded + 16);
+    copy_size = loaded;
+    mem.memcpy(copy, bd, loaded);
+    let is sfnt.table.Face as df = sfnt.open(copy, copy_size, 0);
+    let is outline.Reader as dr = outline.open(&df);
+    check("a dot", outline.glyph(&dr, 37, &p) == 1 && outline.path.count(&p) == 2);
+    let is i64 as dstart = outline.glyf.extent(&df, 37, &unused) - df.glyf.off;
+    if (df.loc_long == 1) {
+        poke16(df.loca.off + 38 * 4, 0);
+        poke16(df.loca.off + 38 * 4 + 2, dstart + 14);
+    } else {
+        poke16(df.loca.off + 38 * 2, (dstart + 14) / 2);
+    }
+    check("its flag cut off", outline.glyph(&dr, 37, &p) == 0);
+    // The reader's points bound a glyph as the path does.
+    current_glyph = 35;
+    let is outline.glyf.Points as few with mut = outline.glyf.points_open(39999);
+    check("a point more than the reader holds", outline.glyf.glyph(&df, &few, 35, &p) == 0);
+    outline.glyf.points_close(&few);
+    few = outline.glyf.points_open(40000);
+    check("as many as it holds", outline.glyf.glyph(&df, &few, 35, &p) == 1);
+    outline.glyf.points_close(&few);
+    outline.close(&dr);
+}
+
+fn cff_cases() as void {
+    current = "cff, malformed";
+    current_glyph = 5;
+    fresh("text/testdata/ops.otf");
+    let is sfnt.table.Face as f with mut = sfnt.open(copy, copy_size, 0);
+    let is outline.Reader as r with mut = outline.open(&f);
+    // The stack: 48 values, not 49.
+    zeros(48); b(18); b(14);
+    check("48 values", run(&r, 5) == 1);
+    zeros(49); b(18); b(14);
+    check("49 values", run(&r, 5) == 0);
+    // Subroutines: a number past the end, an empty stack.
+    b(144); b(10); b(14);
+    check("no such subroutine", run(&r, 5) == 0);
+    b(10); b(14);
+    check("calling with nothing", run(&r, 5) == 0);
+    b(139); b(29); b(14);
+    check("no such global subroutine", run(&r, 5) == 0);
+    // Each operator with the wrong number of arguments.
+    b(139); b(21); b(14);
+    check("rmoveto, one", run(&r, 5) == 0);
+    zeros(3); b(22); b(14);
+    check("hmoveto, three", run(&r, 5) == 0);
+    zeros(3); b(4); b(14);
+    check("vmoveto, three", run(&r, 5) == 0);
+    zeros(3); b(5); b(14);
+    check("rlineto, three", run(&r, 5) == 0);
+    b(6); b(14);
+    check("hlineto, none", run(&r, 5) == 0);
+    b(7); b(14);
+    check("vlineto, none", run(&r, 5) == 0);
+    zeros(5); b(8); b(14);
+    check("rrcurveto, five", run(&r, 5) == 0);
+    zeros(7); b(8); b(14);
+    check("rrcurveto, seven", run(&r, 5) == 0);
+    zeros(6); b(27); b(14);
+    check("hhcurveto, six", run(&r, 5) == 0);
+    zeros(3); b(26); b(14);
+    check("vvcurveto, three", run(&r, 5) == 0);
+    zeros(6); b(31); b(14);
+    check("hvcurveto, six", run(&r, 5) == 0);
+    zeros(3); b(30); b(14);
+    check("vhcurveto, three", run(&r, 5) == 0);
+    zeros(7); b(24); b(14);
+    check("rcurveline, seven", run(&r, 5) == 0);
+    zeros(9); b(24); b(14);
+    check("rcurveline, nine", run(&r, 5) == 0);
+    zeros(9); b(25); b(14);
+    check("rlinecurve, nine", run(&r, 5) == 0);
+    zeros(6); b(25); b(14);
+    check("rlinecurve, six", run(&r, 5) == 0);
+    zeros(12); b(12); b(35); b(14);
+    check("flex, twelve", run(&r, 5) == 0);
+    zeros(6); b(12); b(34); b(14);
+    check("hflex, six", run(&r, 5) == 0);
+    zeros(8); b(12); b(36); b(14);
+    check("hflex1, eight", run(&r, 5) == 0);
+    zeros(10); b(12); b(37); b(14);
+    check("flex1, ten", run(&r, 5) == 0);
+    zeros(2); b(14);
+    check("endchar, two", run(&r, 5) == 0);
+    // A width once only: a later odd count is an error, not another width.
+    zeros(3); b(21); zeros(3); b(21); b(14);
+    check("one width only", run(&r, 5) == 0);
+    zeros(3); b(21); zeros(2); b(21); b(14);
+    check("one width, then a move", run(&r, 5) == 1);
+    // What CFF does not have, and what no one has.
+    zeros(2); b(15); b(14);
+    check("vsindex in CFF", run(&r, 5) == 0);
+    zeros(2); b(16); b(14);
+    check("blend in CFF", run(&r, 5) == 0);
+    zeros(2); b(12); b(3); b(14);
+    check("arithmetic", run(&r, 5) == 0);
+    b(2); b(14);
+    check("a reserved operator", run(&r, 5) == 0);
+    // An escape with nothing after it — though the next charstring begins
+    // with flex's own code, and the stack holds what flex wants.
+    let is [14]i64 as esc;
+    let is i64 as ek with mut = 0;
+    while (ek < 13) { esc[ek] = 139; ek = ek + 1; }
+    esc[13] = 12;
+    let is i64 as nlen with mut = 0;
+    let is i64 as nat = outline.cff.item(&f, &r.cff.charstrings, 6, &nlen);
+    let is i64 as nfirst = sfnt.table.u8_at(&f, nat);
+    poke8(nat, 35);
+    check("an escape with nothing after it", run_at_end(&r, 5, cast(*i64, &esc), 14) == 0);
+    poke8(nat, nfirst);
+    // Numbers cut off by the end of the charstring.
+    let is [1]i64 as t1;
+    t1[0] = 28;
+    check("a short integer cut off", run_at_end(&r, 5, cast(*i64, &t1), 1) == 0);
+    t1[0] = 247;
+    check("a two-byte number cut off", run_at_end(&r, 5, cast(*i64, &t1), 1) == 0);
+    t1[0] = 251;
+    check("a negative one cut off", run_at_end(&r, 5, cast(*i64, &t1), 1) == 0);
+    let is [3]i64 as t3;
+    t3[0] = 255; t3[1] = 0; t3[2] = 0;
+    check("a fixed-point number cut off", run_at_end(&r, 5, cast(*i64, &t3), 3) == 0);
+    // A mask longer than what is left.
+    let is [21]i64 as tm;
+    let is i64 as k with mut = 0;
+    while (k < 18) { tm[k] = 139; k = k + 1; }
+    tm[18] = 18;
+    tm[19] = 19;
+    tm[20] = 255;
+    check("a mask cut off", run_at_end(&r, 5, cast(*i64, &tm), 21) == 0);
+    // Accents: a character the font does not have, and an accent of accents.
+    zeros(2); b(205); b(194); b(14);
+    check("seac of a missing base", run(&r, 5) == 0);
+    zeros(2); b(204); b(205); b(14);
+    check("seac of a missing accent", run(&r, 5) == 0);
+    zeros(2); b(204); b(250); b(0); b(14);
+    check("seac of a code with no standard name", run(&r, 5) == 0);
+    current_glyph = 3;
+    let is i64 as alen with mut = 0;
+    let is i64 as aat = outline.cff.item(&f, &r.cff.charstrings, 1, &alen);
+    let is i64 as save0 = sfnt.table.u8_at(&f, aat);
+    let is i64 as save1 = sfnt.table.u8_at(&f, aat + 1);
+    let is i64 as save2 = sfnt.table.u8_at(&f, aat + 2);
+    let is i64 as save3 = sfnt.table.u8_at(&f, aat + 3);
+    let is i64 as save4 = sfnt.table.u8_at(&f, aat + 4);
+    zeros(2); b(204); b(247); b(86); b(14);
+    run(&r, 1);
+    check("seac within seac", outline.glyph(&r, 3, &p) == 0);
+    poke8(aat, save0); poke8(aat + 1, save1); poke8(aat + 2, save2); poke8(aat + 3, save3); poke8(aat + 4, save4);
+    check("seac again", outline.glyph(&r, 3, &p) == 1);
+    // A subroutine calling itself: nested too deep.
+    current_glyph = 10;
+    let is outline.cff.Index as lsubrs;
+    outline.cff.font_dict(&f, &r.cff, 0, &lsubrs);
+    let is i64 as slen with mut = 0;
+    let is i64 as sat = outline.cff.item(&f, &lsubrs, 0, &slen);
+    check("subroutines first", outline.glyph(&r, 10, &p) == 1);
+    poke8(sat, 32);
+    poke8(sat + 1, 10);
+    check("a subroutine calling itself", outline.glyph(&r, 10, &p) == 0);
+    // return at the top: the charstring is over, not malformed.
+    current_glyph = 5;
+    zeros(2); b(21); b(139); b(6); b(11); b(14);
+    check("return at the top ends it", run(&r, 5) == 1 && outline.path.count(&p) == 3);
+    outline.close(&r);
+
+    // Structures: an INDEX with no offset size, a first offset not 1.
+    current = "cff structures";
+    fresh("text/testdata/ops.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    let is i64 as cs = r.cff.charstrings.offs;
+    poke8(cs - 1, 0);
+    check("offsets of no size", outline.open(&f).ok == 0);
+    poke8(cs - 1, 5);
+    check("offsets of five bytes", outline.open(&f).ok == 0);
+    poke8(cs - 1, r.cff.charstrings.offsize);
+    check("restored", outline.open(&f).ok == 1);
+    let is i64 as os = r.cff.charstrings.offsize;
+    let is i64 as first = r.cff.charstrings.offs + os - 1;
+    poke8(first, 2);
+    check("a first offset not 1", outline.open(&f).ok == 0);
+    poke8(first, 1);
+    // An item whose end comes before its start.
+    let is i64 as third = r.cff.charstrings.offs + 3 * os;
+    let is i64 as keep3 = sfnt.table.u16_at(&f, third);
+    check("two-byte offsets", os == 2);
+    poke16(third, 0);
+    check("an item ending before it starts", outline.glyph(&r, 2, &p) == 0);
+    poke16(third, keep3);
+    // The last offset past the table.
+    let is i64 as last = r.cff.charstrings.offs + r.cff.charstrings.count * os;
+    let is i64 as keepl = sfnt.table.u16_at(&f, last);
+    poke16(last, 65535);
+    check("items past the table", outline.open(&f).ok == 0);
+    let is i64 as tend = f.cff.off + f.cff.len;
+    poke16(last, tend + 1 - r.cff.charstrings.data);
+    check("items one byte past the table", outline.open(&f).ok == 0);
+    poke16(last, tend - r.cff.charstrings.data);
+    check("items to the table's end", outline.open(&f).ok == 1);
+    poke16(last, keepl);
+    // No charstrings at all.
+    poke16(cs - 3, 0);
+    check("no charstrings", outline.open(&f).ok == 0);
+    poke16(cs - 3, r.cff.charstrings.count);
+    // A version this is not.
+    poke8(f.cff.off, 3);
+    check("CFF version 3", outline.open(&f).ok == 0);
+    poke8(f.cff.off, 1);
+    check("restored, once more", outline.open(&f).ok == 1);
+    // An item one past the last, by hand: offsets 1, 2, 3 for one item.
+    let is outline.cff.Index as tiny;
+    tiny.count = 1;
+    tiny.offsize = 1;
+    tiny.offs = r.cff.charstrings.offs;
+    tiny.data = r.cff.charstrings.data;
+    tiny.end = r.cff.charstrings.end;
+    poke8(tiny.offs, 1);
+    poke8(tiny.offs + 1, 2);
+    poke8(tiny.offs + 2, 3);
+    let is i64 as tl with mut = 0;
+    check("an item of the count", outline.cff.item(&f, &tiny, 0, &tl) >= 0 && tl == 1);
+    check("no item past the count", outline.cff.item(&f, &tiny, 1, &tl) == 0 - 1);
+    // A real ends at its first 0xF nibble, high or low: 0, then charset.
+    let is i64 as rd = r.cff.charstrings.data + 1;
+    poke8(rd, 30);
+    poke8(rd + 1, 241);
+    poke8(rd + 2, 139);
+    poke8(rd + 3, 15);
+    check("a real ending in its high nibble", outline.cff.find(&f, rd, 4, 15) == 1 && outline.cff.nvals == 2);
+    poke8(rd + 1, 31);
+    check("a real ending in its low nibble", outline.cff.find(&f, rd, 4, 15) == 1 && outline.cff.nvals == 2);
+    // ISOAdobe's charset: glyph i named by standard string i — which this
+    // font's glyphs are not, so its accent finds no acute.
+    fresh("text/testdata/ops.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    // The charset operator made UniqueID's: the charset is the default.
+    let is i64 as cso = find_op(&f, r.cff.top, r.cff.top_len, 15);
+    check("a charset operator", cso > 0);
+    poke8(cso, 13);
+    r = outline.open(&f);
+    current_glyph = 3;
+    check("ISOAdobe: no acute here", r.cff.charset == 0 && outline.glyph(&r, 3, &p) == 0);
+    current_glyph = 5;
+    zeros(2); b(171); b(171); b(14);
+    check("ISOAdobe: glyph 1 is space, which is a glyph here", run(&r, 5) == 1);
+    zeros(2); b(139); b(140); b(14);
+    check("ISOAdobe: no standard name, no glyph", run(&r, 5) == 0);
+    // Type 1 charstrings: not read.
+    let is *u8 as t1data = load("text/testdata/bomb-type1.otf");
+    let is sfnt.table.Face as tf = sfnt.open(t1data, loaded, 0);
+    check("Type 1 charstrings", outline.open(&tf).ok == 0);
+    // Fan-out past the operator limit.
+    current = "bomb.otf";
+    current_glyph = 1;
+    let is *u8 as bdata = load("text/testdata/bomb.otf");
+    let is sfnt.table.Face as bf = sfnt.open(bdata, loaded, 0);
+    let is outline.Reader as br = outline.open(&bf);
+    check("a quarter of a million calls", br.ok == 1 && outline.glyph(&br, 1, &p) == 0);
+
+    // A call with nothing on the stack to say which: refused, in a font of
+    // 1300 subroutines where most numbers a stray value could make name one —
+    // and before the stack's count goes below zero, for what is pushed next
+    // to land below the stack.
+    current = "big.otf";
+    fresh("text/testdata/big.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    current_glyph = 1;
+    zeros(2); b(21); b(10); zeros(3); b(5); b(14);
+    check("callsubr with nothing", run(&r, 1) == 0);
+    zeros(2); b(21); b(139); b(10); b(14);
+    check("callsubr 0, biased to 1131", run(&r, 1) == 1);
+    outline.close(&r);
+
+    // FDSelect saying nothing, or a dict that is not there.
+    current = "cid, malformed";
+    fresh("text/testdata/cid.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    current_glyph = 40;
+    check("a CID glyph", outline.glyph(&r, 40, &p) == 1);
+    // No accents in CID-keyed fonts, whose charsets name CIDs, not
+    // strings — though here the codes' strings, 1 and 2, are CIDs the font
+    // has, and every glyph is made empty enough to draw.
+    let is i64 as eg with mut = 0;
+    while (eg < r.cff.charstrings.count) {
+        let is i64 as elen with mut = 0;
+        poke8(outline.cff.item(&f, &r.cff.charstrings, eg, &elen), 14);
+        eg = eg + 1;
+    }
+    zeros(2); b(171); b(172); b(14);
+    check("seac in a CID font", run(&r, 40) == 0);
+    check("though its pieces draw", outline.glyph(&r, 1, &p) == 1 && outline.glyph(&r, 2, &p) == 1);
+    fresh("text/testdata/cid.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    let is i64 as sel = r.cff.fd_select;
+    let is i64 as format = sfnt.table.u8_at(&f, sel);
+    poke8(sel, 7);
+    check("an FDSelect format no one has", outline.glyph(&r, 40, &p) == 0);
+    poke8(sel, format);
+    // Format 3: every range's dict made one past the last.
+    let is i64 as nr = sfnt.table.u16_at(&f, sel + 1);
+    let is i64 as i with mut = 0;
+    while (i < nr) {
+        poke8(sel + 3 + i * 3 + 2, r.cff.fdarray.count);
+        i = i + 1;
+    }
+    check("a font dict that is not there", outline.glyph(&r, 40, &p) == 0);
+    // Format 0, read past the table: no dict.
+    poke8(sel, 0);
+    let is i64 as beyond = copy_size - sel + 10;
+    check("format 0 past the table", outline.cff.fd(&f, &r.cff, beyond) == 0 - 1);
+    outline.close(&r);
+    // Without FDSelect, many dicts say nothing of which is whose.
+    fresh("text/testdata/cid.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    let is i64 as fso = find_op(&f, r.cff.top, r.cff.top_len, 1237);
+    check("an FDSelect operator", fso > 0);
+    poke8(fso + 1, 38);
+    check("many dicts, no FDSelect", outline.open(&f).ok == 0);
+    // Counted down: two say nothing of which is whose either; one needs no
+    // FDSelect; none is no font.
+    let is i64 as fdc = r.cff.fdarray.offs - 3;
+    poke16(fdc, 2);
+    check("two dicts, no FDSelect", outline.open(&f).ok == 0);
+    poke16(fdc, 1);
+    check("one dict, no FDSelect", outline.open(&f).ok == 1);
+    poke16(fdc, 0);
+    check("no font dicts", outline.open(&f).ok == 0);
+    outline.close(&r);
+
+    // CFF2: no endchar, no return; blend and vsindex held to the store.
+    current = "cff2, malformed";
+    current_glyph = 5;
+    fresh("text/testdata/cff2.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    // Each the last thing the charstring does: CFF2 runs to its end.
+    let is [8]i64 as c2;
+    c2[0] = 14;
+    check("endchar in CFF2", run_at_end(&r, 5, cast(*i64, &c2), 1) == 0);
+    c2[0] = 11;
+    check("return in CFF2", run_at_end(&r, 5, cast(*i64, &c2), 1) == 0);
+    c2[0] = 140; c2[1] = 16;
+    check("blend short of its deltas", run_at_end(&r, 5, cast(*i64, &c2), 2) == 0);
+    c2[0] = 16;
+    check("blend with nothing", run_at_end(&r, 5, cast(*i64, &c2), 1) == 0);
+    c2[0] = 144; c2[1] = 15;
+    check("no such vsindex", run_at_end(&r, 5, cast(*i64, &c2), 2) == 0);
+    c2[0] = 140; c2[1] = 15;
+    check("vsindex one past the store", run_at_end(&r, 5, cast(*i64, &c2), 2) == 0);
+    c2[0] = 15;
+    check("vsindex with nothing", run_at_end(&r, 5, cast(*i64, &c2), 1) == 0);
+    c2[0] = 139; c2[1] = 15;
+    check("vsindex 0", run_at_end(&r, 5, cast(*i64, &c2), 2) == 1);
+    // Values and their deltas, at the default instance: the values.
+    zeros(2); b(139); b(139); b(139); b(139); b(141); b(16); b(21);
+    check("blend keeps the values", run(&r, 5) == 1);
+    outline.close(&r);
+    // A Private DICT naming variation data the store does not have: no
+    // glyph draws.
+    fresh("text/testdata/cff2.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    let is i64 as dlen with mut = 0;
+    let is i64 as d0 = outline.cff.item(&f, &r.cff.fdarray, 0, &dlen);
+    outline.cff.find(&f, d0, dlen, 18);
+    let is i64 as priv_off = f.cff2.off + cast(i64, outline.cff.vals[1]);
+    let is i64 as priv_len = cast(i64, outline.cff.vals[0]);
+    // BlueScale's real, 1e 62 5c 4f (625E-4), made vsindex 1 and two zeros.
+    let is i64 as bs = find_op(&f, priv_off, priv_len, 1209);
+    check("a BlueScale to replace", bs > 0 && sfnt.table.u8_at(&f, bs - 4) == 30);
+    poke8(bs - 4, 140);
+    poke8(bs - 3, 22);
+    poke8(bs - 2, 139);
+    poke8(bs - 1, 139);
+    current_glyph = 5;
+    check("vsindex past the store", outline.glyph(&r, 5, &p) == 0);
+    // Even for a glyph that never blends.
+    c2[0] = 139; c2[1] = 139; c2[2] = 21;
+    check("vsindex past the store, no blend", run_at_end(&r, 5, cast(*i64, &c2), 3) == 0);
+    outline.close(&r);
+    // A store made by hand, whose header before its offsets and whose bytes
+    // after them both read as offsets inside the table: only vsindex 0 is
+    // there, of three regions.
+    fresh("text/testdata/cff2.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    let is outline.cff.Cff as fake = r.cff;
+    fake.vstore = r.cff.charstrings.data + 1;
+    let is i64 as vs = fake.vstore + 2;
+    let is i64 as z with mut = 0;
+    while (z < 22) { poke8(vs + z, 0); z = z + 1; }
+    poke8(vs + 1, 1);
+    poke8(vs + 7, 1);
+    poke8(vs + 11, 16);
+    poke8(vs + 15, 16);
+    poke8(vs + 21, 3);
+    check("vsindex 0 of a store", outline.cff.regions(&f, &fake, 0) == 3);
+    check("vsindex 1 of a store of one", outline.cff.regions(&f, &fake, 1) == 0 - 1);
+    check("vsindex -1", outline.cff.regions(&f, &fake, 0 - 1) == 0 - 1);
+    outline.close(&r);
+    // CFF2 without font dicts, and a CFF2 version this is not.
+    fresh("text/testdata/cff2.otf");
+    f = sfnt.open(copy, copy_size, 0);
+    r = outline.open(&f);
+    let is i64 as fa = find_op(&f, r.cff.top, r.cff.top_len, 1236);
+    check("an FDArray operator", fa > 0);
+    poke8(fa + 1, 38);
+    check("CFF2 with no font dicts", outline.open(&f).ok == 0);
+    poke8(fa + 1, 36);
+    poke8(f.cff2.off, 3);
+    check("CFF2 version 3", outline.open(&f).ok == 0);
+    outline.close(&r);
+}
+
+// Cut anywhere, laid against an unreadable page: whatever opens draws only
+// from within the bytes.
+fn cut(file as *u8) as void {
+    current = file;
+    let is *u8 as data = load(file);
+    let is i64 as size = loaded;
+    let is *u8 as guard = linux.mmap(cast(*u8, 0), 1048576 + 4096, 3, 34, 0 - 1, 0);
+    linux.mprotect(cast(*u8, cast(i64, guard) + 1048576), 4096, 0);
+    let is i64 as n with mut = 0;
+    while (n <= size) {
+        let is *u8 as at = cast(*u8, cast(i64, guard) + 1048576 - n);
+        mem.memcpy(at, data, n);
+        let is sfnt.table.Face as f = sfnt.open(at, n, 0);
+        if (f.ok == 1) {
+            let is outline.Reader as r = outline.open(&f);
+            let is i64 as g with mut = 0;
+            while (g < f.glyphs) {
+                outline.glyph(&r, g, &p);
+                g = g + 1;
+            }
+            outline.close(&r);
+        }
+        n = n + 29;
+    }
+    check("cut anywhere, read only within", 1);
+}
+
+fn main() as i32 {
+    p = outline.path.open(65536);
+    font("text/testdata/composite.ttf", "text/testdata/composite.ttf.outline.ref");
+    font("text/testdata/ops.otf", "text/testdata/ops.otf.outline.ref");
+    font("text/testdata/big.otf", "text/testdata/big.otf.outline.ref");
+    font("text/testdata/cmaps.ttf", "text/testdata/cmaps.ttf.outline.ref");
+    font("text/testdata/glyf.ttf", "text/testdata/glyf.ttf.outline.ref");
+    font("text/testdata/cff.otf", "text/testdata/cff.otf.outline.ref");
+    font("text/testdata/cff2.otf", "text/testdata/cff2.otf.outline.ref");
+    font("text/testdata/vf.ttf", "text/testdata/vf.ttf.outline.ref");
+    font("text/testdata/kern.ttf", "text/testdata/kern.ttf.outline.ref");
+    font("text/testdata/cid.otf", "text/testdata/cid.otf.outline.ref");
+    font("text/testdata/pair.ttc", "text/testdata/pair.ttc.outline.ref");
+    current = "all";
+    check("every glyph", glyphs_checked == 2348);
+    glyf_cases();
+    cff_cases();
+    cut("text/testdata/composite.ttf");
+    cut("text/testdata/ops.otf");
+    cut("text/testdata/cid.otf");
+    cut("text/testdata/cff2.otf");
+
+    if (fails > 0) {
+        io.printf("outline: %d failures (%d glyphs)\n", cast(i64, fails), glyphs_checked);
+        return 1;
+    }
+    io.printf("outline: all checks passed (%d glyphs)\n", glyphs_checked);
+    return 0;
+}

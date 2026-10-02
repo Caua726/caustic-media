@@ -1,0 +1,400 @@
+// text/outline/glyf.cst — TrueType outlines: points on and off the curve,
+// and composites made of other glyphs.
+//
+// A glyph is first expanded into points — a composite's components loaded,
+// one after another, each moved and scaled into place — and only then drawn,
+// because a component may be placed by matching one of its points to one of
+// the points already there, which needs the points rather than a drawing.
+// The drawing follows fontTools, which the tests hold it to: each contour
+// starts at its first on-curve point, consecutive off-curve points imply an
+// on-curve point midway between them, a contour of off-curve points alone
+// starts midway between its last and first, and the line back to the start is
+// the close.
+//
+// Composites nest at most MAX_DEPTH deep, and a glyph is at most
+// MAX_COMPONENTS components all told, so a font whose composites refer to
+// themselves, or fan out, fails the glyph rather than looping. A component's
+// offset is applied after its scale unless it asks otherwise
+// (SCALED_COMPONENT_OFFSET), as on Windows and in fontTools.
+use "../sfnt/table.cst" as table;
+use "path.cst" as path;
+use "std/mem.cst" as mem;
+
+let is i64 as MAX_DEPTH      with imut = 16;
+let is i64 as MAX_COMPONENTS with imut = 4096;
+
+// Simple glyphs' point flags.
+let is i64 as ON_CURVE with imut = 1;
+let is i64 as X_SHORT  with imut = 2;
+let is i64 as Y_SHORT  with imut = 4;
+let is i64 as REPEAT   with imut = 8;
+let is i64 as X_SAME   with imut = 16;   // or positive, for a short x
+let is i64 as Y_SAME   with imut = 32;
+
+// Component flags.
+let is i64 as ARG_WORDS      with imut = 1;
+let is i64 as ARGS_XY        with imut = 2;
+let is i64 as HAVE_SCALE     with imut = 8;
+let is i64 as MORE           with imut = 32;
+let is i64 as HAVE_XY_SCALE  with imut = 64;
+let is i64 as HAVE_2X2       with imut = 128;
+let is i64 as SCALED_OFFSET  with imut = 2048;
+let is i64 as UNSCALED_OFFSET with imut = 4096;
+
+// The expanded points of one glyph: coordinates, on-curve flags and where
+// each contour ends. Sized once; a glyph that does not fit fails. Every
+// contour has a point of its own, so room for the points is room for the
+// contours.
+struct Points {
+    block      as *u8;
+    bytes      as i64;
+    xs         as *f64;
+    ys         as *f64;
+    on         as *u8;
+    ends       as *i64;
+    cap        as i64;   // points, and contours
+    n          as i64;
+    nc         as i64;
+    components as i64;   // loaded so far for the glyph being expanded
+}
+
+fn points_open(cap as i64) as Points {
+    let is Points as s;
+    s.cap = cap;
+    s.bytes = cap * 25;
+    s.block = mem.core.mmap_anon(s.bytes);
+    s.xs = cast(*f64, s.block);
+    s.ys = cast(*f64, cast(i64, s.block) + cap * 8);
+    s.on = cast(*u8, cast(i64, s.block) + cap * 16);
+    s.ends = cast(*i64, cast(i64, s.block) + cap * 17);
+    s.n = 0;
+    s.nc = 0;
+    s.components = 0;
+    if (cast(i64, s.block) == 0) { s.cap = 0; }
+    return s;
+}
+
+fn points_close(s as *Points) as void {
+    if (cast(i64, s.block) != 0) { mem.core.munmap(s.block, s.bytes); }
+    s.block = cast(*u8, 0);
+    s.cap = 0;
+}
+
+fn _px(s as *Points, i as i64) as f64 { return *cast(*f64, cast(i64, s.xs) + i * 8); }
+fn _py(s as *Points, i as i64) as f64 { return *cast(*f64, cast(i64, s.ys) + i * 8); }
+fn _pon(s as *Points, i as i64) as i64 { return cast(i64, *cast(*u8, cast(i64, s.on) + i)); }
+fn _set(s as *Points, i as i64, x as f64, y as f64) as void {
+    *cast(*f64, cast(i64, s.xs) + i * 8) = x;
+    *cast(*f64, cast(i64, s.ys) + i * 8) = y;
+}
+fn _end(s as *Points, i as i64) as i64 { return *cast(*i64, cast(i64, s.ends) + i * 8); }
+
+// Where glyph gid's data starts in the file, its length into len; -1 for a
+// glyph past the face's last or one whose loca entries are out of order or
+// outside glyf.
+fn extent(f as *table.Face, gid as i64, len as *i64) as i64 {
+    *len = 0;
+    if (gid < 0 || gid >= f.glyphs) { return 0 - 1; }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    if (f.loc_long == 1) {
+        if (table.inside(f.loca, f.loca.off + gid * 4, 8) == 0) { return 0 - 1; }
+        a = table.u32_at(f, f.loca.off + gid * 4);
+        b = table.u32_at(f, f.loca.off + gid * 4 + 4);
+    } else {
+        if (table.inside(f.loca, f.loca.off + gid * 2, 4) == 0) { return 0 - 1; }
+        a = table.u16_at(f, f.loca.off + gid * 2) * 2;
+        b = table.u16_at(f, f.loca.off + gid * 2 + 2) * 2;
+    }
+    if (b < a || b > f.glyf.len) { return 0 - 1; }
+    *len = b - a;
+    return f.glyf.off + a;
+}
+
+// Appends glyph gid's points to s. 1, or 0 for a glyph that is malformed,
+// too deep or does not fit.
+fn _load(f as *table.Face, s as *Points, gid as i64, depth as i64) as i32 {
+    if (depth > MAX_DEPTH) { return 0; }
+    let is i64 as len with mut = 0;
+    let is i64 as g = extent(f, gid, &len);
+    if (g < 0) { return 0; }
+    if (len == 0) { return 1; }
+    let is table.Table as t;
+    t.off = g;
+    t.len = len;
+    if (table.inside(t, g, 10) == 0) { return 0; }
+    let is i64 as nc = table.i16_at(f, g);
+    if (nc >= 0) { return _simple(f, s, t, nc); }
+    return _composite(f, s, t, depth);
+}
+
+fn _simple(f as *table.Face, s as *Points, t as table.Table, nc as i64) as i32 {
+    let is i64 as g = t.off;
+    // The contour ends are read unchecked: past the glyph they lead only to
+    // flags that are checked.
+    let is i64 as base = s.n;
+    let is i64 as prev with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < nc) {
+        let is i64 as e = table.u16_at(f, g + 10 + i * 2);
+        if (e <= prev) { return 0; }
+        prev = e;
+        i = i + 1;
+    }
+    let is i64 as n = prev + 1;
+    if (base + n > s.cap) { return 0; }
+    let is i64 as at with mut = g + 12 + nc * 2 + table.u16_at(f, g + 10 + nc * 2);
+    // Flags, each with a repeat count when it says so; kept whole for now.
+    i = 0;
+    while (i < n) {
+        if (table.inside(t, at, 1) == 0) { return 0; }
+        let is i64 as fl = table.u8_at(f, at);
+        at = at + 1;
+        let is i64 as reps with mut = 0;
+        if ((fl & REPEAT) != 0) {
+            if (table.inside(t, at, 1) == 0) { return 0; }
+            reps = table.u8_at(f, at);
+            at = at + 1;
+        }
+        let is i64 as r with mut = 0;
+        while (r <= reps && i < n) {
+            *cast(*u8, cast(i64, s.on) + base + i) = cast(u8, fl);
+            i = i + 1;
+            r = r + 1;
+        }
+        if (r <= reps) { return 0; }
+    }
+    // x deltas, then y.
+    let is i64 as v with mut = 0;
+    i = 0;
+    while (i < n) {
+        let is i64 as fl = _pon(s, base + i);
+        if ((fl & X_SHORT) != 0) {
+            if (table.inside(t, at, 1) == 0) { return 0; }
+            let is i64 as d = table.u8_at(f, at);
+            at = at + 1;
+            if ((fl & X_SAME) != 0) { v = v + d; } else { v = v - d; }
+        } else if ((fl & X_SAME) == 0) {
+            if (table.inside(t, at, 2) == 0) { return 0; }
+            v = v + table.i16_at(f, at);
+            at = at + 2;
+        }
+        *cast(*f64, cast(i64, s.xs) + (base + i) * 8) = cast(f64, v);
+        i = i + 1;
+    }
+    v = 0;
+    i = 0;
+    while (i < n) {
+        let is i64 as fl = _pon(s, base + i);
+        if ((fl & Y_SHORT) != 0) {
+            if (table.inside(t, at, 1) == 0) { return 0; }
+            let is i64 as d = table.u8_at(f, at);
+            at = at + 1;
+            if ((fl & Y_SAME) != 0) { v = v + d; } else { v = v - d; }
+        } else if ((fl & Y_SAME) == 0) {
+            if (table.inside(t, at, 2) == 0) { return 0; }
+            v = v + table.i16_at(f, at);
+            at = at + 2;
+        }
+        *cast(*f64, cast(i64, s.ys) + (base + i) * 8) = cast(f64, v);
+        *cast(*u8, cast(i64, s.on) + base + i) = cast(u8, fl & ON_CURVE);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < nc) {
+        *cast(*i64, cast(i64, s.ends) + (s.nc + i) * 8) = base + table.u16_at(f, g + 10 + i * 2);
+        i = i + 1;
+    }
+    s.n = base + n;
+    s.nc = s.nc + nc;
+    return 1;
+}
+
+fn _f2dot14(f as *table.Face, at as i64) as f64 { return cast(f64, table.i16_at(f, at)) / 16384.0; }
+
+fn _composite(f as *table.Face, s as *Points, t as table.Table, depth as i64) as i32 {
+    let is i64 as start = s.n;
+    let is i64 as at with mut = t.off + 10;
+    let is i64 as more with mut = MORE;
+    while (more != 0) {
+        if (table.inside(t, at, 4) == 0) { return 0; }
+        let is i64 as fl = table.u16_at(f, at);
+        let is i64 as comp = table.u16_at(f, at + 2);
+        at = at + 4;
+        s.components = s.components + 1;
+        if (s.components > MAX_COMPONENTS) { return 0; }
+        let is i64 as a1 with mut = 0;
+        let is i64 as a2 with mut = 0;
+        let is i32 as xy with mut = 0;
+        if ((fl & ARGS_XY) != 0) { xy = 1; }
+        if ((fl & ARG_WORDS) != 0) {
+            if (table.inside(t, at, 4) == 0) { return 0; }
+            if (xy == 1) {
+                a1 = table.i16_at(f, at);
+                a2 = table.i16_at(f, at + 2);
+            } else {
+                a1 = table.u16_at(f, at);
+                a2 = table.u16_at(f, at + 2);
+            }
+            at = at + 4;
+        } else {
+            if (table.inside(t, at, 2) == 0) { return 0; }
+            a1 = table.u8_at(f, at);
+            a2 = table.u8_at(f, at + 1);
+            if (xy == 1) {
+                if (a1 >= 128) { a1 = a1 - 256; }
+                if (a2 >= 128) { a2 = a2 - 256; }
+            }
+            at = at + 2;
+        }
+        let is f64 as xx with mut = 1.0;
+        let is f64 as xy_ with mut = 0.0;
+        let is f64 as yx with mut = 0.0;
+        let is f64 as yy with mut = 1.0;
+        let is i32 as scaled with mut = 0;
+        if ((fl & HAVE_SCALE) != 0) {
+            if (table.inside(t, at, 2) == 0) { return 0; }
+            xx = _f2dot14(f, at);
+            yy = xx;
+            at = at + 2;
+            scaled = 1;
+        } else if ((fl & HAVE_XY_SCALE) != 0) {
+            if (table.inside(t, at, 4) == 0) { return 0; }
+            xx = _f2dot14(f, at);
+            yy = _f2dot14(f, at + 2);
+            at = at + 4;
+            scaled = 1;
+        } else if ((fl & HAVE_2X2) != 0) {
+            if (table.inside(t, at, 8) == 0) { return 0; }
+            xx = _f2dot14(f, at);
+            xy_ = _f2dot14(f, at + 2);
+            yx = _f2dot14(f, at + 4);
+            yy = _f2dot14(f, at + 6);
+            at = at + 8;
+            scaled = 1;
+        }
+        let is i64 as from = s.n;
+        if (_load(f, s, comp, depth + 1) == 0) { return 0; }
+        let is f64 as dx with mut = cast(f64, a1);
+        let is f64 as dy with mut = cast(f64, a2);
+        if (xy == 0) {
+            // Matched points: a1 is one of the composite's points so far,
+            // a2 one of this component's, which is moved onto it after its
+            // own transform.
+            if (a1 >= from - start || a2 >= s.n - from) { return 0; }
+            if (scaled == 1) { _transform(s, from, xx, xy_, yx, yy); }
+            dx = _px(s, start + a1) - _px(s, from + a2);
+            dy = _py(s, start + a1) - _py(s, from + a2);
+            _translate(s, from, dx, dy);
+        } else if (scaled == 0) {
+            _translate(s, from, dx, dy);
+        } else if ((fl & SCALED_OFFSET) != 0 && (fl & UNSCALED_OFFSET) == 0) {
+            _translate(s, from, dx, dy);
+            _transform(s, from, xx, xy_, yx, yy);
+        } else {
+            _transform(s, from, xx, xy_, yx, yy);
+            _translate(s, from, dx, dy);
+        }
+        more = fl & MORE;
+    }
+    return 1;
+}
+
+fn _translate(s as *Points, from as i64, dx as f64, dy as f64) as void {
+    let is i64 as i with mut = from;
+    while (i < s.n) {
+        _set(s, i, _px(s, i) + dx, _py(s, i) + dy);
+        i = i + 1;
+    }
+}
+
+// x' = x xx + y yx, y' = x xy + y yy: the component's 2x2 as the font
+// stores it, xscale, scale01, scale10, yscale.
+fn _transform(s as *Points, from as i64, xx as f64, xy as f64, yx as f64, yy as f64) as void {
+    let is i64 as i with mut = from;
+    while (i < s.n) {
+        let is f64 as x = _px(s, i);
+        let is f64 as y = _py(s, i);
+        _set(s, i, x * xx + y * yx, x * xy + y * yy);
+        i = i + 1;
+    }
+}
+
+fn _mid(a as f64, b as f64) as f64 { return 0.5 * (a + b); }
+
+// The expanded points drawn into p, contour by contour.
+fn draw(s as *Points, p as *path.Path) as void {
+    let is i64 as first with mut = 0;
+    let is i64 as c with mut = 0;
+    while (c < s.nc) {
+        let is i64 as last = _end(s, c);
+        let is i64 as n = last - first + 1;
+        // The first on-curve point; -1 for none.
+        let is i64 as on with mut = 0 - 1;
+        let is i64 as k with mut = 0;
+        while (k < n && on < 0) {
+            if (_pon(s, first + k) == 1) { on = k; }
+            k = k + 1;
+        }
+        if (on < 0) {
+            let is f64 as sx = _mid(_px(s, last), _px(s, first));
+            let is f64 as sy = _mid(_py(s, last), _py(s, first));
+            path.move_to(p, sx, sy);
+            k = 0;
+            while (k < n) {
+                let is i64 as i = first + k;
+                if (k + 1 < n) {
+                    path.quad_to(p, _px(s, i), _py(s, i), _mid(_px(s, i), _px(s, i + 1)), _mid(_py(s, i), _py(s, i + 1)));
+                } else {
+                    path.quad_to(p, _px(s, i), _py(s, i), sx, sy);
+                }
+                k = k + 1;
+            }
+        } else {
+            path.move_to(p, _px(s, first + on), _py(s, first + on));
+            // Every point after the first on-curve one, around to it again.
+            let is i64 as off0 with mut = 0 - 1;   // the first of a run of off-curve points
+            k = 1;
+            while (k <= n) {
+                let is i64 as i = first + (on + k) % n;
+                if (_pon(s, i) == 0) {
+                    if (off0 >= 0) {
+                        // The previous off-curve point and its midpoint with this one.
+                        let is i64 as pi = first + (on + k - 1) % n;
+                        path.quad_to(p, _px(s, pi), _py(s, pi), _mid(_px(s, pi), _px(s, i)), _mid(_py(s, pi), _py(s, i)));
+                    }
+                    off0 = i;
+                } else {
+                    if (off0 >= 0) {
+                        let is i64 as pi = first + (on + k - 1) % n;
+                        path.quad_to(p, _px(s, pi), _py(s, pi), _px(s, i), _py(s, i));
+                        off0 = 0 - 1;
+                    } else if (k < n) {
+                        // The line back to the start is the close's.
+                        path.line_to(p, _px(s, i), _py(s, i));
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        path.close_path(p);
+        first = last + 1;
+        c = c + 1;
+    }
+}
+
+// Glyph gid's outline into p, cleared first. 1, or 0 for a glyph that is
+// malformed or does not fit, with p empty.
+fn glyph(f as *table.Face, s as *Points, gid as i64, p as *path.Path) as i32 {
+    path.clear(p);
+    s.n = 0;
+    s.nc = 0;
+    s.components = 0;
+    if (_load(f, s, gid, 0) == 0) { return 0; }
+    draw(s, p);
+    if (p.full == 1) {
+        path.clear(p);
+        return 0;
+    }
+    return 1;
+}

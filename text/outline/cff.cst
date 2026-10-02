@@ -1,0 +1,761 @@
+// text/outline/cff.cst — PostScript outlines: CFF and CFF2.
+//
+// A glyph is a charstring, a program for a small stack machine whose
+// operators draw lines and cubic curves; shared pieces are subroutines, local
+// to a font dict or global, called with biased numbers. CFF2 is the variable
+// form: the same machine without widths, endchar or return, with blend and
+// vsindex. A CID-keyed font — every large CJK font — has many font dicts,
+// each with subroutines of its own, and FDSelect says which a glyph uses.
+//
+// The interpreter is bounded, since a charstring is data from a file: the
+// stack holds at most 48 values (513 in CFF2), subroutines nest at most 10
+// deep, and a glyph runs at most MAX_OPS operators. A glyph's font dict is
+// read when the glyph is, so a font may have as many as FDSelect can name.
+// Hints are counted, for the masks that follow them, and otherwise ignored.
+// endchar's deprecated accent
+// building (seac) draws two glyphs found by their standard names. The
+// arithmetic operators of the Type 2 specification, which no font producer
+// writes and CFF2 dropped, end the glyph as malformed.
+//
+// Contours are drawn as fontTools draws them, which the tests hold this to:
+// every moveto starts a contour, closing the one before; a drawing operator
+// with none before it starts one where the pen is; the end closes the last.
+// At blend, the default instance: the variation step adds the deltas.
+use "../sfnt/table.cst" as table;
+use "path.cst" as path;
+
+let is i64 as MAX_OPS   with imut = 65536;
+let is i64 as MAX_DEPTH with imut = 10;
+
+// An INDEX: count items, their data found through offsets.
+struct Index {
+    count   as i64;
+    offsize as i64;
+    offs    as i64;   // the offset array, absolute
+    data    as i64;   // where offset 1 points, absolute
+    end     as i64;   // just past the INDEX
+}
+
+struct Cff {
+    t           as table.Table;   // CFF or CFF2
+    cff2        as i32;
+    cid         as i32;           // font dicts, chosen by FDSelect
+    top         as i64;           // the Top DICT, absolute
+    top_len     as i64;
+    charstrings as Index;
+    gsubrs      as Index;
+    fdarray     as Index;
+    private     as i64;           // one font dict's Private DICT, absolute
+    private_len as i64;
+    fd_select   as i64;           // absolute; 0 for one font dict
+    charset     as i64;           // absolute, or 0, 1, 2 for the predefined ones
+    vstore      as i64;           // CFF2's ItemVariationStore, absolute; 0 for none
+    ok          as i32;
+    _pad0       as i32;
+}
+
+// --- INDEX ---
+
+fn _index(f as *table.Face, t as table.Table, at as i64, wide as i32, out as *Index) as i32 {
+    out.count = 0;
+    out.offsize = 0;
+    out.offs = 0;
+    out.data = 0;
+    out.end = at;
+    let is i64 as hdr with mut = 2;
+    if (wide == 1) { hdr = 4; }
+    if (table.inside(t, at, hdr) == 0) { return 0; }
+    let is i64 as n with mut = table.u16_at(f, at);
+    if (wide == 1) { n = table.u32_at(f, at); }
+    out.count = n;
+    if (n == 0) {
+        out.end = at + hdr;
+        return 1;
+    }
+    // An offset size outside 1 to 4, or offsets past the table, read
+    // offsets the two checks after refuse: the first must be 1 and the last
+    // must end within the table.
+    let is i64 as os = table.u8_at(f, at + hdr);
+    out.offsize = os;
+    out.offs = at + hdr + 1;
+    out.data = out.offs + (n + 1) * os - 1;
+    let is i64 as last = _off(f, out, n);
+    if (_off(f, out, 0) != 1 || table.inside(t, out.data + 1, last - 1) == 0) { return 0; }
+    out.end = out.data + last;
+    return 1;
+}
+
+fn _off(f as *table.Face, x as *Index, i as i64) as i64 {
+    let is i64 as at = x.offs + i * x.offsize;
+    if (x.offsize == 1) { return table.u8_at(f, at); }
+    if (x.offsize == 2) { return table.u16_at(f, at); }
+    if (x.offsize == 3) { return table.u24_at(f, at); }
+    return table.u32_at(f, at);
+}
+
+// Item i's data: where it starts, its length into len; -1 for no such item
+// or one whose offsets are out of order.
+fn item(f as *table.Face, x as *Index, i as i64, len as *i64) as i64 {
+    *len = 0;
+    if (i < 0 || i >= x.count) { return 0 - 1; }
+    let is i64 as a = _off(f, x, i);
+    let is i64 as b = _off(f, x, i + 1);
+    if (a < 1 || b < a || x.data + b > x.end) { return 0 - 1; }
+    *len = b - a;
+    return x.data + a;
+}
+
+// --- DICT ---
+//
+// Operands then an operator, over and over. find() runs through a DICT for
+// one operator and leaves its operands in vals; dicts are small, and each is
+// read for a handful of entries once per face.
+
+let is [48]f64 as vals with mut;
+let is i64 as nvals with mut = 0;
+
+// The operator op — 12 x as 1200 + x — in the DICT at at, len long; 1 with
+// its operands in vals, 0 when it is not there.
+fn find(f as *table.Face, at as i64, len as i64, op as i64) as i32 {
+    let is i64 as p with mut = at;
+    let is i64 as end = at + len;
+    nvals = 0;
+    while (p < end) {
+        let is i64 as b = table.u8_at(f, p);
+        // Operators: CFF's 0 to 21, CFF2's vsindex, blend and vstore, and
+        // the reserved values around them.
+        if (b <= 27) {
+            let is i64 as code with mut = b;
+            p = p + 1;
+            if (b == 12) {
+                code = 1200 + table.u8_at(f, p);
+                p = p + 1;
+            }
+            if (code == op) { return 1; }
+            nvals = 0;
+        } else {
+            let is f64 as v with mut = 0.0;
+            if (b == 28) {
+                v = cast(f64, table.i16_at(f, p + 1));
+                p = p + 3;
+            } else if (b == 29) {
+                v = cast(f64, table.i32_at(f, p + 1));
+                p = p + 5;
+            } else if (b == 30) {
+                // A real, in nibbles, ended by the first 0xF, high or low —
+                // the byte it is in is the last: only its extent matters here.
+                p = p + 1;
+                let is i32 as more with mut = 1;
+                while (more == 1 && p < end) {
+                    let is i64 as c = table.u8_at(f, p);
+                    p = p + 1;
+                    if ((c & 15) == 15 || (c >> 4) == 15) { more = 0; }
+                }
+            } else if (b >= 32 && b <= 246) {
+                v = cast(f64, b - 139);
+                p = p + 1;
+            } else if (b >= 247 && b <= 250) {
+                v = cast(f64, (b - 247) * 256 + table.u8_at(f, p + 1) + 108);
+                p = p + 2;
+            } else if (b >= 251 && b <= 254) {
+                v = cast(f64, 0 - (b - 251) * 256 - table.u8_at(f, p + 1) - 108);
+                p = p + 2;
+            } else {
+                return 0;
+            }
+            if (nvals < 48) {
+                vals[nvals] = v;
+                nvals = nvals + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+fn _int(i as i64) as i64 { return cast(i64, vals[i]); }
+
+// --- Opening ---
+
+// The Private DICT at off, size long: its subroutines into subrs, and its
+// variation data — CFF2's vsindex, 0 when it does not say — returned. CFF
+// has no store for a vsindex to name, so one there weighs nothing.
+fn _private(f as *table.Face, c as *Cff, off as i64, size as i64, subrs as *Index) as i64 {
+    subrs.count = 0;
+    if (size <= 0 || table.inside(c.t, off, size) == 0) { return 0; }
+    if (find(f, off, size, 19) == 1 && nvals >= 1) {
+        _index(f, c.t, off + _int(0), c.cff2, subrs);
+    }
+    if (find(f, off, size, 22) == 1 && nvals >= 1) { return _int(0); }
+    return 0;
+}
+
+// Font dict fd's subroutines into subrs, its variation data returned.
+fn font_dict(f as *table.Face, c as *Cff, fd as i64, subrs as *Index) as i64 {
+    subrs.count = 0;
+    if (c.cid == 0) { return _private(f, c, c.private, c.private_len, subrs); }
+    let is i64 as dl with mut = 0;
+    let is i64 as d = item(f, &c.fdarray, fd, &dl);
+    if (d < 0 || find(f, d, dl, 18) == 0 || nvals < 2) { return 0; }
+    return _private(f, c, c.t.off + _int(1), _int(0), subrs);
+}
+
+fn open(f as *table.Face) as Cff {
+    let is Cff as c;
+    c.ok = 0;
+    c.cid = 0;
+    c.top = 0;
+    c.top_len = 0;
+    c.fdarray.count = 0;
+    c.private = 0;
+    c.private_len = 0;
+    c.fd_select = 0;
+    c.charset = 0;
+    c.vstore = 0;
+    c._pad0 = 0;
+    c.cff2 = 0;
+    c.t = f.cff;
+    if (f.outline == table.OUTLINE_CFF2) {
+        c.cff2 = 1;
+        c.t = f.cff2;
+    }
+    let is i64 as base = c.t.off;
+    if (table.inside(c.t, base, 4) == 0) { return c; }
+    let is i64 as top with mut = 0;
+    let is i64 as top_len with mut = 0;
+    if (c.cff2 == 1) {
+        if (table.u8_at(f, base) != 2 || table.inside(c.t, base, 5) == 0) { return c; }
+        top = base + table.u8_at(f, base + 2);
+        top_len = table.u16_at(f, base + 3);
+        if (table.inside(c.t, top, top_len) == 0) { return c; }
+        if (_index(f, c.t, top + top_len, 1, &c.gsubrs) == 0) { return c; }
+    } else {
+        if (table.u8_at(f, base) != 1) { return c; }
+        let is Index as names;
+        let is Index as tops;
+        let is Index as strings;
+        if (_index(f, c.t, base + table.u8_at(f, base + 2), 0, &names) == 0) { return c; }
+        if (_index(f, c.t, names.end, 0, &tops) == 0 || tops.count < 1) { return c; }
+        if (_index(f, c.t, tops.end, 0, &strings) == 0) { return c; }
+        if (_index(f, c.t, strings.end, 0, &c.gsubrs) == 0) { return c; }
+        top = item(f, &tops, 0, &top_len);
+        if (top < 0) { return c; }
+        // Only Type 2 charstrings.
+        if (find(f, top, top_len, 1206) == 1 && nvals >= 1 && _int(0) != 2) { return c; }
+        if (find(f, top, top_len, 15) == 1 && nvals >= 1) {
+            c.charset = _int(0);
+            if (c.charset > 2) { c.charset = base + c.charset; }
+        }
+    }
+    c.top = top;
+    c.top_len = top_len;
+    if (find(f, top, top_len, 17) == 0 || nvals < 1) { return c; }
+    if (_index(f, c.t, base + _int(0), c.cff2, &c.charstrings) == 0) { return c; }
+    if (c.charstrings.count < 1) { return c; }
+    if (c.cff2 == 1 && find(f, top, top_len, 24) == 1 && nvals >= 1) { c.vstore = base + _int(0); }
+    if (find(f, top, top_len, 1236) == 1 && nvals >= 1) {
+        // Font dicts, each with a Private DICT of its own, read per glyph.
+        if (_index(f, c.t, base + _int(0), c.cff2, &c.fdarray) == 0 || c.fdarray.count < 1) { return c; }
+        c.cid = 1;
+        if (find(f, top, top_len, 1237) == 1 && nvals >= 1) { c.fd_select = base + _int(0); }
+        if (c.fdarray.count > 1 && c.fd_select == 0) { return c; }
+    } else {
+        // CFF2 has font dicts always.
+        if (c.cff2 == 1) { return c; }
+        if (find(f, top, top_len, 18) == 1 && nvals >= 2) {
+            c.private = base + _int(1);
+            c.private_len = _int(0);
+        }
+    }
+    c.ok = 1;
+    return c;
+}
+
+// Which font dict glyph gid uses; -1 when FDSelect does not say.
+fn fd(f as *table.Face, c as *Cff, gid as i64) as i64 {
+    if (c.fd_select == 0) { return 0; }
+    let is i64 as s = c.fd_select;
+    let is i64 as format = table.u8_at(f, s);
+    let is i64 as r with mut = 0 - 1;
+    if (format == 0) {
+        if (table.inside(c.t, s + 1 + gid, 1) == 0) { return 0 - 1; }
+        r = table.u8_at(f, s + 1 + gid);
+    } else if (format == 3 || format == 4) {
+        // Ranges: a first glyph and its dict, up to the next range's first; a
+        // sentinel after the last.
+        let is i64 as w with mut = 2;
+        let is i64 as dw with mut = 1;
+        if (format == 4) { w = 4; dw = 2; }
+        let is i64 as n with mut = table.u16_at(f, s + 1);
+        if (format == 4) { n = table.u32_at(f, s + 1); }
+        // Ranges past the table read as nothing that matches, or as zeros.
+        let is i64 as ranges = s + 1 + w;
+        let is i64 as step = w + dw;
+        let is i64 as lo with mut = 0;
+        let is i64 as hi with mut = n;
+        while (lo < hi) {
+            let is i64 as mid = (lo + hi) / 2;
+            let is i64 as first with mut = table.u16_at(f, ranges + mid * step);
+            let is i64 as next with mut = table.u16_at(f, ranges + (mid + 1) * step);
+            if (format == 4) {
+                first = table.u32_at(f, ranges + mid * step);
+                next = table.u32_at(f, ranges + (mid + 1) * step);
+            }
+            if (gid < first) { hi = mid; }
+            else if (gid >= next) { lo = mid + 1; }
+            else {
+                if (format == 4) { r = table.u16_at(f, ranges + mid * step + w); } else { r = table.u8_at(f, ranges + mid * step + w); }
+                lo = hi;
+            }
+        }
+    }
+    if (r >= c.fdarray.count) { return 0 - 1; }
+    return r;
+}
+
+// --- seac's standard names ---
+
+// The standard string a Standard Encoding code names; 0 for none.
+fn _std(code as i64) as i64 {
+    if (code >= 32 && code <= 126) { return code - 31; }
+    if (code >= 161 && code <= 175) { return code - 65; }
+    if (code >= 177 && code <= 180) { return code - 66; }
+    if (code >= 182 && code <= 189) { return code - 67; }
+    if (code == 191) { return 123; }
+    if (code >= 193 && code <= 200) { return code - 69; }
+    if (code >= 202 && code <= 203) { return code - 70; }
+    if (code >= 205 && code <= 208) { return code - 71; }
+    if (code == 225) { return 138; }
+    if (code == 227) { return 139; }
+    if (code >= 232 && code <= 235) { return code - 92; }
+    if (code == 241) { return 144; }
+    if (code == 245) { return 145; }
+    if (code >= 248 && code <= 251) { return code - 102; }
+    return 0;
+}
+
+// The glyph whose name is standard string sid, through the charset; -1.
+fn _by_sid(f as *table.Face, c as *Cff, sid as i64) as i64 {
+    let is i64 as n = c.charstrings.count;
+    if (sid <= 0) { return 0 - 1; }
+    if (c.charset == 0) {
+        // ISOAdobe: glyph i is standard string i, as far as it goes.
+        if (sid < n && sid <= 228) { return sid; }
+        return 0 - 1;
+    }
+    if (c.charset < 3) { return 0 - 1; }
+    let is i64 as s = c.charset;
+    let is i64 as format = table.u8_at(f, s);
+    let is i64 as g with mut = 1;
+    let is i64 as at with mut = s + 1;
+    if (format == 0) {
+        while (g < n) {
+            if (table.u16_at(f, at) == sid) { return g; }
+            at = at + 2;
+            g = g + 1;
+        }
+        return 0 - 1;
+    }
+    if (format != 1 && format != 2) { return 0 - 1; }
+    while (g < n && table.inside(c.t, at, 3) == 1) {
+        let is i64 as first = table.u16_at(f, at);
+        let is i64 as left with mut = table.u8_at(f, at + 2);
+        let is i64 as w with mut = 3;
+        if (format == 2) {
+            left = table.u16_at(f, at + 2);
+            w = 4;
+        }
+        if (sid >= first && sid <= first + left) { return g + (sid - first); }
+        g = g + left + 1;
+        at = at + w;
+    }
+    return 0 - 1;
+}
+
+// --- The interpreter ---
+
+struct Run {
+    f       as *table.Face;
+    c       as *Cff;
+    p       as *path.Path;
+    stack   as [513]f64;
+    n       as i64;
+    max     as i64;
+    x       as f64;
+    y       as f64;
+    stems   as i64;
+    ops     as i64;
+    depth   as i64;
+    lsubrs  as *Index;
+    regions as i64;   // CFF2: the regions blend weighs for the current vsindex
+    open    as i32;   // a contour started
+    width   as i32;   // CFF: the width has been taken, or there is none to take
+    done    as i32;   // endchar
+    err     as i32;
+    seac    as i32;   // drawing an accent's component: no further seac
+    _pad0   as i32;
+}
+
+fn _push(r as *Run, v as f64) as void {
+    if (r.n >= r.max) { r.err = 1; return; }
+    r.stack[r.n] = v;
+    r.n = r.n + 1;
+}
+
+// For the first stack-clearing operator of a CFF charstring: an argument
+// more than the operator takes is the advance width, which hmtx gives anyway.
+fn _width(r as *Run, even as i32) as i64 {
+    let is i64 as first with mut = 0;
+    if (r.width == 0) {
+        r.width = 1;
+        if (r.c.cff2 == 0 && (r.n % 2 == 1) == (even == 1)) { first = 1; }
+    }
+    return first;
+}
+
+fn _moveto(r as *Run, dx as f64, dy as f64) as void {
+    r.x = r.x + dx;
+    r.y = r.y + dy;
+    path.move_to(r.p, r.x, r.y);
+    r.open = 1;
+}
+
+fn _ensure(r as *Run) as void {
+    if (r.open == 0) {
+        path.move_to(r.p, r.x, r.y);
+        r.open = 1;
+    }
+}
+
+fn _line(r as *Run, dx as f64, dy as f64) as void {
+    _ensure(r);
+    r.x = r.x + dx;
+    r.y = r.y + dy;
+    path.line_to(r.p, r.x, r.y);
+}
+
+fn _curve(r as *Run, dx1 as f64, dy1 as f64, dx2 as f64, dy2 as f64, dx3 as f64, dy3 as f64) as void {
+    _ensure(r);
+    let is f64 as x1 = r.x + dx1;
+    let is f64 as y1 = r.y + dy1;
+    let is f64 as x2 = x1 + dx2;
+    let is f64 as y2 = y1 + dy2;
+    r.x = x2 + dx3;
+    r.y = y2 + dy3;
+    path.cubic_to(r.p, x1, y1, x2, y2, r.x, r.y);
+}
+
+fn _s(r as *Run, i as i64) as f64 { return r.stack[i]; }
+
+fn _abs(v as f64) as f64 { if (v < 0.0) { return 0.0 - v; } return v; }
+
+fn _bias(count as i64) as i64 {
+    if (count < 1240) { return 107; }
+    if (count < 33900) { return 1131; }
+    return 32768;
+}
+
+// CFF2: how many regions the ItemVariationData numbered vsindex weighs; -1
+// for none.
+fn regions(f as *table.Face, c as *Cff, vsindex as i64) as i64 {
+    if (c.vstore == 0) { return 0; }
+    // The store follows a 2-byte length.
+    let is i64 as vs = c.vstore + 2;
+    if (vsindex < 0 || vsindex >= table.u16_at(f, vs + 6)) { return 0 - 1; }
+    let is i64 as d = vs + table.u32_at(f, vs + 8 + vsindex * 4);
+    if (table.inside(c.t, d, 6) == 0) { return 0 - 1; }
+    return table.u16_at(f, d + 4);
+}
+
+fn _stems(r as *Run, from as i64) as void {
+    r.stems = r.stems + (r.n - from) / 2;
+}
+
+// Runs the charstring at at, len long. Calls itself for subroutines.
+fn _exec(r as *Run, at as i64, len as i64) as void {
+    let is i64 as p with mut = at;
+    let is i64 as end = at + len;
+    while (p < end && r.err == 0 && r.done == 0) {
+        r.ops = r.ops + 1;
+        if (r.ops > MAX_OPS) { r.err = 1; return; }
+        let is i64 as b = table.u8_at(r.f, p);
+        p = p + 1;
+        if (b >= 32 || b == 28) {
+            if (b == 28) {
+                if (p + 2 > end) { r.err = 1; return; }
+                _push(r, cast(f64, table.i16_at(r.f, p)));
+                p = p + 2;
+            } else if (b <= 246) {
+                _push(r, cast(f64, b - 139));
+            } else if (b <= 250) {
+                if (p + 1 > end) { r.err = 1; return; }
+                _push(r, cast(f64, (b - 247) * 256 + table.u8_at(r.f, p) + 108));
+                p = p + 1;
+            } else if (b <= 254) {
+                if (p + 1 > end) { r.err = 1; return; }
+                _push(r, cast(f64, 0 - (b - 251) * 256 - table.u8_at(r.f, p) - 108));
+                p = p + 1;
+            } else {
+                if (p + 4 > end) { r.err = 1; return; }
+                _push(r, cast(f64, table.i32_at(r.f, p)) / 65536.0);
+                p = p + 4;
+            }
+        } else {
+            p = _op(r, b, p, end);
+        }
+    }
+}
+
+// Operator b, its bytes at p onwards — only the masks and the escape take
+// any. Where the charstring goes on.
+fn _op(r as *Run, b as i64, p0 as i64, end as i64) as i64 {
+    let is i64 as p with mut = p0;
+    let is i64 as n = r.n;
+    if (b == 1 || b == 3 || b == 18 || b == 23) {
+        // hstem, vstem, hstemhm, vstemhm
+        _stems(r, _width(r, 1));
+        r.n = 0;
+    } else if (b == 19 || b == 20) {
+        // hintmask, cntrmask: arguments still there are vertical stems.
+        _stems(r, _width(r, 1));
+        r.n = 0;
+        p = p + (r.stems + 7) / 8;
+        if (p > end) { r.err = 1; }
+    } else if (b == 21) {
+        let is i64 as k = _width(r, 1);
+        if (n - k != 2) { r.err = 1; return p; }
+        _moveto(r, _s(r, k), _s(r, k + 1));
+        r.n = 0;
+    } else if (b == 22 || b == 4) {
+        let is i64 as k = _width(r, 0);
+        if (n - k != 1) { r.err = 1; return p; }
+        if (b == 22) { _moveto(r, _s(r, k), 0.0); } else { _moveto(r, 0.0, _s(r, k)); }
+        r.n = 0;
+    } else if (b == 5) {
+        if (n < 2 || n % 2 != 0) { r.err = 1; return p; }
+        let is i64 as i with mut = 0;
+        while (i < n) { _line(r, _s(r, i), _s(r, i + 1)); i = i + 2; }
+        r.n = 0;
+    } else if (b == 6 || b == 7) {
+        if (n < 1) { r.err = 1; return p; }
+        let is i32 as h with mut = 0;
+        if (b == 6) { h = 1; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            if (h == 1) { _line(r, _s(r, i), 0.0); } else { _line(r, 0.0, _s(r, i)); }
+            h = 1 - h;
+            i = i + 1;
+        }
+        r.n = 0;
+    } else if (b == 8) {
+        if (n < 6 || n % 6 != 0) { r.err = 1; return p; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            _curve(r, _s(r, i), _s(r, i + 1), _s(r, i + 2), _s(r, i + 3), _s(r, i + 4), _s(r, i + 5));
+            i = i + 6;
+        }
+        r.n = 0;
+    } else if (b == 27 || b == 26) {
+        // hhcurveto, vvcurveto: an odd first argument across the curves' grain.
+        let is i64 as i with mut = 0;
+        let is f64 as across with mut = 0.0;
+        if (n % 4 == 1) { across = _s(r, 0); i = 1; }
+        if (n < 4 || (n - i) % 4 != 0) { r.err = 1; return p; }
+        while (i < n) {
+            if (b == 27) {
+                _curve(r, _s(r, i), across, _s(r, i + 1), _s(r, i + 2), _s(r, i + 3), 0.0);
+            } else {
+                _curve(r, across, _s(r, i), _s(r, i + 1), _s(r, i + 2), 0.0, _s(r, i + 3));
+            }
+            across = 0.0;
+            i = i + 4;
+        }
+        r.n = 0;
+    } else if (b == 31 || b == 30) {
+        // hvcurveto, vhcurveto: alternating, a fifth argument on the last.
+        if (n < 4 || (n % 4 != 0 && n % 4 != 1)) { r.err = 1; return p; }
+        let is i32 as h with mut = 0;
+        if (b == 31) { h = 1; }
+        let is i64 as i with mut = 0;
+        while (n - i >= 4) {
+            let is f64 as last with mut = 0.0;
+            if (n - i == 5) { last = _s(r, i + 4); }
+            if (h == 1) {
+                _curve(r, _s(r, i), 0.0, _s(r, i + 1), _s(r, i + 2), last, _s(r, i + 3));
+            } else {
+                _curve(r, 0.0, _s(r, i), _s(r, i + 1), _s(r, i + 2), _s(r, i + 3), last);
+            }
+            h = 1 - h;
+            i = i + 4;
+        }
+        r.n = 0;
+    } else if (b == 24) {
+        // rcurveline: curves, then a line.
+        if (n < 8 || (n - 2) % 6 != 0) { r.err = 1; return p; }
+        let is i64 as i with mut = 0;
+        while (i < n - 2) {
+            _curve(r, _s(r, i), _s(r, i + 1), _s(r, i + 2), _s(r, i + 3), _s(r, i + 4), _s(r, i + 5));
+            i = i + 6;
+        }
+        _line(r, _s(r, i), _s(r, i + 1));
+        r.n = 0;
+    } else if (b == 25) {
+        // rlinecurve: lines, then a curve.
+        if (n < 8 || (n - 6) % 2 != 0) { r.err = 1; return p; }
+        let is i64 as i with mut = 0;
+        while (i < n - 6) { _line(r, _s(r, i), _s(r, i + 1)); i = i + 2; }
+        _curve(r, _s(r, i), _s(r, i + 1), _s(r, i + 2), _s(r, i + 3), _s(r, i + 4), _s(r, i + 5));
+        r.n = 0;
+    } else if (b == 10 || b == 29) {
+        if (n < 1) { r.err = 1; return p; }
+        let is *Index as subrs with mut = r.lsubrs;
+        if (b == 29) { subrs = &r.c.gsubrs; }
+        let is i64 as k = cast(i64, _s(r, n - 1)) + _bias(subrs.count);
+        r.n = n - 1;
+        let is i64 as len with mut = 0;
+        let is i64 as at = item(r.f, subrs, k, &len);
+        if (at < 0 || r.depth >= MAX_DEPTH) { r.err = 1; return p; }
+        r.depth = r.depth + 1;
+        _exec(r, at, len);
+        r.depth = r.depth - 1;
+    } else if (b == 11) {
+        // return: the caller's loop goes on.
+        if (r.c.cff2 == 1) { r.err = 1; return p; }
+        return end;
+    } else if (b == 14) {
+        if (r.c.cff2 == 1) { r.err = 1; return p; }
+        let is i64 as k = _width(r, 1);
+        if (n - k == 4 && r.seac == 0) {
+            _seac(r, _s(r, k), _s(r, k + 1), cast(i64, _s(r, k + 2)), cast(i64, _s(r, k + 3)));
+        } else if (n - k != 0) {
+            r.err = 1;
+        }
+        r.n = 0;
+        r.done = 1;
+    } else if (b == 15) {
+        // vsindex
+        if (r.c.cff2 == 0 || n < 1) { r.err = 1; return p; }
+        r.regions = regions(r.f, r.c, cast(i64, _s(r, n - 1)));
+        if (r.regions < 0) { r.err = 1; }
+        r.n = n - 1;
+    } else if (b == 16) {
+        // blend: n values, each followed by its deltas; the default instance
+        // keeps the values.
+        if (r.c.cff2 == 0 || n < 1) { r.err = 1; return p; }
+        let is i64 as k = cast(i64, _s(r, n - 1));
+        let is i64 as need = k * (r.regions + 1) + 1;
+        if (k < 0 || need > n) { r.err = 1; return p; }
+        r.n = n - need + k;
+    } else if (b == 12) {
+        if (p >= end) { r.err = 1; return p; }
+        let is i64 as e = table.u8_at(r.f, p);
+        p = p + 1;
+        _flex(r, e);
+    } else {
+        r.err = 1;
+    }
+    return p;
+}
+
+fn _flex(r as *Run, e as i64) as void {
+    let is i64 as n = r.n;
+    if (e == 35) {
+        // flex: two curves, and a depth no one renders.
+        if (n != 13) { r.err = 1; return; }
+        _curve(r, _s(r, 0), _s(r, 1), _s(r, 2), _s(r, 3), _s(r, 4), _s(r, 5));
+        _curve(r, _s(r, 6), _s(r, 7), _s(r, 8), _s(r, 9), _s(r, 10), _s(r, 11));
+    } else if (e == 34) {
+        if (n != 7) { r.err = 1; return; }
+        _curve(r, _s(r, 0), 0.0, _s(r, 1), _s(r, 2), _s(r, 3), 0.0);
+        _curve(r, _s(r, 4), 0.0, _s(r, 5), 0.0 - _s(r, 2), _s(r, 6), 0.0);
+    } else if (e == 36) {
+        if (n != 9) { r.err = 1; return; }
+        _curve(r, _s(r, 0), _s(r, 1), _s(r, 2), _s(r, 3), _s(r, 4), 0.0);
+        _curve(r, _s(r, 5), 0.0, _s(r, 6), _s(r, 7), _s(r, 8), 0.0 - (_s(r, 1) + _s(r, 3) + _s(r, 7)));
+    } else if (e == 37) {
+        // flex1: the last point's one free coordinate is along the curves'
+        // longer extent; the other brings it back level with the start.
+        if (n != 11) { r.err = 1; return; }
+        let is f64 as dx = _s(r, 0) + _s(r, 2) + _s(r, 4) + _s(r, 6) + _s(r, 8);
+        let is f64 as dy = _s(r, 1) + _s(r, 3) + _s(r, 5) + _s(r, 7) + _s(r, 9);
+        let is f64 as dx6 with mut = 0.0 - dx;
+        let is f64 as dy6 with mut = _s(r, 10);
+        if (_abs(dx) > _abs(dy)) {
+            dx6 = _s(r, 10);
+            dy6 = 0.0 - dy;
+        }
+        _curve(r, _s(r, 0), _s(r, 1), _s(r, 2), _s(r, 3), _s(r, 4), _s(r, 5));
+        _curve(r, _s(r, 6), _s(r, 7), _s(r, 8), _s(r, 9), dx6, dy6);
+    } else {
+        r.err = 1;
+        return;
+    }
+    r.n = 0;
+}
+
+// The accent's base glyph and the accent moved by adx, ady, both found by
+// their Standard Encoding codes.
+fn _seac(r as *Run, adx as f64, ady as f64, bchar as i64, achar as i64) as void {
+    let is i64 as base = _by_sid(r.f, r.c, _std(bchar));
+    let is i64 as accent = _by_sid(r.f, r.c, _std(achar));
+    if (base < 0 || accent < 0 || r.c.cid == 1) { r.err = 1; return; }
+    // endchar: nothing is drawn after these.
+    _component(r, base, 0.0, 0.0);
+    _component(r, accent, adx, ady);
+}
+
+fn _component(r as *Run, gid as i64, dx as f64, dy as f64) as void {
+    if (r.err != 0) { return; }
+    let is i64 as len with mut = 0;
+    let is i64 as at = item(r.f, &r.c.charstrings, gid, &len);
+    if (at < 0) { r.err = 1; return; }
+    // Its first moveto closes whatever was open.
+    r.x = dx;
+    r.y = dy;
+    r.n = 0;
+    r.stems = 0;
+    r.width = 0;
+    r.seac = 1;
+    r.done = 0;
+    _exec(r, at, len);
+}
+
+// Glyph gid's outline into p, cleared first. 1, or 0 for a glyph that is
+// malformed or does not fit, with p empty.
+fn glyph(f as *table.Face, c as *Cff, gid as i64, p as *path.Path) as i32 {
+    path.clear(p);
+    if (c.ok == 0) { return 0; }
+    let is i64 as len with mut = 0;
+    let is i64 as at = item(f, &c.charstrings, gid, &len);
+    if (at < 0) { return 0; }
+    let is i64 as d = fd(f, c, gid);
+    if (d < 0) { return 0; }
+    let is Index as lsubrs;
+    let is i64 as vsindex = font_dict(f, c, d, &lsubrs);
+    let is Run as r;
+    r.f = f;
+    r.c = c;
+    r.p = p;
+    r.n = 0;
+    r.max = 48;
+    if (c.cff2 == 1) { r.max = 513; }
+    r.x = 0.0;
+    r.y = 0.0;
+    r.stems = 0;
+    r.ops = 0;
+    r.depth = 0;
+    r.lsubrs = &lsubrs;
+    r.regions = regions(f, c, vsindex);
+    if (r.regions < 0) { return 0; }
+    r.open = 0;
+    r.width = 0;
+    r.done = 0;
+    r.err = 0;
+    r.seac = 0;
+    _exec(&r, at, len);
+    if (r.open == 1) { path.close_path(p); }
+    if (r.err != 0 || p.full == 1) {
+        path.clear(p);
+        return 0;
+    }
+    return 1;
+}

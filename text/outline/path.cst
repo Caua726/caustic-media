@@ -1,0 +1,209 @@
+// text/outline/path.cst — the shape of a glyph: contours of lines, quadratic
+// and cubic curves, in font units. Both outline formats produce it and the
+// rasterizer reads it, so neither knows which format the other came from.
+//
+// A path holds as many points as it was opened for and is never grown; one
+// that ran out says so (full) and keeps what fitted, which the caller treats
+// as a failed glyph rather than a drawn one. Starting a contour closes the one
+// before it, as both formats' contours are closed.
+//
+// Read back a segment at a time with next(), each carrying where it starts:
+//
+//   let is path.Cursor as cur = path.cursor();
+//   let is path.Seg as s;
+//   while (path.next(&p, &cur, &s) == 1) { ... s.kind, s.x0 .. s.y3 ... }
+use "std/mem.cst" as mem;
+
+let is i64 as MOVE  with imut = 1;
+let is i64 as LINE  with imut = 2;
+let is i64 as QUAD  with imut = 3;
+let is i64 as CUBIC with imut = 4;
+let is i64 as CLOSE with imut = 5;
+
+struct Path {
+    block   as *u8;
+    bytes   as i64;
+    cmds    as *u8;    // one per command
+    xs      as *f64;   // the points, in command order
+    ys      as *f64;
+    cap     as i64;    // points it holds
+    ncmd    as i64;
+    npt     as i64;
+    start_x as f64;    // the open contour's first point
+    start_y as f64;
+    open    as i32;    // a contour has been started and not closed
+    full    as i32;    // something did not fit
+}
+
+// A path for up to points points; ok() is 0 if it could not be mapped.
+fn open(points as i64) as Path {
+    let is Path as p;
+    p.cap = points;
+    // Every command but a close takes a point, and a close follows at least
+    // one move: twice the points is room for every command.
+    p.bytes = p.cap * 2 + p.cap * 16;
+    p.block = mem.core.mmap_anon(p.bytes);
+    p.cmds = p.block;
+    p.xs = cast(*f64, cast(i64, p.block) + p.cap * 2);
+    p.ys = cast(*f64, cast(i64, p.block) + p.cap * 2 + p.cap * 8);
+    p.ncmd = 0;
+    p.npt = 0;
+    p.start_x = 0.0;
+    p.start_y = 0.0;
+    p.open = 0;
+    p.full = 0;
+    if (cast(i64, p.block) == 0) { p.cap = 0; p.full = 1; }
+    return p;
+}
+
+fn ok(p as *Path) as i32 {
+    if (p.cap > 0 && cast(i64, p.block) != 0) { return 1; }
+    return 0;
+}
+
+fn close(p as *Path) as void {
+    if (cast(i64, p.block) != 0) { mem.core.munmap(p.block, p.bytes); }
+    p.block = cast(*u8, 0);
+    p.cap = 0;
+    p.ncmd = 0;
+    p.npt = 0;
+}
+
+fn clear(p as *Path) as void {
+    p.ncmd = 0;
+    p.npt = 0;
+    p.open = 0;
+    p.full = 0;
+}
+
+// Commands never outrun their room when points do not: every command but a
+// close takes a point, and every close follows a move.
+fn _cmd(p as *Path, k as i64, points as i64) as i32 {
+    if (p.npt + points > p.cap) {
+        p.full = 1;
+        return 0;
+    }
+    *cast(*u8, cast(i64, p.cmds) + p.ncmd) = cast(u8, k);
+    p.ncmd = p.ncmd + 1;
+    return 1;
+}
+
+fn _pt(p as *Path, x as f64, y as f64) as void {
+    *cast(*f64, cast(i64, p.xs) + p.npt * 8) = x;
+    *cast(*f64, cast(i64, p.ys) + p.npt * 8) = y;
+    p.npt = p.npt + 1;
+}
+
+fn close_path(p as *Path) as void {
+    if (p.open == 0) { return; }
+    p.open = 0;
+    _cmd(p, CLOSE, 0);
+}
+
+fn move_to(p as *Path, x as f64, y as f64) as void {
+    close_path(p);
+    if (_cmd(p, MOVE, 1) == 0) { return; }
+    _pt(p, x, y);
+    p.start_x = x;
+    p.start_y = y;
+    p.open = 1;
+}
+
+fn line_to(p as *Path, x as f64, y as f64) as void {
+    if (_cmd(p, LINE, 1) == 0) { return; }
+    _pt(p, x, y);
+}
+
+fn quad_to(p as *Path, cx as f64, cy as f64, x as f64, y as f64) as void {
+    if (_cmd(p, QUAD, 2) == 0) { return; }
+    _pt(p, cx, cy);
+    _pt(p, x, y);
+}
+
+fn cubic_to(p as *Path, c1x as f64, c1y as f64, c2x as f64, c2y as f64, x as f64, y as f64) as void {
+    if (_cmd(p, CUBIC, 3) == 0) { return; }
+    _pt(p, c1x, c1y);
+    _pt(p, c2x, c2y);
+    _pt(p, x, y);
+}
+
+fn count(p as *Path) as i64 { return p.ncmd; }
+fn points(p as *Path) as i64 { return p.npt; }
+
+// --- Reading back ---
+
+struct Cursor {
+    cmd  as i64;
+    pt   as i64;
+    x    as f64;   // the current point
+    y    as f64;
+    sx   as f64;   // the contour's start
+    sy   as f64;
+}
+
+fn cursor() as Cursor {
+    let is Cursor as c;
+    c.cmd = 0;
+    c.pt = 0;
+    c.x = 0.0;
+    c.y = 0.0;
+    c.sx = 0.0;
+    c.sy = 0.0;
+    return c;
+}
+
+// A segment: from x0, y0 through the controls to its end — x1, y1 for a move,
+// a line or a close (the contour's start); x2, y2 for a quadratic; x3, y3 for
+// a cubic.
+struct Seg {
+    kind as i64;
+    x0 as f64;
+    y0 as f64;
+    x1 as f64;
+    y1 as f64;
+    x2 as f64;
+    y2 as f64;
+    x3 as f64;
+    y3 as f64;
+}
+
+fn _x(p as *Path, i as i64) as f64 { return *cast(*f64, cast(i64, p.xs) + i * 8); }
+fn _y(p as *Path, i as i64) as f64 { return *cast(*f64, cast(i64, p.ys) + i * 8); }
+
+// The next segment into s; 0 at the end.
+fn next(p as *Path, c as *Cursor, s as *Seg) as i32 {
+    if (c.cmd >= p.ncmd) { return 0; }
+    let is i64 as k = cast(i64, *cast(*u8, cast(i64, p.cmds) + c.cmd));
+    c.cmd = c.cmd + 1;
+    s.kind = k;
+    s.x0 = c.x;
+    s.y0 = c.y;
+    if (k == CLOSE) {
+        s.x1 = c.sx;
+        s.y1 = c.sy;
+        c.x = c.sx;
+        c.y = c.sy;
+        return 1;
+    }
+    let is i64 as n with mut = 1;
+    if (k == QUAD) { n = 2; }
+    if (k == CUBIC) { n = 3; }
+    s.x1 = _x(p, c.pt);
+    s.y1 = _y(p, c.pt);
+    if (n >= 2) {
+        s.x2 = _x(p, c.pt + 1);
+        s.y2 = _y(p, c.pt + 1);
+    }
+    if (n == 3) {
+        s.x3 = _x(p, c.pt + 2);
+        s.y3 = _y(p, c.pt + 2);
+    }
+    c.pt = c.pt + n;
+    c.x = _x(p, c.pt - 1);
+    c.y = _y(p, c.pt - 1);
+    if (k == MOVE) {
+        c.sx = c.x;
+        c.sy = c.y;
+    }
+    return 1;
+}

@@ -191,9 +191,343 @@ def synthetic_cmaps():
     print("cmaps.ttf", os.path.getsize(os.path.join(OUT, "cmaps.ttf")), "bytes")
 
 
+def synthetic_composites():
+    # TrueType composites in every form a reader meets: an offset, a uniform
+    # scale (offset not scaled, the Microsoft way), the same with the offset
+    # scaled (the Apple way), x and y scales, a 2x2 matrix, a component placed
+    # by matching points, composites of composites — and a base glyph with a
+    # contour of off-curve points only, and one with consecutive off-curves.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphComponent, GlyphCoordinates
+    from fontTools.ttLib.tables import _g_l_y_f as G
+    names = [".notdef", "base", "round", "offset", "scaled", "scaled_apple", "xy", "matrix",
+             "matched", "nested", "empty", "matched_scaled", "rotated"]
+    fb = FontBuilder(2048, isTTF=True)
+    fb.setupGlyphOrder(names)
+
+    def simple(points, flags, ends):
+        g = Glyph()
+        g.numberOfContours = len(ends)
+        g.coordinates = GlyphCoordinates(points)
+        g.flags = bytearray(flags)
+        g.endPtsOfContours = ends
+        from fontTools.ttLib.tables import ttProgram
+        g.program = ttProgram.Program()
+        g.program.fromBytecode(b"")
+        return g
+
+    # Two contours: on, off, off, on, off (wrapping); and four off-curves.
+    base = simple([(0, 0), (100, 300), (300, 300), (400, 0), (200, -100),
+                   (500, 500), (700, 500), (700, 700), (550, 700)],
+                  [1, 0, 0, 1, 0, 0, 0, 0, 0], [4, 8])
+    # Starting off the curve, with on-curve points after.
+    rotated = simple([(0, 100), (100, 0), (200, 100), (100, 200)], [0, 1, 0, 1], [3])
+    pen = TTGlyphPen(None)
+    pen.moveTo((10, 10)); pen.lineTo((10, 90)); pen.qCurveTo((50, 130), (90, 90)); pen.closePath()
+    rnd = pen.glyph()
+
+    def comp(name, x=0, y=0, transform=None, flags=0, first=None, second=None):
+        c = GlyphComponent()
+        c.glyphName = name
+        c.flags = flags
+        if first is not None:
+            c.firstPt, c.secondPt = first, second
+        else:
+            c.x, c.y = x, y
+            c.flags |= G.ARGS_ARE_XY_VALUES
+        if transform is not None:
+            c.transform = transform
+        return c
+
+    def composite(comps):
+        g = Glyph()
+        g.numberOfContours = -1
+        g.components = comps
+        return g
+
+    glyphs = {
+        ".notdef": rnd, "base": base, "round": rnd,
+        "offset": composite([comp("base", 100, 50)]),
+        "scaled": composite([comp("base", 100, 50, [[0.5, 0], [0, 0.5]])]),
+        "scaled_apple": composite([comp("base", 100, 50, [[0.5, 0], [0, 0.5]], G.SCALED_COMPONENT_OFFSET)]),
+        "xy": composite([comp("base", -30, 20, [[0.75, 0], [0, 1.25]])]),
+        "matrix": composite([comp("round", 5, 7, [[0.5, 0.25], [-0.25, 0.75]])]),
+        "matched": composite([comp("base", 0, 0), comp("round", first=3, second=0)]),
+        "nested": composite([comp("offset", 10, 0), comp("matrix", 0, 300)]),
+        "empty": Glyph(),
+        "matched_scaled": composite([comp("base", 0, 0), comp("round", first=3, second=0,
+                                                              transform=[[0.5, 0], [0, 0.5]])]),
+        "rotated": rotated,
+    }
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics({n: (800, 0) for n in names})
+    fb.setupHorizontalHeader(ascent=1900, descent=-500)
+    fb.setupNameTable({"familyName": "Caustic Test Composites", "styleName": "Regular"})
+    fb.setupCharacterMap({0x41 + i: n for i, n in enumerate(names[1:])})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    fb.save(os.path.join(OUT, "composite.ttf"))
+    print("composite.ttf", os.path.getsize(os.path.join(OUT, "composite.ttf")), "bytes")
+
+
+def synthetic_ops():
+    # A CFF font whose glyphs between them use every Type 2 path operator:
+    # each line and curve form with its odd and even argument counts, the four
+    # flexes, stems and masks, local and global subroutines, and endchar's
+    # deprecated accent building (seac), which needs glyphs by their standard
+    # names.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.misc.psCharStrings import T2CharString
+    names = [".notdef", "A", "acute", "Aacute", "lines", "hv", "curves", "flexes", "hints", "manystems", "subrs",
+             "nomove"]
+    gsubrs = [[10, 20, "rlineto", "return"]]
+    # Subroutine numbers are biased: with fewer than 1240, by 107.
+    lsubrs = [[30, -40, "rlineto", "return"], [5, 5, 5, -5, 5, 0, "rrcurveto", -107, "callsubr", "return"]]
+    progs = {
+        ".notdef": [100, 0, "hmoveto", 400, 700, -400, "hlineto", "endchar"],
+        "A": [500, 0, 0, "rmoveto", 250, 700, 250, -700, "rlineto", "endchar"],
+        "acute": [200, 100, 600, "rmoveto", 100, 150, -30, 10, "rlineto", "endchar"],
+        # Accent building: the base A, the acute moved by 120, 80.
+        "Aacute": [500, 120, 80, 65, 194, "endchar"],
+        "lines": [600, 50, "vmoveto", 100, "hlineto", 50, 60, 70, "vlineto", 10, 20, 30, 40, "hlineto",
+                  -5, -6, "rlineto", "endchar"],
+        "hv": [600, 10, 10, "rmoveto",
+               # hhcurveto with a leading dy, vvcurveto with a leading dx
+               5, 20, 10, 30, 40, "hhcurveto", 7, 20, 10, 30, 40, "vvcurveto",
+               20, 10, 30, 40, 20, 10, 30, 40, "hhcurveto", 20, 10, 30, 40, "vvcurveto",
+               # hvcurveto and vhcurveto: 4, 8 and 9 arguments
+               10, 20, 30, 40, "hvcurveto", 10, 20, 30, 40, 50, 60, 70, 80, "hvcurveto",
+               10, 20, 30, 40, 50, 60, 70, 80, 90, "hvcurveto",
+               10, 20, 30, 40, "vhcurveto", 10, 20, 30, 40, 50, 60, 70, 80, 15, "vhcurveto",
+               10, 20, 30, 40, 50, "vhcurveto", "endchar"],
+        "curves": [600, 0, 0, "rmoveto", 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, "rrcurveto",
+                   10, 20, 30, 40, 50, 60, 70, 80, "rcurveline", 10, 20, 30, 40, 50, 60, 70, 80, "rlinecurve",
+                   "endchar"],
+        "flexes": [600, 0, 0, "rmoveto",
+                   10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 50, "flex",
+                   10, 20, 30, 40, 50, 60, 70, "hflex",
+                   10, 20, 30, 40, 50, 60, 70, 80, 90, "hflex1",
+                   10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, "flex1",
+                   -10, -20, -30, -40, -50, -60, -70, -80, -90, -100, 110, "flex1", "endchar"],
+        # Four stems, then a fifth declared by the vstem before cntrmask: the
+        # masks grow from one byte's worth of stems to... still one byte, but
+        # the stems must be counted to know.
+        "hints": [600, 0, 50, 100, 50, "hstemhm", 10, 20, 30, 40, "vstemhm", "hintmask", bytes([0b11110000]),
+                  0, 0, "rmoveto", 100, "hlineto", 5, 5, "vstem", "cntrmask", bytes([0b11111000]),
+                  100, "vlineto", "hintmask", bytes([0b10101000]), -100, "hlineto", "endchar"],
+        # Nine stems: the masks take two bytes, and the first hintmask's
+        # pending arguments are vertical stems.
+        "manystems": [600, 0, 10, 20, 10, 40, 10, 60, 10, 80, 10, "hstemhm",
+                      0, 10, 20, 10, 40, 10, 60, 10, "hintmask", bytes([255, 128]),
+                      0, 0, "rmoveto", 50, "hlineto", "hintmask", bytes([1, 0]), 50, "vlineto", "endchar"],
+        # Drawing before any moveto: the contour starts where the pen is.
+        "nomove": [10, 20, "rlineto", 30, 40, "rlineto", "endchar"],
+        "subrs": [600, 0, 0, "rmoveto", -107, "callgsubr", -107, "callsubr", -106, "callsubr",
+                  -50, "hlineto", "endchar"],
+    }
+    fb = FontBuilder(1000, isTTF=False)
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({0x41: "A", 0xB4: "acute", 0xC1: "Aacute"})
+    charstrings = {}
+    for n in names:
+        charstrings[n] = T2CharString(program=progs[n])
+    fb.setupCFF("CausticTestOps-Regular", {"FullName": "Caustic Test Ops"}, charstrings, {})
+    cff = fb.font["CFF "].cff
+    top = cff.topDictIndex[0]
+    from fontTools.cffLib import GlobalSubrsIndex, SubrsIndex
+    for p in gsubrs:
+        cff.GlobalSubrs.append(T2CharString(program=p))
+    top.Private.Subrs = SubrsIndex()
+    for p in lsubrs:
+        top.Private.Subrs.append(T2CharString(program=p))
+    for n in names:
+        cs = top.CharStrings[n]
+        cs.private = top.Private
+        cs.globalSubrs = cff.GlobalSubrs
+    fb.setupHorizontalMetrics({n: (600, 0) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "Caustic Test Ops", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    fb.save(os.path.join(OUT, "ops.otf"))
+    print("ops.otf", os.path.getsize(os.path.join(OUT, "ops.otf")), "bytes")
+
+
+def synthetic_bombs():
+    # Fonts a reader must refuse rather than follow. bomb.ttf: composites
+    # fourteen deep, each holding the next twice — 16384 components with no
+    # points, past the reader's limit though no deeper than it allows — and a
+    # composite holding itself. bomb.otf: ten subroutines, each calling the
+    # next four times, nested no deeper than allowed, a quarter of a million
+    # calls. No outline reference is written for either.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphComponent
+    from fontTools.ttLib.tables import _g_l_y_f as G
+    from fontTools.misc.psCharStrings import T2CharString
+    from fontTools.cffLib import SubrsIndex
+    depth = 14
+    chain = 18
+    names = ([".notdef", "empty", "loop"] + ["dag%d" % i for i in range(depth)]
+             + ["chain%d" % i for i in range(chain)] + ["big", "twice", "dot"])
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(names)
+
+    def composite(children):
+        g = Glyph()
+        g.numberOfContours = -1
+        g.components = []
+        for ch in children:
+            c = GlyphComponent()
+            c.glyphName = ch
+            c.x, c.y = 0, 0
+            c.flags = G.ARGS_ARE_XY_VALUES
+            g.components.append(c)
+        return g
+
+    # "loop" is saved holding "empty", which fontTools allows, and patched
+    # below to hold itself, which it does not.
+    glyphs = {".notdef": Glyph(), "empty": Glyph(), "loop": composite(["empty"])}
+    for i in range(depth):
+        child = "dag%d" % (i + 1) if i + 1 < depth else "empty"
+        glyphs["dag%d" % i] = composite([child, child])
+    # One component each, 18 deep: chain1 reaches the empty glyph 17 below,
+    # past the limit of 16; chain2 does not.
+    for i in range(chain):
+        child = "chain%d" % (i + 1) if i + 1 < chain else "empty"
+        glyphs["chain%d" % i] = composite([child])
+    # 40000 points: drawn alone, but twice is more than a glyph may expand to.
+    from fontTools.ttLib.tables._g_l_y_f import GlyphCoordinates
+    from fontTools.ttLib.tables import ttProgram
+    big = Glyph()
+    big.numberOfContours = 1
+    big.coordinates = GlyphCoordinates([(i % 200, i // 200) for i in range(40000)])
+    big.flags = bytearray([1] * 40000)
+    big.endPtsOfContours = [39999]
+    big.program = ttProgram.Program()
+    big.program.fromBytecode(b"")
+    glyphs["big"] = big
+    glyphs["twice"] = composite(["big", "big"])
+    # One on-curve point at the origin: one flag and no coordinates.
+    dot = Glyph()
+    dot.numberOfContours = 1
+    dot.coordinates = GlyphCoordinates([(0, 0)])
+    dot.flags = bytearray([1])
+    dot.endPtsOfContours = [0]
+    dot.program = ttProgram.Program()
+    dot.program.fromBytecode(b"")
+    glyphs["dot"] = dot
+    fb.setupGlyf(glyphs, validateGlyphFormat=False)
+    fb.font.recalcBBoxes = False
+    fb.setupHorizontalMetrics({n: (500, 0) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "Caustic Test Bomb", "styleName": "Regular"})
+    fb.setupCharacterMap({0x41: "dag0"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    path = os.path.join(OUT, "bomb.ttf")
+    fb.save(path)
+    import struct
+    font = TTFont(path)
+    glyf_off = font.reader.tables["glyf"].offset
+    loop = names.index("loop")
+    start = font["loca"][loop]
+    data = bytearray(open(path, "rb").read())
+    # The first component's glyph index, after the 10-byte header and its flags.
+    struct.pack_into(">H", data, glyf_off + start + 12, loop)
+    open(path, "wb").write(bytes(data))
+    print("bomb.ttf", os.path.getsize(path), "bytes")
+
+    names = [".notdef", "fan"]
+    fb = FontBuilder(1000, isTTF=False)
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({0x41: "fan"})
+    progs = {".notdef": [500, "endchar"], "fan": [500, 0, 0, "rmoveto", -107, "callsubr", "endchar"]}
+    fb.setupCFF("CausticTestBomb-Regular", {"FullName": "Caustic Test Bomb"},
+                {n: T2CharString(program=progs[n]) for n in names}, {})
+    top = fb.font["CFF "].cff.topDictIndex[0]
+    top.Private.Subrs = SubrsIndex()
+    for k in range(10):
+        if k < 9:
+            prog = [-107 + k + 1, "callsubr"] * 4 + ["return"]
+        else:
+            prog = ["return"]
+        top.Private.Subrs.append(T2CharString(program=prog))
+    for n in names:
+        top.CharStrings[n].private = top.Private
+    fb.font.recalcBBoxes = False
+    fb.setupHorizontalMetrics({n: (500, 0) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "Caustic Test Bomb CFF", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    fb.save(os.path.join(OUT, "bomb.otf"))
+    print("bomb.otf", os.path.getsize(os.path.join(OUT, "bomb.otf")), "bytes")
+    # The same, saying its charstrings are Type 1: not read at all.
+    fb.font["CFF "].cff.topDictIndex[0].CharstringType = 1
+    fb.save(os.path.join(OUT, "bomb-type1.otf"))
+    print("bomb-type1.otf", os.path.getsize(os.path.join(OUT, "bomb-type1.otf")), "bytes")
+
+
+def synthetic_big():
+    # A CFF font big enough for what small fonts never need: charstrings past
+    # 64 KB, so the INDEX offsets take three bytes; 1300 local subroutines, so
+    # their numbers are biased by 1131; fixed-point numbers; glyph names out of
+    # the standard strings' order, so the charset is format 0 — with an accent
+    # built by seac through it; and every name a standard string, with no
+    # FontInfo, so the Strings INDEX is empty and the global subroutine one of
+    # the glyphs calls is found only by stepping over it.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.misc.psCharStrings import T2CharString
+    from fontTools.cffLib import SubrsIndex
+    names = [".notdef", "A", "B", "acute", "C", "Aacute", "D"]
+    stems = []
+    for k in range(1750):
+        stems += [0.5, 0.25, 0.5, 0.25, 0.5, 0.25, 0.5, 0.25, "hstemhm"]
+    progs = {
+        ".notdef": [500, "endchar"],
+        "A": [500, 0, 0, "rmoveto", 250, 700, 250, -700, "rlineto", "endchar"],
+        "B": [500, 0.5, 0, "rmoveto", 100.25, "hlineto", 1250 - 1131, "callsubr", "endchar"],
+        "acute": [200, 100, 600, "rmoveto", 100, 150, -30, 10, "rlineto", "endchar"],
+        "C": [500, 0, 0, "rmoveto", 10, "hlineto", -107, "callgsubr", "endchar"],
+        "Aacute": [500, 120, 80, 65, 194, "endchar"],
+        "D": stems + [0, 0, "rmoveto", 10.5, "hlineto", "endchar"],
+    }
+    fb = FontBuilder(1000, isTTF=False)
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({0x41: "A", 0xB4: "acute", 0xC1: "Aacute"})
+    fb.setupCFF("CausticTestBig-Regular", {}, {n: T2CharString(program=progs[n]) for n in names}, {})
+    cff = fb.font["CFF "].cff
+    top = cff.topDictIndex[0]
+    top.Private.Subrs = SubrsIndex()
+    for k in range(1300):
+        prog = [0, 50.5, "rlineto", "return"] if k == 1250 else ["return"]
+        top.Private.Subrs.append(T2CharString(program=prog))
+    cff.GlobalSubrs.append(T2CharString(program=[0, 30, "rlineto", "return"]))
+    for n in names:
+        top.CharStrings[n].private = top.Private
+        top.CharStrings[n].globalSubrs = cff.GlobalSubrs
+    fb.setupHorizontalMetrics({n: (500, 0) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "Caustic Test Big", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    fb.save(os.path.join(OUT, "big.otf"))
+    print("big.otf", os.path.getsize(os.path.join(OUT, "big.otf")), "bytes")
+
+
 def main():
     os.makedirs(os.path.join(OUT, "licenses"), exist_ok=True)
+    synthetic_big()
     synthetic_cmaps()
+    synthetic_composites()
+    synthetic_ops()
+    synthetic_bombs()
     for out, src, _, text, family in SOURCES:
         font = TTFont(src, recalcTimestamp=False)
         licence_font = TTFont(src, lazy=True)
