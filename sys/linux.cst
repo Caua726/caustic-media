@@ -1,0 +1,195 @@
+// sys/linux.cst — the Linux syscalls caustic-media needs and std/ lacks.
+//
+// Unix-domain sockets, and the ancillary data that passes file descriptors
+// over them: D-Bus speaks over one (dbus/), and Wayland will (window/wayland/).
+// They belong in std/os/linux.cst beside read and mmap, as
+// window/x11/bind/xshm.cst says of its own four; until std/ grows them they are
+// here, shared rather than copied into each user, and moving them later is a
+// rename.
+//
+// Raw syscalls, not libc, for the reason the whole project is: a Caustic
+// binary is a static ELF with nothing linked it does not ask for.
+use "std/os/linux.cst" as linux;
+use "std/mem.cst" as mem;
+
+fn _nr(x86_64 as i64, aarch64 as i64) as i64 {
+    if (__target_is_aarch64 == 1) { return aarch64; }
+    return x86_64;
+}
+
+let is i64 as AF_UNIX      with imut = 1;
+let is i64 as SOCK_STREAM  with imut = 1;
+let is i64 as SOCK_CLOEXEC with imut = 524288;
+let is i64 as SOL_SOCKET   with imut = 1;
+let is i64 as SCM_RIGHTS   with imut = 1;
+let is i64 as MSG_DONTWAIT with imut = 64;
+let is i64 as MSG_NOSIGNAL with imut = 16384;        // a closed peer is an error, not SIGPIPE
+let is i64 as MSG_CMSG_CLOEXEC with imut = 1073741824;
+let is i64 as EAGAIN       with imut = 11;
+let is i64 as EINTR        with imut = 4;
+
+// The most descriptors one message carries here. D-Bus allows more; nothing
+// this library talks to sends more than a few.
+let is i64 as MAX_FDS with imut = 16;
+
+fn getuid() as i64 { return syscall(_nr(102, 174), 0); }
+
+fn socket(domain as i64, kind as i64, protocol as i64) as i64 {
+    return syscall(_nr(41, 198), domain, kind, protocol);
+}
+
+fn socketpair(domain as i64, kind as i64, protocol as i64, fds as *i32) as i64 {
+    return syscall(_nr(53, 199), domain, kind, protocol, fds);
+}
+
+fn memfd_create(name as *u8, flags as i64) as i64 {
+    return syscall(_nr(319, 279), name, flags);
+}
+
+fn close(fd as i64) as void { linux.close(fd); }
+
+// --- Connecting ---
+
+struct SockaddrUn {
+    family as u16;
+    path   as [108]u8;
+}
+
+// Connects a stream socket to path — or, when abstract is 1, to the name in
+// Linux's abstract namespace, which has no file and starts with a zero byte.
+// A descriptor, or a negative errno.
+fn connect_unix(path as *u8, len as i64, abstract as i32) as i64 {
+    let is i64 as room with mut = 108;
+    if (abstract == 1) { room = 107; }
+    if (len <= 0 || len >= room) { return 0 - 36; }   // ENAMETOOLONG
+    let is SockaddrUn as a;
+    mem.memzero(cast(*u8, &a), sizeof(SockaddrUn));
+    a.family = cast(u16, AF_UNIX);
+    let is i64 as at with mut = 0;
+    if (abstract == 1) { at = 1; }
+    mem.memcpy(cast(*u8, cast(i64, &a.path) + at), path, len);
+    // The family, then the bytes and one more: a path's terminating zero, or
+    // the zero an abstract name starts with — counted once either way, since
+    // a zero after an abstract name would be part of the name.
+    let is i64 as alen = 2 + len + 1;
+    let is i64 as fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return fd; }
+    let is i64 as r = syscall(_nr(42, 203), fd, &a, alen);
+    if (r < 0) {
+        linux.close(fd);
+        return r;
+    }
+    return fd;
+}
+
+// --- Sending and receiving, with descriptors ---
+
+struct Iovec {
+    base as *u8;
+    len  as i64;
+}
+
+struct Msghdr {
+    name       as *u8;
+    namelen    as u32;
+    _pad0      as u32;
+    iov        as *Iovec;
+    iovlen     as i64;
+    control    as *u8;
+    controllen as i64;
+    flags      as i32;
+    _pad1      as i32;
+}
+
+// struct cmsghdr, then the descriptors: room for MAX_FDS of them.
+struct Control {
+    len   as i64;
+    level as i32;
+    kind  as i32;
+    fds   as [16]i32;
+}
+
+// Sends len bytes and, when nfds > 0, the descriptors with them. The kernel
+// delivers the descriptors with the first byte. Bytes sent, or a negative errno.
+fn send_fds(fd as i64, buf as *u8, len as i64, fds as *i32, nfds as i64) as i64 {
+    if (nfds < 0 || nfds > MAX_FDS) { return 0 - 22; }   // EINVAL
+    let is Iovec as v;
+    v.base = buf;
+    v.len = len;
+    let is Msghdr as h;
+    mem.memzero(cast(*u8, &h), sizeof(Msghdr));
+    h.iov = &v;
+    h.iovlen = 1;
+    let is Control as c;
+    if (nfds > 0) {
+        c.len = 16 + nfds * 4;
+        c.level = cast(i32, SOL_SOCKET);
+        c.kind = cast(i32, SCM_RIGHTS);
+        let is i64 as i with mut = 0;
+        while (i < nfds) {
+            c.fds[i] = *cast(*i32, cast(i64, fds) + i * 4);
+            i = i + 1;
+        }
+        h.control = cast(*u8, &c);
+        // CMSG_SPACE, the header and the data rounded up to 8, as POSIX
+        // asks; Linux takes the unrounded length too.
+        h.controllen = 16 + (nfds * 4 + 7) / 8 * 8;
+    }
+    let is i64 as r with mut = 0 - EINTR;
+    while (r == 0 - EINTR) {
+        r = syscall(_nr(46, 211), fd, &h, MSG_NOSIGNAL);
+    }
+    return r;
+}
+
+// Receives into buf, up to cap bytes, and any descriptors that came with them
+// into fds (room for MAX_FDS), their count in nfds. Close-on-exec is set on
+// every one received. Bytes received — 0 when the peer closed — or a negative
+// errno; -EAGAIN when wait is 0 and nothing is there.
+fn recv_fds(fd as i64, buf as *u8, cap as i64, fds as *i32, nfds as *i64, wait as i32) as i64 {
+    let is Iovec as v;
+    v.base = buf;
+    v.len = cap;
+    let is Msghdr as h;
+    mem.memzero(cast(*u8, &h), sizeof(Msghdr));
+    h.iov = &v;
+    h.iovlen = 1;
+    let is Control as c;
+    mem.memzero(cast(*u8, &c), sizeof(Control));
+    h.control = cast(*u8, &c);
+    h.controllen = sizeof(Control);
+    let is i64 as flags with mut = MSG_CMSG_CLOEXEC;
+    if (wait == 0) { flags = flags | MSG_DONTWAIT; }
+    let is i64 as r with mut = 0 - EINTR;
+    while (r == 0 - EINTR) {
+        r = syscall(_nr(47, 212), fd, &h, flags);
+    }
+    *nfds = 0;
+    if (r < 0) { return r; }
+    if (h.controllen >= 16 && c.level == cast(i32, SOL_SOCKET) && c.kind == cast(i32, SCM_RIGHTS)) {
+        let is i64 as n = (c.len - 16) / 4;
+        let is i64 as i with mut = 0;
+        while (i < n && i < MAX_FDS) {
+            *cast(*i32, cast(i64, fds) + i * 4) = c.fds[i];
+            i = i + 1;
+        }
+        *nfds = i;
+    }
+    return r;
+}
+
+// Waits until fd is readable, for up to timeout_ms (negative: forever).
+// 1 when it is, 0 on timeout, a negative errno otherwise.
+fn wait_readable(fd as i64, timeout_ms as i64) as i64 {
+    // struct pollfd: int fd, short events, short revents.
+    let is [8]u8 as p;
+    *cast(*i32, &p) = cast(i32, fd);
+    *cast(*i16, cast(i64, &p) + 4) = cast(i16, 1);   // POLLIN
+    *cast(*i16, cast(i64, &p) + 6) = cast(i16, 0);
+    // One descriptor, so poll's count of the ready ones is that 1.
+    let is i64 as r with mut = 0 - EINTR;
+    while (r == 0 - EINTR) {
+        r = linux.poll(cast(*u8, &p), 1, timeout_ms);
+    }
+    return r;
+}

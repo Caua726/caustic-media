@@ -1,0 +1,784 @@
+// dbus/conn_test.cst — two connections on a private bus, talking.
+//
+// Run inside dbus-run-session (tools/run_dbus.sh), never on the desktop's own
+// session bus. One connection exports an object, the other calls it; both
+// talk to the bus itself, which is dbus-daemon — a second implementation of
+// the protocol, so what passes here is what libdbus accepts.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../sys/linux.cst" as sys;
+use "dbus.cst" as dbus;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn count(s as *u8, n as i64, sub as *u8) as i64 {
+    let is i64 as m = dbus.wire.cstr_len(sub);
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i + m <= n) {
+        if (mem.memcmp(cast(*u8, cast(i64, s) + i), sub, m) == 0) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+fn has(s as *u8, n as i64, sub as *u8) as i32 {
+    let is i64 as m = dbus.wire.cstr_len(sub);
+    let is i64 as i with mut = 0;
+    while (i + m <= n) {
+        if (mem.memcmp(cast(*u8, cast(i64, s) + i), sub, m) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- The exported object ---
+
+struct State {
+    count     as i64;
+    label     as [64]u8;
+    label_len as i64;
+    ticks     as i64;
+    last_tick as i64;
+    changed   as i64;
+    busy      as i64;
+    quiet     as i64;
+}
+
+let is State as st with mut;
+
+fn m_add(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as a = dbus.wire.get_i32(&k.args);
+    let is i64 as b = dbus.wire.get_i32(&k.args);
+    dbus.wire.put_i32(k.reply, a + b);
+    st.count = st.count + 1;
+}
+
+fn m_echo(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&k.args, &n);
+    dbus.wire.put_string_n(k.reply, s, n);
+}
+
+fn m_fail(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    k.error_name = "org.caustic.Error.Nope";
+    k.error_text = "it says no";
+}
+
+fn m_read_fd(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as f = dbus.conn.take_fd(k.msg, 0);
+    let is [32]u8 as text;
+    linux.lseek(f, 0, 0);
+    let is i64 as n = linux.read(f, cast(*u8, &text), 31);
+    linux.close(f);
+    if (n < 0) { k.error_name = "org.caustic.Error.Read"; return; }
+    dbus.wire.put_string_n(k.reply, cast(*u8, &text), n);
+}
+
+fn m_nested(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is dbus.message.Message as m = dbus.message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                                "org.freedesktop.DBus", "GetId");
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    if (dbus.conn.call_method(c, &m, 1000, &rep) == dbus.conn.BUSY
+        && dbus.conn.wait_reply(c, 12345, 10, &rep) == dbus.conn.BUSY) { st.busy = 1; }
+}
+
+fn m_quiet(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    st.quiet = st.quiet + 1;
+}
+
+let is i64 as dups with mut = 0;
+let is i64 as dup_fd with mut = 0 - 1;
+
+// A new file holding "dup N", returned as a descriptor.
+fn m_dup(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    dups = dups + 1;
+    let is i64 as f = sys.memfd_create("dup", 0);
+    let is [8]u8 as text;
+    text[0] = 100; text[1] = 117; text[2] = 112; text[3] = 32; text[4] = cast(u8, 48 + dups);
+    linux.write(f, cast(*u8, &text), 5);
+    dbus.wire.put_fd(k.reply, f);
+    dup_fd = f;
+}
+
+// Whether descriptor f is open.
+fn is_open_fd(f as i64) as i32 {
+    if (linux.fcntl(f, 1, 0) >= 0) { return 1; }
+    return 0;
+}
+
+fn content_is(f as i64, want as *u8) as i32 {
+    let is [16]u8 as got;
+    linux.lseek(f, 0, 0);
+    let is i64 as n = linux.read(f, cast(*u8, &got), 16);
+    if (n != 5 || mem.memcmp(cast(*u8, &got), want, 5) != 0) { return 0; }
+    return 1;
+}
+
+// --- A bus that is not one ---
+//
+// A child process on a socket of its own, speaking just enough of the
+// protocol to test what a client does when the other side misbehaves: script
+// 1 refuses the AUTH, 2 ends its lines with a bare "\n", 3 answers Hello with
+// a number, 4 does everything right but refuse descriptors. Every script
+// first checks the AUTH line it got is the one auth_line makes.
+
+let is *u8 as FAKE with imut = "/tmp/caustic_fake_bus.sock";
+
+fn fake_line(fd as i64, buf as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (n < 200) {
+        if (linux.read(fd, cast(*u8, cast(i64, buf) + n), 1) != 1) { return 0 - 1; }
+        n = n + 1;
+        if (n >= 2 && *cast(*u8, cast(i64, buf) + n - 1) == 10) { return n; }
+    }
+    return 0 - 1;
+}
+
+fn fake_say(fd as i64, s as *u8) as void { linux.write(fd, s, dbus.wire.cstr_len(s)); }
+
+fn fake_serve(fd as i64, script as i64) as i64 {
+    let is [256]u8 as line;
+    let is [96]u8 as want;
+    let is i64 as n = fake_line(fd, cast(*u8, &line));
+    let is i64 as wn = dbus.conn.auth_line(sys.getuid(), cast(*u8, &want), 96);
+    if (n != wn || mem.memcmp(cast(*u8, &line), cast(*u8, &want), n) != 0) { return 3; }
+    // 1 refuses, then carries on as if it had not: the client must stop at
+    // the refusal, not at whatever goes wrong after.
+    if (script == 1) { fake_say(fd, "REJECTED EXTERNAL\r\n"); }
+    else if (script == 2) { fake_say(fd, "OK 0123456789abcdef0123456789abcdef\n"); }
+    else { fake_say(fd, "OK 0123456789abcdef0123456789abcdef\r\n"); }
+    if (fake_line(fd, cast(*u8, &line)) < 0) { return 0; }
+    if (script == 4) { fake_say(fd, "ERROR\r\n"); } else { fake_say(fd, "AGREE_UNIX_FD\r\n"); }
+    if (fake_line(fd, cast(*u8, &line)) < 0) { return 0; }
+    // Hello, whole.
+    let is [512]u8 as msg;
+    let is i64 as got with mut = 0;
+    let is i64 as total with mut = 0;
+    while (total == 0 || got < total) {
+        let is i64 as r = linux.read(fd, cast(*u8, cast(i64, &msg) + got), 512 - got);
+        if (r <= 0) { return 0; }
+        got = got + r;
+        total = dbus.message.length(cast(*u8, &msg), got);
+    }
+    let is dbus.message.Message as hello with mut = dbus.message.empty();
+    if (dbus.message.parse(cast(*u8, &msg), got, cast(*i32, 0), 0, &hello) <= 0) { return 4; }
+    let is dbus.message.Message as r with mut = dbus.message.method_return(&hello);
+    r.sender = "org.freedesktop.DBus";
+    let is [64]u8 as body;
+    let is dbus.wire.Writer as w with mut = dbus.wire.writer(cast(*u8, &body), 64);
+    if (script == 3) {
+        r.signature = "u";
+        dbus.wire.put_u32(&w, 7);
+    } else {
+        r.signature = "s";
+        dbus.wire.put_string(&w, ":1.42");
+    }
+    let is [512]u8 as out;
+    let is i64 as len = dbus.message.encode(&r, 1, cast(*u8, &body), w.len, 0, cast(*u8, &out), 512);
+    linux.write(fd, cast(*u8, &out), len);
+    if (script == 5) {
+        // The client's call; then a signal and the reply, each with a
+        // descriptor, in one write — both descriptors with its first byte.
+        got = 0;
+        total = 0;
+        while (total == 0 || got < total) {
+            let is i64 as rr = linux.read(fd, cast(*u8, cast(i64, &msg) + got), 512 - got);
+            if (rr <= 0) { return 5; }
+            got = got + rr;
+            total = dbus.message.length(cast(*u8, &msg), got);
+        }
+        let is dbus.message.Message as callm with mut = dbus.message.empty();
+        if (dbus.message.parse(cast(*u8, &msg), got, cast(*i32, 0), 0, &callm) <= 0) { return 6; }
+        let is [2]i32 as two;
+        two[0] = cast(i32, sys.memfd_create("one", 0));
+        two[1] = cast(i32, sys.memfd_create("two", 0));
+        linux.write(cast(i64, two[0]), "one!!", 5);
+        linux.write(cast(i64, two[1]), "two!!", 5);
+        let is [64]u8 as fb;
+        let is dbus.wire.Writer as fw with mut = dbus.wire.writer(cast(*u8, &fb), 64);
+        dbus.wire.put_fd(&fw, 0);
+        let is dbus.message.Message as sig with mut = dbus.message.signal("/f", "x.y", "S");
+        sig.signature = "h";
+        let is [1024]u8 as both;
+        let is i64 as n1 = dbus.message.encode(&sig, 2, cast(*u8, &fb), fw.len, 1, cast(*u8, &both), 1024);
+        let is dbus.message.Message as rep with mut = dbus.message.method_return(&callm);
+        rep.signature = "h";
+        let is i64 as n2 = dbus.message.encode(&rep, 3, cast(*u8, &fb), fw.len, 1, cast(*u8, cast(i64, &both) + n1), 1024 - n1);
+        sys.send_fds(fd, cast(*u8, &both), n1 + n2, cast(*i32, &two), 2);
+    }
+    // Until the client hangs up.
+    while (linux.read(fd, cast(*u8, &msg), 512) > 0) { }
+    return 0;
+}
+
+// Opens a connection to a fake bus playing script; the child's exit code in
+// child_code.
+fn fake_open(script as i64, l as *dbus.conn.Limits, child_code as *i64) as dbus.conn.Conn {
+    linux.unlink(FAKE);
+    let is sys.SockaddrUn as a;
+    mem.memzero(cast(*u8, &a), sizeof(sys.SockaddrUn));
+    a.family = cast(u16, sys.AF_UNIX);
+    mem.memcpy(cast(*u8, &a.path), FAKE, 27);
+    let is i64 as lfd = sys.socket(sys.AF_UNIX, sys.SOCK_STREAM, 0);
+    linux.bind(lfd, cast(*u8, &a), 2 + 27);
+    linux.listen(lfd, 1);
+    let is i64 as pid = linux.fork();
+    if (pid == 0) {
+        let is i64 as cfd = linux.accept(lfd, cast(*u8, 0), cast(*u32, 0));
+        linux.exit(fake_serve(cfd, script));
+    }
+    linux.close(lfd);
+    let is dbus.conn.Conn as c = dbus.conn.open_address("unix:path=/tmp/caustic_fake_bus.sock", 37, l);
+    if (script < 4) { dbus.conn.close(&c); }
+    let is i32 as status with mut = 0;
+    if (script < 4) {
+        linux.wait4(pid, &status, 0, cast(*u8, 0));
+        *child_code = cast(i64, (status >> 8) & 255);
+    } else {
+        *child_code = pid;
+    }
+    return c;
+}
+
+fn p_count(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    dbus.wire.put_i32(w, st.count);
+}
+
+fn p_label(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    dbus.wire.put_string_n(w, cast(*u8, &st.label), st.label_len);
+}
+
+fn p_set_label(c as *dbus.conn.Conn, r as *dbus.wire.Reader, user as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(r, &n);
+    if (n == 0 || n >= 64) { return 0; }
+    mem.memcpy(cast(*u8, &st.label), s, n + 1);
+    st.label_len = n;
+    return 1;
+}
+
+fn on_tick(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    st.last_tick = dbus.wire.get_u32(&r);
+    st.ticks = st.ticks + 1;
+}
+
+let is i64 as others with mut = 0;
+
+fn on_other(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    others = others + 1;
+}
+
+fn on_changed(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as n with mut = 0;
+    let is *u8 as iface = dbus.wire.get_string(&r, &n);
+    let is i64 as end = dbus.wire.get_array(&r, 8);
+    dbus.wire.get_struct(&r);
+    let is *u8 as name = dbus.wire.get_string(&r, &n);
+    let is *u8 as sig = dbus.wire.get_variant(&r, &n);
+    let is *u8 as v = dbus.wire.get_string(&r, &n);
+    if (r.err == 0 && dbus.message.named(iface, "org.caustic.Test") == 1 && dbus.message.named(name, "Label") == 1
+        && sig[0] == 115 && dbus.message.named(v, "renamed") == 1 && r.pos == end) {
+        st.changed = st.changed + 1;
+    }
+}
+
+let is [7]dbus.conn.Method as methods with mut;
+let is [2]dbus.conn.Property as props with mut;
+let is [1]dbus.conn.SignalDecl as signals with mut;
+let is [1]dbus.conn.Interface as ifaces with mut;
+
+fn method(i as i64, name as *u8, ins as *u8, outs as *u8, h as dbus.conn.MethodFn, in_names as *u8, out_names as *u8) as void {
+    methods[i].name = name;
+    methods[i].in_sig = ins;
+    methods[i].out_sig = outs;
+    methods[i].handler = h;
+    methods[i].in_names = in_names;
+    methods[i].out_names = out_names;
+}
+
+// c2 calls, c1 answers, c2 gets the reply.
+fn ask(c2 as *dbus.conn.Conn, c1 as *dbus.conn.Conn, m as *dbus.message.Message, out as *dbus.message.Message) as i32 {
+    let is i64 as serial = dbus.conn.send(c2, m);
+    if (serial == 0) { return dbus.conn.last_error(c2); }
+    dbus.conn.dispatch(c1, 1000);
+    return dbus.conn.wait_reply(c2, serial, 2000, out);
+}
+
+let is *u8 as PATH  with imut = "/org/caustic/Test";
+let is *u8 as IFACE with imut = "org.caustic.Test";
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    st.count = 0;
+    st.ticks = 0;
+    st.changed = 0;
+    st.busy = 0;
+    st.quiet = 0;
+    mem.memcpy(cast(*u8, &st.label), "first", 6);
+    st.label_len = 5;
+
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c1 with mut = dbus.conn.open_session(&l);
+    let is dbus.conn.Conn as c2 with mut = dbus.conn.open_session(&l);
+    check("connected", dbus.conn.is_open(&c1) == 1 && dbus.conn.is_open(&c2) == 1);
+    if (dbus.conn.is_open(&c1) == 0 || dbus.conn.is_open(&c2) == 0) {
+        io.printf("dbus conn: no bus (error %d) — run inside tools/run_dbus.sh\n", cast(i64, dbus.conn.last_error(&c1)));
+        return 1;
+    }
+    check("a unique name", dbus.conn.unique_name(&c1)[0] == 58 && dbus.conn.unique_name(&c1)[1] == 49);
+    check("two names", dbus.message.named(dbus.conn.unique_name(&c1), dbus.conn.unique_name(&c2)) == 0);
+    check("the bus's guid", dbus.wire.cstr_len(dbus.conn.guid(&c1)) == 32);
+    check("descriptors can pass", dbus.conn.can_pass_fds(&c1) == 1);
+
+    // --- The bus itself ---
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    let is dbus.message.Message as getid = dbus.message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                                    "org.freedesktop.DBus", "GetId");
+    dbus.conn.body(&c1);
+    check("GetId", dbus.conn.call_method(&c1, &getid, 2000, &rep) == dbus.conn.OK);
+    let is dbus.wire.Reader as r with mut = dbus.message.body(&rep);
+    let is i64 as n with mut = 0;
+    let is *u8 as s with mut = dbus.wire.get_string(&r, &n);
+    check("the bus's id", n == 32);
+    // The id is the bus's; the guid the server authenticated with is its
+    // address's, and the address says it too.
+    let is *u8 as addr = env.getenv("DBUS_SESSION_BUS_ADDRESS");
+    check("the guid the address names", has(addr, dbus.wire.cstr_len(addr), dbus.conn.guid(&c1)) == 1);
+    check("a well-known name", dbus.conn.request_name(&c1, "org.caustic.Test", 4) == 1);
+    check("already ours", dbus.conn.request_name(&c1, "org.caustic.Test", 4) == 4);
+    check("someone else's", dbus.conn.request_name(&c2, "org.caustic.Test", 4) == 3);
+    let is dbus.message.Message as list = dbus.message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                                   "org.freedesktop.DBus", "ListNames");
+    dbus.conn.body(&c2);
+    check("ListNames", dbus.conn.call_method(&c2, &list, 2000, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    let is i64 as end with mut = dbus.wire.get_array(&r, 4);
+    let is i32 as seen_unique with mut = 0;
+    let is i32 as seen_name with mut = 0;
+    while (r.err == 0 && r.pos < end) {
+        s = dbus.wire.get_string(&r, &n);
+        if (dbus.message.named(s, dbus.conn.unique_name(&c1)) == 1) { seen_unique = 1; }
+        if (dbus.message.named(s, "org.caustic.Test") == 1) { seen_name = 1; }
+    }
+    check("the bus lists us", seen_unique == 1 && seen_name == 1);
+    let is dbus.message.Message as nobody = dbus.message.method_call("org.caustic.Nobody", "/", "org.caustic.Nobody", "X");
+    dbus.conn.body(&c2);
+    check("nobody there", dbus.conn.call_method(&c2, &nobody, 2000, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, "org.freedesktop.DBus.Error.ServiceUnknown") == 1);
+
+    // --- Exporting ---
+    method(0, "Add", "ii", "i", fn_ptr(m_add), "a,b", "sum");
+    method(1, "Echo", "s", "s", fn_ptr(m_echo), "text", "same");
+    method(2, "Fail", "", "", fn_ptr(m_fail), cast(*u8, 0), cast(*u8, 0));
+    method(3, "ReadFd", "h", "s", fn_ptr(m_read_fd), "file", "text");
+    method(4, "Nested", "", "", fn_ptr(m_nested), cast(*u8, 0), cast(*u8, 0));
+    method(5, "Quiet", "", "", fn_ptr(m_quiet), cast(*u8, 0), cast(*u8, 0));
+    method(6, "Dup", "", "h", fn_ptr(m_dup), cast(*u8, 0), "file");
+    props[0].name = "Count";
+    props[0].sig = "i";
+    props[0].get = fn_ptr(p_count);
+    props[0].set = cast(dbus.conn.SetFn, 0);
+    props[1].name = "Label";
+    props[1].sig = "s";
+    props[1].get = fn_ptr(p_label);
+    props[1].set = fn_ptr(p_set_label);
+    signals[0].name = "Ticked";
+    signals[0].sig = "u";
+    signals[0].names = "n";
+    ifaces[0].name = IFACE;
+    ifaces[0].methods = cast(*dbus.conn.Method, &methods);
+    ifaces[0].nmethods = 7;
+    ifaces[0].props = cast(*dbus.conn.Property, &props);
+    ifaces[0].nprops = 2;
+    ifaces[0].signals = cast(*dbus.conn.SignalDecl, &signals);
+    ifaces[0].nsignals = 1;
+    check("exported", dbus.conn.export(&c1, PATH, cast(*dbus.conn.Interface, &ifaces), 1, cast(*u8, 0)) == dbus.conn.OK);
+    check("not twice", dbus.conn.export(&c1, PATH, cast(*dbus.conn.Interface, &ifaces), 1, cast(*u8, 0)) == dbus.conn.BAD_ARGUMENT);
+    check("another", dbus.conn.export(&c1, "/org/other", cast(*dbus.conn.Interface, &ifaces), 1, cast(*u8, 0)) == dbus.conn.OK);
+    check("and one whose name goes on", dbus.conn.export(&c1, "/org/caustic/TestMore", cast(*dbus.conn.Interface, &ifaces), 1, cast(*u8, 0)) == dbus.conn.OK);
+    check("not at a bad path", dbus.conn.export(&c1, "/a/", cast(*dbus.conn.Interface, &ifaces), 1, cast(*u8, 0)) == dbus.conn.BAD_ARGUMENT);
+
+    // --- Calling it ---
+    let is dbus.message.Message as add with mut = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Add");
+    add.signature = "ii";
+    let is *dbus.wire.Writer as w with mut = dbus.conn.body(&c2);
+    dbus.wire.put_i32(w, 2);
+    dbus.wire.put_i32(w, 40);
+    check("Add", ask(&c2, &c1, &add, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    check("2 + 40", dbus.message.named(rep.signature, "i") == 1 && dbus.wire.get_i32(&r) == 42);
+    let is dbus.message.Message as echo with mut = dbus.message.method_call(dbus.conn.unique_name(&c1), PATH,
+                                                                           cast(*u8, 0), "Echo");
+    echo.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&c2), "hello, bus");
+    check("Echo, by unique name and with no interface", ask(&c2, &c1, &echo, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("echoed", n == 10 && mem.memcmp(s, "hello, bus", 10) == 0);
+    let is dbus.message.Message as fail = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Fail");
+    dbus.conn.body(&c2);
+    check("a handler's error", ask(&c2, &c1, &fail, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, "org.caustic.Error.Nope") == 1);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("and its text", dbus.message.named(s, "it says no") == 1);
+    let is dbus.message.Message as wrong with mut = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Add");
+    wrong.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&c2), "two");
+    check("arguments of the wrong types", ask(&c2, &c1, &wrong, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_INVALID_ARGS) == 1);
+    let is dbus.message.Message as nomethod = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Nope");
+    dbus.conn.body(&c2);
+    check("no such method", ask(&c2, &c1, &nomethod, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_UNKNOWN_METHOD) == 1);
+    let is dbus.message.Message as noiface = dbus.message.method_call("org.caustic.Test", PATH, "org.caustic.Other", "Add");
+    dbus.conn.body(&c2);
+    check("no such interface", ask(&c2, &c1, &noiface, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_UNKNOWN_INTERFACE) == 1);
+    let is dbus.message.Message as introbad = dbus.message.method_call("org.caustic.Test", PATH,
+                                                                       "org.freedesktop.DBus.Introspectable", "Nope");
+    dbus.conn.body(&c2);
+    check("Introspectable has only Introspect", ask(&c2, &c1, &introbad, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_UNKNOWN_METHOD) == 1);
+    let is dbus.message.Message as noobj = dbus.message.method_call("org.caustic.Test", "/org/caustic/None", IFACE, "Add");
+    dbus.conn.body(&c2);
+    check("no such object", ask(&c2, &c1, &noobj, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_UNKNOWN_OBJECT) == 1);
+    let is dbus.message.Message as nested = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Nested");
+    dbus.conn.body(&c2);
+    check("a handler's blocking call is refused", ask(&c2, &c1, &nested, &rep) == dbus.conn.OK && st.busy == 1);
+    let is dbus.message.Message as quiet with mut = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Quiet");
+    quiet.flags = dbus.message.NO_REPLY_EXPECTED;
+    dbus.conn.body(&c2);
+    let is i64 as qs = dbus.conn.send(&c2, &quiet);
+    dbus.conn.dispatch(&c1, 1000);
+    check("no reply expected, none sent", st.quiet == 1 && dbus.conn.wait_reply(&c2, qs, 200, &rep) == dbus.conn.TIMEOUT);
+
+    // A descriptor, carried.
+    let is i64 as mf = sys.memfd_create("conn_test", 0);
+    linux.write(mf, "through the bus", 15);
+    let is dbus.message.Message as rd with mut = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "ReadFd");
+    rd.signature = "h";
+    dbus.wire.put_fd(dbus.conn.body(&c2), mf);
+    check("ReadFd", ask(&c2, &c1, &rd, &rep) == dbus.conn.OK);
+    linux.close(mf);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("read through the descriptor that came", n == 15 && mem.memcmp(s, "through the bus", 15) == 0);
+
+    // Several in flight, answered out of order of waiting.
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_i32(w, 1);
+    dbus.wire.put_i32(w, 1);
+    let is i64 as s1 = dbus.conn.send(&c2, &add);
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_i32(w, 10);
+    dbus.wire.put_i32(w, 10);
+    let is i64 as s2 = dbus.conn.send(&c2, &add);
+    dbus.conn.dispatch(&c1, 1000);
+    check("the second reply first", dbus.conn.wait_reply(&c2, s2, 2000, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    check("is the second's", dbus.wire.get_i32(&r) == 20);
+    check("the first reply, dropped meanwhile", dbus.conn.wait_reply(&c2, s1, 200, &rep) == dbus.conn.TIMEOUT);
+
+    // Nobody answering.
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_i32(w, 0);
+    dbus.wire.put_i32(w, 0);
+    let is i64 as late = dbus.conn.send(&c2, &add);
+    check("a timeout", dbus.conn.wait_reply(&c2, late, 100, &rep) == dbus.conn.TIMEOUT);
+    dbus.conn.dispatch(&c1, 1000);
+
+    // --- Properties ---
+    let is dbus.message.Message as get with mut = dbus.message.method_call("org.caustic.Test", PATH,
+                                                                          "org.freedesktop.DBus.Properties", "Get");
+    get.signature = "ss";
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_string(w, IFACE);
+    dbus.wire.put_string(w, "Count");
+    check("Get", ask(&c2, &c1, &get, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_variant(&r, &n);
+    check("Count is the calls answered", s[0] == 105 && dbus.wire.get_i32(&r) == st.count && st.count == 4);
+    let is dbus.message.Message as all with mut = dbus.message.method_call("org.caustic.Test", PATH,
+                                                                          "org.freedesktop.DBus.Properties", "GetAll");
+    all.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&c2), IFACE);
+    check("GetAll", ask(&c2, &c1, &all, &rep) == dbus.conn.OK && dbus.message.named(rep.signature, "a{sv}") == 1);
+    r = dbus.message.body(&rep);
+    end = dbus.wire.get_array(&r, 8);
+    let is i64 as entries with mut = 0;
+    while (r.err == 0 && r.pos < end) {
+        dbus.wire.get_struct(&r);
+        dbus.wire.get_string(&r, &n);
+        s = dbus.wire.get_variant(&r, &n);
+        dbus.wire.skip(&r, s, n);
+        entries = entries + 1;
+    }
+    check("both properties", entries == 2 && r.err == 0);
+    let is dbus.message.Message as set with mut = dbus.message.method_call("org.caustic.Test", PATH,
+                                                                          "org.freedesktop.DBus.Properties", "Set");
+    set.signature = "ssv";
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_string(w, IFACE);
+    dbus.wire.put_string(w, "Label");
+    dbus.wire.put_variant(w, "s");
+    dbus.wire.put_string(w, "renamed");
+    check("Set", ask(&c2, &c1, &set, &rep) == dbus.conn.OK && dbus.message.named(cast(*u8, &st.label), "renamed") == 1);
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_string(w, IFACE);
+    dbus.wire.put_string(w, "Count");
+    dbus.wire.put_variant(w, "i");
+    dbus.wire.put_i32(w, 1);
+    check("a read-only property", ask(&c2, &c1, &set, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_PROPERTY_READ_ONLY) == 1);
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_string(w, IFACE);
+    dbus.wire.put_string(w, "Label");
+    dbus.wire.put_variant(w, "i");
+    dbus.wire.put_i32(w, 1);
+    check("a value of the wrong type", ask(&c2, &c1, &set, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_INVALID_ARGS) == 1);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("told as a wrong type, before any setter", dbus.message.named(s, "the value is not of the property's type") == 1);
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_string(w, IFACE);
+    dbus.wire.put_string(w, "Label");
+    dbus.wire.put_variant(w, "s");
+    dbus.wire.put_string(w, "");
+    check("a value the setter refuses", ask(&c2, &c1, &set, &rep) == dbus.conn.REPLY_ERROR);
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_string(w, IFACE);
+    dbus.wire.put_string(w, "Nothing");
+    check("no such property", ask(&c2, &c1, &get, &rep) == dbus.conn.REPLY_ERROR
+          && dbus.message.named(rep.error_name, dbus.conn.E_UNKNOWN_PROPERTY) == 1);
+
+    // --- Introspection ---
+    let is dbus.message.Message as intro with mut = dbus.message.method_call("org.caustic.Test", PATH,
+                                                                            "org.freedesktop.DBus.Introspectable", "Introspect");
+    dbus.conn.body(&c2);
+    check("Introspect", ask(&c2, &c1, &intro, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("the interface", has(s, n, "<interface name=\"org.caustic.Test\">") == 1);
+    check("a method with its arguments", has(s, n, "<method name=\"Add\"><arg type=\"i\" name=\"a\" direction=\"in\"/><arg type=\"i\" name=\"b\" direction=\"in\"/><arg type=\"i\" name=\"sum\" direction=\"out\"/></method>") == 1);
+    check("a read-only property", has(s, n, "<property name=\"Count\" type=\"i\" access=\"read\"/>") == 1);
+    check("a writable one", has(s, n, "<property name=\"Label\" type=\"s\" access=\"readwrite\"/>") == 1);
+    check("a signal", has(s, n, "<signal name=\"Ticked\"><arg type=\"u\" name=\"n\"/></signal>") == 1);
+    check("the standard interfaces", has(s, n, "org.freedesktop.DBus.Properties") == 1 && has(s, n, "org.freedesktop.DBus.Peer") == 1);
+    intro.path = "/";
+    dbus.conn.body(&c2);
+    check("Introspect the root", ask(&c2, &c1, &intro, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("the root's child", has(s, n, "<node name=\"org\"/>") == 1 && has(s, n, "org.caustic.Test") == 0);
+    check("once, for both paths under it", count(s, n, "<node name=\"org\"/>") == 1);
+    intro.path = "/org/caustic";
+    dbus.conn.body(&c2);
+    check("Introspect a node on the way", ask(&c2, &c1, &intro, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("its child", has(s, n, "<node name=\"Test\"/>") == 1);
+    intro.path = PATH;
+    dbus.conn.body(&c2);
+    ask(&c2, &c1, &intro, &rep);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("a longer name is not a child", has(s, n, "<node name") == 0);
+    intro.path = "/org/caus";
+    dbus.conn.body(&c2);
+    check("a prefix of a name is no node", ask(&c2, &c1, &intro, &rep) == dbus.conn.REPLY_ERROR);
+    intro.path = "/elsewhere";
+    dbus.conn.body(&c2);
+    check("Introspect nothing", ask(&c2, &c1, &intro, &rep) == dbus.conn.REPLY_ERROR);
+
+    // --- Peer ---
+    let is dbus.message.Message as ping with mut = dbus.message.method_call("org.caustic.Test", "/",
+                                                                           "org.freedesktop.DBus.Peer", "Ping");
+    dbus.conn.body(&c2);
+    check("Ping, at any path", ask(&c2, &c1, &ping, &rep) == dbus.conn.OK);
+    ping.member = "GetMachineId";
+    dbus.conn.body(&c2);
+    check("GetMachineId", ask(&c2, &c1, &ping, &rep) == dbus.conn.OK);
+    r = dbus.message.body(&rep);
+    s = dbus.wire.get_string(&r, &n);
+    check("a machine id", n == 32);
+
+    // --- Signals ---
+    let is i64 as h = dbus.conn.add_match(&c2, cast(*u8, 0), PATH, IFACE, "Ticked", fn_ptr(on_tick), cast(*u8, 0));
+    check("a match", h > 0);
+    let is i64 as hother = dbus.conn.add_match(&c2, cast(*u8, 0), PATH, IFACE, "Tocked", fn_ptr(on_other), cast(*u8, 0));
+    let is i64 as helse = dbus.conn.add_match(&c2, cast(*u8, 0), "/org/caustic/Elsewhere", IFACE, "Ticked", fn_ptr(on_other), cast(*u8, 0));
+    dbus.wire.put_u32(dbus.conn.body(&c1), 7);
+    check("emitted", dbus.conn.emit(&c1, PATH, IFACE, "Ticked", "u") == dbus.conn.OK);
+    check("one message dispatched", dbus.conn.dispatch(&c2, 1000) == 1);
+    check("received", st.ticks == 1 && st.last_tick == 7);
+    check("by its handler only: not another member's, not another path's", others == 0);
+    dbus.conn.remove_match(&c2, hother);
+    dbus.conn.remove_match(&c2, helse);
+    dbus.wire.put_u32(dbus.conn.body(&c1), 1);
+    dbus.conn.emit(&c1, PATH, IFACE, "Tocked", "u");
+    check("a member nobody matches is not even sent", dbus.conn.dispatch(&c2, 200) == 0);
+    let is [400]u8 as longm;
+    mem.memset(cast(*u8, &longm), 77, 399);
+    longm[399] = 0;
+    check("a rule too long", dbus.conn.add_match(&c2, cast(*u8, 0), PATH, IFACE, cast(*u8, &longm), fn_ptr(on_tick), cast(*u8, 0))
+          == 0 - cast(i64, dbus.conn.BAD_ARGUMENT));
+    check("no such handle", dbus.conn.remove_match(&c2, 0) == dbus.conn.BAD_ARGUMENT
+          && dbus.conn.remove_match(&c2, 1000000) == dbus.conn.BAD_ARGUMENT);
+    dbus.wire.put_u32(dbus.conn.body(&c1), 8);
+    dbus.conn.emit(&c1, "/org/caustic/Other", IFACE, "Ticked", "u");
+    dbus.conn.dispatch(&c2, 200);
+    check("not from another path", st.ticks == 1);
+    check("removed", dbus.conn.remove_match(&c2, h) == dbus.conn.OK);
+    dbus.wire.put_u32(dbus.conn.body(&c1), 9);
+    dbus.conn.emit(&c1, PATH, IFACE, "Ticked", "u");
+    dbus.conn.dispatch(&c2, 200);
+    check("no more after it", st.ticks == 1);
+    check("not twice", dbus.conn.remove_match(&c2, h) == dbus.conn.BAD_ARGUMENT);
+    let is i64 as h2 = dbus.conn.add_match(&c2, cast(*u8, 0), PATH, "org.freedesktop.DBus.Properties",
+                                           "PropertiesChanged", fn_ptr(on_changed), cast(*u8, 0));
+    check("PropertiesChanged", h2 > 0 && dbus.conn.properties_changed(&c1, PATH, IFACE, "Label") == dbus.conn.OK);
+    dbus.conn.dispatch(&c2, 1000);
+    check("with the new value", st.changed == 1);
+    check("of a property there is", dbus.conn.properties_changed(&c1, PATH, IFACE, "Nothing") == dbus.conn.BAD_ARGUMENT);
+
+    // --- Sizes ---
+    let is dbus.conn.Limits as tiny with mut = dbus.conn.limits_default();
+    tiny.buffer = 4096;
+    let is dbus.conn.Conn as c3 with mut = dbus.conn.open_session(&tiny);
+    check("a small connection", dbus.conn.is_open(&c3) == 1);
+    let is [5000]u8 as big;
+    mem.memset(cast(*u8, &big), 120, 4999);
+    big[4999] = 0;
+    echo.destination = "org.caustic.Test";
+    dbus.wire.put_string(dbus.conn.body(&c3), cast(*u8, &big));
+    check("a message larger than it", dbus.conn.send(&c3, &echo) == 0 && dbus.conn.last_error(&c3) == dbus.conn.TOO_BIG);
+    tiny.buffer = 100;
+    let is dbus.conn.Conn as c4 = dbus.conn.open_session(&tiny);
+    check("buffers too small to talk", dbus.conn.is_open(&c4) == 0 && dbus.conn.last_error(&c4) == dbus.conn.BAD_ARGUMENT);
+    dbus.conn.close(&c3);
+
+    // --- The serial, past 32 bits ---
+    c2.serial = 4294967295;
+    let is dbus.message.Message as wrapq with mut = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Quiet");
+    wrapq.flags = dbus.message.NO_REPLY_EXPECTED;
+    dbus.conn.body(&c2);
+    check("the serial wraps to 1, never 0", dbus.conn.send(&c2, &wrapq) == 1);
+    dbus.conn.dispatch(&c1, 1000);
+
+    // --- A body is used once ---
+    dbus.wire.put_string(dbus.conn.body(&c2), "stale");
+    dbus.conn.send(&c2, &echo);
+    dbus.conn.dispatch(&c1, 1000);
+    dbus.conn.dispatch(&c2, 200);
+    check("the next message starts with no arguments", dbus.conn.send(&c2, &wrapq) > 0);
+    dbus.conn.dispatch(&c1, 1000);
+
+    // --- Descriptors in replies ---
+    let is dbus.message.Message as dup = dbus.message.method_call("org.caustic.Test", PATH, IFACE, "Dup");
+    dbus.conn.body(&c2);
+    let is i64 as d0 = dbus.conn.send(&c2, &dup);
+    dbus.conn.dispatch(&c1, 1000);
+    // Before c2 receives it: the kernel would give the copy it receives the
+    // number just freed.
+    check("the sender's copy closed once sent", dup_fd >= 0 && is_open_fd(dup_fd) == 0);
+    check("Dup", dbus.conn.wait_reply(&c2, d0, 2000, &rep) == dbus.conn.OK && rep.unix_fds == 1);
+    let is i64 as left = cast(i64, *rep.fds);
+    check("a descriptor came", is_open_fd(left) == 1 && content_is(left, "dup 1") == 1);
+    dbus.conn.dispatch(&c2, 0);
+    check("not taken, closed with its reply", is_open_fd(left) == 0);
+    dbus.conn.body(&c2);
+    ask(&c2, &c1, &dup, &rep);
+    let is i64 as kept = dbus.conn.take_fd(&rep, 0);
+    check("taken", kept >= 0 && dbus.conn.take_fd(&rep, 0) == 0 - 1 && dbus.conn.take_fd(&rep, 1) == 0 - 1);
+    dbus.conn.dispatch(&c2, 0);
+    check("taken, kept", is_open_fd(kept) == 1 && content_is(kept, "dup 2") == 1);
+    linux.close(kept);
+    dbus.conn.body(&c2);
+    let is i64 as d1 = dbus.conn.send(&c2, &dup);
+    dbus.conn.body(&c2);
+    let is i64 as d2 = dbus.conn.send(&c2, &dup);
+    dbus.conn.dispatch(&c1, 1000);
+    dbus.conn.wait_reply(&c2, d1, 2000, &rep);
+    let is i64 as f1 = dbus.conn.take_fd(&rep, 0);
+    dbus.conn.wait_reply(&c2, d2, 2000, &rep);
+    let is i64 as f2 = dbus.conn.take_fd(&rep, 0);
+    check("two in flight, each its own", content_is(f1, "dup 3") == 1 && content_is(f2, "dup 4") == 1);
+    linux.close(f1);
+    linux.close(f2);
+
+    // --- Closing ---
+    dbus.conn.unexport(&c1, PATH);
+    w = dbus.conn.body(&c2);
+    dbus.wire.put_i32(w, 1);
+    dbus.wire.put_i32(w, 1);
+    check("unexported", ask(&c2, &c1, &add, &rep) == dbus.conn.REPLY_ERROR);
+    dbus.conn.close(&c1);
+    dbus.conn.close(&c2);
+    check("closed", dbus.conn.is_open(&c1) == 0);
+    dbus.conn.body(&c2);
+    check("nothing sent on a closed one", dbus.conn.send(&c2, &add) == 0 && dbus.conn.last_error(&c2) == dbus.conn.CLOSED);
+    let is dbus.conn.Conn as none = dbus.conn.open_address("tcp:host=localhost,port=1", 27, &l);
+    check("no address to connect to", dbus.conn.is_open(&none) == 0 && dbus.conn.last_error(&none) == dbus.conn.NO_ADDRESS);
+    let is dbus.conn.Conn as gone = dbus.conn.open_address("unix:path=/tmp/caustic-no-bus", 29, &l);
+    check("nobody listening", dbus.conn.is_open(&gone) == 0 && dbus.conn.last_error(&gone) == dbus.conn.CONNECT_FAILED);
+
+    // --- Peers that misbehave ---
+    let is [96]u8 as al;
+    check("AUTH for uid 0", dbus.conn.auth_line(0, cast(*u8, &al), 96) == 19 && al[0] == 0
+          && mem.memcmp(cast(*u8, cast(i64, &al) + 1), "AUTH EXTERNAL 30\r\n", 18) == 0);
+    check("AUTH for uid 1000", dbus.conn.auth_line(1000, cast(*u8, &al), 96) == 25
+          && mem.memcmp(cast(*u8, cast(i64, &al) + 1), "AUTH EXTERNAL 31303030\r\n", 24) == 0);
+    check("no room for it", dbus.conn.auth_line(1000, cast(*u8, &al), 10) == 0);
+    let is i64 as code with mut = 0;
+    let is dbus.conn.Conn as f1c = fake_open(1, &l, &code);
+    check("refused", dbus.conn.is_open(&f1c) == 0 && dbus.conn.last_error(&f1c) == dbus.conn.AUTH_FAILED && code == 0);
+    let is dbus.conn.Conn as f2c = fake_open(2, &l, &code);
+    check("a line without its \\r", dbus.conn.is_open(&f2c) == 0 && dbus.conn.last_error(&f2c) == dbus.conn.AUTH_FAILED);
+    let is dbus.conn.Conn as f3c = fake_open(3, &l, &code);
+    check("Hello answered with a number", dbus.conn.is_open(&f3c) == 0 && dbus.conn.last_error(&f3c) == dbus.conn.BAD_MESSAGE && code == 0);
+    let is dbus.conn.Conn as f4c with mut = fake_open(4, &l, &code);
+    check("a peer that does it right", dbus.conn.is_open(&f4c) == 1 && dbus.message.named(dbus.conn.unique_name(&f4c), ":1.42") == 1
+          && dbus.message.named(dbus.conn.guid(&f4c), "0123456789abcdef0123456789abcdef") == 1);
+    check("and passes no descriptors", dbus.conn.can_pass_fds(&f4c) == 0);
+    let is i64 as nofd = sys.memfd_create("nofd", 0);
+    dbus.wire.put_fd(dbus.conn.body(&f4c), nofd);
+    check("so none are sent", dbus.conn.send(&f4c, &rd) == 0 && dbus.conn.last_error(&f4c) == dbus.conn.BAD_ARGUMENT);
+    linux.close(nofd);
+    dbus.conn.close(&f4c);
+    let is i32 as st4 with mut = 0;
+    linux.wait4(code, &st4, 0, cast(*u8, 0));
+    check("it saw the right AUTH", ((st4 >> 8) & 255) == 0);
+    // Two messages arriving with both their descriptors at once: each gets its own.
+    let is dbus.conn.Conn as f5c with mut = fake_open(5, &l, &code);
+    let is dbus.message.Message as any = dbus.message.method_call("x.y", "/f", "x.y", "Give");
+    dbus.conn.body(&f5c);
+    check("the reply, after a signal nobody wanted", dbus.conn.call_method(&f5c, &any, 2000, &rep) == dbus.conn.OK);
+    let is i64 as given = dbus.conn.take_fd(&rep, 0);
+    check("with the reply's descriptor, not the signal's", content_is(given, "two!!") == 1);
+    linux.close(given);
+    dbus.conn.close(&f5c);
+    linux.wait4(code, &st4, 0, cast(*u8, 0));
+    linux.unlink(FAKE);
+
+    if (fails > 0) {
+        io.printf("dbus conn: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("dbus conn: all checks passed\n");
+    return 0;
+}

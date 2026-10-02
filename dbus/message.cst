@@ -1,0 +1,309 @@
+// dbus/message.cst — a message: the header, its fields, and the body.
+//
+// Sixteen fixed bytes — byte order, type, flags, version, the body's length,
+// the serial, the fields' length — then the fields, an array of (code,
+// variant), then padding to 8 and the body. The fields say who it is for,
+// which object, interface and member, what it replies to, and the body's
+// signature.
+//
+// parse reads one from a buffer that may hold less, or more: 0 when it is not
+// all there yet, -1 when it is not a message, otherwise how many bytes it took.
+// It checks what it can without knowing the program: the fields each type
+// needs, each field's type, and the body against its signature — a body that
+// says it is (su) and is not never reaches a handler.
+use "std/mem.cst" as mem;
+use "wire.cst" as wire;
+
+let is i32 as METHOD_CALL   with imut = 1;
+let is i32 as METHOD_RETURN with imut = 2;
+let is i32 as ERROR         with imut = 3;
+let is i32 as SIGNAL        with imut = 4;
+
+let is i32 as NO_REPLY_EXPECTED with imut = 1;
+let is i32 as NO_AUTO_START     with imut = 2;
+let is i32 as ALLOW_INTERACTIVE_AUTHORIZATION with imut = 4;
+
+let is i64 as F_PATH         with imut = 1;
+let is i64 as F_INTERFACE    with imut = 2;
+let is i64 as F_MEMBER       with imut = 3;
+let is i64 as F_ERROR_NAME   with imut = 4;
+let is i64 as F_REPLY_SERIAL with imut = 5;
+let is i64 as F_DESTINATION  with imut = 6;
+let is i64 as F_SENDER       with imut = 7;
+let is i64 as F_SIGNATURE    with imut = 8;
+let is i64 as F_UNIX_FDS     with imut = 9;
+
+let is i64 as MAX_MESSAGE with imut = 134217728;
+
+// Strings are zero-terminated and null when absent. In a parsed message they
+// point into the buffer it was parsed from, and live as long as it does.
+struct Message {
+    kind         as i32;
+    flags        as i32;
+    serial       as i64;
+    reply_serial as i64;
+    path         as *u8;
+    interface    as *u8;
+    member       as *u8;
+    error_name   as *u8;
+    destination  as *u8;
+    sender       as *u8;
+    signature    as *u8;
+    unix_fds     as i64;   // how many descriptors it carries
+    body         as *u8;
+    body_len     as i64;
+    big          as i32;   // the body is big-endian
+    _pad0        as i32;
+    fds          as *i32;  // its descriptors, unix_fds of them
+}
+
+fn empty() as Message {
+    let is Message as m;
+    m.kind = 0;
+    m.flags = 0;
+    m.serial = 0;
+    m.reply_serial = 0;
+    m.path = cast(*u8, 0);
+    m.interface = cast(*u8, 0);
+    m.member = cast(*u8, 0);
+    m.error_name = cast(*u8, 0);
+    m.destination = cast(*u8, 0);
+    m.sender = cast(*u8, 0);
+    m.signature = cast(*u8, 0);
+    m.unix_fds = 0;
+    m.body = cast(*u8, 0);
+    m.body_len = 0;
+    m.big = 0;
+    m._pad0 = 0;
+    m.fds = cast(*i32, 0);
+    return m;
+}
+
+fn method_call(destination as *u8, path as *u8, interface as *u8, member as *u8) as Message {
+    let is Message as m = empty();
+    m.kind = METHOD_CALL;
+    m.destination = destination;
+    m.path = path;
+    m.interface = interface;
+    m.member = member;
+    return m;
+}
+
+fn signal(path as *u8, interface as *u8, member as *u8) as Message {
+    let is Message as m = empty();
+    m.kind = SIGNAL;
+    m.path = path;
+    m.interface = interface;
+    m.member = member;
+    return m;
+}
+
+// The reply to a call, addressed back to whoever made it.
+fn method_return(to as *Message) as Message {
+    let is Message as m = empty();
+    m.kind = METHOD_RETURN;
+    m.reply_serial = to.serial;
+    m.destination = to.sender;
+    return m;
+}
+
+fn error(to as *Message, name as *u8) as Message {
+    let is Message as m = empty();
+    m.kind = ERROR;
+    m.reply_serial = to.serial;
+    m.destination = to.sender;
+    m.error_name = name;
+    return m;
+}
+
+fn _has(s as *u8) as i32 {
+    if (cast(i64, s) != 0) { return 1; }
+    return 0;
+}
+
+fn _field_s(w as *wire.Writer, code as i64, sig as *u8, v as *u8) as void {
+    if (_has(v) == 0) { return; }
+    wire.put_struct(w);
+    wire.put_byte(w, code);
+    wire.put_variant(w, sig);
+    if (code == F_PATH) { wire.put_path(w, v); }
+    else if (code == F_SIGNATURE) { wire.put_signature(w, v); }
+    else { wire.put_string(w, v); }
+}
+
+fn _field_u(w as *wire.Writer, code as i64, v as i64) as void {
+    wire.put_struct(w);
+    wire.put_byte(w, code);
+    wire.put_variant(w, "u");
+    wire.put_u32(w, v);
+}
+
+// Whether m has the fields its type needs.
+fn _complete(m as *Message) as i32 {
+    if (m.kind == METHOD_CALL) { return _has(m.path) & _has(m.member); }
+    if (m.kind == SIGNAL) { return _has(m.path) & _has(m.interface) & _has(m.member); }
+    if (m.kind == ERROR) {
+        if (m.reply_serial == 0) { return 0; }
+        return _has(m.error_name);
+    }
+    if (m.kind == METHOD_RETURN) {
+        if (m.reply_serial == 0) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+// m with serial, its body the len bytes at body carrying nfds descriptors,
+// into out (room for cap). The body is checked against m.signature first.
+// The bytes written, or -1 when it does not fit or is not a valid message.
+fn encode(m as *Message, serial as i64, body as *u8, len as i64, nfds as i64,
+          out as *u8, cap as i64) as i64 {
+    if (serial <= 0 || serial > 4294967295 || _complete(m) == 0) { return 0 - 1; }
+    // The body must be what its signature says, all of it.
+    let is *u8 as sig with mut = m.signature;
+    if (_has(sig) == 0) { sig = ""; }
+    let is wire.Reader as check with mut = wire.reader(body, len, 0);
+    let is [16]i32 as any_fds;
+    check.fds = cast(*i32, &any_fds);
+    check.nfds = nfds;
+    if (wire.skip_all(&check, sig, wire.cstr_len(sig)) == 0) { return 0 - 1; }
+
+    let is wire.Writer as w with mut = wire.writer(out, cap);
+    wire.put_byte(&w, 108);   // 'l'
+    wire.put_byte(&w, cast(i64, m.kind));
+    wire.put_byte(&w, cast(i64, m.flags));
+    wire.put_byte(&w, 1);
+    wire.put_u32(&w, len);
+    wire.put_u32(&w, serial);
+    let is i64 as fields = wire.put_array(&w, 8);
+    _field_s(&w, F_PATH, "o", m.path);
+    _field_s(&w, F_INTERFACE, "s", m.interface);
+    _field_s(&w, F_MEMBER, "s", m.member);
+    _field_s(&w, F_ERROR_NAME, "s", m.error_name);
+    if (m.reply_serial != 0) { _field_u(&w, F_REPLY_SERIAL, m.reply_serial); }
+    _field_s(&w, F_DESTINATION, "s", m.destination);
+    _field_s(&w, F_SENDER, "s", m.sender);
+    if (wire.cstr_len(sig) > 0) { _field_s(&w, F_SIGNATURE, "g", sig); }
+    if (nfds > 0) { _field_u(&w, F_UNIX_FDS, nfds); }
+    wire.put_array_end(&w, fields, 8);
+    wire.pad(&w, 8);
+    if (w.err != 0 || w.len + len > cap || w.len + len > MAX_MESSAGE) { return 0 - 1; }
+    mem.memcpy(cast(*u8, cast(i64, out) + w.len), body, len);
+    return w.len + len;
+}
+
+// How long the message at buf is, from its first 16 bytes: 0 when fewer are
+// there, -1 when they are not a message's.
+fn length(buf as *u8, len as i64) as i64 {
+    if (len < 16) { return 0; }
+    let is i64 as order = cast(i64, *buf) & 255;
+    let is i32 as big with mut = 0;
+    if (order == 66) { big = 1; }
+    else if (order != 108) { return 0 - 1; }
+    let is wire.Reader as r with mut = wire.reader(buf, 16, big);
+    r.pos = 3;
+    if (wire.get_byte(&r) != 1) { return 0 - 1; }
+    let is i64 as body = wire.get_u32(&r);
+    wire.get_u32(&r);
+    let is i64 as fields = wire.get_u32(&r);
+    let is i64 as header with mut = 16 + fields;
+    header = (header + 7) / 8 * 8;
+    let is i64 as total = header + body;
+    if (total > MAX_MESSAGE) { return 0 - 1; }
+    return total;
+}
+
+// A basic type's signature is one byte, and a variant's is one complete type,
+// so its first byte says it.
+fn _expect(r as *wire.Reader, sig as *u8, n as i64, want as u8) as void {
+    if (*sig != want) { r.err = 1; r.pos = r.len; }
+}
+
+// One message from buf, len bytes of it, with the descriptors that came with
+// it — fds, nfds of them — into out. See the top.
+fn parse(buf as *u8, len as i64, fds as *i32, nfds as i64, out as *Message) as i64 {
+    *out = empty();
+    let is i64 as total = length(buf, len);
+    if (total <= 0) { return total; }
+    if (len < total) { return 0; }
+    let is i32 as big with mut = 0;
+    if ((cast(i64, *buf) & 255) == 66) { big = 1; }
+    out.big = big;
+    out.kind = cast(i32, cast(i64, *cast(*u8, cast(i64, buf) + 1)) & 255);
+    out.flags = cast(i32, cast(i64, *cast(*u8, cast(i64, buf) + 2)) & 255);
+    let is wire.Reader as h with mut = wire.reader(buf, total, big);
+    h.pos = 4;
+    out.body_len = wire.get_u32(&h);
+    out.serial = wire.get_u32(&h);
+    if (out.serial == 0) { return 0 - 1; }
+    let is i64 as end = wire.get_array(&h, 8);
+    let is i64 as n with mut = 0;
+    while (h.err == 0 && h.pos < end) {
+        wire.get_struct(&h);
+        let is i64 as code = wire.get_byte(&h);
+        let is *u8 as sig = wire.get_variant(&h, &n);
+        if (h.err != 0) { return 0 - 1; }
+        if (code == F_PATH) {
+            _expect(&h, sig, n, 111);
+            out.path = wire.get_path(&h, &n);
+        } else if (code == F_INTERFACE || code == F_MEMBER || code == F_ERROR_NAME
+                   || code == F_DESTINATION || code == F_SENDER) {
+            _expect(&h, sig, n, 115);
+            let is *u8 as v = wire.get_string(&h, &n);
+            if (code == F_INTERFACE) { out.interface = v; }
+            if (code == F_MEMBER) { out.member = v; }
+            if (code == F_ERROR_NAME) { out.error_name = v; }
+            if (code == F_DESTINATION) { out.destination = v; }
+            if (code == F_SENDER) { out.sender = v; }
+        } else if (code == F_REPLY_SERIAL) {
+            _expect(&h, sig, n, 117);
+            out.reply_serial = wire.get_u32(&h);
+        } else if (code == F_SIGNATURE) {
+            _expect(&h, sig, n, 103);
+            out.signature = wire.get_signature(&h, &n);
+        } else if (code == F_UNIX_FDS) {
+            _expect(&h, sig, n, 117);
+            out.unix_fds = wire.get_u32(&h);
+        } else {
+            // A field this version of the protocol does not have: skipped,
+            // as the specification says.
+            wire.skip(&h, sig, n);
+        }
+    }
+    if (h.err != 0 || h.pos != end) { return 0 - 1; }
+    wire.align(&h, 8);
+    if (h.err != 0 || h.pos + out.body_len != total) { return 0 - 1; }
+    out.body = cast(*u8, cast(i64, buf) + h.pos);
+    if (out.unix_fds > nfds) { return 0 - 1; }
+    out.fds = fds;
+    // Unknown types are passed on, for the caller to ignore, as the
+    // specification asks; the known ones must have their fields, and type 0
+    // is none.
+    if (out.kind <= SIGNAL && _complete(out) == 0) { return 0 - 1; }
+    let is *u8 as sig with mut = out.signature;
+    if (_has(sig) == 0) { sig = ""; }
+    let is wire.Reader as b with mut = wire.reader(out.body, out.body_len, big);
+    b.fds = fds;
+    b.nfds = out.unix_fds;
+    if (wire.skip_all(&b, sig, wire.cstr_len(sig)) == 0) { return 0 - 1; }
+    return total;
+}
+
+// A Reader over m's body.
+fn body(m as *Message) as wire.Reader {
+    let is wire.Reader as r = wire.reader(m.body, m.body_len, m.big);
+    r.fds = m.fds;
+    r.nfds = m.unix_fds;
+    return r;
+}
+
+// Whether s, null or not, is the zero-terminated t.
+fn named(s as *u8, t as *u8) as i32 {
+    if (_has(s) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (*cast(*u8, cast(i64, s) + i) == *cast(*u8, cast(i64, t) + i)) {
+        if (*cast(*u8, cast(i64, s) + i) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}

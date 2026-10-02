@@ -1,0 +1,1201 @@
+// dbus/conn.cst — a connection to a bus.
+//
+// Open authenticates (EXTERNAL, with this process's uid), asks for Unix fd
+// passing and says Hello, which gives the connection its unique name. From
+// then on:
+//
+//   call_method  sends a method call and waits for its reply. Whatever arrives
+//             first is dispatched on the way — a signal to its handlers, a
+//             call to the object it names — so nothing is lost while waiting.
+//   send      sends without waiting, and returns the serial; wait_reply
+//             waits for the reply to it later, so several calls can be in
+//             flight at once.
+//   dispatch  reads what has arrived and dispatches it; for a main loop that
+//             polls fd(c).
+//
+// A message body is written into body(c) before the send that takes it. A
+// reply call returns lives in the connection's buffer until the next
+// operation on it, which is when it is dropped — copy what is needed first.
+// Descriptors that come with a message are closed when it is dropped unless
+// the program took them with take_fd.
+//
+// Handlers run inside dispatch, or inside call when the message arrived while
+// waiting. They may reply and send signals; a blocking call from inside one
+// would have to dispatch inside dispatch, so it is refused with BUSY.
+//
+// Exported objects are tables the program owns: a path, its interfaces, and
+// for each its methods, properties and signals. Calls to them are routed by
+// path, interface and member, their arguments checked against the declared
+// signature; Introspect, Properties (Get, GetAll, Set) and Peer (Ping,
+// GetMachineId) are answered from the tables.
+//
+// Signal handlers are registered with add_match, which also asks the bus to
+// route the signal here. The handler is chosen here by path, interface and
+// member; filtering by sender is left to the bus, which knows which unique
+// name a well-known one belongs to.
+use "std/os/linux.cst" as linux;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "../sys/linux.cst" as sys;
+use "wire.cst" as wire;
+use "message.cst" as message;
+use "address.cst" as address;
+
+// --- Errors ---
+
+let is i32 as OK             with imut = 0;
+let is i32 as NO_ADDRESS     with imut = 1;   // no session bus address, or none to connect to
+let is i32 as CONNECT_FAILED with imut = 2;
+let is i32 as AUTH_FAILED    with imut = 3;
+let is i32 as IO             with imut = 4;   // the connection broke, or the peer closed it
+let is i32 as TOO_BIG        with imut = 5;   // a message larger than the buffers
+let is i32 as TIMEOUT        with imut = 6;
+let is i32 as BAD_MESSAGE    with imut = 7;   // the peer sent something that is not a message
+let is i32 as REPLY_ERROR    with imut = 8;   // the reply was an error; see the message's error_name
+let is i32 as BUSY           with imut = 9;   // a blocking call from inside a handler
+let is i32 as FULL           with imut = 10;  // the objects or matches table is full
+let is i32 as BAD_ARGUMENT   with imut = 11;
+let is i32 as OUT_OF_MEMORY  with imut = 12;
+let is i32 as CLOSED         with imut = 13;
+
+// Errors a bus peer sends, by name.
+let is *u8 as E_UNKNOWN_METHOD    with imut = "org.freedesktop.DBus.Error.UnknownMethod";
+let is *u8 as E_UNKNOWN_OBJECT    with imut = "org.freedesktop.DBus.Error.UnknownObject";
+let is *u8 as E_UNKNOWN_INTERFACE with imut = "org.freedesktop.DBus.Error.UnknownInterface";
+let is *u8 as E_UNKNOWN_PROPERTY  with imut = "org.freedesktop.DBus.Error.UnknownProperty";
+let is *u8 as E_PROPERTY_READ_ONLY with imut = "org.freedesktop.DBus.Error.PropertyReadOnly";
+let is *u8 as E_INVALID_ARGS      with imut = "org.freedesktop.DBus.Error.InvalidArgs";
+let is *u8 as E_FAILED            with imut = "org.freedesktop.DBus.Error.Failed";
+
+// --- Sizes ---
+
+struct Limits {
+    buffer  as i64;   // bytes: the largest message sent or received
+    objects as i64;   // exported paths
+    matches as i64;   // signal handlers
+}
+
+fn limits_default() as Limits {
+    let is Limits as l;
+    l.buffer = 262144;
+    l.objects = 32;
+    l.matches = 32;
+    return l;
+}
+
+// --- Tables the program owns ---
+
+// A method call being answered: its message, its arguments, and the reply's
+// body. A handler that fails sets error_name, and error_text if it has more
+// to say; the reply is then that error. Descriptors written into the reply
+// are closed once it is sent.
+struct Call {
+    msg        as *message.Message;
+    args       as wire.Reader;
+    reply      as *wire.Writer;
+    error_name as *u8;
+    error_text as *u8;
+}
+
+type MethodFn = fn(*Conn, *Call, *u8) as void;
+type GetFn    = fn(*Conn, *wire.Writer, *u8) as void;      // writes the value, of the declared type
+type SetFn    = fn(*Conn, *wire.Reader, *u8) as i32;       // reads it; 0 refuses it
+type SignalFn = fn(*Conn, *message.Message, *u8) as void;
+
+// Names are for Introspect: the arguments' names, comma-separated, or null.
+struct Method {
+    name      as *u8;
+    in_sig    as *u8;
+    out_sig   as *u8;
+    handler   as MethodFn;
+    in_names  as *u8;
+    out_names as *u8;
+}
+
+struct Property {
+    name as *u8;
+    sig  as *u8;
+    get  as GetFn;
+    set  as SetFn;   // null: read-only
+}
+
+struct SignalDecl {
+    name  as *u8;
+    sig   as *u8;
+    names as *u8;
+}
+
+struct Interface {
+    name     as *u8;
+    methods  as *Method;
+    nmethods as i64;
+    props    as *Property;
+    nprops   as i64;
+    signals  as *SignalDecl;
+    nsignals as i64;
+}
+
+struct Object {
+    path   as *u8;
+    ifaces as *Interface;
+    niface as i64;
+    user   as *u8;
+}
+
+struct Match {
+    used      as i64;
+    path      as *u8;
+    interface as *u8;
+    member    as *u8;
+    handler   as SignalFn;
+    user      as *u8;
+    rule      as [384]u8;
+}
+
+// --- The connection ---
+
+let is i64 as MAX_QUEUED_FDS with imut = 64;
+
+struct Conn {
+    fd        as i64;
+    ok        as i32;
+    err       as i32;
+    unix_fds  as i32;   // the bus agreed to pass descriptors
+    in_handler as i32;
+    serial    as i64;
+    cap       as i64;
+    block     as *u8;
+    block_bytes as i64;
+    rbuf      as *u8;   // bytes received, messages at the front
+    rlen      as i64;
+    rfds      as [64]i32;   // descriptors received, in order, not yet dropped
+    nrfds     as i64;
+    held      as i64;   // bytes of rbuf a returned reply holds until the next operation
+    held_fds  as i64;
+    wbuf      as *u8;   // a message being sent
+    bodyw     as wire.Writer;   // body(c)
+    replyw    as wire.Writer;   // a reply being built inside dispatch
+    dbuf      as *u8;   // a message being dispatched, copied out of rbuf
+    dfds      as [16]i32;
+    xbuf      as *u8;   // Introspect's XML
+    xlen      as i64;
+    objects   as *Object;
+    nobjects  as i64;
+    obj_cap   as i64;
+    matches   as *Match;
+    match_cap as i64;
+    unique    as [256]u8;
+    guid      as [40]u8;
+    last      as message.Message;
+}
+
+fn _p(base as *u8, off as i64) as *u8 { return cast(*u8, cast(i64, base) + off); }
+
+fn _len(s as *u8) as i64 { return wire.cstr_len(s); }
+
+fn fd(c as *Conn) as i64 { return c.fd; }
+fn is_open(c as *Conn) as i32 { return c.ok; }
+fn last_error(c as *Conn) as i32 { return c.err; }
+fn unique_name(c as *Conn) as *u8 { return cast(*u8, &c.unique); }
+fn guid(c as *Conn) as *u8 { return cast(*u8, &c.guid); }
+fn can_pass_fds(c as *Conn) as i32 { return c.unix_fds; }
+
+fn _broken(c as *Conn, e as i32) as i32 {
+    c.err = e;
+    if (c.ok == 1) {
+        linux.close(c.fd);
+        c.fd = 0 - 1;
+        c.ok = 0;
+    }
+    return e;
+}
+
+// --- Authentication ---
+
+fn _write_all(fd as i64, p as *u8, n as i64) as i32 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as r = sys.send_fds(fd, _p(p, done), n - done, cast(*i32, 0), 0);
+        if (r <= 0) { return 0; }
+        done = done + r;
+    }
+    return 1;
+}
+
+// One line from the server, "\r\n" stripped, into c.rbuf; its length, or -1.
+fn _line(c as *Conn) as i64 {
+    let is i64 as n with mut = 0;
+    let is [16]i32 as fds;
+    let is i64 as nf with mut = 0;
+    while (n < 1024) {
+        // A line ends with "\r\n", and a bare "\n" is a server not speaking
+        // the protocol.
+        if (n >= 1 && *_p(c.rbuf, n - 1) == 10) {
+            if (n < 2 || *_p(c.rbuf, n - 2) != 13) { return 0 - 1; }
+            *_p(c.rbuf, n - 2) = 0;
+            return n - 2;
+        }
+        if (sys.wait_readable(c.fd, 5000) != 1) { return 0 - 1; }
+        // One byte at a time: the server sends nothing after the line until
+        // spoken to, but reading past it would take bytes of the first message.
+        let is i64 as r = sys.recv_fds(c.fd, _p(c.rbuf, n), 1, cast(*i32, &fds), &nf, 1);
+        if (r != 1) { return 0 - 1; }
+        n = n + 1;
+    }
+    return 0 - 1;
+}
+
+fn _starts(s as *u8, p as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (*_p(p, i) != 0) {
+        if (*_p(s, i) != *_p(p, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The first thing a client sends: a zero byte, then AUTH EXTERNAL with the
+// uid — in decimal, hex-encoded byte by byte, so uid 1000 is "31303030".
+// Into buf (room for cap); its length.
+fn auth_line(uid as i64, buf as *u8, cap as i64) as i64 {
+    if (cap < 64) { return 0; }
+    let is [24]u8 as dec;
+    let is i64 as u with mut = uid;
+    let is i64 as nd with mut = 0;
+    if (u == 0) { dec[0] = 48; nd = 1; }
+    while (u > 0) {
+        dec[nd] = cast(u8, 48 + u % 10);
+        u = u / 10;
+        nd = nd + 1;
+    }
+    *buf = 0;
+    mem.memcpy(_p(buf, 1), "AUTH EXTERNAL ", 14);
+    let is i64 as n with mut = 15;
+    let is *u8 as hx = "0123456789abcdef";
+    while (nd > 0) {
+        nd = nd - 1;
+        let is i64 as d = cast(i64, dec[nd]);
+        *_p(buf, n) = *_p(hx, d / 16);
+        *_p(buf, n + 1) = *_p(hx, d % 16);
+        n = n + 2;
+    }
+    *_p(buf, n) = 13;
+    *_p(buf, n + 1) = 10;
+    return n + 2;
+}
+
+fn _auth(c as *Conn) as i32 {
+    let is [96]u8 as line;
+    let is i64 as n = auth_line(sys.getuid(), cast(*u8, &line), 96);
+    if (_write_all(c.fd, cast(*u8, &line), n) == 0) { return 0; }
+    let is i64 as got with mut = _line(c);
+    if (got < 3 || _starts(c.rbuf, "OK ") == 0) { return 0; }
+    let is i64 as g with mut = 0;
+    while (g < 32 && g + 3 < got) {
+        c.guid[g] = *_p(c.rbuf, g + 3);
+        g = g + 1;
+    }
+    c.guid[g] = 0;
+    if (_write_all(c.fd, "NEGOTIATE_UNIX_FD\r\n", 19) == 0) { return 0; }
+    // Anything but AGREE leaves descriptors off; a server gone by now fails
+    // the Hello that follows.
+    got = _line(c);
+    if (got >= 0 && _starts(c.rbuf, "AGREE_UNIX_FD") == 1) { c.unix_fds = 1; }
+    if (_write_all(c.fd, "BEGIN\r\n", 7) == 0) { return 0; }
+    return 1;
+}
+
+// --- Opening and closing ---
+
+fn _empty(l as *Limits) as Conn {
+    let is Conn as c;
+    c.fd = 0 - 1;
+    c.ok = 0;
+    c.err = OK;
+    c.unix_fds = 0;
+    c.in_handler = 0;
+    c.serial = 0;
+    c.cap = l.buffer;
+    c.block = cast(*u8, 0);
+    c.block_bytes = 0;
+    c.rlen = 0;
+    c.nrfds = 0;
+    c.held = 0;
+    c.held_fds = 0;
+    c.xlen = 0;
+    c.nobjects = 0;
+    c.obj_cap = l.objects;
+    c.match_cap = l.matches;
+    c.unique[0] = 0;
+    c.guid[0] = 0;
+    c.last = message.empty();
+    return c;
+}
+
+// Connects to the bus at addr (n bytes), trying its entries in order.
+fn open_address(addr as *u8, n as i64, l as *Limits) as Conn {
+    let is Conn as c with mut = _empty(l);
+    if (l.buffer < 4096 || l.objects < 0 || l.matches < 0) { c.err = BAD_ARGUMENT; return c; }
+    let is i64 as objs = l.objects * sizeof(Object);
+    let is i64 as mats = l.matches * sizeof(Match);
+    c.block_bytes = 6 * l.buffer + objs + mats;
+    c.block = mem.core.mmap_anon(c.block_bytes);
+    if (cast(i64, c.block) == 0) { c.err = OUT_OF_MEMORY; return c; }
+    mem.memzero(c.block, c.block_bytes);
+    c.rbuf = c.block;
+    c.wbuf = _p(c.block, l.buffer);
+    c.bodyw = wire.writer(_p(c.block, 2 * l.buffer), l.buffer);
+    c.replyw = wire.writer(_p(c.block, 3 * l.buffer), l.buffer);
+    c.dbuf = _p(c.block, 4 * l.buffer);
+    c.xbuf = _p(c.block, 5 * l.buffer);
+    c.objects = cast(*Object, _p(c.block, 6 * l.buffer));
+    c.matches = cast(*Match, _p(c.block, 6 * l.buffer + objs));
+
+    let is address.Address as a;
+    let is i64 as entries = address.count(addr, n);
+    let is i64 as i with mut = 0;
+    c.err = NO_ADDRESS;
+    while (i < entries && c.fd < 0) {
+        if (address.entry(addr, n, i, &a) == 1) {
+            let is i32 as abs with mut = 0;
+            if (a.kind == address.ABSTRACT) { abs = 1; }
+            let is i64 as fd = sys.connect_unix(cast(*u8, &a.name), a.len, abs);
+            if (fd >= 0) { c.fd = fd; } else { c.err = CONNECT_FAILED; }
+        }
+        i = i + 1;
+    }
+    if (c.fd < 0) {
+        mem.core.munmap(c.block, c.block_bytes);
+        c.block = cast(*u8, 0);
+        return c;
+    }
+    if (_auth(&c) == 0) {
+        linux.close(c.fd);
+        c.fd = 0 - 1;
+        mem.core.munmap(c.block, c.block_bytes);
+        c.block = cast(*u8, 0);
+        c.err = AUTH_FAILED;
+        return c;
+    }
+    c.ok = 1;
+    c.err = OK;
+    let is message.Message as hello = message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                          "org.freedesktop.DBus", "Hello");
+    let is message.Message as rep with mut = message.empty();
+    body(&c);
+    if (call_method(&c, &hello, 5000, &rep) != OK) {
+        close(&c);
+        c.err = AUTH_FAILED;
+        return c;
+    }
+    let is wire.Reader as r with mut = message.body(&rep);
+    let is i64 as len with mut = 0;
+    let is *u8 as name = wire.get_string(&r, &len);
+    if (r.err != 0 || len >= 256) {
+        close(&c);
+        c.err = BAD_MESSAGE;
+        return c;
+    }
+    mem.memcpy(cast(*u8, &c.unique), name, len + 1);
+    return c;
+}
+
+// The session bus. See address.session: the program must have called env.init.
+fn open_session(l as *Limits) as Conn {
+    let is [512]u8 as a;
+    let is i64 as n = address.session(cast(*u8, &a), 512);
+    if (n == 0) {
+        let is Conn as c with mut = _empty(l);
+        c.err = NO_ADDRESS;
+        return c;
+    }
+    return open_address(cast(*u8, &a), n, l);
+}
+
+fn _close_fds(p as *i32, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i32 as f = *cast(*i32, cast(i64, p) + i * 4);
+        if (f >= 0) { linux.close(cast(i64, f)); }
+        i = i + 1;
+    }
+}
+
+fn close(c as *Conn) as void {
+    if (cast(i64, c.block) == 0) { return; }
+    if (c.fd >= 0) { linux.close(c.fd); }
+    _close_fds(cast(*i32, &c.rfds), c.nrfds);
+    c.nrfds = 0;
+    mem.core.munmap(c.block, c.block_bytes);
+    c.block = cast(*u8, 0);
+    c.fd = 0 - 1;
+    c.ok = 0;
+}
+
+// --- Sending ---
+
+// The body of the next message sent, emptied; write the arguments into it.
+fn body(c as *Conn) as *wire.Writer {
+    wire.reset(&c.bodyw);
+    return &c.bodyw;
+}
+
+fn _send_with(c as *Conn, m as *message.Message, w as *wire.Writer) as i64 {
+    if (c.ok == 0) { c.err = CLOSED; return 0; }
+    if (w.err != 0) { c.err = TOO_BIG; return 0; }
+    if (w.nfds > 0 && c.unix_fds == 0) { c.err = BAD_ARGUMENT; return 0; }
+    c.serial = c.serial + 1;
+    if (c.serial > 4294967295) { c.serial = 1; }
+    let is i64 as n = message.encode(m, c.serial, w.buf, w.len, w.nfds, c.wbuf, c.cap);
+    if (n < 0) { c.err = BAD_ARGUMENT; return 0; }
+    // The descriptors go with the first bytes; the rest follows without.
+    let is i64 as done = sys.send_fds(c.fd, c.wbuf, n, cast(*i32, &w.fds), w.nfds);
+    if (done <= 0) { _broken(c, IO); return 0; }
+    if (_write_all(c.fd, _p(c.wbuf, done), n - done) == 0) { _broken(c, IO); return 0; }
+    return c.serial;
+}
+
+// Sends m with body(c) as its body; its serial, or 0 when it could not.
+fn send(c as *Conn, m as *message.Message) as i64 {
+    let is i64 as s = _send_with(c, m, &c.bodyw);
+    wire.reset(&c.bodyw);
+    return s;
+}
+
+// A signal from path, with body(c) as its arguments.
+fn emit(c as *Conn, path as *u8, interface as *u8, member as *u8, sig as *u8) as i32 {
+    let is message.Message as m with mut = message.signal(path, interface, member);
+    if (cast(i64, sig) != 0 && _len(sig) > 0) { m.signature = sig; }
+    if (send(c, &m) == 0) { return c.err; }
+    return OK;
+}
+
+// --- Receiving ---
+
+// Drops the reply call returned, and its descriptors unless taken.
+fn _release(c as *Conn) as void {
+    if (c.held == 0) { return; }
+    _drop_front(c, c.held, c.held_fds, 1);
+    c.held = 0;
+    c.held_fds = 0;
+    c.last = message.empty();
+}
+
+// Removes the first n bytes and nfds descriptors; closes them when close_them.
+fn _drop_front(c as *Conn, n as i64, nfds as i64, close_them as i32) as void {
+    if (close_them == 1) { _close_fds(cast(*i32, &c.rfds), nfds); }
+    let is i64 as i with mut = 0;
+    while (i + nfds < c.nrfds) {
+        c.rfds[i] = c.rfds[i + nfds];
+        i = i + 1;
+    }
+    c.nrfds = c.nrfds - nfds;
+    if (n < c.rlen) { mem.core.memmove(c.rbuf, _p(c.rbuf, n), c.rlen - n); }
+    c.rlen = c.rlen - n;
+}
+
+// Reads what has arrived, waiting up to wait_ms (0: not at all; negative:
+// forever). 1 when bytes came, 0 when none did, or an error.
+fn _fill(c as *Conn, wait_ms as i64) as i32 {
+    if (c.rlen >= c.cap) { return _broken(c, TOO_BIG); }
+    if (wait_ms != 0) {
+        let is i64 as w = sys.wait_readable(c.fd, wait_ms);
+        if (w == 0) { return 0; }
+        if (w < 0) { return _broken(c, IO); }
+    }
+    let is [16]i32 as fds;
+    let is i64 as nf with mut = 0;
+    let is i64 as r = sys.recv_fds(c.fd, _p(c.rbuf, c.rlen), c.cap - c.rlen, cast(*i32, &fds), &nf, 0);
+    if (r == 0 - sys.EAGAIN) { return 0; }
+    if (r <= 0) { return _broken(c, IO); }
+    c.rlen = c.rlen + r;
+    let is i64 as i with mut = 0;
+    while (i < nf) {
+        if (c.nrfds >= MAX_QUEUED_FDS) {
+            linux.close(cast(i64, fds[i]));
+        } else {
+            c.rfds[c.nrfds] = fds[i];
+            c.nrfds = c.nrfds + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The message at the front of rbuf: 1 with it in m, 0 when it is not all
+// there yet, or an error — which breaks the connection, since a stream that
+// lost its place cannot find it again.
+fn _front(c as *Conn, m as *message.Message) as i32 {
+    let is i64 as total = message.length(c.rbuf, c.rlen);
+    if (total < 0) { return 0 - _broken(c, BAD_MESSAGE); }
+    if (total == 0 || total > c.rlen) {
+        if (total > c.cap) { return 0 - _broken(c, TOO_BIG); }
+        return 0;
+    }
+    let is i64 as r = message.parse(c.rbuf, c.rlen, cast(*i32, &c.rfds), c.nrfds, m);
+    if (r <= 0) { return 0 - _broken(c, BAD_MESSAGE); }
+    return 1;
+}
+
+// Waits for the reply to the call sent with serial: OK with it in out,
+// REPLY_ERROR with the error in out (its error_name says which), or what went
+// wrong. Whatever else arrives meanwhile is dispatched. The reply lives in the
+// connection's buffer until the next operation on it.
+fn wait_reply(c as *Conn, serial as i64, timeout_ms as i64, out as *message.Message) as i32 {
+    *out = message.empty();
+    if (c.in_handler == 1) {
+        c.err = BUSY;
+        return BUSY;
+    }
+    _release(c);
+    let is i64 as deadline = time.now_ms() + timeout_ms;
+    while (c.ok == 1) {
+        let is message.Message as f with mut = message.empty();
+        let is i32 as got = _front(c, &f);
+        if (got < 0) { return c.err; }
+        if (got == 1) {
+            if ((f.kind == message.METHOD_RETURN || f.kind == message.ERROR) && f.reply_serial == serial) {
+                c.held = message.length(c.rbuf, c.rlen);
+                c.held_fds = f.unix_fds;
+                c.last = f;
+                *out = f;
+                if (f.kind == message.ERROR) { c.err = REPLY_ERROR; return REPLY_ERROR; }
+                return OK;
+            }
+            _dispatch_front(c, &f);
+        } else {
+            let is i64 as left = deadline - time.now_ms();
+            if (left <= 0) { c.err = TIMEOUT; return TIMEOUT; }
+            let is i32 as r = _fill(c, left);
+            if (r > 1) { return r; }
+        }
+    }
+    return c.err;
+}
+
+// send, then wait_reply: the reply in out, or what went wrong.
+fn call_method(c as *Conn, m as *message.Message, timeout_ms as i64, out as *message.Message) as i32 {
+    *out = message.empty();
+    if (c.in_handler == 1) {
+        wire.reset(&c.bodyw);
+        c.err = BUSY;
+        return BUSY;
+    }
+    _release(c);
+    let is i64 as serial = send(c, m);
+    if (serial == 0) { return c.err; }
+    return wait_reply(c, serial, timeout_ms, out);
+}
+
+// Dispatches everything that has arrived, waiting up to wait_ms for the first
+// of it. How many messages were dispatched, or minus an error.
+fn dispatch(c as *Conn, wait_ms as i64) as i64 {
+    if (c.ok == 0) { return 0 - cast(i64, CLOSED); }
+    if (c.in_handler == 1) { return 0; }
+    _release(c);
+    let is i64 as done with mut = 0;
+    let is i64 as wait with mut = wait_ms;
+    while (c.ok == 1) {
+        let is message.Message as f with mut = message.empty();
+        let is i32 as got = _front(c, &f);
+        if (got < 0) { return 0 - cast(i64, c.err); }
+        if (got == 1) {
+            _dispatch_front(c, &f);
+            done = done + 1;
+            wait = 0;
+        } else {
+            let is i32 as r = _fill(c, wait);
+            if (r > 1) { return 0 - cast(i64, r); }
+            if (r == 0) { return done; }
+            wait = 0;
+        }
+    }
+    return 0 - cast(i64, c.err);
+}
+
+// Takes descriptor i of m: the program owns it now, and it is not closed when
+// m is dropped. -1 when there is none.
+fn take_fd(m as *message.Message, i as i64) as i64 {
+    if (i < 0 || i >= m.unix_fds) { return 0 - 1; }
+    let is *i32 as p = cast(*i32, cast(i64, m.fds) + i * 4);
+    let is i64 as f = cast(i64, *p);
+    *p = 0 - 1;
+    return f;
+}
+
+// --- Dispatching ---
+
+// The message at the front, moved out of rbuf into dbuf so handlers may send
+// and receive while it is still being read, then handed to whoever wants it.
+fn _dispatch_front(c as *Conn, f as *message.Message) as void {
+    let is i64 as total = message.length(c.rbuf, c.rlen);
+    let is i64 as nf = f.unix_fds;
+    if (nf > 16) {
+        // More than a handler here is ever handed: dropped, descriptors closed.
+        _drop_front(c, total, nf, 1);
+        return;
+    }
+    mem.memcpy(c.dbuf, c.rbuf, total);
+    let is i64 as i with mut = 0;
+    while (i < nf && i < 16) {
+        c.dfds[i] = c.rfds[i];
+        i = i + 1;
+    }
+    _drop_front(c, total, nf, 0);
+    let is message.Message as m with mut = message.empty();
+    if (message.parse(c.dbuf, total, cast(*i32, &c.dfds), nf, &m) <= 0) { return; }
+    c.in_handler = 1;
+    if (m.kind == message.SIGNAL) { _deliver_signal(c, &m); }
+    if (m.kind == message.METHOD_CALL) { _answer(c, &m); }
+    c.in_handler = 0;
+    _close_fds(cast(*i32, &c.dfds), nf);
+}
+
+fn _same(a as *u8, b as *u8) as i32 { return message.named(a, b); }
+
+fn _deliver_signal(c as *Conn, m as *message.Message) as void {
+    let is i64 as i with mut = 0;
+    while (i < c.match_cap) {
+        let is *Match as k = cast(*Match, cast(i64, c.matches) + i * sizeof(Match));
+        if (k.used == 1
+            && (cast(i64, k.path) == 0 || _same(m.path, k.path) == 1)
+            && (cast(i64, k.interface) == 0 || _same(m.interface, k.interface) == 1)
+            && (cast(i64, k.member) == 0 || _same(m.member, k.member) == 1)) {
+            call(k.handler, c, m, k.user);
+        }
+        i = i + 1;
+    }
+}
+
+fn _reply_error(c as *Conn, m as *message.Message, name as *u8, text as *u8) as void {
+    if ((m.flags & message.NO_REPLY_EXPECTED) != 0) { return; }
+    let is message.Message as e with mut = message.error(m, name);
+    wire.reset(&c.replyw);
+    if (cast(i64, text) != 0) {
+        wire.put_string(&c.replyw, text);
+        e.signature = "s";
+    }
+    _send_with(c, &e, &c.replyw);
+    wire.reset(&c.replyw);
+}
+
+fn _reply(c as *Conn, m as *message.Message, sig as *u8) as void {
+    if ((m.flags & message.NO_REPLY_EXPECTED) != 0) { return; }
+    let is message.Message as r with mut = message.method_return(m);
+    if (cast(i64, sig) != 0 && _len(sig) > 0) { r.signature = sig; }
+    if (c.replyw.err != 0) {
+        _reply_error(c, m, E_FAILED, "the reply did not fit");
+        _close_fds(cast(*i32, &c.replyw.fds), c.replyw.nfds);
+        return;
+    }
+    _send_with(c, &r, &c.replyw);
+    // A handler cannot close what it puts in its reply, which is sent after
+    // it returns: the descriptors are closed here, once they are on their way.
+    _close_fds(cast(*i32, &c.replyw.fds), c.replyw.nfds);
+    wire.reset(&c.replyw);
+}
+
+fn _object(c as *Conn, path as *u8) as *Object {
+    let is i64 as i with mut = 0;
+    while (i < c.obj_cap) {
+        let is *Object as o = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
+        if (cast(i64, o.path) != 0 && _same(o.path, path) == 1) { return o; }
+        i = i + 1;
+    }
+    return cast(*Object, 0);
+}
+
+fn _iface(o as *Object, name as *u8) as *Interface {
+    let is i64 as i with mut = 0;
+    while (i < o.niface) {
+        let is *Interface as f = cast(*Interface, cast(i64, o.ifaces) + i * sizeof(Interface));
+        if (_same(f.name, name) == 1) { return f; }
+        i = i + 1;
+    }
+    return cast(*Interface, 0);
+}
+
+fn _method(f as *Interface, name as *u8) as *Method {
+    let is i64 as i with mut = 0;
+    while (i < f.nmethods) {
+        let is *Method as d = cast(*Method, cast(i64, f.methods) + i * sizeof(Method));
+        if (_same(d.name, name) == 1) { return d; }
+        i = i + 1;
+    }
+    return cast(*Method, 0);
+}
+
+fn _prop(f as *Interface, name as *u8) as *Property {
+    let is i64 as i with mut = 0;
+    while (i < f.nprops) {
+        let is *Property as d = cast(*Property, cast(i64, f.props) + i * sizeof(Property));
+        if (_same(d.name, name) == 1) { return d; }
+        i = i + 1;
+    }
+    return cast(*Property, 0);
+}
+
+// Whether the message's arguments are exactly sig.
+fn _args_are(m as *message.Message, sig as *u8) as i32 {
+    let is *u8 as have with mut = m.signature;
+    if (cast(i64, have) == 0) { have = ""; }
+    let is *u8 as want with mut = sig;
+    if (cast(i64, want) == 0) { want = ""; }
+    return _same(have, want);
+}
+
+// Whether some exported path lies under path, so path is a node too.
+fn _has_children(c as *Conn, path as *u8) as i32 {
+    let is i64 as n = _len(path);
+    let is i64 as i with mut = 0;
+    while (i < c.obj_cap) {
+        let is *Object as o = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
+        if (cast(i64, o.path) != 0 && _under(o.path, path, n) > 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Where the child element's name starts in p when p lies under parent (n
+// bytes long), or 0 when it does not.
+fn _under(p as *u8, parent as *u8, n as i64) as i64 {
+    let is i64 as pn = _len(p);
+    if (n == 1) {   // the root
+        if (pn > 1) { return 1; }
+        return 0;
+    }
+    if (pn <= n + 1 || mem.memcmp(p, parent, n) != 0 || *_p(p, n) != 47) { return 0; }
+    return n + 1;
+}
+
+fn _answer(c as *Conn, m as *message.Message) as void {
+    let is *u8 as iface = m.interface;
+    if (_same(iface, "org.freedesktop.DBus.Peer") == 1) { _peer(c, m); return; }
+    let is *Object as o = _object(c, m.path);
+    if (_same(iface, "org.freedesktop.DBus.Introspectable") == 1) {
+        if (_same(m.member, "Introspect") == 1 && (cast(i64, o) != 0 || _has_children(c, m.path) == 1)) {
+            _introspect(c, m, o);
+            return;
+        }
+    }
+    if (cast(i64, o) == 0) {
+        _reply_error(c, m, E_UNKNOWN_OBJECT, "no object at this path");
+        return;
+    }
+    if (_same(iface, "org.freedesktop.DBus.Properties") == 1) { _properties(c, m, o); return; }
+    // The method: in the interface named, or the first interface that has
+    // it when none is.
+    let is *Method as d with mut = cast(*Method, 0);
+    if (cast(i64, iface) != 0) {
+        let is *Interface as f = _iface(o, iface);
+        if (cast(i64, f) == 0) {
+            if (_same(iface, "org.freedesktop.DBus.Introspectable") == 0) {
+                _reply_error(c, m, E_UNKNOWN_INTERFACE, "no such interface on this object");
+                return;
+            }
+        } else {
+            d = _method(f, m.member);
+        }
+    } else {
+        let is i64 as i with mut = 0;
+        while (i < o.niface && cast(i64, d) == 0) {
+            d = _method(cast(*Interface, cast(i64, o.ifaces) + i * sizeof(Interface)), m.member);
+            i = i + 1;
+        }
+    }
+    if (cast(i64, d) == 0) {
+        _reply_error(c, m, E_UNKNOWN_METHOD, "no such method");
+        return;
+    }
+    if (_args_are(m, d.in_sig) == 0) {
+        _reply_error(c, m, E_INVALID_ARGS, "the arguments are not of the method's types");
+        return;
+    }
+    let is Call as k;
+    k.msg = m;
+    k.args = message.body(m);
+    wire.reset(&c.replyw);
+    k.reply = &c.replyw;
+    k.error_name = cast(*u8, 0);
+    k.error_text = cast(*u8, 0);
+    call(d.handler, c, &k, o.user);
+    if (cast(i64, k.error_name) != 0) {
+        _reply_error(c, m, k.error_name, k.error_text);
+        return;
+    }
+    _reply(c, m, d.out_sig);
+}
+
+// --- Peer ---
+
+fn _peer(c as *Conn, m as *message.Message) as void {
+    if (_same(m.member, "Ping") == 1 && _args_are(m, "") == 1) {
+        wire.reset(&c.replyw);
+        _reply(c, m, "");
+        return;
+    }
+    if (_same(m.member, "GetMachineId") == 1 && _args_are(m, "") == 1) {
+        let is [40]u8 as id;
+        let is i64 as f with mut = linux.open("/etc/machine-id", 0, 0);
+        if (f < 0) { f = linux.open("/var/lib/dbus/machine-id", 0, 0); }
+        let is i64 as n with mut = 0;
+        if (f >= 0) {
+            n = linux.read(f, cast(*u8, &id), 32);
+            linux.close(f);
+        }
+        if (n != 32) {
+            _reply_error(c, m, E_FAILED, "no machine id");
+            return;
+        }
+        id[32] = 0;
+        wire.reset(&c.replyw);
+        wire.put_string(&c.replyw, cast(*u8, &id));
+        _reply(c, m, "s");
+        return;
+    }
+    _reply_error(c, m, E_UNKNOWN_METHOD, "no such method");
+}
+
+// --- Properties ---
+
+fn _put_prop(c as *Conn, w as *wire.Writer, p as *Property, user as *u8) as void {
+    wire.put_variant(w, p.sig);
+    call(p.get, c, w, user);
+}
+
+fn _properties(c as *Conn, m as *message.Message, o as *Object) as void {
+    let is wire.Reader as r with mut = message.body(m);
+    let is i64 as n with mut = 0;
+    if (_same(m.member, "Get") == 1 && _args_are(m, "ss") == 1) {
+        let is *Interface as f = _iface(o, wire.get_string(&r, &n));
+        if (cast(i64, f) == 0) { _reply_error(c, m, E_UNKNOWN_INTERFACE, "no such interface on this object"); return; }
+        let is *Property as p = _prop(f, wire.get_string(&r, &n));
+        if (cast(i64, p) == 0) { _reply_error(c, m, E_UNKNOWN_PROPERTY, "no such property"); return; }
+        wire.reset(&c.replyw);
+        _put_prop(c, &c.replyw, p, o.user);
+        _reply(c, m, "v");
+        return;
+    }
+    if (_same(m.member, "GetAll") == 1 && _args_are(m, "s") == 1) {
+        let is *Interface as f = _iface(o, wire.get_string(&r, &n));
+        if (cast(i64, f) == 0) { _reply_error(c, m, E_UNKNOWN_INTERFACE, "no such interface on this object"); return; }
+        wire.reset(&c.replyw);
+        let is i64 as at = wire.put_array(&c.replyw, 8);
+        let is i64 as i with mut = 0;
+        while (i < f.nprops) {
+            let is *Property as p = cast(*Property, cast(i64, f.props) + i * sizeof(Property));
+            wire.put_struct(&c.replyw);
+            wire.put_string(&c.replyw, p.name);
+            _put_prop(c, &c.replyw, p, o.user);
+            i = i + 1;
+        }
+        wire.put_array_end(&c.replyw, at, 8);
+        _reply(c, m, "a{sv}");
+        return;
+    }
+    if (_same(m.member, "Set") == 1 && _args_are(m, "ssv") == 1) {
+        let is *Interface as f = _iface(o, wire.get_string(&r, &n));
+        if (cast(i64, f) == 0) { _reply_error(c, m, E_UNKNOWN_INTERFACE, "no such interface on this object"); return; }
+        let is *Property as p = _prop(f, wire.get_string(&r, &n));
+        if (cast(i64, p) == 0) { _reply_error(c, m, E_UNKNOWN_PROPERTY, "no such property"); return; }
+        if (cast(i64, p.set) == 0) { _reply_error(c, m, E_PROPERTY_READ_ONLY, "the property is read-only"); return; }
+        let is *u8 as vs = wire.get_variant(&r, &n);
+        if (_same(vs, p.sig) == 0) { _reply_error(c, m, E_INVALID_ARGS, "the value is not of the property's type"); return; }
+        if (call(p.set, c, &r, o.user) == 0) { _reply_error(c, m, E_INVALID_ARGS, "the value was refused"); return; }
+        wire.reset(&c.replyw);
+        _reply(c, m, "");
+        return;
+    }
+    _reply_error(c, m, E_UNKNOWN_METHOD, "no such method");
+}
+
+// PropertiesChanged for one property of an exported object, with its value
+// now, as org.freedesktop.DBus.Properties defines it.
+fn properties_changed(c as *Conn, path as *u8, interface as *u8, name as *u8) as i32 {
+    let is *Object as o = _object(c, path);
+    if (cast(i64, o) == 0) { return BAD_ARGUMENT; }
+    let is *Interface as f = _iface(o, interface);
+    if (cast(i64, f) == 0) { return BAD_ARGUMENT; }
+    let is *Property as p = _prop(f, name);
+    if (cast(i64, p) == 0) { return BAD_ARGUMENT; }
+    let is *wire.Writer as w = body(c);
+    wire.put_string(w, interface);
+    let is i64 as at = wire.put_array(w, 8);
+    wire.put_struct(w);
+    wire.put_string(w, name);
+    _put_prop(c, w, p, o.user);
+    wire.put_array_end(w, at, 8);
+    let is i64 as none = wire.put_array(w, 4);
+    wire.put_array_end(w, none, 4);
+    return emit(c, path, "org.freedesktop.DBus.Properties", "PropertiesChanged", "sa{sv}as");
+}
+
+// --- Introspection ---
+
+fn _x(c as *Conn, s as *u8) as void {
+    let is i64 as n = _len(s);
+    if (c.xlen + n + 1 > c.cap) { c.xlen = c.cap; return; }
+    mem.memcpy(_p(c.xbuf, c.xlen), s, n);
+    c.xlen = c.xlen + n;
+}
+
+fn _xn(c as *Conn, s as *u8, n as i64) as void {
+    if (c.xlen + n + 1 > c.cap) { c.xlen = c.cap; return; }
+    mem.memcpy(_p(c.xbuf, c.xlen), s, n);
+    c.xlen = c.xlen + n;
+}
+
+// <arg> elements for each complete type of sig, named from names.
+fn _xargs(c as *Conn, sig as *u8, names as *u8, dir as *u8) as void {
+    if (cast(i64, sig) == 0) { return; }
+    let is i64 as n = _len(sig);
+    let is i64 as i with mut = 0;
+    let is i64 as ni with mut = 0;
+    while (i < n) {
+        let is i64 as e = wire.next(sig, n, i);
+        if (e < 0) { return; }
+        _x(c, "<arg type=\"");
+        _xn(c, _p(sig, i), e - i);
+        _x(c, "\"");
+        if (cast(i64, names) != 0 && *_p(names, ni) != 0) {
+            let is i64 as ne with mut = ni;
+            while (*_p(names, ne) != 0 && *_p(names, ne) != 44) { ne = ne + 1; }
+            _x(c, " name=\"");
+            _xn(c, _p(names, ni), ne - ni);
+            _x(c, "\"");
+            ni = ne;
+            if (*_p(names, ni) == 44) { ni = ni + 1; }
+        }
+        if (cast(i64, dir) != 0) {
+            _x(c, " direction=\"");
+            _x(c, dir);
+            _x(c, "\"");
+        }
+        _x(c, "/>");
+        i = e;
+    }
+}
+
+fn _introspect(c as *Conn, m as *message.Message, o as *Object) as void {
+    c.xlen = 0;
+    _x(c, "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"\n");
+    _x(c, "\"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n");
+    _x(c, " <interface name=\"org.freedesktop.DBus.Introspectable\"><method name=\"Introspect\">");
+    _x(c, "<arg type=\"s\" name=\"xml_data\" direction=\"out\"/></method></interface>\n");
+    _x(c, " <interface name=\"org.freedesktop.DBus.Peer\"><method name=\"Ping\"/><method name=\"GetMachineId\">");
+    _x(c, "<arg type=\"s\" name=\"machine_uuid\" direction=\"out\"/></method></interface>\n");
+    if (cast(i64, o) != 0) {
+        _x(c, " <interface name=\"org.freedesktop.DBus.Properties\">");
+        _x(c, "<method name=\"Get\"><arg type=\"s\" name=\"interface_name\" direction=\"in\"/>");
+        _x(c, "<arg type=\"s\" name=\"property_name\" direction=\"in\"/><arg type=\"v\" name=\"value\" direction=\"out\"/></method>");
+        _x(c, "<method name=\"GetAll\"><arg type=\"s\" name=\"interface_name\" direction=\"in\"/>");
+        _x(c, "<arg type=\"a{sv}\" name=\"props\" direction=\"out\"/></method>");
+        _x(c, "<method name=\"Set\"><arg type=\"s\" name=\"interface_name\" direction=\"in\"/>");
+        _x(c, "<arg type=\"s\" name=\"property_name\" direction=\"in\"/><arg type=\"v\" name=\"value\" direction=\"in\"/></method>");
+        _x(c, "<signal name=\"PropertiesChanged\"><arg type=\"s\" name=\"interface_name\"/>");
+        _x(c, "<arg type=\"a{sv}\" name=\"changed_properties\"/><arg type=\"as\" name=\"invalidated_properties\"/></signal>");
+        _x(c, "</interface>\n");
+        let is i64 as i with mut = 0;
+        while (i < o.niface) {
+            let is *Interface as f = cast(*Interface, cast(i64, o.ifaces) + i * sizeof(Interface));
+            _x(c, " <interface name=\"");
+            _x(c, f.name);
+            _x(c, "\">");
+            let is i64 as j with mut = 0;
+            while (j < f.nmethods) {
+                let is *Method as d = cast(*Method, cast(i64, f.methods) + j * sizeof(Method));
+                _x(c, "<method name=\"");
+                _x(c, d.name);
+                _x(c, "\">");
+                _xargs(c, d.in_sig, d.in_names, "in");
+                _xargs(c, d.out_sig, d.out_names, "out");
+                _x(c, "</method>");
+                j = j + 1;
+            }
+            j = 0;
+            while (j < f.nprops) {
+                let is *Property as p = cast(*Property, cast(i64, f.props) + j * sizeof(Property));
+                _x(c, "<property name=\"");
+                _x(c, p.name);
+                _x(c, "\" type=\"");
+                _x(c, p.sig);
+                if (cast(i64, p.set) == 0) { _x(c, "\" access=\"read\"/>"); } else { _x(c, "\" access=\"readwrite\"/>"); }
+                j = j + 1;
+            }
+            j = 0;
+            while (j < f.nsignals) {
+                let is *SignalDecl as s = cast(*SignalDecl, cast(i64, f.signals) + j * sizeof(SignalDecl));
+                _x(c, "<signal name=\"");
+                _x(c, s.name);
+                _x(c, "\">");
+                _xargs(c, s.sig, s.names, cast(*u8, 0));
+                _x(c, "</signal>");
+                j = j + 1;
+            }
+            _x(c, "</interface>\n");
+            i = i + 1;
+        }
+    }
+    // The children: the next element of every exported path under this one,
+    // each once.
+    let is i64 as n = _len(m.path);
+    let is i64 as i with mut = 0;
+    while (i < c.obj_cap) {
+        let is *Object as q = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
+        let is i64 as at with mut = 0;
+        if (cast(i64, q.path) != 0) { at = _under(q.path, m.path, n); }
+        if (at > 0) {
+            let is i64 as e with mut = at;
+            while (*_p(q.path, e) != 0 && *_p(q.path, e) != 47) { e = e + 1; }
+            // Listed already, by an earlier path with the same next element?
+            let is i32 as seen with mut = 0;
+            let is i64 as j with mut = 0;
+            while (j < i && seen == 0) {
+                let is *Object as r = cast(*Object, cast(i64, c.objects) + j * sizeof(Object));
+                if (cast(i64, r.path) != 0 && _under(r.path, m.path, n) == at
+                    && mem.memcmp(r.path, q.path, e) == 0
+                    && (*_p(r.path, e) == 0 || *_p(r.path, e) == 47)) { seen = 1; }
+                j = j + 1;
+            }
+            if (seen == 0) {
+                _x(c, " <node name=\"");
+                _xn(c, _p(q.path, at), e - at);
+                _x(c, "\"/>\n");
+            }
+        }
+        i = i + 1;
+    }
+    _x(c, "</node>\n");
+    if (c.xlen >= c.cap) {
+        _reply_error(c, m, E_FAILED, "the introspection data did not fit");
+        return;
+    }
+    wire.reset(&c.replyw);
+    wire.put_string_n(&c.replyw, c.xbuf, c.xlen);
+    _reply(c, m, "s");
+}
+
+// --- Exporting ---
+
+// Exports ifaces (n of them) at path, with user handed to every handler.
+// The program keeps path and the tables alive while exported.
+fn export(c as *Conn, path as *u8, ifaces as *Interface, n as i64, user as *u8) as i32 {
+    if (wire.path_valid(path, _len(path)) == 0 || n < 0) { return BAD_ARGUMENT; }
+    if (cast(i64, _object(c, path)) != 0) { return BAD_ARGUMENT; }
+    let is i64 as i with mut = 0;
+    while (i < c.obj_cap) {
+        let is *Object as o = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
+        if (cast(i64, o.path) == 0) {
+            o.path = path;
+            o.ifaces = ifaces;
+            o.niface = n;
+            o.user = user;
+            c.nobjects = c.nobjects + 1;
+            return OK;
+        }
+        i = i + 1;
+    }
+    return FULL;
+}
+
+fn unexport(c as *Conn, path as *u8) as void {
+    let is *Object as o = _object(c, path);
+    if (cast(i64, o) == 0) { return; }
+    o.path = cast(*u8, 0);
+    c.nobjects = c.nobjects - 1;
+}
+
+// --- The bus ---
+
+fn _bus(member as *u8) as message.Message {
+    return message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", member);
+}
+
+// Asks the bus for a well-known name. The bus's answer: 1 the primary owner,
+// 2 queued, 3 exists, 4 already the owner; or minus an error.
+fn request_name(c as *Conn, name as *u8, flags as i64) as i64 {
+    let is message.Message as m with mut = _bus("RequestName");
+    m.signature = "su";
+    let is *wire.Writer as w = body(c);
+    wire.put_string(w, name);
+    wire.put_u32(w, flags);
+    let is message.Message as rep with mut = message.empty();
+    let is i32 as r = call_method(c, &m, 5000, &rep);
+    if (r != OK) { return 0 - cast(i64, r); }
+    let is wire.Reader as b with mut = message.body(&rep);
+    return wire.get_u32(&b);
+}
+
+fn release_name(c as *Conn, name as *u8) as i64 {
+    let is message.Message as m with mut = _bus("ReleaseName");
+    m.signature = "s";
+    wire.put_string(body(c), name);
+    let is message.Message as rep with mut = message.empty();
+    let is i32 as r = call_method(c, &m, 5000, &rep);
+    if (r != OK) { return 0 - cast(i64, r); }
+    let is wire.Reader as b with mut = message.body(&rep);
+    return wire.get_u32(&b);
+}
+
+fn _rule_part(k as *Match, n as i64, key as *u8, v as *u8) as i64 {
+    if (cast(i64, v) == 0) { return n; }
+    let is i64 as kn = _len(key);
+    let is i64 as vn = _len(v);
+    if (n + kn + vn + 4 >= 384) { return 0 - 1; }
+    if (n < 0) { return n; }
+    let is *u8 as at = _p(cast(*u8, &k.rule), n);
+    *at = 44;
+    mem.memcpy(_p(at, 1), key, kn);
+    *_p(at, 1 + kn) = 61;
+    *_p(at, 2 + kn) = 39;
+    mem.memcpy(_p(at, 3 + kn), v, vn);
+    *_p(at, 3 + kn + vn) = 39;
+    return n + 4 + kn + vn;
+}
+
+// Calls handler for every signal from sender (null: any), at path, of
+// interface and member — each null for any — and asks the bus to send them.
+// A handle for remove_match, or minus an error.
+fn add_match(c as *Conn, sender as *u8, path as *u8, interface as *u8, member as *u8,
+             handler as SignalFn, user as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    let is *Match as k with mut = cast(*Match, 0);
+    while (i < c.match_cap && cast(i64, k) == 0) {
+        let is *Match as q = cast(*Match, cast(i64, c.matches) + i * sizeof(Match));
+        if (q.used == 0) { k = q; } else { i = i + 1; }
+    }
+    if (cast(i64, k) == 0) { return 0 - cast(i64, FULL); }
+    mem.memcpy(cast(*u8, &k.rule), "type='signal'", 13);
+    let is i64 as n with mut = 13;
+    n = _rule_part(k, n, "sender", sender);
+    n = _rule_part(k, n, "path", path);
+    n = _rule_part(k, n, "interface", interface);
+    n = _rule_part(k, n, "member", member);
+    if (n < 0) { return 0 - cast(i64, BAD_ARGUMENT); }
+    k.rule[n] = 0;
+    let is message.Message as m with mut = _bus("AddMatch");
+    m.signature = "s";
+    wire.put_string(body(c), cast(*u8, &k.rule));
+    let is message.Message as rep with mut = message.empty();
+    let is i32 as r = call_method(c, &m, 5000, &rep);
+    if (r != OK) { return 0 - cast(i64, r); }
+    k.path = path;
+    k.interface = interface;
+    k.member = member;
+    k.handler = handler;
+    k.user = user;
+    k.used = 1;
+    return i + 1;
+}
+
+fn remove_match(c as *Conn, h as i64) as i32 {
+    if (h < 1 || h > c.match_cap) { return BAD_ARGUMENT; }
+    let is *Match as k = cast(*Match, cast(i64, c.matches) + (h - 1) * sizeof(Match));
+    if (k.used == 0) { return BAD_ARGUMENT; }
+    k.used = 0;
+    let is message.Message as m with mut = _bus("RemoveMatch");
+    m.signature = "s";
+    wire.put_string(body(c), cast(*u8, &k.rule));
+    let is message.Message as rep with mut = message.empty();
+    return call_method(c, &m, 5000, &rep);
+}
