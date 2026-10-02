@@ -360,11 +360,13 @@ from `main` even when nothing calls the module, and lazy initialisation does not
 help. That is why `x11/cursor.cst` and `x11/monitors.cst` are not wired into the
 window and a program takes them directly.
 
-**The toolchain has a ceiling worth knowing about.** A single binary importing
-more than roughly 256 distinct extern symbols gets PLT relocations for every
-soname but a `DT_NEEDED` entry for only the first, and dies at `exec` naming a
-function whose library was never recorded. The link tests are one binary per
-shared object because of it.
+**The toolchain had a ceiling, fixed in Caustic 0.1.12.** The assembler kept the
+first 256 imports of each object file and dropped the rest silently, so a
+module whose first 256 imports came from one library lost the `DT_NEEDED` of
+every library it called after them, and the program died at `exec` naming one
+of their functions. Every module is its own object file, so it took one module
+that large to hit it. `x11/all_link_test.cst` links all seven X libraries —
+1161 imports — and `check_needed.sh` asserts every soname is recorded.
 
 ---
 

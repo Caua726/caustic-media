@@ -117,11 +117,11 @@ fi
 # 408 declared while the test resolved 407 — so it is asserted here rather than
 # left to whoever remembers.
 
-if ls ./*_link_test.cst >/dev/null 2>&1; then
-    # Every link test, and any module alias: the bindings are split one file per
-    # C header and the tests one binary per shared object, so a symbol may be
-    # exercised from any of them.
-    grep -hoE '\b[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\(' ./*_link_test.cst \
+if ls ./link/*.cst >/dev/null 2>&1; then
+    # Every module in link/, which is where the link tests' calls live, and any
+    # module alias: the bindings are split one file per C header and the calls
+    # one module per shared object, so a symbol may be exercised from any of them.
+    grep -hoE '\b[a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\(' ./link/*.cst \
       | sed 's/^[a-z][a-z0-9_]*\.//; s/(//' | sort -u > "$TMP/touched"
     awk '{print $2}' "$TMP/declared" | sort -u > "$TMP/decl_all"
     comm -23 "$TMP/decl_all" "$TMP/touched" > "$TMP/untouched"
