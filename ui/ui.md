@@ -8,6 +8,7 @@ X11, Wayland and Windows, and links no toolkit of anybody else's.
 ```
 ui/
   ui.cst          hub
+  app.cst         the application: its windows, each with its own tree
   tree.cst        widgets as nodes in a window's tree, and the handles to them
   widget.cst      the table of functions every kind of widget fills in
   geom.cst        sizes, constraints, and the layout record each widget carries
@@ -326,6 +327,15 @@ with an era, the tree sized at open and never grown, children kept in order,
 recursive destruction children-first with each kind's `destroy` entry, reparent
 refusing cycles, hidden and disabled inherited from ancestors, and layout
 invalidation that climbs to the root.
+
+**The application** (`app.cst`, tested by `app_test`): one per program,
+holding what no single window owns — the system's settings, which every
+window's router takes, and the timers, one clock for one loop — and a bounded
+table of windows named by handles with an era. Each window has its own tree
+and its own router, its logical size, its scale and whether the platform says
+it is active (a change repaints all of it); `app.frame` lays it out at its size
+and collects what to repaint. It is fed by calls, as the router is: the
+platform loop that opens real windows and presents frames sits above it.
 
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
 with its test): margins, alignment, minimum and maximum, right to left,
