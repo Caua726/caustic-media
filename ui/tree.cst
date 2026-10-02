@@ -14,8 +14,9 @@
 // through last_error(). Queries on a stale handle quietly answer 0 or null,
 // because by the time a frame walks the tree a dead handle is ordinary.
 use "std/mem.cst" as mem;
-use "widget.cst" as widget;
+use "../math/math.cst" as math;
 use "geom.cst" as geom;
+use "event.cst" as event;
 
 // --- Errors ---
 
@@ -62,11 +63,40 @@ struct Connection {
     widget as i64;
     seq    as i64;   // its id, and its place in connection order
     made   as i64;   // the emission count when it was made
-    cb     as *u8;   // null once disconnected
+    cb     as SignalFn;   // null once disconnected
     user   as *u8;
     signal as i32;
     _pad0  as i32;
 }
+
+// --- Kinds of widget ---
+//
+// Caustic has no classes, so a kind of widget is a value: a name, how many
+// bytes of data each widget of the kind carries, and the functions that give
+// it behaviour. widget.cst documents each entry and makes an empty Kind; it
+// lives here because the tree stores a pointer to one in every node, and the
+// entries' types name the Tree.
+//
+// Every entry has a function-pointer type rather than a bare *u8, so call()
+// checks how many arguments it is given — and so that, once the compiler also
+// checks a function against the type it is stored as, every kind a program
+// defines is checked with no change to this API.
+type DestroyFn = fn(*Tree, i64, *u8) as void;
+type MeasureFn = fn(*Tree, i64, *u8, *geom.Constraint, *geom.Size) as void;
+type ArrangeFn = fn(*Tree, i64, *u8, *math.rect.Rect) as void;
+type EventFn   = fn(*Tree, i64, *u8, *event.Event) as i64;
+
+struct Kind {
+    name       as *u8;
+    data_bytes as i64;   // zeroed for each new widget, owned by the tree
+    destroy    as DestroyFn;
+    measure    as MeasureFn;
+    arrange    as ArrangeFn;
+    event      as EventFn;
+}
+
+// A signal callback: cb(tree, widget, arg, user). See signal.cst.
+type SignalFn = fn(*Tree, i64, *u8, *u8) as void;
 
 // --- Nodes ---
 //
@@ -75,7 +105,7 @@ struct Connection {
 struct Node {
     era    as i32;
     used   as i32;
-    kind   as *widget.Kind;
+    kind   as *Kind;
     parent as i64;
     first  as i64;
     last   as i64;
@@ -125,7 +155,7 @@ let is i64 as SCRATCH_ENTRY_BYTES with imut = 48;
 
 // The root's kind. Module scope rather than inside the Tree, because a Tree
 // is returned by value and a pointer into it would not survive the copy.
-let is widget.Kind as _root_kind with mut;
+let is Kind as _root_kind with mut;
 
 fn _node(t as *Tree, i as i64) as *Node {
     return cast(*Node, cast(i64, t.nodes) + i * sizeof(Node));
@@ -211,7 +241,12 @@ fn open(l as *Limits) as Tree {
     }
     t.ok = 1;
 
-    _root_kind = widget.kind("root", 0);
+    _root_kind.name = "root";
+    _root_kind.data_bytes = 0;
+    _root_kind.destroy = cast(DestroyFn, 0);
+    _root_kind.measure = cast(MeasureFn, 0);
+    _root_kind.arrange = cast(ArrangeFn, 0);
+    _root_kind.event = cast(EventFn, 0);
     t.root = _claim(&t, &_root_kind);
     return t;
 }
@@ -266,7 +301,7 @@ fn clear_error(t as *Tree) as void { t.err = OK; }
 // Claims a free slot for a widget of kind k, or returns -1. The search starts
 // where the last one ended, so creating and destroying in a loop does not
 // rescan the whole table each time.
-fn _claim(t as *Tree, k as *widget.Kind) as i64 {
+fn _claim(t as *Tree, k as *Kind) as i64 {
     let is i64 as scanned with mut = 0;
     let is i64 as i with mut = t.next_free;
     while (scanned < t.cap) {
@@ -300,10 +335,10 @@ fn _claim(t as *Tree, k as *widget.Kind) as i64 {
 fn _release(t as *Tree, i as i64) as void {
     let is *Node as n = _node(t, i);
     if (cast(i64, n.kind) != 0 && cast(i64, n.kind.destroy) != 0) {
-        call(n.kind.destroy, cast(*u8, t), _handle(t, i), _data_at(t, i));
+        call(n.kind.destroy, t, _handle(t, i), _data_at(t, i));
     }
     n.used = 0;
-    n.kind = cast(*widget.Kind, 0);
+    n.kind = cast(*Kind, 0);
     n.era = n.era + 1;
     if (n.era == 0) { n.era = 1; }
     t.live = t.live - 1;
@@ -371,7 +406,7 @@ fn _unlink(t as *Tree, i as i64) as void {
 
 // Adds a widget of kind k as the last child of parent. Returns its handle, or
 // 0 with last_error() set.
-fn create(t as *Tree, k as *widget.Kind, parent as i64) as i64 {
+fn create(t as *Tree, k as *Kind, parent as i64) as i64 {
     if (t.ok == 0) { t.err = BAD_ARGUMENT; return 0; }
     let is i64 as p = _index(t, parent);
     if (p < 0) { t.err = INVALID_HANDLE; return 0; }
@@ -448,9 +483,9 @@ fn child_count(t as *Tree, w as i64) as i64 {
     return _node(t, i).count;
 }
 
-fn kind(t as *Tree, w as i64) as *widget.Kind {
+fn kind(t as *Tree, w as i64) as *Kind {
     let is i64 as i = _index(t, w);
-    if (i < 0) { return cast(*widget.Kind, 0); }
+    if (i < 0) { return cast(*Kind, 0); }
     return _node(t, i).kind;
 }
 
