@@ -7,7 +7,14 @@ use "geom.cst" as geom;
 use "layout.cst" as layout;
 use "router.cst" as router;
 use "timer.cst" as timer;
+use "anim.cst" as anim;
+use "painter.cst" as painter;
+use "paint.cst" as paint;
+use "style.cst" as style;
 use "app.cst" as app;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
 
 let is i32 as fails with mut = 0;
 
@@ -26,6 +33,12 @@ fn counted_destroy(t as *tree.Tree, w as i64, data as *u8) as void {
 
 let is tree.Kind as counted with mut;
 
+fn filled_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, style.hex(0xFF0000));
+}
+
+let is tree.Kind as filled with mut;
+
 let is i64 as fired with mut = 0;
 
 fn on_timer(user as *u8) as void { fired = fired + 1; }
@@ -38,6 +51,8 @@ fn same(a as math.rect.Rect, x as f64, y as f64, w as f64, h as f64) as i32 {
 fn main() as i32 {
     counted = widget.kind("counted", 0);
     counted.destroy = fn_ptr(counted_destroy);
+    filled = widget.kind("filled", 0);
+    filled.paint = fn_ptr(filled_paint);
 
     let is app.Limits as l = app.limits_default();
     l.windows = 2;
@@ -98,6 +113,37 @@ fn main() as i32 {
     app.set_active(&a, w1, 1);
     check("active again: nothing to repaint", 1 - app.needs_frame(&a, w1));
 
+    // --- Painting, through the window's cache when it has one ---
+    let is gpu.device.Device as dv = gpu.open_headless(64, 48, gpu.SOFTWARE);
+    let is draw2d.Limits as dl = draw2d.limits_default();
+    let is draw2d.Canvas as cv = draw2d.open(&dv, &dl);
+    let is paint.Cache as cc = paint.cache_open(&dv, &dl);
+    let is i64 as faded = tree.create(t1, &filled, tree.root(t1));
+    tree.set_opacity(t1, faded, 0.5);
+    let is paint.Stats as ps;
+    app.frame(&a, w1);
+    draw2d.begin(&cv, 64.0, 48.0, 1.0);
+    app.paint(&a, w1, &cv, cast(*style.Theme, 0), 0, &ps);
+    tree.damage_clear(t1);
+    check("no cache at first", cast(i64, app.cache(&a, w1)) == 0);
+    check("no cache: painted directly", ps.cache_blits == 0 && ps.painted == 1);
+    app.set_cache(&a, w1, &cc);
+    check("its cache", cast(i64, app.cache(&a, w1)) == cast(i64, &cc));
+    check("not the other window's", cast(i64, app.cache(&a, w2)) == 0);
+    tree.invalidate_paint(t1, faded);
+    app.frame(&a, w1);
+    draw2d.begin(&cv, 64.0, 48.0, 1.0);
+    app.paint(&a, w1, &cv, cast(*style.Theme, 0), 0, &ps);
+    tree.damage_clear(t1);
+    check("through its cache", ps.cache_renders == 1 && ps.cache_blits == 1);
+    app.set_cache(&a, w2, &cc);
+    app.set_cache(&a, 0, cast(*paint.Cache, 0));
+    check("a stale handle: no cache, and none set", cast(i64, app.cache(&a, 0)) == 0
+          && cast(i64, app.cache(&a, w1)) == cast(i64, &cc));
+    tree.destroy(t1, faded);
+    app.frame(&a, w1);
+    tree.damage_clear(t1);
+
     // --- Settings are the application's, in every window's router ---
     let is router.Settings as s = router.settings_default();
     s.double_click_ms = 650;
@@ -113,6 +159,37 @@ fn main() as i32 {
     check("not yet", fired == 0);
     app.tick(&a, 1050);
     check("fired", fired == 1);
+
+    // --- Animations: each window its own clock, run by the application's loop ---
+    let is *anim.Animator as an1 = app.animator(&a, w1);
+    check("an animator per window", cast(i64, an1) != 0 && cast(i64, an1) != cast(i64, app.animator(&a, w2)));
+    check("a stale handle: none", cast(i64, app.animator(&a, 0)) == 0);
+    check("nothing animating: nothing due", app.next_due(&a) == 0 - 1);
+    tree.damage_clear(t1);
+    let is i64 as fading = anim.fade(an1, k1, 0.0, 100, math.curve.EASE_LINEAR);
+    check("a tween in the first window's tree", fading != 0);
+    check("due at once", app.next_due(&a) == 1050);
+    check("the tick runs it", app.tick(&a, 2000) == 1);
+    check("then a frame later", app.next_due(&a) == 2016);
+    app.tick(&a, 2050);
+    check("half way", tree.opacity(t1, k1) == 0.5 && app.needs_frame(&a, w1) == 1);
+    timer.add(app.timers(&a), 2050, 5, 0, fn_ptr(on_timer), cast(*u8, 0));
+    check("the earlier of a timer and a frame", app.next_due(&a) == 2055);
+    app.tick(&a, 2055);
+    check("both ran", fired == 2 && anim.running(an1, fading) == 1);
+    app.tick(&a, 2100);
+    check("there", tree.opacity(t1, k1) == 0.0 && anim.running(an1, fading) == 0);
+    check("over: nothing due", app.next_due(&a) == 0 - 1);
+    tree.set_opacity(t1, k1, 1.0);
+    // The other window's runs on the same tick.
+    let is i64 as k2w = tree.create(t2, &filled, tree.root(t2));
+    anim.fade(app.animator(&a, w2), k2w, 0.5, 100, math.curve.EASE_LINEAR);
+    app.tick(&a, 3000);
+    app.tick(&a, 3100);
+    check("the second window's too", tree.opacity(t2, k2w) == 0.5);
+    tree.destroy(t2, k2w);
+    // Still running when its window closes: gone with it.
+    anim.fade(app.animator(&a, w2), tree.root(t2), 0.5, 100, math.curve.EASE_LINEAR);
 
     // --- The program's own pointer, per window ---
     let is i64 as mine = 42;
@@ -132,8 +209,11 @@ fn main() as i32 {
     let is i64 as w3 = app.window_open(&a, 50.0, 50.0);
     check("the slot is reused", w3 != 0);
     check("a reused slot is another handle", w3 != w2 && app.window_valid(&a, w2) == 0);
-    check("a reused slot starts clean", app.scale(&a, w3) == 1.0 && cast(i64, app.user(&a, w3)) == 0);
+    check("a reused slot starts clean", app.scale(&a, w3) == 1.0 && cast(i64, app.user(&a, w3)) == 0
+          && cast(i64, app.cache(&a, w3)) == 0);
     check("new windows take the settings", app.router(&a, w3).settings.double_click_ms == 650);
+    check("a reused slot: nothing animating", anim.active(app.animator(&a, w3)) == 0 && app.next_due(&a) == 0 - 1);
+    check("its animator on its own tree", app.animator(&a, w3).t == app.tree(&a, w3));
 
     // --- Walking the windows ---
     let is i64 as seen with mut = 0;
@@ -148,6 +228,8 @@ fn main() as i32 {
     app.close(&a);
     check("closed: every widget destroyed", destroyed == 3);
     check("closed: not open", 1 - app.is_open(&a));
+    paint.cache_close(&cc);
+    draw2d.close(&cv);
 
     if (fails > 0) {
         io.printf("app: %d failures\n", cast(i64, fails));

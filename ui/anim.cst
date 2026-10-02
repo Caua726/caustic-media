@@ -1,0 +1,394 @@
+// ui/anim.cst — things that change over time: a widget fading in or out,
+// sliding aside, a colour or a number moving to another.
+//
+// A tween takes a value from where it is to a target over a duration, along
+// an easing curve (math/curve.cst, or the theme's): a widget's opacity or its
+// translation — tree.set_opacity, tree.set_translation, neither of which lays
+// anything out — or a colour or number the program owns, whose widget is
+// repainted as it changes. No clock is read here, as in timer.cst: tick() is
+// handed the time, and next_due() says when the next frame is wanted — every
+// interval while anything runs, -1 when nothing does, so an idle window
+// sleeps.
+//
+// A tween starts at the first tick after it is made, from the value as it is
+// then. Making one for something that already has one — the same widget's
+// opacity, the same colour — replaces it, and the new one starts from where
+// the old one got to: a fade reversed half way turns back from there rather
+// than jumping. The one replaced is not done; neither is one cancelled.
+//
+// Reduced motion — the theme's motion.reduced, which follows the desktop —
+// and a duration of 0 put the value at its target at once; the tween still
+// runs its callbacks at the next tick, so a program that hides a widget when
+// its fade is done works the same with animations off. A tween whose widget is
+// destroyed is dropped at the next tick, with nothing written and nothing
+// called: a colour or number may have lived in the widget's data.
+//
+// Ids carry an era, as timers' do: one whose tween has ended does nothing,
+// even once its slot holds another.
+use "../math/math.cst" as math;
+use "tree.cst" as tree;
+use "style.cst" as style;
+
+let is i64 as MAX_TWEENS with imut = 64;
+
+// The tree's theme's curve (style.Motion.ease), read as the tween runs.
+let is i64 as THEME_EASE with imut = 0 - 1;
+
+let is i32 as OK             with imut = 0;
+let is i32 as FULL           with imut = 1;   // the value was put at its target at once
+let is i32 as INVALID_HANDLE with imut = 2;
+
+// What a tween drives.
+let is i64 as _FADE   with imut = 1;
+let is i64 as _MOVE   with imut = 2;
+let is i64 as _COLOR  with imut = 3;
+let is i64 as _NUMBER with imut = 4;
+
+// What a tween calls: fn(user), after each step and once when it is done.
+type AnimFn = fn(*u8) as void;
+
+struct Tween {
+    w         as i64;
+    what      as i64;
+    target    as *u8;      // the program's colour or number
+    from      as [4]f64;   // as written; a colour is interpolated premultiplied
+    to        as [4]f64;
+    start     as i64;      // -1 until its first tick
+    duration  as i64;
+    ease      as i64;
+    runs      as i64;      // 0 or less: for ever
+    step      as AnimFn;
+    step_user as *u8;
+    done      as AnimFn;
+    done_user as *u8;
+    alternate as i32;      // every other run backwards; set_repeat's, and
+                           // meaningless with one run
+    era       as i32;
+    used      as i32;
+    _pad0     as i32;
+}
+
+struct Animator {
+    t        as *tree.Tree;
+    slots    as [64]Tween;
+    last     as i64;   // the last tick's time
+    interval as i64;   // milliseconds between frames
+    err      as i32;
+    _pad0    as i32;
+}
+
+// For the widgets of t, at 60 frames a second until set_interval says
+// otherwise.
+fn init(t as *tree.Tree) as Animator {
+    let is Animator as an;
+    an.t = t;
+    an.last = 0;
+    an.interval = 16;
+    an.err = OK;
+    an._pad0 = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TWEENS) {
+        an.slots[i].used = 0;
+        an.slots[i].era = 1;
+        i = i + 1;
+    }
+    return an;
+}
+
+fn _id(an as *Animator, i as i64) as i64 {
+    return (cast(i64, an.slots[i].era) << 32) | (i + 1);
+}
+
+// The slot an id names while its tween runs, -1 otherwise.
+fn _slot(an as *Animator, id as i64) as i64 {
+    let is i64 as i = (id & 4294967295) - 1;
+    if (i < 0 || i >= MAX_TWEENS) { return 0 - 1; }
+    if (an.slots[i].used == 0) { return 0 - 1; }
+    if (cast(i64, an.slots[i].era) != ((id >> 32) & 4294967295)) { return 0 - 1; }
+    return i;
+}
+
+fn _free(an as *Animator, i as i64) as void {
+    an.slots[i].used = 0;
+    an.slots[i].era = an.slots[i].era + 1;
+    if (an.slots[i].era == 0) { an.slots[i].era = 1; }
+}
+
+// The value as it is now, as where the tween starts.
+fn _read(an as *Animator, tw as *Tween) as void {
+    if (tw.what == _FADE) { tw.from[0] = tree.opacity(an.t, tw.w); }
+    if (tw.what == _MOVE) {
+        tw.from[0] = tree.translation_x(an.t, tw.w);
+        tw.from[1] = tree.translation_y(an.t, tw.w);
+    }
+    if (tw.what == _COLOR) {
+        let is *math.color.Color as c = cast(*math.color.Color, tw.target);
+        tw.from[0] = c.r;
+        tw.from[1] = c.g;
+        tw.from[2] = c.b;
+        tw.from[3] = c.a;
+    }
+    if (tw.what == _NUMBER) { tw.from[0] = *cast(*f64, tw.target); }
+}
+
+// p of the way from one to the other; exactly the other at 1.
+fn _lerp(a as f64, b as f64, p as f64) as f64 {
+    if (p == 1.0) { return b; }
+    return a + (b - a) * p;
+}
+
+// The value p of the way, eased already, written where it goes. At 0 and 1
+// exactly the ends, whatever the rounding.
+fn _write(an as *Animator, tw as *Tween, p as f64) as void {
+    if (tw.what == _FADE) { tree.set_opacity(an.t, tw.w, _lerp(tw.from[0], tw.to[0], p)); }
+    if (tw.what == _MOVE) {
+        tree.set_translation(an.t, tw.w, _lerp(tw.from[0], tw.to[0], p), _lerp(tw.from[1], tw.to[1], p));
+    }
+    if (tw.what == _COLOR) {
+        let is *math.color.Color as c = cast(*math.color.Color, tw.target);
+        let is f64 as fa = tw.from[3];
+        let is f64 as ta = tw.to[3];
+        let is f64 as a = _lerp(fa, ta, p);
+        if (p == 0.0) {
+            *c = math.color.rgba(tw.from[0], tw.from[1], tw.from[2], fa);
+        } else if (p == 1.0) {
+            *c = math.color.rgba(tw.to[0], tw.to[1], tw.to[2], ta);
+        } else if (a <= 0.0) {
+            // Nothing shows; the colour it is heading to, for when it does.
+            *c = math.color.rgba(tw.to[0], tw.to[1], tw.to[2], 0.0);
+        } else {
+            // Premultiplied, as CSS does: fading toward a transparent colour
+            // does not turn toward that colour on the way.
+            c.r = (tw.from[0] * fa + (tw.to[0] * ta - tw.from[0] * fa) * p) / a;
+            c.g = (tw.from[1] * fa + (tw.to[1] * ta - tw.from[1] * fa) * p) / a;
+            c.b = (tw.from[2] * fa + (tw.to[2] * ta - tw.from[2] * fa) * p) / a;
+            c.a = a;
+        }
+        tree.invalidate_paint(an.t, tw.w);
+    }
+    if (tw.what == _NUMBER) {
+        *cast(*f64, tw.target) = _lerp(tw.from[0], tw.to[0], p);
+        tree.invalidate_paint(an.t, tw.w);
+    }
+}
+
+fn _reduced(an as *Animator) as i32 { return tree.theme(an.t).motion.reduced; }
+
+fn _new(an as *Animator, w as i64, what as i64, target as *u8, a as f64, b as f64, c as f64, d as f64,
+        ms as i64, ease as i64) as i64 {
+    an.err = OK;
+    if (tree.is_valid(an.t, w) == 0) { an.err = INVALID_HANDLE; return 0; }
+    let is i64 as i with mut = 0;
+    while (i < MAX_TWEENS) {
+        let is *Tween as o = &an.slots[i];
+        if (o.used == 1 && o.w == w && o.what == what && o.target == target) { _free(an, i); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < MAX_TWEENS && an.slots[i].used == 1) { i = i + 1; }
+    let is Tween as spare;
+    let is *Tween as tw with mut = &spare;
+    if (i < MAX_TWEENS) { tw = &an.slots[i]; }
+    tw.w = w;
+    tw.what = what;
+    tw.target = target;
+    tw.to[0] = a;
+    tw.to[1] = b;
+    tw.to[2] = c;
+    tw.to[3] = d;
+    tw.start = 0 - 1;
+    tw.duration = ms;
+    tw.ease = ease;
+    tw.runs = 1;
+    tw.step = cast(AnimFn, 0);
+    tw.step_user = cast(*u8, 0);
+    tw.done = cast(AnimFn, 0);
+    tw.done_user = cast(*u8, 0);
+    if (i >= MAX_TWEENS) {
+        // No room to run: there at once, rather than left where it was.
+        an.err = FULL;
+        _write(an, tw, 1.0);
+        return 0;
+    }
+    tw.used = 1;
+    if (ms <= 0 || _reduced(an) == 1) {
+        _write(an, tw, 1.0);
+        tw.duration = 0;
+    }
+    return _id(an, i);
+}
+
+// w's opacity to a, over ms milliseconds along ease (math.curve.EASE_*, or
+// THEME_EASE). Returns the tween's id, or 0 with last_error() set.
+fn fade(an as *Animator, w as i64, a as f64, ms as i64, ease as i64) as i64 {
+    return _new(an, w, _FADE, cast(*u8, 0), a, 0.0, 0.0, 0.0, ms, ease);
+}
+
+// w's translation to x, y.
+fn move(an as *Animator, w as i64, x as f64, y as f64, ms as i64, ease as i64) as i64 {
+    return _new(an, w, _MOVE, cast(*u8, 0), x, y, 0.0, 0.0, ms, ease);
+}
+
+// The program's colour at target to c, w repainted as it changes. target
+// must last as long as the tween, or as w.
+fn color(an as *Animator, w as i64, target as *math.color.Color, c as math.color.Color,
+         ms as i64, ease as i64) as i64 {
+    return _new(an, w, _COLOR, cast(*u8, target), c.r, c.g, c.b, c.a, ms, ease);
+}
+
+// The program's number at target to v, w repainted as it changes.
+fn number(an as *Animator, w as i64, target as *f64, v as f64, ms as i64, ease as i64) as i64 {
+    return _new(an, w, _NUMBER, cast(*u8, target), v, 0.0, 0.0, 0.0, ms, ease);
+}
+
+// cb(user) after every step, the last included — for what a repaint does not
+// cover, such as laying out again.
+fn on_step(an as *Animator, id as i64, cb as AnimFn, user as *u8) as void {
+    let is i64 as i = _slot(an, id);
+    if (i < 0) { return; }
+    an.slots[i].step = cb;
+    an.slots[i].step_user = user;
+}
+
+// cb(user) once, when the tween reaches its end — by time or by finish().
+fn on_done(an as *Animator, id as i64, cb as AnimFn, user as *u8) as void {
+    let is i64 as i = _slot(an, id);
+    if (i < 0) { return; }
+    an.slots[i].done = cb;
+    an.slots[i].done_user = user;
+}
+
+// Runs it runs times in all, 0 or less for ever; alternate sends every
+// other run back the way it came, its curve backwards too.
+fn set_repeat(an as *Animator, id as i64, runs as i64, alternate as i32) as void {
+    let is i64 as i = _slot(an, id);
+    if (i < 0) { return; }
+    an.slots[i].runs = runs;
+    an.slots[i].alternate = alternate;
+}
+
+// Stops it where it is.
+fn cancel(an as *Animator, id as i64) as void {
+    let is i64 as i = _slot(an, id);
+    if (i < 0) { return; }
+    _free(an, i);
+}
+
+// The value at the end of its last run — of the run it is in, for one that
+// runs for ever — then its callbacks.
+fn _end(an as *Animator, i as i64) as void {
+    let is *Tween as tw = &an.slots[i];
+    let is i64 as run with mut = 0;
+    if (tw.start < 0) {
+        _read(an, tw);
+    } else if (tw.runs <= 0 && tw.duration > 0) {
+        run = (an.last - tw.start) / tw.duration;
+    }
+    if (tw.runs > 0) { run = tw.runs - 1; }
+    if (tw.alternate == 1 && run % 2 == 1) { _write(an, tw, 0.0); } else { _write(an, tw, 1.0); }
+    let is AnimFn as step = tw.step;
+    let is *u8 as su = tw.step_user;
+    let is AnimFn as done = tw.done;
+    let is *u8 as du = tw.done_user;
+    // Freed before the callbacks, which may start tweens into it.
+    _free(an, i);
+    if (cast(i64, step) != 0) { call(step, su); }
+    if (cast(i64, done) != 0) { call(done, du); }
+}
+
+// Puts it at its end now, and it is done.
+fn finish(an as *Animator, id as i64) as void {
+    let is i64 as i = _slot(an, id);
+    if (i < 0) { return; }
+    _end(an, i);
+}
+
+fn running(an as *Animator, id as i64) as i32 {
+    if (_slot(an, id) < 0) { return 0; }
+    return 1;
+}
+
+fn active(an as *Animator) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TWEENS) {
+        if (an.slots[i].used == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn last_error(an as *Animator) as i32 { return an.err; }
+
+// The frame clock: ms between ticks while anything runs — the display's
+// refresh, where the platform says it. At least 1.
+fn set_interval(an as *Animator, ms as i64) as void {
+    an.interval = ms;
+    if (ms < 1) { an.interval = 1; }
+}
+
+// When the next tick is wanted: -1 with nothing running, at once — the last
+// tick's time — for a tween waiting to start, else a frame after the last.
+fn next_due(an as *Animator) as i64 {
+    let is i64 as due with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TWEENS) {
+        if (an.slots[i].used == 1) {
+            if (an.slots[i].start < 0) { return an.last; }
+            due = an.last + an.interval;
+        }
+        i = i + 1;
+    }
+    return due;
+}
+
+// Steps every tween to now, and returns how many it stepped. A tween made by
+// a callback during this pass waits for the next, as a timer would.
+fn tick(an as *Animator, now as i64) as i64 {
+    an.last = now;
+    let is [64]i64 as ids;
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TWEENS) {
+        if (an.slots[i].used == 1) {
+            ids[n] = _id(an, i);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    let is i64 as ran with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is i64 as s = _slot(an, ids[k]);
+        if (s >= 0) {
+            let is *Tween as tw = &an.slots[s];
+            if (tree.is_valid(an.t, tw.w) == 0) {
+                _free(an, s);
+            } else {
+                if (tw.start < 0) {
+                    tw.start = now;
+                    _read(an, tw);
+                }
+                // A clock stepping back gives less than nothing, which the
+                // easing curves clamp to the start.
+                let is i64 as elapsed = now - tw.start;
+                if (tw.duration <= 0 || _reduced(an) == 1) {
+                    _end(an, s);
+                } else if (tw.runs > 0 && elapsed / tw.duration >= tw.runs) {
+                    _end(an, s);
+                } else {
+                    let is i64 as run = elapsed / tw.duration;
+                    let is f64 as q with mut = cast(f64, elapsed % tw.duration) / cast(f64, tw.duration);
+                    if (tw.alternate == 1 && run % 2 == 1) { q = 1.0 - q; }
+                    let is i64 as e with mut = tw.ease;
+                    if (e == THEME_EASE) { e = tree.theme(an.t).motion.ease; }
+                    _write(an, tw, math.curve.ease(e, q));
+                    if (cast(i64, tw.step) != 0) { call(tw.step, tw.step_user); }
+                }
+                ran = ran + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return ran;
+}

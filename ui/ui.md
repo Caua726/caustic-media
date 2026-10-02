@@ -248,6 +248,12 @@ toolkit has to run on whichever `gpu/` backend the program opened.
 the union of dirty rectangles, clipped to them, and presents only that region
 where the window backend allows it.
 
+**Animation.** A widget can be drawn moved from where layout put it and faded
+as a whole, without laying anything out again; tweens take those — and colours
+and numbers a widget paints from — to a target over the theme's durations and
+along its curve, stepped by a frame clock per window that wakes the loop only
+while something moves. "Reduce motion" puts every value at its target at once.
+
 ---
 
 ## Text
@@ -443,12 +449,43 @@ repaints the places it left and reached without one paint entry inside it
 (`cache_test`, every frame compared with the same tree painted with no cache).
 `damage.collect` makes the texture stale when anything inside changes other
 than moving along with it. The texture holds premultiplied colour and goes back
-with a premultiplied blend, so soft edges match painting directly; a cache
-inside a cache, or one with a layered widget inside, is painted directly.
+with a premultiplied blend, so soft edges match painting directly. A texture
+inside another's is painted first and put back into it, `paint.MAX_NEST` deep,
+each on a canvas of its own opened when first needed; a change inside the inner
+one makes both stale, the inner one moving within the outer only the outer.
+Deeper than that, with a layered widget inside, or with no entry left, a widget
+is painted directly. `app.set_cache` gives a window its cache.
+
+**Moving and fading** (`tree.set_translation`, `tree.set_opacity`, tested by
+`visual_test`): a translation moves a widget and its subtree from where layout
+put it — painted, damaged and hit there, its window rectangle there
+(`layout.visual_rect`), nothing laid out again. Opacity fades the subtree as one
+picture: below 1 a widget goes through a texture of its own, as `F_CACHE` does,
+put back with every channel scaled; changing only the opacity puts the same
+texture back fainter, painting nothing inside it again. At 0 nothing of it is
+drawn and it is still hit. With no cache to go through it is drawn as it is.
+
+**Animation** (`anim.cst`, tested by `anim_test`; `math/curve.cst` for the
+curves): tweens on a widget's opacity and translation, and on a colour or a
+number the program owns, whose widget is repainted as it changes. Each starts
+at the first tick after it is made, from the value as it is then; one made for
+something that already has one replaces it from where it got to, so a reversed
+fade turns back rather than jumps. A curve by name — the usual polynomial, sine
+and exponential ones, CSS's `ease` family and Windows 11's Fluent curves as
+cubic Béziers — or the theme's (`style.Motion.ease`: ease-out cubic for
+Adwaita, in-out quadratic for Breeze, Fluent's point to point for Windows 11).
+Colours move premultiplied, as CSS's do. Repeating, back and forth, for ever;
+callbacks after each step and when done, which is never for one cancelled,
+replaced or whose widget was destroyed — that one is dropped with nothing
+written. Reduced motion, or a duration of 0, puts the value at its target at
+once and still calls back at the next tick, so code that hides a widget when
+its fade is done works with animations off. Every window has an animator
+(`app.animator`): `app.next_due` asks for a frame an interval after the last
+while anything runs and nothing otherwise, and `app.tick` steps them.
 
 **The theme** (`style.cst`, tested by `style_test`): tokens — a palette by role,
-a type scale, spacing, radii, borders, shadows, durations — and the variants a
-widget picks from by its painter state (`style.pick`): controls, the suggested
+a type scale, spacing, radii, borders, shadows, durations and an easing curve —
+and the variants a widget picks from by its painter state (`style.pick`): controls, the suggested
 and destructive actions, fields, rows, indicators and tracks, with hover and
 press laid over whichever background applies, disabled fading everything and a
 window in the backdrop quieting its text. Colours are sRGB as written

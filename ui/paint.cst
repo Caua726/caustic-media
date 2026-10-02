@@ -33,9 +33,15 @@
 // widget repaints the places it left and reached without calling one paint
 // entry inside it. damage.collect says when the texture is stale. The texture
 // holds premultiplied colour, so it goes back with draw2d.image_premultiplied
-// and its soft edges come out as they would have been drawn directly. A cached
-// widget inside another, or with a layered widget inside it, is painted
-// directly: one texture cannot hold what has to escape it.
+// and its soft edges come out as they would have been drawn directly.
+//
+// A widget given an opacity below 1 (tree.set_opacity) goes through the same
+// textures, put back faded: its subtree fades as one picture. One with a
+// texture inside another's has a texture of its own, painted first and put
+// back into the outer one, MAX_NEST deep; deeper than that, or with a
+// layered widget inside it, or with no Cache or no entry left, a widget is
+// painted directly — at full opacity, since one texture cannot hold what has
+// to escape it, and without one there is nothing to fade as one.
 //
 // The caller owns the frame around it: draw2d.begin on the target's size, this,
 // draw2d.flush into a pass that loads what the target already holds, present
@@ -56,6 +62,8 @@ use "style.cst" as style;
 // --- The cache ---
 
 let is i64 as MAX_CACHED with imut = 16;
+// Textures painted inside textures: a canvas each, opened when first needed.
+let is i64 as MAX_NEST with imut = 4;
 
 struct CacheEntry {
     w   as i64;   // the cached widget; 0 for a free entry
@@ -64,21 +72,26 @@ struct CacheEntry {
     ph  as i64;
 }
 
-// Textures for cached widgets, and the canvas and command buffer that paint
-// into them. On the device the window paints with; MAX_CACHED widgets at once,
-// and a cached widget past that is painted directly.
+// Textures for cached widgets, and the canvases and command buffer that
+// paint into them — one canvas per texture being painted at once, the
+// outermost first. On the device the window paints with; MAX_CACHED widgets
+// at once, and a cached widget past that is painted directly.
 struct Cache {
-    d       as *dev.Device;
-    canvas  as draw2d.Canvas;
-    cmd     as i64;
-    entries as [16]CacheEntry;
-    ok      as i32;
-    _pad0   as i32;
+    d        as *dev.Device;
+    limits   as draw2d.Limits;
+    canvases as [4]draw2d.Canvas;
+    opened   as i64;   // canvases opened, from the first
+    cmd      as i64;
+    entries  as [16]CacheEntry;
+    ok       as i32;
+    _pad0    as i32;
 }
 
 fn cache_open(d as *dev.Device, l as *draw2d.Limits) as Cache {
     let is Cache as cc;
     cc.d = d;
+    cc.limits = *l;
+    cc.opened = 0;
     cc.ok = 0;
     cc._pad0 = 0;
     let is i64 as i with mut = 0;
@@ -89,10 +102,21 @@ fn cache_open(d as *dev.Device, l as *draw2d.Limits) as Cache {
         cc.entries[i].ph = 0;
         i = i + 1;
     }
-    cc.canvas = draw2d.open(d, l);
     cc.cmd = command.create(d);
-    if (draw2d.is_open(&cc.canvas) == 1 && cc.cmd != 0) { cc.ok = 1; }
+    if (_canvas(&cc, 0) != cast(*draw2d.Canvas, 0) && cc.cmd != 0) { cc.ok = 1; }
     return cc;
+}
+
+// The canvas for a texture painted inside depth others; null when there is
+// none to have.
+fn _canvas(cc as *Cache, depth as i64) as *draw2d.Canvas {
+    if (depth < 0 || depth >= MAX_NEST) { return cast(*draw2d.Canvas, 0); }
+    while (cc.opened <= depth) {
+        cc.canvases[cc.opened] = draw2d.open(cc.d, &cc.limits);
+        if (draw2d.is_open(&cc.canvases[cc.opened]) == 0) { return cast(*draw2d.Canvas, 0); }
+        cc.opened = cc.opened + 1;
+    }
+    return &cc.canvases[depth];
 }
 
 fn cache_close(cc as *Cache) as void {
@@ -103,7 +127,12 @@ fn cache_close(cc as *Cache) as void {
         cc.entries[i].w = 0;
         i = i + 1;
     }
-    draw2d.close(&cc.canvas);
+    i = 0;
+    while (i < cc.opened) {
+        draw2d.close(&cc.canvases[i]);
+        i = i + 1;
+    }
+    cc.opened = 0;
     if (cc.cmd != 0) { command.destroy(cc.d, cc.cmd); }
     cc.cmd = 0;
     cc.ok = 0;
@@ -114,7 +143,7 @@ fn cache_used(cc as *Cache, t as *tree.Tree) as i64 {
     let is i64 as n with mut = 0;
     let is i64 as i with mut = 0;
     while (i < MAX_CACHED) {
-        if (cc.entries[i].w != 0 && tree.is_valid(t, cc.entries[i].w) == 1) { n = n + 1; }
+        if (cc.entries[i].w != 0 && tree.is_textured(t, cc.entries[i].w) == 1) { n = n + 1; }
         i = i + 1;
     }
     return n;
@@ -131,7 +160,7 @@ fn _entry(cc as *Cache, t as *tree.Tree, w as i64) as *CacheEntry {
     i = 0;
     while (i < MAX_CACHED) {
         let is *CacheEntry as e = &cc.entries[i];
-        if (e.w == 0 || tree.is_valid(t, e.w) == 0 || tree.has_flag(t, e.w, tree.F_CACHE) == 0) {
+        if (e.w == 0 || tree.is_valid(t, e.w) == 0 || tree.is_textured(t, e.w) == 0) {
             if (e.tex != 0) { texture.destroy(cc.d, e.tex); }
             e.tex = 0;
             e.pw = 0;
@@ -182,8 +211,12 @@ struct _Walk {
     st      as *Stats;
     region  as math.rect.Rect;
     focus   as i64;
-    cache   as *Cache;   // null while painting into a cache
-    no_ring as i64;      // a widget whose ring is drawn outside its texture
+    cache   as *Cache;   // null for none
+    // The widget whose texture this walk paints, 0 on the window: not given
+    // a texture again, and its ring drawn outside it. depth is how many
+    // textures are being painted around this one.
+    own     as i64;
+    depth   as i64;
     clip_on as i32;
     _pad0   as i32;
 }
@@ -234,6 +267,8 @@ fn _ring(k as *_Walk, r as math.rect.Rect, th as *style.Theme) as void {
 fn _visit(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
           layer0 as i64, disabled0 as i32, th0 as *style.Theme) as void {
     if (tree.is_hidden_here(k.t, w) == 1) { return; }
+    // Wholly transparent: nothing of it to draw.
+    if (tree.opacity(k.t, w) <= 0.0) { return; }
     let is *style.Overrides as ov = tree.overrides(k.t, w);
     if (cast(i64, ov) != 0) {
         _visit_over(k, w, ox, oy, clip0, layer0, disabled0, th0, ov);
@@ -255,7 +290,7 @@ fn _visit_over(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.R
 fn _visit_as(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rect,
              layer0 as i64, disabled0 as i32, th as *style.Theme) as void {
     k.st.walked = k.st.walked + 1;
-    let is math.rect.Rect as r = layout.rect(k.t, w);
+    let is math.rect.Rect as r = layout.visual_rect(k.t, w);
     let is math.rect.Rect as wr = math.rect.rect(ox + r.x, oy + r.y, r.w, r.h);
     let is math.rect.Rect as clip with mut = clip0;
     let is i64 as layer with mut = layer0;
@@ -299,7 +334,7 @@ fn _visit_as(k as *_Walk, w as i64, ox as f64, oy as f64, clip0 as math.rect.Rec
         _visit(k, ch, wr.x, wr.y, vis, layer, disabled, th);
         ch = tree.next_sibling(k.t, ch);
     }
-    if (shown == 1 && (p.state & painter.S_FOCUS_VISIBLE) != 0 && p.focus_drawn == 0 && w != k.no_ring) {
+    if (shown == 1 && (p.state & painter.S_FOCUS_VISIBLE) != 0 && p.focus_drawn == 0 && w != k.own) {
         draw2d.set_layer(k.c, layer);
         _clip(k, vis);
         _ring(k, wr, th);
@@ -320,8 +355,9 @@ fn _has_layered(t as *tree.Tree, w as i64) as i32 {
 fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
            vis as math.rect.Rect, layer as i64, disabled as i32, th as *style.Theme) as i32 {
     if (cast(i64, k.cache) == 0 || k.cache.ok == 0) { return 0; }
-    if (tree.has_flag(k.t, w, tree.F_CACHE) == 0) { return 0; }
+    if (tree.is_textured(k.t, w) == 0 || w == k.own) { return 0; }
     if (tree.layered_count(k.t) > 0 && _has_layered(k.t, w) == 1) { return 0; }
+    if (cast(i64, _canvas(k.cache, k.depth)) == 0) { return 0; }
     let is *CacheEntry as e = _entry(k.cache, k.t, w);
     if (cast(i64, e) == 0) { return 0; }
     let is f64 as s = k.c.scale;
@@ -343,8 +379,10 @@ fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
     }
     draw2d.set_layer(k.c, layer);
     _clip(k, vis);
+    // Faded as one: premultiplied, every channel scales with the opacity.
+    let is f64 as a = tree.opacity(k.t, w);
     draw2d.image_premultiplied(k.c, e.tex, 0, wr.x, wr.y, wr.w, wr.h, 0.0, 0.0, 1.0, 1.0,
-                               math.color.rgba(1.0, 1.0, 1.0, 1.0));
+                               math.color.rgba(a, a, a, a));
     k.st.cache_blits = k.st.cache_blits + 1;
     // Its own ring goes on top, after everything in it, as it would have
     // without a cache.
@@ -355,11 +393,13 @@ fn _cached(k as *_Walk, w as i64, ox as f64, oy as f64, wr as math.rect.Rect,
 }
 
 // The whole of w's subtree into its texture, on transparency, at the
-// coordinates it has in the window.
+// coordinates it has in the window. Textures inside it are painted, each on
+// the next canvas, as the walk reaches them — before this one's commands are
+// submitted, which is what puts them back finished.
 fn _render(k as *_Walk, e as *CacheEntry, w as i64, ox as f64, oy as f64,
            wr as math.rect.Rect, layer as i64, disabled as i32, th as *style.Theme) as void {
     let is *Cache as cc = k.cache;
-    let is *draw2d.Canvas as oc = &cc.canvas;
+    let is *draw2d.Canvas as oc = _canvas(cc, k.depth);
     draw2d.begin(oc, cast(f64, e.pw), cast(f64, e.ph), k.c.scale);
     draw2d.set_origin(oc, wr.x, wr.y);
     let is _Walk as k2;
@@ -369,8 +409,9 @@ fn _render(k as *_Walk, e as *CacheEntry, w as i64, ox as f64, oy as f64,
     k2.st = k.st;
     k2.region = wr;
     k2.focus = k.focus;
-    k2.cache = cast(*Cache, 0);
-    k2.no_ring = w;
+    k2.cache = cc;
+    k2.own = w;
+    k2.depth = k.depth + 1;
     k2.clip_on = 0;
     k2._pad0 = 0;
     // th already holds w's own overrides: in from _visit_as, not _visit.
@@ -407,7 +448,8 @@ fn frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i
     k._pad0 = 0;
     k.focus = 0;
     k.cache = o.cache;
-    k.no_ring = 0;
+    k.own = 0;
+    k.depth = 0;
     if (cast(i64, o.router) != 0) { k.focus = router.focused(t, o.router); }
     let is *style.Theme as th with mut = o.theme;
     if (cast(i64, th) == 0) { th = tree.theme(t); }

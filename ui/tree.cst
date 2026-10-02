@@ -151,6 +151,11 @@ struct Node {
     placed  as math.rect.Rect;
     layer   as i64;   // 0, or above everything at lower layers; see set_layer
     overrides as *style.Overrides;   // the program's; null for none. See set_overrides
+    // Where it is drawn, moved from where it is laid out, and how much of it
+    // shows: see set_translation and set_opacity.
+    tx      as f64;
+    ty      as f64;
+    opacity as f64;
 }
 
 struct Tree {
@@ -374,6 +379,9 @@ fn _claim(t as *Tree, k as *Kind) as i64 {
             n.placed = math.rect.rect_zero();
             n.layer = 0;
             n.overrides = cast(*style.Overrides, 0);
+            n.tx = 0.0;
+            n.ty = 0.0;
+            n.opacity = 1.0;
             if (t.stride > 0) { mem.core.memzero(_data_at(t, i), t.stride); }
             t.live = t.live + 1;
             t.next_free = i + 1;
@@ -518,11 +526,8 @@ fn destroy(t as *Tree, w as i64) as void {
     if (i < 0) { return; }
     if (i == t.root) { t.err = BAD_ARGUMENT; return; }
     let is i64 as p = _node(t, i).parent;
-    // A cached ancestor's texture still shows what is about to go.
-    if (p != 0 - 1) {
-        let is i64 as c = _cached_above(t, p);
-        if (c >= 0) { _node(t, c).flags = _node(t, c).flags | F_CACHE_DIRTY; }
-    }
+    // The textures around it still show what is about to go.
+    if (p != 0 - 1) { _stale_from(t, p); }
     _unlink(t, i);
     if (p != 0 - 1) { _invalidate_from(t, p); }
     _release_subtree(t, i);
@@ -712,14 +717,37 @@ fn set_flag(t as *Tree, w as i64, bit as i64, on as i32) as void {
     }
 }
 
-// The nearest cached widget at or above slot i, -1 for none.
-fn _cached_above(t as *Tree, i as i64) as i64 {
+// Whether node i is painted through a texture of its own: F_CACHE, or
+// partly transparent, which needs its subtree composited as one.
+fn _textured(t as *Tree, i as i64) as i32 {
+    let is *Node as n = _node(t, i);
+    if ((n.flags & F_CACHE) != 0 || n.opacity < 1.0) { return 1; }
+    return 0;
+}
+
+fn is_textured(t as *Tree, w as i64) as i32 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0; }
+    return _textured(t, i);
+}
+
+// Every texture at or above slot i is stale: each holds the picture of the
+// ones inside it.
+fn _stale_from(t as *Tree, i as i64) as void {
     let is i64 as a with mut = i;
     while (a != 0 - 1) {
-        if ((_node(t, a).flags & F_CACHE) != 0) { return a; }
-        a = _node(t, a).parent;
+        let is *Node as n = _node(t, a);
+        if (_textured(t, a) == 1) { n.flags = n.flags | F_CACHE_DIRTY; }
+        a = n.parent;
     }
-    return 0 - 1;
+}
+
+// w's texture, if it has one, and every one around it, are to be painted
+// again — damage.cst's, when something inside changed.
+fn stale_textures(t as *Tree, w as i64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    _stale_from(t, i);
 }
 
 fn has_flag(t as *Tree, w as i64, bit as i64) as i32 {
@@ -1091,4 +1119,64 @@ fn overrides(t as *Tree, w as i64) as *style.Overrides {
     let is i64 as i = _index(t, w);
     if (i < 0) { return cast(*style.Overrides, 0); }
     return _node(t, i).overrides;
+}
+
+// --- Where a widget is drawn, and how much of it ---
+//
+// Translation moves a widget and everything under it from where layout put
+// it: painted there, hit there, its rectangle in the window there — and laid
+// out exactly as before, which is what lets an animation slide something
+// without measuring anything again. Opacity fades the widget and its subtree
+// as one picture, composited through a texture of its own (paint.cst's
+// cache): a translucent subtree is not each widget translucent, which would
+// show the widgets behind one another through it. At 0 nothing of it is
+// drawn; it is still there, and still hit.
+
+fn set_translation(t as *Tree, w as i64, x as f64, y as f64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    let is *Node as n = _node(t, i);
+    if (n.tx == x && n.ty == y) { return; }
+    n.tx = x;
+    n.ty = y;
+    // Nothing to lay out; damage.cst sees it move.
+    t.paint_wanted = 1;
+}
+
+fn translation_x(t as *Tree, w as i64) as f64 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0.0; }
+    return _node(t, i).tx;
+}
+
+fn translation_y(t as *Tree, w as i64) as f64 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0.0; }
+    return _node(t, i).ty;
+}
+
+// From 0, not drawn, to 1, opaque; outside that, the nearer end.
+fn set_opacity(t as *Tree, w as i64, a as f64) as void {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return; }
+    let is f64 as v with mut = a;
+    if (v < 0.0) { v = 0.0; }
+    if (v > 1.0) { v = 1.0; }
+    let is *Node as n = _node(t, i);
+    if (n.opacity == v) { return; }
+    // Becoming translucent needs its subtree painted into a texture first;
+    // after that a fade only changes how the texture is put back, so the
+    // place is repainted without marking anything in it changed. The
+    // textures around it show it, though. Where nothing of it is on screen
+    // there is nothing to repaint, and no frame asked for.
+    if (n.opacity >= 1.0) { n.flags = n.flags | F_CACHE_DIRTY; }
+    n.opacity = v;
+    if (n.parent != 0 - 1) { _stale_from(t, n.parent); }
+    damage_add(t, &n.painted);
+}
+
+fn opacity(t as *Tree, w as i64) as f64 {
+    let is i64 as i = _index(t, w);
+    if (i < 0) { return 0.0; }
+    return _node(t, i).opacity;
 }
