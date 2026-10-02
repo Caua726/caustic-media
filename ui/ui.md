@@ -28,6 +28,7 @@ ui/
   paint.cst       drawing the tree through render/'s 2D family
   painter.cst     what a widget's paint entry is handed
   style.cst       the theme: colours, metrics, fonts, per-state variants
+  system.cst      the desktop's settings, as the theme and the timings
   a11y.cst        role, name and state per widget; the platform bridges
   widgets/        label, button, check, radio, entry, slider, progress,
                   scroll, list, tree, table, menu, tabs, splitter, dialog
@@ -464,8 +465,12 @@ the same on its way down, so every paint entry gets its widget's theme, and a
 cached subtree too. `app.set_theme` and `app.set_prefs` switch every window at
 once; the theme lives in the application's mapping, so the trees' pointers to
 it survive the `App` being returned by value. Reading the preferences from the
-platform — XSETTINGS, the settings portal, the registry — is `window/`'s, and
-not written yet.
+platform is `window/`'s (`window/settings.cst`: GTK's files, XSETTINGS, the
+portal over D-Bus); `system.cst` turns what it reads into `style.Prefs` and the
+router's timings — double-click time and distance, the drag threshold, the
+caret's blink — and `app.set_system` applies both to every window, keeping its
+own copy so the theme's font names outlive the caller's record (`system_test`).
+The Windows registry comes with the Win32 backend.
 
 ## For scale
 
