@@ -38,7 +38,7 @@ window and drive the GPU itself.
 | `image/` | pixels on the CPU: load, save, transform, generate, atlas | design note only |
 | `text/` | fonts, glyph atlases, shaping, layout | design note only |
 | `audio/` | device, mixer, music, positional | design note only |
-| `ui/` | immediate-mode widgets, drawn through `render/` | design note only |
+| `ui/` | a toolkit for applications, drawn by us; immediate mode beside it in `ui/immediate/` | toolkit designed; immediate-mode prototype, tested |
 
 The shape the whole thing is aiming at:
 
@@ -53,7 +53,7 @@ render/   the framework: meshes, sprites, materials, cameras, a frame
 image/    pixels on the CPU: load, save, transform, generate, atlas
 text/     fonts, glyph atlases, shaping, layout
 audio/    device, mixer, music, positional:  alsa | wasapi | causticos
-ui/       immediate-mode widgets, drawn through render/
+ui/       a toolkit for applications, drawn by us;  immediate/ for HUDs and tools
 ```
 
 Each has a design note beside it recording what it holds and why:

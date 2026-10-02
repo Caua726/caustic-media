@@ -1,193 +1,334 @@
 # The UI layer
 
-Widgets: buttons, sliders, text fields, panels, menus, trees, tables. Drawn
-through [`render/`](../render/render.md)'s 2D family, typeset by
-[`text/`](../text/text.md), fed by [`input/`](../input/input.md).
+Interfaces for applications: what GTK is for C and Qt is for C++. Widgets that
+exist as objects, laid out by the toolkit, and drawn by this library itself on
+every platform — so a program written against it looks and behaves the same on
+X11, Wayland and Windows, and links no toolkit of anybody else's.
 
 ```
 ui/
-  ui.cst        hub
-  context.cst   the frame: begin, end, the id stack, what has focus
-  layout.cst    stacking, rows, columns, grids, spacing
-  widget.cst    button, label, checkbox, radio, slider, progress, separator
-  edit.cst      text fields, with selection, caret and IME
-  container.cst window, panel, collapsing header, tab bar, scroll area
-  list.cst      lists, trees, tables
-  menu.cst      menu bar, context menu, popup
-  draw.cst      the primitives widgets are built from, over render/draw2d
-  theme.cst     colours, spacing, fonts, rounding
-```
+  ui.cst          hub
+  tree.cst        widgets as nodes in a window's tree, and the handles to them
+  widget.cst      the table of functions every kind of widget fills in
+  layout.cst      measure and arrange: box, grid, stack, size policies
+  event.cst       routing: hit-testing, capture, bubbling, focus, shortcuts
+  signal.cst      connecting a callback to what a widget emits
+  model.cst       row and cell models behind lists, trees and tables
+  paint.cst       damage tracking, drawing through render/'s 2D family
+  style.cst       the theme: colours, metrics, fonts, per-state variants
+  a11y.cst        role, name and state per widget; the platform bridges
+  widgets/        label, button, check, radio, entry, slider, progress,
+                  scroll, list, tree, table, menu, tabs, splitter, dialog
 
-Neither SDL nor raylib has one — raygui is a separate project and Dear ImGui is
-the reference everyone actually uses. So this is the layer with no comparison to
-measure against, and the most opinion per line.
+  immediate/      the other model, for HUDs and tools   immediate/immediate.md
+```
 
 ---
 
-## Immediate mode
+## Three ways to put an interface in a window
 
-Decided already, and worth restating because everything here follows from it:
+The promise from the start was a GUI *the library's way or the program's way*,
+the same promise [`gpu/`](../gpu/gpu.md) makes about Vulkan. So there are three,
+and none of them is a wrapper over another:
+
+| | for | |
+|---|---|---|
+| **the toolkit** — `ui/` | applications: forms, lists, menus, dialogs, settings | this note |
+| **immediate mode** — `ui/immediate/` | HUDs, debug panels, editors inside a game, throwaway tools | [`immediate/immediate.md`](immediate/immediate.md) |
+| **direct** — `window/` and `render/` | a program that draws every pixel itself | [`../window/window.md`](../window/window.md) |
+
+The direct path is SDL's: open a window, take its events, draw with `render/`,
+`gpu/` or the raw bindings under them. It needs nothing from this directory, and
+`ui/` adds no shared library to a binary that does use it — it is Caustic code
+over `window/`, `input/`, `render/` and `text/`.
+
+The toolkit and immediate mode share what sits under them — the 2D drawing, the
+text, the events — and nothing else. They are two models, not one model with a
+switch.
+
+---
+
+## Drawn by us
+
+The toolkit paints every widget itself, as Qt does, rather than wrapping each
+platform's own controls, as wxWidgets does. Four reasons, in order of weight:
+
+**Linux has no native widget set.** X11 and Wayland draw nothing; "native" there
+means GTK or Qt. Wrapping native controls on Linux therefore means linking GTK —
+on this machine `libgtk-4.so.1` is 11806 KB, exports 5476 symbols and carries 44
+`DT_NEEDED` entries of its own — which is the opposite of what every other layer
+in this repository does.
+
+**One behaviour everywhere.** A drawn widget has the same metrics, focus rules and
+keyboard handling on every backend, so a dialog laid out on Linux is laid out on
+Windows. Wrapped controls differ in size and behaviour per platform, and a
+portable API over them ends up as their intersection.
+
+**Testable like the rest.** A tree renders into a `gpu/software` target with no
+display at all and is compared pixel for pixel — the way the rasteriser and the
+window layer are tested now. A native control can only be tested through the
+platform that draws it.
+
+**It is what `window/` was built to support.** A toolkit that paints needs a
+surface and events, and nothing else from the platform.
+
+The costs, stated rather than discovered:
+
+- **It does not look native unless the theme makes it.** So it follows the
+  platform's conventions wherever they are observable: dialog button order,
+  shortcut modifiers, scroll direction, double-click time, the system font and
+  scale, and the light or dark preference — the XDG portal's `color-scheme` on
+  Linux, `AppsUseLightTheme` on Windows.
+- **Accessibility is ours to provide.** A native control brings its own; a drawn
+  one is invisible to a screen reader until the toolkit exposes it. Qt carries
+  the same obligation and meets it with AT-SPI on Linux and UI Automation on
+  Windows, and so must this — see below.
+- **Every widget is ours to get right**, the text entry most of all.
+
+---
+
+## Retained: widgets are objects
+
+Applications are where immediate mode's costs land hardest, which is why the
+toolkit is the other model:
+
+- **State lives in the widget.** A text field holds its text, selection and undo
+  history; a list holds its scroll offset and selection. Nothing has to be
+  recognised across frames by hashing its label.
+- **Layout takes two passes.** Measure, then arrange — so centring a row,
+  aligning the columns of a form and wrapping text to the width it is given are
+  ordinary rather than special cases.
+- **Only what changed is redrawn.** An application is idle most of the time. A
+  tree knows what is dirty, and on the software backend that is the difference
+  between repainting a blinking caret and repainting 1920×1080.
+- **The accessibility tree is the widget tree.** It does not have to be recorded
+  on the side.
+
+The cost is the one immediate mode was built to avoid: the tree and the
+program's data can disagree. The answer is discipline about direction — signals
+out, setters in, and models for anything large — rather than a binding
+framework.
 
 ```cst
-if (ui.button(&ctx, "Save")) { save(&doc); }
+// The designed interface; it does not compile today.
+let is ui.Window as w     = ui.window(&app, "Settings", 480, 320);
+let is ui.Widget as form  = ui.grid(&w, ui.root(&w));
+let is ui.Widget as name  = ui.entry(&w, form);
+let is ui.Widget as save  = ui.button(&w, form, "Save");
+ui.on_clicked(&w, save, on_save, cast(*u8, &doc));
 ```
-
-There is no button object. The call draws it, tests the pointer against it, and
-returns whether it was clicked, every frame. The widget tree is a function of the
-program's data because it is *rebuilt from* the program's data, so the two cannot
-disagree — which is the entire class of bug that retained-mode UI spends its
-machinery preventing.
-
-The costs are real and worth stating rather than discovering: it redraws every
-frame, and both animation and accessibility need something the model does not
-obviously provide. Both are answered below, and neither turns out to require a
-second mechanism. Against a retained toolkit's ~500k lines for the same widget
-set, at maybe 1% of that, it is the right trade for a framework — and it is what
-[`render/`](../render/render.md)'s decision that state travels with the work was
-already pointing at.
 
 ---
 
-## Identity is the hard part
+## Widgets without classes
 
-Immediate mode's one genuinely difficult problem, and the place implementations
-diverge.
+Caustic has structs, functions and typed function pointers — no classes, no
+inheritance, no virtual dispatch. GTK builds an object system on top of C to get
+those (GObject); Qt needs a code generator for its signals (moc). Neither is the
+shape here.
 
-The library must recognise the same widget across frames — to know that *this*
-button is the one being held, that *that* field has the caret. With no objects,
-identity comes from a generated id, usually hashing the label with the enclosing
-scope. Which breaks in exactly the ways you would expect:
+A widget is **a node plus a kind**:
 
-- Two buttons labelled "OK" in the same panel collide, and pressing one presses
-  both.
-- A list whose items reorder makes focus jump to whatever now occupies the slot.
-- A label that changes with state — `"Pause"` becoming `"Resume"` — is a
-  different widget as far as the id is concerned, so a click in progress is lost.
+- the **node** is what every widget has: parent and children, geometry, flags
+  (visible, enabled, dirty), style state;
+- the **kind** is a table of functions — measure, arrange, paint, event — called
+  through typed pointers, the pattern
+  [`gpu/vk/bind/loader.cst`](../gpu/vk/bind/loader.cst) already uses for Vulkan
+  commands;
+- the **data** is a struct the kind owns: the text of an entry, the value and
+  range of a slider.
 
-The answers are an explicit id when the label is not unique, an id stack that
-scopes children under their container, and a way to push a loop index. None of
-that is optional, and a UI layer that discovers it late has to change every call
-site.
+A new kind of widget is a new table and a struct, and a program writes one
+exactly as this library does. That is the extension point, and a toolkit without
+one cannot grow it later.
+
+**Handles, not pointers.** A program holds a `ui.Widget` — an index and a
+generation into its window's node pool — so a destroyed widget's handle fails a
+check instead of pointing into reused memory. The pool is bounded and sized when
+the window is created; growing it is explicit, the same rule the draw queue and
+the event queue follow.
+
+---
+
+## Layout
+
+Two passes, run only over subtrees marked dirty:
+
+1. **measure**, bottom-up: each widget reports minimum, preferred and maximum
+   size for the constraint it is offered;
+2. **arrange**, top-down: each container hands its children their rectangles.
+
+The containers are **box** (a row or column, with spacing and stretch factors),
+**grid** (forms), **stack** (one visible child: tabs, wizards), **scroll area**
+and **splitter**. That set covers what GTK's and Qt's layouts are used for in
+practice.
+
+Units are logical pixels. [`window/`](../window/window.md)'s `display.cst`
+supplies the scale per monitor, and everything — theme metrics, font sizes,
+borders — scales with it; a window moved to a monitor with a different scale is
+laid out again.
+
+**Not now:** constraint solving, the Cassowary algorithm Apple's Auto Layout is
+built on. Nested boxes and grids reach the same result for nearly every form,
+and a solver is hard to debug from a user's report.
+
+---
+
+## Events and signals
+
+**In.** [`input/`](../input/input.md) delivers events — events rather than
+sampled state, because a click that begins and ends between two frames must not
+be lost. The toolkit routes them:
+
+- **pointer**: hit-test the tree top-down, deliver to the deepest widget, bubble
+  to its ancestors until one handles it. A press *captures* the pointer, so a
+  drag that leaves the slider stays with the slider.
+- **keyboard**: to the focused widget, then up the tree. Tab and Shift+Tab walk
+  the focus chain; shortcuts and mnemonics are resolved at the window before the
+  focused widget sees the key.
+- **text**: composed text and the IME's pre-edit string from `input/`'s
+  `text.cst`, to the focused entry.
+
+**Out.** A widget emits signals — clicked, changed, activated — and the program
+connects a callback: a function pointer and a user-data pointer, called
+synchronously. No signals named by string, no generated code, no delivery queued
+across threads; a callback that wants to act later posts to the window's queue
+itself.
+
+---
+
+## Models for large data
+
+A list of ten thousand rows does not create ten thousand widgets. Lists, trees
+and tables take a **model** — functions answering how many rows there are, what
+is in a cell, and that something changed — and create widgets only for the rows
+on screen, recycling them as it scrolls. That is Qt's model/view and GTK 4's list
+models, for the same reason: it is the difference between a file manager and one
+that freezes opening `/usr/lib`.
+
+---
+
+## Painting
+
+Through [`render/`](../render/render.md)'s 2D family: `shapes2d` for frames and
+fills, `draw2d` for icons and glyph atlases, nested **scissor** for clipping — a
+scroll area clips its children — and **layers**, so a popup draws over what it
+covers. `ui/` adds no drawing primitives of its own, and never draws into a
+`gpu/software` target directly the way the immediate-mode prototype does now: the
+toolkit has to run on whichever `gpu/` backend the program opened.
+
+**Damage.** A widget that changes marks its rectangle dirty; the frame repaints
+the union of dirty rectangles, clipped to them, and presents only that region
+where the window backend allows it.
+
+---
+
+## Text
+
+All of it from [`text/`](../text/text.md): shaping and layout for labels,
+wrapping to the arranged width, caret positions and hit-testing for entries,
+selection rectangles across bidirectional runs.
+
+The entry is the hardest widget in any toolkit — selection, undo, IME,
+clipboard, caret movement through bidi text — and it waits for `text/` to reach
+caret and hit-testing rather than being faked with a monospace bitmap font.
+
+---
+
+## Style
+
+A **theme**: colours, metrics (padding, spacing, border widths, corner radii),
+fonts, and a variant per state — normal, hover, pressed, focused, disabled,
+selected. One struct the window carries, and a widget may override fields of its
+own.
+
+**Not CSS.** GTK 3 moved its theming to CSS and took on the cascade, selector
+matching and invalidation that CSS engines are built around. Most of what an
+application changes is a colour or a spacing, and a struct does that.
+
+Two themes ship, light and dark, chosen from the platform's preference and
+switchable at run time.
+
+---
+
+## Windows, popups and dialogs
+
+Each top-level window is a `window/` window with its own tree. Menus, the list
+of a combo box and tooltips are **popups**: separate windows positioned against
+their parent — override-redirect on X11, `xdg_popup` on Wayland — because a popup
+has to be able to extend past its parent's edge. `window/` already keeps several
+windows on one connection (`window/x11/multi_test.cst`), which is what this
+needs.
+
+Dialogs are windows with a modal flag and a result. The file dialog is our own
+first; the XDG desktop portal on Linux and the system dialog on Windows come
+later, because users expect their own.
+
+Clipboard and drag-and-drop come from `window/`, where the X11 side is already
+done.
+
+---
+
+## Accessibility
+
+Not optional for a toolkit meant for applications, and harder here than for a
+native one, because nothing is inherited.
+
+The retained tree makes the shape free: each widget reports a **role**, a
+**name**, a **state** and its **actions**, and a bridge exposes the tree — AT-SPI
+over D-Bus on Linux, UI Automation over COM on Windows. The bridges are a
+platform surface comparable to a window backend, so they are not first. The
+per-widget role, name and state are, because adding them afterwards means
+touching every widget.
 
 ---
 
 ## What it needs from the layers below
 
-**From `render/`:** the 2D family entirely — sprites for icons, `shapes2d` for
-frames and fills, scissor for clipping, and layer ordering so a popup draws over
-what it covers. `ui/` adds no drawing of its own; `draw.cst` is a vocabulary of
-rounded rectangles and borders composed from what is already there.
+| from | what | state |
+|---|---|---|
+| `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 done; Wayland and Win32 designed |
+| `input/` | events; text input and IME composition | design note |
+| `render/` | `draw2d`, `shapes2d`, scissor, layers | the 3D path is started; the 2D family is not |
+| `text/` | shaping, layout, caret, hit-testing | design notes only |
 
-**From `text/`:** glyph layout, and the three questions a text field asks — where
-the caret sits for a byte offset, which offset is under a point, and what a
-selection rectangle looks like across a bidirectional run. Those are much easier
-to answer while layout is being built than afterwards, which is why they are
-named in `text/`'s note.
+Three of the four foundations do not exist yet, which is why the toolkit has no
+code.
 
-**From `input/`:** events rather than sampled state, because a UI cares about
-transitions — pressed, released, dragged — and losing a click that happened
-between two frames is a bug users report as "it sometimes doesn't work". Text
-input, dead keys and IME composition come from there too, since a text field that
-a Japanese user cannot type into is not a text field.
+## For scale
 
----
+Measured on this machine, as a sense of what the references weigh rather than a
+target:
 
-## Layout is immediate too
+| | size | exported symbols |
+|---|---|---|
+| `libgtk-4.so.1` | 11806 KB | 5476 |
+| `libQt6Widgets` + `libQt6Gui` + `libQt6Core` | 24049 KB | 25536 |
 
-Widgets are placed as they are called, in one pass, taking the space they ask
-for and advancing a cursor. No measure pass, no deferred placement, no second
-traversal.
-
-That is the same decision as everything else here: the call does the work, and
-reading it tells you what happened. It also means a widget's position is known
-at the moment it is called, so hit-testing against the pointer can happen right
-there rather than being deferred to a later phase.
-
-The cost is real and worth naming: **a row cannot be centred if its total width
-is only known once the row has ended.** Anything whose placement depends on a
-sibling that has not been called yet needs the program to supply a size, or to
-compute it and pass it in.
-
-Where that is not enough, the answer is an explicit measure — the program asks
-what a piece of content would occupy, then lays it out with the number in hand.
-That is a function a caller invokes, not a hidden phase the library runs, so it
-stays consistent with the rest.
-
----
-
-## Per-id state, which immediate mode never actually avoided
-
-The model is usually described as keeping no state. It does not keep the *widget
-tree*, which is the part that matters — but it has always kept a small table
-keyed by id: which widget is being held, which has keyboard focus, where a
-scroll area is scrolled to, what a text field has selected.
-
-Naming that table makes two things fall out that otherwise look like problems.
-
-**Animation.** A panel that slides open has to remember how far open it is. That
-is another field in a table that already exists, not a new mechanism and not a
-retreat toward retained mode. A program that wants control instead passes its own
-`t` and drives the animation itself, which stays the more explicit path and is
-always available.
-
-**Cheap persistence for expensive widgets.** A table with ten thousand rows does
-not need its layout recomputed every frame; the row height and the scroll offset
-live in the same table, and only the visible rows are built.
-
-The table is bounded and its size is stated, for the same reason the draw queue
-and the event queue are.
-
-## Accessibility
-
-Immediate mode has nothing persistent for a screen reader to walk, and *"not a
-toy — real software"* makes ignoring that uncomfortable.
-
-Implementing it properly means AT-SPI over D-Bus on Linux and UI Automation over
-COM on Windows — a platform surface comparable to a window backend, for a layer
-that does not exist yet. So not now.
-
-What is decided now is that it stays possible: **the id stack is the tree.**
-Immediate mode does have hierarchy — a widget's id is scoped by its container —
-it simply does not persist it. So the context can be told to record a node per
-widget as it goes, and when it is not told, the recording costs nothing. The
-platform bridges become backends later, against a tree that was already there.
-
-Deciding this late instead would mean discovering that ids were generated in a
-way that cannot express hierarchy, and changing every call site.
-
-## Theme
-
-Colours, spacing, rounding, borders and font choices in one struct the context
-carries, rather than constants scattered through widgets. That is what makes a
-program able to look like itself instead of like the library, and it costs
-nothing to do from the start and a rewrite to add later.
-
----
-
-## Not now, and deliberately
-
-**Multi-window and docking.** Dear ImGui added both after the fact and it
-reshaped its architecture — viewports turn one context into several, each with
-its own platform window and render target. Doing it later would cost the same
-rework here, and doing it now would cost it before there is a single working
-widget. Neither is worth it yet.
-
-**A retained escape hatch** — a path where a widget keeps its own state and
-rebuilds only what changed. The per-id table above covers the case that motivates
-it, which is expensive widgets, without a second model to maintain.
+Both carry decades of widgets, platforms and compatibility. The goal is the
+widget set applications actually use, done properly, not parity.
 
 ---
 
 ## Order of work
 
-Blocked on `render/`'s 2D path and on `text/` reaching layout and hit-testing —
-`ui/` cannot start before either.
+1. **The tree, the widget table, handles and layout** — testable with geometry
+   alone, before anything is drawn.
+2. **Event routing**: capture, bubbling, the focus chain — testable with
+   synthetic events.
+3. **Painting and damage**, once `render/draw2d` exists.
+4. **The first widgets** — label, button, check, radio, slider, progress — with
+   box, grid and stack, and the light and dark themes.
+5. **The entry**, once `text/` has caret and hit-testing and `input/` delivers
+   composed text.
+6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
+7. **The accessibility bridges**, AT-SPI first.
 
-1. **`context` and the id stack**, which everything else assumes.
-2. **`draw` and `theme`**, over `render/draw2d`.
-3. **`layout`**, then button, label, checkbox and slider — enough to be useful.
-4. **`container`**: panels, scroll areas, tabs.
-5. **`edit`**, once `text/` can answer caret and hit-testing, and `input/` can
-   deliver composed text.
-6. **`list` and `menu`**, which are the widgets that most need the id stack to be
-   right.
+## Not now, and deliberately
+
+- **Wrapping native controls.** Decided above.
+- **Markup** — GtkBuilder XML, Qt's `.ui` files, QML. A tree built in code is the
+  API; a format can be layered on it later without changing it.
+- **CSS.** Decided above.
+- **Docking** and multi-document layouts.
+- **Rich text editing.** The entry is plain text with selection.
