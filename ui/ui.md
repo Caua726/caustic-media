@@ -32,7 +32,7 @@ ui/
   text.cst        one text service: runs laid out and drawn
   access.cst      role, name, states, value and actions per widget
   widgets/        label, button, check, radio, entry, slider, progress,
-                  scroll, list, tree, table, menu, tabs, splitter, dialog
+                  list, tree, table, menu, tabs, dialog
 
   immediate/      the other model, for HUDs and tools   immediate/immediate.md
 ```
@@ -350,6 +350,38 @@ text of its own takes its name from the label that says `labelled_by` it.
 
 ---
 
+## The first widgets
+
+Each a kind with its data, its setters that say what they changed, its
+signals and its role; drawn from the theme's variants and metrics, so a
+theme change restyles them all:
+
+- **label** — text in a style of the theme, or spans of styles; wrapping to
+  the width it is given (height for width), at most a number of lines with an
+  ellipsis, aligned; selectable on request, then with a caret's worth of
+  layout and the selection's rectangles, copied with Ctrl+C. A mnemonic
+  (`_Save`) underlines its letter while Alt is held and moves focus to what
+  the label is for.
+- **button** — text, an icon, or both; `clicked` on release inside it, on
+  Space or Enter; the default button of a window answers Enter anywhere and
+  is drawn in the accent, the cancel button Escape; a **toggle button** keeps
+  a pressed state and says `toggled`. A **link** is a button drawn as text in
+  the link colour, `activate_link` carrying its address.
+- **check box** — on, off or mixed (three-state on request), with its label
+  beside it, the whole of it hit; **radio** buttons in a group, one on,
+  arrows moving within the group; a **switch** on or off, its knob sliding
+  over the theme's duration.
+- **slider** — a value in a range, by step and by page, dragged, clicked to
+  jump or to page, moved by the arrows, Page Up and Down, Home and End;
+  horizontal or vertical, right to left mirrored; marks on request. A
+  **spin box** — an entry of a number with buttons and the same keys, the
+  value held to range and step; a **progress bar** — a fraction, or a pulse
+  going back and forth when there is none.
+- **separator**, **image** (an image at its size or scaled to fit, keeping
+  its proportions), **group box** (a frame with a title around one child),
+  and the **tooltip**: text shown after the hover delay over the widget that
+  has it, on the topmost layer, hidden by a press, a key or leaving it.
+
 ## What it needs from the layers below
 
 | from | what | state |
@@ -582,6 +614,22 @@ the window. `access.act` asks a widget to do one of its actions, with a value
 for setting one; one that is gone or disabled, or whose kind does not list the
 action, is not asked. A widget with no name of its own takes its label's. The
 bridges to the platform come later and read nothing else.
+
+**Labels** (`widgets/label.cst`, tested by `label_test` on a headless software
+device): text copied into the label's run and laid out through the text
+service in the theme's text style for its role — caption, body, heading,
+monospace and the rest — of its part of the window, so a theme change or an
+override's text scale sets it again; spans of the program's styles over it,
+their empty fields the label's. Measured as wide as its text would like and
+as tall as its text at the width offered; wrapping, no narrower than its
+widest word; at most a number of lines with an ellipsis, and then, not
+wrapping, cut to its width and no narrower than the ellipsis. Drawn in the
+theme's colour for its tone — text, secondary, accent, error, warning,
+success, link — faded when disabled, quieter in the backdrop, aligned across
+by its alignment in the widget's direction and centred down. Its text is its
+name to assistive technology, and the name of the widget it labels. A
+mnemonic (`_Save`; `__` for an underscore) underlines its letter while Alt is
+held; bound to the router, Alt and the letter focus what it labels.
 
 ## For scale
 
