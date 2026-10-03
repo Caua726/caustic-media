@@ -104,17 +104,21 @@ fn style_of(ts as style.TextStyle) as Style {
 // --- Runs ---
 
 struct Glyph {
-    x     as f64;   // the pen, from the run's top left
-    y     as f64;   // the baseline
-    id    as i64;
-    face  as i64;   // in the run's faces
-    style as i64;   // in the run's styles
+    x       as f64;   // the pen, from the run's top left
+    y       as f64;   // the baseline
+    adv     as f64;   // its advance, along the line
+    id      as i64;
+    face    as i64;   // in the run's faces
+    style   as i64;   // in the run's styles
+    cluster as i64;   // the byte offset of the first character it came from
 }
 
 struct Face {
-    font  as *font.Font;
-    index as i64;
-    px    as f64;
+    font    as *font.Font;
+    index   as i64;
+    px      as f64;
+    under_y as f64;   // an underline's top, below the baseline
+    under_h as f64;   // and its thickness
 }
 
 struct Line {
@@ -135,51 +139,166 @@ struct Deco {
     style as i64;
 }
 
+// What a widget keeps of its text: the text itself and how it was last laid
+// out, in one block — the text, then the glyphs, the faces, the lines, the
+// decorations and each style's colour. A label's whole text is one mapping.
 struct Run {
-    glyphs as model.Arr;
-    faces  as model.Arr;
-    lines  as model.Arr;
-    decos  as model.Arr;
-    colors as [16]math.color.Color;   // each style's
-    width  as f64;                    // the widest line's content
-    height as f64;
-    cut    as i32;                    // max_lines left text out
-    ok     as i32;                    // laid out
+    block   as *u8;
+    bytes   as i64;   // the block's size
+    nbytes  as i64;   // the text's
+    nglyphs as i64;
+    nfaces  as i64;
+    nlines  as i64;
+    ndecos  as i64;
+    nstyles as i64;
+    width   as f64;   // the widest line's content
+    height  as f64;
+    least   as f64;   // the widest stretch between break opportunities: no narrower breaks a word
+    cut     as i32;   // max_lines left text out
+    ok      as i32;   // laid out since the text was set
 }
 
 fn run() as Run {
     let is Run as r;
-    r.glyphs = model.arr(sizeof(Glyph));
-    r.faces = model.arr(sizeof(Face));
-    r.lines = model.arr(sizeof(Line));
-    r.decos = model.arr(sizeof(Deco));
+    r.block = cast(*u8, 0);
+    r.bytes = 0;
+    r.nbytes = 0;
+    r.nglyphs = 0;
+    r.nfaces = 0;
+    r.nlines = 0;
+    r.ndecos = 0;
+    r.nstyles = 0;
     r.width = 0.0;
     r.height = 0.0;
+    r.least = 0.0;
     r.cut = 0;
     r.ok = 0;
     return r;
 }
 
-fn run_close(r as *Run) as void {
-    model.arr_close(&r.glyphs);
-    model.arr_close(&r.faces);
-    model.arr_close(&r.lines);
-    model.arr_close(&r.decos);
+fn _forget(r as *Run) as void {
+    r.nglyphs = 0;
+    r.nfaces = 0;
+    r.nlines = 0;
+    r.ndecos = 0;
+    r.nstyles = 0;
+    r.width = 0.0;
+    r.height = 0.0;
+    r.least = 0.0;
+    r.cut = 0;
     r.ok = 0;
 }
 
-fn glyph_count(r as *Run) as i64 { return r.glyphs.n; }
-fn glyph(r as *Run, i as i64) as *Glyph { return cast(*Glyph, model.arr_at(&r.glyphs, i)); }
-fn face_count(r as *Run) as i64 { return r.faces.n; }
-fn face(r as *Run, i as i64) as *Face { return cast(*Face, model.arr_at(&r.faces, i)); }
-fn line_count(r as *Run) as i64 { return r.lines.n; }
-fn line(r as *Run, i as i64) as *Line { return cast(*Line, model.arr_at(&r.lines, i)); }
-fn deco_count(r as *Run) as i64 { return r.decos.n; }
-fn deco(r as *Run, i as i64) as *Deco { return cast(*Deco, model.arr_at(&r.decos, i)); }
+fn run_close(r as *Run) as void {
+    if (r.bytes > 0) { mem.core.munmap(r.block, r.bytes); }
+    r.block = cast(*u8, 0);
+    r.bytes = 0;
+    r.nbytes = 0;
+    _forget(r);
+}
+
+fn _a8(n as i64) as i64 { return (n + 7) / 8 * 8; }
+
+// The block at least need bytes, its first keep kept: 1, or 0 when memory is
+// refused, the run as it was.
+fn _room(r as *Run, need as i64, keep as i64) as i32 {
+    if (need <= r.bytes) { return 1; }
+    let is i64 as size = (need + 4095) / 4096 * 4096;
+    let is *u8 as nb = mem.core.mmap_anon(size);
+    if (cast(i64, nb) <= 0) { return 0; }
+    if (keep > 0) { mem.memcpy(nb, r.block, keep); }
+    if (r.bytes > 0) { mem.core.munmap(r.block, r.bytes); }
+    r.block = nb;
+    r.bytes = size;
+    return 1;
+}
+
+// The run's text from here on: n bytes of UTF-8 copied in — from anywhere,
+// the run's own text included — and nothing laid out. 1, or 0 when memory is
+// refused, the run as it was.
+fn set_text(r as *Run, text as *u8, n as i64) as i32 {
+    if (n < 0) { return 0; }
+    let is i64 as at = cast(i64, text) - cast(i64, r.block);
+    if (r.bytes > 0 && at >= 0 && at < r.bytes) {
+        // Part of its own: moved to the front, which is never past it.
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            r.block[i] = r.block[at + i];
+            i = i + 1;
+        }
+    } else {
+        if (_room(r, _a8(n), 0) == 0) { return 0; }
+        if (n > 0) { mem.memcpy(r.block, text, n); }
+    }
+    r.nbytes = n;
+    _forget(r);
+    return 1;
+}
+
+// The text, which the caller may change in place before the run is laid out
+// again; set_length shortens it.
+fn text_of(r as *Run) as *u8 { return r.block; }
+fn text_length(r as *Run) as i64 { return r.nbytes; }
+
+fn set_length(r as *Run, n as i64) as void {
+    if (n >= 0 && n <= r.nbytes) {
+        r.nbytes = n;
+        _forget(r);
+    }
+}
+
+fn _glyphs(r as *Run) as i64 { return cast(i64, r.block) + _a8(r.nbytes); }
+fn _faces(r as *Run) as i64 { return _glyphs(r) + r.nglyphs * sizeof(Glyph); }
+fn _lines(r as *Run) as i64 { return _faces(r) + r.nfaces * sizeof(Face); }
+fn _decos(r as *Run) as i64 { return _lines(r) + r.nlines * sizeof(Line); }
+fn _colors(r as *Run) as i64 { return _decos(r) + r.ndecos * sizeof(Deco); }
+
+fn glyph_count(r as *Run) as i64 { return r.nglyphs; }
+fn glyph(r as *Run, i as i64) as *Glyph { return cast(*Glyph, _glyphs(r) + i * sizeof(Glyph)); }
+fn face_count(r as *Run) as i64 { return r.nfaces; }
+fn face(r as *Run, i as i64) as *Face { return cast(*Face, _faces(r) + i * sizeof(Face)); }
+fn line_count(r as *Run) as i64 { return r.nlines; }
+fn line(r as *Run, i as i64) as *Line { return cast(*Line, _lines(r) + i * sizeof(Line)); }
+fn deco_count(r as *Run) as i64 { return r.ndecos; }
+fn deco(r as *Run, i as i64) as *Deco { return cast(*Deco, _decos(r) + i * sizeof(Deco)); }
+
+// Style k's colour, alpha 0 when it has none of its own.
+fn color_of(r as *Run, k as i64) as math.color.Color {
+    return *cast(*math.color.Color, _colors(r) + k * sizeof(math.color.Color));
+}
+
+// The rectangle under the character at byte offset at — its glyphs', where an
+// underline of it alone would be drawn — into *out: 1, or 0 when no glyph
+// starts there. The underlined letter of a mnemonic.
+fn underline_at(r as *Run, at as i64, out as *Deco) as i32 {
+    let is i32 as any with mut = 0;
+    let is f64 as x1 with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < r.nglyphs) {
+        let is *Glyph as g = glyph(r, i);
+        if (g.cluster == at) {
+            let is *Face as f = face(r, g.face);
+            if (any == 0) {
+                out.x = g.x;
+                out.y = g.y + f.under_y;
+                out.h = f.under_h;
+                out.style = g.style;
+                x1 = g.x + g.adv;
+                any = 1;
+            } else {
+                if (g.x < out.x) { out.x = g.x; }
+                if (g.x + g.adv > x1) { x1 = g.x + g.adv; }
+            }
+        }
+        i = i + 1;
+    }
+    if (any == 1) { out.w = x1 - out.x; }
+    return any;
+}
 
 // The first line's baseline, from the run's top; 0 for a run of no lines.
 fn baseline(r as *Run) as f64 {
-    if (r.lines.n == 0) { return 0.0; }
+    if (r.nlines == 0) { return 0.0; }
     return line(r, 0).y;
 }
 
@@ -343,35 +462,13 @@ fn font_for(s as *Service, family as *u8, weight as i64, italic as i32) as *font
 
 // --- Laying out ---
 
-fn _face_index(r as *Run, f as *font.Font, index as i64, px as f64) as i64 {
-    let is i64 as i with mut = 0;
-    while (i < r.faces.n) {
-        let is *Face as fc = face(r, i);
-        if (cast(i64, fc.font) == cast(i64, f) && fc.index == index && fc.px == px) { return i; }
-        i = i + 1;
-    }
-    let is *Face as fc = cast(*Face, model.arr_push(&r.faces));
-    if (cast(i64, fc) == 0) { return 0 - 1; }
-    fc.font = f;
-    fc.index = index;
-    fc.px = px;
-    return r.faces.n - 1;
-}
-
-// The text — nbytes of UTF-8 — set in styles, each span of it in its style
-// and the rest in style 0, in the box params describes, into r: 1, or 0 when
-// it could not be — a style with no font, more than MAX_STYLES of them, or
-// what layout refuses.
-fn lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, nstyles as i64,
-       spans as *model.Span, nspans as i64, params as *model.Params) as i32 {
-    r.glyphs.n = 0;
-    r.faces.n = 0;
-    r.lines.n = 0;
-    r.decos.n = 0;
-    r.width = 0.0;
-    r.height = 0.0;
-    r.cut = 0;
-    r.ok = 0;
+// The run's text set in styles, each span of it in its style and the rest
+// in style 0, in the box params describes: 1, or 0 when it could not be — a
+// style with no font, more than MAX_STYLES of them, memory refused, or what
+// layout refuses — and then nothing is laid out.
+fn lay_text(s as *Service, r as *Run, styles as *Style, nstyles as i64, spans as *model.Span, nspans as i64,
+            params as *model.Params) as i32 {
+    _forget(r);
     if (nstyles < 1 || nstyles > MAX_STYLES) { return 0; }
     let is i64 as k with mut = 0;
     while (k < nstyles) {
@@ -383,32 +480,78 @@ fn lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, n
         ls.px = st.size;
         ls.underline = st.underline;
         ls.strike = st.strike;
-        r.colors[k] = st.color;
         k = k + 1;
     }
-    if (layout.set(&s.lay, text, nbytes, cast(*model.Style, &s.lstyles), nstyles, spans, nspans, params) == 0) {
+    let is *layout.Layout as l = &s.lay;
+    if (layout.set(l, r.block, r.nbytes, cast(*model.Style, &s.lstyles), nstyles, spans, nspans, params) == 0) {
         return 0;
     }
-    let is *layout.Layout as l = &s.lay;
+    // The faces, each layout slot's once, in the order glyphs first use
+    // them. A layout has no more slots than font.MAX_SIZED, and never one
+    // face in two.
+    let is [16]i64 as of_slot;
+    let is [16]Face as found;
+    let is i64 as nf with mut = 0;
+    k = 0;
+    while (k < font.MAX_SIZED) {
+        of_slot[k] = 0 - 1;
+        k = k + 1;
+    }
+    let is i64 as ng = layout.glyph_count(l);
     let is i64 as i with mut = 0;
-    while (i < layout.glyph_count(l)) {
+    while (i < ng) {
+        let is i64 as slot = cast(i64, layout.glyph(l, i).slot);
+        if (of_slot[slot] < 0) {
+            let is *font.Sized as z = layout.face(l, slot);
+            found[nf].font = z.font;
+            found[nf].index = z.index;
+            found[nf].px = z.px;
+            // As text/layout puts an underline: the face's own, or a tenth
+            // of an em down and a fourteenth thick when it says none.
+            let is f64 as em = cast(f64, z.m.upem);
+            let is f64 as thick with mut = cast(f64, z.m.underline_thickness);
+            if (thick <= 0.0) { thick = em / 14.0; }
+            let is f64 as pos with mut = cast(f64, z.m.underline_pos);
+            if (pos == 0.0) { pos = 0.0 - em / 10.0; }
+            found[nf].under_y = 0.0 - pos * z.scale;
+            found[nf].under_h = thick * z.scale;
+            of_slot[slot] = nf;
+            nf = nf + 1;
+        }
+        i = i + 1;
+    }
+    let is i64 as nl = layout.line_count(l);
+    let is i64 as nd = layout.deco_count(l);
+    let is i64 as need = _a8(r.nbytes) + ng * sizeof(Glyph) + nf * sizeof(Face) + nl * sizeof(Line) +
+                         nd * sizeof(Deco) + nstyles * sizeof(math.color.Color);
+    if (_room(r, need, r.nbytes) == 0) { return 0; }
+    r.nglyphs = ng;
+    r.nfaces = nf;
+    r.nlines = nl;
+    r.ndecos = nd;
+    r.nstyles = nstyles;
+    i = 0;
+    while (i < ng) {
         let is *model.Glyph as g = layout.glyph(l, i);
-        let is *font.Sized as z = layout.face(l, cast(i64, g.slot));
-        let is i64 as fi = _face_index(r, z.font, z.index, z.px);
-        let is *Glyph as out = cast(*Glyph, model.arr_push(&r.glyphs));
-        if (fi < 0 || cast(i64, out) == 0) { return 0; }
+        let is *Glyph as out = glyph(r, i);
         out.x = g.x;
         out.y = g.y;
+        out.adv = g.adv;
         out.id = cast(i64, g.id);
-        out.face = fi;
+        out.face = of_slot[cast(i64, g.slot)];
         out.style = cast(i64, g.style);
+        out.cluster = cast(i64, g.cluster);
         i = i + 1;
     }
     i = 0;
-    while (i < layout.line_count(l)) {
+    while (i < nf) {
+        *face(r, i) = found[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < nl) {
         let is *model.Line as ml = layout.line(l, i);
-        let is *Line as ln = cast(*Line, model.arr_push(&r.lines));
-        if (cast(i64, ln) == 0) { return 0; }
+        let is *Line as ln = line(r, i);
         ln.x = ml.x;
         ln.top = ml.top;
         ln.y = ml.y;
@@ -419,10 +562,9 @@ fn lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, n
         i = i + 1;
     }
     i = 0;
-    while (i < layout.deco_count(l)) {
+    while (i < nd) {
         let is *model.Deco as md = layout.deco(l, i);
-        let is *Deco as dc = cast(*Deco, model.arr_push(&r.decos));
-        if (cast(i64, dc) == 0) { return 0; }
+        let is *Deco as dc = deco(r, i);
         dc.x = md.x;
         dc.y = md.y;
         dc.w = md.w;
@@ -430,11 +572,25 @@ fn lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, n
         dc.style = md.style;
         i = i + 1;
     }
+    k = 0;
+    while (k < nstyles) {
+        *cast(*math.color.Color, _colors(r) + k * sizeof(math.color.Color)) = styles[k].color;
+        k = k + 1;
+    }
     r.width = layout.width(l);
     r.height = layout.height(l);
+    r.least = layout.min_width(l);
     r.cut = layout.cut(l);
     r.ok = 1;
     return 1;
+}
+
+// The text — nbytes of UTF-8, copied into the run — laid out as lay_text
+// does.
+fn lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, nstyles as i64,
+       spans as *model.Span, nspans as i64, params as *model.Params) as i32 {
+    if (set_text(r, text, nbytes) == 0) { return 0; }
+    return lay_text(s, r, styles, nstyles, spans, nspans, params);
 }
 
 // One style over the whole of the text: the common case.
@@ -531,11 +687,11 @@ fn draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as
     let is f64 as cw = cast(f64, s.colors.w);
     let is f64 as chh = cast(f64, s.colors.h);
     let is i64 as i with mut = 0;
-    while (i < r.glyphs.n) {
+    while (i < r.nglyphs) {
         let is *Glyph as g = glyph(r, i);
         let is *Face as fc = face(r, g.face);
         let is *Open as o = _open(s, fc);
-        let is math.color.Color as col with mut = r.colors[g.style];
+        let is math.color.Color as col with mut = color_of(r, g.style);
         if (col.a <= 0.0) { col = fg; }
         if (cast(i64, o) == 0) {
             ok = 0;
@@ -577,9 +733,9 @@ fn draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as
         i = i + 1;
     }
     i = 0;
-    while (i < r.decos.n) {
+    while (i < r.ndecos) {
         let is *Deco as dc = deco(r, i);
-        let is math.color.Color as col with mut = r.colors[dc.style];
+        let is math.color.Color as col with mut = color_of(r, dc.style);
         if (col.a <= 0.0) { col = fg; }
         shapes.fill_rect(c, x + dc.x, y + dc.y, dc.w, dc.h, col);
         i = i + 1;

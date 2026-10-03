@@ -543,9 +543,13 @@ The Windows registry comes with the Win32 backend.
 **Text** (`text.cst`, tested by `text_test`): one service per application,
 on a device or with none for measuring alone, sized once (`text.Limits`: the
 glyph pages and their side, the glyphs the caches remember, the faces open
-for drawing at once). It lays out with its one `text/layout` Layout and copies
-what a widget keeps into a run — glyphs with their faces named by font, face
-and size, lines, decorations, each style's colour. Fonts come through the
+for drawing at once). It lays out with its one `text/layout` Layout into the
+run a widget keeps — one block holding the text itself, copied, and how it was
+laid out: glyphs with their clusters and advances and their faces named by
+font, face and size, lines, decorations, each style's colour, and the least
+width the text can be given without a word broken. A run lays out its own text
+again, as a theme change asks, and says where an underline of one character
+goes, as a mnemonic's is drawn. Fonts come through the
 program's resolver, asked once for each family, weight and style and
 remembered by name — sixteen of them, the rest asked again each time; a style
 of no family takes the theme's. Drawing rasterizes each glyph at the size and
