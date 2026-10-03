@@ -1,0 +1,511 @@
+// text/shape/seq.cst — matching a lookup's sequences, and the lookups that
+// context rules nest. What GSUB and GPOS share.
+//
+// A lookup looks at the glyphs its flag lets it see: not the bases, the
+// ligatures or the marks it says to ignore, nor marks of another attachment
+// class or outside its mark filtering set. A default ignorable is passed
+// over when it is not the item a rule asks for — save, in GSUB, a hidden one
+// (chars.is_hidden), which substitutions must see, and a ZWNJ within the
+// input, which is there to stop a ligature; and a ZWJ within the input of a
+// feature that handles joiners itself (plan.F_MANUAL_JOINERS).
+//
+// A rule's items are matched by glyph, by class or by coverage, one after
+// another from the current glyph: the input, which the rule acts on, must
+// also be glyphs the feature applies to; the backtrack, before it, is looked
+// for among the glyphs already done, and the lookahead after the input.
+use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
+use "../outline/outline.cst" as outline;
+use "glyphs.cst" as glyphs;
+use "otl.cst" as otl;
+use "plan.cst" as plan;
+
+let is i64 as MAX_DEPTH with imut = 64;
+let is i64 as MAX_SEQ with imut = 64;
+
+// Lookup flags.
+let is i64 as RIGHT_TO_LEFT with imut = 1;
+let is i64 as IGNORE_BASES with imut = 2;
+let is i64 as IGNORE_LIGATURES with imut = 4;
+let is i64 as IGNORE_MARKS with imut = 8;
+let is i64 as USE_MARK_FILTER with imut = 16;
+
+// What a rule's items are.
+let is i64 as BY_ANY with imut = 0;
+let is i64 as BY_GLYPH with imut = 1;
+let is i64 as BY_CLASS with imut = 2;
+let is i64 as BY_COVERAGE with imut = 3;
+
+// Where they are looked for.
+let is i64 as INPUT with imut = 0;
+let is i64 as CONTEXT with imut = 1;
+
+// A lookup applied at the current glyph: GSUB's or GPOS's own.
+type Apply = fn(*Ctx, i64) as i32;
+
+struct Ctx {
+    f        as *table.Face;
+    r        as *outline.Reader;
+    run      as *glyphs.Run;
+    l        as *otl.Layout;
+    t        as i64;      // plan.GSUB or plan.GPOS
+    apply    as Apply;
+    dir      as i64;      // the direction the run is in
+    lookup   as i64;      // the lookup being applied
+    flag     as i64;      // its flag
+    filter   as i64;      // its mark filtering set, otl.NONE for none
+    mask     as i64;      // the features it is applied for
+    flags    as i64;      // plan.F_* of those
+    classes  as i32;      // the face has GDEF classes
+    _pad0    as i32;
+    store    as var.Store;
+    depth    as i64;
+    pos      as *i64;     // where the current rule's input is
+    stack    as [4160]i64;    // MAX_SEQ positions for each level
+}
+
+fn open(c as *Ctx, f as *table.Face, r as *outline.Reader, run as *glyphs.Run, l as *otl.Layout, t as i64,
+        apply as Apply, dir as i64) as void {
+    c.f = f;
+    c.r = r;
+    c.run = run;
+    c.l = l;
+    c.t = t;
+    c.apply = apply;
+    c.dir = dir;
+    c.lookup = otl.NONE;
+    c.flag = 0;
+    c.filter = otl.NONE;
+    c.mask = 0;
+    c.flags = 0;
+    c.classes = otl.has_classes(f);
+    c._pad0 = 0;
+    c.store = otl.store(f);
+    c.depth = 0;
+    c.pos = cast(*i64, &c.stack);
+}
+
+// The lookup at lk made the one being applied: its flag and filter.
+fn set_lookup(c as *Ctx, index as i64, lk as i64) as void {
+    c.lookup = index;
+    c.flag = otl.lookup_flag(c.f, c.l, lk);
+    c.filter = otl.mark_filter(c.f, c.l, lk);
+}
+
+fn u16(c as *Ctx, at as i64) as i64 { return otl.u16(c.f, c.l.t, at); }
+
+// --- The run, where the lookup is ---
+
+fn here(c as *Ctx) as i64 { return glyphs.here(c.run); }
+fn total(c as *Ctx) as i64 { return glyphs.total(c.run); }
+fn at(c as *Ctx, k as i64) as *glyphs.Glyph { return glyphs.at(c.run, k); }
+fn cur(c as *Ctx) as *glyphs.Glyph { return glyphs.at(c.run, glyphs.here(c.run)); }
+
+// The lookup moved to record k of the run.
+fn go(c as *Ctx, k as i64) as i32 {
+    if (c.run.passing == 1) { return glyphs.seek(c.run, k); }
+    c.run.i = k;
+    return 1;
+}
+
+// --- What a lookup sees ---
+
+// Whether the lookup's flag has it pass over g.
+fn ignored(c as *Ctx, g as *glyphs.Glyph) as i32 {
+    let is i64 as cls = cast(i64, g.cls);
+    if (cls == glyphs.BASE && (c.flag & IGNORE_BASES) != 0) { return 1; }
+    if (cls == glyphs.LIGATURE && (c.flag & IGNORE_LIGATURES) != 0) { return 1; }
+    if (cls == glyphs.MARK) {
+        if ((c.flag & IGNORE_MARKS) != 0) { return 1; }
+        if ((c.flag & USE_MARK_FILTER) != 0 && c.filter != otl.NONE) {
+            return 1 - otl.in_mark_set(c.f, c.filter, cast(i64, g.id));
+        }
+        let is i64 as want = (c.flag >> 8) & 255;
+        if (want != 0 && want != cast(i64, g.mclass)) { return 1; }
+    }
+    return 0;
+}
+
+// Whether g, a default ignorable, may be passed over when it is not the item
+// looked for.
+fn passable(c as *Ctx, g as *glyphs.Glyph, where as i64) as i32 {
+    let is i64 as u = cast(i64, g.uflags);
+    if ((u & glyphs.U_IGNORABLE) == 0) { return 0; }
+    if (c.t == plan.GSUB && (u & glyphs.U_HIDDEN) != 0) { return 0; }
+    if (where == INPUT) {
+        if (c.t == plan.GSUB && (u & glyphs.U_ZWNJ) != 0) { return 0; }
+        if ((c.flags & plan.F_MANUAL_JOINERS) != 0 && (u & glyphs.U_ZWJ) != 0) { return 0; }
+    }
+    return 1;
+}
+
+// Whether g is the item value, matched by `by` against base.
+fn is_item(c as *Ctx, g as *glyphs.Glyph, by as i64, base as i64, value as i64) as i32 {
+    let is i64 as id = cast(i64, g.id);
+    if (by == BY_GLYPH) { return cast(i32, id == value); }
+    if (by == BY_CLASS) { return cast(i32, otl.class_of(c.f, c.l.t, base, id) == value); }
+    if (by == BY_COVERAGE) {
+        if (value == 0) { return 0; }
+        return cast(i32, otl.coverage(c.f, c.l.t, base + value, id) != otl.NONE);
+    }
+    return 1;
+}
+
+// The next item after record from: the record it is, or otl.NONE when the
+// text ends first or a record that may not be passed over is not it.
+fn find_next(c as *Ctx, from as i64, where as i64, by as i64, base as i64, value as i64) as i64 {
+    let is i64 as t = total(c);
+    let is i64 as k with mut = from + 1;
+    while (k < t) {
+        let is *glyphs.Glyph as g = at(c, k);
+        if (ignored(c, g) == 0) {
+            let is i32 as pass = passable(c, g, where);
+            let is i32 as wanted with mut = 1;
+            if (where == INPUT && (cast(i64, g.mask) & c.mask) == 0) { wanted = 0; }
+            if (by == BY_ANY && pass == 1) { wanted = 0; }
+            if (wanted == 1 && is_item(c, g, by, base, value) == 1) { return k; }
+            if (pass == 0) { return otl.NONE; }
+        }
+        k = k + 1;
+    }
+    return otl.NONE;
+}
+
+// The item before record from, among those already done.
+fn find_prev(c as *Ctx, from as i64, where as i64, by as i64, base as i64, value as i64) as i64 {
+    let is i64 as k with mut = from - 1;
+    while (k >= 0) {
+        let is *glyphs.Glyph as g = at(c, k);
+        if (ignored(c, g) == 0) {
+            let is i32 as pass = passable(c, g, where);
+            let is i32 as wanted with mut = 1;
+            if (where == INPUT && (cast(i64, g.mask) & c.mask) == 0) { wanted = 0; }
+            if (by == BY_ANY && pass == 1) { wanted = 0; }
+            if (wanted == 1 && is_item(c, g, by, base, value) == 1) { return k; }
+            if (pass == 0) { return otl.NONE; }
+        }
+        k = k - 1;
+    }
+    return otl.NONE;
+}
+
+// --- Sequences ---
+
+// The components a glyph is made of: a ligature's count, 1 for any other.
+fn own_count(g as *glyphs.Glyph) as i64 {
+    if (g.cls == cast(u8, glyphs.LIGATURE) && g.lig != cast(u8, 0) && g.comp == cast(u8, 0) && g.ncomp != cast(u8, 0)) {
+        return cast(i64, g.ncomp);
+    }
+    return 1;
+}
+
+// The components it brings to a ligature it becomes part of: none for a
+// piece of a glyph split by a multiple substitution past the first, which
+// stands for the whole.
+fn components(g as *glyphs.Glyph) as i64 {
+    if ((cast(i64, g.made) & glyphs.MULTIPLIED) != 0 && g.comp != cast(u8, 0)) { return 0; }
+    return own_count(g);
+}
+
+// Whether the lookup passes over the ligature mark g belongs to.
+fn _passes_ligature(c as *Ctx, g as *glyphs.Glyph) as i32 {
+    let is i64 as k with mut = here(c) - 1;
+    while (k >= 0) {
+        let is *glyphs.Glyph as h = at(c, k);
+        if (h.lig != g.lig) { return 0; }
+        if (h.comp == cast(u8, 0)) { return ignored(c, h); }
+        k = k - 1;
+    }
+    return 0;
+}
+
+// The input, count items from the current glyph — the first is it, the rest
+// matched against the values at vals — into c.pos: 1, with *end just past
+// the last; or 0. A ligature is not formed from marks of another ligature's
+// components. *comps, unless null, counts the components of what matched.
+fn match_input(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, end as *i64, comps as *i64) as i32 {
+    if (count < 1 || count > MAX_SEQ) { return 0; }
+    let is i64 as h = here(c);
+    let is *glyphs.Glyph as first = at(c, h);
+    c.pos[0] = h;
+    let is i64 as n with mut = own_count(first);
+    let is i32 as on_component = cast(i32, first.lig != cast(u8, 0) && first.comp != cast(u8, 0));
+    let is i64 as freed with mut = 0 - 1;   // whether the lookup passes over first's ligature: unknown yet
+    let is i64 as k with mut = h;
+    let is i64 as i with mut = 1;
+    while (i < count) {
+        k = find_next(c, k, INPUT, by, base, u16(c, vals + (i - 1) * 2));
+        if (k == otl.NONE) { return 0; }
+        let is *glyphs.Glyph as g = at(c, k);
+        if (on_component == 1) {
+            if (g.lig != first.lig || g.comp != first.comp) {
+                if (freed < 0) { freed = cast(i64, _passes_ligature(c, first)); }
+                if (freed == 0) { return 0; }
+            }
+        } else if (g.lig != cast(u8, 0) && g.comp != cast(u8, 0) && g.lig != first.lig) {
+            return 0;
+        }
+        c.pos[i] = k;
+        n = n + components(g);
+        i = i + 1;
+    }
+    *end = k + 1;
+    if (cast(i64, comps) != 0) { *comps = n; }
+    return 1;
+}
+
+// The backtrack: count items before the current glyph: 1, with *start where
+// the first of them is; or 0.
+fn match_backtrack(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, start as *i64) as i32 {
+    let is i64 as k with mut = here(c);
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        k = find_prev(c, k, CONTEXT, by, base, u16(c, vals + i * 2));
+        if (k == otl.NONE) { return 0; }
+        i = i + 1;
+    }
+    *start = k;
+    return 1;
+}
+
+// The lookahead: count items after record from: 1, with *end just past the
+// last of them; or 0.
+fn match_lookahead(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, from as i64, end as *i64) as i32 {
+    let is i64 as k with mut = from;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        k = find_next(c, k, CONTEXT, by, base, u16(c, vals + i * 2));
+        if (k == otl.NONE) { return 0; }
+        i = i + 1;
+    }
+    *end = k + 1;
+    return 1;
+}
+
+// --- Nested lookups ---
+
+// Lookup index applied at the current glyph, one level deeper. Lookups
+// nested deeper than MAX_DEPTH are a font gone round in circles: the shaping
+// fails, as it does when the work runs out.
+fn nest(c as *Ctx, index as i64) as i32 {
+    if (c.depth >= MAX_DEPTH) {
+        c.run.ok = 0;
+        return 0;
+    }
+    if (glyphs.step(c.run, 1) == 0) { return 0; }
+    let is i64 as lk = otl.lookup(c.f, c.l, index);
+    if (lk == 0) { return 0; }
+    let is i64 as saved_lookup = c.lookup;
+    let is i64 as saved_flag = c.flag;
+    let is i64 as saved_filter = c.filter;
+    let is *i64 as saved_pos = c.pos;
+    c.depth = c.depth + 1;
+    c.pos = cast(*i64, cast(i64, &c.stack) + c.depth * MAX_SEQ * 8);
+    set_lookup(c, index, lk);
+    let is i32 as done = call(c.apply, c, index);
+    c.lookup = saved_lookup;
+    c.flag = saved_flag;
+    c.filter = saved_filter;
+    c.pos = saved_pos;
+    c.depth = c.depth - 1;
+    return done;
+}
+
+// The lookup records at recs — nrec of them, a sequence index and a lookup
+// index each — applied to the input matched, count items in c.pos ending
+// before end; then the lookup moved past it. A nested lookup may add or
+// remove glyphs where it applies: the positions after move with them.
+fn apply_records(c as *Ctx, count0 as i64, nrec as i64, recs as i64, end0 as i64) as void {
+    let is i64 as count with mut = count0;
+    let is i64 as end with mut = end0;
+    let is i64 as j with mut = 0;
+    while (j < nrec && c.run.ok == 1) {
+        let is i64 as idx = u16(c, recs + j * 4);
+        let is i64 as index = u16(c, recs + j * 4 + 2);
+        j = j + 1;
+        if (idx < count) {
+            let is i64 as before = total(c);
+            let is i64 as p = c.pos[idx];
+            if (p < before && go(c, p) == 1 && nest(c, index) == 1) {
+                let is i64 as delta with mut = total(c) - before;
+                if (delta != 0) {
+                    end = end + delta;
+                    if (end < p) {
+                        delta = delta + p - end;
+                        end = p;
+                    }
+                    if (delta > 0) {
+                        if (count + delta > MAX_SEQ) {
+                            j = nrec;
+                        } else {
+                            // New glyphs right after the one it applied to.
+                            let is i64 as k with mut = count - 1;
+                            while (k > idx) {
+                                c.pos[k + delta] = c.pos[k] + delta;
+                                k = k - 1;
+                            }
+                            k = 1;
+                            while (k <= delta) {
+                                c.pos[idx + k] = p + k;
+                                k = k + 1;
+                            }
+                            count = count + delta;
+                        }
+                    } else if (delta < 0) {
+                        // Glyphs gone after it: as many of the positions after it.
+                        let is i64 as gone with mut = 0 - delta;
+                        if (gone > count - idx - 1) { gone = count - idx - 1; }
+                        let is i64 as k with mut = idx + 1;
+                        while (k + gone < count) {
+                            c.pos[k] = c.pos[k + gone] + delta;
+                            k = k + 1;
+                        }
+                        count = count - gone;
+                    }
+                }
+            }
+        }
+    }
+    go(c, end);
+}
+
+// --- Context: GSUB's type 5 and GPOS's 7 ---
+
+// The offset at offsets + 2 i of a list of n, from base; 0 for one past the
+// list or null.
+fn offset(c as *Ctx, base as i64, n as i64, offsets as i64, i as i64) as i64 {
+    if (i < 0 || i >= n) { return 0; }
+    return otl.off16(c.f, c.l.t, base, offsets + i * 2);
+}
+
+// A rule's input matched and its lookups applied.
+fn _context_apply(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, nrec as i64, recs as i64) as i32 {
+    let is i64 as end with mut = 0;
+    if (match_input(c, count, by, base, vals, &end, cast(*i64, 0)) == 0) { return 0; }
+    glyphs.mark_unsafe(c.run, here(c), end);
+    apply_records(c, count, nrec, recs, end);
+    return 1;
+}
+
+// The first rule of the set at set that matches, applied.
+fn _rule_set(c as *Ctx, set as i64, by as i64, base as i64) as i32 {
+    if (set == 0) { return 0; }
+    let is i64 as n = u16(c, set);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as rule = offset(c, set, n, set + 2, i);
+        if (rule != 0) {
+            let is i64 as count = u16(c, rule);
+            let is i64 as nrec = u16(c, rule + 2);
+            let is i64 as recs with mut = rule + 4;
+            if (count > 0) { recs = rule + 4 + (count - 1) * 2; }
+            if (_context_apply(c, count, by, base, rule + 4, nrec, recs) == 1) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn context(c as *Ctx, st as i64) as i32 {
+    let is i64 as format = u16(c, st);
+    let is i64 as g = cast(i64, cur(c).id);
+    if (format == 1 || format == 2) {
+        let is i64 as index = otl.coverage(c.f, c.l.t, otl.off16(c.f, c.l.t, st, st + 2), g);
+        if (index == otl.NONE) { return 0; }
+        if (format == 1) {
+            let is i64 as n = u16(c, st + 4);
+            return _rule_set(c, offset(c, st, n, st + 6, index), BY_GLYPH, 0);
+        }
+        let is i64 as cd = otl.off16(c.f, c.l.t, st, st + 4);
+        let is i64 as n = u16(c, st + 6);
+        return _rule_set(c, offset(c, st, n, st + 8, otl.class_of(c.f, c.l.t, cd, g)), BY_CLASS, cd);
+    }
+    if (format == 3) {
+        let is i64 as count = u16(c, st + 2);
+        let is i64 as nrec = u16(c, st + 4);
+        if (count == 0) { return 0; }
+        if (otl.coverage(c.f, c.l.t, otl.off16(c.f, c.l.t, st, st + 6), g) == otl.NONE) { return 0; }
+        return _context_apply(c, count, BY_COVERAGE, st, st + 8, nrec, st + 6 + count * 2);
+    }
+    return 0;
+}
+
+// --- Chained context: GSUB's type 6 and GPOS's 8 ---
+
+// A chained rule: the input, then the lookahead after it and the backtrack
+// before it, each matched against its own class definition (or coverages
+// from st); then the lookups applied.
+fn _chain_apply(c as *Ctx, nback as i64, back as i64, ninput as i64, input as i64, nahead as i64, ahead as i64,
+                nrec as i64, recs as i64, by as i64, bbase as i64, ibase as i64, abase as i64) as i32 {
+    let is i64 as end with mut = 0;
+    if (match_input(c, ninput, by, ibase, input, &end, cast(*i64, 0)) == 0) { return 0; }
+    let is i64 as last with mut = end;
+    if (match_lookahead(c, nahead, by, abase, ahead, end - 1, &last) == 0) { return 0; }
+    let is i64 as start with mut = here(c);
+    if (match_backtrack(c, nback, by, bbase, back, &start) == 0) { return 0; }
+    glyphs.mark_unsafe(c.run, start, last);
+    apply_records(c, ninput, nrec, recs, end);
+    return 1;
+}
+
+fn _chain_rule(c as *Ctx, rule as i64, by as i64, bbase as i64, ibase as i64, abase as i64) as i32 {
+    let is i64 as nback = u16(c, rule);
+    let is i64 as back = rule + 2;
+    let is i64 as at_input = back + nback * 2;
+    let is i64 as ninput = u16(c, at_input);
+    let is i64 as input = at_input + 2;
+    let is i64 as at_ahead with mut = input;
+    if (ninput > 0) { at_ahead = input + (ninput - 1) * 2; }
+    let is i64 as nahead = u16(c, at_ahead);
+    let is i64 as ahead = at_ahead + 2;
+    let is i64 as at_recs = ahead + nahead * 2;
+    let is i64 as nrec = u16(c, at_recs);
+    return _chain_apply(c, nback, back, ninput, input, nahead, ahead, nrec, at_recs + 2, by, bbase, ibase, abase);
+}
+
+fn _chain_set(c as *Ctx, set as i64, by as i64, bbase as i64, ibase as i64, abase as i64) as i32 {
+    if (set == 0) { return 0; }
+    let is i64 as n = u16(c, set);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as rule = offset(c, set, n, set + 2, i);
+        if (rule != 0 && _chain_rule(c, rule, by, bbase, ibase, abase) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn chain(c as *Ctx, st as i64) as i32 {
+    let is i64 as format = u16(c, st);
+    let is i64 as g = cast(i64, cur(c).id);
+    if (format == 1 || format == 2) {
+        let is i64 as index = otl.coverage(c.f, c.l.t, otl.off16(c.f, c.l.t, st, st + 2), g);
+        if (index == otl.NONE) { return 0; }
+        if (format == 1) {
+            let is i64 as n = u16(c, st + 4);
+            return _chain_set(c, offset(c, st, n, st + 6, index), BY_GLYPH, 0, 0, 0);
+        }
+        let is i64 as bcd = otl.off16(c.f, c.l.t, st, st + 4);
+        let is i64 as icd = otl.off16(c.f, c.l.t, st, st + 6);
+        let is i64 as acd = otl.off16(c.f, c.l.t, st, st + 8);
+        let is i64 as n = u16(c, st + 10);
+        return _chain_set(c, offset(c, st, n, st + 12, otl.class_of(c.f, c.l.t, icd, g)), BY_CLASS, bcd, icd, acd);
+    }
+    if (format == 3) {
+        let is i64 as nback = u16(c, st + 2);
+        let is i64 as back = st + 4;
+        let is i64 as at_input = back + nback * 2;
+        let is i64 as ninput = u16(c, at_input);
+        let is i64 as input = at_input + 2;
+        if (ninput == 0) { return 0; }
+        if (otl.coverage(c.f, c.l.t, otl.off16(c.f, c.l.t, st, input), g) == otl.NONE) { return 0; }
+        let is i64 as at_ahead = input + ninput * 2;
+        let is i64 as nahead = u16(c, at_ahead);
+        let is i64 as ahead = at_ahead + 2;
+        let is i64 as at_recs = ahead + nahead * 2;
+        let is i64 as nrec = u16(c, at_recs);
+        return _chain_apply(c, nback, back, ninput, input + 2, nahead, ahead, nrec, at_recs + 2,
+                            BY_COVERAGE, st, st, st);
+    }
+    return 0;
+}

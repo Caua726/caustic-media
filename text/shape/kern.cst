@@ -1,65 +1,50 @@
-// text/shape/kern.cst — the legacy kern table, as shaping uses it: applied
-// when GPOS does not kern, and read for what it holds that changes how
-// marks are positioned.
+// text/shape/kern.cst — the legacy kern table applied, for fonts whose GPOS
+// does not kern: each glyph the kern feature applies to moved closer to the
+// next one, or further from it, by the table's value for the pair (read by
+// ../sfnt/kern.cst). Marks and default ignorables between the two are passed
+// over, as GPOS's kerning lookups pass over them.
 //
-// Two layouts share the tag: Microsoft's, version 0 with 16-bit counts and
-// six-byte subtable headers; Apple's, version 1.0 with 32-bit ones and
-// eight-byte headers. Subtables are walked by their lengths, as HarfBuzz
-// walks them.
+// The adjustment is shared: half goes to the first glyph's advance, the
+// rest to the second's advance and, back, to its offset — the second is
+// drawn where it would have been, and a caret between the two sits in the
+// middle of the gap they close.
 use "../sfnt/table.cst" as table;
+use "../sfnt/kern.cst" as legacy;
+use "glyphs.cst" as glyphs;
 
-// Whether the face has a kern table that says anything: its first four
-// bytes are not all zero.
-fn has_kerning(f as *table.Face) as i32 {
+// Whether the face has a kern table the shaper reads: version 0 with
+// subtables.
+fn present(f as *table.Face) as i32 {
     let is table.Table as t = f.kern;
     if (table.inside(t, t.off, 4) == 0) { return 0; }
-    if (table.u32_at(f, t.off) != 0) { return 1; }
-    return 0;
+    return cast(i32, table.u16_at(f, t.off) == 0 && table.u16_at(f, t.off + 2) > 0);
 }
 
-fn _major(f as *table.Face) as i64 { return table.u16_at(f, f.kern.off); }
+fn _passed(g as *glyphs.Glyph) as i32 {
+    return cast(i32, g.cls == cast(u8, glyphs.MARK) || (cast(i64, g.uflags) & glyphs.U_IGNORABLE) != 0);
+}
 
-// Each subtable's format and coverage bits, in Microsoft's layout or
-// Apple's; what() 1 for a state machine (format 1), 2 for cross-stream.
-fn _any(f as *table.Face, what as i64) as i32 {
-    let is table.Table as t = f.kern;
-    if (has_kerning(f) == 0) { return 0; }
-    let is i64 as major = _major(f);
-    let is i64 as n with mut = 0;
-    let is i64 as st with mut = 0;
-    if (major == 0) {
-        n = table.u16_at(f, t.off + 2);
-        st = t.off + 4;
-    } else if (major == 1) {
-        n = table.u32_at(f, t.off + 4);
-        st = t.off + 8;
-    } else {
-        return 0;
-    }
+fn apply(f as *table.Face, run as *glyphs.Run, mask as i64) as void {
     let is i64 as i with mut = 0;
-    while (i < n) {
-        let is i64 as len with mut = 0;
-        let is i64 as fmt with mut = 0;
-        let is i64 as cross with mut = 0;
-        if (major == 0) {
-            if (table.inside(t, st, 6) == 0) { return 0; }
-            len = table.u16_at(f, st + 2);
-            fmt = table.u8_at(f, st + 4);
-            cross = table.u8_at(f, st + 5) & 4;
-        } else {
-            if (table.inside(t, st, 8) == 0) { return 0; }
-            len = table.u32_at(f, st);
-            fmt = table.u8_at(f, st + 5);
-            cross = table.u8_at(f, st + 4) & 64;
+    while (i < run.len) {
+        let is *glyphs.Glyph as g = &run.src[i];
+        if ((cast(i64, g.mask) & mask) != 0 && _passed(g) == 0) {
+            let is i64 as j with mut = i + 1;
+            while (j < run.len && _passed(&run.src[j]) == 1) { j = j + 1; }
+            // A pair is kerned when the feature applies to both of it.
+            if (j < run.len && (cast(i64, run.src[j].mask) & mask) != 0) {
+                let is i64 as v = legacy.pair(f, cast(i64, g.id), cast(i64, run.src[j].id));
+                if (v != 0) {
+                    let is i64 as half with mut = v / 2;
+                    if (half * 2 > v) { half = half - 1; }
+                    let is i64 as rest = v - half;
+                    run.place[i].xa = cast(i32, cast(i64, run.place[i].xa) + half);
+                    run.place[j].xa = cast(i32, cast(i64, run.place[j].xa) + rest);
+                    run.place[j].xo = cast(i32, cast(i64, run.place[j].xo) + rest);
+                    glyphs.mark_unsafe(run, i, j + 1);
+                }
+            }
         }
-        if (what == 1 && fmt == 1) { return 1; }
-        if (what == 2 && cross != 0) { return 1; }
-        if (len <= 0) { return 0; }
-        st = st + len;
         i = i + 1;
     }
-    return 0;
 }
-
-fn has_state_machine(f as *table.Face) as i32 { return _any(f, 1); }
-fn has_cross_stream(f as *table.Face) as i32 { return _any(f, 2); }

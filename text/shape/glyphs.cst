@@ -1,0 +1,372 @@
+// text/shape/glyphs.cst — the run being shaped: one record per character,
+// then per glyph, and the passes that rewrite it.
+//
+// A pass reads the run from src and writes it into dst, then the two are
+// swapped. While a pass is under way, the run is what has been written
+// followed by what is still to read — the "combined" sequence that at()
+// indexes — and a rule may look back into the first part and ahead into the
+// second. Positions (place) belong to the run once glyphs no longer change.
+//
+// The run is bounded: it may grow to MAX_GROWTH times the text it started
+// from (at least MIN_RECORDS records), and take MAX_WORK steps for each record
+// it started with (at least MIN_WORK) — enough for any font made for text,
+// and what keeps one made to loop from shaping forever. Past a bound, or
+// when memory is refused, the run stops being ok and the passes do nothing
+// more.
+use "std/mem.cst" as mem;
+
+// What a glyph is to the lookups: GDEF's classes; a component is a piece of
+// a ligature that GDEF does not class.
+let is i64 as UNCLASSED with imut = 0;
+let is i64 as BASE with imut = 1;
+let is i64 as LIGATURE with imut = 2;
+let is i64 as MARK with imut = 3;
+let is i64 as COMPONENT with imut = 4;
+
+// How a glyph came to be.
+let is i64 as SUBSTITUTED with imut = 1;
+let is i64 as LIGATED with imut = 2;
+let is i64 as MULTIPLIED with imut = 4;
+
+// What the character was.
+let is i64 as U_IGNORABLE with imut = 1;   // a default ignorable
+let is i64 as U_HIDDEN with imut = 2;      // one substitutions must see (chars.is_hidden)
+let is i64 as U_CONTINUES with imut = 4;   // continues the grapheme before it
+let is i64 as U_ZWJ with imut = 8;
+let is i64 as U_ZWNJ with imut = 16;
+let is i64 as U_FALLBACK_SPACE with imut = 32;   // a space drawn with the font's own
+
+let is i64 as MAX_GROWTH with imut = 64;
+let is i64 as MIN_RECORDS with imut = 16384;
+let is i64 as MAX_WORK with imut = 1024;
+let is i64 as MIN_WORK with imut = 65536;
+
+struct Glyph {
+    id       as u32;   // the character, until glyphs are chosen; the glyph after
+    cluster  as u32;   // the byte offset of the first character it came from
+    mask     as u64;   // the features that apply to it (plan.cst)
+    alt      as u32;   // while composing: the glyph the font has for the character
+    cat      as u8;    // the character's general category
+    ccc      as u8;    // its canonical combining class
+    uflags   as u8;    // U_*
+    space    as u8;    // its chars.space_kind
+    cls      as u8;    // BASE .. COMPONENT
+    mclass   as u8;    // a mark's attachment class
+    made     as u8;    // SUBSTITUTED | LIGATED | MULTIPLIED
+    lig      as u8;    // the ligature it belongs to; 0 for none
+    comp     as u8;    // a mark's component of that ligature, from 1; a piece's number
+    ncomp    as u8;    // a ligature's count of components
+    unsafe   as u8;    // the text is unsafe to break before its cluster
+    _pad0    as u8;
+}
+
+// A glyph's advance and offset from where it would be drawn, in font units;
+// and while positioning, what it is attached to: the glyph link records away,
+// as a mark or cursively.
+struct Place {
+    xa   as i32;
+    ya   as i32;
+    xo   as i32;
+    yo   as i32;
+    link as i32;
+    kind as i32;
+}
+
+let is i64 as ATTACH_MARK with imut = 1;
+let is i64 as ATTACH_CURSIVE with imut = 2;
+
+struct Run {
+    block   as *u8;
+    bytes   as i64;
+    src     as *Glyph;
+    dst     as *Glyph;
+    place   as *Place;
+    cap     as i64;    // records each array holds
+    len     as i64;    // records in src
+    i       as i64;    // the next to read, in a pass
+    n       as i64;    // written, in a pass
+    most    as i64;    // records the run may hold
+    work    as i64;    // steps left
+    serial  as i64;    // the last ligature number given
+    random  as i64;    // the state of rand's numbers
+    ok      as i32;
+    passing as i32;
+}
+
+fn open() as Run {
+    let is Run as r;
+    mem.memzero(cast(*u8, &r), sizeof(Run));
+    r.ok = 1;
+    return r;
+}
+
+fn close(r as *Run) as void {
+    if (r.bytes > 0) { mem.core.munmap(r.block, r.bytes); }
+    r.block = cast(*u8, 0);
+    r.bytes = 0;
+    r.cap = 0;
+}
+
+fn _record_bytes() as i64 { return 2 * sizeof(Glyph) + sizeof(Place); }
+
+// Room for cap records in each array, what they hold kept.
+fn _grow(r as *Run, cap as i64) as i32 {
+    if (cap <= r.cap) { return 1; }
+    if (cap > r.most) {
+        r.ok = 0;
+        return 0;
+    }
+    let is i64 as c with mut = r.cap;
+    if (c < 64) { c = 64; }
+    while (c < cap) { c = c * 2; }
+    if (c > r.most) { c = r.most; }
+    let is i64 as bytes = c * _record_bytes();
+    let is *u8 as block = mem.core.mmap_anon(bytes);
+    if (cast(i64, block) <= 0) {
+        r.ok = 0;
+        return 0;
+    }
+    let is *Glyph as src = cast(*Glyph, block);
+    let is *Glyph as dst = cast(*Glyph, cast(i64, block) + c * sizeof(Glyph));
+    let is *Place as place = cast(*Place, cast(i64, block) + 2 * c * sizeof(Glyph));
+    if (r.cap > 0) {
+        mem.memcpy(cast(*u8, src), cast(*u8, r.src), r.cap * sizeof(Glyph));
+        mem.memcpy(cast(*u8, dst), cast(*u8, r.dst), r.cap * sizeof(Glyph));
+        mem.memcpy(cast(*u8, place), cast(*u8, r.place), r.cap * sizeof(Place));
+        mem.core.munmap(r.block, r.bytes);
+    }
+    r.block = block;
+    r.bytes = bytes;
+    r.src = src;
+    r.dst = dst;
+    r.place = place;
+    r.cap = c;
+    return 1;
+}
+
+// The run emptied, for a text of n characters: its bounds set by n.
+fn reset(r as *Run, n as i64) as i32 {
+    r.ok = 1;
+    r.passing = 0;
+    r.len = 0;
+    r.i = 0;
+    r.n = 0;
+    r.serial = 0;
+    r.random = 1;
+    r.most = n * MAX_GROWTH;
+    if (r.most < MIN_RECORDS) { r.most = MIN_RECORDS; }
+    r.work = n * MAX_WORK;
+    if (r.work < MIN_WORK) { r.work = MIN_WORK; }
+    return _grow(r, n + 1);
+}
+
+// One step of work taken; 0 when there is none left.
+fn step(r as *Run, k as i64) as i32 {
+    r.work = r.work - k;
+    if (r.work < 0) { r.ok = 0; }
+    return r.ok;
+}
+
+// A record added at the end of the run, before any pass.
+fn push(r as *Run, g as *Glyph) as i32 {
+    if (_grow(r, r.len + 1) == 0) { return 0; }
+    r.src[r.len] = *g;
+    r.len = r.len + 1;
+    return 1;
+}
+
+// --- Passes ---
+
+fn begin(r as *Run) as void {
+    r.i = 0;
+    r.n = 0;
+    r.passing = 1;
+}
+
+// What is left to read written, and what was written made the run.
+fn end(r as *Run) as void {
+    if (r.passing == 0) { return; }
+    let is i64 as left = r.len - r.i;
+    if (r.ok == 1 && _grow(r, r.n + left) == 1) {
+        mem.core.memmove(cast(*u8, &r.dst[r.n]), cast(*u8, &r.src[r.i]), left * sizeof(Glyph));
+        r.n = r.n + left;
+        let is *Glyph as t = r.src;
+        r.src = r.dst;
+        r.dst = t;
+        r.len = r.n;
+    }
+    r.i = 0;
+    r.n = 0;
+    r.passing = 0;
+}
+
+fn more(r as *Run) as i32 { return cast(i32, r.ok == 1 && r.i < r.len); }
+fn cur(r as *Run) as *Glyph { return &r.src[r.i]; }
+
+// Room to write k more.
+fn room(r as *Run, k as i64) as i32 {
+    if (r.ok == 0) { return 0; }
+    return _grow(r, r.n + k);
+}
+
+// The current record written as it is.
+fn keep(r as *Run) as void {
+    if (room(r, 1) == 0) { return; }
+    r.dst[r.n] = r.src[r.i];
+    r.n = r.n + 1;
+    r.i = r.i + 1;
+}
+
+// k records written as they are.
+fn keep_n(r as *Run, k as i64) as void {
+    if (k <= 0 || room(r, k) == 0) { return; }
+    mem.core.memmove(cast(*u8, &r.dst[r.n]), cast(*u8, &r.src[r.i]), k * sizeof(Glyph));
+    r.n = r.n + k;
+    r.i = r.i + k;
+}
+
+// g written; nothing read.
+fn put(r as *Run, g as *Glyph) as void {
+    let is Glyph as copy = *g;
+    if (room(r, 1) == 0) { return; }
+    r.dst[r.n] = copy;
+    r.n = r.n + 1;
+}
+
+// The current record read and not written.
+fn drop(r as *Run) as void { r.i = r.i + 1; }
+
+// --- The combined sequence: written, then still to read ---
+
+fn total(r as *Run) as i64 {
+    if (r.passing == 0) { return r.len; }
+    return r.n + r.len - r.i;
+}
+
+// Where the current record is in it.
+fn here(r as *Run) as i64 {
+    if (r.passing == 0) { return r.i; }
+    return r.n;
+}
+
+fn at(r as *Run, k as i64) as *Glyph {
+    if (r.passing == 0) { return &r.src[k]; }
+    if (k < r.n) { return &r.dst[k]; }
+    return &r.src[r.i + k - r.n];
+}
+
+// The pass moved so that k records are written: forward by writing what is
+// read, back by reading again what was written.
+fn seek(r as *Run, k as i64) as i32 {
+    if (r.ok == 0) { return 0; }
+    if (k > r.n) {
+        keep_n(r, k - r.n);
+        return r.ok;
+    }
+    let is i64 as back = r.n - k;
+    if (back == 0) { return 1; }
+    if (r.i < back) {
+        // Not enough read to put them back in front of: what is left moves up.
+        let is i64 as left = r.len - r.i;
+        let is i64 as shift = back - r.i;
+        if (_grow(r, r.len + shift) == 0) { return 0; }
+        mem.core.memmove(cast(*u8, &r.src[r.i + shift]), cast(*u8, &r.src[r.i]), left * sizeof(Glyph));
+        r.i = r.i + shift;
+        r.len = r.len + shift;
+    }
+    r.i = r.i - back;
+    mem.core.memmove(cast(*u8, &r.src[r.i]), cast(*u8, &r.dst[k]), back * sizeof(Glyph));
+    r.n = k;
+    return 1;
+}
+
+// --- Clusters ---
+
+// Records a .. b of the combined sequence made one cluster — and with them
+// every record that shares a cluster with one of them — the smallest of
+// theirs.
+fn join(r as *Run, a0 as i64, b0 as i64) as void {
+    let is i64 as a with mut = a0;
+    let is i64 as b with mut = b0;
+    let is i64 as t = total(r);
+    if (b - a < 2) { return; }
+    while (a > 0 && at(r, a - 1).cluster == at(r, a).cluster) { a = a - 1; }
+    while (b < t && at(r, b).cluster == at(r, b - 1).cluster) { b = b + 1; }
+    let is u32 as low with mut = at(r, a).cluster;
+    let is i64 as k with mut = a + 1;
+    while (k < b) {
+        if (at(r, k).cluster < low) { low = at(r, k).cluster; }
+        k = k + 1;
+    }
+    k = a;
+    while (k < b) {
+        at(r, k).cluster = low;
+        k = k + 1;
+    }
+}
+
+// The text marked unsafe to break anywhere within records a .. b of the
+// combined sequence: before each of their clusters but the first.
+fn mark_unsafe(r as *Run, a as i64, b0 as i64) as void {
+    let is i64 as b with mut = b0;
+    let is i64 as t = total(r);
+    if (b > t) { b = t; }
+    if (b - a < 2) { return; }
+    let is u32 as low with mut = at(r, a).cluster;
+    let is i64 as k with mut = a + 1;
+    while (k < b) {
+        if (at(r, k).cluster < low) { low = at(r, k).cluster; }
+        k = k + 1;
+    }
+    k = a;
+    while (k < b) {
+        if (at(r, k).cluster != low) { at(r, k).unsafe = cast(u8, 1); }
+        k = k + 1;
+    }
+}
+
+// --- Order ---
+
+fn reverse_range(r as *Run, a as i64, b as i64) as void {
+    let is i64 as i with mut = a;
+    let is i64 as j with mut = b - 1;
+    while (i < j) {
+        let is Glyph as t = r.src[i];
+        r.src[i] = r.src[j];
+        r.src[j] = t;
+        let is Place as p = r.place[i];
+        r.place[i] = r.place[j];
+        r.place[j] = p;
+        i = i + 1;
+        j = j - 1;
+    }
+}
+
+// The run reversed by clusters: each cluster's records keep their order.
+fn reverse_clusters(r as *Run) as void {
+    reverse_range(r, 0, r.len);
+    let is i64 as a with mut = 0;
+    while (a < r.len) {
+        let is i64 as b with mut = a + 1;
+        while (b < r.len && r.src[b].cluster == r.src[a].cluster) { b = b + 1; }
+        reverse_range(r, a, b);
+        a = b;
+    }
+}
+
+// --- Ligatures ---
+
+// A new ligature's number: never 0, and not the last one's.
+fn next_ligature(r as *Run) as i64 {
+    r.serial = r.serial + 1;
+    if (r.serial > 255) { r.serial = 1; }
+    return r.serial;
+}
+
+// The next of rand's numbers: Park and Miller's generator, its product cut
+// to 32 bits before the remainder — as the shapers most text is set with
+// compute it, so that rand picks the same alternates here as there.
+fn next_random(r as *Run) as i64 {
+    r.random = ((r.random * 48271) & 4294967295) % 2147483647;
+    return r.random;
+}

@@ -1,7 +1,15 @@
-// text/shape/shape_test.cst — shaping held to HarfBuzz: every case of every
-// text/testdata/*.shape.ref (written by text/tools/shape_reference.py)
-// shaped here, and its glyphs, clusters, flags, advances and offsets
-// compared with HarfBuzz's, all of them, exactly.
+// text/shape/shape_test.cst — shaping held to what HarfBuzz gives: every case
+// of every text/testdata/*.shape.ref (written by text/tools/shape_reference.py)
+// shaped here, its glyphs, clusters, advances and offsets compared with
+// HarfBuzz's, all of them, exactly. And the shaper's own promise about where
+// text may be broken kept: at every cluster it does not mark unsafe to break
+// before, the text shaped in two parts gives exactly the glyphs and positions
+// of the whole.
+//
+// Where the font has no GPOS, marks are placed by the shaper's own fallback
+// (fallback.cst), not HarfBuzz's: their offsets are held to what the
+// fallback promises — the mark's ink centred on its base's, clear of it by
+// a sixteenth of the em, stacked — on shape-plain.ttf, made for it.
 //
 // Run from the repository's root, where text/testdata is.
 use "std/io.cst" as io;
@@ -12,8 +20,8 @@ use "../sfnt/table.cst" as table;
 use "../sfnt/var.cst" as var;
 use "../outline/outline.cst" as outline;
 use "shape.cst" as shape;
-use "buffer.cst" as buffer;
-use "tag.cst" as tag;
+use "glyphs.cst" as glyphs;
+use "scripts.cst" as scripts;
 
 let is i32 as fails with mut = 0;
 let is i32 as cases with mut = 0;
@@ -161,6 +169,30 @@ let is [4096]u8 as text;
 let is [64]shape.Feature as feats;
 let is [256]u8 as name;
 let is [64]u8 as lang;
+let is shape.Shaper as sh;
+let is i32 as split_checks with mut = 0;
+
+// A shaped run kept, to compare another with.
+struct Kept {
+    n     as i64;
+    g     as [4096]glyphs.Glyph;
+    p     as [4096]glyphs.Place;
+}
+
+let is Kept as whole;
+let is Kept as first;
+let is Kept as second;
+
+fn keep(k as *Kept) as void {
+    k.n = shape.count(&sh);
+    if (k.n > 4096) { k.n = 4096; }
+    let is i64 as i with mut = 0;
+    while (i < k.n) {
+        k.g[i] = *shape.glyph(&sh, i);
+        k.p[i] = *shape.place(&sh, i);
+        i = i + 1;
+    }
+}
 
 fn _copy_word(dst as *u8, cap as i64) as void {
     let is i64 as i with mut = 0;
@@ -171,9 +203,102 @@ fn _copy_word(dst as *u8, cap as i64) as void {
     dst[i] = 0;
 }
 
+fn _same(a as *glyphs.Glyph, pa as *glyphs.Place, b as *glyphs.Glyph, pb as *glyphs.Place) as i32 {
+    return cast(i32, a.id == b.id && a.cluster == b.cluster && pa.xa == pb.xa && pa.ya == pb.ya &&
+                     pa.xo == pb.xo && pa.yo == pb.yo);
+}
+
+// The text cut before cluster c, each part shaped alone, the two put side
+// by side as they are drawn: whether that is the whole.
+fn split_at(r as *outline.Reader, t as *shape.Text, c as i64) as i32 {
+    let is i64 as end with mut = t.n;
+    if (t.length >= 0 && t.start + t.length < end) { end = t.start + t.length; }
+    let is shape.Text as part = *t;
+    part.start = t.start;
+    part.length = c - t.start;
+    shape.shape(&sh, r, &part);
+    keep(&first);
+    part.start = c;
+    part.length = end - c;
+    shape.shape(&sh, r, &part);
+    keep(&second);
+    if (first.n + second.n != whole.n) { return 0; }
+    let is *Kept as left with mut = &first;
+    let is *Kept as right with mut = &second;
+    if (t.dir == shape.RTL) {
+        left = &second;
+        right = &first;
+    }
+    let is i64 as i with mut = 0;
+    while (i < whole.n) {
+        let is i32 as ok with mut = 0;
+        if (i < left.n) { ok = _same(&whole.g[i], &whole.p[i], &left.g[i], &left.p[i]); }
+        else { ok = _same(&whole.g[i], &whole.p[i], &right.g[i - left.n], &right.p[i - left.n]); }
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Every cluster not marked unsafe to break before, cut before.
+fn check_breaks(font as *u8, r as *outline.Reader, t as *shape.Text) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as low with mut = 0 - 1;
+    while (i < whole.n) {
+        let is i64 as c = cast(i64, whole.g[i].cluster);
+        if (low < 0 || c < low) { low = c; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < whole.n) {
+        let is i64 as c = cast(i64, whole.g[i].cluster);
+        let is i32 as starts with mut = 1;
+        if (i > 0 && cast(i64, whole.g[i - 1].cluster) == c) { starts = 0; }
+        if (starts == 1 && c != low && whole.g[i].unsafe == cast(u8, 0)) {
+            split_checks = split_checks + 1;
+            if (split_at(r, t, c) == 0) {
+                io.printf("FAIL: %s, %s: not unsafe to break before cluster %d, but it is\n", font,
+                          cast(*u8, &name), c);
+                fails = fails + 1;
+                return;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// A failed case's glyphs, ours and HarfBuzz's — read again from where its
+// list starts — to see where they part.
+fn show(list_at as i64, ng as i64) as void {
+    io.printf("  ours:");
+    let is i64 as k with mut = 0;
+    while (k < whole.n && k < 48) {
+        io.printf(" %d@%d+%d(%d,%d)", cast(i64, whole.g[k].id), cast(i64, whole.g[k].cluster),
+                  cast(i64, whole.p[k].xa), cast(i64, whole.p[k].xo), cast(i64, whole.p[k].yo));
+        k = k + 1;
+    }
+    io.printf("\n  hb:  ");
+    let is i64 as saved = at;
+    at = list_at;
+    k = 0;
+    while (k < ng) {
+        next_line();
+        let is i64 as g = num();
+        let is i64 as cl = num();
+        let is i64 as xa = num();
+        num();
+        let is i64 as xo = num();
+        let is i64 as yo = num();
+        if (k < 48) { io.printf(" %d@%d+%d(%d,%d)", g, cl, xa, xo, yo); }
+        k = k + 1;
+    }
+    io.printf("\n");
+    at = saved;
+}
+
 // The case starting at the current line, read and shaped with the font in
 // data, and compared.
-fn run_case(font as *u8, data as *u8, size as i64, b as *buffer.Buffer) as void {
+fn run_case(font as *u8, data as *u8, size as i64) as void {
     rest();
     _copy_word(cast(*u8, &name), 256);
     expect("face");
@@ -198,10 +323,10 @@ fn run_case(font as *u8, data as *u8, size as i64, b as *buffer.Buffer) as void 
     let is i64 as length = num();
     expect("props");
     next_word();
-    let is i64 as dir with mut = buffer.LTR;
-    if (is_word("rtl") == 1) { dir = buffer.RTL; }
+    let is i64 as dir with mut = shape.LTR;
+    if (is_word("rtl") == 1) { dir = shape.RTL; }
     next_word();
-    let is i64 as script = tag.of(cast(*u8, &word));
+    let is i64 as script = scripts.of(cast(*u8, &word));
     next_word();
     let is *u8 as lg with mut = cast(*u8, 0);
     if (is_word("-") == 0) {
@@ -209,14 +334,20 @@ fn run_case(font as *u8, data as *u8, size as i64, b as *buffer.Buffer) as void 
         lg = cast(*u8, &lang);
     }
     expect("flags");
-    let is i64 as flags = num();
+    let is i64 as flags with mut = 0;
+    while (next_word() > 0) {
+        if (is_word("start") == 1) { flags = flags | shape.AT_START; }
+        if (is_word("keep") == 1) { flags = flags | shape.KEEP_IGNORABLES; }
+        if (is_word("drop") == 1) { flags = flags | shape.DROP_IGNORABLES; }
+        if (is_word("nocircle") == 1) { flags = flags | shape.NO_DOTTED_CIRCLE; }
+    }
     expect("features");
     let is i64 as nf = num();
     let is i64 as k with mut = 0;
     while (k < nf) {
         next_line();
         next_word();
-        feats[k].tag = tag.of(cast(*u8, &word));
+        feats[k].tag = scripts.of(cast(*u8, &word));
         feats[k].value = num();
         feats[k].start = num();
         feats[k].end = num();
@@ -233,7 +364,7 @@ fn run_case(font as *u8, data as *u8, size as i64, b as *buffer.Buffer) as void 
         while (k < nv) {
             next_line();
             next_word();
-            let is i64 as t = tag.of(cast(*u8, &word));
+            let is i64 as t = scripts.of(cast(*u8, &word));
             var.set(&d, &f, t, fnum());
             k = k + 1;
         }
@@ -241,28 +372,31 @@ fn run_case(font as *u8, data as *u8, size as i64, b as *buffer.Buffer) as void 
         outline.vary(&r, &c);
     }
 
-    let is shape.Run as run;
-    run.text = cast(*u8, &text);
-    run.n = n;
-    run.offset = off;
-    run.length = length;
-    run.dir = dir;
-    run.script = script;
-    run.lang = lg;
-    run.features = cast(*shape.Feature, &feats);
-    run.nfeatures = nf;
-    run.flags = flags;
-    let is i32 as ok = shape.shape(&r, b, &run);
+    let is shape.Text as t;
+    t.bytes = cast(*u8, &text);
+    t.n = n;
+    t.start = off;
+    t.length = length;
+    t.dir = dir;
+    t.script = script;
+    t.lang = lg;
+    t.features = cast(*shape.Feature, &feats);
+    t.nfeatures = nf;
+    t.flags = flags;
+    let is i32 as ok = shape.shape(&sh, &r, &t);
+    keep(&whole);
+    let is i32 as own_marks = cast(i32, f.gpos.len == 0);
 
     expect("glyphs");
     let is i64 as ng = num();
     let is i32 as bad with mut = 0;
+    let is i64 as list_at = at;
     if (ok == 0) {
         io.printf("FAIL: %s, %s: shaping stopped\n", font, cast(*u8, &name));
         bad = 1;
     }
-    if (b.len != ng && bad == 0) {
-        io.printf("FAIL: %s, %s: %d glyphs, HarfBuzz %d\n", font, cast(*u8, &name), b.len, ng);
+    if (whole.n != ng && bad == 0) {
+        io.printf("FAIL: %s, %s: %d glyphs, HarfBuzz %d\n", font, cast(*u8, &name), whole.n, ng);
         bad = 1;
     }
     k = 0;
@@ -270,25 +404,30 @@ fn run_case(font as *u8, data as *u8, size as i64, b as *buffer.Buffer) as void 
         next_line();
         let is i64 as g = num();
         let is i64 as cl = num();
-        let is i64 as fl = num();
         let is i64 as xa = num();
         let is i64 as ya = num();
         let is i64 as xo = num();
         let is i64 as yo = num();
-        if (bad == 0 && k < b.len) {
-            let is buffer.Info as i = b.info[k];
-            let is buffer.Pos as p = b.pos[k];
-            if (cast(i64, i.cp) != g || cast(i64, i.cluster) != cl || cast(i64, i.mask) != fl ||
-                cast(i64, p.xa) != xa || cast(i64, p.ya) != ya || cast(i64, p.xo) != xo || cast(i64, p.yo) != yo) {
-                io.printf("FAIL: %s, %s: glyph %d is %d %d %d %d %d %d %d, HarfBuzz's %d %d %d %d %d %d %d\n",
-                          font, cast(*u8, &name), k, cast(i64, i.cp), cast(i64, i.cluster), cast(i64, i.mask),
-                          cast(i64, p.xa), cast(i64, p.ya), cast(i64, p.xo), cast(i64, p.yo), g, cl, fl, xa, ya, xo, yo);
+        if (bad == 0 && k < whole.n) {
+            let is glyphs.Glyph as i = whole.g[k];
+            let is glyphs.Place as p = whole.p[k];
+            let is i32 as offsets with mut = cast(i32, cast(i64, p.xo) == xo && cast(i64, p.yo) == yo);
+            if (own_marks == 1 && i.cls == cast(u8, glyphs.MARK)) { offsets = 1; }
+            if (cast(i64, i.id) != g || cast(i64, i.cluster) != cl ||
+                cast(i64, p.xa) != xa || cast(i64, p.ya) != ya || offsets == 0) {
+                io.printf("FAIL: %s, %s: glyph %d is %d %d %d %d %d %d, HarfBuzz's %d %d %d %d %d %d\n",
+                          font, cast(*u8, &name), k, cast(i64, i.id), cast(i64, i.cluster),
+                          cast(i64, p.xa), cast(i64, p.ya), cast(i64, p.xo), cast(i64, p.yo), g, cl, xa, ya, xo, yo);
                 bad = 1;
             }
         }
         k = k + 1;
     }
-    if (bad == 1) { fails = fails + 1; }
+    if (bad == 1) {
+        fails = fails + 1;
+        show(list_at, ng);
+    }
+    if (bad == 0) { check_breaks(font, &r, &t); }
     outline.close(&r);
     cases = cases + 1;
 }
@@ -337,16 +476,177 @@ fn reference(font as *u8) as void {
         fails = fails + 1;
         return;
     }
-    let is buffer.Buffer as b = buffer.open();
     while (next_line() == 1) {
         next_word();
-        if (is_word("case") == 1) { run_case(font, data, size, &b); }
+        if (is_word("case") == 1) { run_case(font, data, size); }
     }
-    buffer.close(&b);
+}
+
+// --- Marks placed without GPOS ---
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: fallback marks: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+// Glyph k's ink where it is drawn: its extents moved to its pen position and
+// by its offset.
+fn ink(r as *outline.Reader, k as i64, pen as i64, x0 as *i64, y0 as *i64, x1 as *i64, y1 as *i64) as void {
+    let is outline.Extents as e;
+    outline.extents(r, cast(i64, whole.g[k].id), &e);
+    *x0 = pen + cast(i64, whole.p[k].xo) + e.x_bearing;
+    *x1 = *x0 + e.width;
+    *y1 = cast(i64, whole.p[k].yo) + e.y_bearing;
+    *y0 = *y1 + e.height;
+}
+
+fn fallback_case(r as *outline.Reader, utf8 as *u8, dir as i64, script as *u8) as void {
+    let is shape.Text as t;
+    let is i64 as n with mut = 0;
+    while (utf8[n] != 0) { n = n + 1; }
+    t.bytes = utf8;
+    t.n = n;
+    t.start = 0;
+    t.length = 0 - 1;
+    t.dir = dir;
+    t.script = scripts.of(script);
+    t.lang = cast(*u8, 0);
+    t.features = cast(*shape.Feature, 0);
+    t.nfeatures = 0;
+    t.flags = 0;
+    shape.shape(&sh, r, &t);
+    keep(&whole);
+}
+
+// A mark of an edge's class after a base: side 0 centred, 1 on the left
+// edge, 2 on the right; vertical 1 above, -1 below; touching or a gap clear.
+fn fallback_edge(r as *outline.Reader, utf8 as *u8, what as *u8, side as i64, vertical as i64, touching as i64) as void {
+    let is i64 as gap with mut = r.face.upem / 16;
+    if (touching == 1) { gap = 0; }
+    let is i64 as bx0 with mut = 0;
+    let is i64 as by0 with mut = 0;
+    let is i64 as bx1 with mut = 0;
+    let is i64 as by1 with mut = 0;
+    let is i64 as mx0 with mut = 0;
+    let is i64 as my0 with mut = 0;
+    let is i64 as mx1 with mut = 0;
+    let is i64 as my1 with mut = 0;
+    fallback_case(r, utf8, shape.LTR, "Latn");
+    ink(r, 0, 0, &bx0, &by0, &bx1, &by1);
+    ink(r, 1, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    let is i32 as ok with mut = cast(i32, whole.n == 2);
+    if (side == 0) { ok = ok & cast(i32, (bx0 + bx1) - (mx0 + mx1) <= 1 && (mx0 + mx1) - (bx0 + bx1) <= 1); }
+    if (side == 1) { ok = ok & cast(i32, mx0 == bx0); }
+    if (side == 2) { ok = ok & cast(i32, mx1 == bx1); }
+    if (vertical > 0) { ok = ok & cast(i32, my0 == by1 + gap); }
+    if (vertical < 0) { ok = ok & cast(i32, my1 == by0 - gap); }
+    check(what, ok);
+}
+
+fn fallback_marks() as void {
+    let is *u8 as data = load("text/testdata/shape-plain.ttf");
+    let is i64 as size = loaded;
+    if (cast(i64, data) == 0) {
+        check("shape-plain.ttf read", 0);
+        return;
+    }
+    let is table.Face as f = sfnt.open(data, size, 0);
+    let is outline.Reader as r = outline.open(&f);
+    let is i64 as gap = f.upem / 16;
+    let is i64 as bx0 with mut = 0;
+    let is i64 as by0 with mut = 0;
+    let is i64 as bx1 with mut = 0;
+    let is i64 as by1 with mut = 0;
+    let is i64 as mx0 with mut = 0;
+    let is i64 as my0 with mut = 0;
+    let is i64 as mx1 with mut = 0;
+    let is i64 as my1 with mut = 0;
+
+    // Above (230): centred, a gap over the base; no advance.
+    fallback_case(&r, "a\xcc\x81", shape.LTR, "Latn");
+    check("acute: two glyphs", whole.n == 2);
+    ink(&r, 0, 0, &bx0, &by0, &bx1, &by1);
+    ink(&r, 1, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    check("acute: no advance", whole.p[1].xa == cast(i32, 0));
+    check("acute: centred", (bx0 + bx1) - (mx0 + mx1) <= 1 && (mx0 + mx1) - (bx0 + bx1) <= 1);
+    check("acute: a gap above", my0 == by1 + gap);
+
+    // Below (220), and another below it.
+    fallback_case(&r, "a\xcc\xa3\xcc\xa3", shape.LTR, "Latn");
+    ink(&r, 0, 0, &bx0, &by0, &bx1, &by1);
+    ink(&r, 1, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    check("dot below: a gap under", my1 == by0 - gap);
+    let is i64 as first_bottom = my0;
+    ink(&r, 2, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    check("dots below: stacked", my1 == first_bottom - gap);
+
+    // Attached below (202): touching.
+    fallback_case(&r, "a\xcc\xa7", shape.LTR, "Latn");
+    ink(&r, 0, 0, &bx0, &by0, &bx1, &by1);
+    ink(&r, 1, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    check("cedilla: attached", my1 == by0);
+
+    // Two above, stacked.
+    fallback_case(&r, "a\xcc\x81\xcc\x88", shape.LTR, "Latn");
+    ink(&r, 1, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    let is i64 as first_top = my1;
+    ink(&r, 2, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    check("acute and diaeresis: stacked", my0 == first_top + gap);
+
+    // Overlay (1): through the middle — of a capital, whose middle is not
+    // the mark's own.
+    fallback_case(&r, "A\xcc\xb4", shape.LTR, "Latn");
+    ink(&r, 0, 0, &bx0, &by0, &bx1, &by1);
+    ink(&r, 1, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    check("tilde overlay: through", (by0 + by1) - (my0 + my1) <= 1 && (my0 + my1) - (by0 + by1) <= 1);
+
+    // A class that names no place (32, a kasra's): below, its ink being below.
+    fallback_case(&r, "a\xd9\x90", shape.LTR, "Latn");
+    ink(&r, 0, 0, &bx0, &by0, &bx1, &by1);
+    ink(&r, 1, cast(i64, whole.p[0].xa), &mx0, &my0, &mx1, &my1);
+    check("kasra: below, by its ink", my1 == by0 - gap);
+
+    // The classes of an edge: their ink on the base's left or right edge,
+    // above or below it — clear of it, or touching for 214 and 216.
+    fallback_edge(&r, "a\xe1\xb7\x8e", "214, attached above: centred, touching", 0, 1, 1);
+    fallback_edge(&r, "a\xcc\x9b", "216, the horn: right, touching above", 2, 1, 1);
+    fallback_edge(&r, "a\xe1\xb7\xba", "218: left, below", 1, 0 - 1, 0);
+    fallback_edge(&r, "a\xe3\x80\xad", "222: right, below", 2, 0 - 1, 0);
+    fallback_edge(&r, "a\xe3\x80\xab", "228: left, above", 1, 1, 0);
+    fallback_edge(&r, "a\xcc\x95", "232: right, above", 2, 1, 0);
+
+    // A base the legacy kern table moved: the mark is centred on its ink
+    // where it was moved to.
+    fallback_case(&r, "av\xcc\x81", shape.LTR, "Latn");
+    ink(&r, 1, cast(i64, whole.p[0].xa), &bx0, &by0, &bx1, &by1);
+    ink(&r, 2, cast(i64, whole.p[0].xa) + cast(i64, whole.p[1].xa), &mx0, &my0, &mx1, &my1);
+    check("kerned base: moved", whole.p[1].xo != cast(i32, 0));
+    check("kerned base: the acute centred on it",
+          (bx0 + bx1) - (mx0 + mx1) <= 1 && (mx0 + mx1) - (bx0 + bx1) <= 1);
+
+    // A mark with no base before it in its grapheme stays where it is.
+    fallback_case(&r, "\xcc\x81a", shape.LTR, "Latn");
+    check("a mark with no base: not moved", whole.p[0].xo == cast(i32, 0) && whole.p[0].yo == cast(i32, 0));
+
+    // Right to left: the mark drawn first, the base after it, from the same pen.
+    fallback_case(&r, "\xde\x80\xde\xa6", shape.RTL, "Thaa");
+    check("thaana: two glyphs", whole.n == 2);
+    ink(&r, 1, 0, &bx0, &by0, &bx1, &by1);
+    ink(&r, 0, 0, &mx0, &my0, &mx1, &my1);
+    check("thaana: centred", (bx0 + bx1) - (mx0 + mx1) <= 1 && (mx0 + mx1) - (bx0 + bx1) <= 1);
+    check("thaana: above", my0 == by1 + gap);
+    outline.close(&r);
 }
 
 fn main() as i32 {
+    shape.open(&sh);
+    fallback_marks();
     reference("shape.ttf");
+    reference("shape-plain.ttf");
+    reference("lookups.ttf");
+    reference("varlookups.ttf");
     reference("glyf.ttf");
     reference("cff.otf");
     reference("kern.ttf");
@@ -355,10 +655,12 @@ fn main() as i32 {
     reference("vf.ttf");
     reference("cff2.otf");
     reference("pair.ttc");
+    shape.close(&sh);
     if (fails > 0) {
         io.printf("shape: %d failures in %d cases\n", cast(i64, fails), cast(i64, cases));
         return 1;
     }
-    io.printf("shape: all %d cases as HarfBuzz shapes them\n", cast(i64, cases));
+    io.printf("shape: all %d cases as HarfBuzz shapes them; %d cuts where text may be broken, shaped in two\n",
+              cast(i64, cases), cast(i64, split_checks));
     return 0;
 }

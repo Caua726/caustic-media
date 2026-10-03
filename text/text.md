@@ -176,7 +176,11 @@ answer while the layout is being built than afterwards.
 
 1. **`sfnt` and `outline`** — read a face, get a glyph's curves.
 2. **`raster` and `atlas`** — glyphs on screen at one size. Done.
-3. **Simple shaping and layout**, with caustic-unicode for breaking.
-4. **Caret and hit-testing**, which `ui/` blocks on.
-5. **`GSUB`/`GPOS`**, when a script that needs it does.
+3. **Shaping**, both stages: every `GSUB` and `GPOS` lookup, the legacy `kern`
+   table, the fallbacks — done, held to what HarfBuzz gives
+   ([`shape/shape.md`](shape/shape.md)). The scripts with shapers of their
+   own (Arabic joining, Indic reordering, Hangul, Thai, Khmer, Myanmar, USE)
+   are [B].
+4. **Layout**, with caustic-unicode for breaking and bidi.
+5. **Caret and hit-testing**, which `ui/` blocks on.
 6. **SDF**, when text in a 3D scene does.

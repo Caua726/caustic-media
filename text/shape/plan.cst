@@ -1,0 +1,406 @@
+// text/shape/plan.cst — what the features a text asks for come to: which
+// lookups apply, in which order, to which glyphs.
+//
+// Features are wanted with a value, over the whole text or over a stretch of
+// its clusters. Wanted over the whole text, the value holds everywhere and
+// what was wanted before is forgotten; over stretches after that, it holds
+// there. Each feature the selected language system has — or that
+// the shaper does itself when the font does not (kern) — gets bits in every
+// glyph's mask, enough for the largest value it is wanted with; a feature
+// wanted everywhere with value 1 shares bit 0, which every glyph has. A
+// glyph's value for a feature is then its mask's bits for it.
+//
+// Then each table's lookups, stage by stage: the lookups of every feature in
+// the stage, plus the language system's required feature in its, each once,
+// in the order of the LookupList — the order the OpenType specification
+// says lookups are applied in — with the bits of all the features that
+// asked for it.
+use "std/mem.cst" as mem;
+use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
+use "otl.cst" as otl;
+use "scripts.cst" as scripts;
+use "langs.cst" as langs;
+
+// What a wanted feature is to the shaper.
+let is i64 as F_KEEP with imut = 1;            // kept even when the font lacks it
+let is i64 as F_MANUAL_JOINERS with imut = 2;  // ZWJ is not passed over within its matches
+let is i64 as F_RANDOM with imut = 4;          // its largest value picks an alternate at random
+
+let is i64 as GSUB with imut = 0;
+let is i64 as GPOS with imut = 1;
+let is i64 as STAGE_FIRST with imut = 0;       // GSUB's first stage: rvrn alone
+let is i64 as STAGE_MAIN with imut = 1;
+
+let is i64 as EVERYWHERE with imut = 1;        // bit 0
+let is i64 as MAX_BITS with imut = 8;
+let is i64 as LAST_BIT with imut = 62;
+let is i64 as ALL with imut = 4294967295;      // a feature's end: to the end of the text
+
+struct Want {
+    tag   as i64;
+    value as i64;
+    start as i64;
+    end   as i64;
+    stage as i64;
+    flags as i64;
+}
+
+struct Feature {
+    tag     as i64;
+    index0  as i64;   // in GSUB, otl.NONE where absent
+    index1  as i64;   // in GPOS
+    stage   as i64;
+    flags   as i64;
+    shift   as i64;
+    mask    as i64;
+    value   as i64;   // where it is not wanted over a stretch
+    most    as i64;
+    last_whole as i64;   // the last want over the whole text; -1 for none
+    ranged  as i32;
+    _pad0   as i32;
+}
+
+struct Step {
+    lookup as i64;
+    mask   as i64;
+    flags  as i64;
+}
+
+struct Plan {
+    block    as *u8;
+    bytes    as i64;
+    wants    as *Want;
+    nwants   as i64;
+    cap      as i64;
+    feats    as *Feature;
+    nfeats   as i64;
+    sblock   as *u8;
+    sbytes   as i64;
+    steps    as *Step;
+    nsteps   as i64;
+    cap_steps as i64;
+    // Where each stage's steps end: GSUB's two, then GPOS's.
+    first_end as i64;
+    gsub_end as i64;
+    gpos_end as i64;
+    gsub     as otl.Layout;
+    gpos     as otl.Layout;
+    langsys0 as i64;   // the language systems selected; 0 for none
+    langsys1 as i64;
+    var0     as i64;   // the FeatureVariations records in force; otl.NONE for none
+    var1     as i64;
+    initial  as i64;   // every glyph's mask, before features wanted over stretches
+    next_bit as i64;
+    req_tag  as i64;   // the tag of GSUB's required feature, -1 for none
+    req_stage as i64;  // and the stage it goes in
+}
+
+fn open() as Plan {
+    let is Plan as p;
+    mem.memzero(cast(*u8, &p), sizeof(Plan));
+    return p;
+}
+
+fn close(p as *Plan) as void {
+    if (p.bytes > 0) { mem.core.munmap(p.block, p.bytes); }
+    if (p.sbytes > 0) { mem.core.munmap(p.sblock, p.sbytes); }
+    p.bytes = 0;
+    p.sbytes = 0;
+}
+
+// A block of at least need bytes in *block, kept when it is large enough.
+fn _block(block as **u8, bytes as *i64, need as i64) as i32 {
+    if (need <= *bytes) { return 1; }
+    if (*bytes > 0) { mem.core.munmap(*block, *bytes); }
+    let is i64 as n with mut = 4096;
+    while (n < need) { n = n * 2; }
+    *block = mem.core.mmap_anon(n);
+    if (cast(i64, *block) <= 0) {
+        *bytes = 0;
+        return 0;
+    }
+    *bytes = n;
+    return 1;
+}
+
+// The language system of layout l that script and lang select: the script's
+// first tag the table has, or DFLT, dflt or latn; then the language's first
+// tag the script has, or dflt, or the script's default.
+fn _select(f as *table.Face, l as *otl.Layout, script as i64, lang as *u8) as i64 {
+    if (l.ok == 0) { return 0; }
+    let is [2]i64 as stags;
+    let is i64 as ns = scripts.tags(script, cast(*i64, &stags));
+    let is i64 as s with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < ns && s == 0) {
+        s = otl.script(f, l, stags[i]);
+        i = i + 1;
+    }
+    if (s == 0) { s = otl.script(f, l, scripts.DFLT); }
+    if (s == 0) { s = otl.script(f, l, scripts.DFLT_LOWER); }
+    if (s == 0) { s = otl.script(f, l, scripts.LATN); }
+    if (s == 0) { return 0; }
+    let is [8]i64 as ltags;
+    let is i64 as nl = langs.tags(lang, cast(*i64, &ltags), langs.MAX_TAGS);
+    i = 0;
+    while (i < nl) {
+        let is i64 as ls = otl.langsys(f, l, s, ltags[i]);
+        if (ls != 0) { return ls; }
+        i = i + 1;
+    }
+    let is i64 as d = otl.langsys(f, l, s, scripts.DFLT_LOWER);
+    if (d != 0) { return d; }
+    return otl.default_langsys(f, l, s);
+}
+
+// The plan begun for a face, a script (ISO 15924, as scripts.of("Latn")) and
+// a language (BCP 47, or null), with room for up to most features wanted.
+fn begin(p as *Plan, f as *table.Face, script as i64, lang as *u8, most as i64) as i32 {
+    if (_block(&p.block, &p.bytes, most * (sizeof(Want) + sizeof(Feature))) == 0) { return 0; }
+    p.wants = cast(*Want, p.block);
+    p.feats = cast(*Feature, cast(i64, p.block) + most * sizeof(Want));
+    p.cap = most;
+    p.nwants = 0;
+    p.nfeats = 0;
+    p.nsteps = 0;
+    p.gsub = otl.open(f, f.gsub);
+    p.gpos = otl.open(f, f.gpos);
+    p.langsys0 = _select(f, &p.gsub, script, lang);
+    p.langsys1 = _select(f, &p.gpos, script, lang);
+    return 1;
+}
+
+// Feature tag wanted with value over clusters start .. end (0 and ALL for
+// the whole text), in a stage of GSUB.
+fn want(p as *Plan, tag as i64, value as i64, start as i64, end as i64, stage as i64, flags as i64) as void {
+    if (p.nwants >= p.cap) { return; }
+    let is *Want as w = &p.wants[p.nwants];
+    p.nwants = p.nwants + 1;
+    w.tag = tag;
+    w.value = value;
+    w.start = start;
+    w.end = end;
+    w.stage = stage;
+    w.flags = flags;
+}
+
+fn is_whole(w as *Want) as i32 { return cast(i32, w.start == 0 && w.end == ALL); }
+
+fn feature(p as *Plan, tag as i64) as *Feature {
+    let is i64 as i with mut = 0;
+    while (i < p.nfeats) {
+        if (p.feats[i].tag == tag) { return &p.feats[i]; }
+        i = i + 1;
+    }
+    return cast(*Feature, 0);
+}
+
+fn mask_of(p as *Plan, tag as i64) as i64 {
+    let is *Feature as ft = feature(p, tag);
+    if (cast(i64, ft) == 0) { return 0; }
+    return ft.mask;
+}
+
+// The bits of value 1 of feature tag; 0 when it has none.
+fn one_of(p as *Plan, tag as i64) as i64 {
+    let is *Feature as ft = feature(p, tag);
+    if (cast(i64, ft) == 0) { return 0; }
+    return (1 << ft.shift) & ft.mask;
+}
+
+fn _bits(v as i64) as i64 {
+    let is i64 as n with mut = 0;
+    while ((v >> n) != 0) { n = n + 1; }
+    return n;
+}
+
+// The wanted features gathered by tag, found, and given bits.
+fn _features(f as *table.Face, p as *Plan) as void {
+    p.initial = EVERYWHERE;
+    p.next_bit = 1;
+    let is i64 as i with mut = 0;
+    while (i < p.nwants) {
+        let is *Want as w = &p.wants[i];
+        let is *Feature as ft with mut = feature(p, w.tag);
+        if (cast(i64, ft) == 0) {
+            ft = &p.feats[p.nfeats];
+            p.nfeats = p.nfeats + 1;
+            mem.memzero(cast(*u8, ft), sizeof(Feature));
+            ft.tag = w.tag;
+            ft.stage = w.stage;
+            ft.index0 = otl.NONE;
+            ft.index1 = otl.NONE;
+            ft.last_whole = 0 - 1;
+        }
+        if (w.stage < ft.stage) { ft.stage = w.stage; }
+        ft.flags = ft.flags | w.flags;
+        if (is_whole(w) == 1) {
+            ft.value = w.value;
+            ft.most = w.value;
+            ft.ranged = 0;
+            ft.last_whole = i;
+        } else {
+            ft.ranged = 1;
+            if (w.value > ft.most) { ft.most = w.value; }
+        }
+        i = i + 1;
+    }
+    // Found, and given bits; those not found and not kept are dropped.
+    let is i64 as kept with mut = 0;
+    i = 0;
+    while (i < p.nfeats) {
+        let is Feature as ft with mut = p.feats[i];
+        if (ft.most > 0) {
+            if (ft.tag == p.req_tag) { p.req_stage = ft.stage; }
+            if (p.langsys0 != 0) { ft.index0 = otl.find_feature(f, &p.gsub, p.langsys0, ft.tag); }
+            if (p.langsys1 != 0) { ft.index1 = otl.find_feature(f, &p.gpos, p.langsys1, ft.tag); }
+            let is i32 as found = cast(i32, ft.index0 != otl.NONE || ft.index1 != otl.NONE || (ft.flags & F_KEEP) != 0);
+            let is i32 as placed with mut = 0;
+            if (found == 1) {
+                if (ft.ranged == 0 && ft.most == 1) {
+                    ft.shift = 0;
+                    ft.mask = EVERYWHERE;
+                    placed = 1;
+                } else {
+                    let is i64 as bits with mut = _bits(ft.most);
+                    if (bits > MAX_BITS) { bits = MAX_BITS; }
+                    if (p.next_bit + bits <= LAST_BIT) {
+                        ft.shift = p.next_bit;
+                        ft.mask = ((1 << bits) - 1) << p.next_bit;
+                        p.next_bit = p.next_bit + bits;
+                        p.initial = p.initial | ((ft.value << ft.shift) & ft.mask);
+                        placed = 1;
+                    }
+                }
+            }
+            if (placed == 1) {
+                p.feats[kept] = ft;
+                kept = kept + 1;
+            }
+        }
+        i = i + 1;
+    }
+    p.nfeats = kept;
+}
+
+fn _push(p as *Plan, lookup as i64, mask as i64, flags as i64) as void {
+    if (p.nsteps >= p.cap_steps) { return; }
+    let is *Step as s = &p.steps[p.nsteps];
+    p.nsteps = p.nsteps + 1;
+    s.lookup = lookup;
+    s.mask = mask;
+    s.flags = flags;
+}
+
+// Feature index's lookups in table t pushed, under the variations in force.
+fn _add(f as *table.Face, p as *Plan, t as i64, index as i64, mask as i64, flags as i64) as void {
+    let is *otl.Layout as l with mut = &p.gsub;
+    let is i64 as v with mut = p.var0;
+    if (t == GPOS) {
+        l = &p.gpos;
+        v = p.var1;
+    }
+    let is i64 as ft = otl.feature(f, l, index, v);
+    let is i64 as n = otl.feature_lookup_count(f, l, ft);
+    let is i64 as total = otl.lookup_count(f, l);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as k = otl.feature_lookup(f, l, ft, i);
+        if (k < total) { _push(p, k, mask, flags); }
+        i = i + 1;
+    }
+}
+
+fn _count(f as *table.Face, p as *Plan, t as i64, index as i64) as i64 {
+    if (index == otl.NONE) { return 0; }
+    let is *otl.Layout as l with mut = &p.gsub;
+    let is i64 as v with mut = p.var0;
+    if (t == GPOS) {
+        l = &p.gpos;
+        v = p.var1;
+    }
+    return otl.feature_lookup_count(f, l, otl.feature(f, l, index, v));
+}
+
+// Steps from start sorted by lookup, and each lookup kept once with the bits
+// of every feature that asked for it.
+fn _merge(p as *Plan, start as i64) as void {
+    let is i64 as i with mut = start + 1;
+    while (i < p.nsteps) {
+        let is Step as x = p.steps[i];
+        let is i64 as j with mut = i;
+        while (j > start && p.steps[j - 1].lookup > x.lookup) {
+            p.steps[j] = p.steps[j - 1];
+            j = j - 1;
+        }
+        p.steps[j] = x;
+        i = i + 1;
+    }
+    if (p.nsteps - start < 2) { return; }
+    let is i64 as w with mut = start;
+    i = start + 1;
+    while (i < p.nsteps) {
+        if (p.steps[i].lookup == p.steps[w].lookup) {
+            p.steps[w].mask = p.steps[w].mask | p.steps[i].mask;
+            p.steps[w].flags = p.steps[w].flags | p.steps[i].flags;
+        } else {
+            w = w + 1;
+            p.steps[w] = p.steps[i];
+        }
+        i = i + 1;
+    }
+    p.nsteps = w + 1;
+}
+
+// The stage's steps of table t: the required feature's when it belongs
+// here, and each feature's.
+fn _stage(f as *table.Face, p as *Plan, t as i64, stage as i64, required as i64, required_stage as i64) as void {
+    let is i64 as start = p.nsteps;
+    if (required != otl.NONE && required_stage == stage) { _add(f, p, t, required, EVERYWHERE, 0); }
+    let is i64 as i with mut = 0;
+    while (i < p.nfeats) {
+        let is *Feature as ft = &p.feats[i];
+        let is i64 as index with mut = ft.index0;
+        let is i64 as fs with mut = ft.stage;
+        if (t == GPOS) {
+            index = ft.index1;
+            fs = STAGE_FIRST;
+        }
+        if (index != otl.NONE && fs == stage) { _add(f, p, t, index, ft.mask, ft.flags); }
+        i = i + 1;
+    }
+    _merge(p, start);
+}
+
+// The plan made, at the face's instance c.
+fn compile(f as *table.Face, p as *Plan, c as *var.Coords) as i32 {
+    p.var0 = otl.find_variations(f, &p.gsub, c);
+    p.var1 = otl.find_variations(f, &p.gpos, c);
+    let is i64 as req0 = otl.required_feature(f, &p.gsub, p.langsys0);
+    let is i64 as req1 = otl.required_feature(f, &p.gpos, p.langsys1);
+    // A required feature goes in the stage of a feature wanted with its tag —
+    // whether its language system lists that or not — or in the main stage.
+    p.req_tag = 0 - 1;
+    if (req0 != otl.NONE) { p.req_tag = otl.feature_tag(f, &p.gsub, req0); }
+    p.req_stage = STAGE_MAIN;
+    _features(f, p);
+    // Room for every lookup before they are merged.
+    let is i64 as most with mut = _count(f, p, GSUB, req0) + _count(f, p, GPOS, req1);
+    let is i64 as i with mut = 0;
+    while (i < p.nfeats) {
+        most = most + _count(f, p, GSUB, p.feats[i].index0) + _count(f, p, GPOS, p.feats[i].index1);
+        i = i + 1;
+    }
+    if (_block(&p.sblock, &p.sbytes, (most + 1) * sizeof(Step)) == 0) { return 0; }
+    p.steps = cast(*Step, p.sblock);
+    p.cap_steps = most + 1;
+    p.nsteps = 0;
+    _stage(f, p, GSUB, STAGE_FIRST, req0, p.req_stage);
+    p.first_end = p.nsteps;
+    _stage(f, p, GSUB, STAGE_MAIN, req0, p.req_stage);
+    p.gsub_end = p.nsteps;
+    _stage(f, p, GPOS, STAGE_FIRST, req1, STAGE_FIRST);
+    p.gpos_end = p.nsteps;
+    return 1;
+}

@@ -1,0 +1,337 @@
+// text/shape/otl.cst — OpenType layout's common tables, read where they lie:
+// GSUB's and GPOS's script, feature and lookup lists, coverage and class
+// definitions, feature variations; and GDEF.
+//
+// Every read is bounded by the table it is in: what lies outside reads as 0,
+// which is an empty list, a null offset, class 0. A table that is not
+// version 1 is not there.
+use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
+
+let is i64 as NONE with imut = 0 - 1;
+
+struct Layout {
+    t          as table.Table;
+    scripts    as i64;   // absolute offsets; 0 for none
+    features   as i64;
+    lookups    as i64;
+    variations as i64;
+    ok         as i32;
+    _pad0      as i32;
+}
+
+fn u16(f as *table.Face, t as table.Table, at as i64) as i64 {
+    if (table.inside(t, at, 2) == 0) { return 0; }
+    return table.u16_at(f, at);
+}
+
+fn i16(f as *table.Face, t as table.Table, at as i64) as i64 {
+    let is i64 as v = u16(f, t, at);
+    if (v >= 32768) { return v - 65536; }
+    return v;
+}
+
+fn u32(f as *table.Face, t as table.Table, at as i64) as i64 {
+    if (table.inside(t, at, 4) == 0) { return 0; }
+    return table.u32_at(f, at);
+}
+
+// What the 16-bit offset at at points to, from base; 0 for null.
+fn off16(f as *table.Face, t as table.Table, base as i64, at as i64) as i64 {
+    let is i64 as o = u16(f, t, at);
+    if (o == 0) { return 0; }
+    return base + o;
+}
+
+fn off32(f as *table.Face, t as table.Table, base as i64, at as i64) as i64 {
+    let is i64 as o = u32(f, t, at);
+    if (o == 0) { return 0; }
+    return base + o;
+}
+
+fn open(f as *table.Face, t as table.Table) as Layout {
+    let is Layout as l;
+    l.t = t;
+    l.scripts = 0;
+    l.features = 0;
+    l.lookups = 0;
+    l.variations = 0;
+    l.ok = 0;
+    l._pad0 = 0;
+    if (t.len < 10 || u16(f, t, t.off) != 1) { return l; }
+    l.ok = 1;
+    l.scripts = off16(f, t, t.off, t.off + 4);
+    l.features = off16(f, t, t.off, t.off + 6);
+    l.lookups = off16(f, t, t.off, t.off + 8);
+    if (u16(f, t, t.off + 2) >= 1) { l.variations = off32(f, t, t.off, t.off + 10); }
+    return l;
+}
+
+// --- Coverage and classes ---
+
+// Glyph g's index in the coverage table at cov; NONE when it is not covered.
+fn coverage(f as *table.Face, t as table.Table, cov as i64, g as i64) as i64 {
+    if (cov == 0) { return NONE; }
+    let is i64 as format = u16(f, t, cov);
+    let is i64 as n = u16(f, t, cov + 2);
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = n - 1;
+    if (format == 1) {
+        while (lo <= hi) {
+            let is i64 as mid = (lo + hi) / 2;
+            let is i64 as v = u16(f, t, cov + 4 + mid * 2);
+            if (g < v) { hi = mid - 1; } else if (g > v) { lo = mid + 1; } else { return mid; }
+        }
+        return NONE;
+    }
+    if (format == 2) {
+        while (lo <= hi) {
+            let is i64 as mid = (lo + hi) / 2;
+            let is i64 as rec = cov + 4 + mid * 6;
+            if (g < u16(f, t, rec)) { hi = mid - 1; }
+            else if (g > u16(f, t, rec + 2)) { lo = mid + 1; }
+            else { return u16(f, t, rec + 4) + g - u16(f, t, rec); }
+        }
+    }
+    return NONE;
+}
+
+// Glyph g's class in the class definition at cd; 0 for none.
+fn class_of(f as *table.Face, t as table.Table, cd as i64, g as i64) as i64 {
+    if (cd == 0) { return 0; }
+    let is i64 as format = u16(f, t, cd);
+    if (format == 1) {
+        let is i64 as first = u16(f, t, cd + 2);
+        let is i64 as n = u16(f, t, cd + 4);
+        if (g < first || g >= first + n) { return 0; }
+        return u16(f, t, cd + 6 + (g - first) * 2);
+    }
+    if (format == 2) {
+        let is i64 as lo with mut = 0;
+        let is i64 as hi with mut = u16(f, t, cd + 2) - 1;
+        while (lo <= hi) {
+            let is i64 as mid = (lo + hi) / 2;
+            let is i64 as rec = cd + 4 + mid * 6;
+            if (g < u16(f, t, rec)) { hi = mid - 1; }
+            else if (g > u16(f, t, rec + 2)) { lo = mid + 1; }
+            else { return u16(f, t, rec + 4); }
+        }
+    }
+    return 0;
+}
+
+// --- Records: a count, then a tag and an offset each, sorted by tag ---
+
+// Record tag's index in the list at list; NONE for none.
+fn find_record(f as *table.Face, t as table.Table, list as i64, tag as i64) as i64 {
+    if (list == 0) { return NONE; }
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = u16(f, t, list) - 1;
+    while (lo <= hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as v = u32(f, t, list + 2 + mid * 6);
+        if (tag < v) { hi = mid - 1; } else if (tag > v) { lo = mid + 1; } else { return mid; }
+    }
+    return NONE;
+}
+
+fn record_tag(f as *table.Face, t as table.Table, list as i64, i as i64) as i64 {
+    return u32(f, t, list + 2 + i * 6);
+}
+
+// What record i points to, its offset taken from base.
+fn record(f as *table.Face, t as table.Table, list as i64, base as i64, i as i64) as i64 {
+    if (list == 0 || i < 0 || i >= u16(f, t, list)) { return 0; }
+    return off16(f, t, base, list + 2 + i * 6 + 4);
+}
+
+// --- Scripts and language systems ---
+
+// The script table for tag; 0 for none.
+fn script(f as *table.Face, l as *Layout, tag as i64) as i64 {
+    return record(f, l.t, l.scripts, l.scripts, find_record(f, l.t, l.scripts, tag));
+}
+
+// The language system tag selects in the script table at s; 0 for none.
+fn langsys(f as *table.Face, l as *Layout, s as i64, tag as i64) as i64 {
+    if (s == 0) { return 0; }
+    return record(f, l.t, s + 2, s, find_record(f, l.t, s + 2, tag));
+}
+
+fn default_langsys(f as *table.Face, l as *Layout, s as i64) as i64 {
+    if (s == 0) { return 0; }
+    return off16(f, l.t, s, s);
+}
+
+// The language system's required feature index; NONE for none.
+fn required_feature(f as *table.Face, l as *Layout, ls as i64) as i64 {
+    if (ls == 0) { return NONE; }
+    let is i64 as i = u16(f, l.t, ls + 2);
+    if (i == 65535) { return NONE; }
+    return i;
+}
+
+fn langsys_count(f as *table.Face, l as *Layout, ls as i64) as i64 {
+    if (ls == 0) { return 0; }
+    return u16(f, l.t, ls + 4);
+}
+
+fn langsys_feature(f as *table.Face, l as *Layout, ls as i64, i as i64) as i64 {
+    return u16(f, l.t, ls + 6 + i * 2);
+}
+
+// --- Features ---
+
+fn feature_tag(f as *table.Face, l as *Layout, i as i64) as i64 {
+    if (l.features == 0 || i < 0 || i >= u16(f, l.t, l.features)) { return 0; }
+    return record_tag(f, l.t, l.features, i);
+}
+
+// The first feature of the language system with tag; NONE for none.
+fn find_feature(f as *table.Face, l as *Layout, ls as i64, tag as i64) as i64 {
+    let is i64 as n = langsys_count(f, l, ls);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as k = langsys_feature(f, l, ls, i);
+        if (feature_tag(f, l, k) == tag) { return k; }
+        i = i + 1;
+    }
+    return NONE;
+}
+
+// Feature i's table — the one FeatureVariations record v puts in its place,
+// if any (v NONE for none).
+fn feature(f as *table.Face, l as *Layout, i as i64, v as i64) as i64 {
+    if (v != NONE && l.variations != 0) {
+        let is i64 as fv = l.variations;
+        if (v < u32(f, l.t, fv + 4)) {
+            let is i64 as subs = off32(f, l.t, fv, fv + 8 + v * 8 + 4);
+            if (subs != 0) {
+                let is i64 as n = u16(f, l.t, subs + 4);
+                let is i64 as k with mut = 0;
+                while (k < n) {
+                    let is i64 as rec = subs + 6 + k * 6;
+                    if (u16(f, l.t, rec) == i) { return off32(f, l.t, subs, rec + 2); }
+                    k = k + 1;
+                }
+            }
+        }
+    }
+    return record(f, l.t, l.features, l.features, i);
+}
+
+fn feature_lookup_count(f as *table.Face, l as *Layout, ft as i64) as i64 {
+    if (ft == 0) { return 0; }
+    return u16(f, l.t, ft + 2);
+}
+
+fn feature_lookup(f as *table.Face, l as *Layout, ft as i64, i as i64) as i64 {
+    return u16(f, l.t, ft + 4 + i * 2);
+}
+
+// The first FeatureVariations record whose conditions the coordinates meet;
+// NONE for none. A condition is an axis's range (format 1, the only one
+// the specification defines); one of another format is not met.
+fn find_variations(f as *table.Face, l as *Layout, c as *var.Coords) as i64 {
+    let is i64 as fv = l.variations;
+    if (fv == 0) { return NONE; }
+    let is i64 as n = u32(f, l.t, fv + 4);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as set = off32(f, l.t, fv, fv + 8 + i * 8);
+        let is i32 as met with mut = 1;
+        if (set != 0) {
+            let is i64 as m = u16(f, l.t, set);
+            let is i64 as k with mut = 0;
+            while (k < m && met == 1) {
+                let is i64 as cond = off32(f, l.t, set, set + 2 + k * 4);
+                if (cond == 0 || u16(f, l.t, cond) != 1) {
+                    met = 0;
+                } else {
+                    let is i64 as axis = u16(f, l.t, cond + 2);
+                    let is i64 as v with mut = 0;
+                    if (axis < c.n) { v = c.v[axis]; }
+                    if (v < i16(f, l.t, cond + 4) || v > i16(f, l.t, cond + 6)) { met = 0; }
+                }
+                k = k + 1;
+            }
+        }
+        if (met == 1) { return i; }
+        i = i + 1;
+    }
+    return NONE;
+}
+
+// --- Lookups ---
+
+fn lookup_count(f as *table.Face, l as *Layout) as i64 {
+    if (l.lookups == 0) { return 0; }
+    return u16(f, l.t, l.lookups);
+}
+
+// Lookup i's table; 0 for none.
+fn lookup(f as *table.Face, l as *Layout, i as i64) as i64 {
+    if (l.lookups == 0 || i < 0 || i >= u16(f, l.t, l.lookups)) { return 0; }
+    return off16(f, l.t, l.lookups, l.lookups + 2 + i * 2);
+}
+
+fn lookup_type(f as *table.Face, l as *Layout, lk as i64) as i64 { return u16(f, l.t, lk); }
+fn lookup_flag(f as *table.Face, l as *Layout, lk as i64) as i64 { return u16(f, l.t, lk + 2); }
+fn subtable_count(f as *table.Face, l as *Layout, lk as i64) as i64 { return u16(f, l.t, lk + 4); }
+fn subtable(f as *table.Face, l as *Layout, lk as i64, i as i64) as i64 { return off16(f, l.t, lk, lk + 6 + i * 2); }
+
+// The mark filtering set the lookup names, when its flag says it has one;
+// NONE otherwise.
+fn mark_filter(f as *table.Face, l as *Layout, lk as i64) as i64 {
+    if ((lookup_flag(f, l, lk) & 16) == 0) { return NONE; }
+    return u16(f, l.t, lk + 6 + subtable_count(f, l, lk) * 2);
+}
+
+// --- GDEF ---
+
+fn _gdef(f as *table.Face) as i32 {
+    return cast(i32, f.gdef.len >= 12 && u16(f, f.gdef, f.gdef.off) == 1);
+}
+
+fn _gdef_minor(f as *table.Face) as i64 { return u16(f, f.gdef, f.gdef.off + 2); }
+
+fn has_classes(f as *table.Face) as i32 {
+    if (_gdef(f) == 0) { return 0; }
+    return cast(i32, u16(f, f.gdef, f.gdef.off + 4) != 0);
+}
+
+// Glyph g's class in GDEF: 1 base, 2 ligature, 3 mark, 4 component; 0 for
+// none.
+fn glyph_class(f as *table.Face, g as i64) as i64 {
+    if (_gdef(f) == 0) { return 0; }
+    return class_of(f, f.gdef, off16(f, f.gdef, f.gdef.off, f.gdef.off + 4), g);
+}
+
+fn mark_class(f as *table.Face, g as i64) as i64 {
+    if (_gdef(f) == 0) { return 0; }
+    return class_of(f, f.gdef, off16(f, f.gdef, f.gdef.off, f.gdef.off + 10), g);
+}
+
+fn mark_set_count(f as *table.Face) as i64 {
+    if (_gdef(f) == 0 || _gdef_minor(f) < 2) { return 0; }
+    let is i64 as sets = off16(f, f.gdef, f.gdef.off, f.gdef.off + 12);
+    if (sets == 0 || u16(f, f.gdef, sets) != 1) { return 0; }
+    return u16(f, f.gdef, sets + 2);
+}
+
+// Whether mark filtering set k holds glyph g.
+fn in_mark_set(f as *table.Face, k as i64, g as i64) as i32 {
+    if (k < 0 || k >= mark_set_count(f)) { return 0; }
+    let is i64 as sets = off16(f, f.gdef, f.gdef.off, f.gdef.off + 12);
+    let is i64 as cov = off32(f, f.gdef, sets, sets + 4 + k * 4);
+    return cast(i32, coverage(f, f.gdef, cov, g) != NONE);
+}
+
+// GDEF's item variation store, for GPOS's deltas.
+fn store(f as *table.Face) as var.Store {
+    if (_gdef(f) == 1 && _gdef_minor(f) >= 3) {
+        let is i64 as at = off32(f, f.gdef, f.gdef.off, f.gdef.off + 14);
+        if (at != 0) { return var.store(f, f.gdef, at); }
+    }
+    return var.no_store(f.gdef);
+}

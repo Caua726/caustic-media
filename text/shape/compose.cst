@@ -1,0 +1,212 @@
+// text/shape/compose.cst — characters decomposed and composed as the font can
+// draw them: Unicode's canonical normalization (UAX #15), with the font as
+// the judge of which form to keep.
+//
+// Within each grapheme: a character the font has no glyph for is replaced by
+// its canonical decomposition, as far down as the font needs — each piece
+// kept when the font has it, decomposed further when not — if that ends in
+// pieces the font has; marks are put in canonical order, by combining class;
+// then a mark is composed into the character before it when the two have a
+// canonical composition the font has a glyph for, and nothing between them
+// blocks it (UAX #15's rule). So `e` + `◌́` and `é` come out alike, whichever
+// the font has, and a font with neither draws both pieces.
+//
+// A space the font has no glyph for is drawn with its space, at the width
+// chars.space_kind says; a non-breaking hyphen with its hyphen.
+use "../sfnt/table.cst" as table;
+use "../sfnt/cmap.cst" as cmap;
+use "caustic-unicode/src/ucd/tables/decomp.cst" as dec;
+use "caustic-unicode/src/normalize/normalize.cst" as norm;
+use "glyphs.cst" as glyphs;
+use "chars.cst" as chars;
+
+// Runs of marks longer than this are left in the order they came in: no
+// text needs them reordered, and sorting them costs the square of their
+// length.
+let is i64 as MAX_MARKS with imut = 32;
+
+let is i64 as HANGUL_S with imut = 44032;
+let is i64 as HANGUL_L with imut = 4352;
+let is i64 as HANGUL_V with imut = 4449;
+let is i64 as HANGUL_T with imut = 4519;
+let is i64 as HANGUL_COUNT with imut = 11172;
+
+fn nominal(f as *table.Face, u as i64) as i64 { return cmap.glyph(f, u); }
+
+// u's canonical decomposition, one level, into parts: how many (0 for none).
+fn decompose_once(u as i64, parts as *i64) as i64 {
+    if (u >= HANGUL_S && u < HANGUL_S + HANGUL_COUNT) {
+        let is i64 as s = u - HANGUL_S;
+        let is i64 as t = s % 28;
+        if (t != 0) {
+            parts[0] = u - t;
+            parts[1] = HANGUL_T + t;
+        } else {
+            parts[0] = HANGUL_L + s / 588;
+            parts[1] = HANGUL_V + (s % 588) / 28;
+        }
+        return 2;
+    }
+    let is i32 as m = dec.decomp_get(cast(i32, u));
+    if (m == 0) { return 0; }
+    let is i64 as rec = cast(i64, dec.decomp_meta_at(m));
+    let is i64 as off = rec & 1048575;
+    let is i64 as n = (rec >> 20) & 255;
+    if (((rec >> 28) & 1) != 0 || n < 1 || n > 2) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        parts[i] = cast(i64, dec.decomp_pool_at(cast(i32, off + i)));
+        i = i + 1;
+    }
+    return n;
+}
+
+// u as characters the font has, into out from n: the new count, or -1 when
+// it cannot be.
+fn _expand(f as *table.Face, u as i64, out as *i64, n as i64, depth as i64) as i64 {
+    if (nominal(f, u) != 0) {
+        if (n >= 64) { return 0 - 1; }
+        out[n] = u;
+        return n + 1;
+    }
+    if (depth > 8) { return 0 - 1; }
+    let is [2]i64 as parts;
+    let is i64 as k = decompose_once(u, cast(*i64, &parts));
+    if (k == 0) { return 0 - 1; }
+    let is i64 as m with mut = n;
+    let is i64 as i with mut = 0;
+    while (i < k) {
+        m = _expand(f, parts[i], out, m, depth + 1);
+        if (m < 0) { return 0 - 1; }
+        i = i + 1;
+    }
+    return m;
+}
+
+// g with character u in its place: what Unicode says of u, its glyph.
+fn _as(f as *table.Face, g as *glyphs.Glyph, u as i64) as void {
+    g.id = cast(u32, u);
+    g.cat = cast(u8, chars.category(u));
+    g.ccc = cast(u8, chars.combining_class(u));
+    g.alt = cast(u32, nominal(f, u));
+}
+
+// The current record written as the font can draw it.
+fn _decompose(f as *table.Face, r as *glyphs.Run) as void {
+    let is glyphs.Glyph as g = *glyphs.cur(r);
+    let is i64 as u = cast(i64, g.id);
+    let is i64 as have = nominal(f, u);
+    if (have != 0) {
+        g.alt = cast(u32, have);
+        glyphs.put(r, &g);
+        glyphs.drop(r);
+        return;
+    }
+    let is [64]i64 as pieces;
+    let is i64 as n = _expand(f, u, cast(*i64, &pieces), 0, 0);
+    if (n > 0) {
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            let is glyphs.Glyph as piece = g;
+            _as(f, &piece, pieces[i]);
+            glyphs.put(r, &piece);
+            i = i + 1;
+        }
+        glyphs.drop(r);
+        return;
+    }
+    let is i64 as kind = chars.space_kind(u);
+    let is i64 as space = nominal(f, 32);
+    if (kind != chars.NOT_SPACE && space != 0) {
+        g.alt = cast(u32, space);
+        g.space = cast(u8, kind);
+        g.uflags = cast(u8, cast(i64, g.uflags) | glyphs.U_FALLBACK_SPACE);
+    } else if (u == 8209) {
+        // A non-breaking hyphen looks like a hyphen.
+        g.alt = cast(u32, nominal(f, 8208));
+    }
+    glyphs.put(r, &g);
+    glyphs.drop(r);
+}
+
+// Records a .. b of what was written, marks in canonical order: each run of
+// them sorted by class, stably.
+fn _order(r as *glyphs.Run, a as i64, b as i64) as void {
+    let is i64 as i with mut = a;
+    while (i < b) {
+        if (r.dst[i].ccc == cast(u8, 0)) {
+            i = i + 1;
+        } else {
+            let is i64 as end with mut = i;
+            while (end < b && r.dst[end].ccc != cast(u8, 0)) { end = end + 1; }
+            if (end - i <= MAX_MARKS) {
+                let is i64 as k with mut = i + 1;
+                while (k < end) {
+                    let is glyphs.Glyph as x = r.dst[k];
+                    let is i64 as j with mut = k;
+                    while (j > i && r.dst[j - 1].ccc > x.ccc) {
+                        r.dst[j] = r.dst[j - 1];
+                        j = j - 1;
+                    }
+                    r.dst[j] = x;
+                    k = k + 1;
+                }
+            }
+            i = end;
+        }
+    }
+}
+
+// Records a .. of what was written composed where the font can; the new
+// end of them.
+fn _compose(f as *table.Face, r as *glyphs.Run, a as i64, b as i64) as i64 {
+    if (b - a < 2) { return b; }
+    let is i64 as w with mut = a + 1;       // where the next kept record goes
+    let is i64 as starter with mut = 0 - 1;
+    if (r.dst[a].ccc == cast(u8, 0)) { starter = a; }
+    let is i64 as last_ccc with mut = 0 - 1;  // of the last record kept after the starter; -1 for none
+    let is i64 as i with mut = a + 1;
+    while (i < b) {
+        let is glyphs.Glyph as m = r.dst[i];
+        let is i64 as ccc = cast(i64, m.ccc);
+        let is i32 as done with mut = 0;
+        if (starter >= 0 && chars.is_mark(cast(i64, m.cat)) == 1 && (last_ccc < 0 || (last_ccc < ccc && last_ccc != 0))) {
+            let is i64 as both = cast(i64, norm.compose_pair(cast(i32, r.dst[starter].id), cast(i32, m.id)));
+            if (both > 0) {
+                let is i64 as g = nominal(f, both);
+                if (g != 0) {
+                    _as(f, &r.dst[starter], both);
+                    done = 1;
+                }
+            }
+        }
+        if (done == 0) {
+            r.dst[w] = m;
+            if (ccc == 0) {
+                starter = w;
+                last_ccc = 0 - 1;
+            } else {
+                last_ccc = ccc;
+            }
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    return w;
+}
+
+// The run, a grapheme at a time, as the font can draw it.
+fn compose(f as *table.Face, r as *glyphs.Run) as void {
+    glyphs.begin(r);
+    while (glyphs.more(r) == 1) {
+        let is i64 as a = r.n;
+        let is u32 as cluster = glyphs.cur(r).cluster;
+        while (glyphs.more(r) == 1 && glyphs.cur(r).cluster == cluster) { _decompose(f, r); }
+        if (r.ok == 1 && r.n - a > 1) {
+            _order(r, a, r.n);
+            r.n = _compose(f, r, a, r.n);
+        }
+        glyphs.step(r, 1);
+    }
+    glyphs.end(r);
+}

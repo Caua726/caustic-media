@@ -27,6 +27,9 @@ nothing, to reach what real fonts rarely do.
 | `bomb.otf` | made by the tool | subroutines that fan out past the operator limit |
 | `bomb-type1.otf` | made by the tool | Type 1 charstrings, which are refused |
 | `shape.ttf` | made by the tool | shaping without the font's help: no `GDEF` or `GSUB`, an empty `GPOS`; bases, marks above, below and through as rectangles; a spacing mark; variation sequences |
+| `shape-plain.ttf` | made by the tool | the same glyphs with no `GPOS`: marks placed by the shaper's fallback; a legacy `kern` table |
+| `lookups.ttf` | made by the tool | every `GSUB` and `GPOS` lookup type in every format — context and chained context by glyph, class and coverage, extensions, reverse chaining, nested lookups that add and remove glyphs — and every lookup flag: bases, ligatures and marks ignored, mark attachment classes, mark filtering sets, right to left; a required feature |
+| `varlookups.ttf` | made by the tool | lookups an instance chooses: `FeatureVariations` swapping `rvrn`'s and `calt`'s lookups at a weight from half way up, and at a light weight and narrow width together; a required feature tagged `rvrn`, in that feature's stage; a language system's feature listing one lookup twice; placements, an advance and an anchor varied; a `GDEF` with no glyph classes, marks known by their characters |
 | `fonts/` | made by the tool | a pretend system's fonts for [`../fonts`](../fonts/fonts.md): 32 files in nested directories, one not named as a font — a family in weights from 100 to 900, two widths, italic and oblique, a CFF face, legacy families split from typographic ones; variable faces over weight, width, slant, italic and optical size, some past CSS's ranges; Greek and Cyrillic companions; a collection of two CJK faces; a colour face standing for emoji; monospace; old weight classes, no `OS/2`, an `OS/2` too short, no names; weights between 400 and 500; a broken file and an empty one. Glyphs are squares: only what matching reads matters |
 
 `*.sfnt.ref` is what fontTools reads from each: tables, names, every cmap
@@ -38,8 +41,8 @@ is each at chosen instances: HarfBuzz's coordinates for them, every glyph's
 outline and advance, every `MVAR` delta — described at the top of
 `../tools/var_reference.py`. `raster.ref` is paths and glyphs of these fonts
 drawn as coverage, described at the top of `../tools/raster_reference.py`.
-`*.shape.ref` is text shaped by HarfBuzz in each font — glyphs, clusters, glyph
-flags and positions — described at the top of `../tools/shape_reference.py`.
+`*.shape.ref` is text shaped by HarfBuzz in each font — glyphs, clusters and
+positions — described at the top of `../tools/shape_reference.py`.
 
 All are made by development tools that need fontTools and the source fonts; the
 output is versioned so the tests need none of them, and is the same byte for byte

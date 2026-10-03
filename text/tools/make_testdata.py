@@ -110,6 +110,17 @@ def rename(font, old_names, family):
                         fd.FontName = fd.FontName.replace(old_names[0].replace(" ", ""), ps)
 
 
+def make_subset(out, src, text, family):
+    font = TTFont(src, recalcTimestamp=False)
+    licence_font = TTFont(src, lazy=True)
+    old = families(font)
+    subset_font(font, text)
+    rename(font, old, family)
+    font.save(os.path.join(OUT, out))
+    licence(licence_font, out)
+    print(out, os.path.getsize(os.path.join(OUT, out)), "bytes")
+
+
 def licence(font, out_name):
     copyright = font["name"].getDebugName(0) or ""
     with open(os.path.join(OUT, "licenses", out_name + ".txt"), "w", encoding="utf-8") as f:
@@ -929,6 +940,20 @@ SHAPE_ABOVE = "ַָּّ̀́̂̃̈̊ަާ᩠༹"
 SHAPE_BELOW = "ِ̧̨̣࿆ͅ"
 SHAPE_THROUGH = "̴"
 SHAPE_SPACING = "༹"
+# Added after the rest, so that no other glyph moves: a composite whose mark,
+# an overlay, is of combining class 1 — what composes with it alone; and
+# marks of the classes that put them on an edge or touching (214, 216, 218,
+# 222, 228, 232).
+SHAPE_LATE_ABOVE = "\u1DCE\u031B\u302B\u0315"
+SHAPE_LATE_BELOW = "\u1DFA\u302D"
+SHAPE_LATE = "∉" + SHAPE_LATE_ABOVE + SHAPE_LATE_BELOW
+
+
+def _left(g):
+    """A glyph's left side bearing: its ink's left edge, so that the font
+    draws it where its points are."""
+    g.recalcBounds(None)
+    return getattr(g, "xMin", 0)
 
 
 def make_shape_font(gpos):
@@ -936,8 +961,10 @@ def make_shape_font(gpos):
     # tell glyphs apart; marks sit to the left of their origin, as combining
     # marks are drawn, over, under or through where the base before them is.
     # The emoji heart has a second glyph, chosen by VS16 through cmap format
-    # 14, and the plain one VS15 asks for by default. With gpos, an empty
-    # GPOS table: positioning by the font, which does nothing — no fallback.
+    # 14, and the plain one VS15 asks for by default. ∉ is there, its overlay
+    # solidus not. With gpos, an empty GPOS table: positioning by the font,
+    # which does nothing — no fallback; without, a legacy kern table, and
+    # marks placed by fallback.
     from fontTools.fontBuilder import FontBuilder
     from fontTools.pens.ttGlyphPen import TTGlyphPen
     from fontTools.ttLib import newTable
@@ -948,24 +975,29 @@ def make_shape_font(gpos):
         pen.moveTo((x0, y0)); pen.lineTo((x0, y1)); pen.lineTo((x1, y1)); pen.lineTo((x1, y0)); pen.closePath()
         return pen.glyph()
 
-    marks = SHAPE_ABOVE + SHAPE_BELOW + SHAPE_THROUGH
-    cps = sorted(set(ord(c) for c in SHAPE_BASES + marks))
-    names = [".notdef"] + ["u%04X" % c for c in cps] + ["u2764.emoji"]
+    above = SHAPE_ABOVE + SHAPE_LATE_ABOVE
+    below = SHAPE_BELOW + SHAPE_LATE_BELOW
+    marks = above + below + SHAPE_THROUGH
+    cps = sorted(set(ord(c) for c in SHAPE_BASES + SHAPE_ABOVE + SHAPE_BELOW + SHAPE_THROUGH))
+    late = [ord(c) for c in SHAPE_LATE]
+    names = [".notdef"] + ["u%04X" % c for c in cps] + ["u2764.emoji"] + ["u%04X" % c for c in late]
     glyphs, metrics = {}, {}
     glyphs[".notdef"] = rect(50, 0, 450, 700)
     metrics[".notdef"] = (500, 50)
-    for i, c in enumerate(cps):
+    for i, c in enumerate(cps + late):
         n = "u%04X" % c
         ch = chr(c)
         if ch in marks and ch not in SHAPE_SPACING:
             adv = 0
+        elif c in late:
+            adv = 600
         else:
             adv = 200 + (i * 73) % 600
         if c == 0x20:
             adv, g = 260, None
-        elif ch in SHAPE_ABOVE:
+        elif ch in above:
             g = rect(-300 + adv, 550, -100 + adv, 700)
-        elif ch in SHAPE_BELOW:
+        elif ch in below:
             g = rect(-300, -200, -100, -50)
         elif ch in SHAPE_THROUGH:
             g = rect(-350, 200, -50, 300)
@@ -975,12 +1007,12 @@ def make_shape_font(gpos):
             pen = TTGlyphPen(None)
             g = pen.glyph()
         glyphs[n] = g
-        metrics[n] = (adv, getattr(g, "xMin", 0))
+        metrics[n] = (adv, _left(g))
     glyphs["u2764.emoji"] = rect(30, -100, 970, 800)
     metrics["u2764.emoji"] = (1000, 30)
     fb = FontBuilder(1000, isTTF=True)
     fb.setupGlyphOrder(names)
-    fb.setupCharacterMap({c: "u%04X" % c for c in cps},
+    fb.setupCharacterMap({c: "u%04X" % c for c in cps + late},
                          uvs=[(0x2764, 0xFE0F, "u2764.emoji"), (0x2764, 0xFE0E, None)])
     fb.setupGlyf(glyphs)
     fb.setupHorizontalMetrics(metrics)
@@ -992,6 +1024,18 @@ def make_shape_font(gpos):
                 usWinAscent=800, usWinDescent=200)
     fb.setupPost()
     fb.updateHead(created=3786825600, modified=3786825600)
+    if not gpos:
+        # Without GPOS, the legacy kern table kerns: version 0, one format 0
+        # subtable.
+        from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
+        kern = newTable("kern")
+        kern.version = 0
+        sub = KernTable_format_0()
+        sub.version, sub.coverage, sub.format = 0, 1, 0
+        sub.kernTable = {("u0041", "u0056"): -80, ("u0056", "u0041"): -70, ("u0054", "u006F"): -55,
+                         ("u0057", "u006F"): -40, ("u0061", "u0076"): -25, ("u0066", "u0069"): 15}
+        kern.kernTables = [sub]
+        fb.font["kern"] = kern
     if gpos:
         t = newTable("GPOS")
         t.table = ot.GPOS()
@@ -1011,15 +1055,935 @@ def make_shape_font(gpos):
 
 def synthetic_shape():
     # Made from nothing, so under no licence.
-    for name, gpos in (("shape.ttf", True),):
+    for name, gpos in (("shape.ttf", True), ("shape-plain.ttf", False)):
         path = os.path.join(OUT, name)
         make_shape_font(gpos).save(path)
         print(name, os.path.getsize(path), "bytes")
 
 
+# --- lookups.ttf: every lookup type, format and flag ---
+
+LOOKUPS_FEA = """
+languagesystem DFLT dflt;
+languagesystem latn dflt;
+languagesystem latn TRK;
+languagesystem latn KOH;
+languagesystem deva dflt;
+
+markClass [acutecomb gravecomb tildecomb ringcomb] <anchor 0 600> @TOP;
+markClass [dotbelowcomb cedillacomb] <anchor 0 0> @BOTTOM;
+@ABOVE = [acutecomb gravecomb tildecomb ringcomb];
+
+lookup SC1 { sub [a b c] by [a.sc b.sc c.sc]; } SC1;
+lookup SC2 { sub [d e] by [e.sc d.sc]; } SC2;
+feature smcp { lookup SC1; lookup SC2; } smcp;
+
+feature salt { sub a from [a.alt1 a.alt2 a.alt3]; } salt;
+feature rand { sub b from [b.alt1 b.alt2]; } rand;
+
+feature ccmp { lookup MULT { sub w by v v; sub q by NULL; } MULT; } ccmp;
+
+feature liga {
+    lookup LIGA { lookupflag IgnoreMarks; sub f f i by f_f_i; sub f i by f_i; sub f l by f_l; } LIGA;
+    lookup LIGA_TH useExtension { sub T h by T_h; } LIGA_TH;
+} liga;
+
+feature dlig { lookup SPLIT { sub f_i by f i; } SPLIT; } dlig;
+
+feature calt {
+    lookup CALT1 { sub x y' z by y.alt; } CALT1;
+    lookup CALT2 { sub [m n] o' [p r] by o.alt; } CALT2;
+} calt;
+
+feature rclt { lookup REV { rsub [m n] s' [t] by s.alt; } REV; } rclt;
+
+feature locl { script latn; language TRK required; sub i by i.trk; } locl;
+
+# A language's second tag ("ko": KOR, then KOH) and a script's ("Deva": dev2,
+# then deva), each the only one the font has, with a feature of its own.
+feature ss06 {
+    script latn; language KOH exclude_dflt; sub a by a.alt2;
+    script deva; language dflt; sub a by a.alt3;
+} ss06;
+
+lookup PH1 { sub u by u.alt; } PH1;
+feature ss01 { lookup PH1; } ss01;
+
+feature kern {
+    lookup KPAIR { pos a v -40; pos v a -35; pos A <0 0 -80 0> V <10 0 0 0>; pos V A -30; } KPAIR;
+    lookup KCLASS { pos [T Y] [o e] -60; pos [L] [T Y] -70; } KCLASS;
+    lookup KSINGLE { pos x <10 20 30 0>; pos [g j] <5 -10 0 0>; } KSINGLE;
+    lookup KEXT useExtension { pos k k -25; } KEXT;
+} kern;
+
+feature mark {
+    lookup MBASE { pos base [a b c e o x u g h v v.alt] <anchor 250 520> mark @TOP <anchor 250 -20> mark @BOTTOM; } MBASE;
+    lookup MLIG {
+        pos ligature f_i <anchor 150 720> mark @TOP <anchor 150 -20> mark @BOTTOM
+            ligComponent <anchor 450 720> mark @TOP <anchor 450 -20> mark @BOTTOM;
+        pos ligature f_f_i <anchor 120 720> mark @TOP ligComponent <anchor 300 720> mark @TOP
+            ligComponent <anchor 480 720> mark @TOP;
+        pos ligature F_G_H <anchor 100 720> mark @TOP ligComponent <anchor 300 740> mark @TOP
+            ligComponent <anchor 500 760> mark @TOP;
+        pos ligature f_i_l <anchor 110 720> mark @TOP ligComponent <anchor 310 740> mark @TOP
+            ligComponent <anchor 510 760> mark @TOP;
+    } MLIG;
+} mark;
+
+feature mkmk {
+    lookup MKMK { lookupflag MarkAttachmentType @ABOVE;
+        pos mark [acutecomb gravecomb tildecomb ringcomb] <anchor 0 700> mark @TOP; } MKMK;
+    lookup MKMK2 { lookupflag UseMarkFilteringSet [dotbelowcomb];
+        pos mark [dotbelowcomb] <anchor 0 -150> mark @BOTTOM; } MKMK2;
+} mkmk;
+
+feature curs {
+    lookup CURS { lookupflag RightToLeft IgnoreMarks;
+        pos cursive k <anchor 0 100> <anchor 300 150>;
+        pos cursive l <anchor 0 150> <anchor 350 100>; } CURS;
+} curs;
+
+feature dist { lookup DIST1 { pos x y' 25 z; } DIST1; } dist;
+
+lookup PP1 { pos u <0 0 15 0>; } PP1;
+feature ss02 { lookup PP1; } ss02;
+
+# What the other features leave untried, each on letters of its own: a glyph
+# made a mark; a ligature made a mark; a ligature of a ligature the font
+# calls a base, and of one it calls a ligature, marks between their parts;
+# reverse chaining at the text's end; ligatures of marks on a ligature's
+# components, the lookup passing over the ligature or not; a mark joined to
+# a piece of a glyph a multiple substitution split; an advance of -32768;
+# cursive attachment from both ends, the second turning the first round.
+feature ss03 {
+    lookup TOMARK { sub B by acutecomb; } TOMARK;
+    lookup TORING { sub M N by ringcomb; } TORING;
+    lookup LIG2 { sub F G by F_G; } LIG2;
+    lookup LIG3 { lookupflag IgnoreMarks; sub F_G H by F_G_H; } LIG3;
+    lookup LIG4 { lookupflag IgnoreMarks; sub f_i l by f_i_l; } LIG4;
+    lookup REV2 { rsub [J] K' by K.alt; } REV2;
+    lookup MLIGA { lookupflag IgnoreLigatures; sub acutecomb gravecomb by tildecomb; } MLIGA;
+    lookup MLIGC { lookupflag IgnoreLigatures; sub n acutecomb by n.alt; } MLIGC;
+    lookup PIECEMARK { sub v acutecomb by v.alt; } PIECEMARK;
+    lookup FAR { pos O <0 0 -32768 0>; } FAR;
+    lookup CURSA { pos cursive C <anchor NULL> <anchor 300 200>; pos cursive D <anchor 0 120> <anchor 350 250>; } CURSA;
+    lookup CURSB { lookupflag RightToLeft;
+        pos cursive D <anchor 0 50> <anchor 300 250>; pos cursive E <anchor 0 220> <anchor NULL>; } CURSB;
+} ss03;
+
+feature ss04 {
+    lookup MLIGB { sub acutecomb gravecomb by tildecomb; } MLIGB;
+    lookup MKMK3 { lookupflag IgnoreLigatures; pos mark [acutecomb] <anchor 0 650> mark @TOP; } MKMK3;
+} ss04;
+
+# Reached from a context alone, where reverse chaining is not applied.
+lookup REVN { rsub o' by o.alt; } REVN;
+
+# Lookups of several subtables, an earlier one passing over what a later one
+# takes, each way a subtable can pass a glyph by; rule sets of several rules
+# are added by hand. Pairs several to a first glyph, one of zero, pairs of
+# classes with both glyphs valued. Cursive attachment chained 70 long, then
+# turned round from its far end; and turned back over the same pair. A
+# glyph the font calls a base put on another as a mark. A glyph split into
+# two and three pieces, marks after them. Reverse chaining in subtables of
+# a rule each.
+markClass [acutecomb] <anchor 0 610> @A5;
+markClass [gravecomb] <anchor 0 620> @G5;
+markClass [tildecomb] <anchor 0 630> @T5;
+markClass [y] <anchor 20 0> @Y5;
+feature ss05 {
+    lookup MULT5 { sub H by h i; sub G by h i i; } MULT5;
+    lookup VVLIG { sub v v by f_i; } VVLIG;
+    lookup REV5 {
+        rsub [c] b' [d] by b.alt1;
+        rsub b' [e] by b.alt2;
+        rsub [a] b' by b.alt1;
+        rsub x' [e] by x.alt;
+    } REV5;
+    lookup PSET {
+        pos a <0 0 -11 0> c <0 1 0 0>; pos a <0 0 -12 0> d <0 2 0 0>; pos a <0 0 -13 0> e <0 3 0 0>;
+        pos a <0 0 0 0> f <0 0 0 0>; pos a <0 0 -14 0> i <0 4 0 0>;
+    } PSET;
+    lookup PPLACE { pos o <0 0 0 0> c <7 0 0 0>; pos o <0 0 0 0> d <0 9 0 0>; } PPLACE;
+    lookup PCLASS { pos [T Y] <0 0 -60 0> [o e] <0 7 0 0>; pos [L] <0 0 -70 0> [T Y] <3 0 0 0>; } PCLASS;
+    lookup CURS4 { lookupflag 0; pos cursive D <anchor 0 120> <anchor 350 250>; } CURS4;
+    lookup CURS5 { lookupflag RightToLeft;
+        pos cursive D <anchor NULL> <anchor 300 260>; pos cursive E <anchor 0 210> <anchor NULL>; } CURS5;
+    lookup MBASE2 { lookupflag 0;
+        pos base [d] <anchor 100 500> mark @A5;
+        pos base [k] <anchor 150 520> mark @G5;
+        subtable;
+        pos base [d z] <anchor 200 510> mark @A5 <anchor 210 520> mark @G5 <anchor 220 530> mark @T5;
+    } MBASE2;
+    lookup MLIG2 { lookupflag 0;
+        pos ligature T_h <anchor 100 700> mark @A5 ligComponent <anchor 300 700> mark @A5;
+        subtable;
+        pos ligature T_h <anchor 110 710> mark @A5 <anchor 120 720> mark @G5
+            ligComponent <anchor 310 710> mark @A5 <anchor 320 720> mark @G5;
+        pos ligature f_l <anchor 130 730> mark @A5 <anchor 140 740> mark @G5
+            ligComponent <anchor 330 730> mark @A5 <anchor 340 740> mark @G5;
+    } MLIG2;
+    lookup MKMK5 { lookupflag 0;
+        pos mark [acutecomb] <anchor 0 800> mark @G5;
+        subtable;
+        pos mark [acutecomb ringcomb] <anchor 0 810> mark @G5 <anchor 0 820> mark @T5;
+    } MKMK5;
+    lookup YMARK { lookupflag 0; pos base [x] <anchor 100 300> mark @Y5; } YMARK;
+} ss05;
+
+# Fractions, each part of them its own glyph.
+feature frac { sub [one two] by [one.fr two.fr]; } frac;
+feature numr { sub [one two fraction] by [one.nu two.nu fraction.nu]; } numr;
+feature dnom { sub [one two fraction] by [one.dn two.dn fraction.dn]; } dnom;
+
+table GDEF {
+    GlyphClassDef [a b c d e f g h i j k l m n o p q r s t u v w x y z A L T V Y a.sc b.sc c.sc d.sc e.sc
+                   a.alt1 a.alt2 a.alt3 b.alt1 b.alt2 y.alt o.alt s.alt i.trk h.alt k.alt r.alt g.alt j.alt
+                   v.alt x.alt u.alt t.alt z.alt B C D E F G H I J K M N O K.alt n.alt F_G
+                   one two fraction one.fr two.fr one.nu two.nu fraction.nu one.dn two.dn fraction.dn],
+                  [f_f_i f_i f_l T_h F_G_H f_i_l],
+                  [acutecomb gravecomb tildecomb ringcomb dotbelowcomb cedillacomb], ;
+} GDEF;
+"""
+
+LOOKUP_MARKS = {"acutecomb": 0x301, "gravecomb": 0x300, "tildecomb": 0x303, "ringcomb": 0x30A,
+                "dotbelowcomb": 0x323, "cedillacomb": 0x327}
+LOOKUP_EXTRA = ["a.sc", "b.sc", "c.sc", "d.sc", "e.sc", "a.alt1", "a.alt2", "a.alt3", "b.alt1", "b.alt2",
+                "y.alt", "o.alt", "s.alt", "i.trk", "h.alt", "k.alt", "r.alt", "g.alt", "j.alt", "v.alt",
+                "x.alt", "u.alt", "t.alt", "z.alt", "f_f_i", "f_i", "f_l", "T_h"]
+# Added later, after the rest so that their glyph ids are new: letters for
+# ss03's lookups alone, their alternates and ligatures, and fractions.
+LOOKUP_LETTERS = "BCDEFGHIJKMNO"
+LOOKUP_MORE = (list(LOOKUP_LETTERS) +
+               ["K.alt", "n.alt", "F_G", "F_G_H", "f_i_l", "one", "two", "fraction", "one.fr", "two.fr",
+                "one.nu", "two.nu", "fraction.nu", "one.dn", "two.dn", "fraction.dn"])
+LOOKUP_MORE_CMAP = dict([(ord(c), c) for c in LOOKUP_LETTERS] + [(0x31, "one"), (0x32, "two"), (0x2044, "fraction")])
+
+
+def _extra_lookups(font):
+    """What the feature file cannot say: context substitution in each format,
+    chained by classes, nested lookups that add and take away glyphs, lookup
+    flags over ligatures and bases; context positioning in each format,
+    chained by classes and by coverages. Substitutions join ss01's lookups,
+    positionings ss02's."""
+    from fontTools.ttLib.tables import otTables as ot
+    from fontTools.otlLib import builder as ob
+    gmap = font.getReverseGlyphMap()
+
+    def cov(glyphs):
+        return ob.buildCoverage(glyphs, gmap)
+
+    def classes(m):
+        cd = ot.ClassDef()
+        cd.classDefs = dict(m)
+        return cd
+
+    def rec(kind, seq, index):
+        r = getattr(ot, kind)()
+        r.SequenceIndex, r.LookupListIndex = seq, index
+        return r
+
+    def add(table, kind, subtables, flag=0):
+        lk = ot.Lookup()
+        lk.LookupType, lk.LookupFlag = kind, flag
+        lk.SubTable = subtables
+        lk.SubTableCount = len(subtables)
+        table.LookupList.Lookup.append(lk)
+        table.LookupList.LookupCount = len(table.LookupList.Lookup)
+        return table.LookupList.LookupCount - 1
+
+    gsub, gpos = font["GSUB"].table, font["GPOS"].table
+    single = lambda m: add(gsub, 1, [ob.buildSingleSubstSubtable(m)])
+    l_h = single({"h": "h.alt", "k": "k.alt"})
+    l_r = single({"r": "r.alt"})
+    l_gj = single({"g": "g.alt", "j": "j.alt"})
+    l_v = single({"v": "v.alt"})
+    l_x = single({"x": "x.alt"})
+    l_b = single({"b": "b.alt1"})
+    l_acute = single({"acutecomb": "tildecomb"})
+    # The lookups the feature file made, by what they do.
+    names = {}
+    for i, lk in enumerate(gsub.LookupList.Lookup):
+        st = lk.SubTable[0]
+        if lk.LookupType == 2 and "w" in getattr(st, "mapping", {}):
+            names["mult"] = i
+        if lk.LookupType == 4 and "f" in getattr(st, "ligatures", {}) and lk.LookupFlag == 8:
+            names["liga"] = i
+
+    # Context, format 1: g h, and j k r.
+    f1 = ot.ContextSubst()
+    f1.Format = 1
+    f1.Coverage = cov(["g", "j"])
+    sets = []
+    for first, rest, records in (("g", ["h"], [(1, l_h)]), ("j", ["k", "r"], [(1, l_h), (2, l_r)])):
+        rs = ot.SubRuleSet()
+        rule = ot.SubRule()
+        rule.Input = rest
+        rule.GlyphCount = len(rest) + 1
+        rule.SubstLookupRecord = [rec("SubstLookupRecord", q, k) for q, k in records]
+        rule.SubstCount = len(records)
+        rs.SubRule = [rule]
+        rs.SubRuleCount = 1
+        sets.append(rs)
+    f1.SubRuleSet = sets
+    f1.SubRuleSetCount = len(sets)
+    # Format 2: a class of h and k followed by one of m and n.
+    f2 = ot.ContextSubst()
+    f2.Format = 2
+    f2.Coverage = cov(["h", "k"])
+    f2.ClassDef = classes({"h": 1, "k": 1, "m": 2, "n": 2})
+    cr = ot.SubClassRule()
+    cr.Class = [2]
+    cr.GlyphCount = 2
+    cr.SubstLookupRecord = [rec("SubstLookupRecord", 0, l_h)]
+    cr.SubstCount = 1
+    cs = ot.SubClassSet()
+    cs.SubClassRule = [cr]
+    cs.SubClassRuleCount = 1
+    f2.SubClassSet = [None, cs, None]
+    f2.SubClassSetCount = 3
+    # Format 3: r, then t.
+    f3 = ot.ContextSubst()
+    f3.Format = 3
+    f3.Coverage = [cov(["r"]), cov(["t"])]
+    f3.GlyphCount = 2
+    f3.SubstLookupRecord = [rec("SubstLookupRecord", 0, l_r)]
+    f3.SubstCount = 1
+    c5 = add(gsub, 5, [f1, f2, f3])
+    # Nested lookups that change the length: p w x — w made v v, the second v
+    # varied after it; and f i x — f i made one, the x after it varied.
+    grow = ot.ContextSubst()
+    grow.Format = 1
+    grow.Coverage = cov(["f", "p"])
+    sets = []
+    for first, rest, records in (("f", ["i", "x"], [(0, names["liga"]), (1, l_x)]),
+                                 ("p", ["w", "x"], [(1, names["mult"]), (2, l_v), (3, l_x)]),
+                                 ):
+        rs = ot.SubRuleSet()
+        rule = ot.SubRule()
+        rule.Input = rest
+        rule.GlyphCount = len(rest) + 1
+        rule.SubstLookupRecord = [rec("SubstLookupRecord", q, k) for q, k in records]
+        rule.SubstCount = len(records)
+        rs.SubRule = [rule]
+        rs.SubRuleCount = 1
+        sets.append(rs)
+    grow.SubRuleSet = sets
+    grow.SubRuleSetCount = len(sets)
+    c5b = add(gsub, 5, [grow])
+    # Chained, format 2: g or j after a, before o.
+    ch = ot.ChainContextSubst()
+    ch.Format = 2
+    ch.Coverage = cov(["g", "j"])
+    ch.BacktrackClassDef = classes({"a": 1})
+    ch.InputClassDef = classes({"g": 1, "j": 1})
+    ch.LookAheadClassDef = classes({"o": 1})
+    rule = ot.ChainSubClassRule()
+    rule.Backtrack, rule.BacktrackGlyphCount = [1], 1
+    rule.Input, rule.InputGlyphCount = [], 1
+    rule.LookAhead, rule.LookAheadGlyphCount = [1], 1
+    rule.SubstLookupRecord = [rec("SubstLookupRecord", 0, l_gj)]
+    rule.SubstCount = 1
+    cset = ot.ChainSubClassSet()
+    cset.ChainSubClassRule = [rule]
+    cset.ChainSubClassRuleCount = 1
+    ch.ChainSubClassSet = [None, cset]
+    ch.ChainSubClassSetCount = 2
+    c6 = add(gsub, 6, [ch])
+    # Flags: a and b with ligatures between passed over; an acute and a grave
+    # with a base between.
+    over = ot.ContextSubst()
+    over.Format = 3
+    over.Coverage = [cov(["a"]), cov(["b"])]
+    over.GlyphCount = 2
+    over.SubstLookupRecord = [rec("SubstLookupRecord", 1, l_b)]
+    over.SubstCount = 1
+    c_lig = add(gsub, 5, [over], flag=4)
+    marks = ot.ContextSubst()
+    marks.Format = 3
+    marks.Coverage = [cov(["acutecomb"]), cov(["gravecomb"])]
+    marks.GlyphCount = 2
+    marks.SubstLookupRecord = [rec("SubstLookupRecord", 0, l_acute)]
+    marks.SubstCount = 1
+    c_base = add(gsub, 5, [marks], flag=2)
+    for fr in gsub.FeatureList.FeatureRecord:
+        if fr.FeatureTag == "ss01":
+            fr.Feature.LookupListIndex += [c5, c5b, c6, c_lig, c_base]
+            fr.Feature.LookupCount = len(fr.Feature.LookupListIndex)
+
+    # ss03's, by hand: a multiple substitution into one glyph; a context
+    # whose records come out of order, the first growing the text before the
+    # second goes back (b w: w made v v, then b varied); lookups nested as
+    # deep as they may go, and deeper; chained contexts with two glyphs
+    # behind and two ahead — by glyph, by class, by coverage.
+    for i, lk in enumerate(gsub.LookupList.Lookup):
+        st = lk.SubTable[0]
+        if lk.LookupType == 1 and getattr(st, "mapping", {}).get("a") == "a.sc":
+            names["sc1"] = i
+    one_seq = add(gsub, 2, [ob.buildMultipleSubstSubtable({"I": ["J"]})])
+    ooo = ot.ContextSubst()
+    ooo.Format = 3
+    ooo.Coverage = [cov(["b"]), cov(["w"])]
+    ooo.GlyphCount = 2
+    ooo.SubstLookupRecord = [rec("SubstLookupRecord", 1, names["mult"]), rec("SubstLookupRecord", 0, names["sc1"])]
+    ooo.SubstCount = 2
+    c_ooo = add(gsub, 5, [ooo])
+    # Nested 64 deep, each level adding a y after n: as deep as nesting goes;
+    # and 65 deep after u, one level too many.
+    def nested(first, depth):
+        grow = add(gsub, 2, [ob.buildMultipleSubstSubtable({first: [first, "y"]})])
+        top = len(gsub.LookupList.Lookup)
+        for k in range(depth):
+            ctx = ot.ContextSubst()
+            ctx.Format = 3
+            ctx.Coverage = [cov([first])]
+            ctx.GlyphCount = 1
+            records = [rec("SubstLookupRecord", 0, grow)]
+            if k + 1 < depth:
+                records.append(rec("SubstLookupRecord", 0, top + k + 1))
+            ctx.SubstLookupRecord, ctx.SubstCount = records, len(records)
+            add(gsub, 5, [ctx])
+        return top
+    deep = nested("n", 64)
+    too_deep = nested("u", 65)
+    l_c = single({"c": "c.sc"})
+    l_d = single({"d": "d.sc"})
+    l_e = single({"e": "e.sc"})
+    # The backtrack is stored nearest first: b, then a.
+    g1 = ot.ChainContextSubst()
+    g1.Format = 1
+    g1.Coverage = cov(["c"])
+    rule = ot.ChainSubRule()
+    rule.Backtrack, rule.BacktrackGlyphCount = ["b", "a"], 2
+    rule.Input, rule.InputGlyphCount = [], 1
+    rule.LookAhead, rule.LookAheadGlyphCount = ["d", "e"], 2
+    rule.SubstLookupRecord, rule.SubstCount = [rec("SubstLookupRecord", 0, l_c)], 1
+    rs = ot.ChainSubRuleSet()
+    rs.ChainSubRule, rs.ChainSubRuleCount = [rule], 1
+    g1.ChainSubRuleSet, g1.ChainSubRuleSetCount = [rs], 1
+    g2 = ot.ChainContextSubst()
+    g2.Format = 2
+    g2.Coverage = cov(["d"])
+    g2.BacktrackClassDef = classes({"a": 1, "b": 2})
+    g2.InputClassDef = classes({"d": 1})
+    g2.LookAheadClassDef = classes({"e": 1, "f": 2})
+    rule = ot.ChainSubClassRule()
+    rule.Backtrack, rule.BacktrackGlyphCount = [2, 1], 2
+    rule.Input, rule.InputGlyphCount = [], 1
+    rule.LookAhead, rule.LookAheadGlyphCount = [1, 2], 2
+    rule.SubstLookupRecord, rule.SubstCount = [rec("SubstLookupRecord", 0, l_d)], 1
+    cset = ot.ChainSubClassSet()
+    cset.ChainSubClassRule, cset.ChainSubClassRuleCount = [rule], 1
+    g2.ChainSubClassSet, g2.ChainSubClassSetCount = [None, cset], 2
+    g3 = ot.ChainContextSubst()
+    g3.Format = 3
+    g3.BacktrackCoverage, g3.BacktrackGlyphCount = [cov(["g"]), cov(["h"])], 2
+    g3.InputCoverage, g3.InputGlyphCount = [cov(["e"])], 1
+    g3.LookAheadCoverage, g3.LookAheadGlyphCount = [cov(["g"]), cov(["m"])], 2
+    g3.SubstLookupRecord, g3.SubstCount = [rec("SubstLookupRecord", 0, l_e)], 1
+    c_chains = add(gsub, 6, [g1, g2, g3])
+    for fr in gsub.FeatureList.FeatureRecord:
+        if fr.FeatureTag == "ss03":
+            fr.Feature.LookupListIndex += [one_seq, c_ooo, deep, too_deep, c_chains]
+            fr.Feature.LookupCount = len(fr.Feature.LookupListIndex)
+
+    # ss05's, by hand: rule sets of two rules, the first applied when both
+    # match and the second when it alone does — in a context by glyph (M N:
+    # N varied; M alone: M varied) and by class (B F; B), and in a chain by
+    # glyph (I J before K; I) and by class (p u; p) — the classes with a set
+    # of no rules for C and m, which a later subtable takes; and a context
+    # nesting reverse chaining. What each becomes is a glyph not its own: the
+    # letters are ones no other lookup of ss05 looks at. The chain by glyph
+    # covers K too, its lookahead, so that what comes right after an input
+    # is always something the lookup goes on to vary.
+    l_N, l_M = single({"N": "n.alt"}), single({"M": "K.alt"})
+    l_F, l_B, l_C = single({"F": "h.alt"}), single({"B": "k.alt"}), single({"C": "r.alt"})
+    l_J, l_I, l_K = single({"J": "j.alt"}), single({"I": "g.alt"}), single({"K": "k.alt"})
+    l_u, l_p, l_m = single({"u": "u.alt"}), single({"p": "t.alt"}), single({"m": "z.alt"})
+
+    def sub_rules(rules):
+        rs = ot.SubRuleSet()
+        rs.SubRule = []
+        for rest, records in rules:
+            rule = ot.SubRule()
+            rule.Input, rule.GlyphCount = rest, len(rest) + 1
+            rule.SubstLookupRecord = [rec("SubstLookupRecord", q, k) for q, k in records]
+            rule.SubstCount = len(records)
+            rs.SubRule.append(rule)
+        rs.SubRuleCount = len(rs.SubRule)
+        return rs
+
+    two1 = ot.ContextSubst()
+    two1.Format = 1
+    two1.Coverage = cov(["M"])
+    two1.SubRuleSet, two1.SubRuleSetCount = [sub_rules([(["N"], [(1, l_N)]), ([], [(0, l_M)])])], 1
+    c_two1 = add(gsub, 5, [two1])
+    two2 = ot.ContextSubst()
+    two2.Format = 2
+    two2.Coverage = cov(["B", "C"])
+    two2.ClassDef = classes({"B": 1, "F": 2, "C": 3})
+    cs = ot.SubClassSet()
+    cs.SubClassRule = []
+    for rest, records in (([2], [(1, l_F)]), ([], [(0, l_B)])):
+        cr = ot.SubClassRule()
+        cr.Class, cr.GlyphCount = rest, len(rest) + 1
+        cr.SubstLookupRecord = [rec("SubstLookupRecord", q, k) for q, k in records]
+        cr.SubstCount = len(records)
+        cs.SubClassRule.append(cr)
+    cs.SubClassRuleCount = len(cs.SubClassRule)
+    two2.SubClassSet, two2.SubClassSetCount = [None, cs, None, None], 4
+    c_alone = ot.ContextSubst()
+    c_alone.Format = 3
+    c_alone.Coverage, c_alone.GlyphCount = [cov(["C"])], 1
+    c_alone.SubstLookupRecord, c_alone.SubstCount = [rec("SubstLookupRecord", 0, l_C)], 1
+    c_two2 = add(gsub, 5, [two2, c_alone])
+    two3 = ot.ChainContextSubst()
+    two3.Format = 1
+    two3.Coverage = cov(["I", "K"])
+
+    def chain_rules(rules):
+        rs = ot.ChainSubRuleSet()
+        rs.ChainSubRule = []
+        for rest, ahead, records in rules:
+            rule = ot.ChainSubRule()
+            rule.Backtrack, rule.BacktrackGlyphCount = [], 0
+            rule.Input, rule.InputGlyphCount = rest, len(rest) + 1
+            rule.LookAhead, rule.LookAheadGlyphCount = ahead, len(ahead)
+            rule.SubstLookupRecord = [rec("SubstLookupRecord", q, k) for q, k in records]
+            rule.SubstCount = len(records)
+            rs.ChainSubRule.append(rule)
+        rs.ChainSubRuleCount = len(rs.ChainSubRule)
+        return rs
+    two3.ChainSubRuleSet = [chain_rules([(["J"], ["K"], [(1, l_J)]), ([], [], [(0, l_I)])]),
+                            chain_rules([([], [], [(0, l_K)])])]
+    two3.ChainSubRuleSetCount = 2
+    c_two3 = add(gsub, 6, [two3])
+    two4 = ot.ChainContextSubst()
+    two4.Format = 2
+    two4.Coverage = cov(["p", "m"])
+    two4.BacktrackClassDef = classes({})
+    two4.InputClassDef = classes({"p": 1, "m": 2, "u": 3})
+    two4.LookAheadClassDef = classes({})
+    cset = ot.ChainSubClassSet()
+    cset.ChainSubClassRule = []
+    for rest, records in (([3], [(1, l_u)]), ([], [(0, l_p)])):
+        rule = ot.ChainSubClassRule()
+        rule.Backtrack, rule.BacktrackGlyphCount = [], 0
+        rule.Input, rule.InputGlyphCount = rest, len(rest) + 1
+        rule.LookAhead, rule.LookAheadGlyphCount = [], 0
+        rule.SubstLookupRecord = [rec("SubstLookupRecord", q, k) for q, k in records]
+        rule.SubstCount = len(records)
+        cset.ChainSubClassRule.append(rule)
+    cset.ChainSubClassRuleCount = len(cset.ChainSubClassRule)
+    two4.ChainSubClassSet, two4.ChainSubClassSetCount = [None, cset, None], 3
+    m_alone = ot.ChainContextSubst()
+    m_alone.Format = 3
+    m_alone.BacktrackCoverage, m_alone.BacktrackGlyphCount = [], 0
+    m_alone.InputCoverage, m_alone.InputGlyphCount = [cov(["m"])], 1
+    m_alone.LookAheadCoverage, m_alone.LookAheadGlyphCount = [], 0
+    m_alone.SubstLookupRecord, m_alone.SubstCount = [rec("SubstLookupRecord", 0, l_m)], 1
+    c_two4 = add(gsub, 6, [two4, m_alone])
+    # Contexts that pass over marks, so that their input is not side by side,
+    # nesting a lookup that changes the length before the records after it:
+    # 1 2 1 with 1 made 1 2 2, then the second item (now the first 2 made)
+    # and the fourth (the 2 that was there); 2 1 2 with the first 2 taken
+    # out, then the second item (now the last 2).
+    l_grow = add(gsub, 2, [ob.buildMultipleSubstSubtable({"one": ["one", "two", "two"]})])
+    l_gone = add(gsub, 2, [ob.buildMultipleSubstSubtable({"two": []})])
+    l_nu = single({"two": "two.nu"})
+    l_dn = single({"one": "one.dn", "two": "two.dn"})
+    grows = ot.ContextSubst()
+    grows.Format = 3
+    grows.Coverage, grows.GlyphCount = [cov(["one"]), cov(["two"]), cov(["one"])], 3
+    grows.SubstLookupRecord = [rec("SubstLookupRecord", 0, l_grow), rec("SubstLookupRecord", 1, l_nu),
+                               rec("SubstLookupRecord", 3, l_dn)]
+    grows.SubstCount = 3
+    c_grows = add(gsub, 5, [grows], flag=8)
+    shrinks = ot.ContextSubst()
+    shrinks.Format = 3
+    shrinks.Coverage, shrinks.GlyphCount = [cov(["two"]), cov(["one"]), cov(["two"])], 3
+    shrinks.SubstLookupRecord = [rec("SubstLookupRecord", 0, l_gone), rec("SubstLookupRecord", 1, l_dn)]
+    shrinks.SubstCount = 2
+    c_shrinks = add(gsub, 5, [shrinks], flag=8)
+    for i, lk in enumerate(gsub.LookupList.Lookup):
+        st = lk.SubTable[0]
+        if lk.LookupType == 8 and getattr(st, "Substitute", None) == ["o.alt"]:
+            names["revn"] = i
+    nest_rev = ot.ContextSubst()
+    nest_rev.Format = 3
+    nest_rev.Coverage, nest_rev.GlyphCount = [cov(["o"])], 1
+    nest_rev.SubstLookupRecord, nest_rev.SubstCount = [rec("SubstLookupRecord", 0, names["revn"])], 1
+    c_nest_rev = add(gsub, 5, [nest_rev])
+    for fr in gsub.FeatureList.FeatureRecord:
+        if fr.FeatureTag == "ss05":
+            fr.Feature.LookupListIndex += [c_two1, c_two2, c_two3, c_two4, c_nest_rev, c_grows, c_shrinks]
+            fr.Feature.LookupCount = len(fr.Feature.LookupListIndex)
+
+    # Positioning.
+    def single_pos(glyphs, value):
+        return add(gpos, 1, [ob.buildSinglePosSubtable({g: value for g in glyphs}, gmap)])
+    vr = lambda **kw: ob.buildValue(kw)
+    p_x = single_pos(["x"], vr(XAdvance=50))
+    p_y = single_pos(["y"], vr(YPlacement=-30))
+    p_z = single_pos(["z"], vr(XPlacement=12))
+    p_t = single_pos(["t"], vr(XAdvance=-20, YPlacement=8))
+    # A value for each glyph: format 2.
+    p_2 = add(gpos, 1, [ob.buildSinglePosSubtable({"m": vr(XAdvance=11), "n": vr(YPlacement=5)}, gmap)])
+    q1 = ot.ContextPos()
+    q1.Format = 1
+    q1.Coverage = cov(["x"])
+    rs = ot.PosRuleSet()
+    rule = ot.PosRule()
+    rule.Input, rule.GlyphCount = ["y"], 2
+    rule.PosLookupRecord = [rec("PosLookupRecord", 0, p_x), rec("PosLookupRecord", 1, p_y)]
+    rule.PosCount = 2
+    rs.PosRule, rs.PosRuleCount = [rule], 1
+    q1.PosRuleSet, q1.PosRuleSetCount = [rs], 1
+    q2 = ot.ContextPos()
+    q2.Format = 2
+    q2.Coverage = cov(["x"])
+    q2.ClassDef = classes({"x": 1, "z": 2})
+    cr = ot.PosClassRule()
+    cr.Class, cr.GlyphCount = [2], 2
+    cr.PosLookupRecord = [rec("PosLookupRecord", 1, p_z)]
+    cr.PosCount = 1
+    cs = ot.PosClassSet()
+    cs.PosClassRule, cs.PosClassRuleCount = [cr], 1
+    q2.PosClassSet, q2.PosClassSetCount = [None, cs, None], 3
+    q3 = ot.ContextPos()
+    q3.Format = 3
+    q3.Coverage = [cov(["t"]), cov(["u"])]
+    q3.GlyphCount = 2
+    q3.PosLookupRecord = [rec("PosLookupRecord", 0, p_t)]
+    q3.PosCount = 1
+    c7 = add(gpos, 7, [q1, q2, q3])
+    k2 = ot.ChainContextPos()
+    k2.Format = 2
+    k2.Coverage = cov(["z"])
+    k2.BacktrackClassDef = classes({"y": 1})
+    k2.InputClassDef = classes({"z": 1})
+    k2.LookAheadClassDef = classes({"t": 1})
+    rule = ot.ChainPosClassRule()
+    rule.Backtrack, rule.BacktrackGlyphCount = [1], 1
+    rule.Input, rule.InputGlyphCount = [], 1
+    rule.LookAhead, rule.LookAheadGlyphCount = [1], 1
+    rule.PosLookupRecord = [rec("PosLookupRecord", 0, p_z)]
+    rule.PosCount = 1
+    cset = ot.ChainPosClassSet()
+    cset.ChainPosClassRule, cset.ChainPosClassRuleCount = [rule], 1
+    k2.ChainPosClassSet, k2.ChainPosClassSetCount = [None, cset], 2
+    k3 = ot.ChainContextPos()
+    k3.Format = 3
+    k3.BacktrackCoverage, k3.BacktrackGlyphCount = [cov(["s"])], 1
+    k3.InputCoverage, k3.InputGlyphCount = [cov(["t"]), cov(["t"])], 2
+    k3.LookAheadCoverage, k3.LookAheadGlyphCount = [cov(["s"])], 1
+    k3.PosLookupRecord = [rec("PosLookupRecord", 1, p_t)]
+    k3.PosCount = 1
+    c8 = add(gpos, 8, [k2, k3])
+    for fr in gpos.FeatureList.FeatureRecord:
+        if fr.FeatureTag == "ss02":
+            fr.Feature.LookupListIndex += [p_2, c7, c8]
+            fr.Feature.LookupCount = len(fr.Feature.LookupListIndex)
+
+    # ss05's cursive attachment in two subtables, which the feature file
+    # cannot keep apart: the first has g with no exit, j with no entry and r
+    # where the second has them otherwise, and lacks h, s and u; then the
+    # pair h u turned back by a lookup right to left.
+    def anchors(entry, exit):
+        return (entry and ob.buildAnchor(*entry), exit and ob.buildAnchor(*exit))
+    curs_a = ob.buildCursivePosSubtable({"g": anchors((5, 5), None), "j": anchors(None, (999, 999)),
+                                         "r": anchors((0, 50), None)}, gmap)
+    curs_b = ob.buildCursivePosSubtable({"g": anchors(None, (300, 100)), "j": anchors((0, 100), (320, 80)),
+                                         "r": anchors((0, 60), None), "h": anchors(None, (280, 90)),
+                                         "s": anchors((0, 40), None), "u": anchors((0, 70), None)}, gmap)
+    curs2 = add(gpos, 3, [curs_a, curs_b])
+    curs3 = add(gpos, 3, [ob.buildCursivePosSubtable({"h": anchors(None, (310, 70)), "u": anchors((0, 90), None)},
+                                                     gmap)], flag=1)
+    for fr in gpos.FeatureList.FeatureRecord:
+        if fr.FeatureTag == "ss05":
+            fr.Feature.LookupListIndex += [curs2, curs3]
+            fr.Feature.LookupCount = len(fr.Feature.LookupListIndex)
+
+
+def make_lookups_font():
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+
+    def rect(x0, y0, x1, y1):
+        pen = TTGlyphPen(None)
+        pen.moveTo((x0, y0)); pen.lineTo((x0, y1)); pen.lineTo((x1, y1)); pen.lineTo((x1, y0)); pen.closePath()
+        return pen.glyph()
+
+    letters = [chr(c) for c in range(ord("a"), ord("z") + 1)] + list("ALTVY")
+    names = [".notdef", "space"] + letters + list(LOOKUP_MARKS) + LOOKUP_EXTRA + LOOKUP_MORE
+    glyphs, metrics = {}, {}
+    for i, n in enumerate(names):
+        if n == ".notdef":
+            g, adv = rect(50, 0, 450, 700), 500
+        elif n == "space":
+            g, adv = TTGlyphPen(None).glyph(), 260
+        elif n in LOOKUP_MARKS:
+            below = LOOKUP_MARKS[n] in (0x323, 0x327)
+            g, adv = (rect(-250, -200, -50, -50) if below else rect(-250, 600, -50, 750)), 0
+        else:
+            adv = 300 + (i * 37) % 400
+            g = rect(30, 0, adv - 30, 500 if n[0].islower() else 700)
+        glyphs[n] = g
+        metrics[n] = (adv, _left(g))
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(names)
+    cmap = {ord(c): c for c in letters}
+    cmap.update(LOOKUP_MORE_CMAP)
+    cmap[32] = "space"
+    for n, c in LOOKUP_MARKS.items():
+        cmap[c] = n
+    fb.setupCharacterMap(cmap)
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(metrics)
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    family = "Caustic Test Lookups"
+    fb.setupNameTable({"familyName": family, "styleName": "Regular", "uniqueFontIdentifier": family,
+                       "fullName": family, "psName": family.replace(" ", "")}, mac=False)
+    fb.setupOS2(usWeightClass=400, version=4, sTypoAscender=800, sTypoDescender=-200,
+                usWinAscent=800, usWinDescent=200)
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    addOpenTypeFeaturesFromString(fb.font, LOOKUPS_FEA)
+    _extra_lookups(fb.font)
+    return fb.font
+
+
+def synthetic_lookups():
+    # Made from nothing, so under no licence.
+    path = os.path.join(OUT, "lookups.ttf")
+    make_lookups_font().save(path)
+    print("lookups.ttf", os.path.getsize(path), "bytes")
+
+
+# --- varlookups.ttf: lookups that depend on the instance, and on no GDEF ---
+
+VARLOOKUPS_FEA = """
+languagesystem DFLT dflt;
+languagesystem latn dflt;
+languagesystem grek dflt;
+
+# Ligatures the font has no class for: one of a base and a mark, which
+# stays a base; one that starts with a mark, which is a mark no longer. First
+# of all, before the mark is varied and the contexts pass over ligatures.
+lookup NLIG { sub n acutecomb by f_i; } NLIG;
+lookup MLIG { sub acutecomb x by y.alt; } MLIG;
+lookup RV_A { sub a by a.alt; } RV_A;
+lookup RV_C { sub c by c.alt; } RV_C;
+lookup CALT_B { sub b by b.alt; } CALT_B;
+lookup MAIN_E { sub e.alt by x; } MAIN_E;
+lookup RV_D { sub d by d.alt; } RV_D;
+lookup DUP { sub d by d d; } DUP;
+lookup REQ { sub e by e.alt; } REQ;
+lookup ACUTE { sub acutecomb by gravecomb; } ACUTE;
+lookup LIGA { sub f i by f_i; } LIGA;
+lookup SPLIT { sub f_i by f i; } SPLIT;
+lookup CTX_X { lookupflag IgnoreLigatures; sub n x' by x.alt; } CTX_X;
+lookup CTX_Y { lookupflag IgnoreLigatures; sub n y' by y.alt; } CTX_Y;
+
+feature rvrn { script DFLT; language dflt; lookup RV_D; script latn; language dflt; lookup DUP; } rvrn;
+feature calt { lookup MAIN_E; } calt;
+feature liga { lookup LIGA; } liga;
+feature dlig { lookup SPLIT; } dlig;
+feature ss01 { lookup ACUTE; lookup CTX_X; lookup CTX_Y; } ss01;
+feature ss02 { lookup NLIG; lookup MLIG; } ss02;
+
+markClass [acutecomb gravecomb] <anchor 0 600> @TOP;
+feature mark {
+    pos base [a b c d e n x y] <anchor (wght=100:200 wght=400:250 wght=900:300) 500> mark @TOP;
+} mark;
+feature kern {
+    pos x <(wght=100:-20 wght=400:0 wght=900:40) (wght=100:10 wght=400:0 wght=900:-30)
+           (wght=100:-15 wght=400:0 wght=900:25) 3>;
+    pos y <0 0 (wght=100:-30 wght=400:0 wght=900:60) 0>;
+    pos a b <0 0 (wght=100:-30 wght=400:0 wght=900:40) 0>;
+    pos a c <0 (wght=100:5 wght=400:0 wght=900:-8) 0 0>;
+    pos a d <(wght=100:6 wght=400:0 wght=900:-9) 0 0 0>;
+} kern;
+"""
+
+
+def _sort_features(table):
+    """The feature list in order of tag, every index into it moved with it."""
+    recs = table.FeatureList.FeatureRecord
+    order = sorted(range(len(recs)), key=lambda i: recs[i].FeatureTag)
+    new = {old: k for k, old in enumerate(order)}
+    table.FeatureList.FeatureRecord = [recs[i] for i in order]
+    for sr in table.ScriptList.ScriptRecord:
+        for ls in [sr.Script.DefaultLangSys] + [r.LangSys for r in sr.Script.LangSysRecord]:
+            if ls is None:
+                continue
+            ls.FeatureIndex = sorted(new[i] for i in ls.FeatureIndex)
+            if ls.ReqFeatureIndex != 0xFFFF:
+                ls.ReqFeatureIndex = new[ls.ReqFeatureIndex]
+    fv = getattr(table, "FeatureVariations", None)
+    if fv is not None:
+        for r in fv.FeatureVariationRecord:
+            subs = r.FeatureTableSubstitution.SubstitutionRecord
+            for sub in subs:
+                sub.FeatureIndex = new[sub.FeatureIndex]
+            subs.sort(key=lambda sub: sub.FeatureIndex)
+
+
+def make_varlookups_font():
+    """A variable font, weight and width, whose lookups change with the
+    instance: FeatureVariations that swap rvrn's lookups — at a weight from
+    exactly half way up, or at a light weight and narrow width together — and
+    with them calt's, the second substitution of the set; placements and an
+    advance moved by device tables, and an anchor. Its DFLT language system
+    has a required feature tagged rvrn, which goes in rvrn's stage, before a
+    calt lookup listed earlier; Greek's has it too, without rvrn itself;
+    Latin's rvrn lists one lookup twice. GDEF has no glyph classes: marks are
+    known by their characters, and what substitutions make by what they do."""
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+    from fontTools.ttLib.tables import otTables as ot
+
+    def rect(x0, y0, x1, y1):
+        pen = TTGlyphPen(None)
+        pen.moveTo((x0, y0)); pen.lineTo((x0, y1)); pen.lineTo((x1, y1)); pen.lineTo((x1, y0)); pen.closePath()
+        return pen.glyph()
+
+    letters = list("abcdefinxy")
+    marks = {"acutecomb": 0x301, "gravecomb": 0x300}
+    names = ([".notdef", "space"] + letters + list(marks) +
+             ["a.alt", "b.alt", "c.alt", "d.alt", "e.alt", "x.alt", "y.alt", "f_i"])
+    glyphs, metrics = {}, {}
+    for i, n in enumerate(names):
+        if n == ".notdef":
+            g, adv = rect(50, 0, 450, 700), 500
+        elif n == "space":
+            g, adv = TTGlyphPen(None).glyph(), 260
+        elif n in marks:
+            # An advance of their own, for shaping to take away.
+            g, adv = rect(-250, 600, -50, 750), 200
+        else:
+            adv = 300 + (i * 41) % 400
+            g = rect(30, 0, adv - 30, 500)
+        glyphs[n] = g
+        metrics[n] = (adv, _left(g))
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(names)
+    cmap = {ord(c): c for c in letters}
+    cmap[32] = "space"
+    for n, c in marks.items():
+        cmap[c] = n
+    fb.setupCharacterMap(cmap)
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(metrics)
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    family = "Caustic Test Var Lookups"
+    fb.setupNameTable({"familyName": family, "styleName": "Regular", "uniqueFontIdentifier": family,
+                       "fullName": family, "psName": family.replace(" ", "")}, mac=False)
+    fb.setupOS2(usWeightClass=400, version=4, sTypoAscender=800, sTypoDescender=-200,
+                usWinAscent=800, usWinDescent=200)
+    fb.setupPost()
+    fb.setupFvar([("wght", 100, 400, 900, "Weight"), ("wdth", 75, 100, 125, "Width")], [])
+    fb.updateHead(created=3786825600, modified=3786825600)
+    addOpenTypeFeaturesFromString(fb.font, VARLOOKUPS_FEA)
+
+    gsub = fb.font["GSUB"].table
+    index = {}
+    for i, lk in enumerate(gsub.LookupList.Lookup):
+        st = lk.SubTable[0]
+        m = getattr(st, "mapping", {})
+        for name, src, dst in (("RV_A", "a", "a.alt"), ("RV_C", "c", "c.alt"), ("CALT_B", "b", "b.alt"),
+                               ("MAIN_E", "e.alt", "x"), ("RV_D", "d", "d.alt"), ("REQ", "e", "e.alt")):
+            if m.get(src) == dst:
+                index[name] = i
+            if lk.LookupType == 2 and tuple(m.get("d", ())) == ("d", "d"):
+                index["DUP"] = i
+
+    def feature_of(script, tag):
+        for sr in gsub.ScriptList.ScriptRecord:
+            if sr.ScriptTag == script:
+                for k in sr.Script.DefaultLangSys.FeatureIndex:
+                    if gsub.FeatureList.FeatureRecord[k].FeatureTag == tag:
+                        return k
+        raise KeyError((script, tag))
+
+    # Latin's rvrn: one lookup, twice.
+    latn = gsub.FeatureList.FeatureRecord[feature_of("latn", "rvrn")].Feature
+    latn.LookupListIndex = [index["DUP"], index["DUP"]]
+    latn.LookupCount = 2
+    # The required feature, a second rvrn: DFLT's and Greek's.
+    req = ot.FeatureRecord()
+    req.FeatureTag = "rvrn"
+    req.Feature = ot.Feature()
+    req.Feature.FeatureParams = None
+    req.Feature.LookupListIndex = [index["REQ"]]
+    req.Feature.LookupCount = 1
+    gsub.FeatureList.FeatureRecord.append(req)
+    gsub.FeatureList.FeatureCount = len(gsub.FeatureList.FeatureRecord)
+    for sr in gsub.ScriptList.ScriptRecord:
+        if sr.ScriptTag in ("DFLT", "grek"):
+            sr.Script.DefaultLangSys.ReqFeatureIndex = len(gsub.FeatureList.FeatureRecord) - 1
+
+    # The variations, made here to say exactly what is swapped.
+    def condition(axis, lo, hi):
+        c = ot.ConditionTable()
+        c.Format = 1
+        c.AxisIndex, c.FilterRangeMinValue, c.FilterRangeMaxValue = axis, lo, hi
+        return c
+
+    def swap(feature, lookups):
+        s = ot.FeatureTableSubstitutionRecord()
+        s.FeatureIndex = feature
+        s.Feature = ot.Feature()
+        s.Feature.FeatureParams = None
+        s.Feature.LookupListIndex = lookups
+        s.Feature.LookupCount = len(lookups)
+        return s
+
+    def record(conditions, swaps):
+        r = ot.FeatureVariationRecord()
+        r.ConditionSet = ot.ConditionSet()
+        r.ConditionSet.ConditionTable = conditions
+        r.ConditionSet.ConditionCount = len(conditions)
+        r.FeatureTableSubstitution = ot.FeatureTableSubstitution()
+        r.FeatureTableSubstitution.Version = 0x00010000
+        swaps.sort(key=lambda s: s.FeatureIndex)
+        r.FeatureTableSubstitution.SubstitutionRecord = swaps
+        r.FeatureTableSubstitution.SubstitutionCount = len(swaps)
+        return r
+
+    rvrn, calt = feature_of("DFLT", "rvrn"), feature_of("DFLT", "calt")
+    fv = ot.FeatureVariations()
+    fv.Version = 0x00010000
+    fv.FeatureVariationRecord = [
+        record([condition(0, 0.5, 1.0)],
+               [swap(rvrn, [index["RV_A"]]), swap(calt, [index["MAIN_E"], index["CALT_B"]])]),
+        record([condition(0, -1.0, -0.5), condition(1, -1.0, -0.4)], [swap(rvrn, [index["RV_C"]])]),
+    ]
+    fv.FeatureVariationCount = len(fv.FeatureVariationRecord)
+    gsub.FeatureVariations = fv
+    gsub.Version = 0x00010001
+    _sort_features(gsub)
+
+    gdef = fb.font["GDEF"].table
+    gdef.GlyphClassDef = None
+    gdef.MarkAttachClassDef = None
+    return fb.font
+
+
+def synthetic_varlookups():
+    # Made from nothing, so under no licence.
+    path = os.path.join(OUT, "varlookups.ttf")
+    make_varlookups_font().save(path)
+    print("varlookups.ttf", os.path.getsize(path), "bytes")
+
+
 def main():
     os.makedirs(os.path.join(OUT, "licenses"), exist_ok=True)
     synthetic_shape()
+    synthetic_lookups()
+    synthetic_varlookups()
     synthetic_fonts()
     synthetic_big()
     synthetic_var()
@@ -1029,14 +1993,7 @@ def main():
     synthetic_ops()
     synthetic_bombs()
     for out, src, _, text, family in SOURCES:
-        font = TTFont(src, recalcTimestamp=False)
-        licence_font = TTFont(src, lazy=True)
-        old = families(font)
-        subset_font(font, text)
-        rename(font, old, family)
-        font.save(os.path.join(OUT, out))
-        licence(licence_font, out)
-        print(out, os.path.getsize(os.path.join(OUT, out)), "bytes")
+        make_subset(out, src, text, family)
 
     out, src, faces, text, fams = COLLECTION
     coll = TTCollection(src)
