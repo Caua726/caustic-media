@@ -641,6 +641,14 @@ Home and End — with Ctrl+A and Ctrl+C claimed ahead of the window's
 shortcuts; what the pointer or Shift selects goes to the primary selection.
 The selection is drawn behind its text in the theme's selection colours.
 
+**Images** (`widgets/image.cst`, tested by `image_test`): a texture of the
+program's at the size it says, centred in what the image is given, or scaled
+to fit keeping its proportions (shorter when narrower); filtered or the
+nearest texel taken, straight or premultiplied. A symbolic image is drawn in
+the colour what holds it gives, else the theme's text colour; disabled, an
+image fades as controls do unless it was given a colour. Its description is
+its name to assistive technology.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
