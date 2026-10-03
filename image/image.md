@@ -109,10 +109,41 @@ rather than a second pixel pipeline.
 
 ---
 
+## Current state
+
+`buffer.cst` (the `Image`, owned or borrowed), `generate.cst`, `transform.cst`
+(crop, flips, nearest resize; alpha multiplied in and out; a rectangle copied
+between images, cut to both), `atlas.cst` and `load.cst`, with the hub
+`image.cst` — which does not import `load.cst`.
+
+**The atlas** packs rectangles into pages of an `Image` each by their skyline,
+bottom-left; opens pages as the last fills, up to a number fixed at open; and
+when none has room takes back the page least recently used — whole, its era
+counted on so its slots read as gone — but never one used in the frame being
+drawn, so a rectangle that does not fit is `NO_ROOM`, said, never dropped. Each
+page keeps the region changed since it was last uploaded. `atlas_test` checks
+where rectangles land, the pages' order of reuse, the dirty regions, and three
+thousand random rectangles packed without overlap into nine tenths of four
+pages.
+
+**Loading** is through caustic-image, which the Causticfile fetches with
+caustic-compact at their tags: any format it decodes, into the nearest format
+here — gray R8, colour RGB8, anything transparent RGBA8, 16-bit channels by
+their high byte. `load_test` decodes PNGs of every colour type written byte by
+byte by `tools/make_pngs.py`, pixels known exactly. The three libraries this
+repository builds on are also built for Windows and run under wine
+(`caustic-mk run test-win32`).
+
+Mutation-tested: every mutant killed but those that cannot be — the skyline's
+merging of steps of one height and its handling of a step ending at a
+rectangle's edge change no placement, and a copy of no width copies nothing
+either way — the checks no test could tell apart removed.
+
 ## Order of work
 
 1. **The `Image` type and ownership** — enough for `render/texture` to take one.
 2. **Generation**, which needs nothing and unblocks seeing textures work.
-3. **Atlas packing**, which `text/` blocks on.
-4. **Load and save** through caustic-image.
+3. **Atlas packing**, which `text/` blocks on. Done.
+4. **Load** through caustic-image. Done; saving waits for something that needs
+   it.
 5. **Mipmaps**, when a texture large enough to alias appears.

@@ -1,0 +1,300 @@
+// image/atlas.cst — rectangles packed into pages of an image each: glyphs,
+// icons, sprites, anything drawn from one texture rather than many.
+//
+// Each page is packed by its skyline — the top edge of what has been placed,
+// as steps across the page — and a rectangle goes where it sits lowest, the
+// leftmost of equals: bottom-left, the packer stb_rect_pack and most glyph
+// caches use, which leaves little room under what it places when sizes are
+// as alike as glyphs'.
+//
+// Pages are opened as the last fills, up to a number fixed at open. When none
+// has room and no more may be opened, the page least recently used is taken
+// whole — cleared, and its era counted on, so that every slot on it
+// reads as gone — but never a page used in the current frame, whose slots a
+// frame being drawn may still be reading. A rectangle that does not fit then
+// is NO_ROOM, said to the caller, who decides — never dropped. A program
+// marks the frames (next_frame) and the slots it draws from (touch).
+//
+// The pixels are the atlas's: a page's Image, written where alloc() says, and
+// a dirty region for each, the union of what was placed since the page was
+// last cleaned — what an upload to a texture has to carry.
+use "std/mem.cst" as mem;
+use "buffer.cst" as buffer;
+
+let is i32 as PLACED  with imut = 1;
+let is i32 as NO_ROOM with imut = 0;     // not now: every page is in use
+let is i32 as NEVER   with imut = 0 - 1; // larger than a page, or of no size
+
+// Where a rectangle landed: its page and corner, and the page's era
+// then, which changes when the page is taken back.
+struct Slot {
+    page as i64;
+    x    as i64;
+    y    as i64;
+    era  as i64;
+}
+
+struct Region {
+    x as i64;
+    y as i64;
+    w as i64;
+    h as i64;
+}
+
+struct Atlas {
+    w      as i64;     // a page's size
+    h      as i64;
+    format as i32;
+    _pad0  as i32;
+    max    as i64;     // pages at most
+    count  as i64;     // pages opened
+    frame  as i64;
+    block  as *u8;
+    bytes  as i64;
+    images as *buffer.Image;
+    sky    as *i64;    // a page's skyline: x and y of each step, w + 1 steps
+    steps  as *i64;    // how many steps each page's skyline has
+    last   as *i64;    // the frame each page was last used in
+    eras   as *i64;
+    dirty  as *i64;    // x0, y0, x1, y1 a page; x1 = 0 when clean
+}
+
+fn _geti(p as *i64, i as i64) as i64 { return *cast(*i64, cast(i64, p) + i * 8); }
+fn _puti(p as *i64, i as i64, v as i64) as void { *cast(*i64, cast(i64, p) + i * 8) = v; }
+
+// An atlas of up to max_pages pages of w by h pixels in format, none opened
+// yet; ok() is 0 if its records could not be mapped or it may have none.
+fn open(w as i64, h as i64, format as i32, max_pages as i64) as Atlas {
+    let is Atlas as a;
+    a.w = w;
+    a.h = h;
+    a.format = format;
+    a._pad0 = 0;
+    a.max = max_pages;
+    a.count = 0;
+    a.frame = 0;
+    let is i64 as per = (w + 1) * 2 + 8;
+    a.bytes = max_pages * (sizeof(buffer.Image) + per * 8);
+    a.block = cast(*u8, 0);
+    if (max_pages > 0 && w > 0 && h > 0) { a.block = mem.core.mmap_anon(a.bytes); }
+    if (cast(i64, a.block) == 0) { a.max = 0; }
+    let is i64 as b = cast(i64, a.block);
+    a.images = cast(*buffer.Image, b);
+    let is i64 as rec = b + max_pages * sizeof(buffer.Image);
+    a.sky = cast(*i64, rec);
+    a.steps = cast(*i64, rec + max_pages * (w + 1) * 16);
+    a.last = cast(*i64, rec + max_pages * ((w + 1) * 16 + 8));
+    a.eras = cast(*i64, rec + max_pages * ((w + 1) * 16 + 16));
+    a.dirty = cast(*i64, rec + max_pages * ((w + 1) * 16 + 24));
+    return a;
+}
+
+fn ok(a as *Atlas) as i32 {
+    if (a.max > 0) { return 1; }
+    return 0;
+}
+
+fn close(a as *Atlas) as void {
+    let is i64 as i with mut = 0;
+    while (i < a.count) {
+        buffer.destroy(page(a, i));
+        i = i + 1;
+    }
+    if (cast(i64, a.block) != 0) { mem.core.munmap(a.block, a.bytes); }
+    a.block = cast(*u8, 0);
+    a.max = 0;
+    a.count = 0;
+}
+
+fn pages(a as *Atlas) as i64 { return a.count; }
+
+fn page(a as *Atlas, i as i64) as *buffer.Image {
+    return cast(*buffer.Image, cast(i64, a.images) + i * sizeof(buffer.Image));
+}
+
+fn next_frame(a as *Atlas) as void { a.frame = a.frame + 1; }
+
+// Whether the slot's page still holds what was placed there.
+fn valid(a as *Atlas, s as *Slot) as i32 {
+    if (s.page < 0 || s.page >= a.count) { return 0; }
+    if (_geti(a.eras, s.page) != s.era) { return 0; }
+    return 1;
+}
+
+// The slot's page used this frame, and so not taken back during it.
+fn touch(a as *Atlas, s as *Slot) as void {
+    if (valid(a, s) == 1) { _puti(a.last, s.page, a.frame); }
+}
+
+// --- The skyline ---
+
+fn _sx(a as *Atlas, p as i64, i as i64) as i64 { return _geti(a.sky, (p * (a.w + 1) + i) * 2); }
+fn _sy(a as *Atlas, p as i64, i as i64) as i64 { return _geti(a.sky, (p * (a.w + 1) + i) * 2 + 1); }
+fn _set_step(a as *Atlas, p as i64, i as i64, x as i64, y as i64) as void {
+    _puti(a.sky, (p * (a.w + 1) + i) * 2, x);
+    _puti(a.sky, (p * (a.w + 1) + i) * 2 + 1, y);
+}
+
+// The page empty: one step, all of it, at 0.
+fn _reset(a as *Atlas, p as i64) as void {
+    _set_step(a, p, 0, 0, 0);
+    _puti(a.steps, p, 1);
+}
+
+// Where a w by h rectangle sits lowest on page p, leftmost of equals: its
+// step into *at and its y returned, -1 when it fits nowhere.
+fn _find(a as *Atlas, p as i64, w as i64, h as i64, at as *i64) as i64 {
+    let is i64 as n = _geti(a.steps, p);
+    let is i64 as best with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as x = _sx(a, p, i);
+        if (x + w <= a.w) {
+            // The highest step under it.
+            let is i64 as y with mut = 0;
+            let is i64 as j with mut = i;
+            while (j < n && _sx(a, p, j) < x + w) {
+                if (_sy(a, p, j) > y) { y = _sy(a, p, j); }
+                j = j + 1;
+            }
+            if (y + h <= a.h && (best < 0 || y < best)) {
+                best = y;
+                *at = i;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// The rectangle placed at step i, y: a step of its own at its top, the steps
+// it covers gone, the one it covers in part moved to its right edge, and
+// steps of one height made one.
+fn _place(a as *Atlas, p as i64, i as i64, y as i64, w as i64, h as i64) as void {
+    let is i64 as n with mut = _geti(a.steps, p);
+    let is i64 as x = _sx(a, p, i);
+    let is i64 as right = x + w;
+    // The steps from i on that lie wholly under it: j is the first that
+    // does not.
+    let is i64 as j with mut = i;
+    while (j < n) {
+        let is i64 as end with mut = a.w;
+        if (j + 1 < n) { end = _sx(a, p, j + 1); }
+        if (end > right) { break; }
+        j = j + 1;
+    }
+    // Steps i .. j - 1 become the one new step; step j, which starts under
+    // the rectangle or at its right edge, starts at that edge.
+    if (j < n) { _set_step(a, p, j, right, _sy(a, p, j)); }
+    let is i64 as removed = j - i;
+    if (removed == 0) {
+        // Shift right by one to make room.
+        let is i64 as k with mut = n;
+        while (k > i) {
+            _set_step(a, p, k, _sx(a, p, k - 1), _sy(a, p, k - 1));
+            k = k - 1;
+        }
+        n = n + 1;
+    } else if (removed > 1) {
+        let is i64 as k with mut = i + 1;
+        while (k + removed - 1 < n) {
+            _set_step(a, p, k, _sx(a, p, k + removed - 1), _sy(a, p, k + removed - 1));
+            k = k + 1;
+        }
+        n = n - (removed - 1);
+    }
+    _set_step(a, p, i, x, y + h);
+    // Neighbours of one height made one step: fewer to search, though the
+    // places found would be the same.
+    let is i64 as k with mut = 1;
+    let is i64 as m with mut = 1;
+    while (k < n) {
+        if (_sy(a, p, k) != _sy(a, p, m - 1)) {
+            _set_step(a, p, m, _sx(a, p, k), _sy(a, p, k));
+            m = m + 1;
+        }
+        k = k + 1;
+    }
+    _puti(a.steps, p, m);
+}
+
+fn _mark(a as *Atlas, p as i64, x as i64, y as i64, w as i64, h as i64) as void {
+    let is i64 as d = p * 4;
+    if (_geti(a.dirty, d + 2) == 0) {
+        _puti(a.dirty, d, x);
+        _puti(a.dirty, d + 1, y);
+        _puti(a.dirty, d + 2, x + w);
+        _puti(a.dirty, d + 3, y + h);
+        return;
+    }
+    if (x < _geti(a.dirty, d)) { _puti(a.dirty, d, x); }
+    if (y < _geti(a.dirty, d + 1)) { _puti(a.dirty, d + 1, y); }
+    if (x + w > _geti(a.dirty, d + 2)) { _puti(a.dirty, d + 2, x + w); }
+    if (y + h > _geti(a.dirty, d + 3)) { _puti(a.dirty, d + 3, y + h); }
+}
+
+fn _take(a as *Atlas, p as i64, w as i64, h as i64, s as *Slot) as i32 {
+    let is i64 as i with mut = 0;
+    let is i64 as y = _find(a, p, w, h, &i);
+    if (y < 0) { return NO_ROOM; }
+    s.page = p;
+    s.x = _sx(a, p, i);
+    s.y = y;
+    s.era = _geti(a.eras, p);
+    _place(a, p, i, y, w, h);
+    _puti(a.last, p, a.frame);
+    _mark(a, p, s.x, s.y, w, h);
+    return PLACED;
+}
+
+// A w by h rectangle placed into *s: PLACED; NO_ROOM when every page is full
+// or in use this frame; NEVER when it is larger than a page or of no size.
+fn alloc(a as *Atlas, w as i64, h as i64, s as *Slot) as i32 {
+    if (w <= 0 || h <= 0 || w > a.w || h > a.h) { return NEVER; }
+    // A page with room, the first.
+    let is i64 as p with mut = 0;
+    while (p < a.count) {
+        if (_take(a, p, w, h, s) == PLACED) { return PLACED; }
+        p = p + 1;
+    }
+    // A new page.
+    if (a.count < a.max) {
+        p = a.count;
+        // Its era and dirty region are 0, as mapped.
+        *page(a, p) = buffer.create(a.w, a.h, a.format);
+        _reset(a, p);
+        a.count = a.count + 1;
+        return _take(a, p, w, h, s);
+    }
+    // The least recently used, if not this frame.
+    let is i64 as oldest with mut = 0 - 1;
+    p = 0;
+    while (p < a.count) {
+        let is i64 as t = _geti(a.last, p);
+        if (t < a.frame && (oldest < 0 || t < _geti(a.last, oldest))) { oldest = p; }
+        p = p + 1;
+    }
+    if (oldest < 0) { return NO_ROOM; }
+    _reset(a, oldest);
+    _puti(a.eras, oldest, _geti(a.eras, oldest) + 1);
+    return _take(a, oldest, w, h, s);
+}
+
+// --- Uploading ---
+
+// What changed on page p since it was last cleaned, into *r: 1, or 0 when
+// nothing did.
+fn dirty(a as *Atlas, p as i64, r as *Region) as i32 {
+    if (p < 0 || p >= a.count) { return 0; }
+    let is i64 as d = p * 4;
+    if (_geti(a.dirty, d + 2) == 0) { return 0; }
+    r.x = _geti(a.dirty, d);
+    r.y = _geti(a.dirty, d + 1);
+    r.w = _geti(a.dirty, d + 2) - r.x;
+    r.h = _geti(a.dirty, d + 3) - r.y;
+    return 1;
+}
+
+fn clean(a as *Atlas, p as i64) as void {
+    if (p >= 0 && p < a.count) { _puti(a.dirty, p * 4 + 2, 0); }
+}
