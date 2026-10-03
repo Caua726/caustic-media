@@ -8,7 +8,7 @@
 #   faces N                 how many faces the file holds
 #   face I                  the records after it are face I's
 #   tables N                how many tables its directory lists
-#   outline glyf|cff|cff2
+#   outline glyf|cff|cff2|none   none for bitmaps alone
 #   upem U
 #   glyphs N
 #   head xmin ymin xmax ymax mac_style loc_format
@@ -83,8 +83,10 @@ def face(out, font):
         kind = "glyf"
     elif "CFF2" in font:
         kind = "cff2"
-    else:
+    elif "CFF " in font:
         kind = "cff"
+    else:
+        kind = "none"
     out.append("outline %s" % kind)
     head = font["head"]
     out.append("upem %d" % head.unitsPerEm)

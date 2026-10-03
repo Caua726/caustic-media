@@ -185,4 +185,7 @@ answer while the layout is being built than afterwards.
    ([`layout/layout.md`](layout/layout.md)).
 5. **Caret and hit-testing**, which `ui/` blocks on — done, in
    `layout/cursor.cst`.
-6. **SDF**, when text in a 3D scene does.
+6. **Colour glyphs**: bitmaps (`CBDT`/`CBLC`) and layers (`COLR` version 0,
+   `CPAL`) — done ([`color/color.md`](color/color.md)); `sbix` and `COLR`
+   version 1 are [B].
+7. **SDF**, when text in a 3D scene does.

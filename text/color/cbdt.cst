@@ -1,0 +1,202 @@
+// text/color/cbdt.cst — colour bitmaps: CBLC says where each glyph's image
+// is at each size the font was drawn at (a strike), CBDT holds the images —
+// PNG, with the glyph's metrics in pixels of its strike.
+//
+// A strike is a size in pixels an em (ppem) and the ranges of glyphs it has,
+// each range found through an index subtable of one of five formats: offsets
+// of 32 or 16 bits (1, 3), images all of one size (2), glyph and offset pairs
+// (4), images of one size for a sparse list of glyphs (5). An image is of one
+// of three formats: small metrics before it (17), big ones (18), or none, the
+// index's being for all (19).
+use "../sfnt/table.cst" as table;
+
+let is i64 as TAG_CBLC with imut = 0x43424C43;
+let is i64 as TAG_CBDT with imut = 0x43424454;
+
+let is i64 as SIZE_RECORD with imut = 48;
+
+struct Bitmap {
+    data    as *u8;    // the PNG
+    len     as i64;
+    ppem    as i64;    // its strike's
+    width   as i64;    // in pixels of the strike
+    height  as i64;
+    left    as i64;    // from the pen to its left edge
+    top     as i64;    // from the baseline up to its top edge
+    advance as i64;
+}
+
+fn _cblc(f as *table.Face) as table.Table { return table.find(f, TAG_CBLC); }
+fn _cbdt(f as *table.Face) as table.Table { return table.find(f, TAG_CBDT); }
+
+// Whether the face has colour bitmaps.
+fn present(f as *table.Face) as i32 {
+    return cast(i32, _cblc(f).len >= 8 && _cbdt(f).len >= 4);
+}
+
+// How many strikes it has.
+fn strikes(f as *table.Face) as i64 {
+    if (present(f) == 0) { return 0; }
+    let is table.Table as t = _cblc(f);
+    let is i64 as n = table.u32_at(f, t.off + 4);
+    if (table.inside(t, t.off + 8, n * SIZE_RECORD) == 0) { return 0; }
+    return n;
+}
+
+fn _size(f as *table.Face, i as i64) as i64 { return _cblc(f).off + 8 + i * SIZE_RECORD; }
+
+// Strike i's size, in pixels an em: the larger of its two.
+fn ppem(f as *table.Face, i as i64) as i64 {
+    let is i64 as x = table.u8_at(f, _size(f, i) + 44);
+    let is i64 as y = table.u8_at(f, _size(f, i) + 45);
+    if (x > y) { return x; }
+    return y;
+}
+
+// The strike to draw at px pixels an em from: the smallest as large, so that
+// it is made smaller rather than larger; or the largest there is. -1 for
+// none.
+fn nearest(f as *table.Face, px as f64) as i64 {
+    let is i64 as n = strikes(f);
+    let is i64 as best with mut = 0 - 1;
+    let is i64 as largest with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as p = ppem(f, i);
+        if (cast(f64, p) >= px && (best < 0 || p < ppem(f, best))) { best = i; }
+        if (largest < 0 || p > ppem(f, largest)) { largest = i; }
+        i = i + 1;
+    }
+    if (best < 0) { return largest; }
+    return best;
+}
+
+// Big metrics at at into b.
+fn _big(f as *table.Face, at as i64, b as *Bitmap) as void {
+    b.height = table.u8_at(f, at);
+    b.width = table.u8_at(f, at + 1);
+    b.left = _i8(table.u8_at(f, at + 2));
+    b.top = _i8(table.u8_at(f, at + 3));
+    b.advance = table.u8_at(f, at + 4);
+}
+
+fn _i8(v as i64) as i64 {
+    if (v >= 128) { return v - 256; }
+    return v;
+}
+
+// The image of glyph gid at offset off of CBDT, len bytes, its metrics from
+// the index at metrics when the image does not have them (format 19).
+fn _image(f as *table.Face, format as i64, off as i64, len as i64, metrics as i64, b as *Bitmap) as i32 {
+    let is table.Table as t = _cbdt(f);
+    let is i64 as at = t.off + off;
+    let is i64 as head with mut = 0;
+    if (format == 17) {
+        // Small metrics: height, width, bearing x and y, advance.
+        b.height = table.u8_at(f, at);
+        b.width = table.u8_at(f, at + 1);
+        b.left = _i8(table.u8_at(f, at + 2));
+        b.top = _i8(table.u8_at(f, at + 3));
+        b.advance = table.u8_at(f, at + 4);
+        head = 5;
+    } else if (format == 18) {
+        _big(f, at, b);
+        head = 8;
+    } else if (format == 19) {
+        if (metrics == 0) { return 0; }
+        _big(f, metrics, b);
+    } else {
+        return 0;
+    }
+    let is i64 as n = table.u32_at(f, at + head);
+    if (head + 4 + n > len || table.inside(t, at + head + 4, n) == 0 || n == 0) { return 0; }
+    b.data = cast(*u8, cast(i64, f.data) + at + head + 4);
+    b.len = n;
+    return 1;
+}
+
+// Glyph gid's image in strike s into *b: 1, or 0 when the strike has none.
+fn find(f as *table.Face, s as i64, gid as i64, b as *Bitmap) as i32 {
+    if (s < 0 || s >= strikes(f)) { return 0; }
+    let is table.Table as t = _cblc(f);
+    let is i64 as size = _size(f, s);
+    b.ppem = ppem(f, s);
+    let is i64 as arr = t.off + table.u32_at(f, size);
+    let is i64 as count = table.u32_at(f, size + 8);
+    if (table.inside(t, arr, count * 8) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < count) {
+        let is i64 as rec = arr + k * 8;
+        let is i64 as first = table.u16_at(f, rec);
+        let is i64 as last = table.u16_at(f, rec + 2);
+        if (gid >= first && gid <= last) {
+            let is i64 as sub = arr + table.u32_at(f, rec + 4);
+            if (table.inside(t, sub, 8) == 0) { return 0; }
+            let is i64 as index_format = table.u16_at(f, sub);
+            let is i64 as image_format = table.u16_at(f, sub + 2);
+            let is i64 as base = table.u32_at(f, sub + 4);
+            let is i64 as i = gid - first;
+            if (index_format == 1 || index_format == 3) {
+                let is i64 as w with mut = 4;
+                if (index_format == 3) { w = 2; }
+                let is i64 as at = sub + 8 + i * w;
+                if (table.inside(t, at, 2 * w) == 0) { return 0; }
+                let is i64 as off with mut = table.u32_at(f, at);
+                let is i64 as next with mut = table.u32_at(f, at + 4);
+                if (w == 2) {
+                    off = table.u16_at(f, at);
+                    next = table.u16_at(f, at + 2);
+                }
+                if (next <= off) { return 0; }
+                return _image(f, image_format, base + off, next - off, 0, b);
+            }
+            if (index_format == 2) {
+                let is i64 as each = table.u32_at(f, sub + 8);
+                return _image(f, image_format, base + i * each, each, sub + 12, b);
+            }
+            if (index_format == 4) {
+                let is i64 as n = table.u32_at(f, sub + 8);
+                if (table.inside(t, sub + 12, (n + 1) * 4) == 0) { return 0; }
+                let is i64 as j with mut = 0;
+                while (j < n) {
+                    let is i64 as pair = sub + 12 + j * 4;
+                    if (table.u16_at(f, pair) == gid) {
+                        let is i64 as off = table.u16_at(f, pair + 2);
+                        let is i64 as next = table.u16_at(f, pair + 6);
+                        if (next <= off) { return 0; }
+                        return _image(f, image_format, base + off, next - off, 0, b);
+                    }
+                    j = j + 1;
+                }
+                return 0;
+            }
+            if (index_format == 5) {
+                let is i64 as each = table.u32_at(f, sub + 8);
+                let is i64 as n = table.u32_at(f, sub + 20);
+                if (table.inside(t, sub + 24, n * 2) == 0) { return 0; }
+                let is i64 as j with mut = 0;
+                while (j < n) {
+                    if (table.u16_at(f, sub + 24 + j * 2) == gid) {
+                        return _image(f, image_format, base + j * each, each, sub + 12, b);
+                    }
+                    j = j + 1;
+                }
+                return 0;
+            }
+            return 0;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Whether any strike has an image for glyph gid.
+fn has(f as *table.Face, gid as i64) as i32 {
+    let is Bitmap as b;
+    let is i64 as s with mut = 0;
+    while (s < strikes(f)) {
+        if (find(f, s, gid, &b) == 1) { return 1; }
+        s = s + 1;
+    }
+    return 0;
+}

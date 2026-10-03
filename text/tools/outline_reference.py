@@ -57,6 +57,9 @@ def main():
             continue
         data = open(p, "rb").read()
         fonts = TTCollection(p).fonts if p.endswith(".ttc") else [TTFont(p)]
+        # Nor the fonts of colour bitmaps alone, which have no outlines.
+        if not any(t in fonts[0] for t in ("glyf", "CFF ", "CFF2")):
+            continue
         out = ["faces %d" % len(fonts)]
         for i, f in enumerate(fonts):
             out.append("face %d" % i)

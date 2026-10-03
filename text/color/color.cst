@@ -1,0 +1,332 @@
+// text/color/color.cst — colour glyphs drawn: a glyph's layers (colr.cst)
+// filled one over another, or its bitmap (cbdt.cst) decoded and scaled to
+// the size asked for. Into RGBA8 pixels, premultiplied — as the atlas keeps
+// colour glyphs and a premultiplied blend draws them.
+//
+// Positions are as raster.cst has them: pixels, y down, the pen on the
+// baseline; a glyph's box is the whole pixels its ink touches. A bitmap
+// drawn at a size other than its strike's is resampled by area: each pixel
+// the average of what it covers of the strike's — sharp made smaller, soft
+// made larger, as bitmaps are.
+//
+// The text's colour is what a layer of the foreground entry is drawn in: a
+// glyph with such a layer is a different bitmap for each colour, and a
+// caller drawing it in more than one keeps a font number for each with the
+// atlas (get()).
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../../image/image.cst" as image;
+use "../../image/load.cst" as load;
+use "../sfnt/table.cst" as table;
+use "../outline/outline.cst" as outline;
+use "../raster/raster.cst" as raster;
+use "../atlas.cst" as atlas;
+use "colr.cst" as colr;
+use "cbdt.cst" as cbdt;
+
+let is i64 as NONE with imut = 0;
+let is i64 as LAYERS with imut = 1;
+let is i64 as BITMAP with imut = 2;
+
+// How glyph gid is in colour: in layers, as bitmaps, or not at all.
+fn kind(f as *table.Face, gid as i64) as i64 {
+    if (colr.layer_count(f, gid) > 0) { return LAYERS; }
+    if (cbdt.has(f, gid) == 1) { return BITMAP; }
+    return NONE;
+}
+
+// What drawing layers borrows — a rasterizer and a path, as the atlas does —
+// and the coverage of one layer at a time.
+struct Painter {
+    raster as *raster.Raster;
+    path   as *outline.path.Path;
+    cover  as *u8;
+    bytes  as i64;
+}
+
+fn painter(r as *raster.Raster, p as *outline.path.Path) as Painter {
+    let is Painter as pt;
+    pt.raster = r;
+    pt.path = p;
+    pt.cover = cast(*u8, 0);
+    pt.bytes = 0;
+    return pt;
+}
+
+fn close(pt as *Painter) as void {
+    if (pt.bytes > 0) { mem.core.munmap(pt.cover, pt.bytes); }
+    pt.bytes = 0;
+}
+
+fn _cover(pt as *Painter, n as i64) as i32 {
+    if (n <= pt.bytes) { return 1; }
+    if (pt.bytes > 0) { mem.core.munmap(pt.cover, pt.bytes); }
+    let is i64 as b with mut = 4096;
+    while (b < n) { b = b * 2; }
+    pt.cover = mem.core.mmap_anon(b);
+    if (cast(i64, pt.cover) <= 0) {
+        pt.bytes = 0;
+        return 0;
+    }
+    pt.bytes = b;
+    return 1;
+}
+
+fn _join(b as *raster.Box, c as *raster.Box) as void {
+    if (c.w == 0 || c.h == 0) { return; }
+    if (b.w == 0 || b.h == 0) {
+        *b = *c;
+        return;
+    }
+    let is i64 as right with mut = b.left + b.w;
+    let is i64 as bottom with mut = b.top + b.h;
+    if (c.left + c.w > right) { right = c.left + c.w; }
+    if (c.top + c.h > bottom) { bottom = c.top + c.h; }
+    if (c.left < b.left) { b.left = c.left; }
+    if (c.top < b.top) { b.top = c.top; }
+    b.w = right - b.left;
+    b.h = bottom - b.top;
+}
+
+// --- Layers ---
+
+// The box of glyph gid's layers at px pixels an em, the pen at (x, y): 1, or
+// 0 when one cannot be read.
+fn layers_box(pt as *Painter, r as *outline.Reader, gid as i64, px as f64, x as f64, y as f64,
+              b as *raster.Box) as i32 {
+    let is raster.flatten.Transform as t = raster.glyph_transform(px / cast(f64, r.face.upem), x, y);
+    b.left = 0;
+    b.top = 0;
+    b.w = 0;
+    b.h = 0;
+    let is i64 as n = colr.layer_count(r.face, gid);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is colr.Layer as l = colr.layer(r.face, gid, i);
+        if (outline.glyph(r, l.glyph, pt.path) == 0) { return 0; }
+        let is raster.Box as c;
+        if (raster.bounds(pt.path, &t, &c) == 0) { return 0; }
+        _join(b, &c);
+        i = i + 1;
+    }
+    return 1;
+}
+
+// c over d: c's colour times the coverage a, then over what is there.
+fn _over(d as *u8, r as i64, g as i64, bl as i64, al as i64, a as i64) as void {
+    let is i64 as sr = (r * a + 127) / 255;
+    let is i64 as sg = (g * a + 127) / 255;
+    let is i64 as sb = (bl * a + 127) / 255;
+    let is i64 as sa = (al * a + 127) / 255;
+    let is i64 as keep = 255 - sa;
+    d[0] = cast(u8, sr + (cast(i64, d[0]) * keep + 127) / 255);
+    d[1] = cast(u8, sg + (cast(i64, d[1]) * keep + 127) / 255);
+    d[2] = cast(u8, sb + (cast(i64, d[2]) * keep + 127) / 255);
+    d[3] = cast(u8, sa + (cast(i64, d[3]) * keep + 127) / 255);
+}
+
+// Glyph gid's layers drawn into box b's pixels at out, rows stride apart, in
+// palette p and the text's colour fg (0xRRGGBBAA). 1, or 0 when a layer
+// cannot be read or drawn.
+fn draw_layers(pt as *Painter, r as *outline.Reader, gid as i64, px as f64, x as f64, y as f64, p as i64,
+               fg as u32, b as *raster.Box, out as *u8, stride as i64) as i32 {
+    let is i64 as row with mut = 0;
+    while (row < b.h) {
+        mem.memzero(cast(*u8, cast(i64, out) + row * stride), b.w * 4);
+        row = row + 1;
+    }
+    if (b.w == 0 || b.h == 0) { return 1; }
+    if (_cover(pt, b.w * b.h) == 0) { return 0; }
+    let is raster.flatten.Transform as t = raster.glyph_transform(px / cast(f64, r.face.upem), x, y);
+    let is i64 as n = colr.layer_count(r.face, gid);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is colr.Layer as l = colr.layer(r.face, gid, i);
+        if (outline.glyph(r, l.glyph, pt.path) == 0) { return 0; }
+        if (raster.draw(pt.raster, pt.path, &t, b, raster.NONZERO, pt.cover, b.w) == 0) { return 0; }
+        let is i64 as c = cast(i64, colr.color(r.face, p, l.entry, fg));
+        let is i64 as al = c & 255;
+        // The colour premultiplied, once.
+        let is i64 as cr = (((c >> 24) & 255) * al + 127) / 255;
+        let is i64 as cg = (((c >> 16) & 255) * al + 127) / 255;
+        let is i64 as cb = (((c >> 8) & 255) * al + 127) / 255;
+        row = 0;
+        while (row < b.h) {
+            let is i64 as k with mut = 0;
+            while (k < b.w) {
+                let is i64 as a = cast(i64, pt.cover[row * b.w + k]);
+                if (a > 0) {
+                    _over(cast(*u8, cast(i64, out) + row * stride + k * 4), cr, cg, cb, al, a);
+                }
+                k = k + 1;
+            }
+            row = row + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// --- Bitmaps ---
+
+// Where glyph gid's bitmap goes at px pixels an em, the pen at (x, y): its
+// strike's image into *bm, its box into *b. 1, or 0 when no strike has it.
+fn bitmap_box(f as *table.Face, gid as i64, px as f64, x as f64, y as f64, bm as *cbdt.Bitmap,
+              b as *raster.Box) as i32 {
+    if (cbdt.find(f, cbdt.nearest(f, px), gid, bm) == 0) { return 0; }
+    let is f64 as s = px / cast(f64, bm.ppem);
+    let is f64 as x0 = x + cast(f64, bm.left) * s;
+    let is f64 as y0 = y - cast(f64, bm.top) * s;
+    b.left = cast(i64, fm.floor(x0));
+    b.top = cast(i64, fm.floor(y0));
+    b.w = cast(i64, fm.ceil(x0 + cast(f64, bm.width) * s)) - b.left;
+    b.h = cast(i64, fm.ceil(y0 + cast(f64, bm.height) * s)) - b.top;
+    return 1;
+}
+
+// How much of source pixel k, of n, the span from u0 to u1 covers.
+fn _overlap(k as i64, u0 as f64, u1 as f64) as f64 {
+    let is f64 as lo with mut = cast(f64, k);
+    let is f64 as hi with mut = lo + 1.0;
+    if (u0 > lo) { lo = u0; }
+    if (u1 < hi) { hi = u1; }
+    if (hi <= lo) { return 0.0; }
+    return hi - lo;
+}
+
+// Glyph gid's bitmap drawn into box b's pixels at out, rows stride apart, as
+// bitmap_box placed it: decoded, premultiplied, resampled. 1, or 0 when it
+// cannot be decoded.
+fn draw_bitmap(f as *table.Face, gid as i64, px as f64, x as f64, y as f64, b as *raster.Box, out as *u8,
+               stride as i64) as i32 {
+    let is cbdt.Bitmap as bm;
+    let is raster.Box as placed;
+    if (bitmap_box(f, gid, px, x, y, &bm, &placed) == 0) { return 0; }
+    let is image.buffer.Image as src with mut = load.bytes(bm.data, bm.len);
+    if (cast(i64, src.pixels) == 0) { return 0; }
+    if (src.format != image.RGBA8) {
+        let is image.buffer.Image as rgba = image.buffer.create(src.width, src.height, image.RGBA8);
+        let is i64 as q with mut = 0;
+        while (q < src.height) {
+            let is i64 as k with mut = 0;
+            while (k < src.width) {
+                let is *u8 as from = image.buffer.pixel_at(&src, k, q);
+                let is *u8 as to = image.buffer.pixel_at(&rgba, k, q);
+                to[3] = cast(u8, 255);
+                if (src.format == image.R8) {
+                    to[0] = from[0];
+                    to[1] = from[0];
+                    to[2] = from[0];
+                } else {
+                    to[0] = from[0];
+                    to[1] = from[1];
+                    to[2] = from[2];
+                }
+                k = k + 1;
+            }
+            q = q + 1;
+        }
+        image.buffer.destroy(&src);
+        src = rgba;
+    }
+    image.transform.premultiply(&src);
+    let is f64 as s = px / cast(f64, bm.ppem);
+    // The strike's pixels in the box's: where its left and top edges fall.
+    let is f64 as x0 = x + cast(f64, bm.left) * s;
+    let is f64 as y0 = y - cast(f64, bm.top) * s;
+    // A box pixel spans 1 / s strike pixels each way: what it covers of each
+    // is weighed by its part of that.
+    let is f64 as area = s * s;
+    let is i64 as row with mut = 0;
+    while (row < b.h) {
+        let is f64 as v0 = (cast(f64, b.top + row) - y0) / s;
+        let is f64 as v1 = (cast(f64, b.top + row + 1) - y0) / s;
+        let is i64 as q0 with mut = cast(i64, fm.floor(v0));
+        if (q0 < 0) { q0 = 0; }
+        let is i64 as q1 with mut = cast(i64, fm.ceil(v1));
+        if (q1 > src.height) { q1 = src.height; }
+        let is i64 as col with mut = 0;
+        while (col < b.w) {
+            let is f64 as u0 = (cast(f64, b.left + col) - x0) / s;
+            let is f64 as u1 = (cast(f64, b.left + col + 1) - x0) / s;
+            let is i64 as k0 with mut = cast(i64, fm.floor(u0));
+            if (k0 < 0) { k0 = 0; }
+            let is i64 as k1 with mut = cast(i64, fm.ceil(u1));
+            if (k1 > src.width) { k1 = src.width; }
+            let is [4]f64 as acc;
+            acc[0] = 0.0;
+            acc[1] = 0.0;
+            acc[2] = 0.0;
+            acc[3] = 0.0;
+            let is i64 as q with mut = q0;
+            while (q < q1) {
+                let is f64 as wy = _overlap(q, v0, v1);
+                let is i64 as k with mut = k0;
+                while (k < k1) {
+                    let is f64 as w = wy * _overlap(k, u0, u1) * area;
+                    let is *u8 as sp = image.buffer.pixel_at(&src, k, q);
+                    acc[0] = acc[0] + w * cast(f64, sp[0]);
+                    acc[1] = acc[1] + w * cast(f64, sp[1]);
+                    acc[2] = acc[2] + w * cast(f64, sp[2]);
+                    acc[3] = acc[3] + w * cast(f64, sp[3]);
+                    k = k + 1;
+                }
+                q = q + 1;
+            }
+            let is *u8 as d = cast(*u8, cast(i64, out) + row * stride + col * 4);
+            let is i64 as j with mut = 0;
+            while (j < 4) {
+                let is i64 as v with mut = cast(i64, fm.floor(acc[j] + 0.5));
+                if (v > 255) { v = 255; }
+                if (v < 0) { v = 0; }
+                d[j] = cast(u8, v);
+                j = j + 1;
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    image.buffer.destroy(&src);
+    return 1;
+}
+
+// --- Through the atlas ---
+
+// Colour glyph gid of the face r reads, at size pixels an em, its pen at (x,
+// y): found in the atlas's colour cache c, or drawn into it — its pages
+// RGBA8 — in palette p and the text's colour fg. As atlas.get: PLACED,
+// NO_ROOM, or NEVER for a glyph not in colour or not drawable.
+fn get(c as *atlas.Cache, pt as *Painter, r as *outline.Reader, font as i64, size as f64, gid as i64, x as f64,
+       y as f64, p as i64, fg as u32, out as *atlas.Placed) as i32 {
+    let is i32 as found = atlas.find(c, font, size, gid, x, y, out);
+    if (found != atlas.MISSING) { return found; }
+    // Drawn where the cache puts the pen: its step past the whole pixel.
+    let is i64 as wx with mut = 0;
+    let is i64 as wy with mut = 0;
+    let is f64 as fx = cast(f64, raster.subpixel(x, c.xsteps, &wx)) / cast(f64, c.xsteps);
+    let is f64 as fy = cast(f64, raster.subpixel(y, c.ysteps, &wy)) / cast(f64, c.ysteps);
+    let is i64 as k = kind(r.face, gid);
+    let is raster.Box as b;
+    let is cbdt.Bitmap as bm;
+    let is i32 as ok with mut = 0;
+    if (c.pages.format == image.RGBA8) {
+        if (k == LAYERS) { ok = layers_box(pt, r, gid, size, fx, fy, &b); }
+        if (k == BITMAP) { ok = bitmap_box(r.face, gid, size, fx, fy, &bm, &b); }
+    }
+    if (ok == 0) {
+        atlas.refuse(c, font, size, gid, x, y);
+        return atlas.NEVER;
+    }
+    let is i32 as got = atlas.put(c, font, size, gid, x, y, b.left, b.top, b.w, b.h, out);
+    if (got != atlas.PLACED || out.w == 0) { return got; }
+    let is *image.buffer.Image as pg = image.atlas.page(c.pages, out.page);
+    let is *u8 as at = cast(*u8, cast(i64, pg.pixels) + out.sy * pg.stride + out.sx * 4);
+    let is i32 as drawn with mut = 0;
+    if (k == LAYERS) { drawn = draw_layers(pt, r, gid, size, fx, fy, p, fg, &b, at, pg.stride); }
+    if (k == BITMAP) { drawn = draw_bitmap(r.face, gid, size, fx, fy, &b, at, pg.stride); }
+    if (drawn == 0) {
+        atlas.refuse(c, font, size, gid, x, y);
+        return atlas.NEVER;
+    }
+    return atlas.PLACED;
+}

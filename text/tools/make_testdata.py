@@ -38,6 +38,10 @@ LATIN += "̧̀́̂̃̈"
 CJK = "漢字かなカナ一二三葛辻\U00020B9F\U00029E3D"
 CJK += "\uFE00\uFE01" + "".join(chr(c) for c in range(0xE0100, 0xE0104))
 CJK += LATIN[:95]
+# Emoji drawn as bitmaps: a face, a hand with a skin tone (a ligature), a
+# flag (another), a heart. Musical signs drawn in layers of colour.
+EMOJI = "\U0001F600\U0001F44D\U0001F3FD\U0001F1E7\U0001F1F7\u2764"
+ZNAMENNY = "\U0001CF00\U0001CF01\U0001CF02"
 
 SOURCES = [
     # (output, source, face index in a collection or None, text, new family)
@@ -47,6 +51,9 @@ SOURCES = [
     ("vf.ttf", "/usr/share/fonts/inter/InterVariable.ttf", None, LATIN, "Caustic Test Variable"),
     ("kern.ttf", "/usr/share/fonts/liberation/LiberationSans-Regular.ttf", None, LATIN, "Caustic Test Kern"),
     ("cid.otf", "/usr/share/fonts/adobe-source-han-sans/SourceHanSansJP-Regular.otf", None, CJK, "Caustic Test CID"),
+    ("cbdt.ttf", "/usr/share/fonts/noto/NotoColorEmoji.ttf", None, EMOJI, "Caustic Test CBDT"),
+    ("colr.ttf", "/usr/share/fonts/noto/NotoZnamennyMusicalNotation-Regular.ttf", None, ZNAMENNY,
+     "Caustic Test COLR"),
 ]
 # Two faces of one collection, cut down and put back into one.
 COLLECTION = ("pair.ttc", "/usr/share/fonts/inter/Inter.ttc", ["Inter Regular", "Inter Bold"], LATIN,
@@ -1972,6 +1979,157 @@ def make_varlookups_font():
     return fb.font
 
 
+# --- color.ttf: colour glyphs every way the formats allow ---
+
+def _png(w, h, pixels, kind=6):
+    """A PNG of rows of (r, g, b, a), made here so that nothing else is needed
+    to make it: RGBA (colour type 6), or RGB (2) or grey (0) of what the type
+    has room for."""
+    import struct
+    import zlib
+    keep = {6: 4, 2: 3, 0: 1}[kind]
+    raw = b"".join(b"\x00" + bytes(c for p in row for c in p[:keep]) for row in pixels)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, kind, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def _pattern(w, h, seed):
+    # Colours and alphas that tell pixels apart, a third of them half seen.
+    return [[((x * 37 + seed * 50) % 256, (y * 53 + seed * 11) % 256, (x * y * 7 + seed) % 256,
+              128 if (x + y + seed) % 3 == 0 else 255) for x in range(w)] for y in range(h)]
+
+
+def make_color_font():
+    """Glyphs in layers (COLR version 0) and as bitmaps (CBLC, CBDT). The
+    layers are rectangles on whole pixels at 10 pixels an em, so that drawn
+    they are their colours exactly: three of a palette overlapping, and one
+    in the text's colour under one half seen through; two palettes. The
+    bitmaps are in two strikes, 32 and 16 pixels an em in that order,
+    through every index format (1 to 5) and every image format (17, 18,
+    19), in RGBA, RGB and grey; two glyphs are in the 16 strike alone."""
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib import newTable
+    from fontTools.ttLib.tables import E_B_L_C_ as L
+    from fontTools.ttLib.tables import C_B_D_T_ as D
+    from fontTools.ttLib.tables.BitmapGlyphMetrics import BigGlyphMetrics, SmallGlyphMetrics
+    from fontTools.colorLib.builder import buildCOLR, buildCPAL
+
+    def rect(x0, y0, x1, y1):
+        pen = TTGlyphPen(None)
+        pen.moveTo((x0, y0)); pen.lineTo((x0, y1)); pen.lineTo((x1, y1)); pen.lineTo((x1, y0)); pen.closePath()
+        return pen.glyph()
+
+    bitmaps = ["b1", "b2", "b3", "b4", "b5", "b6", "b7"]
+    names = [".notdef", "space", "layered", "two", "red", "green", "blue", "fg", "half"] + bitmaps
+    glyphs = {
+        ".notdef": rect(50, 0, 450, 700), "space": TTGlyphPen(None).glyph(),
+        "layered": rect(0, 0, 800, 600), "two": rect(0, 0, 800, 800),
+        "red": rect(0, 0, 400, 400), "green": rect(200, 200, 600, 600), "blue": rect(400, 0, 800, 200),
+        "fg": rect(0, 0, 800, 800), "half": rect(0, 0, 400, 800),
+    }
+    for n in bitmaps:
+        glyphs[n] = TTGlyphPen(None).glyph()
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({0x41: "layered", 0x42: "two", **{0x43 + i: n for i, n in enumerate(bitmaps)}})
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics({n: (1000, getattr(glyphs[n], "xMin", 0)) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    family = "Caustic Test Color"
+    fb.setupNameTable({"familyName": family, "styleName": "Regular", "uniqueFontIdentifier": family,
+                       "fullName": family, "psName": family.replace(" ", "")}, mac=False)
+    fb.setupOS2(usWeightClass=400, version=4, sTypoAscender=800, sTypoDescender=-200,
+                usWinAscent=800, usWinDescent=200)
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    font = fb.font
+    font["COLR"] = buildCOLR({"layered": [("red", 0), ("green", 1), ("blue", 2)],
+                              "two": [("fg", 0xFFFF), ("half", 3)]}, version=0)
+    font["CPAL"] = buildCPAL([[(1.0, 0.0, 0.0, 1.0), (0.0, 1.0, 0.0, 1.0), (0.0, 0.0, 1.0, 1.0),
+                               (1.0, 1.0, 1.0, 128 / 255)],
+                              [(1.0, 1.0, 0.0, 1.0), (0.0, 1.0, 1.0, 1.0), (1.0, 0.0, 1.0, 1.0),
+                               (0.0, 0.0, 0.0, 128 / 255)]])
+
+    # Bearings of one pixel in, the top a pixel under the em's top; and for
+    # two subtables negative, the image starting left of the pen and, in
+    # one, its top below the baseline as far as a byte goes.
+    def small(w, h, bx=1, by=None):
+        m = SmallGlyphMetrics()
+        m.height, m.width, m.BearingX, m.BearingY, m.Advance = h, w, bx, h - 1 if by is None else by, w + 2
+        return m
+
+    def big(w, h, bx=1, by=None):
+        m = BigGlyphMetrics()
+        m.height, m.width = h, w
+        m.horiBearingX, m.horiBearingY, m.horiAdvance = bx, h - 1 if by is None else by, w + 2
+        m.vertBearingX, m.vertBearingY, m.vertAdvance = 0, 0, h
+        return m
+    bearings = {(4, 17): (-3, -128), (1, 18): (-2, None)}
+    # Two images of the 32 strike in RGB and in grey, with no alpha; b6 and
+    # b7 not in that strike at all. The larger strike first, as nothing says
+    # they are in order.
+    kinds = {(32, "b4"): 2, (32, "b5"): 0}
+
+    cbdt = newTable("CBDT")
+    cbdt.version = 3.0
+    cbdt.strikeData = []
+    cblc = newTable("CBLC")
+    cblc.version = 3.0
+    cblc.strikes = []
+    for ppem, subs in ((32, [(5, 19, ["b1", "b2", "b3"], 12, 12), (1, 18, ["b4", "b5"], 10, 10)]),
+                       (16, [(1, 17, ["b1", "b2"], 8, 8), (2, 19, ["b3", "b4"], 6, 6), (3, 18, ["b5"], 4, 4),
+                             (4, 17, ["b6", "b7"], 5, 5)])):
+        data = {}
+        st = L.Strike()
+        bs = L.BitmapSizeTable()
+        bs.ppemX = bs.ppemY = ppem
+        bs.bitDepth, bs.flags, bs.colorRef = 32, 1, 0
+        for side in ("hori", "vert"):
+            lm = L.SbitLineMetrics()
+            for k in ("ascender", "descender", "widthMax", "caretSlopeNumerator", "caretSlopeDenominator",
+                      "caretOffset", "minOriginSB", "minAdvanceSB", "maxBeforeBL", "minAfterBL", "pad1", "pad2"):
+                setattr(lm, k, 0)
+            lm.ascender, lm.widthMax = ppem, ppem
+            setattr(bs, side, lm)
+        st.bitmapSizeTable = bs
+        st.indexSubTables = []
+        for index_format, image_format, gnames, w, h in subs:
+            ist = getattr(L, "eblc_index_sub_table_%d" % index_format)(None, font)
+            ist.indexFormat, ist.imageFormat = index_format, image_format
+            ist.names = gnames
+            if index_format in (2, 5):
+                ist.metrics = big(w, h)
+            for n in gnames:
+                g = {17: D.cbdt_bitmap_format_17, 18: D.cbdt_bitmap_format_18,
+                     19: D.cbdt_bitmap_format_19}[image_format](None, font)
+                bx, by = bearings.get((index_format, image_format), (1, None))
+                if image_format == 17:
+                    g.metrics = small(w, h, bx, by)
+                if image_format == 18:
+                    g.metrics = big(w, h, bx, by)
+                g.imageData = _png(w, h, _pattern(w, h, names.index(n) + ppem), kinds.get((ppem, n), 6))
+                data[n] = g
+            if index_format in (2, 5):
+                ist.imageSize = max(len(data[n].imageData) + 4 for n in gnames)
+            st.indexSubTables.append(ist)
+        cbdt.strikeData.append(data)
+        cblc.strikes.append(st)
+    font["CBDT"] = cbdt
+    font["CBLC"] = cblc
+    return font
+
+
+def synthetic_color():
+    # Made from nothing, so under no licence.
+    path = os.path.join(OUT, "color.ttf")
+    make_color_font().save(path)
+    print("color.ttf", os.path.getsize(path), "bytes")
+
+
 def synthetic_varlookups():
     # Made from nothing, so under no licence.
     path = os.path.join(OUT, "varlookups.ttf")
@@ -1984,6 +2142,7 @@ def main():
     synthetic_shape()
     synthetic_lookups()
     synthetic_varlookups()
+    synthetic_color()
     synthetic_fonts()
     synthetic_big()
     synthetic_var()

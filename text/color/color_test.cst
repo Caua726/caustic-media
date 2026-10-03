@@ -1,0 +1,622 @@
+// text/color/color_test.cst — colour glyphs held to what others read in the
+// test fonts (text/testdata/*.color.ref, written by
+// text/tools/color_reference.py): every strike, every image's metrics, its
+// PNG to the byte and its pixels decoded and premultiplied to the byte; the
+// strike chosen for a size as HarfBuzz chooses it; every layer, every
+// palette's colours. Then drawn, to what is known of them: layers on whole
+// pixels their colours exactly, one over another, the text's colour where
+// the font says; a bitmap at its strike's size its pixels exactly, at half
+// the average of each four; at any size its ink kept; a layer in the font's
+// one colour its glyph's coverage. And through the atlas, kept and found.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../image/image.cst" as image;
+use "../../image/load.cst" as load;
+use "../sfnt/sfnt.cst" as sfnt;
+use "../sfnt/table.cst" as table;
+use "../outline/outline.cst" as outline;
+use "../raster/raster.cst" as raster;
+use "../atlas.cst" as atlas;
+use "cbdt.cst" as cbdt;
+use "colr.cst" as colr;
+use "color.cst" as color;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load_file(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+// --- Hashes, as the tool's ---
+
+fn fnv(h0 as i64, data as *u8, n as i64) as i64 {
+    let is i64 as h with mut = h0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = (h ^ cast(i64, data[i])) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+let is i64 as FNV_START with imut = 0 - 3750763034362895579;
+
+// A PNG decoded as the atlas keeps it: RGBA, premultiplied.
+fn decoded(data as *u8, len as i64) as image.buffer.Image {
+    let is image.buffer.Image as im with mut = load.bytes(data, len);
+    if (cast(i64, im.pixels) != 0 && im.format != image.RGBA8) {
+        let is image.buffer.Image as rgba = image.buffer.create(im.width, im.height, image.RGBA8);
+        let is i64 as y with mut = 0;
+        while (y < im.height) {
+            let is i64 as x with mut = 0;
+            while (x < im.width) {
+                let is *u8 as s = image.buffer.pixel_at(&im, x, y);
+                let is *u8 as d = image.buffer.pixel_at(&rgba, x, y);
+                d[3] = cast(u8, 255);
+                d[0] = s[0];
+                d[1] = s[0];
+                d[2] = s[0];
+                if (im.format == image.RGB8) {
+                    d[1] = s[1];
+                    d[2] = s[2];
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        image.buffer.destroy(&im);
+        im = rgba;
+    }
+    image.transform.premultiply(&im);
+    return im;
+}
+
+fn pixels_hash(px as *u8, w as i64, h as i64, stride as i64) as i64 {
+    let is i64 as hsh with mut = FNV_START;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        hsh = fnv(hsh, cast(*u8, cast(i64, px) + y * stride), w * 4);
+        y = y + 1;
+    }
+    return hsh;
+}
+
+// --- The reference, a line at a time ---
+
+let is *u8 as ref with mut;
+let is i64 as ref_len with mut = 0;
+let is i64 as at with mut = 0;
+let is i64 as lp with mut = 0;
+let is i64 as le with mut = 0;
+
+fn _c(i as i64) as i64 {
+    if (i >= ref_len) { return 0; }
+    return cast(i64, ref[i]);
+}
+
+fn next_line() as i32 {
+    if (at >= ref_len) { return 0; }
+    lp = at;
+    le = at;
+    while (le < ref_len && _c(le) != 10) { le = le + 1; }
+    at = le + 1;
+    return 1;
+}
+
+fn _skip() as void {
+    while (lp < le && _c(lp) == 32) { lp = lp + 1; }
+}
+
+// Whether the line's next word is w, moved past when it is.
+fn word_is(w as *u8) as i32 {
+    _skip();
+    let is i64 as i with mut = 0;
+    while (w[i] != 0) {
+        if (_c(lp + i) != cast(i64, w[i])) { return 0; }
+        i = i + 1;
+    }
+    if (lp + i < le && _c(lp + i) != 32) { return 0; }
+    lp = lp + i;
+    return 1;
+}
+
+fn num() as i64 {
+    _skip();
+    let is i64 as neg with mut = 0;
+    if (_c(lp) == 45) {
+        neg = 1;
+        lp = lp + 1;
+    }
+    let is i64 as v with mut = 0;
+    while (lp < le && _c(lp) >= 48 && _c(lp) <= 57) {
+        v = v * 10 + _c(lp) - 48;
+        lp = lp + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+
+fn hex() as i64 {
+    _skip();
+    let is i64 as v with mut = 0;
+    while (lp < le && _c(lp) != 32) {
+        let is i64 as c = _c(lp);
+        let is i64 as d with mut = c - 48;
+        if (c >= 97) { d = c - 87; }
+        v = (v << 4) | d;
+        lp = lp + 1;
+    }
+    return v;
+}
+
+// --- Against the reference ---
+
+fn against(name as *u8, data as *u8, size as i64) as void {
+    let is [256]u8 as path;
+    let is *u8 as dir = "text/testdata/";
+    let is i64 as n with mut = 0;
+    while (dir[n] != 0) {
+        path[n] = dir[n];
+        n = n + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (name[k] != 0) {
+        path[n] = name[k];
+        n = n + 1;
+        k = k + 1;
+    }
+    let is *u8 as suffix = ".color.ref";
+    k = 0;
+    while (suffix[k] != 0) {
+        path[n] = suffix[k];
+        n = n + 1;
+        k = k + 1;
+    }
+    path[n] = cast(u8, 0);
+    ref = load_file(cast(*u8, &path));
+    ref_len = loaded;
+    at = 0;
+    if (cast(i64, ref) == 0) {
+        io.printf("FAIL: cannot read %s\n", cast(*u8, &path));
+        fails = fails + 1;
+        return;
+    }
+    let is table.Face as f = sfnt.open(data, size, 0);
+    let is i64 as strike with mut = 0 - 1;
+    let is i32 as images with mut = 1;
+    let is i32 as pngs with mut = 1;
+    let is i32 as pixels with mut = 1;
+    let is i32 as chosen with mut = 1;
+    let is i32 as layers with mut = 1;
+    let is i32 as colors with mut = 1;
+    let is i64 as base with mut = 0;
+    let is i64 as layer_at with mut = 0;
+    while (next_line() == 1) {
+        if (word_is("strikes") == 1) {
+            check("strikes: as many", cbdt.strikes(&f) == num());
+        } else if (word_is("strike") == 1) {
+            strike = strike + 1;
+            if (cbdt.ppem(&f, strike) != num()) { images = 0; }
+        } else if (word_is("image") == 1) {
+            let is cbdt.Bitmap as b;
+            let is i64 as gid = num();
+            if (cbdt.find(&f, strike, gid, &b) == 0 || b.width != num() || b.height != num() || b.left != num() ||
+                b.top != num() || b.advance != num() || b.len != num()) {
+                images = 0;
+            } else {
+                if (fnv(FNV_START, b.data, b.len) != hex()) { pngs = 0; }
+                let is image.buffer.Image as im = decoded(b.data, b.len);
+                if (cast(i64, im.pixels) == 0 || pixels_hash(im.pixels, im.width, im.height, im.stride) != hex()) {
+                    pixels = 0;
+                }
+                image.buffer.destroy(&im);
+            }
+        } else if (word_is("chosen") == 1) {
+            let is i64 as px = num();
+            let is i64 as gid = num();
+            let is cbdt.Bitmap as b;
+            if (cbdt.find(&f, cbdt.nearest(&f, cast(f64, px)), gid, &b) == 0 || fnv(FNV_START, b.data, b.len) != hex()) {
+                chosen = 0;
+            }
+        } else if (word_is("base") == 1) {
+            base = num();
+            layer_at = 0;
+            if (colr.layer_count(&f, base) != num() || color.kind(&f, base) != color.LAYERS) { layers = 0; }
+        } else if (word_is("layer") == 1) {
+            let is colr.Layer as l = colr.layer(&f, base, layer_at);
+            if (l.glyph != num() || l.entry != num()) { layers = 0; }
+            layer_at = layer_at + 1;
+        } else if (word_is("palettes") == 1) {
+            if (colr.palettes(&f) != num() || colr.entries(&f) != num()) { colors = 0; }
+        } else if (word_is("color") == 1) {
+            let is i64 as p = num();
+            let is i64 as e = num();
+            if (cast(i64, colr.color(&f, p, e, cast(u32, 0))) != hex()) { colors = 0; }
+        }
+    }
+    io.printf("  %s\n", name);
+    check("each image where CBLC says, its metrics", images);
+    check("each image's PNG, to the byte", pngs);
+    check("each image's pixels, decoded and premultiplied", pixels);
+    check("the strike chosen for a size, as HarfBuzz chooses", chosen);
+    check("each glyph's layers", layers);
+    check("each palette's colours", colors);
+}
+
+// --- Drawing ---
+
+let is outline.path.Path as path with mut;
+let is raster.Raster as ras with mut;
+let is color.Painter as pt with mut;
+let is *u8 as canvas with mut;
+
+let is i64 as STRIDE with imut = 1024;
+
+fn pixel(x as i64, y as i64) as i64 {
+    let is *u8 as p = cast(*u8, cast(i64, canvas) + y * STRIDE + x * 4);
+    return (cast(i64, p[0]) << 24) | (cast(i64, p[1]) << 16) | (cast(i64, p[2]) << 8) | cast(i64, p[3]);
+}
+
+// The canvas's first w by h pixels set to a byte no drawing here gives, to
+// see what is written past a box.
+fn sentinel(w as i64, h as i64) as void {
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w * 4) {
+            canvas[y * STRIDE + x] = cast(u8, 90);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// 1 when the column right of a w by h box and the row under it are still
+// the sentinel's.
+fn kept_outside(w as i64, h as i64) as i32 {
+    let is i64 as y with mut = 0;
+    while (y <= h) {
+        let is i64 as x with mut = 0;
+        while (x <= w) {
+            if (y == h || x == w) {
+                let is i64 as c with mut = 0;
+                while (c < 4) {
+                    if (canvas[y * STRIDE + x * 4 + c] != cast(u8, 90)) { return 0; }
+                    c = c + 1;
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 1;
+}
+
+fn layers_drawn(r as *outline.Reader) as void {
+    let is raster.Box as b;
+    // Layered: red, green over it, blue; at 10 pixels an em a unit is a
+    // hundredth of a pixel, the pen at (0, 8).
+    check("layers: their box", color.layers_box(&pt, r, 2, 10.0, 0.0, 8.0, &b) == 1 && b.left == 0 && b.top == 2 &&
+          b.w == 8 && b.h == 6);
+    sentinel(16, 16);
+    check("layers: drawn", color.draw_layers(&pt, r, 2, 10.0, 0.0, 8.0, 0, cast(u32, 0), &b, canvas, STRIDE) == 1);
+    check("layers: nothing written past their box", kept_outside(8, 6));
+    check("layers: red alone", pixel(1, 5) == 4278190335);          // ff0000ff, row 7 of the text
+    check("layers: green over red", pixel(3, 3) == 16711935);       // 00ff00ff
+    check("layers: green alone", pixel(5, 1) == 16711935);
+    check("layers: blue alone", pixel(5, 5) == 65535);               // 0000ffff
+    check("layers: nothing", pixel(7, 1) == 0);
+    color.draw_layers(&pt, r, 2, 10.0, 0.0, 8.0, 1, cast(u32, 0), &b, canvas, STRIDE);
+    check("layers, the second palette: yellow, cyan, magenta", pixel(1, 5) == 4294902015 && pixel(3, 3) == 16777215 &&
+          pixel(5, 5) == 4278255615);
+    // Two: the text's colour, white half seen over its left half.
+    color.layers_box(&pt, r, 3, 10.0, 0.0, 8.0, &b);
+    color.draw_layers(&pt, r, 3, 10.0, 0.0, 8.0, 0, cast(u32, 541090047), &b, canvas, STRIDE);   // 204060ff
+    check("the text's colour where the font says", pixel(6, 4) == 541090047);
+    check("half white over it", pixel(1, 4) == 2426450175);          // 90a0b0ff
+    color.draw_layers(&pt, r, 3, 10.0, 0.0, 8.0, 1, cast(u32, 541090047), &b, canvas, STRIDE);
+    check("half black over it", pixel(1, 4) == 270545151);           // 102030ff
+    // Layered again after it, its coverage left where the smaller box ends.
+    color.layers_box(&pt, r, 2, 10.0, 0.0, 8.0, &b);
+    sentinel(16, 16);
+    color.draw_layers(&pt, r, 2, 10.0, 0.0, 8.0, 0, cast(u32, 0), &b, canvas, STRIDE);
+    check("layers after a larger glyph: nothing past their box", kept_outside(8, 6));
+    let is raster.Box as empty = b;
+    empty.w = 0;
+    check("an empty box: drawn, as nothing", color.draw_layers(&pt, r, 2, 10.0, 0.0, 8.0, 0, cast(u32, 0), &empty,
+                                                               canvas, STRIDE) == 1);
+}
+
+// What the tool's pattern is at (x, y) for seed: premultiplied.
+fn pattern(x as i64, y as i64, seed as i64, ch as i64) as i64 {
+    let is i64 as a with mut = 255;
+    if ((x + y + seed) % 3 == 0) { a = 128; }
+    let is i64 as v with mut = a;
+    if (ch == 0) { v = (x * 37 + seed * 50) % 256; }
+    if (ch == 1) { v = (y * 53 + seed * 11) % 256; }
+    if (ch == 2) { v = (x * y * 7 + seed) % 256; }
+    if (ch == 3) { return a; }
+    return (v * a + 127) / 255;
+}
+
+fn plain(f as *table.Face, gid as i64, what as *u8) as void {
+    let is raster.Box as b;
+    let is cbdt.Bitmap as bm;
+    io.printf("  %s\n", what);
+    check("its box", color.bitmap_box(f, gid, 32.0, 0.0, 32.0, &bm, &b) == 1 && bm.ppem == 32 && b.left == 0 - 2 &&
+          b.top == 23 && b.w == 10 && b.h == 10);
+    sentinel(16, 16);
+    check("drawn", color.draw_bitmap(f, gid, 32.0, 0.0, 32.0, &b, canvas, STRIDE) == 1);
+    let is image.buffer.Image as im = decoded(bm.data, bm.len);
+    check("its pixels as decoded, all seen", pixels_hash(canvas, 10, 10, STRIDE) ==
+          pixels_hash(im.pixels, 10, 10, im.stride) && canvas[3] == cast(u8, 255));
+    check("nothing written past its box", kept_outside(10, 10));
+    image.buffer.destroy(&im);
+}
+
+fn bitmaps_drawn(f as *table.Face, emoji as *table.Face) as void {
+    let is raster.Box as b;
+    let is cbdt.Bitmap as bm;
+    // b1 at its strike's size: its pixels where its metrics put them.
+    check("a bitmap at its strike's size: its box", color.bitmap_box(f, 9, 16.0, 0.0, 16.0, &bm, &b) == 1 &&
+          b.left == 1 && b.top == 9 && b.w == 8 && b.h == 8);
+    sentinel(16, 16);
+    check("drawn", color.draw_bitmap(f, 9, 16.0, 0.0, 16.0, &b, canvas, STRIDE) == 1);
+    let is image.buffer.Image as im = decoded(bm.data, bm.len);
+    check("its pixels exactly", pixels_hash(canvas, 8, 8, STRIDE) == pixels_hash(im.pixels, 8, 8, im.stride));
+    check("nothing written past its box", kept_outside(8, 8));
+    image.buffer.destroy(&im);
+    // At 8 pixels an em, from the 16 strike: each pixel the average of four.
+    check("a bitmap at half: its box", color.bitmap_box(f, 9, 8.0, 0.0, 8.0, &bm, &b) == 1 && bm.ppem == 16 &&
+          b.left == 0 && b.top == 4 && b.w == 5 && b.h == 5);
+    color.draw_bitmap(f, 9, 8.0, 0.0, 8.0, &b, canvas, STRIDE);
+    // Its strike pixels start half a pixel in: the box's pixel (1, 1) is
+    // strike pixels (1..2, 1..2) of b1 (seed 9 + 16).
+    let is i32 as avg with mut = 1;
+    let is i64 as ch with mut = 0;
+    while (ch < 4) {
+        let is i64 as sum = pattern(1, 1, 25, ch) + pattern(2, 1, 25, ch) + pattern(1, 2, 25, ch) + pattern(2, 2, 25, ch);
+        let is i64 as want = (sum * 2 + 4) / 8;
+        let is i64 as got = cast(i64, *cast(*u8, cast(i64, canvas) + STRIDE + 4 + ch));
+        if (got != want) { avg = 0; }
+        ch = ch + 1;
+    }
+    check("a bitmap at half: the average of four", avg);
+    // b4 and b5 of the 32 strike, in RGB and in grey with no alpha: drawn at
+    // its size, their pixels as decoded, nothing past their boxes.
+    plain(f, 12, "an RGB bitmap");
+    plain(f, 13, "a grey bitmap");
+    // b6 is in the 16 strike alone: none at 32, as HarfBuzz gives none.
+    check("a glyph not in the nearest strike: no bitmap", color.bitmap_box(f, 14, 32.0, 0.0, 32.0, &bm, &b) == 0 &&
+          color.draw_bitmap(f, 14, 32.0, 0.0, 32.0, &b, canvas, STRIDE) == 0 &&
+          color.bitmap_box(f, 14, 16.0, 0.0, 16.0, &bm, &b) == 1);
+    // The emoji at 20 pixels an em: what ink it has kept, as much as its
+    // strike's made smaller.
+    let is i64 as gid = sfnt.cmap.glyph(emoji, 128512);
+    check("an emoji: a bitmap", color.kind(emoji, gid) == color.BITMAP);
+    check("an emoji at 20 pixels: drawn", color.bitmap_box(emoji, gid, 20.0, 0.0, 20.0, &bm, &b) == 1 &&
+          color.draw_bitmap(emoji, gid, 20.0, 0.0, 20.0, &b, canvas, STRIDE) == 1);
+    let is image.buffer.Image as src = decoded(bm.data, bm.len);
+    let is f64 as before with mut = 0.0;
+    let is i64 as y with mut = 0;
+    while (y < src.height) {
+        let is i64 as x with mut = 0;
+        while (x < src.width) {
+            before = before + cast(f64, image.buffer.pixel_at(&src, x, y)[3]);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is f64 as s = 20.0 / 109.0;
+    let is f64 as after with mut = 0.0;
+    y = 0;
+    while (y < b.h) {
+        let is i64 as x with mut = 0;
+        while (x < b.w) {
+            after = after + cast(f64, *cast(*u8, cast(i64, canvas) + y * STRIDE + x * 4 + 3));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is f64 as d = after - before * s * s;
+    let is f64 as room = cast(f64, b.w * b.h) * 0.5;
+    check("an emoji at 20 pixels: its ink kept", d <= room && d >= 0.0 - room);
+    image.buffer.destroy(&src);
+}
+
+// A glyph of the font's one colour: its alpha is the glyph's coverage.
+fn one_colour(r as *outline.Reader) as void {
+    let is i64 as gid = sfnt.cmap.glyph(r.face, 118528);
+    let is raster.Box as b;
+    check("a sign in layers", color.kind(r.face, gid) == color.LAYERS);
+    check("its box", color.layers_box(&pt, r, gid, 40.0, 3.25, 30.0, &b) == 1 && b.w > 0 && b.h > 0);
+    color.draw_layers(&pt, r, gid, 40.0, 3.25, 30.0, 0, cast(u32, 0), &b, canvas, STRIDE);
+    outline.glyph(r, gid, &path);
+    let is raster.flatten.Transform as t = raster.glyph_transform(40.0 / cast(f64, r.face.upem), 3.25, 30.0);
+    let is *u8 as cov = mem.core.mmap_anon(b.w * b.h + 16);
+    raster.draw(&ras, &path, &t, &b, raster.NONZERO, cov, b.w);
+    let is i32 as same with mut = 1;
+    let is i64 as y with mut = 0;
+    while (y < b.h) {
+        let is i64 as x with mut = 0;
+        while (x < b.w) {
+            let is *u8 as p = cast(*u8, cast(i64, canvas) + y * STRIDE + x * 4);
+            let is i64 as a = cast(i64, cov[y * b.w + x]);
+            if (cast(i64, p[3]) != a || cast(i64, p[0]) != a || p[1] != cast(u8, 0) || p[2] != cast(u8, 0)) { same = 0; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    check("red, its coverage", same);
+}
+
+fn through_the_atlas(r as *outline.Reader) as void {
+    let is image.atlas.Atlas as pages with mut = image.atlas.open(64, 64, image.RGBA8, 2);
+    let is atlas.Cache as c with mut = atlas.open(&pages, &ras, &path, 64, 1, 1);
+    let is atlas.Placed as got;
+    let is cbdt.Bitmap as bm;
+    check("layered through the atlas: placed",
+          color.get(&c, &pt, r, 1, 10.0, 2, 5.0, 20.0, 0, cast(u32, 0), &got) == atlas.PLACED);
+    check("where its box says", got.x == 5 && got.y == 14 && got.w == 8 && got.h == 6);
+    let is raster.Box as b;
+    color.layers_box(&pt, r, 2, 10.0, 0.0, 0.0, &b);
+    color.draw_layers(&pt, r, 2, 10.0, 0.0, 0.0, 0, cast(u32, 0), &b, canvas, STRIDE);
+    let is *image.buffer.Image as pg with mut = image.atlas.page(&pages, got.page);
+    check("its page holds it as drawn", pixels_hash(canvas, 8, 6, STRIDE) ==
+          pixels_hash(cast(*u8, cast(i64, pg.pixels) + got.sy * pg.stride + got.sx * 4), 8, 6, pg.stride));
+    let is atlas.Placed as again;
+    check("found again", color.get(&c, &pt, r, 1, 10.0, 2, 7.0, 21.0, 0, cast(u32, 0), &again) == atlas.PLACED &&
+          again.sx == got.sx && again.sy == got.sy && again.x == 7);
+    check("a bitmap through the atlas", color.get(&c, &pt, r, 1, 16.0, 9, 0.0, 16.0, 0, cast(u32, 0), &got) ==
+          atlas.PLACED && got.w == 8 && got.h == 8);
+    // The page's second glyph, not at its corner: there as drawn too.
+    color.bitmap_box(r.face, 9, 16.0, 0.0, 16.0, &bm, &b);
+    color.draw_bitmap(r.face, 9, 16.0, 0.0, 16.0, &b, canvas, STRIDE);
+    pg = image.atlas.page(&pages, got.page);
+    check("its page holds it as drawn, past the first", (got.sx > 0 || got.sy > 0) && pixels_hash(canvas, 8, 8, STRIDE) ==
+          pixels_hash(cast(*u8, cast(i64, pg.pixels) + got.sy * pg.stride + got.sx * 4), 8, 8, pg.stride));
+    check("a bitmap not in the nearest strike: never",
+          color.get(&c, &pt, r, 1, 32.0, 14, 0.0, 32.0, 0, cast(u32, 0), &got) == atlas.NEVER);
+    check("a glyph not in colour: never", color.get(&c, &pt, r, 1, 16.0, 1, 0.0, 16.0, 0, cast(u32, 0), &got) ==
+          atlas.NEVER);
+    image.atlas.close(&pages);
+    // On a page as wide as one bitmap, the second goes under the first.
+    let is image.atlas.Atlas as narrow with mut = image.atlas.open(10, 32, image.RGBA8, 1);
+    let is atlas.Cache as n with mut = atlas.open(&narrow, &ras, &path, 64, 1, 1);
+    color.get(&n, &pt, r, 1, 16.0, 9, 0.0, 16.0, 0, cast(u32, 0), &got);
+    check("under another: placed", color.get(&n, &pt, r, 1, 16.0, 10, 0.0, 16.0, 0, cast(u32, 0), &got) ==
+          atlas.PLACED && got.sy > 0);
+    color.bitmap_box(r.face, 10, 16.0, 0.0, 16.0, &bm, &b);
+    color.draw_bitmap(r.face, 10, 16.0, 0.0, 16.0, &b, canvas, STRIDE);
+    pg = image.atlas.page(&narrow, got.page);
+    check("its page holds it as drawn, under the first", pixels_hash(canvas, 8, 8, STRIDE) ==
+          pixels_hash(cast(*u8, cast(i64, pg.pixels) + got.sy * pg.stride + got.sx * 4), 8, 8, pg.stride));
+    image.atlas.close(&narrow);
+    let is image.atlas.Atlas as gray with mut = image.atlas.open(64, 64, image.R8, 1);
+    let is atlas.Cache as g with mut = atlas.open(&gray, &ras, &path, 64, 1, 1);
+    check("on pages of coverage: never", color.get(&g, &pt, r, 1, 10.0, 2, 5.0, 20.0, 0, cast(u32, 0), &got) ==
+          atlas.NEVER);
+    image.atlas.close(&gray);
+}
+
+// Boxes joined: the smallest holding both, whichever sets each edge.
+fn box_of(left as i64, top as i64, w as i64, h as i64) as raster.Box {
+    let is raster.Box as b;
+    b.left = left;
+    b.top = top;
+    b.w = w;
+    b.h = h;
+    return b;
+}
+
+fn joins() as void {
+    let is raster.Box as b with mut = box_of(2, 3, 4, 5);
+    let is raster.Box as c with mut = box_of(4, 1, 1, 2);
+    color._join(&b, &c);
+    check("joined: the first's right and bottom, the second's top", b.left == 2 && b.top == 1 && b.w == 4 && b.h == 7);
+    b = box_of(0, 0, 2, 2);
+    c = box_of(1, 1, 3, 4);
+    color._join(&b, &c);
+    check("joined: the second's right and bottom", b.left == 0 && b.top == 0 && b.w == 4 && b.h == 5);
+    b = box_of(5, 6, 1, 1);
+    c = box_of(1, 2, 2, 2);
+    color._join(&b, &c);
+    check("joined: the second's left and top", b.left == 1 && b.top == 2 && b.w == 5 && b.h == 5);
+    c = box_of(0, 0, 0, 9);
+    color._join(&b, &c);
+    check("an empty box adds nothing", b.left == 1 && b.top == 2 && b.w == 5 && b.h == 5);
+    b = box_of(0, 0, 0, 0);
+    c = box_of(7, 8, 1, 2);
+    color._join(&b, &c);
+    check("to an empty box, the other", b.left == 7 && b.top == 8 && b.w == 1 && b.h == 2);
+}
+
+fn main() as i32 {
+    path = outline.path.open(65536);
+    ras = raster.open(512, 512);
+    pt = color.painter(&ras, &path);
+    canvas = mem.core.mmap_anon(STRIDE * 256);
+    let is *u8 as emoji_data = load_file("text/testdata/cbdt.ttf");
+    let is i64 as emoji_size = loaded;
+    let is *u8 as colr_data = load_file("text/testdata/colr.ttf");
+    let is i64 as colr_size = loaded;
+    let is *u8 as color_data = load_file("text/testdata/color.ttf");
+    let is i64 as color_size = loaded;
+    if (cast(i64, emoji_data) == 0 || cast(i64, colr_data) == 0 || cast(i64, color_data) == 0) {
+        io.printf("FAIL: cannot read the test fonts\n");
+        return 1;
+    }
+    against("cbdt.ttf", emoji_data, emoji_size);
+    against("colr.ttf", colr_data, colr_size);
+    against("color.ttf", color_data, color_size);
+    let is table.Face as emoji = sfnt.open(emoji_data, emoji_size, 0);
+    let is table.Face as signs = sfnt.open(colr_data, colr_size, 0);
+    let is table.Face as made = sfnt.open(color_data, color_size, 0);
+    let is outline.Reader as signs_r with mut = outline.open(&signs);
+    let is outline.Reader as made_r with mut = outline.open(&made);
+    check("kinds: layers, bitmaps, neither", color.kind(&made, 2) == color.LAYERS &&
+          color.kind(&made, 9) == color.BITMAP && color.kind(&made, 1) == color.NONE);
+    check("a layer's glyph not in colour itself", color.kind(&made, 4) == color.NONE &&
+          color.kind(&made, 7) == color.NONE);
+    check("a bitmap in the last strike alone", color.kind(&made, 15) == color.BITMAP);
+    check("nearest strikes, the larger stored first: 16 for 8 and 16, 32 for 20 and 40", cbdt.ppem(&made, cbdt.nearest(&made, 8.0)) == 16 &&
+          cbdt.ppem(&made, cbdt.nearest(&made, 16.0)) == 16 && cbdt.ppem(&made, cbdt.nearest(&made, 20.0)) == 32 &&
+          cbdt.ppem(&made, cbdt.nearest(&made, 40.0)) == 32);
+    check("no strikes in a font of none", cbdt.nearest(&signs, 20.0) == 0 - 1);
+    let is cbdt.Bitmap as none;
+    check("no image in a strike past the last, or before the first",
+          cbdt.find(&made, 2, 9, &none) == 0 && cbdt.find(&made, 0 - 1, 9, &none) == 0 && cbdt.find(&made, 1, 9, &none) == 1);
+    check("a bearing as far below as a byte goes", cbdt.find(&made, 1, 15, &none) == 1 && none.top == 0 - 128 &&
+          none.left == 0 - 3);
+    check("a palette entry past the last: the text's colour", colr.color(&made, 0, 9, cast(u32, 7)) == cast(u32, 7) &&
+          colr.color(&made, 5, 0, cast(u32, 7)) == cast(u32, 7));
+    check("the entry and the palette one past the last: the text's colour",
+          colr.color(&made, 0, colr.entries(&made), cast(u32, 7)) == cast(u32, 7) &&
+          colr.color(&made, colr.palettes(&made), 0, cast(u32, 7)) == cast(u32, 7) &&
+          colr.color(&made, colr.palettes(&made) - 1, colr.entries(&made) - 1, cast(u32, 7)) != cast(u32, 7));
+    let is colr.Layer as past = colr.layer(&made, 2, colr.layer_count(&made, 2));
+    check("no layer past the last", colr.layer_count(&made, 2) == 3 && past.glyph == 0);
+    joins();
+    layers_drawn(&made_r);
+    bitmaps_drawn(&made, &emoji);
+    one_colour(&signs_r);
+    through_the_atlas(&made_r);
+    color.close(&pt);
+    outline.close(&signs_r);
+    outline.close(&made_r);
+    if (fails > 0) {
+        io.printf("color: %d of %d checks failed\n", fails, checks);
+        return 1;
+    }
+    io.printf("color: all %d checks hold\n", checks);
+    return 0;
+}
