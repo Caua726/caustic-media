@@ -1,0 +1,382 @@
+// text/atlas_test.cst — the glyph cache: a glyph rasterized once for each
+// font, size and subpixel step, placed on an atlas page byte for byte as the
+// rasterizer draws it, and found there again; empty glyphs and glyphs that
+// cannot be drawn remembered as such; entries gone with their page, or
+// pushed out of a full table by ones in use; and what does not fit said.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../image/image.cst" as image;
+use "sfnt/sfnt.cst" as sfnt;
+use "outline/outline.cst" as outline;
+use "raster/raster.cst" as raster;
+use "atlas.cst" as atlas;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+let is outline.path.Path as p with mut;
+let is raster.Raster as ras with mut;
+let is image.atlas.Atlas as pages with mut;
+let is *u8 as scratch with mut;
+
+// The glyph at the step drawn straight by the rasterizer, and the cache's
+// copy on its page: the same box, the same bytes.
+fn same_as_drawn(r as *outline.Reader, gid as i64, size as f64, dx as f64, dy as f64,
+                 g as *atlas.Placed, pen_x as i64, pen_y as i64) as i32 {
+    outline.glyph(r, gid, &p);
+    let is raster.flatten.Transform as t = raster.glyph_transform(size / cast(f64, r.face.upem), dx, dy);
+    let is raster.Box as b;
+    raster.bounds(&p, &t, &b);
+    if (b.w != g.w || b.h != g.h || pen_x + b.left != g.x || pen_y + b.top != g.y) {
+        io.printf("  box %d,%d %dx%d, placed at %d,%d %dx%d\n", b.left, b.top, b.w, b.h, g.x, g.y, g.w, g.h);
+        return 0;
+    }
+    raster.draw(&ras, &p, &t, &b, raster.NONZERO, scratch, b.w);
+    let is *image.buffer.Image as pg = image.atlas.page(&pages, g.page);
+    let is i64 as row with mut = 0;
+    while (row < b.h) {
+        if (mem.memcmp(cast(*u8, cast(i64, scratch) + row * b.w),
+                       cast(*u8, cast(i64, pg.pixels) + (g.sy + row) * pg.stride + g.sx), b.w) != 0) { return 0; }
+        row = row + 1;
+    }
+    return 1;
+}
+
+// --- More: collisions, pages, fonts, frames ---
+
+// The charstring of glyph gid of a CFF face overwritten: its first bytes.
+fn charstring(f as *sfnt.table.Face, r as *outline.Reader, gid as i64, prog as *u8, n as i64) as void {
+    let is i64 as len with mut = 0;
+    let is i64 as at = outline.cff.item(f, &r.cff.charstrings, gid, &len);
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        *cast(*u8, cast(i64, f.data) + at + k) = *cast(*u8, cast(i64, prog) + k);
+        k = k + 1;
+    }
+}
+
+fn more(r as *outline.Reader) as void {
+    let is atlas.Placed as got;
+    image.atlas.close(&pages);
+    pages = image.atlas.open(128, 128, image.R8, 2);
+    // Forty glyphs of one size and step: each in its place, those on the
+    // second row of the page too, as the rasterizer draws them.
+    let is atlas.Cache as c with mut = atlas.open(&pages, &ras, &p, 256, 1, 1);
+    let is i64 as k with mut = 0;
+    let is i32 as all with mut = 1;
+    while (k < 40) {
+        let is i64 as gid = sfnt.cmap.glyph(r.face, 65 + k);
+        if (atlas.get(&c, r, 1, 16.0, gid, 3.0, 40.0, &got) != atlas.PLACED) { all = 0; }
+        if (same_as_drawn(r, gid, 16.0, 0.0, 0.0, &got, 3, 40) == 0) { all = 0; }
+        k = k + 1;
+    }
+    check("forty glyphs of one size", all);
+    check("drawn once each", c.drawn == 40);
+    // Every one found again.
+    k = 0;
+    while (k < 40) {
+        atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 65 + k), 3.0, 40.0, &got);
+        k = k + 1;
+    }
+    check("found again, all forty", c.drawn == 40);
+    // Large enough to take the second page.
+    let is i64 as w = sfnt.cmap.glyph(r.face, 87);
+    check("on the second page", atlas.get(&c, r, 1, 130.0, w, 0.0, 0.0, &got) == atlas.PLACED && got.page == 1
+          && same_as_drawn(r, w, 130.0, 0.0, 0.0, &got, 0, 0) == 1);
+    // Steps given as none: whole pixels.
+    let is atlas.Cache as whole with mut = atlas.open(&pages, &ras, &p, 64, 0, 0);
+    check("no steps: whole pixels", atlas.get(&whole, r, 1, 16.0, w, 10.3, 20.6, &got) == atlas.PLACED
+          && same_as_drawn(r, w, 16.0, 0.0, 0.0, &got, 10, 21) == 1);
+    atlas.close(&whole);
+    // Down steps are part of what a glyph is.
+    let is atlas.Cache as tall with mut = atlas.open(&pages, &ras, &p, 64, 1, 2);
+    atlas.get(&tall, r, 1, 16.0, w, 0.0, 20.0, &got);
+    atlas.get(&tall, r, 1, 16.0, w, 0.0, 20.5, &got);
+    check("a half pixel down, drawn again", tall.drawn == 2 && same_as_drawn(r, w, 16.0, 0.0, 0.5, &got, 0, 20) == 1);
+    atlas.close(&tall);
+    // Too large to be any bitmap: never.
+    check("too large to bound", atlas.get(&c, r, 1, 1.0e12, w, 0.0, 0.0, &got) == atlas.NEVER);
+    atlas.close(&c);
+    // A rasterizer smaller than the glyph, though a page holds it: never.
+    let is raster.Raster as tiny with mut = raster.open(8, 8);
+    c = atlas.open(&pages, &tiny, &p, 64, 1, 1);
+    check("larger than the rasterizer", atlas.get(&c, r, 1, 40.0, w, 0.0, 0.0, &got) == atlas.NEVER);
+    check("and remembered so", atlas.get(&c, r, 1, 40.0, w, 0.0, 0.0, &got) == atlas.NEVER && c.drawn == 1);
+    atlas.close(&c);
+    raster.close(&tiny);
+    // In a table of sixteen every place is looked at: two fonts, one glyph,
+    // two drawings.
+    c = atlas.open(&pages, &ras, &p, 16, 1, 1);
+    atlas.get(&c, r, 1, 16.0, w, 0.0, 0.0, &got);
+    atlas.get(&c, r, 2, 16.0, w, 0.0, 0.0, &got);
+    check("two fonts, two drawings", c.drawn == 2);
+    atlas.close(&c);
+
+    // A font of 2048 units an em.
+    let is *u8 as kd = load("text/testdata/kern.ttf");
+    let is sfnt.table.Face as kf = sfnt.open(kd, loaded, 0);
+    let is outline.Reader as kr with mut = outline.open(&kf);
+    c = atlas.open(&pages, &ras, &p, 64, 1, 1);
+    let is i64 as ka = sfnt.cmap.glyph(&kf, 97);
+    check("2048 units an em", atlas.get(&c, &kr, 3, 20.0, ka, 0.0, 0.0, &got) == atlas.PLACED
+          && same_as_drawn(&kr, ka, 20.0, 0.0, 0.0, &got, 0, 0) == 1);
+    atlas.close(&c);
+    outline.close(&kr);
+
+    // A CFF glyph that is one vertical line: no width, nothing to draw.
+    let is *u8 as cd = load("text/testdata/cff.otf");
+    let is sfnt.table.Face as cf = sfnt.open(cd, loaded, 0);
+    let is outline.Reader as cr with mut = outline.open(&cf);
+    let is [7]u8 as line;
+    line[0] = 139; line[1] = 139; line[2] = 21;   // 0 0 rmoveto
+    line[3] = 139; line[4] = 239; line[5] = 5;    // 0 100 rlineto
+    line[6] = 14;                                 // endchar
+    charstring(&cf, &cr, 5, cast(*u8, &line), 7);
+    c = atlas.open(&pages, &ras, &p, 64, 1, 1);
+    check("a line of no width", atlas.get(&c, &cr, 4, 16.0, 5, 0.0, 0.0, &got) == atlas.PLACED && got.w == 0);
+    atlas.close(&c);
+    outline.close(&cr);
+
+    // An empty glyph outlives its page; a glyph found keeps its page this
+    // frame.
+    image.atlas.close(&pages);
+    pages = image.atlas.open(24, 32, image.R8, 1);
+    c = atlas.open(&pages, &ras, &p, 64, 1, 1);
+    let is i64 as a = sfnt.cmap.glyph(r.face, 97);
+    let is i64 as g = sfnt.cmap.glyph(r.face, 103);
+    let is i64 as space = sfnt.cmap.glyph(r.face, 32);
+    atlas.get(&c, r, 1, 16.0, space, 0.0, 0.0, &got);
+    atlas.get(&c, r, 1, 16.0, a, 0.0, 0.0, &got);
+    atlas.get(&c, r, 1, 16.0, g, 0.0, 0.0, &got);
+    atlas.next_frame(&c);
+    check("found, its page kept", atlas.get(&c, r, 1, 16.0, a, 0.0, 0.0, &got) == atlas.PLACED);
+    check("so no page to take back", atlas.get(&c, r, 1, 30.0, g, 0.0, 0.0, &got) == atlas.NO_ROOM);
+    atlas.next_frame(&c);
+    check("the next frame, taken", atlas.get(&c, r, 1, 30.0, g, 0.0, 0.0, &got) == atlas.PLACED);
+    let is i64 as before with mut = c.drawn;
+    check("the space not drawn again", atlas.get(&c, r, 1, 16.0, space, 0.0, 0.0, &got) == atlas.PLACED
+          && c.drawn == before);
+    atlas.close(&c);
+    image.atlas.close(&pages);
+
+    // Colour: a cache over RGBA pages, bitmaps put there by their maker.
+    let is image.atlas.Atlas as colour with mut = image.atlas.open(64, 64, image.RGBA8, 1);
+    let is atlas.Cache as cc with mut = atlas.open(&colour, &ras, &p, 16, 4, 1);
+    check("not there yet", atlas.find(&cc, 7, 20.0, 9, 10.3, 0.0, &got) == atlas.MISSING);
+    check("a place for 3 by 2", atlas.put(&cc, 7, 20.0, 9, 10.3, 0.0, 1, 0 - 15, 3, 2, &got) == atlas.PLACED
+          && got.w == 3 && got.h == 2 && got.x == 11 && got.y == 0 - 15);
+    let is *image.buffer.Image as cp = image.atlas.page(&colour, got.page);
+    *cast(*u8, cast(i64, cp.pixels) + got.sy * cp.stride + got.sx * 4) = 200;
+    let is atlas.Placed as found;
+    check("found", atlas.find(&cc, 7, 20.0, 9, 30.2, 5.0, &found) == atlas.PLACED && found.sx == got.sx
+          && found.sy == got.sy && found.x == 31 && found.y == 0 - 10 && found.w == 3);
+    check("its pixel", *cast(*u8, cast(i64, cp.pixels) + found.sy * cp.stride + found.sx * 4) == 200);
+    check("another step: not there", atlas.find(&cc, 7, 20.0, 9, 10.6, 0.0, &got) == atlas.MISSING);
+    check("put again: replaced", atlas.put(&cc, 7, 20.0, 9, 10.3, 0.0, 0, 0, 5, 5, &got) == atlas.PLACED
+          && atlas.find(&cc, 7, 20.0, 9, 10.3, 0.0, &found) == atlas.PLACED && found.w == 5);
+    check("nothing to draw", atlas.put(&cc, 7, 20.0, 10, 0.0, 0.0, 0, 0, 0, 4, &got) == atlas.PLACED && got.w == 0
+          && atlas.find(&cc, 7, 20.0, 10, 0.0, 0.0, &found) == atlas.PLACED && found.w == 0);
+    check("nothing to draw, of no height", atlas.put(&cc, 7, 20.0, 14, 0.0, 0.0, 0, 0, 4, 0, &got) == atlas.PLACED
+          && got.h == 0 && atlas.find(&cc, 7, 20.0, 14, 0.0, 0.0, &found) == atlas.PLACED);
+    check("put again, as nothing", atlas.put(&cc, 7, 20.0, 9, 10.3, 0.0, 0, 0, 0, 0, &got) == atlas.PLACED
+          && atlas.find(&cc, 7, 20.0, 9, 10.3, 0.0, &found) == atlas.PLACED && found.w == 0 && found.h == 0);
+    check("refused after being put", atlas.put(&cc, 7, 20.0, 15, 0.0, 0.0, 0, 0, 2, 2, &got) == atlas.PLACED
+          && atlas.refuse(&cc, 7, 20.0, 15, 0.0, 0.0) == 1 && atlas.find(&cc, 7, 20.0, 15, 0.0, 0.0, &got) == atlas.NEVER);
+    check("larger than a page", atlas.put(&cc, 7, 20.0, 11, 0.0, 0.0, 0, 0, 65, 4, &got) == atlas.NEVER
+          && atlas.find(&cc, 7, 20.0, 11, 0.0, 0.0, &got) == atlas.NEVER);
+    check("refused", atlas.refuse(&cc, 7, 20.0, 12, 0.0, 0.0) == 1
+          && atlas.find(&cc, 7, 20.0, 12, 0.0, 0.0, &got) == atlas.NEVER);
+    check("an outline into colour: never", atlas.get(&cc, r, 1, 16.0, a, 0.0, 0.0, &got) == atlas.NEVER);
+    check("no room this frame", atlas.put(&cc, 7, 20.0, 13, 0.0, 0.0, 0, 0, 64, 64, &got) == atlas.NO_ROOM
+          && atlas.find(&cc, 7, 20.0, 13, 0.0, 0.0, &got) == atlas.MISSING);
+    atlas.close(&cc);
+    // A table of no entries: nothing put, nothing refused.
+    cc = atlas.open(&colour, &ras, &p, 0, 1, 1);
+    check("no table: no place", atlas.put(&cc, 7, 20.0, 9, 0.0, 0.0, 0, 0, 1, 1, &got) == atlas.NO_ROOM
+          && atlas.refuse(&cc, 7, 20.0, 9, 0.0, 0.0) == 0 && atlas.find(&cc, 7, 20.0, 9, 0.0, 0.0, &got) == atlas.MISSING);
+    atlas.close(&cc);
+    image.atlas.close(&colour);
+
+    // A free place is taken before anything gives way: seven glyphs in a
+    // table of eight, then an eighth the next frame.
+    pages = image.atlas.open(128, 128, image.R8, 2);
+    c = atlas.open(&pages, &ras, &p, 8, 1, 1);
+    k = 0;
+    while (k < 7) {
+        atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 97 + k), 0.0, 0.0, &got);
+        k = k + 1;
+    }
+    atlas.next_frame(&c);
+    atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 120), 0.0, 0.0, &got);
+    before = c.drawn;
+    k = 0;
+    while (k < 7) {
+        atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 97 + k), 0.0, 0.0, &got);
+        k = k + 1;
+    }
+    check("the seven kept", c.drawn == before);
+    atlas.close(&c);
+    image.atlas.close(&pages);
+
+    // The least recently used gives way: eight glyphs used last in frames 0
+    // to 7, then a ninth, then a tenth.
+    pages = image.atlas.open(128, 128, image.R8, 2);
+    c = atlas.open(&pages, &ras, &p, 8, 1, 1);
+    k = 0;
+    while (k < 8) {
+        let is i64 as j with mut = k;
+        while (j < 8) {
+            atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 97 + j), 0.0, 0.0, &got);
+            j = j + 1;
+        }
+        atlas.next_frame(&c);
+        k = k + 1;
+    }
+    before = c.drawn;
+    atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 120), 0.0, 0.0, &got);
+    atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 121), 0.0, 0.0, &got);
+    check("two more drawn", c.drawn == before + 2);
+    atlas.next_frame(&c);
+    before = c.drawn;
+    k = 2;
+    while (k < 8) {
+        atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 97 + k), 0.0, 0.0, &got);
+        k = k + 1;
+    }
+    check("the six used most recently kept", c.drawn == before);
+    atlas.get(&c, r, 1, 16.0, sfnt.cmap.glyph(r.face, 97), 0.0, 0.0, &got);
+    check("the least recent gone", c.drawn == before + 1);
+    atlas.close(&c);
+}
+
+fn main() as i32 {
+    p = outline.path.open(65536);
+    ras = raster.open(512, 512);
+    scratch = mem.core.mmap_anon(512 * 512);
+    pages = image.atlas.open(128, 128, image.R8, 2);
+    let is *u8 as data = load("text/testdata/glyf.ttf");
+    let is sfnt.table.Face as face = sfnt.open(data, loaded, 0);
+    let is outline.Reader as r with mut = outline.open(&face);
+    let is i64 as a = sfnt.cmap.glyph(&face, 97);
+    let is i64 as g = sfnt.cmap.glyph(&face, 103);
+    let is i64 as space = sfnt.cmap.glyph(&face, 32);
+
+    let is atlas.Cache as c with mut = atlas.open(&pages, &ras, &p, 64, 4, 1);
+    check("a cache", atlas.ok(&c) == 1);
+    let is atlas.Placed as got;
+    // 'a' at 16 pixels, its pen at 10.3, 20: a quarter step past 10.
+    check("placed", atlas.get(&c, &r, 1, 16.0, a, 10.3, 20.0, &got) == atlas.PLACED);
+    check("as the rasterizer draws it a quarter right", same_as_drawn(&r, a, 16.0, 0.25, 0.0, &got, 10, 20) == 1);
+    check("drawn once", c.drawn == 1);
+    // Found again, wherever its pen is in the same step.
+    let is atlas.Placed as again;
+    check("found again", atlas.get(&c, &r, 1, 16.0, a, 30.2, 5.0, &again) == atlas.PLACED);
+    check("not drawn again", c.drawn == 1 && again.page == got.page && again.sx == got.sx && again.sy == got.sy);
+    check("moved with the pen", again.x == got.x + 20 && again.y == got.y - 15 && again.w == got.w);
+    // Another step, size, glyph or font: another drawing.
+    check("half a pixel", atlas.get(&c, &r, 1, 16.0, a, 10.5, 20.0, &got) == atlas.PLACED && c.drawn == 2);
+    check("the half step's", same_as_drawn(&r, a, 16.0, 0.5, 0.0, &got, 10, 20) == 1);
+    check("a whole pixel up: the next pixel, step 0", atlas.get(&c, &r, 1, 16.0, a, 10.9, 20.0, &got) == atlas.PLACED
+          && c.drawn == 3 && same_as_drawn(&r, a, 16.0, 0.0, 0.0, &got, 11, 20) == 1);
+    check("another size", atlas.get(&c, &r, 1, 24.5, a, 0.0, 30.0, &got) == atlas.PLACED && c.drawn == 4
+          && same_as_drawn(&r, a, 24.5, 0.0, 0.0, &got, 0, 30) == 1);
+    check("another glyph", atlas.get(&c, &r, 1, 16.0, g, 0.0, 30.0, &got) == atlas.PLACED && c.drawn == 5
+          && same_as_drawn(&r, g, 16.0, 0.0, 0.0, &got, 0, 30) == 1);
+    check("another font", atlas.get(&c, &r, 2, 16.0, a, 10.3, 20.0, &got) == atlas.PLACED && c.drawn == 6);
+    // A space has nothing to draw: placed, empty, and remembered.
+    check("a space", atlas.get(&c, &r, 1, 16.0, space, 0.0, 0.0, &got) == atlas.PLACED && got.w == 0 && got.h == 0);
+    check("a space, remembered", atlas.get(&c, &r, 1, 16.0, space, 5.0, 0.0, &got) == atlas.PLACED && c.drawn == 7);
+    // A glyph past the font's: never, and remembered so.
+    check("no such glyph", atlas.get(&c, &r, 1, 16.0, 60000, 0.0, 0.0, &got) == atlas.NEVER);
+    check("no such glyph, remembered", atlas.get(&c, &r, 1, 16.0, 60000, 0.0, 0.0, &got) == atlas.NEVER && c.drawn == 8);
+    // Larger than a page: never.
+    check("larger than a page", atlas.get(&c, &r, 1, 400.0, g, 0.0, 0.0, &got) == atlas.NEVER);
+    // Vertical steps: two a pixel.
+    let is atlas.Cache as tall with mut = atlas.open(&pages, &ras, &p, 64, 1, 2);
+    check("half a pixel down", atlas.get(&tall, &r, 1, 16.0, a, 10.3, 20.5, &got) == atlas.PLACED
+          && same_as_drawn(&r, a, 16.0, 0.0, 0.5, &got, 10, 20) == 1);
+    atlas.close(&tall);
+    atlas.close(&c);
+
+    // Pages taken back take their glyphs with them.
+    image.atlas.close(&pages);
+    // A page of 24 by 32: 'a' at 16 pixels is 8 by 10, 'g' 9 by 13, and 'g'
+    // at 30 pixels 15 by 25, which fits the page alone but not beside them.
+    pages = image.atlas.open(24, 32, image.R8, 1);
+    c = atlas.open(&pages, &ras, &p, 64, 1, 1);
+    check("on the only page", atlas.get(&c, &r, 1, 16.0, a, 0.0, 0.0, &got) == atlas.PLACED);
+    check("a second, beside it", atlas.get(&c, &r, 1, 16.0, g, 0.0, 0.0, &got) == atlas.PLACED);
+    check("a third: no room this frame", atlas.get(&c, &r, 1, 30.0, g, 0.0, 0.0, &got) == atlas.NO_ROOM);
+    atlas.next_frame(&c);
+    check("the next: the page taken back", atlas.get(&c, &r, 1, 30.0, g, 0.0, 0.0, &got) == atlas.PLACED
+          && got.sx == 0 && got.sy == 0);
+    let is i64 as before with mut = c.drawn;
+    check("and the first drawn again, beside it", atlas.get(&c, &r, 1, 16.0, a, 0.0, 0.0, &got) == atlas.PLACED
+          && c.drawn == before + 1 && got.sx == 15 && same_as_drawn(&r, a, 16.0, 0.0, 0.0, &got, 0, 0) == 1);
+    atlas.close(&c);
+    image.atlas.close(&pages);
+
+    // A table of four: full of glyphs in use, a fifth waits; the next frame,
+    // the least recently used gives way.
+    pages = image.atlas.open(128, 128, image.R8, 2);
+    c = atlas.open(&pages, &ras, &p, 4, 1, 1);
+    let is i64 as k with mut = 0;
+    let is i32 as all with mut = 1;
+    while (k < 4) {
+        if (atlas.get(&c, &r, 1, 8.0 + cast(f64, k), a, 0.0, 0.0, &got) != atlas.PLACED) { all = 0; }
+        k = k + 1;
+    }
+    check("four in a table of four", all);
+    check("a fifth: no room", atlas.get(&c, &r, 1, 20.0, a, 0.0, 0.0, &got) == atlas.NO_ROOM);
+    atlas.next_frame(&c);
+    atlas.get(&c, &r, 1, 9.0, a, 0.0, 0.0, &got);
+    atlas.get(&c, &r, 1, 10.0, a, 0.0, 0.0, &got);
+    atlas.get(&c, &r, 1, 11.0, a, 0.0, 0.0, &got);
+    before = c.drawn;
+    check("next frame: room", atlas.get(&c, &r, 1, 20.0, a, 0.0, 0.0, &got) == atlas.PLACED && c.drawn == before + 1);
+    check("the one not used gave way", atlas.get(&c, &r, 1, 8.0, a, 0.0, 0.0, &got) == atlas.NO_ROOM);
+    check("the others kept", atlas.get(&c, &r, 1, 11.0, a, 0.0, 0.0, &got) == atlas.PLACED && c.drawn == before + 1);
+    atlas.close(&c);
+    // A table of no entries is none, and places nothing.
+    c = atlas.open(&pages, &ras, &p, 0, 1, 1);
+    check("no entries", atlas.ok(&c) == 0 && atlas.get(&c, &r, 1, 16.0, a, 0.0, 0.0, &got) == atlas.NO_ROOM);
+    atlas.close(&c);
+    more(&r);
+
+    if (fails > 0) {
+        io.printf("glyph atlas: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("glyph atlas: all checks passed\n");
+    return 0;
+}

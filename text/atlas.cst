@@ -1,0 +1,301 @@
+// text/atlas.cst — the glyph cache: each glyph rasterized once for a font,
+// a size and a subpixel step, kept on a page of image/'s atlas, and found
+// there again.
+//
+// A glyph is asked for with its pen position in pixels — y down, on the
+// baseline — which is put on a grid of steps a pixel (raster.subpixel): the
+// whole pixel moves the glyph, the step is part of what it is. Steps are the
+// cache's knob, set at open: four across and one down is what most text
+// wants, one and one is whole pixels.
+//
+// The font is a number the caller gives each face at each instance of a
+// variable font: the cache cannot tell two instances of one face apart
+// otherwise. The size is the em in pixels, compared to the bit.
+//
+// The pages are borrowed — render/coverage.cst's, so that glyphs and filled
+// paths share them and their textures — as are the rasterizer and a path
+// to read outlines into. An entry lives as long as its page holds it: a page
+// taken back (image/atlas.cst) takes its glyphs, which are drawn again when
+// next asked for. The table is sized at open; when the places a glyph may go
+// are all taken, the least recently used gives way — never one used in the
+// frame being drawn, so that a glyph with no place is NO_ROOM, said. A glyph
+// with nothing to draw (a space) and one that cannot be drawn (unreadable, or
+// larger than a page) are remembered as such, and not tried every frame.
+//
+// get() rasterizes outlines, into pages of coverage (R8). Colour glyphs are
+// bitmaps of their own, kept in a cache over pages of RGBA8 apart from
+// coverage's: found with find(), given a place with put() and written there
+// by their maker, or remembered as undrawable with refuse().
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../image/image.cst" as image;
+use "outline/outline.cst" as outline;
+use "raster/raster.cst" as raster;
+
+let is i32 as PLACED  with imut = 1;
+let is i32 as NO_ROOM with imut = 0;
+let is i32 as NEVER   with imut = 0 - 1;
+
+// How many places a glyph may take in the table, from where its key hashes.
+let is i64 as PROBES with imut = 16;
+
+// A glyph placed: where it is on its page, and where it goes on the target,
+// its top left in pixels.
+struct Placed {
+    page as i64;
+    sx   as i64;
+    sy   as i64;
+    w    as i64;
+    h    as i64;
+    x    as i64;
+    y    as i64;
+}
+
+// One glyph remembered. state: 0 unused, PLACED, or NEVER.
+struct Entry {
+    font  as i64;
+    size  as i64;   // the size's bits
+    glyph as i64;
+    step  as i64;   // across, and down times 65536
+    state as i64;
+    last  as i64;   // the frame it was last used in
+    slot  as image.atlas.Slot;
+    left  as i64;   // the box, from the whole pixel the pen is in
+    top   as i64;
+    w     as i64;
+    h     as i64;
+}
+
+struct Cache {
+    pages   as *image.atlas.Atlas;
+    raster  as *raster.Raster;
+    path    as *outline.path.Path;
+    entries as *Entry;
+    cap     as i64;
+    xsteps  as i64;
+    ysteps  as i64;
+    frame   as i64;
+    drawn   as i64;   // glyphs not found, and so read and drawn
+}
+
+fn open(pages as *image.atlas.Atlas, r as *raster.Raster, p as *outline.path.Path, entries as i64,
+        xsteps as i64, ysteps as i64) as Cache {
+    let is Cache as c;
+    c.pages = pages;
+    c.raster = r;
+    c.path = p;
+    c.cap = entries;
+    // Fewer than one step is one: whole pixels.
+    c.xsteps = xsteps;
+    c.ysteps = ysteps;
+    if (c.xsteps < 1) { c.xsteps = 1; }
+    if (c.ysteps < 1) { c.ysteps = 1; }
+    c.frame = 0;
+    c.drawn = 0;
+    // Of no entries, the mapping fails, and the cache is none.
+    c.entries = cast(*Entry, mem.core.mmap_anon(entries * sizeof(Entry)));
+    if (cast(i64, c.entries) == 0) { c.cap = 0; }
+    return c;
+}
+
+fn ok(c as *Cache) as i32 {
+    if (c.cap > 0) { return 1; }
+    return 0;
+}
+
+fn close(c as *Cache) as void {
+    if (cast(i64, c.entries) != 0) { mem.core.munmap(cast(*u8, c.entries), c.cap * sizeof(Entry)); }
+    c.entries = cast(*Entry, 0);
+    c.cap = 0;
+}
+
+// A new frame, for the cache and its pages.
+fn next_frame(c as *Cache) as void {
+    c.frame = c.frame + 1;
+    image.atlas.next_frame(c.pages);
+}
+
+fn _entry(c as *Cache, i as i64) as *Entry {
+    return cast(*Entry, cast(i64, c.entries) + i * sizeof(Entry));
+}
+
+fn _hash(font as i64, size as i64, glyph as i64, step as i64) as i64 {
+    let is i64 as h with mut = font * 31 + size;
+    h = h * 1000003 + glyph;
+    h = h * 1000003 + step;
+    h = h ^ (h >> 29);
+    h = h * 6364136223846793005;
+    // Never negative: the shift is arithmetic, so a negative h is xored with
+    // ones in its top half, its sign bit among them.
+    return h ^ (h >> 32);
+}
+
+fn _place(c as *Cache, e as *Entry, wx as i64, wy as i64, out as *Placed) as void {
+    out.page = e.slot.page;
+    out.sx = e.slot.x;
+    out.sy = e.slot.y;
+    out.w = e.w;
+    out.h = e.h;
+    out.x = wx + e.left;
+    out.y = wy + e.top;
+}
+
+// A key looked for: the pen on its grid, and where in the table.
+struct Look {
+    wx    as i64;   // the whole pixel the pen is in
+    wy    as i64;
+    sx    as i64;   // and its steps
+    sy    as i64;
+    step  as i64;
+    bits  as i64;
+    found as i64;   // the live entry with the key, or -1
+    place as i64;   // otherwise where a new one may go, or -1
+}
+
+fn _look(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f64, l as *Look) as void {
+    l.sx = raster.subpixel(x, c.xsteps, &l.wx);
+    l.sy = raster.subpixel(y, c.ysteps, &l.wy);
+    l.step = l.sx + l.sy * 65536;
+    l.bits = fm.f64_bits(size);
+    l.found = 0 - 1;
+    l.place = 0 - 1;
+    if (c.cap == 0) { return; }
+    // A table smaller than the probes is gone round more than once, which
+    // finds nothing new.
+    let is i64 as home = _hash(font, l.bits, glyph, l.step) % c.cap;
+    let is i64 as free with mut = 0 - 1;
+    let is i64 as oldest with mut = 0 - 1;
+    let is i64 as k with mut = 0;
+    while (k < PROBES) {
+        let is i64 as i = (home + k) % c.cap;
+        let is *Entry as e = _entry(c, i);
+        let is i32 as alive with mut = 0;
+        if (e.state == NEVER) { alive = 1; }
+        if (e.state == PLACED && (e.slot.page < 0 || image.atlas.valid(c.pages, &e.slot) == 1)) { alive = 1; }
+        if (alive == 1 && e.font == font && e.size == l.bits && e.glyph == glyph && e.step == l.step) {
+            l.found = i;
+            return;
+        }
+        if (alive == 0 && free < 0) { free = i; }   // the first: any would do
+        if (alive == 1 && e.last < c.frame && (oldest < 0 || e.last < _entry(c, oldest).last)) { oldest = i; }
+        k = k + 1;
+    }
+    l.place = free;
+    if (l.place < 0) { l.place = oldest; }
+}
+
+// A new entry for the key at the place found, its bitmap's box not yet
+// known.
+fn _claim(c as *Cache, l as *Look, font as i64, glyph as i64) as *Entry {
+    let is *Entry as e = _entry(c, l.place);
+    e.font = font;
+    e.size = l.bits;
+    e.glyph = glyph;
+    e.step = l.step;
+    e.last = c.frame;
+    e.state = NEVER;
+    e.w = 0;
+    e.h = 0;
+    e.left = 0;
+    e.top = 0;
+    e.slot.page = 0 - 1;
+    return e;
+}
+
+// Room on a page for the entry's w by h bitmap, at (left, top) from the
+// whole pixel the pen is in: PLACED, NO_ROOM — the entry given back — or
+// NEVER. Of no size, nothing is placed and nothing need be drawn.
+fn _room(c as *Cache, e as *Entry, left as i64, top as i64, w as i64, h as i64) as i32 {
+    e.left = left;
+    e.top = top;
+    if (w == 0 || h == 0) {
+        e.state = PLACED;
+        return PLACED;
+    }
+    let is i32 as got = image.atlas.alloc(c.pages, w, h, &e.slot);
+    if (got == image.atlas.NEVER) { return NEVER; }
+    if (got == image.atlas.NO_ROOM) {
+        e.state = 0;
+        return NO_ROOM;
+    }
+    e.w = w;
+    e.h = h;
+    e.state = PLACED;
+    return PLACED;
+}
+
+// The glyph at the pen as the cache has it: PLACED with *out, NEVER when it
+// is remembered as one that cannot be drawn, or MISSING.
+let is i32 as MISSING with imut = 2;
+
+fn find(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f64, out as *Placed) as i32 {
+    let is Look as l;
+    _look(c, font, size, glyph, x, y, &l);
+    if (l.found < 0) { return MISSING; }
+    let is *Entry as e = _entry(c, l.found);
+    e.last = c.frame;
+    if (e.state == NEVER) { return NEVER; }
+    if (e.slot.page >= 0) { image.atlas.touch(c.pages, &e.slot); }
+    _place(c, e, l.wx, l.wy, out);
+    return PLACED;
+}
+
+// A place for a bitmap of the glyph at the pen, w by h at (left, top) from
+// the whole pixel the pen is in, which the caller then writes on its page at
+// (out.sx, out.sy) — the way colour glyphs, which the rasterizer does not
+// draw, are kept. PLACED, NO_ROOM, or NEVER when larger than a page.
+fn put(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f64,
+       left as i64, top as i64, w as i64, h as i64, out as *Placed) as i32 {
+    let is Look as l;
+    _look(c, font, size, glyph, x, y, &l);
+    if (l.found >= 0) { l.place = l.found; }
+    if (l.place < 0) { return NO_ROOM; }
+    let is *Entry as e = _claim(c, &l, font, glyph);
+    let is i32 as got = _room(c, e, left, top, w, h);
+    if (got == PLACED) { _place(c, e, l.wx, l.wy, out); }
+    return got;
+}
+
+// The glyph at the pen remembered as one that cannot be drawn. 1, or 0 when
+// the table has no place for it this frame.
+fn refuse(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f64) as i32 {
+    let is Look as l;
+    _look(c, font, size, glyph, x, y, &l);
+    if (l.found >= 0) { l.place = l.found; }
+    if (l.place < 0) { return 0; }
+    _claim(c, &l, font, glyph);
+    return 1;
+}
+
+// Glyph glyph of font at size pixels an em, its pen at (x, y): found, or its
+// outline read and rasterized into the cache — whose pages must hold
+// coverage, R8. Placed into *out: PLACED — with nothing to draw when out.w or
+// out.h is 0 — NO_ROOM when neither the table nor the pages have a place for
+// it this frame, or NEVER when it cannot be drawn.
+fn get(c as *Cache, r as *outline.Reader, font as i64, size as f64, glyph as i64, x as f64, y as f64,
+       out as *Placed) as i32 {
+    let is Look as l;
+    _look(c, font, size, glyph, x, y, &l);
+    if (l.found >= 0) { return find(c, font, size, glyph, x, y, out); }
+    if (l.place < 0) { return NO_ROOM; }
+    let is *Entry as e = _claim(c, &l, font, glyph);
+    c.drawn = c.drawn + 1;
+    if (c.pages.format != image.R8) { return NEVER; }
+    if (outline.glyph(r, glyph, c.path) == 0) { return NEVER; }
+    let is raster.flatten.Transform as t = raster.glyph_transform(size / cast(f64, r.face.upem),
+        cast(f64, l.sx) / cast(f64, c.xsteps), cast(f64, l.sy) / cast(f64, c.ysteps));
+    let is raster.Box as b;
+    if (raster.bounds(c.path, &t, &b) == 0) { return NEVER; }
+    let is i32 as got = _room(c, e, b.left, b.top, b.w, b.h);
+    if (got != PLACED) { return got; }
+    if (e.w > 0) {
+        let is *image.buffer.Image as pg = image.atlas.page(c.pages, e.slot.page);
+        let is *u8 as at = cast(*u8, cast(i64, pg.pixels) + e.slot.y * pg.stride + e.slot.x);
+        if (raster.draw(c.raster, c.path, &t, &b, raster.NONZERO, at, pg.stride) == 0) {
+            e.state = NEVER;
+            return NEVER;
+        }
+    }
+    _place(c, e, l.wx, l.wy, out);
+    return PLACED;
+}

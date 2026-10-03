@@ -122,6 +122,17 @@ resolution and scales, which makes arbitrary size and rotation cheap and is how
 text in a 3D world is usually done. It costs sharpness at small sizes, so it
 complements the direct path rather than replacing it.
 
+What `atlas.cst` does: pages of `image/`'s atlas, borrowed — the same ones
+`render/coverage.cst` gives filled paths, so that one set of textures holds
+both — a table sized at open, and pages added until a number fixed at open,
+then the least recently used taken back whole. A glyph is keyed by a number
+the caller gives each face at each instance, its size to the bit, and its pen
+on a grid of steps a pixel, four across and one down unless told otherwise.
+Nothing used in the frame being drawn gives way, so a glyph with no place is
+`NO_ROOM`, said; a space is remembered as nothing to draw, an unreadable glyph
+as never. Colour glyphs are kept apart, on RGBA pages, written by their maker
+into the place the cache gives them.
+
 ---
 
 ## Fonts are chains, not files
@@ -155,7 +166,7 @@ answer while the layout is being built than afterwards.
 ## Order of work
 
 1. **`sfnt` and `outline`** — read a face, get a glyph's curves.
-2. **`raster` and `atlas`** — glyphs on screen at one size.
+2. **`raster` and `atlas`** — glyphs on screen at one size. Done.
 3. **Simple shaping and layout**, with caustic-unicode for breaking.
 4. **Caret and hit-testing**, which `ui/` blocks on.
 5. **`GSUB`/`GPOS`**, when a script that needs it does.
