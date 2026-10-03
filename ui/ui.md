@@ -30,7 +30,7 @@ ui/
   style.cst       the theme: colours, metrics, fonts, per-state variants
   system.cst      the desktop's settings, as the theme and the timings
   text.cst        one text service: runs laid out and drawn
-  a11y.cst        role, name and state per widget; the platform bridges
+  access.cst      role, name, states, value and actions per widget
   widgets/        label, button, check, radio, entry, slider, progress,
                   scroll, list, tree, table, menu, tabs, splitter, dialog
 
@@ -340,6 +340,14 @@ platform surface comparable to a window backend, so they are not first. The
 per-widget role, name and state are, because adding them afterwards means
 touching every widget.
 
+So a kind carries a role and an `access` entry from the first widget on
+(`access.cst`): asked, it fills in the widget's name and description, its
+states — checked, mixed, pressed, expanded, selected, read-only, required,
+busy — its value and range where it has one, and the actions it answers to,
+each of which a bridge can call through the same entry. Focusable, focused,
+enabled and visible come from the tree, not from the kind. A widget with no
+text of its own takes its name from the label that says `labelled_by` it.
+
 ---
 
 ## What it needs from the layers below
@@ -550,6 +558,17 @@ glyph cache or page, every face slot drawn from in this frame — is said, and
 drawn the next frame, when what was not used makes room. The test holds every
 pixel to what the rasterizer draws for each glyph alone, at scale 1 and 2, with
 the pen between pixels; colour glyphs to their palette's colours exactly.
+
+**Accessibility** (`access.cst`, tested by `access_test`): every kind has a
+role — forty-odd, close to AT-SPI's and UI Automation's — and an `access`
+entry. `access.describe` asks the entry for the name and description, the
+states, the value in its range and the actions the widget answers to, and lays
+over them what the tree and the router know: visible, showing, enabled,
+focusable, focused — those are theirs alone, whatever a kind says. The root is
+the window. `access.act` asks a widget to do one of its actions, with a value
+for setting one; one that is gone or disabled, or whose kind does not list the
+action, is not asked. The bridges to the platform come later and read nothing
+else.
 
 ## For scale
 
