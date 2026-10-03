@@ -19,11 +19,24 @@
 // backdrop; aligned in its rectangle across, centred down. It tells
 // assistive technology its text, and is the name of the widget it labels
 // (set_target).
+//
+// Selectable on request: it then keeps a text/layout Layout of its own beside
+// its run — the cursor's questions need everything a layout found — and its
+// text is selected by dragging, by words after a double click and by
+// paragraphs after a triple, extended with Shift, and by keyboard once it
+// has the focus; Ctrl+A selects all and Ctrl+C copies, and what the pointer
+// or Shift selects goes to the primary selection.
+use "std/mem.cst" as mem;
 use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/draw2d.cst" as draw2d;
 use "../../text/layout/model.cst" as model;
+use "../../text/layout/layout.cst" as tlayout;
+use "../../text/layout/cursor.cst" as cursor;
 use "../tree.cst" as tree;
 use "../widget.cst" as widget;
 use "../geom.cst" as geom;
+use "../event.cst" as event;
 use "../layout.cst" as layout;
 use "../painter.cst" as painter;
 use "../style.cst" as style;
@@ -71,10 +84,26 @@ struct Data {
     align    as i32;           // model.ALIGN_*
     mnemonic as i32;           // the byte its underlined letter starts at; -1 for none
     letter   as i32;           // that letter; 0 for none
+    sel      as *Sel;          // selectable: its layout and selection; null when not
     wrap     as i32;
     ellipsis as i32;
     known    as i32;           // the sizes are for the key
     _pad0    as i32;
+}
+
+// What a selectable label keeps besides: a mapping of its own, the size of
+// a text/layout Layout.
+struct Sel {
+    lay      as tlayout.Layout;
+    lstyles  as [16]model.Style;
+    anchor   as i64;              // where the selection began; the caret is its other end
+    caret    as cursor.Position;
+    want_x   as f64;              // the x moving up and down keeps; below 0 for none
+    unit_a   as i64;              // the word or paragraph the press chose
+    unit_b   as i64;
+    by       as i64;              // a drag extends by: 1 graphemes, 2 words, 3 paragraphs
+    pressing as i32;
+    laid     as i32;              // lay holds its text as last laid out
 }
 
 let is tree.Kind as _kind with mut;
@@ -90,6 +119,7 @@ fn _init() as void {
     _kind.measure = fn_ptr(_measure);
     _kind.arrange = fn_ptr(_arrange);
     _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
     _kind.role = access.ROLE_LABEL;
     _kind.access = fn_ptr(_access);
     _scratch = txt.run();
@@ -124,7 +154,24 @@ fn _data(t as *tree.Tree, w as i64) as *Data {
 
 fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
     let is *Data as d = cast(*Data, data);
+    _drop_sel(d);
     txt.run_close(&d.run);
+}
+
+fn _drop_sel(d as *Data) as void {
+    if (cast(i64, d.sel) == 0) { return; }
+    tlayout.close(&d.sel.lay);
+    mem.core.munmap(cast(*u8, d.sel), sizeof(Sel));
+    d.sel = cast(*Sel, 0);
+}
+
+// Nothing selected, the caret at the start.
+fn _unselect(d as *Data) as void {
+    if (cast(i64, d.sel) == 0) { return; }
+    d.sel.anchor = 0;
+    d.sel.caret = cursor.position(0, 0);
+    d.sel.want_x = 0.0 - 1.0;
+    d.sel.pressing = 0;
 }
 
 // Something it is laid out by changed: measured and drawn again.
@@ -142,6 +189,7 @@ fn set_text(t as *tree.Tree, w as i64, s as *u8, n as i64) as i32 {
     if (txt.set_text(&d.run, s, n) == 0) { return 0; }
     d.mnemonic = 0 - 1;
     d.letter = 0;
+    _unselect(d);
     _changed(t, w, d);
     return 1;
 }
@@ -195,6 +243,7 @@ fn set_text_mnemonic(t as *tree.Tree, w as i64, s as *u8, n as i64) as i32 {
     txt.set_length(&d.run, o);
     d.mnemonic = cast(i32, at);
     d.letter = cast(i32, letter);
+    _unselect(d);
     _changed(t, w, d);
     return 1;
 }
@@ -347,7 +396,9 @@ fn _lay(svc as *txt.Service, d as *Data, st as *txt.Style, width as f64) as i32 
     if (d.wrap == 0 && d.ellipsis == 1 && width >= 0.0) { pp.max_lines = 1; }
     d.laid_w = width;
     if (cast(i64, d.styles) == 0 || d.nstyles < 1) {
-        return txt.lay_text(svc, &d.run, st, 1, cast(*model.Span, 0), 0, &pp);
+        let is i32 as ok = txt.lay_text(svc, &d.run, st, 1, cast(*model.Span, 0), 0, &pp);
+        _lay_sel(svc, d, st, 1, cast(*model.Span, 0), 0, &pp);
+        return ok;
     }
     let is [16]txt.Style as sts;
     let is i64 as n with mut = cast(i64, d.nstyles);
@@ -360,7 +411,17 @@ fn _lay(svc as *txt.Service, d as *Data, st as *txt.Style, width as f64) as i32 
         if (cast(i64, sts[k].family) == 0) { sts[k].family = st.family; }
         k = k + 1;
     }
-    return txt.lay_text(svc, &d.run, cast(*txt.Style, &sts), n, d.spans, cast(i64, d.nspans), &pp);
+    let is i32 as ok = txt.lay_text(svc, &d.run, cast(*txt.Style, &sts), n, d.spans, cast(i64, d.nspans), &pp);
+    _lay_sel(svc, d, cast(*txt.Style, &sts), n, d.spans, cast(i64, d.nspans), &pp);
+    return ok;
+}
+
+// A selectable label's own layout, laid out as its run just was.
+fn _lay_sel(svc as *txt.Service, d as *Data, styles as *txt.Style, n as i64, spans as *model.Span, nspans as i64,
+            pp as *model.Params) as void {
+    if (cast(i64, d.sel) == 0) { return; }
+    d.sel.laid = txt.lay_layout(svc, &d.sel.lay, cast(*model.Style, &d.sel.lstyles), txt.text_of(&d.run),
+                                txt.text_length(&d.run), styles, n, spans, nspans, pp);
 }
 
 // Its sizes in style st, found when the style changed: its text's own width
@@ -435,6 +496,26 @@ fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as voi
 
 // --- Drawing ---
 
+// Where its text is drawn in its rectangle, from its left and its top: for
+// what is laid over it, a caret or an input method's window.
+fn text_left(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return _left(t, w, d, layout.rect(t, w).w);
+}
+
+fn text_top(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return _top(d, layout.rect(t, w).h);
+}
+
+// How far down its rectangle, h tall, its text starts: centred.
+fn _top(d as *Data, h as f64) as f64 {
+    if (h > d.run.height) { return (h - d.run.height) / 2.0; }
+    return 0.0;
+}
+
 fn _tone(th as *style.Theme, tone as i32) as math.color.Color {
     if (tone == DIM) { return th.palette.fg_dim; }
     if (tone == ACCENT) { return th.palette.accent; }
@@ -474,9 +555,28 @@ fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void
         col = style.with_alpha(col, col.a * 0.6);
     }
     let is f64 as x = p.rect.x + _left(t, w, d, p.rect.w);
-    let is f64 as y with mut = p.rect.y;
-    if (p.rect.h > d.run.height) { y = y + (p.rect.h - d.run.height) / 2.0; }
+    let is f64 as y = p.rect.y + _top(d, p.rect.h);
+    // The selection's background behind the text, its text in the
+    // selection's colour over it.
+    let is [32]cursor.Rect as rs;
+    let is i64 as nr with mut = 0;
+    if (cast(i64, d.sel) != 0 && d.sel.laid == 1 && d.sel.anchor != d.sel.caret.offset) {
+        nr = cursor.selection(&d.sel.lay, d.sel.anchor, d.sel.caret.offset, cast(*cursor.Rect, &rs), 32);
+        if (nr > 32) { nr = 32; }
+    }
+    let is i64 as i with mut = 0;
+    while (i < nr) {
+        shapes.fill_rect(p.canvas, x + rs[i].x, y + rs[i].y, rs[i].w, rs[i].h, p.theme.palette.selection_bg);
+        i = i + 1;
+    }
     txt.draw(svc, p.canvas, &d.run, x, y, col);
+    i = 0;
+    while (i < nr) {
+        draw2d.push_clip(p.canvas, x + rs[i].x, y + rs[i].y, rs[i].w, rs[i].h);
+        txt.draw(svc, p.canvas, &d.run, x, y, p.theme.palette.selection_fg);
+        draw2d.pop_clip(p.canvas);
+        i = i + 1;
+    }
     let is txt.Deco as u;
     if (d.mnemonic >= 0 && painter.has(p, painter.S_MNEMONICS) == 1 &&
         txt.underline_at(&d.run, cast(i64, d.mnemonic), &u) == 1) {
@@ -491,5 +591,235 @@ fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
     if (q.action != access.ASK) { return 0; }
     access.set_name(q, txt.text_of(&d.run), txt.text_length(&d.run));
     if (d.wrap == 1) { q.states = q.states | access.MULTI_LINE; }
+    if (cast(i64, d.sel) != 0) { q.states = q.states | access.SELECTABLE; }
+    return 1;
+}
+
+// --- Selecting ---
+
+// Selectable or not: 1, or 0 when memory is refused or w is no label. A
+// selectable label takes the focus, from the keyboard as from a press.
+fn set_selectable(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    if (on == 1 && cast(i64, d.sel) == 0) {
+        let is *Sel as s = cast(*Sel, mem.core.mmap_anon(sizeof(Sel)));
+        if (cast(i64, s) <= 0) { return 0; }
+        tlayout.open(&s.lay);
+        d.sel = s;
+        _unselect(d);
+    }
+    if (on == 0) { _drop_sel(d); }
+    tree.set_focusable(t, w, on);
+    _changed(t, w, d);
+    return 1;
+}
+
+// The selection: where it began and where the caret is, either way round;
+// 1 when it is not empty. Both 0 for a label that is not selectable.
+fn selection(t as *tree.Tree, w as i64, a as *i64, b as *i64) as i32 {
+    let is *Data as d = _data(t, w);
+    *a = 0;
+    *b = 0;
+    if (cast(i64, d) == 0 || cast(i64, d.sel) == 0) { return 0; }
+    *a = d.sel.anchor;
+    *b = d.sel.caret.offset;
+    return cast(i32, *a != *b);
+}
+
+fn _clamp(d as *Data, v as i64) as i64 {
+    if (v < 0) { return 0; }
+    if (v > txt.text_length(&d.run)) { return txt.text_length(&d.run); }
+    return v;
+}
+
+// Selects a .. b, held to the text; nothing for a label that is not
+// selectable.
+fn select(t as *tree.Tree, w as i64, a as i64, b as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || cast(i64, d.sel) == 0) { return; }
+    d.sel.anchor = _clamp(d, a);
+    d.sel.caret = cursor.position(_clamp(d, b), 0);
+    d.sel.want_x = 0.0 - 1.0;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// What is selected, to which of the program's places.
+fn _copy(t as *tree.Tree, d as *Data, which as i32) as void {
+    let is i64 as a with mut = d.sel.anchor;
+    let is i64 as b with mut = d.sel.caret.offset;
+    if (b < a) {
+        a = d.sel.caret.offset;
+        b = d.sel.anchor;
+    }
+    if (a == b) { return; }
+    tree.copy(t, which, cast(*u8, cast(i64, txt.text_of(&d.run)) + a), b - a);
+}
+
+// The paragraph around offset o: from the end of the separator before it to
+// the start of the one after.
+fn _paragraph(d as *Data, o as i64, a as *i64, b as *i64) as void {
+    let is *u8 as p = txt.text_of(&d.run);
+    let is i64 as n = txt.text_length(&d.run);
+    *a = 0;
+    let is i64 as i with mut = o - 1;
+    while (i >= 0) {
+        let is i64 as k = _separator(p, i, n);
+        if (k > 0 && i + k <= o) {
+            *a = i + k;
+            i = 0;
+        }
+        i = i - 1;
+    }
+    i = o;
+    while (i < n && _separator(p, i, n) == 0) { i = i + 1; }
+    *b = i;
+}
+
+// The length of the paragraph separator that starts at byte i — a line feed,
+// a carriage return, U+0085 or U+2029 — or 0.
+fn _separator(p as *u8, i as i64, n as i64) as i64 {
+    let is i64 as c = cast(i64, p[i]);
+    if (c == 10 || c == 13) { return 1; }
+    if (c == 194 && i + 1 < n && cast(i64, p[i + 1]) == 133) { return 2; }
+    if (c == 226 && i + 2 < n && cast(i64, p[i + 1]) == 128 && cast(i64, p[i + 2]) == 169) { return 3; }
+    return 0;
+}
+
+// The word, or the paragraph, at offset o.
+fn _unit(d as *Data, by as i64, o as i64, a as *i64, b as *i64) as void {
+    if (by == 3) {
+        _paragraph(d, o, a, b);
+        return;
+    }
+    *b = cursor.next_word(&d.sel.lay, o);
+    *a = cursor.prev_word(&d.sel.lay, *b);
+    if (*a > o) { *a = o; }
+}
+
+// Where the pointer is, in the text, for an event at local x, y of w.
+fn _hit(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as cursor.Position {
+    let is math.rect.Rect as r = layout.rect(t, w);
+    return cursor.hit(&d.sel.lay, e.local_x - _left(t, w, d, r.w), e.local_y - _top(d, r.h));
+}
+
+// The selection carried on to p by the press's unit: from the unit's far
+// side, round the unit at p.
+fn _extend(d as *Data, p as cursor.Position) as void {
+    let is *Sel as s = d.sel;
+    if (s.by == 1) {
+        s.caret = p;
+        return;
+    }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    _unit(d, s.by, p.offset, &a, &b);
+    if (a < s.unit_a) {
+        s.anchor = s.unit_b;
+        s.caret = cursor.position(a, 0);
+    } else {
+        s.anchor = s.unit_a;
+        if (b < s.unit_b) { b = s.unit_b; }
+        s.caret = cursor.position(b, 0);
+    }
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    let is *Sel as s = d.sel;
+    if (cast(i64, s) == 0 || s.laid == 0) { return 0; }
+    if (e.kind == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        let is cursor.Position as p = _hit(t, w, d, e);
+        s.want_x = 0.0 - 1.0;
+        s.by = 1;
+        if (e.clicks >= 2) {
+            s.by = 3;
+            if (e.clicks == 2) { s.by = 2; }
+            _unit(d, s.by, p.offset, &s.unit_a, &s.unit_b);
+            s.anchor = s.unit_a;
+            s.caret = cursor.position(s.unit_b, 0);
+        } else if ((e.mods & keys.MOD_SHIFT) != 0) {
+            s.caret = p;
+        } else {
+            s.anchor = p.offset;
+            s.caret = p;
+        }
+        s.pressing = 1;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (e.kind == event.POINTER_MOVE) {
+        if (s.pressing == 0) { return 0; }
+        _extend(d, _hit(t, w, d, e));
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP || e.kind == event.POINTER_CANCEL) {
+        if (s.pressing == 0) { return 0; }
+        s.pressing = 0;
+        if (e.kind == event.POINTER_UP) { _copy(t, d, tree.PRIMARY); }
+        return 1;
+    }
+    if (e.kind == event.KEY_DOWN) { return _key(t, w, d, e); }
+    if (e.kind == event.SHORTCUT_OVERRIDE) {
+        // Before the window's shortcuts: Ctrl+A, and Ctrl+C with something
+        // to copy.
+        let is i32 as k with mut = e.key;
+        if (k >= 65 && k <= 90) { k = k + 32; }
+        if ((e.mods & keys.MOD_CONTROL) == 0) { return 0; }
+        if (k == keys.A) { return 1; }
+        if (k == keys.C && s.anchor != s.caret.offset) { return 1; }
+    }
+    return 0;
+}
+
+fn _key(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    let is *Sel as s = d.sel;
+    let is *tlayout.Layout as l = &s.lay;
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    let is i32 as shift = cast(i32, (e.mods & keys.MOD_SHIFT) != 0);
+    let is i32 as k with mut = e.key;
+    if (k >= 65 && k <= 90) { k = k + 32; }
+    if (ctrl == 1 && k == keys.A) {
+        s.anchor = 0;
+        s.caret = cursor.position(txt.text_length(&d.run), 0);
+        _copy(t, d, tree.PRIMARY);
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (ctrl == 1 && k == keys.C) {
+        _copy(t, d, tree.CLIPBOARD);
+        return 1;
+    }
+    let is cursor.Position as at = s.caret;
+    let is cursor.Position as to with mut = at;
+    let is i32 as vertical with mut = 0;
+    let is i64 as li = cursor.line_of(l, at);
+    if (k == keys.LEFT) {
+        if (ctrl == 1) { to = cursor.position(cursor.prev_word(l, at.offset), 0); }
+        else { to = cursor.left(l, at); }
+    } else if (k == keys.RIGHT) {
+        if (ctrl == 1) { to = cursor.position(cursor.next_word(l, at.offset), 0); }
+        else { to = cursor.right(l, at); }
+    } else if (k == keys.UP || k == keys.DOWN) {
+        if (s.want_x < 0.0) { s.want_x = cursor.caret(l, at).x; }
+        if (k == keys.UP) { to = cursor.up(l, at, s.want_x); }
+        else { to = cursor.down(l, at, s.want_x); }
+        vertical = 1;
+    } else if (k == keys.HOME) {
+        to = cursor.position(tlayout.line(l, li).start, 0);
+        if (ctrl == 1) { to = cursor.position(0, 0); }
+    } else if (k == keys.END) {
+        to = cursor.position(tlayout.line(l, li).end, 1);
+        if (ctrl == 1) { to = cursor.position(txt.text_length(&d.run), 0); }
+    } else {
+        return 0;
+    }
+    if (vertical == 0) { s.want_x = 0.0 - 1.0; }
+    s.caret = to;
+    if (shift == 0) { s.anchor = to.offset; }
+    if (shift == 1) { _copy(t, d, tree.PRIMARY); }
+    widget.changed(t, w, widget.CHANGED_PAINT);
     return 1;
 }

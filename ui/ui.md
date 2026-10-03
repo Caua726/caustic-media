@@ -630,6 +630,13 @@ by its alignment in the widget's direction and centred down. Its text is its
 name to assistive technology, and the name of the widget it labels. A
 mnemonic (`_Save`; `__` for an underscore) underlines its letter while Alt is
 held; bound to the router, Alt and the letter focus what it labels.
+Selectable on request, it keeps a `text/layout` Layout of its own beside its
+run (`text.lay_layout`) for the cursor's questions: dragged across, by words
+after a double click and paragraphs after a triple, extended with Shift, and
+by keyboard once focused — arrows, words, lines keeping the x they began at,
+Home and End — with Ctrl+A and Ctrl+C claimed ahead of the window's
+shortcuts; what the pointer or Shift selects goes to the primary selection.
+The selection is drawn behind its text in the theme's selection colours.
 
 ## For scale
 
