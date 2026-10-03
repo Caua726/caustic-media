@@ -301,6 +301,9 @@ clip, with nested scissor, layers, an origin for painting into a texture,
 images straight or premultiplied, glyphs from a coverage atlas) and `shapes2d`
 (rectangles, rounded rectangles with per-corner radii and gradients, borders,
 circles, lines, convex polygons and soft shadows, anti-aliased by a one-pixel
-fringe and exact on whole pixels). `draw2d_test` checks them as pixels through
-a headless software device. `frame` and `queue` as separate modules are not
+fringe and exact on whole pixels; and any path, under any affine transform and
+either winding rule, filled by the text layer's rasterizer — exact area
+coverage — into `coverage`, an atlas of R8 pages that are textures, and drawn
+from there as a glyph is). `draw2d_test` checks them as pixels through a
+headless software device. `frame` and `queue` as separate modules are not
 there: a canvas is the 2D queue, and the frame is the caller's pass.
