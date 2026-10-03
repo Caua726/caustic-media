@@ -30,7 +30,9 @@ slow, that is a fact to state, not a feature to withhold.
   the same code fills a heap block, a static array, or a window's back buffer
 - Triangle fill with a depth buffer, back-face culling, bounding-box traversal
 - **Perspective-correct interpolation** — weights divided by w and renormalised
-- **Top-left fill rule**, so a shared edge is covered exactly once
+- **Top-left fill rule**, so a shared edge is covered exactly once — whichever
+  way each of the two triangles winds, as a fill and the anti-aliasing fringe
+  around it do
 - **Vertices on a 1/256-pixel grid** after projection, as GPUs rasterize in
   fixed point: whether a pixel centre lies inside a triangle does not depend on
   how a division by the target's width rounded, so a layer painted into a
@@ -41,8 +43,8 @@ slow, that is a fact to state, not a feature to withhold.
   coverage material for glyphs; partial texture uploads
 
 The tests check invariants rather than pixels: coverage against area, a seam
-covered once, the nearer surface winning either submission order, one winding
-surviving culling.
+covered once — by triangles wound the same way and wound opposite ways — the
+nearer surface winning either submission order, one winding surviving culling.
 
 `backend.cst` now wraps both in the device's shape, so the shape around it is no
 longer missing: buffers, textures with samplers, pipelines resolved to function
