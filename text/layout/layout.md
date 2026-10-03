@@ -49,6 +49,11 @@ between graphemes, and spaces at the end of a line hang past it. (Knuth and
 Plass's paragraph optimisation is what a document renderer needs, and can
 come later without disturbing the rest.)
 
+A word broken between graphemes is a last resort, so it does not make the
+text any narrower: the **least width** a layout reports is its widest stretch
+between two opportunities, the spaces before each left out — CSS's
+min-content, what a wrapping label can be given without breaking a word.
+
 A line ends where a break falls between two clusters the shaper said are
 **safe to break** between: the glyphs on each side stay as they were shaped.
 Where it is not safe — inside a kerned pair, a contextual form — each side is
@@ -116,7 +121,8 @@ not to assume horizontal.
 those faces and checks what layout promises: where lines break — before a
 width is passed, at opportunities, by graphemes when a word is too long and
 as many as fit, giving back a grapheme when a part shaped alone is wider, at
-paragraph ends; that each line's glyphs are the shaper's for that stretch,
+paragraph ends; the least width, the widest word of any paragraph whatever
+the width; that each line's glyphs are the shaper's for that stretch,
 features ranged per paragraph, an item that shapes to nothing; alignment of
 every glyph, line and decoration, justification of every space, the
 ellipsis in the style of what it follows, tabs at and between stops, line
@@ -150,7 +156,8 @@ ellipsis wider than the box.
 
 Text is itemized by paragraph, bidi level, script, face and style; broken at
 caustic-unicode's opportunities, by graphemes when a word is wider than the
-box, at most `max_lines` lines with an ellipsis; reshaped where a break falls
+box, at most `max_lines` lines with an ellipsis, its least width the widest
+stretch between opportunities; reshaped where a break falls
 inside what the shaper marked unsafe; reordered with bidi per line; aligned
 (start, end, left, right, centre, justified on spaces), with tabs and line
 heights from the faces' metrics; underlined and struck through from `post`
