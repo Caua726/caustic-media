@@ -508,7 +508,10 @@ canvas, the theme, its rectangle, its clip and its state — hover, pressed,
 focused, focus visible, focus within, disabled, backdrop, mnemonics shown
 while Alt is held — and the router
 repaints whatever widget those change for (focus within only for widgets that
-ask, with `tree.F_FOCUS_WITHIN_LOOK`). A widget on a higher layer
+ask, with `tree.F_FOCUS_WITHIN_LOOK`). A paint entry may set the painter's
+`fg`, the colour what the widget holds draws its text in, and everything under
+it is given that colour, as CSS's `color` is inherited: a button's label in the
+button's text colour for its state. A widget on a higher layer
 (`tree.set_layer`) escapes its ancestors' clips, draws above everything below
 it and is hit-tested first: a popup inside the window. The focus ring is drawn
 after the subtree, inside the edge, unless the widget drew its own. A clip a
