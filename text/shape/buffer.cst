@@ -1,0 +1,776 @@
+// text/shape/buffer.cst — the glyphs being shaped: HarfBuzz's buffer.
+//
+// A run starts as characters, one record each, and ends as glyphs with
+// their positions. Between, a step that changes the sequence reads from the
+// input at idx and writes an output, which becomes the input when it ends
+// (sync): characters decomposed, ligatures formed, glyphs inserted. The
+// output shares the input's array until it outgrows what was read — the
+// usual case of a step that writes no more than it reads — and has an array
+// of its own after that, swapped in at sync.
+//
+// Each record carries its cluster: the offset in the UTF-8 text of the
+// first byte of the characters it came from. Steps that join records join
+// their clusters (merge_clusters), to the smallest, so that clusters stay in
+// order — HarfBuzz's default cluster level, the only one here. They also
+// mark where the text cannot be broken and shaped again in two parts with
+// the same result (unsafe_to_break), which is what a layout needs to know to
+// break lines without shaping again.
+//
+// HarfBuzz bounds the work a font can make it do — records written, steps
+// taken — by the length of the text; the bounds are its own, and past them
+// the buffer stops being successful and shaping does no more.
+use "std/mem.cst" as mem;
+
+let is i64 as LTR with imut = 4;
+let is i64 as RTL with imut = 5;
+
+// The buffer's flags, HarfBuzz's: the run begins or ends the text; default
+// ignorables kept as they are, or removed; no dotted circle before a mark
+// that starts the text.
+let is i64 as BOT with imut = 1;
+let is i64 as EOT with imut = 2;
+let is i64 as PRESERVE_IGNORABLES with imut = 4;
+let is i64 as REMOVE_IGNORABLES with imut = 8;
+let is i64 as NO_DOTTED_CIRCLE with imut = 16;
+
+// What shaping has seen, for the steps that are needed only then.
+let is i64 as HAS_FRACTION_SLASH with imut = 1;
+let is i64 as HAS_DEFAULT_IGNORABLES with imut = 2;
+let is i64 as HAS_SPACE_FALLBACK with imut = 4;
+let is i64 as HAS_GPOS_ATTACHMENT with imut = 8;
+let is i64 as HAS_CGJ with imut = 16;
+let is i64 as HAS_BROKEN_SYLLABLE with imut = 32;
+let is i64 as HAS_VARIATION_SELECTOR_FALLBACK with imut = 64;
+let is i64 as HAS_CONTINUATIONS with imut = 128;
+
+// Glyph flags, kept in the low bits of each record's mask — the three
+// HarfBuzz reserves, of which only the first is made here: unsafe to
+// concatenate depends on how HarfBuzz caches lookups, and safe to insert
+// tatweel is the Arabic shaper's (shape.md).
+let is i64 as UNSAFE_TO_BREAK with imut = 1;
+let is i64 as GLYPH_FLAGS with imut = 7;
+
+// A record's unicode properties: the bit that holds a grapheme together.
+let is i64 as CONTINUATION with imut = 128;
+
+let is i64 as MAX_LEN_FACTOR with imut = 256;
+let is i64 as MAX_LEN_MIN with imut = 65536;
+let is i64 as MAX_LEN_DEFAULT with imut = 1073741823;
+let is i64 as MAX_OPS_FACTOR with imut = 4096;
+let is i64 as MAX_OPS_MIN with imut = 65536;
+let is i64 as MAX_OPS_DEFAULT with imut = 536870911;
+
+let is i64 as CONTEXT with imut = 5;
+let is i64 as REPLACEMENT with imut = 65533;
+
+// One character, then one glyph. cp is the character until glyphs are
+// chosen, the glyph after. The rest are what shaping keeps of each:
+// glyph, the glyph normalization found for the character; uprops, its
+// Unicode properties (props.cst); gprops, its glyph class and how it came
+// to be (ot.cst); lig, which ligature and component it belongs to;
+// syllable and aux, the complex shapers'.
+struct Info {
+    cp       as u32;
+    mask     as u32;
+    cluster  as u32;
+    glyph    as u32;
+    uprops   as u16;
+    gprops   as u16;
+    lig      as u8;
+    syllable as u8;
+    aux0     as u8;
+    aux1     as u8;
+}
+
+// Where a glyph goes, in font units; and while positioning, the glyph it is
+// attached to (chain, relative) and how (atype).
+struct Pos {
+    xa    as i32;
+    ya    as i32;
+    xo    as i32;
+    yo    as i32;
+    chain as i16;
+    atype as u8;
+    _pad  as u8;
+}
+
+struct Buffer {
+    info       as *Info;
+    out        as *Info;     // the output: info itself, or alt
+    alt        as *Info;     // the output's own array, when it needs one
+    pos        as *Pos;
+    allocated  as i64;
+    len        as i64;
+    idx        as i64;
+    out_len    as i64;
+    have_output    as i32;
+    have_positions as i32;
+    successful as i32;
+    _pad0      as i32;
+    flags      as i64;
+    scratch    as i64;
+    max_len    as i64;
+    max_ops    as i64;
+    serial     as i64;
+    random     as i64;      // the state of the rand feature's numbers
+    dir        as i64;
+    script     as i64;
+    // The text around the run, ordered outward: before it, then after it.
+    context    as [10]u32;
+    context_len as [2]i64;
+}
+
+fn _cl(i as *Info) as i64 { return cast(i64, i.cluster); }
+
+// --- Life ---
+
+fn open() as Buffer {
+    let is Buffer as b;
+    mem.memzero(cast(*u8, &b), sizeof(Buffer));
+    b.successful = 1;
+    b.max_len = MAX_LEN_DEFAULT;
+    b.max_ops = MAX_OPS_DEFAULT;
+    b.random = 1;
+    b.dir = LTR;
+    return b;
+}
+
+fn close(b as *Buffer) as void {
+    if (b.allocated > 0) {
+        mem.core.munmap(cast(*u8, b.info), b.allocated * sizeof(Info));
+        mem.core.munmap(cast(*u8, b.alt), b.allocated * sizeof(Info));
+        mem.core.munmap(cast(*u8, b.pos), b.allocated * sizeof(Pos));
+    }
+    mem.memzero(cast(*u8, b), sizeof(Buffer));
+}
+
+// Emptied for another run, its arrays kept.
+fn clear(b as *Buffer) as void {
+    b.successful = 1;
+    b.have_output = 0;
+    b.have_positions = 0;
+    b.idx = 0;
+    b.len = 0;
+    b.out_len = 0;
+    b.out = b.info;
+    b.flags = 0;
+    b.scratch = 0;
+    b.serial = 0;
+    b.random = 1;
+    b.dir = LTR;
+    b.script = 0;
+    b.context_len[0] = 0;
+    b.context_len[1] = 0;
+}
+
+// Around shaping: the bounds set from the length, and taken off after.
+fn enter(b as *Buffer) as void {
+    b.serial = 0;
+    b.scratch = 0;
+    let is i64 as l = b.len * MAX_LEN_FACTOR;
+    if (b.len < 16777216) {
+        b.max_len = l;
+        if (b.max_len < MAX_LEN_MIN) { b.max_len = MAX_LEN_MIN; }
+    }
+    if (b.len < 1048576) {
+        b.max_ops = b.len * MAX_OPS_FACTOR;
+        if (b.max_ops < MAX_OPS_MIN) { b.max_ops = MAX_OPS_MIN; }
+    }
+}
+
+fn leave(b as *Buffer) as void {
+    b.max_len = MAX_LEN_DEFAULT;
+    b.max_ops = MAX_OPS_DEFAULT;
+    b.serial = 0;
+}
+
+// --- Room ---
+
+fn _enlarge(b as *Buffer, size as i64) as i32 {
+    if (size > b.max_len) { b.successful = 0; return 0; }
+    if (b.successful == 0) { return 0; }
+    let is i64 as n with mut = b.allocated;
+    while (size >= n) { n = n + (n >> 1) + 32; }
+    let is *u8 as ni = mem.core.mmap_anon(n * sizeof(Info));
+    let is *u8 as na = mem.core.mmap_anon(n * sizeof(Info));
+    let is *u8 as np = mem.core.mmap_anon(n * sizeof(Pos));
+    if (cast(i64, ni) <= 0 || cast(i64, na) <= 0 || cast(i64, np) <= 0) {
+        if (cast(i64, ni) > 0) { mem.core.munmap(ni, n * sizeof(Info)); }
+        if (cast(i64, na) > 0) { mem.core.munmap(na, n * sizeof(Info)); }
+        if (cast(i64, np) > 0) { mem.core.munmap(np, n * sizeof(Pos)); }
+        b.successful = 0;
+        return 0;
+    }
+    let is i32 as separate = cast(i32, cast(i64, b.out) != cast(i64, b.info));
+    if (b.allocated > 0) {
+        mem.memcpy(ni, cast(*u8, b.info), b.allocated * sizeof(Info));
+        mem.memcpy(na, cast(*u8, b.alt), b.allocated * sizeof(Info));
+        mem.memcpy(np, cast(*u8, b.pos), b.allocated * sizeof(Pos));
+        mem.core.munmap(cast(*u8, b.info), b.allocated * sizeof(Info));
+        mem.core.munmap(cast(*u8, b.alt), b.allocated * sizeof(Info));
+        mem.core.munmap(cast(*u8, b.pos), b.allocated * sizeof(Pos));
+    }
+    b.info = cast(*Info, ni);
+    b.alt = cast(*Info, na);
+    b.pos = cast(*Pos, np);
+    if (separate == 1) { b.out = b.alt; } else { b.out = b.info; }
+    b.allocated = n;
+    return 1;
+}
+
+// Room for size records; 0 when there is not, and the buffer unsuccessful.
+fn ensure(b as *Buffer, size as i64) as i32 {
+    if (size == 0 || size < b.allocated) { return 1; }
+    return _enlarge(b, size);
+}
+
+// Room to read nin records and write nout: the output given an array of
+// its own once it would overtake the input it shares one with.
+fn make_room_for(b as *Buffer, nin as i64, nout as i64) as i32 {
+    if (ensure(b, b.out_len + nout) == 0) { return 0; }
+    if (cast(i64, b.out) == cast(i64, b.info) && b.out_len + nout > b.idx + nin) {
+        b.out = b.alt;
+        mem.memcpy(cast(*u8, b.out), cast(*u8, b.info), b.out_len * sizeof(Info));
+    }
+    return 1;
+}
+
+// The unread input moved count records later, to make room before it.
+fn shift_forward(b as *Buffer, count as i64) as i32 {
+    if (ensure(b, b.len + count) == 0) { return 0; }
+    b.max_ops = b.max_ops - (b.len - b.idx);
+    if (b.max_ops < 0) { b.successful = 0; return 0; }
+    mem.core.memmove(cast(*u8, &b.info[b.idx + count]), cast(*u8, &b.info[b.idx]), (b.len - b.idx) * sizeof(Info));
+    if (b.idx + count > b.len) {
+        mem.memzero(cast(*u8, &b.info[b.len]), (b.idx + count - b.len) * sizeof(Info));
+    }
+    b.len = b.len + count;
+    b.idx = b.idx + count;
+    return 1;
+}
+
+// --- Input ---
+
+fn add(b as *Buffer, cp as i64, cluster as i64) as void {
+    if (ensure(b, b.len + 1) == 0) { return; }
+    let is *Info as g = &b.info[b.len];
+    mem.memzero(cast(*u8, g), sizeof(Info));
+    g.cp = cast(u32, cp);
+    g.cluster = cast(u32, cluster);
+    b.len = b.len + 1;
+}
+
+fn _cont(b as i64) as i64 { return b - 128; }
+
+// The character at text[at], bytes before end, into *cp; where the next
+// begins. HarfBuzz's decoder: only well-formed sequences, and for every
+// byte that does not begin one, a replacement and that byte alone.
+fn utf8_next(text as *u8, at as i64, end as i64, cp as *i64) as i64 {
+    let is i64 as c = cast(i64, text[at]);
+    let is i64 as i with mut = at + 1;
+    if (c < 128) { *cp = c; return i; }
+    if (c >= 194 && c <= 223) {
+        if (i < end) {
+            let is i64 as t1 = _cont(cast(i64, text[i]));
+            if (t1 >= 0 && t1 <= 63) { *cp = ((c & 31) << 6) | t1; return i + 1; }
+        }
+    } else if (c >= 224 && c <= 239) {
+        if (end - i > 1) {
+            let is i64 as t1 = _cont(cast(i64, text[i]));
+            let is i64 as t2 = _cont(cast(i64, text[i + 1]));
+            if (t1 >= 0 && t1 <= 63 && t2 >= 0 && t2 <= 63) {
+                let is i64 as v = ((c & 15) << 12) | (t1 << 6) | t2;
+                if (v >= 2048 && (v < 55296 || v > 57343)) { *cp = v; return i + 2; }
+            }
+        }
+    } else if (c >= 240 && c <= 244) {
+        if (end - i > 2) {
+            let is i64 as t1 = _cont(cast(i64, text[i]));
+            let is i64 as t2 = _cont(cast(i64, text[i + 1]));
+            let is i64 as t3 = _cont(cast(i64, text[i + 2]));
+            if (t1 >= 0 && t1 <= 63 && t2 >= 0 && t2 <= 63 && t3 >= 0 && t3 <= 63) {
+                let is i64 as v = ((c & 7) << 18) | (t1 << 12) | (t2 << 6) | t3;
+                if (v >= 65536 && v <= 1114111) { *cp = v; return i + 3; }
+            }
+        }
+    }
+    *cp = REPLACEMENT;
+    return i;
+}
+
+// The character ending before text[at], start the first byte that may be
+// read, into *cp; where it begins.
+fn utf8_prev(text as *u8, start as i64, at as i64, cp as *i64) as i64 {
+    let is i64 as end = at;
+    let is i64 as i with mut = at - 1;
+    while (start < i && (cast(i64, text[i]) & 192) == 128 && end - i < 4) { i = i - 1; }
+    if (utf8_next(text, i, end, cp) == end) { return i; }
+    *cp = REPLACEMENT;
+    return end - 1;
+}
+
+// The characters of text[offset .. offset + length) — length -1 for the
+// rest of the n bytes — each with its byte offset as its cluster, and up to
+// five characters on each side as context.
+fn add_utf8(b as *Buffer, text as *u8, n as i64, offset as i64, length as i64) as void {
+    let is i64 as off with mut = offset;
+    let is i64 as l with mut = length;
+    if (l == 0 - 1) { l = n - off; }
+    if (off > n) { off = n; }
+    if (off < 0) { off = 0; }
+    if (l < 0) { l = 0; }
+    if (l > n - off) { l = n - off; }
+    if (ensure(b, b.len + l / 4) == 0) { return; }
+    let is i64 as cp with mut = 0;
+    if (b.len == 0 && off > 0) {
+        b.context_len[0] = 0;
+        let is i64 as prev with mut = off;
+        while (0 < prev && b.context_len[0] < CONTEXT) {
+            prev = utf8_prev(text, 0, prev, &cp);
+            b.context[b.context_len[0]] = cast(u32, cp);
+            b.context_len[0] = b.context_len[0] + 1;
+        }
+    }
+    let is i64 as next with mut = off;
+    let is i64 as end = off + l;
+    while (next < end) {
+        let is i64 as old = next;
+        next = utf8_next(text, next, end, &cp);
+        add(b, cp, old);
+    }
+    b.context_len[1] = 0;
+    while (next < n && b.context_len[1] < CONTEXT) {
+        next = utf8_next(text, next, n, &cp);
+        b.context[CONTEXT + b.context_len[1]] = cast(u32, cp);
+        b.context_len[1] = b.context_len[1] + 1;
+    }
+}
+
+// --- Reading and writing ---
+
+fn cur(b as *Buffer, i as i64) as *Info { return &b.info[b.idx + i]; }
+fn cur_pos(b as *Buffer, i as i64) as *Pos { return &b.pos[b.idx + i]; }
+
+// The last record written; the output's first when there is none.
+fn prev(b as *Buffer) as *Info {
+    if (b.out_len > 0) { return &b.out[b.out_len - 1]; }
+    return &b.out[0];
+}
+
+fn backtrack_len(b as *Buffer) as i64 {
+    if (b.have_output == 1) { return b.out_len; }
+    return b.idx;
+}
+
+fn lookahead_len(b as *Buffer) as i64 { return b.len - b.idx; }
+
+// The next serial number, never 0, in eight bits.
+fn next_serial(b as *Buffer) as i64 {
+    b.serial = (b.serial + 1) & 255;
+    if (b.serial == 0) { b.serial = 1; }
+    return b.serial;
+}
+
+fn clear_output(b as *Buffer) as void {
+    b.have_output = 1;
+    b.have_positions = 0;
+    b.idx = 0;
+    b.out_len = 0;
+    b.out = b.info;
+}
+
+fn clear_positions(b as *Buffer) as void {
+    b.have_output = 0;
+    b.have_positions = 1;
+    b.out_len = 0;
+    b.out = b.info;
+    if (b.len > 0) { mem.memzero(cast(*u8, b.pos), b.len * sizeof(Pos)); }
+}
+
+// n records copied from the input to the output.
+fn next_glyphs(b as *Buffer, n as i64) as i32 {
+    if (b.have_output == 1) {
+        if (cast(i64, b.out) != cast(i64, b.info) || b.out_len != b.idx) {
+            if (ensure(b, b.out_len + n) == 0) { return 0; }
+            mem.core.memmove(cast(*u8, &b.out[b.out_len]), cast(*u8, &b.info[b.idx]), n * sizeof(Info));
+        }
+        b.out_len = b.out_len + n;
+    }
+    b.idx = b.idx + n;
+    return 1;
+}
+
+fn next_glyph(b as *Buffer) as i32 {
+    if (b.have_output == 1) {
+        if (cast(i64, b.out) != cast(i64, b.info) || b.out_len != b.idx) {
+            if (ensure(b, b.out_len + 1) == 0) { return 0; }
+            b.out[b.out_len] = b.info[b.idx];
+        }
+        b.out_len = b.out_len + 1;
+    }
+    b.idx = b.idx + 1;
+    return 1;
+}
+
+fn skip_glyph(b as *Buffer) as void { b.idx = b.idx + 1; }
+
+// nin records read and nout written in their place, each a copy of the
+// first read (or of the last written, when none is) with glyphs[k] as cp;
+// the clusters read merged.
+fn replace_glyphs(b as *Buffer, nin as i64, nout as i64, glyphs as *u32) as i32 {
+    if (make_room_for(b, nin, nout) == 0) { return 0; }
+    merge_clusters(b, b.idx, b.idx + nin);
+    let is Info as orig with mut;
+    if (b.idx < b.len) { orig = b.info[b.idx]; } else { orig = *prev(b); }
+    let is i64 as k with mut = 0;
+    while (k < nout) {
+        b.out[b.out_len + k] = orig;
+        b.out[b.out_len + k].cp = glyphs[k];
+        k = k + 1;
+    }
+    b.idx = b.idx + nin;
+    b.out_len = b.out_len + nout;
+    return 1;
+}
+
+fn replace_glyph(b as *Buffer, g as i64) as i32 {
+    let is u32 as v = cast(u32, g);
+    return replace_glyphs(b, 1, 1, &v);
+}
+
+// A copy of the current record written, with g as cp; the input stays.
+fn output_glyph(b as *Buffer, g as i64) as i32 {
+    let is u32 as v = cast(u32, g);
+    return replace_glyphs(b, 0, 1, &v);
+}
+
+fn output_info(b as *Buffer, i as *Info) as i32 {
+    let is Info as copy = *i;
+    if (make_room_for(b, 0, 1) == 0) { return 0; }
+    b.out[b.out_len] = copy;
+    b.out_len = b.out_len + 1;
+    return 1;
+}
+
+// The current record written; the input stays.
+fn copy_glyph(b as *Buffer) as i32 { return output_info(b, &b.info[b.idx]); }
+
+// The output made the input: what is left of the input copied over first.
+fn sync(b as *Buffer) as i32 {
+    let is i32 as ok with mut = 0;
+    if (b.successful == 1 && next_glyphs(b, b.len - b.idx) == 1) {
+        if (cast(i64, b.out) != cast(i64, b.info)) {
+            let is *Info as t = b.info;
+            b.info = b.out;
+            b.alt = t;
+        }
+        b.len = b.out_len;
+        ok = 1;
+    }
+    b.have_output = 0;
+    b.out_len = 0;
+    b.out = b.info;
+    b.idx = 0;
+    return ok;
+}
+
+// Synced, and reading again where it was in the output; how far that moved.
+fn sync_so_far(b as *Buffer) as i64 {
+    let is i32 as had = b.have_output;
+    let is i64 as out_i = b.out_len;
+    let is i64 as i = b.idx;
+    let is i64 as old = b.idx;
+    if (sync(b) == 1) { b.idx = out_i; } else { b.idx = i; }
+    if (had == 1) {
+        b.have_output = 1;
+        b.out_len = b.idx;
+    }
+    return b.idx - old;
+}
+
+// The output's length made i, records moved from input to output or back.
+fn move_to(b as *Buffer, i as i64) as i32 {
+    if (b.have_output == 0) {
+        b.idx = i;
+        return 1;
+    }
+    if (b.successful == 0) { return 0; }
+    if (b.out_len < i) {
+        let is i64 as count = i - b.out_len;
+        if (make_room_for(b, count, count) == 0) { return 0; }
+        b.max_ops = b.max_ops - count;
+        if (b.max_ops < 0) { b.successful = 0; return 0; }
+        mem.core.memmove(cast(*u8, &b.out[b.out_len]), cast(*u8, &b.info[b.idx]), count * sizeof(Info));
+        b.idx = b.idx + count;
+        b.out_len = b.out_len + count;
+    } else if (b.out_len > i) {
+        let is i64 as count = b.out_len - i;
+        if (b.idx < count && shift_forward(b, count - b.idx) == 0) { return 0; }
+        b.max_ops = b.max_ops - count;
+        if (b.max_ops < 0) { b.successful = 0; return 0; }
+        b.idx = b.idx - count;
+        b.out_len = b.out_len - count;
+        mem.core.memmove(cast(*u8, &b.info[b.idx]), cast(*u8, &b.out[b.out_len]), count * sizeof(Info));
+    }
+    return 1;
+}
+
+// --- Clusters ---
+
+// A record given a cluster; its glyph flags replaced by mask's when that
+// changes it.
+fn set_cluster(i as *Info, cluster as i64, mask as i64) as void {
+    if (_cl(i) != cluster) {
+        i.mask = cast(u32, (cast(i64, i.mask) & (4294967295 - GLYPH_FLAGS)) | (mask & GLYPH_FLAGS));
+    }
+    i.cluster = cast(u32, cluster);
+}
+
+// Input records start .. end made one cluster, and the records around them
+// that share their first or last cluster with it — into the output too,
+// when it reaches the start of the input.
+fn _merge_clusters_impl(b as *Buffer, start as i64, end as i64) as void {
+    let is i64 as s with mut = start;
+    let is i64 as e with mut = end;
+    b.max_ops = b.max_ops - (e - s);
+    if (b.max_ops < 0) { b.successful = 0; }
+    let is i64 as cluster with mut = _cl(&b.info[s]);
+    let is i64 as i with mut = s + 1;
+    while (i < e) {
+        if (_cl(&b.info[i]) < cluster) { cluster = _cl(&b.info[i]); }
+        i = i + 1;
+    }
+    if (cluster != _cl(&b.info[e - 1])) {
+        while (e < b.len && _cl(&b.info[e - 1]) == _cl(&b.info[e])) { e = e + 1; }
+    }
+    if (cluster != _cl(&b.info[s])) {
+        while (b.idx < s && _cl(&b.info[s - 1]) == _cl(&b.info[s])) { s = s - 1; }
+    }
+    if (b.idx == s && _cl(&b.info[s]) != cluster) {
+        let is i64 as old = _cl(&b.info[s]);
+        i = b.out_len;
+        while (i > 0 && _cl(&b.out[i - 1]) == old) {
+            set_cluster(&b.out[i - 1], cluster, 0);
+            i = i - 1;
+        }
+    }
+    i = s;
+    while (i < e) {
+        set_cluster(&b.info[i], cluster, 0);
+        i = i + 1;
+    }
+}
+
+fn merge_clusters(b as *Buffer, start as i64, end as i64) as void {
+    if (end - start < 2) { return; }
+    _merge_clusters_impl(b, start, end);
+}
+
+fn merge_grapheme_clusters(b as *Buffer, start as i64, end as i64) as void {
+    if (end - start < 2) { return; }
+    _merge_clusters_impl(b, start, end);
+}
+
+// The same for output records start .. end, and into the input when they
+// reach the end of the output.
+fn merge_out_clusters(b as *Buffer, start as i64, end as i64) as void {
+    if (end - start < 2) { return; }
+    let is i64 as s with mut = start;
+    let is i64 as e with mut = end;
+    b.max_ops = b.max_ops - (e - s);
+    if (b.max_ops < 0) { b.successful = 0; }
+    let is i64 as cluster with mut = _cl(&b.out[s]);
+    let is i64 as i with mut = s + 1;
+    while (i < e) {
+        if (_cl(&b.out[i]) < cluster) { cluster = _cl(&b.out[i]); }
+        i = i + 1;
+    }
+    while (s > 0 && _cl(&b.out[s - 1]) == _cl(&b.out[s])) { s = s - 1; }
+    while (e < b.out_len && _cl(&b.out[e - 1]) == _cl(&b.out[e])) { e = e + 1; }
+    if (e == b.out_len) {
+        let is i64 as last = _cl(&b.out[e - 1]);
+        i = b.idx;
+        while (i < b.len && _cl(&b.info[i]) == last) {
+            set_cluster(&b.info[i], cluster, 0);
+            i = i + 1;
+        }
+    }
+    i = s;
+    while (i < e) {
+        set_cluster(&b.out[i], cluster, 0);
+        i = i + 1;
+    }
+}
+
+// The current record dropped, its cluster given to a neighbour unless
+// another record keeps it.
+fn delete_glyph(b as *Buffer) as void {
+    let is i64 as cluster = _cl(&b.info[b.idx]);
+    if ((b.idx + 1 < b.len && cluster == _cl(&b.info[b.idx + 1])) ||
+        (b.out_len > 0 && cluster == _cl(&b.out[b.out_len - 1]))) {
+        skip_glyph(b);
+        return;
+    }
+    if (b.out_len > 0) {
+        if (cluster < _cl(&b.out[b.out_len - 1])) {
+            let is i64 as mask = cast(i64, b.info[b.idx].mask);
+            let is i64 as old = _cl(&b.out[b.out_len - 1]);
+            let is i64 as i with mut = b.out_len;
+            while (i > 0 && _cl(&b.out[i - 1]) == old) {
+                set_cluster(&b.out[i - 1], cluster, mask);
+                i = i - 1;
+            }
+        }
+        skip_glyph(b);
+        return;
+    }
+    if (b.idx + 1 < b.len) { merge_clusters(b, b.idx, b.idx + 2); }
+    skip_glyph(b);
+}
+
+// --- Glyph flags ---
+
+fn _min_cluster(b as *Buffer, infos as *Info, start as i64, end as i64, cluster as i64) as i64 {
+    if (start == end) { return cluster; }
+    let is i64 as m with mut = cluster;
+    if (_cl(&infos[start]) < m) { m = _cl(&infos[start]); }
+    if (_cl(&infos[end - 1]) < m) { m = _cl(&infos[end - 1]); }
+    return m;
+}
+
+// mask added to records start .. end of infos not in the given cluster —
+// with clusters in order, to those on the far side of it.
+fn _set_flags_in(b as *Buffer, infos as *Info, start as i64, end as i64, cluster as i64, mask as i64) as void {
+    if (start == end) { return; }
+    b.max_ops = b.max_ops - (end - start);
+    if (b.max_ops < 0) { b.successful = 0; }
+    let is i64 as first = _cl(&infos[start]);
+    let is i64 as last = _cl(&infos[end - 1]);
+    let is i64 as i with mut = 0;
+    if (cluster != first && cluster != last) {
+        i = start;
+        while (i < end) {
+            if (cluster != _cl(&infos[i])) { infos[i].mask = cast(u32, cast(i64, infos[i].mask) | mask); }
+            i = i + 1;
+        }
+        return;
+    }
+    if (cluster == first) {
+        i = end;
+        while (start < i && _cl(&infos[i - 1]) != first) {
+            infos[i - 1].mask = cast(u32, cast(i64, infos[i - 1].mask) | mask);
+            i = i - 1;
+        }
+    } else {
+        i = start;
+        while (i < end && _cl(&infos[i]) != last) {
+            infos[i].mask = cast(u32, cast(i64, infos[i].mask) | mask);
+            i = i + 1;
+        }
+    }
+}
+
+// mask added to the records start .. end but those of the smallest cluster
+// among them — from_out: start in the output, end in the input. More than
+// 255 records are left alone, as HarfBuzz leaves them (an end before start
+// counts as more, its difference being unsigned).
+fn _set_flags(b as *Buffer, mask as i64, start as i64, end as i64, from_out as i32) as void {
+    if (end != 0 - 1 && (end - start > 255 || end < start)) { return; }
+    let is i64 as e with mut = end;
+    if (e == 0 - 1 || e > b.len) { e = b.len; }
+    if (from_out == 0 && e - start < 2) { return; }
+    if (from_out == 0 || b.have_output == 0) {
+        _set_flags_in(b, b.info, start, e, _min_cluster(b, b.info, start, e, 4294967295), mask);
+        return;
+    }
+    let is i64 as c1 = _min_cluster(b, b.info, b.idx, e, 4294967295);
+    let is i64 as c2 = _min_cluster(b, b.out, start, b.out_len, c1);
+    _set_flags_in(b, b.out, start, b.out_len, c2, mask);
+    _set_flags_in(b, b.info, b.idx, e, c2, mask);
+}
+
+// The text cannot be broken between records start and end (-1: the
+// end) and shaped in two parts to the same glyphs.
+fn unsafe_to_break(b as *Buffer, start as i64, end as i64) as void {
+    _set_flags(b, UNSAFE_TO_BREAK, start, end, 0);
+}
+
+fn unsafe_to_break_from_outbuffer(b as *Buffer, start as i64, end as i64) as void {
+    _set_flags(b, UNSAFE_TO_BREAK, start, end, 1);
+}
+
+// --- Masks ---
+
+// value set under mask on the records whose clusters lie in
+// [cstart, cend); cend -1 for every one.
+fn set_masks(b as *Buffer, value as i64, mask as i64, cstart as i64, cend as i64) as void {
+    if (mask == 0) { return; }
+    let is i64 as v = value & mask;
+    let is i64 as keep = 4294967295 - mask;
+    b.max_ops = b.max_ops - b.len;
+    if (b.max_ops < 0) { b.successful = 0; }
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        let is i64 as c = _cl(&b.info[i]);
+        if ((cstart == 0 && cend == 0 - 1) || (cstart <= c && (cend == 0 - 1 || c < cend))) {
+            b.info[i].mask = cast(u32, (cast(i64, b.info[i].mask) & keep) | v);
+        }
+        i = i + 1;
+    }
+}
+
+// --- Order ---
+
+fn reverse_range(b as *Buffer, start as i64, end as i64) as void {
+    if (end - start < 2) { return; }
+    let is i64 as i with mut = start;
+    let is i64 as j with mut = end - 1;
+    while (i < j) {
+        let is Info as t = b.info[i];
+        b.info[i] = b.info[j];
+        b.info[j] = t;
+        if (b.have_positions == 1) {
+            let is Pos as p = b.pos[i];
+            b.pos[i] = b.pos[j];
+            b.pos[j] = p;
+        }
+        i = i + 1;
+        j = j - 1;
+    }
+}
+
+fn reverse(b as *Buffer) as void { reverse_range(b, 0, b.len); }
+
+// Whether record i continues the group of the one before it: its grapheme
+// (graphemes 1) or its cluster.
+fn _grouped(b as *Buffer, i as i64, graphemes as i32) as i32 {
+    if (graphemes == 1) {
+        if ((cast(i64, b.info[i].uprops) & CONTINUATION) != 0) { return 1; }
+        return 0;
+    }
+    if (_cl(&b.info[i - 1]) == _cl(&b.info[i])) { return 1; }
+    return 0;
+}
+
+// Where the group beginning at start ends.
+fn group_end(b as *Buffer, start as i64, graphemes as i32) as i64 {
+    let is i64 as i with mut = start + 1;
+    while (i < b.len && _grouped(b, i, graphemes) == 1) { i = i + 1; }
+    return i;
+}
+
+// The groups reversed, each kept in its own order.
+fn reverse_groups(b as *Buffer, graphemes as i32) as void {
+    if (b.len == 0) { return; }
+    let is i64 as start with mut = 0;
+    let is i64 as i with mut = 1;
+    while (i < b.len) {
+        if (_grouped(b, i, graphemes) == 0) {
+            reverse_range(b, start, i);
+            start = i;
+        }
+        i = i + 1;
+    }
+    reverse_range(b, start, i);
+    reverse(b);
+}

@@ -1,0 +1,306 @@
+// text/shape/normalize.cst — characters decomposed and composed as the font
+// can draw them: HarfBuzz's normalizer.
+//
+// Not Unicode's normalization, though it follows it: what is done depends on
+// the font. A character the font has is left alone; one it lacks is taken
+// apart, one level at a time, until the pieces are characters it has. Marks
+// are then put in order of their classes — HarfBuzz's classes — and each is
+// put back together with the character before it when the font has the
+// composite. So "e" and U+0301 come out as the font's "é" when it has one, and
+// "ẽ" as "e" and U+0303 when it has those and not "ẽ": text written either
+// way is drawn alike, and drawn at all.
+//
+// A cluster with a variation selector is left as it is, the character and
+// its selector mapped together through cmap format 14 when the font has the
+// sequence.
+//
+// Each record's glyph — Info.glyph — is found here, for shape.cst to make
+// the record's own afterwards.
+use "../sfnt/table.cst" as table;
+use "../sfnt/cmap.cst" as cmap;
+use "buffer.cst" as buffer;
+use "props.cst" as props;
+
+// More marks than this in a row are left in the order they came.
+let is i64 as MAX_COMBINING_MARKS with imut = 32;
+
+// The font's glyph for u into *g, and whether it has one: *g 0 when not.
+fn nominal(f as *table.Face, u as i64, g as *i64) as i32 {
+    *g = cmap.glyph(f, u);
+    if (*g != 0) { return 1; }
+    return 0;
+}
+
+// The glyph for u followed by selector vs, from cmap format 14 — the
+// character's own when the sequence is its default — into *g.
+fn variation(f as *table.Face, u as i64, vs as i64, g as *i64) as i32 {
+    *g = cmap.variant(f, u, vs);
+    if (*g != 0) { return 1; }
+    return 0;
+}
+
+fn _set_glyph(f as *table.Face, i as *buffer.Info) as void {
+    let is i64 as g with mut = 0;
+    nominal(f, cast(i64, i.cp), &g);
+    i.glyph = cast(u32, g);
+}
+
+fn _output_char(b as *buffer.Buffer, u as i64, g as i64) as void {
+    buffer.cur(b, 0).glyph = cast(u32, g);
+    buffer.output_glyph(b, u);
+    props.set_unicode_props(b, buffer.prev(b));
+}
+
+fn _next_char(b as *buffer.Buffer, g as i64) as void {
+    buffer.cur(b, 0).glyph = cast(u32, g);
+    buffer.next_glyph(b);
+}
+
+// ab written as the pieces of its decomposition the font has, in as few
+// pieces as it can (shortest) or as many; how many, 0 when it cannot be.
+fn _decompose(f as *table.Face, b as *buffer.Buffer, shortest as i32, ab as i64) as i64 {
+    let is i64 as a with mut = 0;
+    let is i64 as c with mut = 0;
+    let is i64 as ag with mut = 0;
+    let is i64 as cg with mut = 0;
+    if (props.decompose(ab, &a, &c) == 0) { return 0; }
+    if (c != 0 && nominal(f, c, &cg) == 0) { return 0; }
+    let is i32 as has_a = nominal(f, a, &ag);
+    if (shortest == 1 && has_a == 1) {
+        _output_char(b, a, ag);
+        if (c != 0) {
+            _output_char(b, c, cg);
+            return 2;
+        }
+        return 1;
+    }
+    let is i64 as ret = _decompose(f, b, shortest, a);
+    if (ret > 0) {
+        if (c != 0) {
+            _output_char(b, c, cg);
+            return ret + 1;
+        }
+        return ret;
+    }
+    if (has_a == 1) {
+        _output_char(b, a, ag);
+        if (c != 0) {
+            _output_char(b, c, cg);
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// The current character written as the font can draw it: itself, its
+// decomposition, a space made from the font's space, U+2010 for U+2011, or
+// the missing glyph.
+fn _decompose_current(f as *table.Face, b as *buffer.Buffer, shortest as i32) as void {
+    let is i64 as u = cast(i64, buffer.cur(b, 0).cp);
+    let is i64 as g with mut = 0;
+    if (shortest == 1 && nominal(f, u, &g) == 1) {
+        _next_char(b, g);
+        return;
+    }
+    if (_decompose(f, b, shortest, u) > 0) {
+        buffer.skip_glyph(b);
+        return;
+    }
+    if (shortest == 0 && nominal(f, u, &g) == 1) {
+        _next_char(b, g);
+        return;
+    }
+    if (props.is_unicode_space(buffer.cur(b, 0)) == 1) {
+        let is i64 as kind = props.space_fallback(u);
+        let is i64 as sg with mut = 0;
+        if (kind != props.NOT_SPACE && nominal(f, 32, &sg) == 1) {
+            props.set_space_fallback(buffer.cur(b, 0), kind);
+            _next_char(b, sg);
+            b.scratch = b.scratch | buffer.HAS_SPACE_FALLBACK;
+            return;
+        }
+    }
+    if (u == 8209) {
+        let is i64 as og with mut = 0;
+        if (nominal(f, 8208, &og) == 1) {
+            _next_char(b, og);
+            return;
+        }
+    }
+    _next_char(b, g);
+}
+
+// A cluster with a variation selector, up to end: each character with the
+// selector after it mapped through format 14 as one glyph; when the font has
+// no such sequence, both as they are, the selector kept as one.
+fn _variation_cluster(f as *table.Face, b as *buffer.Buffer, end as i64) as void {
+    while (b.idx < end - 1 && b.successful == 1) {
+        if (props.is_variation_selector(cast(i64, buffer.cur(b, 1).cp)) == 1) {
+            let is i64 as g with mut = 0;
+            if (variation(f, cast(i64, buffer.cur(b, 0).cp), cast(i64, buffer.cur(b, 1).cp), &g) == 1) {
+                buffer.cur(b, 0).glyph = cast(u32, g);
+                let is u32 as u = buffer.cur(b, 0).cp;
+                buffer.replace_glyphs(b, 2, 1, &u);
+            } else {
+                _set_glyph(f, buffer.cur(b, 0));
+                buffer.next_glyph(b);
+                b.scratch = b.scratch | buffer.HAS_VARIATION_SELECTOR_FALLBACK;
+                props.set_variation_selector(buffer.cur(b, 0), 1);
+                _set_glyph(f, buffer.cur(b, 0));
+                buffer.next_glyph(b);
+            }
+            while (b.idx < end && b.successful == 1 && props.is_variation_selector(cast(i64, buffer.cur(b, 0).cp)) == 1) {
+                _set_glyph(f, buffer.cur(b, 0));
+                buffer.next_glyph(b);
+            }
+        } else {
+            _set_glyph(f, buffer.cur(b, 0));
+            buffer.next_glyph(b);
+        }
+    }
+    if (b.idx < end) {
+        _set_glyph(f, buffer.cur(b, 0));
+        buffer.next_glyph(b);
+    }
+}
+
+fn _decompose_cluster(f as *table.Face, b as *buffer.Buffer, end as i64) as void {
+    let is i64 as i with mut = b.idx;
+    while (i < end && b.successful == 1) {
+        if (props.is_variation_selector(cast(i64, b.info[i].cp)) == 1) {
+            _variation_cluster(f, b, end);
+            return;
+        }
+        i = i + 1;
+    }
+    while (b.idx < end && b.successful == 1) { _decompose_current(f, b, 0); }
+}
+
+fn _cc(b as *buffer.Buffer, i as i64) as i64 { return props.modified_class_of(&b.info[i]); }
+
+// Records start .. end sorted by modified class, stably, each move merging
+// the clusters it passes.
+fn _sort(b as *buffer.Buffer, start as i64, end as i64) as void {
+    let is i64 as i with mut = start + 1;
+    while (i < end) {
+        let is i64 as j with mut = i;
+        while (j > start && _cc(b, j - 1) > _cc(b, i)) { j = j - 1; }
+        if (i != j) {
+            buffer.merge_clusters(b, j, i + 1);
+            let is buffer.Info as t = b.info[i];
+            let is i64 as k with mut = i;
+            while (k > j) {
+                b.info[k] = b.info[k - 1];
+                k = k - 1;
+            }
+            b.info[j] = t;
+        }
+        i = i + 1;
+    }
+}
+
+fn normalize(f as *table.Face, b as *buffer.Buffer) as void {
+    if (b.len == 0) { return; }
+    // HarfBuzz's default shaper composes diacritics, and leaves a character
+    // the font has as it is.
+
+    // First, decompose.
+    let is i32 as all_simple with mut = 1;
+    buffer.clear_output(b);
+    let is i64 as count with mut = b.len;
+    b.idx = 0;
+    let is i32 as going with mut = 1;
+    while (going == 1) {
+        let is i64 as end with mut = b.idx + 1;
+        while (end < count && props.is_unicode_mark(&b.info[end]) == 0) { end = end + 1; }
+        if (end < count) { end = end - 1; }
+        // Simple clusters, as many at once as the font has.
+        let is i64 as done with mut = 0;
+        let is i64 as g with mut = 0;
+        while (b.idx + done < end && nominal(f, cast(i64, b.info[b.idx + done].cp), &g) == 1) {
+            b.info[b.idx + done].glyph = cast(u32, g);
+            done = done + 1;
+        }
+        if (buffer.next_glyphs(b, done) == 0) { going = 0; }
+        if (going == 1) {
+            while (b.idx < end && b.successful == 1) { _decompose_current(f, b, 1); }
+            if (b.idx == count || b.successful == 0) { going = 0; }
+        }
+        if (going == 1) {
+            all_simple = 0;
+            end = b.idx + 1;
+            while (end < count && props.is_unicode_mark(&b.info[end]) == 1) { end = end + 1; }
+            _decompose_cluster(f, b, end);
+            if (b.idx >= count || b.successful == 0) { going = 0; }
+        }
+    }
+    buffer.sync(b);
+
+    // Second, reorder.
+    if (all_simple == 0) {
+        count = b.len;
+        let is i64 as i with mut = 0;
+        while (i < count) {
+            if (_cc(b, i) != 0) {
+                let is i64 as end with mut = i + 1;
+                while (end < count && _cc(b, end) != 0) { end = end + 1; }
+                if (end - i <= MAX_COMBINING_MARKS) { _sort(b, i, end); }
+                i = end;
+            }
+            i = i + 1;
+        }
+    }
+    // A grapheme joiner that kept no marks apart is not needed as one, and
+    // may be skipped by lookups.
+    if ((b.scratch & buffer.HAS_CGJ) != 0) {
+        count = b.len;
+        let is i64 as i with mut = 1;
+        while (i + 1 < count) {
+            if (b.info[i].cp == cast(u32, 847) && (_cc(b, i + 1) == 0 || _cc(b, i - 1) <= _cc(b, i + 1))) {
+                props.unhide(&b.info[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    // Third, recompose: a mark with the character it follows, unless a mark
+    // of its class or higher is between them.
+    if (all_simple == 0 && b.successful == 1) {
+        buffer.clear_output(b);
+        count = b.len;
+        let is i64 as starter with mut = 0;
+        buffer.next_glyph(b);
+        let is i32 as composing with mut = 1;
+        while (b.idx < count && composing == 1) {
+            let is i32 as composed with mut = 0;
+            let is *buffer.Info as cur = buffer.cur(b, 0);
+            if (props.is_unicode_mark(cur) == 1) {
+                if (starter == b.out_len - 1 || props.modified_class_of(buffer.prev(b)) < props.modified_class_of(cur)) {
+                    let is i64 as c = props.compose(cast(i64, b.out[starter].cp), cast(i64, cur.cp));
+                    let is i64 as g with mut = 0;
+                    if (c >= 0 && nominal(f, c, &g) == 1) {
+                        if (buffer.next_glyph(b) == 0) {
+                            composing = 0;
+                        } else {
+                            buffer.merge_out_clusters(b, starter, b.out_len);
+                            b.out_len = b.out_len - 1;
+                            b.out[starter].cp = cast(u32, c);
+                            b.out[starter].glyph = cast(u32, g);
+                            props.set_unicode_props(b, &b.out[starter]);
+                            composed = 1;
+                        }
+                    }
+                }
+            }
+            if (composed == 0 && composing == 1) {
+                if (buffer.next_glyph(b) == 0) {
+                    composing = 0;
+                } else if (props.modified_class_of(buffer.prev(b)) == 0) {
+                    starter = b.out_len - 1;
+                }
+            }
+        }
+        buffer.sync(b);
+    }
+}

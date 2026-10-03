@@ -10,14 +10,26 @@ use "cff.cst" as cff;
 
 // What reading a face's outlines needs, made once per face: TrueType's
 // scratch points, or CFF's located structures; and the instance, the default
-// until vary() says otherwise.
+// until vary() says otherwise. measure is a path extents() reads CFF
+// glyphs into, made the first time it does.
 struct Reader {
-    face   as *table.Face;
-    pts    as glyf.Points;
-    cff    as cff.Cff;
-    coords as var.Coords;
-    ok     as i32;
-    _pad0  as i32;
+    face    as *table.Face;
+    pts     as glyf.Points;
+    cff     as cff.Cff;
+    coords  as var.Coords;
+    measure as path.Path;
+    ok      as i32;
+    measuring as i32;
+}
+
+// A glyph's ink as HarfBuzz measures it, in font units, y up: from the
+// origin to its left edge (x_bearing) and its top (y_bearing), its width,
+// and its height — negative, downward from the top.
+struct Extents {
+    x_bearing as i64;
+    y_bearing as i64;
+    width     as i64;
+    height    as i64;
 }
 
 // Room for a glyph of 65536 points: more than a TrueType glyph can have,
@@ -26,7 +38,7 @@ fn open(f as *table.Face) as Reader {
     let is Reader as r;
     r.face = f;
     r.ok = 0;
-    r._pad0 = 0;
+    r.measuring = 0;
     r.pts.block = cast(*u8, 0);
     r.pts.cap = 0;
     r.cff.ok = 0;
@@ -43,6 +55,8 @@ fn open(f as *table.Face) as Reader {
 
 fn close(r as *Reader) as void {
     glyf.points_close(&r.pts);
+    if (r.measuring == 1) { path.close(&r.measure); }
+    r.measuring = 0;
     r.ok = 0;
 }
 
@@ -61,7 +75,7 @@ fn glyph(r as *Reader, gid as i64, p as *path.Path) as i32 {
 }
 
 // Glyph gid's advance at the instance, in font units, unrounded — rounded
-// half away from zero, and no less than 0, it is HarfBuzz's: hmtx's at the
+// as HarfBuzz rounds, halves up, and no less than 0, it is HarfBuzz's: hmtx's at the
 // default instance; moved by HVAR when the font has it; otherwise, when it
 // has gvar, from the glyph's phantom points (glyf.advance); otherwise hmtx's.
 fn advance(r as *Reader, gid as i64) as f64 {
@@ -70,4 +84,147 @@ fn advance(r as *Reader, gid as i64) as f64 {
     if (var.has_hvar(r.face) == 1) { return plain + var.advance_delta(r.face, &r.coords, gid); }
     if (glyf.has_gvar(r.face) == 0) { return plain; }
     return glyf.advance(r.face, &r.pts, gid, &r.coords);
+}
+
+// Glyph gid's advance as HarfBuzz positions it: advance() rounded as
+// HarfBuzz rounds, halves up, and no less than 0 — or half the em, for
+// every glyph of a face with no horizontal metrics.
+fn advance_rounded(r as *Reader, gid as i64) as i64 {
+    if (r.face.hmetrics <= 0 || r.face.hmtx.len == 0) { return r.face.upem / 2; }
+    let is i64 as v = _round(advance(r, gid));
+    if (v < 0) { return 0; }
+    return v;
+}
+
+// --- Extents ---
+
+// HarfBuzz's roundf: floor(x + 0.5), halves up.
+fn _round(x as f64) as i64 {
+    let is f64 as y = x + 0.5;
+    let is i64 as t = cast(i64, y);
+    if (cast(f64, t) > y) { return t - 1; }
+    return t;
+}
+
+fn _zero(e as *Extents) as void {
+    e.x_bearing = 0;
+    e.y_bearing = 0;
+    e.width = 0;
+    e.height = 0;
+}
+
+// The bounds of a CFF glyph's path, as HarfBuzz's charstring interpreter
+// finds them: every point a line or curve passes, its control points too,
+// and the point a contour starts from once something is drawn from it.
+fn _cff_extents(p as *path.Path, e as *Extents) as void {
+    let is f64 as minx with mut = 1.0e300;
+    let is f64 as miny with mut = 1.0e300;
+    let is f64 as maxx with mut = 0.0 - 1.0e300;
+    let is f64 as maxy with mut = 0.0 - 1.0e300;
+    let is f64 as cx with mut = 0.0;
+    let is f64 as cy with mut = 0.0;
+    let is i32 as open with mut = 0;
+    let is i64 as pt with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < p.ncmd) {
+        let is i64 as kind = cast(i64, p.cmds[k]);
+        let is i64 as n with mut = 0;
+        if (kind == path.MOVE || kind == path.LINE) { n = 1; }
+        if (kind == path.QUAD) { n = 2; }
+        if (kind == path.CUBIC) { n = 3; }
+        if (kind == path.MOVE) {
+            open = 0;
+        } else if (n > 0) {
+            if (open == 0) {
+                open = 1;
+                if (cx < minx) { minx = cx; }
+                if (cy < miny) { miny = cy; }
+                if (cx > maxx) { maxx = cx; }
+                if (cy > maxy) { maxy = cy; }
+            }
+            let is i64 as j with mut = 0;
+            while (j < n) {
+                let is f64 as x = path._x(p, pt + j);
+                let is f64 as y = path._y(p, pt + j);
+                if (x < minx) { minx = x; }
+                if (y < miny) { miny = y; }
+                if (x > maxx) { maxx = x; }
+                if (y > maxy) { maxy = y; }
+                j = j + 1;
+            }
+        }
+        if (n > 0) {
+            cx = path._x(p, pt + n - 1);
+            cy = path._y(p, pt + n - 1);
+        }
+        pt = pt + n;
+        k = k + 1;
+    }
+    _zero(e);
+    if (minx < maxx) {
+        e.x_bearing = _round(minx);
+        e.width = _round(maxx) - e.x_bearing;
+    }
+    if (miny < maxy) {
+        e.y_bearing = _round(maxy);
+        e.height = _round(miny) - e.y_bearing;
+    }
+}
+
+// Glyph gid's extents at the instance, as HarfBuzz gives them: a TrueType
+// glyph's from its header — its left side bearing from hmtx — or, at an
+// instance, from its points; a CFF glyph's from its charstring. 1, or 0 for
+// a glyph that cannot be read.
+fn extents(r as *Reader, gid as i64, e as *Extents) as i32 {
+    let is *table.Face as f = r.face;
+    _zero(e);
+    if (f.outline == table.OUTLINE_GLYF) {
+        let is i64 as w with mut = 2;
+        if (f.loc_long == 1) { w = 4; }
+        let is i64 as n with mut = f.loca.len / w - 1;
+        if (n < 1) { n = 1; }
+        if (n > f.glyphs) { n = f.glyphs; }
+        if (gid < 0 || gid >= n) { return 0; }
+        if (var.is_default(&r.coords) == 0) {
+            let is [4]f64 as b;
+            if (glyf.bounds(f, &r.pts, gid, &r.coords, cast(*f64, &b)) == 0) { return 0; }
+            if (b[0] >= b[2] || b[1] >= b[3]) { return 1; }
+            e.x_bearing = _round(b[0]);
+            e.width = _round(b[2] - cast(f64, e.x_bearing));
+            e.y_bearing = _round(b[3]);
+            e.height = _round(b[1] - cast(f64, e.y_bearing));
+            return 1;
+        }
+        let is i64 as len with mut = 0;
+        let is i64 as g = glyf.extent(f, gid, &len);
+        // Out of order, outside glyf, or too short for a header: empty.
+        if (g < 0 || len < 10) { return 1; }
+        let is i64 as x0 = table.i16_at(f, g + 2);
+        let is i64 as y0 = table.i16_at(f, g + 4);
+        let is i64 as x1 = table.i16_at(f, g + 6);
+        let is i64 as y1 = table.i16_at(f, g + 8);
+        let is i64 as lo with mut = x0;
+        let is i64 as hi with mut = x1;
+        if (x1 < x0) { lo = x1; hi = x0; }
+        let is i64 as bottom with mut = y0;
+        let is i64 as top with mut = y1;
+        if (y1 < y0) { bottom = y1; top = y0; }
+        e.x_bearing = hmtx.lsb(f, gid);
+        e.y_bearing = top;
+        e.width = hi - lo;
+        e.height = bottom - top;
+        return 1;
+    }
+    if (f.outline == table.OUTLINE_CFF || f.outline == table.OUTLINE_CFF2) {
+        if (r.cff.ok == 0 || gid < 0 || gid >= f.glyphs) { return 0; }
+        if (r.measuring == 0) {
+            r.measure = path.open(65536);
+            if (path.ok(&r.measure) == 0) { return 0; }
+            r.measuring = 1;
+        }
+        if (cff.glyph(f, &r.cff, gid, &r.coords, &r.measure) == 0) { return 0; }
+        _cff_extents(&r.measure, e);
+        return 1;
+    }
+    return 0;
 }

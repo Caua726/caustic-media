@@ -214,6 +214,7 @@ def check_against_hb(hbfont, gid, lines, what):
 
 
 def round_hb(v):
-    # roundf: halves away from zero.
+    # HarfBuzz's roundf, which is floor(v + 0.5): halves up, not away from
+    # zero as C's is.
     import math
-    return int(math.floor(v + 0.5)) if v >= 0 else -int(math.floor(-v + 0.5))
+    return int(math.floor(v + 0.5))

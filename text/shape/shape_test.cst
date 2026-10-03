@@ -1,0 +1,364 @@
+// text/shape/shape_test.cst — shaping held to HarfBuzz: every case of every
+// text/testdata/*.shape.ref (written by text/tools/shape_reference.py)
+// shaped here, and its glyphs, clusters, flags, advances and offsets
+// compared with HarfBuzz's, all of them, exactly.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../sfnt/sfnt.cst" as sfnt;
+use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
+use "../outline/outline.cst" as outline;
+use "shape.cst" as shape;
+use "buffer.cst" as buffer;
+use "tag.cst" as tag;
+
+let is i32 as fails with mut = 0;
+let is i32 as cases with mut = 0;
+
+// --- Files ---
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+// --- The reference, a line at a time ---
+
+let is *u8 as ref with mut;
+let is i64 as ref_len with mut = 0;
+let is i64 as at with mut = 0;      // the next line's start
+let is i64 as lp with mut = 0;      // reading within the current line
+let is i64 as le with mut = 0;      // the current line's end
+
+fn _c(i as i64) as i64 {
+    if (i >= ref_len) { return 0; }
+    return cast(i64, ref[i]);
+}
+
+// The next line made current; 0 at the end.
+fn next_line() as i32 {
+    if (at >= ref_len) { return 0; }
+    lp = at;
+    le = at;
+    while (le < ref_len && _c(le) != 10) { le = le + 1; }
+    at = le + 1;
+    return 1;
+}
+
+fn _skip() as void {
+    while (lp < le && _c(lp) == 32) { lp = lp + 1; }
+}
+
+let is [256]u8 as word;
+
+// The next word of the line into word; its length.
+fn next_word() as i64 {
+    _skip();
+    let is i64 as n with mut = 0;
+    while (lp < le && _c(lp) != 32 && n < 255) {
+        word[n] = cast(u8, _c(lp));
+        n = n + 1;
+        lp = lp + 1;
+    }
+    word[n] = 0;
+    return n;
+}
+
+// The rest of the line into word.
+fn rest() as void {
+    _skip();
+    let is i64 as n with mut = 0;
+    while (lp < le && n < 255) {
+        word[n] = cast(u8, _c(lp));
+        n = n + 1;
+        lp = lp + 1;
+    }
+    word[n] = 0;
+}
+
+fn is_word(w as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (1 == 1) {
+        let is i64 as a = cast(i64, word[i]);
+        let is i64 as b = cast(i64, w[i]);
+        if (a != b) { return 0; }
+        if (a == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn num() as i64 {
+    _skip();
+    let is i64 as sign with mut = 1;
+    if (_c(lp) == 45) { sign = 0 - 1; lp = lp + 1; }
+    let is i64 as v with mut = 0;
+    while (lp < le && _c(lp) >= 48 && _c(lp) <= 57) {
+        v = v * 10 + (_c(lp) - 48);
+        lp = lp + 1;
+    }
+    return sign * v;
+}
+
+fn fnum() as f64 {
+    _skip();
+    let is f64 as sign with mut = 1.0;
+    if (_c(lp) == 45) { sign = 0.0 - 1.0; lp = lp + 1; }
+    let is f64 as v with mut = 0.0;
+    while (lp < le && _c(lp) >= 48 && _c(lp) <= 57) {
+        v = v * 10.0 + cast(f64, _c(lp) - 48);
+        lp = lp + 1;
+    }
+    if (_c(lp) == 46) {
+        lp = lp + 1;
+        let is f64 as scale with mut = 0.1;
+        while (lp < le && _c(lp) >= 48 && _c(lp) <= 57) {
+            v = v + cast(f64, _c(lp) - 48) * scale;
+            scale = scale / 10.0;
+            lp = lp + 1;
+        }
+    }
+    return sign * v;
+}
+
+fn _hex(c as i64) as i64 {
+    if (c >= 97) { return c - 87; }
+    return c - 48;
+}
+
+// The keyword expected at the start of the next line.
+fn expect(w as *u8) as void {
+    next_line();
+    next_word();
+    if (is_word(w) == 0) {
+        io.printf("FAIL: reference: '%s' where '%s' was expected\n", cast(*u8, &word), w);
+        fails = fails + 1;
+    }
+}
+
+// --- One case ---
+
+let is [4096]u8 as text;
+let is [64]shape.Feature as feats;
+let is [256]u8 as name;
+let is [64]u8 as lang;
+
+fn _copy_word(dst as *u8, cap as i64) as void {
+    let is i64 as i with mut = 0;
+    while (word[i] != 0 && i < cap - 1) {
+        dst[i] = word[i];
+        i = i + 1;
+    }
+    dst[i] = 0;
+}
+
+// The case starting at the current line, read and shaped with the font in
+// data, and compared.
+fn run_case(font as *u8, data as *u8, size as i64, b as *buffer.Buffer) as void {
+    rest();
+    _copy_word(cast(*u8, &name), 256);
+    expect("face");
+    let is i64 as index = num();
+    expect("text");
+    let is i64 as n with mut = 0;
+    _skip();
+    if (_c(lp) == 45) {
+        lp = lp + 1;
+    } else {
+        while (lp < le) {
+            _skip();
+            if (lp < le) {
+                text[n] = cast(u8, _hex(_c(lp)) * 16 + _hex(_c(lp + 1)));
+                n = n + 1;
+                lp = lp + 2;
+            }
+        }
+    }
+    expect("item");
+    let is i64 as off = num();
+    let is i64 as length = num();
+    expect("props");
+    next_word();
+    let is i64 as dir with mut = buffer.LTR;
+    if (is_word("rtl") == 1) { dir = buffer.RTL; }
+    next_word();
+    let is i64 as script = tag.of(cast(*u8, &word));
+    next_word();
+    let is *u8 as lg with mut = cast(*u8, 0);
+    if (is_word("-") == 0) {
+        _copy_word(cast(*u8, &lang), 64);
+        lg = cast(*u8, &lang);
+    }
+    expect("flags");
+    let is i64 as flags = num();
+    expect("features");
+    let is i64 as nf = num();
+    let is i64 as k with mut = 0;
+    while (k < nf) {
+        next_line();
+        next_word();
+        feats[k].tag = tag.of(cast(*u8, &word));
+        feats[k].value = num();
+        feats[k].start = num();
+        feats[k].end = num();
+        k = k + 1;
+    }
+
+    let is table.Face as f = sfnt.open(data, size, index);
+    let is outline.Reader as r = outline.open(&f);
+    expect("variations");
+    let is i64 as nv = num();
+    if (nv > 0) {
+        let is var.Design as d = var.design(&f);
+        k = 0;
+        while (k < nv) {
+            next_line();
+            next_word();
+            let is i64 as t = tag.of(cast(*u8, &word));
+            var.set(&d, &f, t, fnum());
+            k = k + 1;
+        }
+        let is var.Coords as c = var.coords(&f, &d);
+        outline.vary(&r, &c);
+    }
+
+    let is shape.Run as run;
+    run.text = cast(*u8, &text);
+    run.n = n;
+    run.offset = off;
+    run.length = length;
+    run.dir = dir;
+    run.script = script;
+    run.lang = lg;
+    run.features = cast(*shape.Feature, &feats);
+    run.nfeatures = nf;
+    run.flags = flags;
+    let is i32 as ok = shape.shape(&r, b, &run);
+
+    expect("glyphs");
+    let is i64 as ng = num();
+    let is i32 as bad with mut = 0;
+    if (ok == 0) {
+        io.printf("FAIL: %s, %s: shaping stopped\n", font, cast(*u8, &name));
+        bad = 1;
+    }
+    if (b.len != ng && bad == 0) {
+        io.printf("FAIL: %s, %s: %d glyphs, HarfBuzz %d\n", font, cast(*u8, &name), b.len, ng);
+        bad = 1;
+    }
+    k = 0;
+    while (k < ng) {
+        next_line();
+        let is i64 as g = num();
+        let is i64 as cl = num();
+        let is i64 as fl = num();
+        let is i64 as xa = num();
+        let is i64 as ya = num();
+        let is i64 as xo = num();
+        let is i64 as yo = num();
+        if (bad == 0 && k < b.len) {
+            let is buffer.Info as i = b.info[k];
+            let is buffer.Pos as p = b.pos[k];
+            if (cast(i64, i.cp) != g || cast(i64, i.cluster) != cl || cast(i64, i.mask) != fl ||
+                cast(i64, p.xa) != xa || cast(i64, p.ya) != ya || cast(i64, p.xo) != xo || cast(i64, p.yo) != yo) {
+                io.printf("FAIL: %s, %s: glyph %d is %d %d %d %d %d %d %d, HarfBuzz's %d %d %d %d %d %d %d\n",
+                          font, cast(*u8, &name), k, cast(i64, i.cp), cast(i64, i.cluster), cast(i64, i.mask),
+                          cast(i64, p.xa), cast(i64, p.ya), cast(i64, p.xo), cast(i64, p.yo), g, cl, fl, xa, ya, xo, yo);
+                bad = 1;
+            }
+        }
+        k = k + 1;
+    }
+    if (bad == 1) { fails = fails + 1; }
+    outline.close(&r);
+    cases = cases + 1;
+}
+
+// Every case of font's reference.
+fn reference(font as *u8) as void {
+    let is [256]u8 as path;
+    let is [256]u8 as rpath;
+    let is i64 as i with mut = 0;
+    let is *u8 as dir = "text/testdata/";
+    let is i64 as dn = 14;
+    mem.memcpy(cast(*u8, &path), dir, dn);
+    mem.memcpy(cast(*u8, &rpath), dir, dn);
+    while (font[i] != 0) {
+        path[dn + i] = font[i];
+        i = i + 1;
+    }
+    path[dn + i] = 0;
+    // <name>.shape.ref beside <name>.<ext>
+    let is i64 as dot with mut = i;
+    while (dot > 0 && font[dot] != 46) { dot = dot - 1; }
+    let is i64 as j with mut = 0;
+    while (j < dot) {
+        rpath[dn + j] = font[j];
+        j = j + 1;
+    }
+    let is *u8 as suffix = ".shape.ref";
+    let is i64 as s with mut = 0;
+    while (suffix[s] != 0) {
+        rpath[dn + j + s] = suffix[s];
+        s = s + 1;
+    }
+    rpath[dn + j + s] = 0;
+    let is *u8 as data = load(cast(*u8, &path));
+    let is i64 as size = loaded;
+    if (cast(i64, data) == 0) {
+        io.printf("FAIL: cannot read %s\n", cast(*u8, &path));
+        fails = fails + 1;
+        return;
+    }
+    ref = load(cast(*u8, &rpath));
+    ref_len = loaded;
+    at = 0;
+    if (cast(i64, ref) == 0) {
+        io.printf("FAIL: cannot read %s\n", cast(*u8, &rpath));
+        fails = fails + 1;
+        return;
+    }
+    let is buffer.Buffer as b = buffer.open();
+    while (next_line() == 1) {
+        next_word();
+        if (is_word("case") == 1) { run_case(font, data, size, &b); }
+    }
+    buffer.close(&b);
+}
+
+fn main() as i32 {
+    reference("shape.ttf");
+    reference("glyf.ttf");
+    reference("cff.otf");
+    reference("kern.ttf");
+    reference("cid.otf");
+    reference("cmaps.ttf");
+    reference("vf.ttf");
+    reference("cff2.otf");
+    reference("pair.ttc");
+    if (fails > 0) {
+        io.printf("shape: %d failures in %d cases\n", cast(i64, fails), cast(i64, cases));
+        return 1;
+    }
+    io.printf("shape: all %d cases as HarfBuzz shapes them\n", cast(i64, cases));
+    return 0;
+}

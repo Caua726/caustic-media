@@ -26,6 +26,7 @@ nothing, to reach what real fonts rarely do.
 | `bomb.ttf` | made by the tool | composites that loop, fan out and nest past the limit, and of exactly 4096 and 4097 components; 40000 points |
 | `bomb.otf` | made by the tool | subroutines that fan out past the operator limit |
 | `bomb-type1.otf` | made by the tool | Type 1 charstrings, which are refused |
+| `shape.ttf` | made by the tool | shaping without the font's help: no `GDEF` or `GSUB`, an empty `GPOS`; bases, marks above, below and through as rectangles; a spacing mark; variation sequences |
 | `fonts/` | made by the tool | a pretend system's fonts for [`../fonts`](../fonts/fonts.md): 32 files in nested directories, one not named as a font — a family in weights from 100 to 900, two widths, italic and oblique, a CFF face, legacy families split from typographic ones; variable faces over weight, width, slant, italic and optical size, some past CSS's ranges; Greek and Cyrillic companions; a collection of two CJK faces; a colour face standing for emoji; monospace; old weight classes, no `OS/2`, an `OS/2` too short, no names; weights between 400 and 500; a broken file and an empty one. Glyphs are squares: only what matching reads matters |
 
 `*.sfnt.ref` is what fontTools reads from each: tables, names, every cmap
@@ -37,6 +38,8 @@ is each at chosen instances: HarfBuzz's coordinates for them, every glyph's
 outline and advance, every `MVAR` delta — described at the top of
 `../tools/var_reference.py`. `raster.ref` is paths and glyphs of these fonts
 drawn as coverage, described at the top of `../tools/raster_reference.py`.
+`*.shape.ref` is text shaped by HarfBuzz in each font — glyphs, clusters, glyph
+flags and positions — described at the top of `../tools/shape_reference.py`.
 
 All are made by development tools that need fontTools and the source fonts; the
 output is versioned so the tests need none of them, and is the same byte for byte
@@ -54,4 +57,5 @@ python3 text/tools/sfnt_reference.py
 ~/.cache/caustic-media/venv/bin/python text/tools/outline_reference.py
 ~/.cache/caustic-media/venv/bin/python text/tools/var_reference.py
 ~/.cache/caustic-media/venv/bin/python text/tools/raster_reference.py
+~/.cache/caustic-media/venv/bin/python text/tools/shape_reference.py
 ```

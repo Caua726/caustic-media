@@ -919,8 +919,107 @@ def synthetic_fonts():
     open(os.path.join(FONTS, "odd", "readme.txt"), "w").write("Not a font; ignored for its name.\n")
 
 
+# What shape.ttf maps, and the marks among them by where they sit: above,
+# below, through the base, or spacing (an advance of their own, which
+# shaping takes away).
+SHAPE_BASES = ("".join(chr(c) for c in range(0x20, 0x7F)) + "«»çéÄäñḉαᾳ‐⁄◌∈‹›❤" +
+               "ހށނ" + "\U00010900\U00010901\U00010902" +
+               "\U0001F600\U0001F468\U0001F469\U0001F3FB\U0001F1E7\U0001F1F7")
+SHAPE_ABOVE = "ַָּّ̀́̂̃̈̊ަާ᩠༹"
+SHAPE_BELOW = "ِ̧̨̣࿆ͅ"
+SHAPE_THROUGH = "̴"
+SHAPE_SPACING = "༹"
+
+
+def make_shape_font(gpos):
+    # Glyphs are rectangles, each base its own advance so that positions
+    # tell glyphs apart; marks sit to the left of their origin, as combining
+    # marks are drawn, over, under or through where the base before them is.
+    # The emoji heart has a second glyph, chosen by VS16 through cmap format
+    # 14, and the plain one VS15 asks for by default. With gpos, an empty
+    # GPOS table: positioning by the font, which does nothing — no fallback.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib import newTable
+    from fontTools.ttLib.tables import otTables as ot
+
+    def rect(x0, y0, x1, y1):
+        pen = TTGlyphPen(None)
+        pen.moveTo((x0, y0)); pen.lineTo((x0, y1)); pen.lineTo((x1, y1)); pen.lineTo((x1, y0)); pen.closePath()
+        return pen.glyph()
+
+    marks = SHAPE_ABOVE + SHAPE_BELOW + SHAPE_THROUGH
+    cps = sorted(set(ord(c) for c in SHAPE_BASES + marks))
+    names = [".notdef"] + ["u%04X" % c for c in cps] + ["u2764.emoji"]
+    glyphs, metrics = {}, {}
+    glyphs[".notdef"] = rect(50, 0, 450, 700)
+    metrics[".notdef"] = (500, 50)
+    for i, c in enumerate(cps):
+        n = "u%04X" % c
+        ch = chr(c)
+        if ch in marks and ch not in SHAPE_SPACING:
+            adv = 0
+        else:
+            adv = 200 + (i * 73) % 600
+        if c == 0x20:
+            adv, g = 260, None
+        elif ch in SHAPE_ABOVE:
+            g = rect(-300 + adv, 550, -100 + adv, 700)
+        elif ch in SHAPE_BELOW:
+            g = rect(-300, -200, -100, -50)
+        elif ch in SHAPE_THROUGH:
+            g = rect(-350, 200, -50, 300)
+        else:
+            g = rect(40, 0, adv - 40, 500 if ch.islower() else 700)
+        if g is None:
+            pen = TTGlyphPen(None)
+            g = pen.glyph()
+        glyphs[n] = g
+        metrics[n] = (adv, getattr(g, "xMin", 0))
+    glyphs["u2764.emoji"] = rect(30, -100, 970, 800)
+    metrics["u2764.emoji"] = (1000, 30)
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({c: "u%04X" % c for c in cps},
+                         uvs=[(0x2764, 0xFE0F, "u2764.emoji"), (0x2764, 0xFE0E, None)])
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(metrics)
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    family = "Caustic Test Shape" + ("" if gpos else " Plain")
+    fb.setupNameTable({"familyName": family, "styleName": "Regular", "uniqueFontIdentifier": family,
+                       "fullName": family, "psName": family.replace(" ", "")}, mac=False)
+    fb.setupOS2(usWeightClass=400, version=4, sTypoAscender=800, sTypoDescender=-200,
+                usWinAscent=800, usWinDescent=200)
+    fb.setupPost()
+    fb.updateHead(created=3786825600, modified=3786825600)
+    if gpos:
+        t = newTable("GPOS")
+        t.table = ot.GPOS()
+        t.table.Version = 0x00010000
+        t.table.ScriptList = ot.ScriptList()
+        t.table.ScriptList.ScriptRecord = []
+        t.table.ScriptList.ScriptCount = 0
+        t.table.FeatureList = ot.FeatureList()
+        t.table.FeatureList.FeatureRecord = []
+        t.table.FeatureList.FeatureCount = 0
+        t.table.LookupList = ot.LookupList()
+        t.table.LookupList.Lookup = []
+        t.table.LookupList.LookupCount = 0
+        fb.font["GPOS"] = t
+    return fb.font
+
+
+def synthetic_shape():
+    # Made from nothing, so under no licence.
+    for name, gpos in (("shape.ttf", True),):
+        path = os.path.join(OUT, name)
+        make_shape_font(gpos).save(path)
+        print(name, os.path.getsize(path), "bytes")
+
+
 def main():
     os.makedirs(os.path.join(OUT, "licenses"), exist_ok=True)
+    synthetic_shape()
     synthetic_fonts()
     synthetic_big()
     synthetic_var()

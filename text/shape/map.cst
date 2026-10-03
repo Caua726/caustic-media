@@ -1,0 +1,543 @@
+// text/shape/map.cst — the plan's map: which lookups apply, to which
+// glyphs, in which order. HarfBuzz's hb_ot_map_t and its builder.
+//
+// Features are asked for by the shaper and by the program, each over the
+// whole run or a stretch of it, each with a value. The map merges those of
+// one tag, finds each in the language system the script and language
+// select in GSUB and GPOS, and gives each that is found bits in the glyphs'
+// masks — none for a feature on everywhere with value 1, which shares the
+// one global bit. Then each table's lookups, in stages: within a stage, the
+// lookups of every feature in it, each once, in lookup order, applied to
+// the glyphs whose masks hold any of the features that asked for it.
+use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
+use "std/mem.cst" as mem;
+use "ot.cst" as ot;
+use "tag.cst" as tag;
+
+// Feature flags, HarfBuzz's.
+let is i64 as F_GLOBAL with imut = 1;
+let is i64 as F_HAS_FALLBACK with imut = 2;
+let is i64 as F_MANUAL_ZWNJ with imut = 4;
+let is i64 as F_MANUAL_ZWJ with imut = 8;
+let is i64 as F_GLOBAL_SEARCH with imut = 16;
+let is i64 as F_RANDOM with imut = 32;
+let is i64 as F_PER_SYLLABLE with imut = 64;
+
+let is i64 as MAX_BITS with imut = 8;
+let is i64 as MAX_VALUE with imut = 255;
+let is i64 as GLOBAL_SHIFT with imut = 31;
+let is i64 as GLOBAL_MASK with imut = 2147483648;
+
+// A feature as asked for, before the map is made.
+struct Info {
+    tag       as i64;
+    seq       as i64;
+    max_value as i64;
+    flags     as i64;
+    default_value as i64;
+    stage0    as i64;
+    stage1    as i64;
+}
+
+// A feature in the map.
+struct Feature {
+    tag       as i64;
+    index0    as i64;   // in GSUB and GPOS; ot.NOT_FOUND where absent
+    index1    as i64;
+    stage0    as i64;
+    stage1    as i64;
+    shift     as i64;
+    mask      as i64;
+    one_mask  as i64;   // its mask at value 1
+    needs_fallback as i32;
+    auto_zwnj as i32;
+    auto_zwj  as i32;
+    random    as i32;
+    per_syllable as i32;
+    _pad0     as i32;
+}
+
+// A lookup in the map.
+struct Lookup {
+    index     as i64;
+    mask      as i64;
+    tag       as i64;
+    auto_zwnj as i32;
+    auto_zwj  as i32;
+    random    as i32;
+    per_syllable as i32;
+}
+
+// The map, and the builder's state before it is compiled. Its arrays are
+// two blocks: the features, sized by begin() for as many as will be asked
+// for; the lookups, sized by compile() for all the features found have.
+struct Map {
+    fblock     as *u8;
+    fbytes     as i64;
+    lblock     as *u8;
+    lbytes     as i64;
+    infos      as *Info;
+    ninfos     as i64;
+    cap_infos  as i64;
+    features   as *Feature;
+    nfeatures  as i64;
+    lookups0   as *Lookup;
+    nlookups0  as i64;
+    lookups1   as *Lookup;
+    nlookups1  as i64;
+    cap_lookups as i64;
+    stages0    as [16]i64;  // each stage's end among the lookups
+    nstages0   as i64;
+    stages1    as [16]i64;
+    nstages1   as i64;
+    current0   as i64;      // the stage features are being added to
+    current1   as i64;
+    global_mask as i64;
+    // What the script and language select in each table.
+    gsub       as ot.Layout;
+    gpos       as ot.Layout;
+    chosen0    as i64;
+    chosen1    as i64;
+    found0     as i32;
+    found1     as i32;
+    script0    as i64;
+    script1    as i64;
+    lang0      as i64;
+    lang1      as i64;
+}
+
+fn _layout(m as *Map, t as i64) as *ot.Layout {
+    if (t == 0) { return &m.gsub; }
+    return &m.gpos;
+}
+
+fn open() as Map {
+    let is Map as m;
+    mem.memzero(cast(*u8, &m), sizeof(Map));
+    return m;
+}
+
+fn close(m as *Map) as void {
+    if (m.fbytes > 0) { mem.core.munmap(m.fblock, m.fbytes); }
+    if (m.lbytes > 0) { mem.core.munmap(m.lblock, m.lbytes); }
+    m.fblock = cast(*u8, 0);
+    m.fbytes = 0;
+    m.lblock = cast(*u8, 0);
+    m.lbytes = 0;
+}
+
+// A block of at least need bytes in *block, of *bytes, kept when it is large
+// enough; 0 when the memory is refused.
+fn _block(block as **u8, bytes as *i64, need as i64) as i32 {
+    if (need <= *bytes) { return 1; }
+    if (*bytes > 0) { mem.core.munmap(*block, *bytes); }
+    let is i64 as n with mut = 4096;
+    while (n < need) { n = n * 2; }
+    *block = mem.core.mmap_anon(n);
+    if (cast(i64, *block) <= 0) {
+        *bytes = 0;
+        return 0;
+    }
+    *bytes = n;
+    return 1;
+}
+
+// The builder started for a face, a script (ISO 15924) and a language
+// (BCP 47, or null), with room for up to ninfos features: the script and
+// language systems selected in GSUB and GPOS.
+fn begin(m as *Map, f as *table.Face, script as i64, lang as *u8, ninfos as i64) as i32 {
+    m.gsub = ot.layout(f, f.gsub);
+    m.gpos = ot.layout(f, f.gpos);
+    if (_block(&m.fblock, &m.fbytes, ninfos * (sizeof(Info) + sizeof(Feature))) == 0) { return 0; }
+    m.infos = cast(*Info, m.fblock);
+    m.features = cast(*Feature, cast(i64, m.fblock) + ninfos * sizeof(Info));
+    m.cap_infos = ninfos;
+    m.ninfos = 0;
+    m.nfeatures = 0;
+    m.nlookups0 = 0;
+    m.nlookups1 = 0;
+    m.nstages0 = 0;
+    m.nstages1 = 0;
+    m.current0 = 0;
+    m.current1 = 0;
+    let is [3]i64 as stags;
+    let is [3]i64 as ltags;
+    let is i64 as sn with mut = tag.MAX_TAGS;
+    let is i64 as ln with mut = tag.MAX_TAGS;
+    tag.from_script_and_language(script, lang, cast(*i64, &stags), &sn, cast(*i64, &ltags), &ln);
+    let is i64 as idx with mut = 0;
+    let is i64 as chosen with mut = 0;
+    m.found0 = ot.select_script(f, &m.gsub, cast(*i64, &stags), sn, &idx, &chosen);
+    m.script0 = idx;
+    m.chosen0 = chosen;
+    m.lang0 = ot.select_language(f, &m.gsub, idx, cast(*i64, &ltags), ln);
+    m.found1 = ot.select_script(f, &m.gpos, cast(*i64, &stags), sn, &idx, &chosen);
+    m.script1 = idx;
+    m.chosen1 = chosen;
+    m.lang1 = ot.select_language(f, &m.gpos, idx, cast(*i64, &ltags), ln);
+    return 1;
+}
+
+fn add_feature(m as *Map, t as i64, flags as i64, value as i64) as void {
+    if (t == 0 || m.ninfos >= m.cap_infos) { return; }
+    let is *Info as i = &m.infos[m.ninfos];
+    m.ninfos = m.ninfos + 1;
+    i.tag = t;
+    i.seq = m.ninfos;
+    i.max_value = value;
+    i.flags = flags;
+    i.default_value = 0;
+    if ((flags & F_GLOBAL) != 0) { i.default_value = value; }
+    i.stage0 = m.current0;
+    i.stage1 = m.current1;
+}
+
+fn enable_feature(m as *Map, t as i64, flags as i64, value as i64) as void {
+    add_feature(m, t, F_GLOBAL | flags, value);
+}
+
+fn add_gsub_pause(m as *Map) as void { m.current0 = m.current0 + 1; }
+fn add_gpos_pause(m as *Map) as void { m.current1 = m.current1 + 1; }
+
+fn _before(a as *Info, b as *Info) as i32 {
+    if (a.tag != b.tag) { return cast(i32, a.tag < b.tag); }
+    return cast(i32, a.seq < b.seq);
+}
+
+// The features asked for sorted by tag, then by the order they were asked
+// for in.
+fn _sort_infos(m as *Map) as void {
+    let is i64 as i with mut = 1;
+    while (i < m.ninfos) {
+        let is Info as t = m.infos[i];
+        let is i64 as j with mut = i;
+        while (j > 0 && _before(&t, &m.infos[j - 1]) == 1) {
+            m.infos[j] = m.infos[j - 1];
+            j = j - 1;
+        }
+        m.infos[j] = t;
+        i = i + 1;
+    }
+}
+
+// How many bits value needs.
+fn _bits(value as i64) as i64 {
+    let is i64 as n with mut = 0;
+    while ((value >> n) != 0) { n = n + 1; }
+    return n;
+}
+
+// Feature tag's index in the language system selected in table t — the
+// earliest, as HarfBuzz finds it; NOT_FOUND for none.
+fn _langsys_feature(f as *table.Face, m as *Map, t as i64, ft as i64) as i64 {
+    let is *ot.Layout as l = _layout(m, t);
+    let is i64 as script with mut = m.script0;
+    let is i64 as lang with mut = m.lang0;
+    if (t == 1) {
+        script = m.script1;
+        lang = m.lang1;
+    }
+    let is i64 as ls = ot.langsys(f, l, script, lang);
+    let is i64 as n = ot.langsys_feature_count(f, l, ls);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as k = ot.langsys_feature(f, l, ls, i);
+        if (ot.feature_tag(f, l, k) == ft) { return k; }
+        i = i + 1;
+    }
+    return ot.NOT_FOUND;
+}
+
+fn _push_lookup(m as *Map, t as i64, index as i64, mask as i64, auto_zwnj as i32, auto_zwj as i32,
+                random as i32, per_syllable as i32, ft as i64) as void {
+    let is *Lookup as k with mut = cast(*Lookup, 0);
+    if (t == 0) {
+        if (m.nlookups0 >= m.cap_lookups) { return; }
+        k = &m.lookups0[m.nlookups0];
+        m.nlookups0 = m.nlookups0 + 1;
+    } else {
+        if (m.nlookups1 >= m.cap_lookups) { return; }
+        k = &m.lookups1[m.nlookups1];
+        m.nlookups1 = m.nlookups1 + 1;
+    }
+    k.index = index;
+    k.mask = mask;
+    k.tag = ft;
+    k.auto_zwnj = auto_zwnj;
+    k.auto_zwj = auto_zwj;
+    k.random = random;
+    k.per_syllable = per_syllable;
+}
+
+// The lookups of feature index — of its substitute under the variations
+// record var_index — pushed for table t.
+fn _add_lookups(f as *table.Face, m as *Map, t as i64, index as i64, var_index as i64, mask as i64,
+                auto_zwnj as i32, auto_zwj as i32, random as i32, per_syllable as i32, ft as i64) as void {
+    let is *ot.Layout as l = _layout(m, t);
+    let is i64 as total = ot.lookup_count(f, l);
+    let is i64 as fte = ot.feature_table(f, l, index, var_index);
+    let is i64 as n = ot.feature_lookup_count(f, l, fte);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as k = ot.feature_lookup(f, l, fte, i);
+        if (k < total) { _push_lookup(m, t, k, mask, auto_zwnj, auto_zwj, random, per_syllable, ft); }
+        i = i + 1;
+    }
+}
+
+fn _lookups(m as *Map, t as i64) as *Lookup {
+    if (t == 0) { return m.lookups0; }
+    return m.lookups1;
+}
+
+fn _nlookups(m as *Map, t as i64) as i64 {
+    if (t == 0) { return m.nlookups0; }
+    return m.nlookups1;
+}
+
+fn _set_nlookups(m as *Map, t as i64, n as i64) as void {
+    if (t == 0) { m.nlookups0 = n; } else { m.nlookups1 = n; }
+}
+
+// Lookups from start sorted by index, stably, and each index kept once,
+// with the masks of all that asked for it.
+fn _merge_lookups(m as *Map, t as i64, start as i64) as void {
+    let is *Lookup as a = _lookups(m, t);
+    let is i64 as n = _nlookups(m, t);
+    if (start + 1 >= n) { return; }
+    let is i64 as i with mut = start + 1;
+    while (i < n) {
+        let is Lookup as x = a[i];
+        let is i64 as j with mut = i;
+        while (j > start && a[j - 1].index > x.index) {
+            a[j] = a[j - 1];
+            j = j - 1;
+        }
+        a[j] = x;
+        i = i + 1;
+    }
+    let is i64 as w with mut = start;
+    i = start + 1;
+    while (i < n) {
+        if (a[i].index != a[w].index) {
+            w = w + 1;
+            a[w] = a[i];
+        } else {
+            a[w].mask = a[w].mask | a[i].mask;
+            a[w].auto_zwnj = a[w].auto_zwnj & a[i].auto_zwnj;
+            a[w].auto_zwj = a[w].auto_zwj & a[i].auto_zwj;
+        }
+        i = i + 1;
+    }
+    _set_nlookups(m, t, w + 1);
+}
+
+// The map made from the features asked for. var0 and var1 are the
+// FeatureVariations records GSUB's and GPOS's features are taken from
+// (ot.NO_VARIATIONS for none).
+fn compile(f as *table.Face, m as *Map, var0 as i64, var1 as i64) as void {
+    m.global_mask = GLOBAL_MASK;
+    let is i64 as req_index0 = ot.required_feature(f, &m.gsub, ot.langsys(f, &m.gsub, m.script0, m.lang0));
+    let is i64 as req_index1 = ot.required_feature(f, &m.gpos, ot.langsys(f, &m.gpos, m.script1, m.lang1));
+    let is i64 as req_tag0 = ot.feature_tag(f, &m.gsub, req_index0);
+    let is i64 as req_tag1 = ot.feature_tag(f, &m.gpos, req_index1);
+    let is i64 as req_stage0 with mut = 0;
+    let is i64 as req_stage1 with mut = 0;
+
+    // Sort and merge duplicates.
+    if (m.ninfos > 0) {
+        _sort_infos(m);
+        let is *Info as fi = m.infos;
+        let is i64 as j with mut = 0;
+        let is i64 as i with mut = 1;
+        while (i < m.ninfos) {
+            if (fi[i].tag != fi[j].tag) {
+                j = j + 1;
+                fi[j] = fi[i];
+            } else {
+                if ((fi[i].flags & F_GLOBAL) != 0) {
+                    fi[j].flags = fi[j].flags | F_GLOBAL;
+                    fi[j].max_value = fi[i].max_value;
+                    fi[j].default_value = fi[i].default_value;
+                } else {
+                    if ((fi[j].flags & F_GLOBAL) != 0) { fi[j].flags = fi[j].flags ^ F_GLOBAL; }
+                    if (fi[i].max_value > fi[j].max_value) { fi[j].max_value = fi[i].max_value; }
+                }
+                fi[j].flags = fi[j].flags | (fi[i].flags & F_HAS_FALLBACK);
+                if (fi[i].stage0 < fi[j].stage0) { fi[j].stage0 = fi[i].stage0; }
+                if (fi[i].stage1 < fi[j].stage1) { fi[j].stage1 = fi[i].stage1; }
+            }
+            i = i + 1;
+        }
+        m.ninfos = j + 1;
+    }
+
+    // Bits for each feature found.
+    let is i64 as next_bit with mut = 4;
+    let is i64 as i with mut = 0;
+    while (i < m.ninfos) {
+        let is *Info as info = &m.infos[i];
+        let is i64 as bits with mut = 0;
+        if ((info.flags & F_GLOBAL) == 0 || info.max_value != 1) {
+            bits = _bits(info.max_value);
+            if (bits > MAX_BITS) { bits = MAX_BITS; }
+        }
+        if (info.max_value != 0 && next_bit + bits < GLOBAL_SHIFT) {
+            if (req_tag0 == info.tag) { req_stage0 = info.stage0; }
+            if (req_tag1 == info.tag) { req_stage1 = info.stage1; }
+            let is i64 as k0 with mut = _langsys_feature(f, m, 0, info.tag);
+            let is i64 as k1 with mut = _langsys_feature(f, m, 1, info.tag);
+            let is i32 as found = cast(i32, k0 != ot.NOT_FOUND || k1 != ot.NOT_FOUND);
+            let is i32 as found_any with mut = found;
+            if (found == 0 && (info.flags & F_GLOBAL_SEARCH) != 0) {
+                k0 = ot.find_feature(f, &m.gsub, info.tag);
+                k1 = ot.find_feature(f, &m.gpos, info.tag);
+                found_any = cast(i32, k0 != ot.NOT_FOUND || k1 != ot.NOT_FOUND);
+            }
+            if (found_any == 1 || (info.flags & F_HAS_FALLBACK) != 0) {
+                let is *Feature as fm = &m.features[m.nfeatures];
+                m.nfeatures = m.nfeatures + 1;
+                fm.tag = info.tag;
+                fm.index0 = k0;
+                fm.index1 = k1;
+                fm.stage0 = info.stage0;
+                fm.stage1 = info.stage1;
+                fm.auto_zwnj = cast(i32, (info.flags & F_MANUAL_ZWNJ) == 0);
+                fm.auto_zwj = cast(i32, (info.flags & F_MANUAL_ZWJ) == 0);
+                fm.random = cast(i32, (info.flags & F_RANDOM) != 0);
+                fm.per_syllable = cast(i32, (info.flags & F_PER_SYLLABLE) != 0);
+                if ((info.flags & F_GLOBAL) != 0 && info.max_value == 1) {
+                    fm.shift = GLOBAL_SHIFT;
+                    fm.mask = GLOBAL_MASK;
+                } else {
+                    fm.shift = next_bit;
+                    fm.mask = (1 << (next_bit + bits)) - (1 << next_bit);
+                    next_bit = next_bit + bits;
+                    m.global_mask = m.global_mask | ((info.default_value << fm.shift) & fm.mask);
+                }
+                fm.one_mask = (1 << fm.shift) & fm.mask;
+                fm.needs_fallback = 1 - found_any;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Room for every lookup the features found have, before they are
+    // merged.
+    let is i64 as most with mut = 0;
+    let is i64 as t with mut = 0;
+    while (t < 2) {
+        let is *ot.Layout as l = _layout(m, t);
+        let is i64 as var_index with mut = var0;
+        let is i64 as n with mut = 0;
+        if (t == 0) {
+            n = ot.feature_lookup_count(f, l, ot.feature_table(f, l, req_index0, var0));
+        } else {
+            var_index = var1;
+            n = ot.feature_lookup_count(f, l, ot.feature_table(f, l, req_index1, var1));
+        }
+        let is i64 as k with mut = 0;
+        while (k < m.nfeatures) {
+            let is i64 as fidx with mut = m.features[k].index0;
+            if (t == 1) { fidx = m.features[k].index1; }
+            n = n + ot.feature_lookup_count(f, l, ot.feature_table(f, l, fidx, var_index));
+            k = k + 1;
+        }
+        if (n > most) { most = n; }
+        t = t + 1;
+    }
+    if (_block(&m.lblock, &m.lbytes, 2 * (most + 1) * sizeof(Lookup)) == 0) { return; }
+    m.lookups0 = cast(*Lookup, m.lblock);
+    m.lookups1 = cast(*Lookup, cast(i64, m.lblock) + (most + 1) * sizeof(Lookup));
+    m.cap_lookups = most + 1;
+
+    // Each table's lookups, stage by stage; the last stage ends both.
+    add_gsub_pause(m);
+    add_gpos_pause(m);
+    t = 0;
+    while (t < 2) {
+        let is i64 as stages with mut = m.current0;
+        let is i64 as req with mut = req_index0;
+        let is i64 as req_stage with mut = req_stage0;
+        let is i64 as var_index with mut = var0;
+        if (t == 1) {
+            stages = m.current1;
+            req = req_index1;
+            req_stage = req_stage1;
+            var_index = var1;
+        }
+        let is i64 as last with mut = 0;
+        let is i64 as stage with mut = 0;
+        while (stage < stages) {
+            if (req != ot.NOT_FOUND && req_stage == stage) {
+                _add_lookups(f, m, t, req, var_index, GLOBAL_MASK, 1, 1, 0, 0, 538976288);
+            }
+            let is i64 as k with mut = 0;
+            while (k < m.nfeatures) {
+                let is *Feature as fm = &m.features[k];
+                let is i64 as fs with mut = fm.stage0;
+                let is i64 as fidx with mut = fm.index0;
+                if (t == 1) {
+                    fs = fm.stage1;
+                    fidx = fm.index1;
+                }
+                if (fs == stage) {
+                    _add_lookups(f, m, t, fidx, var_index, fm.mask, fm.auto_zwnj, fm.auto_zwj, fm.random,
+                                 fm.per_syllable, fm.tag);
+                }
+                k = k + 1;
+            }
+            _merge_lookups(m, t, last);
+            last = _nlookups(m, t);
+            if (stage < 16) {
+                if (t == 0) {
+                    m.stages0[stage] = last;
+                    m.nstages0 = stage + 1;
+                } else {
+                    m.stages1[stage] = last;
+                    m.nstages1 = stage + 1;
+                }
+            }
+            stage = stage + 1;
+        }
+        t = t + 1;
+    }
+}
+
+// The feature with tag in the map; null for none.
+fn feature(m as *Map, t as i64) as *Feature {
+    let is i64 as i with mut = 0;
+    while (i < m.nfeatures) {
+        if (m.features[i].tag == t) { return &m.features[i]; }
+        i = i + 1;
+    }
+    return cast(*Feature, 0);
+}
+
+fn mask_of(m as *Map, t as i64) as i64 {
+    let is *Feature as fm = feature(m, t);
+    if (cast(i64, fm) == 0) { return 0; }
+    return fm.mask;
+}
+
+fn shift_of(m as *Map, t as i64) as i64 {
+    let is *Feature as fm = feature(m, t);
+    if (cast(i64, fm) == 0) { return 0; }
+    return fm.shift;
+}
+
+fn one_mask(m as *Map, t as i64) as i64 {
+    let is *Feature as fm = feature(m, t);
+    if (cast(i64, fm) == 0) { return 0; }
+    return fm.one_mask;
+}
+
+// The feature's index in table t, ot.NOT_FOUND when the map does not have
+// it or the table does not.
+fn feature_index(m as *Map, table_index as i64, t as i64) as i64 {
+    let is *Feature as fm = feature(m, t);
+    if (cast(i64, fm) == 0) { return ot.NOT_FOUND; }
+    if (table_index == 0) { return fm.index0; }
+    return fm.index1;
+}

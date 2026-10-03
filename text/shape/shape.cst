@@ -1,0 +1,562 @@
+// text/shape/shape.cst — the hub: a run of text in, glyphs, clusters and
+// positions out, as HarfBuzz's default shaper gives them. See shape.md.
+//
+// A run is one script, one direction and one face at one instance: layout
+// splits a paragraph into such runs and shapes each, passing the whole
+// paragraph so that a run can see the text around it. What comes back is in
+// the buffer: for each glyph, its index (Info.cp), its cluster — the byte
+// offset in the text of the first character it came from — and the glyph
+// flags in its mask (buffer.UNSAFE_TO_BREAK); and its advance and offsets
+// (Pos), in font units, in visual order.
+use "../sfnt/table.cst" as table;
+use "../outline/outline.cst" as outline;
+use "buffer.cst" as buffer;
+use "props.cst" as props;
+use "normalize.cst" as normalize;
+use "ot.cst" as ot;
+use "tag.cst" as tag;
+use "kern.cst" as kern;
+use "fallback.cst" as fallback;
+use "map.cst" as map;
+use "gsub.cst" as gsub;
+
+// A feature asked for, as HarfBuzz's hb_feature_t: on (1), off (0) or an
+// alternate's number, over the clusters start .. end — 0 and ALL for the
+// whole run.
+struct Feature {
+    tag   as i64;
+    value as i64;
+    start as i64;
+    end   as i64;
+}
+
+let is i64 as ALL with imut = 4294967295;
+
+// What to shape. text holds n bytes of UTF-8, the run those from offset,
+// length of them (-1: to the end); the rest is context. dir is buffer.LTR
+// or RTL; script an ISO 15924 tag (tag.of("Latn")); lang a BCP 47 tag, or
+// null. flags are the buffer's (buffer.BOT, ...).
+struct Run {
+    text      as *u8;
+    n         as i64;
+    offset    as i64;
+    length    as i64;
+    dir       as i64;
+    script    as i64;
+    lang      as *u8;
+    features  as *Feature;
+    nfeatures as i64;
+    flags     as i64;
+}
+
+// What shaping a run will do, decided before it starts.
+struct Plan {
+    dir          as i64;
+    script       as i64;
+    global_mask  as i64;
+    frac_mask    as i64;
+    numr_mask    as i64;
+    dnom_mask    as i64;
+    rtlm_mask    as i64;
+    kern_mask    as i64;
+    has_frac     as i32;
+    fallback_glyph_classes as i32;
+    apply_gpos   as i32;
+    apply_kern   as i32;
+    apply_fallback_kern as i32;
+    zero_marks   as i32;
+    has_gpos_mark as i32;
+    adjust_mark_positioning_when_zeroing as i32;
+    fallback_mark_positioning as i32;
+    _pad0        as i32;
+    m            as map.Map;
+}
+
+fn _gpos_ok(f as *table.Face) as i32 {
+    if (f.gpos.len >= 10 && ot.u16(f, f.gpos, f.gpos.off) == 1) { return 1; }
+    return 0;
+}
+
+// The features the default shaper asks for, in HarfBuzz's order, then the
+// run's: rvrn alone in the first stage, then the direction's, automatic
+// fractions, rand, HarfBuzz's own four, the common and the horizontal ones.
+// A run's feature over the whole run is global; over part of it, not.
+let is i64 as DEFAULT_FEATURES with imut = 25;
+
+fn _collect_features(m as *map.Map, run as *Run) as void {
+    map.enable_feature(m, tag.of("rvrn"), 0, 1);
+    map.add_gsub_pause(m);
+    if (run.dir == buffer.LTR) {
+        map.enable_feature(m, tag.of("ltra"), 0, 1);
+        map.enable_feature(m, tag.of("ltrm"), 0, 1);
+    } else {
+        map.enable_feature(m, tag.of("rtla"), 0, 1);
+        map.add_feature(m, tag.of("rtlm"), 0, 1);
+    }
+    map.add_feature(m, tag.of("frac"), 0, 1);
+    map.add_feature(m, tag.of("numr"), 0, 1);
+    map.add_feature(m, tag.of("dnom"), 0, 1);
+    map.enable_feature(m, tag.of("rand"), map.F_RANDOM, map.MAX_VALUE);
+    map.enable_feature(m, tag.of("Harf"), 0, 1);
+    map.enable_feature(m, tag.of("HARF"), 0, 1);
+    map.enable_feature(m, tag.of("Buzz"), 0, 1);
+    map.enable_feature(m, tag.of("BUZZ"), 0, 1);
+    let is i64 as joiners = map.F_MANUAL_ZWNJ | map.F_MANUAL_ZWJ;
+    map.enable_feature(m, tag.of("abvm"), 0, 1);
+    map.enable_feature(m, tag.of("blwm"), 0, 1);
+    map.enable_feature(m, tag.of("ccmp"), 0, 1);
+    map.enable_feature(m, tag.of("locl"), 0, 1);
+    map.enable_feature(m, tag.of("mark"), joiners, 1);
+    map.enable_feature(m, tag.of("mkmk"), joiners, 1);
+    map.enable_feature(m, tag.of("rlig"), 0, 1);
+    map.enable_feature(m, tag.of("calt"), 0, 1);
+    map.enable_feature(m, tag.of("clig"), 0, 1);
+    map.enable_feature(m, tag.of("curs"), 0, 1);
+    map.enable_feature(m, tag.of("dist"), 0, 1);
+    map.enable_feature(m, tag.of("kern"), map.F_HAS_FALLBACK, 1);
+    map.enable_feature(m, tag.of("liga"), 0, 1);
+    map.enable_feature(m, tag.of("rclt"), 0, 1);
+    let is i64 as i with mut = 0;
+    while (i < run.nfeatures) {
+        let is *Feature as ft = &run.features[i];
+        let is i64 as flags with mut = 0;
+        if (ft.start == 0 && ft.end == ALL) { flags = map.F_GLOBAL; }
+        map.add_feature(m, ft.tag, flags, ft.value);
+        i = i + 1;
+    }
+}
+
+// HarfBuzz's decisions for the default shaper: the map of features and
+// lookups; GPOS positions when the font has it; the kern table when GPOS
+// has no kerning; marks' advances taken away after positioning, and when
+// the font positions nothing, marks placed by their outlines. 0 when the
+// memory for the map is refused.
+fn _plan(r as *outline.Reader, run as *Run, p as *Plan) as i32 {
+    let is *table.Face as f = r.face;
+    p.dir = run.dir;
+    p.script = run.script;
+    p.m = map.open();
+    let is *map.Map as m = &p.m;
+    if (map.begin(m, f, run.script, run.lang, DEFAULT_FEATURES + run.nfeatures) == 0) { return 0; }
+    _collect_features(m, run);
+    map.compile(f, m, ot.find_variations(f, &m.gsub, &r.coords), ot.find_variations(f, &m.gpos, &r.coords));
+    if (m.cap_lookups == 0) { return 0; }
+    p.global_mask = m.global_mask;
+    p.frac_mask = map.one_mask(m, tag.of("frac"));
+    p.numr_mask = map.one_mask(m, tag.of("numr"));
+    p.dnom_mask = map.one_mask(m, tag.of("dnom"));
+    p.has_frac = cast(i32, p.frac_mask != 0 || (p.numr_mask != 0 && p.dnom_mask != 0));
+    p.rtlm_mask = map.one_mask(m, tag.of("rtlm"));
+    p.kern_mask = map.mask_of(m, tag.of("kern"));
+    let is i32 as has_gpos_kern = cast(i32, map.feature_index(m, 1, tag.of("kern")) != ot.NOT_FOUND);
+    p.fallback_glyph_classes = 1 - ot.has_glyph_classes(f);
+    let is i32 as has_gpos = _gpos_ok(f);
+    p.apply_gpos = has_gpos;
+    p.apply_kern = 0;
+    if (has_gpos_kern == 0 || p.apply_gpos == 0) {
+        if (kern.has_kerning(f) == 1) { p.apply_kern = 1; }
+    }
+    p.apply_fallback_kern = cast(i32, p.apply_gpos == 0 && p.apply_kern == 0);
+    p.zero_marks = cast(i32, p.apply_kern == 0 || kern.has_state_machine(f) == 0);
+    p.has_gpos_mark = cast(i32, map.one_mask(m, tag.of("mark")) != 0);
+    p.adjust_mark_positioning_when_zeroing = cast(i32, p.apply_gpos == 0 && (p.apply_kern == 0 || kern.has_cross_stream(f) == 0));
+    p.fallback_mark_positioning = p.adjust_mark_positioning_when_zeroing;
+    return 1;
+}
+
+// --- The font ---
+
+// Glyph g's advance, as HarfBuzz gives it.
+fn advance(r as *outline.Reader, g as i64) as i64 { return outline.advance_rounded(r, g); }
+
+fn _nominal(f as *table.Face, u as i64) as i64 {
+    let is i64 as g with mut = 0;
+    normalize.nominal(f, u, &g);
+    return g;
+}
+
+// --- Characters ---
+
+// Each record's Unicode properties, and the characters that continue a
+// grapheme marked as such: marks, emoji modifiers, the second of a pair of
+// regional indicators, a ZWJ and the pictograph after it, the halfwidth
+// katakana sound marks, tags.
+fn _set_unicode_props(b as *buffer.Buffer, global_mask as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        let is *buffer.Info as info = &b.info[i];
+        info.mask = cast(u32, global_mask);
+        props.set_unicode_props(b, info);
+        let is i64 as u = cast(i64, info.cp);
+        if (u >= 128) {
+            let is i64 as gc = props.category(info);
+            if (gc == props.LOWERCASE_LETTER || gc == props.UPPERCASE_LETTER || gc == props.TITLECASE_LETTER ||
+                gc == props.OTHER_LETTER || gc == props.SPACE_SEPARATOR) {
+                // These begin graphemes; modifier letters may not.
+            } else if (gc == props.MODIFIER_SYMBOL && u >= 127995 && u <= 127999) {
+                props.set_continuation(b, info);
+            } else if (i > 0 && props.is_regional_indicator(u) == 1) {
+                if (props.is_regional_indicator(cast(i64, b.info[i - 1].cp)) == 1 &&
+                    props.is_continuation(&b.info[i - 1]) == 0) {
+                    props.set_continuation(b, info);
+                }
+            } else if (props.is_zwj(info) == 1) {
+                props.set_continuation(b, info);
+                if (i + 1 < b.len && props.is_extended_pictographic(cast(i64, b.info[i + 1].cp)) == 1) {
+                    i = i + 1;
+                    let is *buffer.Info as next = &b.info[i];
+                    next.mask = cast(u32, global_mask);
+                    props.set_unicode_props(b, next);
+                    props.set_continuation(b, next);
+                }
+            } else if ((u >= 65438 && u <= 65439) || (u >= 917536 && u <= 917631)) {
+                props.set_continuation(b, info);
+            } else if (u == 8260) {
+                b.scratch = b.scratch | buffer.HAS_FRACTION_SLASH;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// A mark that begins the text drawn on a dotted circle, when the font has
+// one.
+fn _insert_dotted_circle(r as *outline.Reader, b as *buffer.Buffer) as void {
+    if ((b.flags & buffer.NO_DOTTED_CIRCLE) != 0) { return; }
+    if ((b.flags & buffer.BOT) == 0 || b.context_len[0] != 0 || props.is_unicode_mark(&b.info[0]) == 0) { return; }
+    if (_nominal(r.face, 9676) == 0) { return; }
+    let is buffer.Info as dc;
+    dc.cp = cast(u32, 9676);
+    dc.glyph = cast(u32, 0);
+    dc.gprops = cast(u16, 0);
+    dc.lig = cast(u8, 0);
+    dc.syllable = cast(u8, 0);
+    dc.aux0 = cast(u8, 0);
+    dc.aux1 = cast(u8, 0);
+    props.set_unicode_props(b, &dc);
+    buffer.clear_output(b);
+    b.idx = 0;
+    dc.cluster = b.info[0].cluster;
+    dc.mask = b.info[0].mask;
+    buffer.output_info(b, &dc);
+    buffer.sync(b);
+}
+
+fn _form_clusters(b as *buffer.Buffer) as void {
+    if ((b.scratch & buffer.HAS_CONTINUATIONS) == 0) { return; }
+    let is i64 as start with mut = 0;
+    while (start < b.len) {
+        let is i64 as end = buffer.group_end(b, start, 1);
+        buffer.merge_grapheme_clusters(b, start, end);
+        start = end;
+    }
+}
+
+// A run set against its script's direction is shaped in the script's,
+// grapheme by grapheme reversed — except digits and flags alone in a run of
+// a right-to-left script, which read left to right.
+fn _ensure_native_direction(b as *buffer.Buffer) as void {
+    let is i64 as dir = b.dir;
+    let is i64 as horiz with mut = tag.direction(b.script);
+    if (horiz == buffer.RTL && dir == buffer.LTR) {
+        let is i32 as number with mut = 0;
+        let is i32 as letter with mut = 0;
+        let is i32 as ri with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < b.len && letter == 0) {
+            let is i64 as gc = props.category(&b.info[i]);
+            if (props.is_letter_category(gc) == 1) { letter = 1; }
+            else if (gc == props.DECIMAL_NUMBER) { number = 1; }
+            else if (props.is_regional_indicator(cast(i64, b.info[i].cp)) == 1) { ri = 1; }
+            i = i + 1;
+        }
+        if ((number == 1 || ri == 1) && letter == 0) { horiz = buffer.LTR; }
+    }
+    if (horiz != 0 && dir != horiz) {
+        buffer.reverse_groups(b, 1);
+        b.dir = dir ^ 1;
+    }
+}
+
+// --- Substitution ---
+
+// Right to left, each character its mirror when the font has it; the rest
+// marked for the rtlm feature.
+fn _rotate_chars(r as *outline.Reader, p as *Plan, b as *buffer.Buffer, target as i64) as void {
+    if (target != buffer.RTL) { return; }
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        let is i64 as u = cast(i64, b.info[i].cp);
+        let is i64 as m = props.mirror(u);
+        if (m != u && _nominal(r.face, m) != 0) {
+            b.info[i].cp = cast(u32, m);
+        } else {
+            b.info[i].mask = cast(u32, cast(i64, b.info[i].mask) | p.rtlm_mask);
+        }
+        i = i + 1;
+    }
+}
+
+// Digits around a fraction slash marked for numr, frac and dnom.
+fn _setup_masks_fraction(p as *Plan, b as *buffer.Buffer) as void {
+    if ((b.scratch & buffer.HAS_FRACTION_SLASH) == 0 || p.has_frac == 0) { return; }
+    let is i64 as pre with mut = p.numr_mask | p.frac_mask;
+    let is i64 as post with mut = p.frac_mask | p.dnom_mask;
+    if (b.dir == buffer.RTL) {
+        pre = p.frac_mask | p.dnom_mask;
+        post = p.numr_mask | p.frac_mask;
+    }
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        if (b.info[i].cp == cast(u32, 8260)) {
+            let is i64 as start with mut = i;
+            let is i64 as end with mut = i + 1;
+            while (start > 0 && props.category(&b.info[start - 1]) == props.DECIMAL_NUMBER) { start = start - 1; }
+            while (end < b.len && props.category(&b.info[end]) == props.DECIMAL_NUMBER) { end = end + 1; }
+            if (start != i && end != i + 1) {
+                buffer.unsafe_to_break(b, start, end);
+                let is i64 as j with mut = start;
+                while (j < i) {
+                    b.info[j].mask = cast(u32, cast(i64, b.info[j].mask) | pre);
+                    j = j + 1;
+                }
+                b.info[i].mask = cast(u32, cast(i64, b.info[i].mask) | p.frac_mask);
+                j = i + 1;
+                while (j < end) {
+                    b.info[j].mask = cast(u32, cast(i64, b.info[j].mask) | post);
+                    j = j + 1;
+                }
+                i = end - 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Fractions marked, and each feature the run asks for over part of it set
+// in the masks of the characters there.
+fn _setup_masks(p as *Plan, b as *buffer.Buffer, run as *Run) as void {
+    _setup_masks_fraction(p, b);
+    let is i64 as i with mut = 0;
+    while (i < run.nfeatures) {
+        let is *Feature as ft = &run.features[i];
+        if (ft.start != 0 || ft.end != ALL) {
+            let is i64 as shift = map.shift_of(&p.m, ft.tag);
+            buffer.set_masks(b, ft.value << shift, map.mask_of(&p.m, ft.tag), ft.start, ft.end);
+        }
+        i = i + 1;
+    }
+}
+
+// Each record's glyph made its own: until here it was a character.
+fn _map_glyphs(b as *buffer.Buffer) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        b.info[i].cp = b.info[i].glyph;
+        i = i + 1;
+    }
+}
+
+// Glyph classes from the characters, for a font with none: non-spacing
+// marks are marks, all else a base — ignorables too, as Uniscribe has them.
+fn _synthesize_glyph_classes(b as *buffer.Buffer) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        let is *buffer.Info as info = &b.info[i];
+        if (props.category(info) != props.NON_SPACING_MARK || props.is_default_ignorable_of(info) == 1) {
+            props.set_glyph_props(info, props.BASE_GLYPH);
+        } else {
+            props.set_glyph_props(info, props.MARK);
+        }
+        i = i + 1;
+    }
+}
+
+fn _substitute_pre(r as *outline.Reader, p as *Plan, b as *buffer.Buffer, run as *Run, target as i64) as void {
+    _rotate_chars(r, p, b, target);
+    normalize.normalize(r.face, b);
+    _setup_masks(p, b, run);
+    if (p.fallback_mark_positioning == 1) { fallback.recategorize_marks(b); }
+    _map_glyphs(b);
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        props.set_glyph_props(&b.info[i], ot.glyph_props(r.face, cast(i64, b.info[i].cp)));
+        b.info[i].lig = cast(u8, 0);
+        i = i + 1;
+    }
+    if (p.fallback_glyph_classes == 1) { _synthesize_glyph_classes(b); }
+    gsub.substitute(r, b, &p.m);
+}
+
+// Default ignorables made invisible: the font's space in their place, of
+// no width — or taken out, when the run asks.
+fn _hide_default_ignorables(r as *outline.Reader, b as *buffer.Buffer) as void {
+    if ((b.scratch & buffer.HAS_DEFAULT_IGNORABLES) == 0 || (b.flags & buffer.PRESERVE_IGNORABLES) != 0) { return; }
+    let is i64 as invisible = _nominal(r.face, 32);
+    if ((b.flags & buffer.REMOVE_IGNORABLES) == 0 && invisible != 0) {
+        let is i64 as i with mut = 0;
+        while (i < b.len) {
+            if (props.is_default_ignorable_of(&b.info[i]) == 1) { b.info[i].cp = cast(u32, invisible); }
+            i = i + 1;
+        }
+        return;
+    }
+    // Taken out, each one's cluster kept by a neighbour.
+    let is i64 as j with mut = 0;
+    let is i64 as count = b.len;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        if (props.is_default_ignorable_of(&b.info[i]) == 1) {
+            let is i64 as cluster = cast(i64, b.info[i].cluster);
+            if (i + 1 < count && cluster == cast(i64, b.info[i + 1].cluster)) {
+                // The cluster survives.
+            } else if (j > 0) {
+                if (cluster < cast(i64, b.info[j - 1].cluster)) {
+                    let is i64 as mask = cast(i64, b.info[i].mask);
+                    let is i64 as old = cast(i64, b.info[j - 1].cluster);
+                    let is i64 as k with mut = j;
+                    while (k > 0 && cast(i64, b.info[k - 1].cluster) == old) {
+                        buffer.set_cluster(&b.info[k - 1], cluster, mask);
+                        k = k - 1;
+                    }
+                }
+            } else if (i + 1 < count) {
+                buffer.merge_clusters(b, i, i + 2);
+            }
+        } else {
+            if (j != i) {
+                b.info[j] = b.info[i];
+                b.pos[j] = b.pos[i];
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    b.len = j;
+}
+
+// --- Positioning ---
+
+fn _zero_width_default_ignorables(b as *buffer.Buffer) as void {
+    if ((b.scratch & buffer.HAS_DEFAULT_IGNORABLES) == 0 || (b.flags & buffer.PRESERVE_IGNORABLES) != 0 ||
+        (b.flags & buffer.REMOVE_IGNORABLES) != 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        if (props.is_default_ignorable_of(&b.info[i]) == 1) {
+            b.pos[i].xa = cast(i32, 0);
+            b.pos[i].ya = cast(i32, 0);
+            b.pos[i].xo = cast(i32, 0);
+        }
+        i = i + 1;
+    }
+}
+
+fn _sat(v as i64) as i32 {
+    if (v > 2147483647) { return cast(i32, 2147483647); }
+    if (v < 0 - 2147483648) { return cast(i32, 0 - 2147483648); }
+    return cast(i32, v);
+}
+
+// Marks' advances taken away — and, adjust, moved back by them, to hang
+// over the glyph before.
+fn _zero_mark_widths(b as *buffer.Buffer, adjust as i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        if (props.is_mark(&b.info[i]) == 1) {
+            if (adjust == 1) {
+                b.pos[i].xo = _sat(cast(i64, b.pos[i].xo) - cast(i64, b.pos[i].xa));
+                b.pos[i].yo = _sat(cast(i64, b.pos[i].yo) - cast(i64, b.pos[i].ya));
+            }
+            b.pos[i].xa = cast(i32, 0);
+            b.pos[i].ya = cast(i32, 0);
+        }
+        i = i + 1;
+    }
+}
+
+fn _first_of(r as *outline.Reader, chars as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (chars[i] != 0) {
+        let is i64 as g = _nominal(r.face, cast(i64, chars[i]));
+        if (g != 0) { return advance(r, g); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _position_default(r as *outline.Reader, b as *buffer.Buffer) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.len) {
+        b.pos[i].xa = cast(i32, advance(r, cast(i64, b.info[i].cp)));
+        i = i + 1;
+    }
+    if ((b.scratch & buffer.HAS_SPACE_FALLBACK) != 0) {
+        let is i64 as punct with mut = _first_of(r, ".");
+        if (punct < 0) { punct = _first_of(r, ","); }
+        fallback.spaces(b, r.face.upem, _first_of(r, "0123456789"), punct);
+    }
+}
+
+fn _position(r as *outline.Reader, p as *Plan, b as *buffer.Buffer) as void {
+    buffer.clear_positions(b);
+    _position_default(r, b);
+    let is i32 as adjust = cast(i32, p.adjust_mark_positioning_when_zeroing == 1 && b.dir == buffer.LTR);
+    // GPOS, kern: to come.
+    if (p.zero_marks == 1) { _zero_mark_widths(b, adjust); }
+    _zero_width_default_ignorables(b);
+    if (p.fallback_mark_positioning == 1) { fallback.position_marks(r, b, p.dir, adjust); }
+    if (b.dir == buffer.RTL) { buffer.reverse(b); }
+}
+
+// Each cluster's glyph flags made the same on all its glyphs.
+fn _propagate_flags(b as *buffer.Buffer) as void {
+    let is i64 as and_mask = buffer.UNSAFE_TO_BREAK;
+    let is i64 as start with mut = 0;
+    while (start < b.len) {
+        let is i64 as end = buffer.group_end(b, start, 0);
+        let is i64 as mask with mut = 0;
+        let is i64 as i with mut = start;
+        while (i < end) {
+            mask = mask | cast(i64, b.info[i].mask);
+            i = i + 1;
+        }
+        mask = mask & and_mask;
+        i = start;
+        while (i < end) {
+            b.info[i].mask = cast(u32, mask);
+            i = i + 1;
+        }
+        start = end;
+    }
+}
+
+// The run shaped into b: 1, or 0 when shaping stopped short — the text too
+// long for its bounds, or memory refused.
+fn shape(r as *outline.Reader, b as *buffer.Buffer, run as *Run) as i32 {
+    buffer.clear(b);
+    b.flags = run.flags;
+    b.dir = run.dir;
+    b.script = run.script;
+    buffer.add_utf8(b, run.text, run.n, run.offset, run.length);
+    if (b.len == 0) { return b.successful; }
+    buffer.enter(b);
+    let is Plan as p;
+    if (_plan(r, run, &p) == 0) {
+        map.close(&p.m);
+        b.successful = 0;
+        return 0;
+    }
+    let is i64 as target = b.dir;
+    _set_unicode_props(b, p.global_mask);
+    _insert_dotted_circle(r, b);
+    _form_clusters(b);
+    _ensure_native_direction(b);
+    _substitute_pre(r, &p, b, run, target);
+    _position(r, &p, b);
+    _hide_default_ignorables(r, b);
+    _propagate_flags(b);
+    b.dir = target;
+    buffer.leave(b);
+    map.close(&p.m);
+    return b.successful;
+}
