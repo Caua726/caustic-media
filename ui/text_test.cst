@@ -1,0 +1,844 @@
+// ui/text_test.cst — the text service: runs as text/layout lays them out,
+// fonts through the program's resolver, and glyphs drawn on a software
+// device where the rasterizer alone puts them, at the canvas's scale; colour
+// glyphs in their colours.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../text/sfnt/sfnt.cst" as sfnt;
+use "../text/sfnt/table.cst" as table;
+use "../text/sfnt/var.cst" as var;
+use "../text/outline/outline.cst" as outline;
+use "../text/raster/raster.cst" as raster;
+use "../text/layout/model.cst" as model;
+use "../text/layout/font.cst" as font;
+use "../text/layout/layout.cst" as layout;
+use "style.cst" as style;
+use "text.cst" as text;
+
+let is i64 as W with imut = 160;
+let is i64 as H with imut = 64;
+let is f64 as PX with imut = 20.0;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn near(a as f64, b as f64, eps as f64) as i32 {
+    let is f64 as d = a - b;
+    return cast(i32, d < eps && d > 0.0 - eps);
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn same(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i32, a[i] == b[i]);
+}
+
+// --- The fonts, and the resolver ---
+
+let is [3]table.Face as faces with mut;
+let is font.List as plain_list with mut;
+let is font.List as glyf_list with mut;
+let is font.List as color_list with mut;
+let is font.Font as plain_font with mut;
+let is font.Font as glyf_font with mut;
+let is font.Font as color_font with mut;
+
+let is i64 as calls with mut = 0;
+let is *u8 as asked_user with mut;
+let is *u8 as asked_family with mut;
+let is i64 as asked_weight with mut = 0;
+let is i32 as asked_italic with mut = 0;
+let is [8]u8 as marker with mut;   // what the program gives with its resolver
+let is *u8 as plain_name with mut;  // the theme's family, as the service is given it
+
+// "Plain" is shape-plain.ttf — glyf.ttf from 700 up — and "Color" is
+// color.ttf; "Bold" is glyf.ttf and "Bald" shape-plain.ttf, two names a
+// letter apart; no family at all is shape-plain.ttf, and any other none.
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font {
+    calls = calls + 1;
+    asked_user = user;
+    asked_family = family;
+    asked_weight = weight;
+    asked_italic = italic;
+    if (cast(i64, family) == 0) { return &plain_font; }
+    if (same(family, "Bold") == 1) { return &glyf_font; }
+    if (same(family, "Bald") == 1) { return &plain_font; }
+    if (same(family, "Plain") == 1) {
+        if (weight >= 700) { return &glyf_font; }
+        return &plain_font;
+    }
+    if (same(family, "Color") == 1) { return &color_font; }
+    return cast(*font.Font, 0);
+}
+
+fn st(size as f64) as text.Style {
+    let is style.TextStyle as ts;
+    ts.size = size;
+    ts.weight = 400;
+    return text.style_of(ts);
+}
+
+let is text.Limits as lim with mut;
+
+fn service(d as *gpu.device.Device) as *text.Service {
+    return text.open(d, &lim, fn_ptr(resolve), cast(*u8, &marker), plain_name);
+}
+
+// --- Measured ---
+
+let is layout.Layout as lay with mut;
+
+fn measured() as void {
+    calls = 0;
+    let is *text.Service as s = service(cast(*gpu.device.Device, 0));
+    check("a service with no device opens, to measure", cast(i64, s) != 0 && s.drawing == 0);
+    let is text.Style as a = st(PX);
+    check("a theme's text style: its size and weight, the theme's family, no colour of its own",
+          a.size == PX && a.weight == 400 && cast(i64, a.family) == 0 && a.italic == 0 && a.underline == 0 &&
+          a.strike == 0 && a.color.a == 0.0);
+    let is text.Run as r = text.run();
+    check("a new run: nothing laid out", r.ok == 0 && text.glyph_count(&r) == 0 && text.line_count(&r) == 0 &&
+          text.baseline(&r) == 0.0);
+    let is model.Params as pp = model.params();
+    check("laid out", text.lay_plain(s, &r, "Hello", 5, &a, &pp) == 1 && r.ok == 1);
+    // The same through text/layout itself.
+    let is model.Style as ms;
+    mem.memset(cast(*u8, &ms), 0, sizeof(model.Style));
+    ms.font = &plain_font;
+    ms.px = PX;
+    layout.set(&lay, "Hello", 5, &ms, 1, cast(*model.Span, 0), 0, &pp);
+    let is i32 as alike with mut = cast(i32, text.glyph_count(&r) == 5 && layout.glyph_count(&lay) == 5);
+    let is i64 as i with mut = 0;
+    while (alike == 1 && i < 5) {
+        let is *text.Glyph as g = text.glyph(&r, i);
+        let is *model.Glyph as m = layout.glyph(&lay, i);
+        if (g.x != m.x || g.y != m.y || g.id != cast(i64, m.id) || g.face != 0 || g.style != 0) { alike = 0; }
+        i = i + 1;
+    }
+    check("the glyphs: which, and where text/layout puts them", alike);
+    check("the glyphs move along the line", text.glyph(&r, 1).x > text.glyph(&r, 0).x && text.glyph(&r, 0).y > 0.0);
+    let is *text.Face as fc = text.face(&r, 0);
+    check("one face, named by font, face and size",
+          text.face_count(&r) == 1 && cast(i64, fc.font) == cast(i64, &plain_font) && fc.index == 0 && fc.px == PX);
+    let is *text.Line as ln with mut = text.line(&r, 0);
+    let is *model.Line as ml with mut = layout.line(&lay, 0);
+    check("one line, as text/layout's", text.line_count(&r) == 1 && ln.x == ml.x && ln.top == ml.top &&
+          ln.y == ml.y && ln.width == ml.width && ln.height == ml.height && ln.start == 0 && ln.end == 5);
+    check("the run's size", r.width == layout.width(&lay) && r.height == layout.height(&lay) && r.width > 0.0 &&
+          r.cut == 0);
+    check("the baseline: the first line's", text.baseline(&r) == ln.y && ln.y > 0.0);
+    check("nothing under or through plain text", text.deco_count(&r) == 0);
+    check("with no device, nothing is drawn", text.draw(s, cast(*draw2d.Canvas, 0), &r, 0.0, 0.0,
+          math.color.black()) == 0);
+    check("nor anything to send", text.upload(s) == 1);
+    // Cut short: the run says so.
+    pp.width = 30.0;
+    pp.max_lines = 1;
+    check("cut short by max_lines", text.lay_plain(s, &r, "aa aa aa aa", 11, &a, &pp) == 1 && r.cut == 1 &&
+          text.line_count(&r) == 1);
+    pp.max_lines = 0;
+    check("broken into lines", text.lay_plain(s, &r, "aa aa aa aa", 11, &a, &pp) == 1 && r.cut == 0 &&
+          text.line_count(&r) > 1 && text.line(&r, 1).y > text.line(&r, 0).y &&
+          text.line(&r, 1).start > 0 && text.line(&r, 0).end <= text.line(&r, 1).start);
+    layout.set(&lay, "aa aa aa aa", 11, &ms, 1, cast(*model.Span, 0), 0, &pp);
+    alike = cast(i32, text.line_count(&r) == layout.line_count(&lay));
+    i = 0;
+    while (alike == 1 && i < text.line_count(&r)) {
+        ln = text.line(&r, i);
+        ml = layout.line(&lay, i);
+        if (ln.x != ml.x || ln.y != ml.y || ln.top != ml.top || ln.width != ml.width || ln.start != ml.start ||
+            ln.end != ml.end) {
+            alike = 0;
+        }
+        i = i + 1;
+    }
+    check("every line as text/layout's", alike);
+    alike = cast(i32, text.glyph_count(&r) == layout.glyph_count(&lay));
+    i = 0;
+    while (alike == 1 && i < text.glyph_count(&r)) {
+        if (text.glyph(&r, i).y != layout.glyph(&lay, i).y || text.glyph(&r, i).x != layout.glyph(&lay, i).x) {
+            alike = 0;
+        }
+        i = i + 1;
+    }
+    check("every glyph on its line", alike);
+    text.run_close(&r);
+    check("a closed run is nothing", r.ok == 0 && text.glyph_count(&r) == 0);
+    text.close(s);
+}
+
+// --- Fonts resolved ---
+
+fn resolved() as void {
+    calls = 0;
+    let is *text.Service as s with mut = service(cast(*gpu.device.Device, 0));
+    let is text.Run as r = text.run();
+    let is text.Style as a with mut = st(PX);
+    let is model.Params as pp = model.params();
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("no family: the theme's, asked of the resolver with the program's pointer",
+          calls == 1 && cast(i64, asked_family) == cast(i64, plain_name) && asked_weight == 400 &&
+          asked_italic == 0 && cast(i64, asked_user) == cast(i64, &marker));
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("a font resolved once", calls == 1);
+    a.weight = 700;
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("bold: asked for", calls == 2 && asked_weight == 700 &&
+          cast(i64, text.face(&r, 0).font) == cast(i64, &glyf_font));
+    a.weight = 400;
+    a.italic = 1;
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("italic: asked for", calls == 3 && asked_italic == 1 && asked_weight == 400);
+    a.italic = 0;
+    a.family = "Color";
+    text.lay_plain(s, &r, "AB", 2, &a, &pp);
+    check("a family of the style's own", calls == 4 && same(asked_family, "Color") == 1 &&
+          cast(i64, text.face(&r, 0).font) == cast(i64, &color_font));
+    a.family = "Nope";
+    check("a family with no font: not laid out", text.lay_plain(s, &r, "Hi", 2, &a, &pp) == 0 && r.ok == 0 &&
+          text.glyph_count(&r) == 0 && text.line_count(&r) == 0 && text.face_count(&r) == 0);
+    a.family = "Bold";
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("a family", calls == 6 && cast(i64, text.face(&r, 0).font) == cast(i64, &glyf_font));
+    a.family = "Bald";
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("and one a letter apart: another", calls == 7 && cast(i64, text.face(&r, 0).font) == cast(i64, &plain_font));
+    // The theme's family as the theme holds it: the same letters as the
+    // style's "Color" before, somewhere else.
+    let is [8]u8 as named;
+    let is *u8 as lit = "Color";
+    let is i64 as k with mut = 0;
+    while (k < 6) {
+        named[k] = lit[k];
+        k = k + 1;
+    }
+    a.family = cast(*u8, 0);
+    text.set_family(s, cast(*u8, &named));
+    text.lay_plain(s, &r, "AB", 2, &a, &pp);
+    check("the theme's family changed: found by name among those resolved",
+          r.ok == 1 && calls == 7 && cast(i64, text.face(&r, 0).font) == cast(i64, &color_font));
+    // Six resolved; ten more fit, the rest are asked for each time.
+    let is i64 as w with mut = 101;
+    while (w <= 116) {
+        a.weight = w;
+        text.lay_plain(s, &r, "AB", 2, &a, &pp);
+        w = w + 1;
+    }
+    check("sixteen more weights, each asked for", calls == 23 && r.ok == 1);
+    a.weight = 110;
+    text.lay_plain(s, &r, "AB", 2, &a, &pp);
+    check("the last that fit, remembered", calls == 23);
+    a.weight = 111;
+    check("the first past the table's room, asked again — and still laid out",
+          text.lay_plain(s, &r, "AB", 2, &a, &pp) == 1 && calls == 24 && r.ok == 1);
+    text.run_close(&r);
+    text.close(s);
+
+    // A theme with no family: the resolver asked for none, its answer kept
+    // apart from a family's.
+    calls = 0;
+    plain_name = cast(*u8, 0);
+    s = service(cast(*gpu.device.Device, 0));
+    plain_name = "Plain";
+    a = st(PX);
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("no family anywhere: asked for none", r.ok == 1 && calls == 1 && cast(i64, asked_family) == 0);
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("none, remembered", calls == 1);
+    a.family = "Plain";
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("a family is not none", calls == 2 && same(asked_family, "Plain") == 1);
+    a.family = cast(*u8, 0);
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("nor none a family", calls == 2);
+    text.close(s);
+
+    // The other way round: a family first, then none.
+    calls = 0;
+    plain_name = cast(*u8, 0);
+    s = service(cast(*gpu.device.Device, 0));
+    plain_name = "Plain";
+    a.family = "Plain";
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    a.family = cast(*u8, 0);
+    text.lay_plain(s, &r, "Hi", 2, &a, &pp);
+    check("none after a family: asked for", calls == 2 && cast(i64, asked_family) == 0);
+    text.run_close(&r);
+    text.close(s);
+}
+
+// --- Styles ---
+
+fn styled() as void {
+    let is *text.Service as s = service(cast(*gpu.device.Device, 0));
+    let is text.Run as r = text.run();
+    let is [17]text.Style as sts;
+    let is i64 as i with mut = 0;
+    while (i < 17) {
+        sts[i] = st(PX);
+        i = i + 1;
+    }
+    sts[1].underline = 1;
+    sts[1].color = math.color.red();
+    sts[2].strike = 1;
+    sts[2].size = 2.0 * PX;
+    let is [2]model.Span as sp;
+    sp[0].start = 3;
+    sp[0].end = 5;
+    sp[0].style = 1;
+    sp[1].start = 6;
+    sp[1].end = 8;
+    sp[1].style = 2;
+    let is model.Params as pp = model.params();
+    check("spans laid out", text.lay(s, &r, "aa bb cc", 8, cast(*text.Style, &sts), 3, cast(*model.Span, &sp), 2,
+                                     &pp) == 1);
+    let is i32 as right with mut = cast(i32, text.glyph_count(&r) == 8);
+    let is [8]i64 as want;
+    want[0] = 0; want[1] = 0; want[2] = 0; want[3] = 1; want[4] = 1; want[5] = 0; want[6] = 2; want[7] = 2;
+    i = 0;
+    while (right == 1 && i < 8) {
+        if (text.glyph(&r, i).style != want[i]) { right = 0; }
+        i = i + 1;
+    }
+    check("each glyph its span's style", right);
+    check("two sizes, two faces", text.face_count(&r) == 2 && text.face(&r, text.glyph(&r, 6).face).px == 2.0 * PX &&
+          text.face(&r, text.glyph(&r, 0).face).px == PX && text.glyph(&r, 3).face == text.glyph(&r, 0).face);
+    check("an underline and a strikethrough, each its style's",
+          text.deco_count(&r) == 2 && text.deco(&r, 0).style + text.deco(&r, 1).style == 3 &&
+          text.deco(&r, 0).w > 0.0 && text.deco(&r, 0).h > 0.0);
+    check("each style's colour kept", r.colors[1].r == 1.0 && r.colors[1].a == 1.0 && r.colors[0].a == 0.0);
+    sp[1].style = 3;
+    check("a span in a style there is not: not laid out",
+          text.lay(s, &r, "aa bb cc", 8, cast(*text.Style, &sts), 3, cast(*model.Span, &sp), 2, &pp) == 0 &&
+          r.ok == 0 && text.glyph_count(&r) == 0);
+    check("no styles: not laid out", text.lay(s, &r, "aa", 2, cast(*text.Style, &sts), 0, cast(*model.Span, 0), 0,
+                                              &pp) == 0 && r.ok == 0);
+    check("more styles than a run holds: not laid out",
+          text.lay(s, &r, "aa", 2, cast(*text.Style, &sts), 17, cast(*model.Span, 0), 0, &pp) == 0);
+    check("as many as it holds", text.lay(s, &r, "aa", 2, cast(*text.Style, &sts), 16, cast(*model.Span, 0), 0,
+                                          &pp) == 1);
+    text.run_close(&r);
+    text.close(s);
+}
+
+// --- Drawn ---
+
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as cmd with mut = 0;
+let is [10240]i32 as px with mut;      // W by H, RGBA
+let is [10240]u8 as want with mut;     // the grey each pixel should be
+let is [262144]u8 as cov with mut;
+let is outline.path.Path as opath with mut;
+let is raster.Raster as oras with mut;
+
+fn frame_begin(c as *draw2d.Canvas, k as f64) as void {
+    draw2d.begin(c, cast(f64, W), cast(f64, H), k);
+    mem.memset(cast(*u8, &want), 255, W * H);
+}
+
+fn frame_end(c as *draw2d.Canvas) as i32 {
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass(target, 0, math.color.white());
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    let is i32 as ok = draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    return ok;
+}
+
+fn ch(x as i64, y as i64, c as i64) as i64 { return cast(i64, cast(*u8, &px)[(y * W + x) * 4 + c]); }
+
+// Run r's glyphs, black on white, as the rasterizer draws each alone with
+// its top left at (x, y) at scale k: the pen on the cache's grid, a quarter
+// of a pixel across, whole pixels down.
+fn want_run(r as *text.Run, x as f64, y as f64, k as f64) as void {
+    let is i64 as i with mut = 0;
+    while (i < text.glyph_count(r)) {
+        let is *text.Glyph as g = text.glyph(r, i);
+        let is *text.Face as fc = text.face(r, g.face);
+        let is var.Coords as vc;
+        let is *table.Face as f = call(fc.font.face, fc.font.user, fc.index, fc.px, &vc);
+        let is outline.Reader as rd = outline.open(f);
+        outline.vary(&rd, &vc);
+        let is i64 as wx with mut = 0;
+        let is i64 as wy with mut = 0;
+        let is i64 as sx = raster.subpixel((x + g.x) * k, 4, &wx);
+        raster.subpixel((y + g.y) * k, 1, &wy);
+        let is raster.flatten.Transform as t = raster.glyph_transform(fc.px * k / cast(f64, f.upem),
+                                                                      cast(f64, sx) / 4.0, 0.0);
+        let is raster.Box as b;
+        if (outline.glyph(&rd, g.id, &opath) == 1 && raster.bounds(&opath, &t, &b) == 1 && b.w > 0 && b.h > 0) {
+            raster.draw(&oras, &opath, &t, &b, raster.NONZERO, cast(*u8, &cov), b.w);
+            let is i64 as row with mut = 0;
+            while (row < b.h) {
+                let is i64 as col with mut = 0;
+                while (col < b.w) {
+                    let is i64 as tx = wx + b.left + col;
+                    let is i64 as ty = wy + b.top + row;
+                    if (tx >= 0 && tx < W && ty >= 0 && ty < H) {
+                        let is i64 as v = cast(i64, cov[row * b.w + col]);
+                        let is i64 as old = cast(i64, want[ty * W + tx]);
+                        want[ty * W + tx] = cast(u8, (old * (255 - v) + 127) / 255);
+                    }
+                    col = col + 1;
+                }
+                row = row + 1;
+            }
+        }
+        outline.close(&rd);
+        i = i + 1;
+    }
+}
+
+// The largest difference between channel c of what was drawn and want.
+fn worst(c as i64) as i64 {
+    let is i64 as most with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        let is i64 as d with mut = cast(i64, cast(*u8, &px)[i * 4 + c]) - cast(i64, want[i]);
+        if (d < 0) { d = 0 - d; }
+        if (d > most) { most = d; }
+        i = i + 1;
+    }
+    return most;
+}
+
+// How many pixels want has ink in.
+fn inked() as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        if (want[i] < 200) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The ink in column x from y down, in pixels.
+fn darkness(x as i64, y as f64) as f64 {
+    let is f64 as dark with mut = 0.0;
+    let is i64 as row with mut = cast(i64, y);
+    while (row < H) {
+        dark = dark + cast(f64, 255 - ch(x, row, 1)) / 255.0;
+        row = row + 1;
+    }
+    return dark;
+}
+
+fn grey_as_wanted() as i32 { return cast(i32, worst(0) <= 2 && worst(1) <= 2 && worst(2) <= 2); }
+
+fn drawn(c as *draw2d.Canvas) as void {
+    let is *text.Service as s = service(&dv);
+    check("a service on a device opens to draw", cast(i64, s) != 0 && s.drawing == 1);
+    let is text.Run as r = text.run();
+    let is text.Run as r2 = text.run();
+    let is text.Run as many = text.run();
+    let is text.Style as a = st(PX);
+    let is model.Params as pp = model.params();
+    text.lay_plain(s, &r, "Hello", 5, &a, &pp);
+    text.lay_plain(s, &r2, "Wq|{}", 5, &a, &pp);
+    // Noto Sans: curves and slants, nothing the same mirrored.
+    let is text.Run as bold = text.run();
+    a.weight = 700;
+    text.lay_plain(s, &bold, "AVg", 3, &a, &pp);
+    a.weight = 400;
+    // Laid out after r: sixteen sizes through text/layout's faces, each
+    // taking a place an earlier run's face had. r names its own.
+    let is [16]text.Style as sts;
+    let is [16]model.Span as sp;
+    let is i64 as i with mut = 0;
+    while (i < 16) {
+        sts[i] = st(8.0 + cast(f64, i));
+        sp[i].start = i;
+        sp[i].end = i + 1;
+        sp[i].style = i;
+        i = i + 1;
+    }
+    text.lay(s, &many, "abcdefghijklmnop", 16, cast(*text.Style, &sts), 16, cast(*model.Span, &sp), 16, &pp);
+
+    frame_begin(c, 1.0);
+    check("drawn", text.draw(s, c, &r, 10.0, 5.0, math.color.black()) == 1);
+    check("a second run in the frame, new glyphs on a page already sent",
+          text.draw(s, c, &r2, 10.0, 35.0, math.color.black()) == 1);
+    text.draw(s, c, &bold, 90.0, 5.0, math.color.black());
+    check("the frame flushed", frame_end(c) == 1);
+    want_run(&r, 10.0, 5.0, 1.0);
+    want_run(&r2, 10.0, 35.0, 1.0);
+    want_run(&bold, 90.0, 5.0, 1.0);
+    check("every pixel as the rasterizer draws the glyphs alone", grey_as_wanted() == 1 && inked() > 150);
+
+    // At twice the pixels, the pen between them.
+    text.next_frame(s);
+    frame_begin(c, 2.0);
+    check("drawn at scale 2", text.draw(s, c, &r, 10.3, 5.0, math.color.black()) == 1);
+    text.draw(s, c, &bold, 50.2, 5.0, math.color.black());
+    frame_end(c);
+    want_run(&r, 10.3, 5.0, 2.0);
+    want_run(&bold, 50.2, 5.0, 2.0);
+    check("at scale 2: rasterized at twice the size, not stretched", grey_as_wanted() == 1 && inked() > 3 * 150);
+
+    // Again: from the cache now, the same.
+    text.next_frame(s);
+    frame_begin(c, 2.0);
+    let is i64 as before = s.cache.drawn;
+    let is i64 as opened = s.next_id;
+    text.draw(s, c, &r, 10.3, 5.0, math.color.black());
+    text.draw(s, c, &bold, 50.2, 5.0, math.color.black());
+    frame_end(c);
+    want_run(&r, 10.3, 5.0, 2.0);
+    want_run(&bold, 50.2, 5.0, 2.0);
+    check("drawn again from the glyph cache", grey_as_wanted() == 1 && s.cache.drawn == before && inked() > 3 * 150);
+    check("its faces opened once, two in all", s.next_id == opened && opened == 3);
+
+    // A style's own colour; the rest in the text's.
+    text.next_frame(s);
+    frame_begin(c, 1.0);
+    a.color = math.color.red();
+    text.lay_plain(s, &r, "Hello", 5, &a, &pp);
+    text.draw(s, c, &r, 10.0, 5.0, math.color.black());
+    frame_end(c);
+    want_run(&r, 10.0, 5.0, 1.0);
+    let is i64 as reddest with mut = 255;
+    i = 0;
+    while (i < W * H) {
+        if (ch(i % W, i / W, 0) < reddest) { reddest = ch(i % W, i / W, 0); }
+        i = i + 1;
+    }
+    check("a style's colour over the text's", reddest >= 253 && worst(1) <= 2 && worst(2) <= 2 && inked() > 50);
+
+    // Underlined in the middle, struck through at the end: each line under
+    // or through its stretch alone, as thick as its deco says, in the text's
+    // colour — the space between "cc" and "cc" has nothing else in it.
+    text.next_frame(s);
+    frame_begin(c, 1.0);
+    a.color = math.color.transparent();
+    let is [3]text.Style as ds;
+    ds[0] = a;
+    ds[1] = a;
+    ds[1].underline = 1;
+    ds[2] = a;
+    ds[2].strike = 1;
+    let is [2]model.Span as dsp;
+    dsp[0].start = 3;
+    dsp[0].end = 5;
+    dsp[0].style = 1;
+    dsp[1].start = 6;
+    dsp[1].end = 11;
+    dsp[1].style = 2;
+    text.lay(s, &r, "aa bb cc cc", 11, cast(*text.Style, &ds), 3, cast(*model.Span, &dsp), 2, &pp);
+    text.draw(s, c, &r, 10.0, 5.0, math.color.black());
+    frame_end(c);
+    let is *text.Deco as under with mut = text.deco(&r, 0);
+    let is *text.Deco as through with mut = text.deco(&r, 1);
+    if (under.style != 1) {
+        under = text.deco(&r, 1);
+        through = text.deco(&r, 0);
+    }
+    check("an underline and a strikethrough", text.deco_count(&r) == 2 && under.style == 1 && through.style == 2 &&
+          under.x > 0.0 && under.y > text.baseline(&r) && through.y < text.baseline(&r));
+    let is f64 as below = 5.0 + text.baseline(&r) + 0.5;
+    check("the underline under its stretch",
+          near(darkness(cast(i64, 10.0 + under.x + under.w / 2.0), below), under.h, 0.05) == 1);
+    check("nothing under the rest", darkness(cast(i64, 10.0 + text.glyph(&r, 0).x + 1.0), below) == 0.0 &&
+          darkness(cast(i64, 10.0 + under.x + under.w + 3.0), below) == 0.0);
+    let is *text.Glyph as gap = text.glyph(&r, 8);
+    check("the strikethrough through its stretch",
+          near(darkness(cast(i64, 10.0 + gap.x + 2.6), 0.0), through.h, 0.05) == 1);
+
+    // The run laid out before the sixteen sizes, drawn after them.
+    text.next_frame(s);
+    frame_begin(c, 1.0);
+    text.lay_plain(s, &r, "Hello", 5, &a, &pp);
+    text.lay(s, &many, "abcdefghijklmnop", 16, cast(*text.Style, &sts), 16, cast(*model.Span, &sp), 16, &pp);
+    text.draw(s, c, &r, 10.0, 5.0, math.color.black());
+    frame_end(c);
+    want_run(&r, 10.0, 5.0, 1.0);
+    check("a run's faces its own: drawn as laid out, after other runs", grey_as_wanted() == 1 && inked() > 50);
+
+    text.run_close(&r);
+    text.run_close(&r2);
+    text.run_close(&bold);
+    text.run_close(&many);
+    text.close(s);
+}
+
+// --- Colour glyphs ---
+
+fn near8(x as i64, y as i64, r as i64, g as i64, b as i64, tol as i64) as i32 {
+    let is i64 as dr with mut = ch(x, y, 0) - r;
+    let is i64 as dg with mut = ch(x, y, 1) - g;
+    let is i64 as db with mut = ch(x, y, 2) - b;
+    if (dr < 0) { dr = 0 - dr; }
+    if (dg < 0) { dg = 0 - dg; }
+    if (db < 0) { db = 0 - db; }
+    return cast(i32, dr <= tol && dg <= tol && db <= tol);
+}
+
+fn colored(c as *draw2d.Canvas) as void {
+    let is *text.Service as s = service(&dv);
+    let is text.Run as r = text.run();
+    let is text.Run as blue = text.run();
+    // color.ttf at 10 pixels an em: its layers on whole pixels, each glyph
+    // ten across, the baseline eight down.
+    let is text.Style as a = st(10.0);
+    a.family = "Color";
+    let is model.Params as pp = model.params();
+    text.lay_plain(s, &r, "AB", 2, &a, &pp);
+    a.color = math.color.blue();
+    text.lay_plain(s, &blue, "AB", 2, &a, &pp);
+    check("colour glyphs laid out", r.ok == 1 && text.glyph_count(&r) == 2 && text.baseline(&r) == 8.0 &&
+          text.glyph(&r, 1).x == 10.0);
+    frame_begin(c, 1.0);
+    check("colour glyphs drawn", text.draw(s, c, &r, 20.0, 10.0, math.color.black()) == 1);
+    text.draw(s, c, &blue, 60.0, 10.0, math.color.black());
+    text.draw(s, c, &r, 100.0, 10.0, math.color.rgba(0.0, 0.0, 0.0, 0.5));
+    let is text.Run as yellow = text.run();
+    a.color = math.color.yellow();
+    text.lay_plain(s, &yellow, "B", 1, &a, &pp);
+    text.draw(s, c, &yellow, 140.0, 10.0, math.color.black());
+    frame_end(c);
+    // A: red under green under blue, in the palette's colours whatever the
+    // text's.
+    check("layers in their colours: red", near8(21, 17, 255, 0, 0, 1) == 1);
+    check("layers in their colours: green over red", near8(23, 15, 0, 255, 0, 1) == 1);
+    check("layers in their colours: blue", near8(25, 17, 0, 0, 255, 1) == 1);
+    check("layers in their colours: green alone", near8(25, 13, 0, 255, 0, 1) == 1);
+    check("nothing past the glyph", near8(29, 17, 255, 255, 255, 1) == 1);
+    // B: a layer in the text's colour, half of it under white at half.
+    check("a layer in the text's colour", near8(36, 17, 0, 0, 0, 1) == 1);
+    check("a palette's half-seen white over it", near8(31, 17, 128, 128, 128, 2) == 1);
+    check("the same glyph in another colour, in the same frame", near8(76, 17, 0, 0, 255, 0) == 1 &&
+          near8(71, 17, 128, 128, 255, 2) == 1 && near8(65, 13, 0, 255, 0, 1) == 1);
+    check("the first kept its colour", near8(36, 17, 0, 0, 0, 1) == 1);
+    check("each channel of the text's colour", near8(146, 17, 255, 255, 0, 0) == 1);
+    check("text at half opacity: colour glyphs at half too", near8(101, 17, 255, 128, 128, 2) == 1 &&
+          near8(116, 17, 128, 128, 128, 2) == 1);
+    text.run_close(&r);
+    text.run_close(&blue);
+    text.run_close(&yellow);
+    text.close(s);
+}
+
+// --- Colour pages ---
+
+fn paged(c as *draw2d.Canvas) as void {
+    // Pages of 16 by 16: four of color.ttf's B at 10 pixels an em, each 8 by
+    // 8, and a glyph for each colour of the text.
+    let is text.Limits as small = text.limits_default();
+    small.color_page = 16;
+    small.color_pages = 2;
+    let is *text.Service as s = text.open(&dv, &small, fn_ptr(resolve), cast(*u8, &marker), plain_name);
+    let is text.Style as a = st(10.0);
+    a.family = "Color";
+    let is model.Params as pp = model.params();
+    let is [9]math.color.Color as cols;
+    cols[0] = math.color.black();
+    cols[1] = math.color.red();
+    cols[2] = math.color.green();
+    cols[3] = math.color.blue();
+    cols[4] = math.color.yellow();
+    cols[5] = math.color.cyan();
+    cols[6] = math.color.magenta();
+    cols[7] = math.color.rgb(1.0, 0.5, 0.0);
+    cols[8] = math.color.rgb(0.0, 0.5, 1.0);
+    let is [9]text.Run as runs;
+    frame_begin(c, 1.0);
+    let is i32 as fit with mut = 1;
+    let is i64 as k with mut = 0;
+    while (k < 9) {
+        a.color = cols[k];
+        runs[k] = text.run();
+        text.lay_plain(s, &runs[k], "B", 1, &a, &pp);
+        if (k < 8 && text.draw(s, c, &runs[k], cast(f64, k * 10), 10.0, math.color.black()) == 0) { fit = 0; }
+        k = k + 1;
+    }
+    check("eight glyphs on two pages", fit);
+    check("a ninth: no room in this frame", text.draw(s, c, &runs[8], 100.0, 10.0, math.color.black()) == 0);
+    frame_end(c);
+    // Each sent as it was drawn: a page's changed part, wherever it is.
+    let is i32 as right with mut = 1;
+    k = 0;
+    while (k < 8) {
+        let is i64 as r8 = cast(i64, cols[k].r * 255.0 + 0.5);
+        let is i64 as g8 = cast(i64, cols[k].g * 255.0 + 0.5);
+        let is i64 as b8 = cast(i64, cols[k].b * 255.0 + 0.5);
+        if (near8(k * 10 + 6, 17, r8, g8, b8, 0) == 0) { right = 0; }
+        k = k + 1;
+    }
+    check("every one where it was drawn, in its colour", right);
+    check("what did not fit, not drawn", near8(106, 17, 255, 255, 255, 0) == 1);
+    text.next_frame(s);
+    frame_begin(c, 1.0);
+    check("the next frame: room again", text.draw(s, c, &runs[8], 0.0, 10.0, math.color.black()) == 1);
+    frame_end(c);
+    check("and drawn", near8(6, 17, 0, 128, 255, 0) == 1);
+    k = 0;
+    while (k < 9) {
+        text.run_close(&runs[k]);
+        k = k + 1;
+    }
+    text.close(s);
+}
+
+// --- A glyph cache too small for a frame ---
+
+fn remembered(c as *draw2d.Canvas) as void {
+    let is text.Limits as small = text.limits_default();
+    small.glyphs = 4;
+    let is *text.Service as s = text.open(&dv, &small, fn_ptr(resolve), cast(*u8, &marker), plain_name);
+    let is text.Run as first = text.run();
+    let is text.Run as second = text.run();
+    let is text.Style as a = st(PX);
+    let is model.Params as pp = model.params();
+    text.lay_plain(s, &first, "abcd", 4, &a, &pp);
+    text.lay_plain(s, &second, "efgh", 4, &a, &pp);
+    frame_begin(c, 1.0);
+    check("four glyphs remembered", text.draw(s, c, &first, 10.0, 5.0, math.color.black()) == 1);
+    check("four more: no room in this frame, and said",
+          text.draw(s, c, &second, 10.0, 35.0, math.color.black()) == 0);
+    frame_end(c);
+    text.next_frame(s);
+    frame_begin(c, 1.0);
+    check("the next frame: room", text.draw(s, c, &second, 10.0, 35.0, math.color.black()) == 1);
+    frame_end(c);
+    want_run(&second, 10.0, 35.0, 1.0);
+    check("and drawn as the rasterizer draws them", grey_as_wanted() == 1 && inked() > 50);
+    text.run_close(&first);
+    text.run_close(&second);
+    text.close(s);
+}
+
+// --- More faces than open at once ---
+
+fn crowded(c as *draw2d.Canvas) as void {
+    let is text.Limits as small = text.limits_default();
+    small.faces = 4;
+    let is *text.Service as s = text.open(&dv, &small, fn_ptr(resolve), cast(*u8, &marker), plain_name);
+    let is [2]text.Run as runs;
+    let is [4]text.Style as sts;
+    let is [4]model.Span as sp;
+    let is model.Params as pp = model.params();
+    let is i64 as j with mut = 0;
+    while (j < 2) {
+        runs[j] = text.run();
+        let is i64 as i with mut = 0;
+        while (i < 4) {
+            sts[i] = st(8.0 + cast(f64, j * 4 + i));
+            sp[i].start = i;
+            sp[i].end = i + 1;
+            sp[i].style = i;
+            i = i + 1;
+        }
+        text.lay(s, &runs[j], "abcd", 4, cast(*text.Style, &sts), 4, cast(*model.Span, &sp), 4, &pp);
+        j = j + 1;
+    }
+    frame_begin(c, 1.0);
+    check("as many faces as open at once", text.draw(s, c, &runs[0], 0.0, 0.0, math.color.black()) == 1);
+    check("more: not drawn, and said", text.draw(s, c, &runs[1], 0.0, 30.0, math.color.black()) == 0);
+    frame_end(c);
+    text.next_frame(s);
+    frame_begin(c, 1.0);
+    check("the next frame: faces not drawn in it make room",
+          text.draw(s, c, &runs[1], 0.0, 30.0, math.color.black()) == 1);
+    frame_end(c);
+    want_run(&runs[1], 0.0, 30.0, 1.0);
+    check("and drawn", grey_as_wanted() == 1 && inked() > 20);
+    text.run_close(&runs[0]);
+    text.run_close(&runs[1]);
+    text.close(s);
+}
+
+fn main() as i32 {
+    let is *u8 as d0 = load("text/testdata/shape-plain.ttf");
+    let is i64 as n0 = loaded;
+    let is *u8 as d1 = load("text/testdata/glyf.ttf");
+    let is i64 as n1 = loaded;
+    let is *u8 as d2 = load("text/testdata/color.ttf");
+    let is i64 as n2 = loaded;
+    if (cast(i64, d0) == 0 || cast(i64, d1) == 0 || cast(i64, d2) == 0) {
+        io.printf("FAIL: cannot read the test fonts\n");
+        return 1;
+    }
+    faces[0] = sfnt.open(d0, n0, 0);
+    faces[1] = sfnt.open(d1, n1, 0);
+    faces[2] = sfnt.open(d2, n2, 0);
+    plain_list.faces = &faces[0];
+    plain_list.n = 1;
+    glyf_list.faces = &faces[1];
+    glyf_list.n = 1;
+    color_list.faces = &faces[2];
+    color_list.n = 1;
+    plain_font = font.of_list(&plain_list);
+    glyf_font = font.of_list(&glyf_list);
+    color_font = font.of_list(&color_list);
+    plain_name = "Plain";
+    lim = text.limits_default();
+    asked_user = cast(*u8, 0);
+    asked_family = cast(*u8, 0);
+    layout.open(&lay);
+
+    measured();
+    resolved();
+    styled();
+
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as dl = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &dl);
+    opath = outline.path.open(65536);
+    oras = raster.open(512, 512);
+
+    drawn(&c);
+    colored(&c);
+    paged(&c);
+    remembered(&c);
+    crowded(&c);
+
+    layout.close(&lay);
+    if (fails == 0) {
+        io.printf("ui text: %d checks passed\n", checks);
+        return 0;
+    }
+    io.printf("ui text: %d of %d checks failed\n", fails, checks);
+    return 1;
+}

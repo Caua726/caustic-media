@@ -1,0 +1,589 @@
+// ui/text.cst — the toolkit's text: one service per application that lays
+// text out and draws it, and runs — what a widget keeps of its text.
+//
+// A text/layout Layout carries a shaper and a table of open faces, tens of
+// kilobytes; the service owns one and lays out with it whatever a widget asks
+// for. What comes back is a Run: each glyph placed — from the run's top
+// left, y down, on its baseline — with its face named by font, face index and
+// size rather than by a slot of the layout's, which the next layout may give
+// to another face; the lines, and what is drawn under and through them. A
+// label keeps a run, measures by it and draws it.
+//
+// Fonts come from the theme through a resolver the program gives: family,
+// weight and italic to a text/layout Font — chains over the system's index
+// for an application, the test fonts for a test.
+//
+// Glyphs are drawn from text/'s glyph cache at the size and subpixel step
+// they land on — the canvas's scale included — coverage on render/coverage's
+// R8 pages and colour glyphs on RGBA pages of the service's own. A page's
+// changed part goes to its texture as soon as a draw has put glyphs on it, so
+// a subtree painted into a texture of its own, flushed before the frame is,
+// finds them there. The service works with no device for measuring alone.
+use "std/mem.cst" as mem;
+use "../math/math.cst" as math;
+use "../image/image.cst" as image;
+use "../gpu/device.cst" as dev;
+use "../gpu/texture.cst" as texture;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
+use "../render/coverage.cst" as coverage;
+use "../text/sfnt/table.cst" as table;
+use "../text/sfnt/var.cst" as var;
+use "../text/outline/outline.cst" as outline;
+use "../text/raster/raster.cst" as raster;
+use "../text/atlas.cst" as atlas;
+use "../text/color/color.cst" as color;
+use "../text/layout/model.cst" as model;
+use "../text/layout/font.cst" as font;
+use "../text/layout/layout.cst" as layout;
+use "style.cst" as style;
+
+// A text/layout Font for a family, a weight (100 to 900) and italic or not;
+// null when there is none. user is what the program gave with it.
+type ResolveFn = fn(*u8, *u8, i64, i32) as *font.Font;
+
+let is i64 as MAX_FONTS  with imut = 16;   // families, weights and styles remembered
+let is i64 as MAX_STYLES with imut = 16;   // styles in one run
+let is i64 as MAX_COLOR_PAGES with imut = 16;
+
+// How much a service holds, sized once: the glyph pages and their side — the
+// largest glyph it draws — the glyphs the caches remember, and the faces open
+// for drawing at once.
+struct Limits {
+    page         as i64;   // coverage, R8
+    pages        as i64;   // up to coverage.MAX_PAGES
+    color_page   as i64;   // colour glyphs, RGBA
+    color_pages  as i64;   // up to MAX_COLOR_PAGES
+    glyphs       as i64;   // coverage glyphs remembered
+    color_glyphs as i64;
+    faces        as i64;
+}
+
+fn limits_default() as Limits {
+    let is Limits as l;
+    l.page = 512;
+    l.pages = 8;
+    l.color_page = 512;
+    l.color_pages = 4;
+    l.glyphs = 4096;
+    l.color_glyphs = 512;
+    l.faces = 64;
+    return l;
+}
+
+// --- Styles ---
+
+// How a stretch of text is set: a family (null for the theme's), a size in
+// logical pixels, a weight, italic; drawn underlined or struck through, in a
+// colour — one of alpha 0 is whatever the run is drawn in.
+struct Style {
+    family    as *u8;
+    size      as f64;
+    weight    as i64;
+    italic    as i32;
+    underline as i32;
+    strike    as i32;
+    _pad0     as i32;
+    color     as math.color.Color;
+}
+
+// The theme's text of a role: its family, size and weight.
+fn style_of(ts as style.TextStyle) as Style {
+    let is Style as s;
+    s.family = cast(*u8, 0);
+    s.size = ts.size;
+    s.weight = ts.weight;
+    s.italic = 0;
+    s.underline = 0;
+    s.strike = 0;
+    s._pad0 = 0;
+    s.color = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+    return s;
+}
+
+// --- Runs ---
+
+struct Glyph {
+    x     as f64;   // the pen, from the run's top left
+    y     as f64;   // the baseline
+    id    as i64;
+    face  as i64;   // in the run's faces
+    style as i64;   // in the run's styles
+}
+
+struct Face {
+    font  as *font.Font;
+    index as i64;
+    px    as f64;
+}
+
+struct Line {
+    x      as f64;   // its content's left
+    top    as f64;
+    y      as f64;   // the baseline
+    width  as f64;
+    height as f64;
+    start  as i64;   // bytes
+    end    as i64;
+}
+
+struct Deco {
+    x     as f64;
+    y     as f64;
+    w     as f64;
+    h     as f64;
+    style as i64;
+}
+
+struct Run {
+    glyphs as model.Arr;
+    faces  as model.Arr;
+    lines  as model.Arr;
+    decos  as model.Arr;
+    colors as [16]math.color.Color;   // each style's
+    width  as f64;                    // the widest line's content
+    height as f64;
+    cut    as i32;                    // max_lines left text out
+    ok     as i32;                    // laid out
+}
+
+fn run() as Run {
+    let is Run as r;
+    r.glyphs = model.arr(sizeof(Glyph));
+    r.faces = model.arr(sizeof(Face));
+    r.lines = model.arr(sizeof(Line));
+    r.decos = model.arr(sizeof(Deco));
+    r.width = 0.0;
+    r.height = 0.0;
+    r.cut = 0;
+    r.ok = 0;
+    return r;
+}
+
+fn run_close(r as *Run) as void {
+    model.arr_close(&r.glyphs);
+    model.arr_close(&r.faces);
+    model.arr_close(&r.lines);
+    model.arr_close(&r.decos);
+    r.ok = 0;
+}
+
+fn glyph_count(r as *Run) as i64 { return r.glyphs.n; }
+fn glyph(r as *Run, i as i64) as *Glyph { return cast(*Glyph, model.arr_at(&r.glyphs, i)); }
+fn face_count(r as *Run) as i64 { return r.faces.n; }
+fn face(r as *Run, i as i64) as *Face { return cast(*Face, model.arr_at(&r.faces, i)); }
+fn line_count(r as *Run) as i64 { return r.lines.n; }
+fn line(r as *Run, i as i64) as *Line { return cast(*Line, model.arr_at(&r.lines, i)); }
+fn deco_count(r as *Run) as i64 { return r.decos.n; }
+fn deco(r as *Run, i as i64) as *Deco { return cast(*Deco, model.arr_at(&r.decos, i)); }
+
+// The first line's baseline, from the run's top; 0 for a run of no lines.
+fn baseline(r as *Run) as f64 {
+    if (r.lines.n == 0) { return 0.0; }
+    return line(r, 0).y;
+}
+
+// --- The service ---
+
+struct Resolved {
+    family as *u8;
+    weight as i64;
+    italic as i64;
+    font   as *font.Font;
+}
+
+// A face open for drawing: the reader rasterizing it, and the glyph cache's
+// name for it, new each time it is opened.
+struct Open {
+    font  as *font.Font;
+    index as i64;
+    px    as f64;
+    id    as i64;     // 0 for an entry not in use
+    used  as i64;     // the frame it was last drawn in
+    face  as *table.Face;
+    r     as outline.Reader;
+}
+
+struct Service {
+    lay      as layout.Layout;
+    resolve  as ResolveFn;
+    user     as *u8;
+    family   as *u8;                   // the theme's interface font
+    fonts    as [16]Resolved;
+    nfonts   as i64;
+    opens    as *Open;
+    nopens   as i64;
+    next_id  as i64;
+    frame    as i64;
+    d        as *dev.Device;
+    cov      as coverage.Coverage;
+    path     as outline.path.Path;
+    cache    as atlas.Cache;
+    colors   as image.atlas.Atlas;
+    ctex     as [16]i64;                 // each colour page's texture; 0 until made
+    ccache   as atlas.Cache;
+    painter  as color.Painter;
+    lstyles  as [16]model.Style;
+    drawing  as i32;                   // a device to draw with
+    _pad0    as i32;
+}
+
+// A service on device d — null to measure alone — holding what l says,
+// resolving fonts with resolve(user, ...). family is the theme's interface
+// font, what a style of no family of its own is set in. Null when memory is
+// refused; on a device, drawing is 0 when the pages were.
+fn open(d as *dev.Device, l as *Limits, resolve as ResolveFn, user as *u8, family as *u8) as *Service {
+    // Both mappings come zeroed: no fonts resolved, no face open, no colour
+    // page's texture made.
+    let is *Service as s = cast(*Service, mem.core.mmap_anon(sizeof(Service)));
+    if (cast(i64, s) <= 0) { return cast(*Service, 0); }
+    s.nopens = l.faces;
+    if (s.nopens < 1) { s.nopens = 1; }
+    s.opens = cast(*Open, mem.core.mmap_anon(s.nopens * sizeof(Open)));
+    if (cast(i64, s.opens) <= 0) {
+        mem.core.munmap(cast(*u8, s), sizeof(Service));
+        return cast(*Service, 0);
+    }
+    layout.open(&s.lay);
+    s.resolve = resolve;
+    s.user = user;
+    s.family = family;
+    s.next_id = 1;
+    s.frame = 1;
+    s.d = d;
+    if (cast(i64, d) != 0) {
+        let is i64 as cp with mut = l.color_pages;
+        if (cp > MAX_COLOR_PAGES) { cp = MAX_COLOR_PAGES; }
+        s.cov = coverage.open(d, l.page, l.pages, l.page);
+        s.path = outline.path.open(65536);
+        s.cache = atlas.open(&s.cov.atlas, &s.cov.raster, &s.path, l.glyphs, 4, 1);
+        s.colors = image.atlas.open(l.color_page, l.color_page, image.RGBA8, cp);
+        s.ccache = atlas.open(&s.colors, &s.cov.raster, &s.path, l.color_glyphs, 1, 1);
+        s.painter = color.painter(&s.cov.raster, &s.path);
+        if (coverage.ok(&s.cov) == 1 && atlas.ok(&s.cache) == 1 && atlas.ok(&s.ccache) == 1 &&
+            image.atlas.ok(&s.colors) == 1) {
+            s.drawing = 1;
+        }
+    }
+    return s;
+}
+
+fn close(s as *Service) as void {
+    let is i64 as i with mut = 0;
+    while (i < s.nopens) {
+        let is *Open as o = &s.opens[i];
+        if (o.id != 0) { outline.close(&o.r); }
+        o.id = 0;
+        i = i + 1;
+    }
+    if (cast(i64, s.d) != 0) {
+        i = 0;
+        while (i < MAX_COLOR_PAGES) {
+            if (s.ctex[i] != 0) { texture.destroy(s.d, s.ctex[i]); }
+            s.ctex[i] = 0;
+            i = i + 1;
+        }
+        color.close(&s.painter);
+        atlas.close(&s.ccache);
+        image.atlas.close(&s.colors);
+        atlas.close(&s.cache);
+        outline.path.close(&s.path);
+        coverage.close(&s.cov);
+    }
+    layout.close(&s.lay);
+    mem.core.munmap(cast(*u8, s.opens), s.nopens * sizeof(Open));
+    mem.core.munmap(cast(*u8, s), sizeof(Service));
+}
+
+// The interface font a style of no family is set in, from here on.
+fn set_family(s as *Service, family as *u8) as void { s.family = family; }
+
+// A frame begins: what the glyph caches hold for it is kept until the next.
+fn next_frame(s as *Service) as void {
+    s.frame = s.frame + 1;
+    if (s.drawing == 1) {
+        atlas.next_frame(&s.cache);
+        atlas.next_frame(&s.ccache);
+        coverage.next_frame(&s.cov);
+        image.atlas.next_frame(&s.colors);
+    }
+}
+
+fn _same(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == cast(i64, b)) { return 1; }
+    if (cast(i64, a) == 0 || cast(i64, b) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i32, a[i] == b[i]);
+}
+
+// The font for a family, weight and style: resolved once and remembered.
+fn font_for(s as *Service, family as *u8, weight as i64, italic as i32) as *font.Font {
+    let is *u8 as fam with mut = family;
+    if (cast(i64, fam) == 0) { fam = s.family; }
+    let is i64 as i with mut = 0;
+    while (i < s.nfonts) {
+        let is *Resolved as rv = &s.fonts[i];
+        if (rv.weight == weight && rv.italic == cast(i64, italic) && _same(rv.family, fam) == 1) { return rv.font; }
+        i = i + 1;
+    }
+    let is *font.Font as f = call(s.resolve, s.user, fam, weight, italic);
+    if (cast(i64, f) == 0) { return f; }
+    // Past the table's room, resolved each time: still right, only slower.
+    if (s.nfonts < MAX_FONTS) {
+        let is *Resolved as rv = &s.fonts[s.nfonts];
+        rv.family = fam;
+        rv.weight = weight;
+        rv.italic = cast(i64, italic);
+        rv.font = f;
+        s.nfonts = s.nfonts + 1;
+    }
+    return f;
+}
+
+// --- Laying out ---
+
+fn _face_index(r as *Run, f as *font.Font, index as i64, px as f64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < r.faces.n) {
+        let is *Face as fc = face(r, i);
+        if (cast(i64, fc.font) == cast(i64, f) && fc.index == index && fc.px == px) { return i; }
+        i = i + 1;
+    }
+    let is *Face as fc = cast(*Face, model.arr_push(&r.faces));
+    if (cast(i64, fc) == 0) { return 0 - 1; }
+    fc.font = f;
+    fc.index = index;
+    fc.px = px;
+    return r.faces.n - 1;
+}
+
+// The text — nbytes of UTF-8 — set in styles, each span of it in its style
+// and the rest in style 0, in the box params describes, into r: 1, or 0 when
+// it could not be — a style with no font, more than MAX_STYLES of them, or
+// what layout refuses.
+fn lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, nstyles as i64,
+       spans as *model.Span, nspans as i64, params as *model.Params) as i32 {
+    r.glyphs.n = 0;
+    r.faces.n = 0;
+    r.lines.n = 0;
+    r.decos.n = 0;
+    r.width = 0.0;
+    r.height = 0.0;
+    r.cut = 0;
+    r.ok = 0;
+    if (nstyles < 1 || nstyles > MAX_STYLES) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < nstyles) {
+        let is *Style as st = &styles[k];
+        let is *model.Style as ls = &s.lstyles[k];
+        mem.memset(cast(*u8, ls), 0, sizeof(model.Style));
+        ls.font = font_for(s, st.family, st.weight, st.italic);
+        if (cast(i64, ls.font) == 0) { return 0; }
+        ls.px = st.size;
+        ls.underline = st.underline;
+        ls.strike = st.strike;
+        r.colors[k] = st.color;
+        k = k + 1;
+    }
+    if (layout.set(&s.lay, text, nbytes, cast(*model.Style, &s.lstyles), nstyles, spans, nspans, params) == 0) {
+        return 0;
+    }
+    let is *layout.Layout as l = &s.lay;
+    let is i64 as i with mut = 0;
+    while (i < layout.glyph_count(l)) {
+        let is *model.Glyph as g = layout.glyph(l, i);
+        let is *font.Sized as z = layout.face(l, cast(i64, g.slot));
+        let is i64 as fi = _face_index(r, z.font, z.index, z.px);
+        let is *Glyph as out = cast(*Glyph, model.arr_push(&r.glyphs));
+        if (fi < 0 || cast(i64, out) == 0) { return 0; }
+        out.x = g.x;
+        out.y = g.y;
+        out.id = cast(i64, g.id);
+        out.face = fi;
+        out.style = cast(i64, g.style);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < layout.line_count(l)) {
+        let is *model.Line as ml = layout.line(l, i);
+        let is *Line as ln = cast(*Line, model.arr_push(&r.lines));
+        if (cast(i64, ln) == 0) { return 0; }
+        ln.x = ml.x;
+        ln.top = ml.top;
+        ln.y = ml.y;
+        ln.width = ml.width;
+        ln.height = ml.height;
+        ln.start = ml.start;
+        ln.end = ml.end;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < layout.deco_count(l)) {
+        let is *model.Deco as md = layout.deco(l, i);
+        let is *Deco as dc = cast(*Deco, model.arr_push(&r.decos));
+        if (cast(i64, dc) == 0) { return 0; }
+        dc.x = md.x;
+        dc.y = md.y;
+        dc.w = md.w;
+        dc.h = md.h;
+        dc.style = md.style;
+        i = i + 1;
+    }
+    r.width = layout.width(l);
+    r.height = layout.height(l);
+    r.cut = layout.cut(l);
+    r.ok = 1;
+    return 1;
+}
+
+// One style over the whole of the text: the common case.
+fn lay_plain(s as *Service, r as *Run, text as *u8, nbytes as i64, st as *Style, params as *model.Params) as i32 {
+    return lay(s, r, text, nbytes, st, 1, cast(*model.Span, 0), 0, params);
+}
+
+// --- Drawing ---
+
+// The open entry for a run's face: found, or opened in the place used
+// longest ago — never one drawn from in this frame. Null when none.
+fn _open(s as *Service, fc as *Face) as *Open {
+    let is i64 as free with mut = 0 - 1;
+    let is i64 as oldest with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < s.nopens) {
+        let is *Open as o = &s.opens[i];
+        if (o.id != 0 && cast(i64, o.font) == cast(i64, fc.font) && o.index == fc.index && o.px == fc.px) {
+            o.used = s.frame;
+            return o;
+        }
+        if (o.id == 0 && free < 0) { free = i; }
+        if (o.id != 0 && o.used < s.frame && (oldest < 0 || o.used < s.opens[oldest].used)) { oldest = i; }
+        i = i + 1;
+    }
+    let is i64 as at with mut = free;
+    if (at < 0) { at = oldest; }
+    if (at < 0) { return cast(*Open, 0); }
+    let is var.Coords as c;
+    let is *table.Face as f = call(fc.font.face, fc.font.user, fc.index, fc.px, &c);
+    if (cast(i64, f) == 0) { return cast(*Open, 0); }
+    let is *Open as o = &s.opens[at];
+    if (o.id != 0) { outline.close(&o.r); }
+    o.font = fc.font;
+    o.index = fc.index;
+    o.px = fc.px;
+    o.face = f;
+    o.r = outline.open(f);
+    outline.vary(&o.r, &c);
+    o.id = s.next_id;
+    s.next_id = s.next_id + 1;
+    o.used = s.frame;
+    return o;
+}
+
+// Colour page p's texture, made the first time it is asked for.
+fn _color_texture(s as *Service, p as i64) as i64 {
+    if (s.ctex[p] == 0) {
+        let is texture.Desc as td = texture.desc(s.colors.w, s.colors.h, texture.RGBA8, texture.SAMPLED);
+        s.ctex[p] = texture.create(s.d, &td);
+    }
+    return s.ctex[p];
+}
+
+// Every changed part of every page sent to its texture: 1, or 0 when the
+// device refused one.
+fn upload(s as *Service) as i32 {
+    if (s.drawing == 0) { return 1; }
+    let is i32 as ok with mut = coverage.upload(&s.cov);
+    let is i64 as p with mut = 0;
+    while (p < image.atlas.pages(&s.colors)) {
+        let is image.atlas.Region as rg;
+        if (image.atlas.dirty(&s.colors, p, &rg) == 1) {
+            let is *image.buffer.Image as pg = image.atlas.page(&s.colors, p);
+            let is *u8 as at = cast(*u8, cast(i64, pg.pixels) + rg.y * pg.stride + rg.x * 4);
+            if (texture.upload_region(s.d, _color_texture(s, p), rg.x, rg.y, rg.w, rg.h, at, pg.stride) == 0) {
+                ok = 0;
+            }
+            image.atlas.clean(&s.colors, p);
+        }
+        p = p + 1;
+    }
+    return ok;
+}
+
+fn _rgba(c as math.color.Color) as u32 {
+    let is i64 as r = cast(i64, c.r * 255.0 + 0.5);
+    let is i64 as g = cast(i64, c.g * 255.0 + 0.5);
+    let is i64 as b = cast(i64, c.b * 255.0 + 0.5);
+    let is i64 as a = cast(i64, c.a * 255.0 + 0.5);
+    return cast(u32, (r << 24) | (g << 16) | (b << 8) | a);
+}
+
+// Run r drawn on c with its top left at (x, y), logical pixels, in fg where
+// a style gives no colour of its own. Glyphs land on the canvas's physical
+// pixels, a quarter of one apart across. 1, or 0 when a glyph found no room
+// in this frame or the device refused a page — what did fit is drawn.
+fn draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color) as i32 {
+    if (s.drawing == 0 || r.ok == 0) { return 0; }
+    let is i32 as ok with mut = 1;
+    let is f64 as k = draw2d.scale(c);
+    let is f64 as pw = cast(f64, s.cov.atlas.w);
+    let is f64 as ph = cast(f64, s.cov.atlas.h);
+    let is f64 as cw = cast(f64, s.colors.w);
+    let is f64 as chh = cast(f64, s.colors.h);
+    let is i64 as i with mut = 0;
+    while (i < r.glyphs.n) {
+        let is *Glyph as g = glyph(r, i);
+        let is *Face as fc = face(r, g.face);
+        let is *Open as o = _open(s, fc);
+        let is math.color.Color as col with mut = r.colors[g.style];
+        if (col.a <= 0.0) { col = fg; }
+        if (cast(i64, o) == 0) {
+            ok = 0;
+        } else {
+            let is f64 as px = fc.px * k;
+            let is f64 as gx = (x + g.x) * k;
+            let is f64 as gy = (y + g.y) * k;
+            let is atlas.Placed as pl;
+            if (color.kind(o.face, g.id) == color.NONE) {
+                let is i32 as got = atlas.get(&s.cache, &o.r, o.id, px, g.id, gx, gy, &pl);
+                if (got == atlas.NO_ROOM) { ok = 0; }
+                if (got == atlas.PLACED && pl.w > 0 && pl.h > 0) {
+                    let is i64 as tex = coverage.texture_of(&s.cov, pl.page);
+                    draw2d.glyph(c, tex, cast(f64, pl.x) / k, cast(f64, pl.y) / k, cast(f64, pl.w) / k,
+                                 cast(f64, pl.h) / k, cast(f64, pl.sx) / pw, cast(f64, pl.sy) / ph,
+                                 cast(f64, pl.sx + pl.w) / pw, cast(f64, pl.sy + pl.h) / ph, col);
+                }
+            } else {
+                // A layer may be in the text's colour, so the colour is
+                // part of what the glyph is cached under — opaque: the
+                // text's opacity comes after, over all of the glyph.
+                let is u32 as fgc = _rgba(math.color.rgba(col.r, col.g, col.b, 1.0));
+                let is i64 as key = (o.id << 32) | (cast(i64, fgc) & 4294967295);
+                let is i32 as got = color.get(&s.ccache, &s.painter, &o.r, key, px, g.id, gx, gy, 0, fgc, &pl);
+                if (got == atlas.NO_ROOM) { ok = 0; }
+                if (got == atlas.PLACED && pl.w > 0 && pl.h > 0) {
+                    let is i64 as tex = _color_texture(s, pl.page);
+                    // Colour glyphs keep their colours; only the text's
+                    // opacity reaches them.
+                    let is f64 as a = col.a;
+                    draw2d.image_premultiplied(c, tex, 0, cast(f64, pl.x) / k, cast(f64, pl.y) / k,
+                                               cast(f64, pl.w) / k, cast(f64, pl.h) / k,
+                                               cast(f64, pl.sx) / cw, cast(f64, pl.sy) / chh,
+                                               cast(f64, pl.sx + pl.w) / cw, cast(f64, pl.sy + pl.h) / chh,
+                                               math.color.rgba(a, a, a, a));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < r.decos.n) {
+        let is *Deco as dc = deco(r, i);
+        let is math.color.Color as col with mut = r.colors[dc.style];
+        if (col.a <= 0.0) { col = fg; }
+        shapes.fill_rect(c, x + dc.x, y + dc.y, dc.w, dc.h, col);
+        i = i + 1;
+    }
+    if (upload(s) == 0) { ok = 0; }
+    return ok;
+}

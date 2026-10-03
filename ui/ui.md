@@ -29,6 +29,7 @@ ui/
   painter.cst     what a widget's paint entry is handed
   style.cst       the theme: colours, metrics, fonts, per-state variants
   system.cst      the desktop's settings, as the theme and the timings
+  text.cst        one text service: runs laid out and drawn
   a11y.cst        role, name and state per widget; the platform bridges
   widgets/        label, button, check, radio, entry, slider, progress,
                   scroll, list, tree, table, menu, tabs, splitter, dialog
@@ -262,6 +263,28 @@ All of it from [`text/`](../text/text.md): shaping and layout for labels,
 wrapping to the arranged width, caret positions and hit-testing for entries,
 selection rectangles across bidirectional runs.
 
+**One text service per application** (`text.cst`). A `text/layout` Layout
+carries a shaper and a table of open faces — tens of kilobytes — which a form
+of fifty labels should not hold fifty times. The service owns one, lays out
+whatever a widget asks for with it, and hands back a **run**: the glyphs —
+each with its face named by font, index and size, not by a slot the next
+layout may give to another — the lines' extent and the decorations. A run is
+what a label keeps, measures by and draws. A widget whose text is edited or
+selected — the entry, a selectable label — keeps a Layout of its own, because
+the cursor's questions need everything a layout found.
+
+Fonts come from the theme — a family, a size and a weight for each role of
+text — through a resolver the program gives the service: a function from
+family, weight and style to a `text/layout` Font. An application hands it
+chains over the system's index (`text/fonts`), a test hands it the test fonts.
+
+Glyphs are drawn from `text/`'s glyph cache: rasterized once at the size and
+subpixel step they are drawn at — the window's scale included — onto
+`render/coverage`'s R8 pages, and colour glyphs onto RGBA pages of the
+service's own. A page's changed part goes to its texture as soon as a glyph is
+drawn there, so a subtree painted into a texture of its own, which is flushed
+before the frame is, finds its glyphs there.
+
 The entry is the hardest widget in any toolkit — selection, undo, IME,
 clipboard, caret movement through bidi text — and it waits for `text/` to reach
 caret and hit-testing rather than being faked with a monospace bitmap font.
@@ -325,11 +348,11 @@ touching every widget.
 |---|---|---|
 | `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 done; Wayland and Win32 designed |
 | `input/` | events; text input and IME composition | design note |
-| `render/` | `draw2d`, `shapes2d`, scissor, layers | the 3D path is started; the 2D family is not |
-| `text/` | shaping, layout, caret, hit-testing | design notes only |
+| `render/` | `draw2d`, `shapes2d`, scissor, layers | done |
+| `text/` | shaping, layout, caret, hit-testing, colour glyphs | done; complex scripts later |
 
-Three of the four foundations do not exist yet, which is why most of the toolkit
-has no code. What can be built without them is built first.
+`input/` is still a design note: the router takes keys and text from
+`window/`'s events as they are.
 
 ## Current state
 
@@ -508,6 +531,25 @@ router's timings — double-click time and distance, the drag threshold, the
 caret's blink — and `app.set_system` applies both to every window, keeping its
 own copy so the theme's font names outlive the caller's record (`system_test`).
 The Windows registry comes with the Win32 backend.
+
+**Text** (`text.cst`, tested by `text_test`): one service per application,
+on a device or with none for measuring alone, sized once (`text.Limits`: the
+glyph pages and their side, the glyphs the caches remember, the faces open
+for drawing at once). It lays out with its one `text/layout` Layout and copies
+what a widget keeps into a run — glyphs with their faces named by font, face
+and size, lines, decorations, each style's colour. Fonts come through the
+program's resolver, asked once for each family, weight and style and
+remembered by name — sixteen of them, the rest asked again each time; a style
+of no family takes the theme's. Drawing rasterizes each glyph at the size and
+quarter-pixel step it lands on at the canvas's scale, through `text/atlas` onto
+`render/coverage`'s pages, colour glyphs — layers and bitmaps — onto RGBA
+pages of the service's own, cached under the text's colour as well, since a
+layer may be in it; the text's opacity is laid over the whole glyph. Each draw
+sends its pages' changed parts before it returns. What finds no room — a full
+glyph cache or page, every face slot drawn from in this frame — is said, and
+drawn the next frame, when what was not used makes room. The test holds every
+pixel to what the rasterizer draws for each glyph alone, at scale 1 and 2, with
+the pen between pixels; colour glyphs to their palette's colours exactly.
 
 ## For scale
 
