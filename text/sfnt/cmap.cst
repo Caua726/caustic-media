@@ -249,3 +249,160 @@ fn variant(f as *table.Face, cp as i64, vs as i64) as i64 {
     if (g < 0) { return glyph(f, cp); }
     return g;
 }
+
+// --- Coverage ---
+
+// The pages of 256 characters a mapping reaches, as bits: page p is bit
+// p & 7 of byte p >> 3, 4352 pages for all of Unicode, so bits holds 544
+// bytes. Font matching keeps them to know which faces to ask for a
+// character; the face's own cmap then answers exactly.
+let is i64 as PAGES with imut = 4352;
+let is i64 as PAGE_BYTES with imut = 544;
+
+// Characters looked up and pages marked by pages(), all told: what its
+// tests hold its bounds to.
+let is i64 as looked with mut = 0;
+
+fn _mark(bits as *u8, p as i64) as i64 {
+    let is *u8 as b = cast(*u8, cast(i64, bits) + (p >> 3));
+    let is i64 as m = 1 << (p & 7);
+    if ((cast(i64, *b) & m) != 0) { return 0; }
+    *b = cast(u8, cast(i64, *b) | m);
+    return 1;
+}
+
+fn _marked(bits as *u8, p as i64) as i32 {
+    if ((cast(i64, *cast(*u8, cast(i64, bits) + (p >> 3))) >> (p & 7)) & 1 == 1) { return 1; }
+    return 0;
+}
+
+// Characters lo to hi looked up one by one, a page left as soon as one in it
+// maps. hi is clamped to the end of Unicode.
+fn _each(f as *table.Face, s as *Subtable, lo as i64, hi as i64, bits as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as last with mut = hi;
+    if (last > 1114111) { last = 1114111; }
+    let is i64 as cp with mut = lo;
+    while (cp <= last) {
+        if (_marked(bits, cp >> 8) == 1) {
+            cp = ((cp >> 8) + 1) << 8;
+        } else {
+            looked = looked + 1;
+            if (lookup(f, s, cp) != 0) { n = n + _mark(bits, cp >> 8); }
+            cp = cp + 1;
+        }
+    }
+    return n;
+}
+
+// Characters lo to hi, all of whose glyphs are known to be valid.
+fn _range(lo as i64, hi as i64, bits as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as last with mut = hi;
+    if (last > 1114111) { last = 1114111; }
+    let is i64 as p with mut = lo >> 8;
+    while (p <= last >> 8) {
+        looked = looked + 1;
+        n = n + _mark(bits, p);
+        p = p + 1;
+    }
+    return n;
+}
+
+// Format 12 and 13 groups: by arithmetic, for a group can span all of
+// Unicode. A group backwards reaches nothing, as lookup finds in it. Groups
+// are sorted and apart in a valid table, so no page is looked at again past
+// the last one marked: a table of groups that overlap costs no more than
+// one that does not, and its pages are a subset of what lookup finds.
+fn _groups(f as *table.Face, s as i64, same as i32, bits as *u8) as i64 {
+    let is i64 as k = table.u32_at(f, s + 12);
+    let is i64 as groups = s + 16;
+    if (table.inside(f.cmap, groups, k * 12) == 0) { return 0; }
+    let is i64 as n with mut = 0;
+    let is i64 as from with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < k) {
+        let is i64 as g = groups + i * 12;
+        let is i64 as start = table.u32_at(f, g);
+        let is i64 as end = table.u32_at(f, g + 4);
+        let is i64 as first = table.u32_at(f, g + 8);
+        let is i64 as lo with mut = start;
+        let is i64 as hi with mut = end;
+        if (same == 1) {
+            if (first < 1 || first >= f.glyphs) { hi = lo - 1; }
+        } else {
+            // Glyphs first to first + (end - start); those from 1 to the
+            // face's last are valid.
+            if (first < 1) { lo = start + 1 - first; }
+            if (first + (end - start) > f.glyphs - 1) { hi = start + (f.glyphs - 1 - first); }
+        }
+        if (lo < from * 256) { lo = from * 256; }
+        if (lo <= hi) {
+            n = n + _range(lo, hi, bits);
+            from = (hi >> 8) + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The pages subtable s maps characters in, into bits (cleared first); how
+// many.
+fn pages(f as *table.Face, s as *Subtable, bits as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < PAGE_BYTES) {
+        *cast(*u8, cast(i64, bits) + i) = cast(u8, 0);
+        i = i + 1;
+    }
+    let is i64 as o = s.off;
+    if (s.format == 0) { return _each(f, s, 0, 255, bits); }
+    if (s.format == 6) {
+        let is i64 as first = table.u16_at(f, o + 6);
+        return _each(f, s, first, first + table.u16_at(f, o + 8) - 1, bits);
+    }
+    if (s.format == 10) {
+        // As many characters as the file has glyphs for; past it they read 0.
+        let is i64 as first = table.u32_at(f, o + 12);
+        let is i64 as k with mut = table.u32_at(f, o + 16);
+        let is i64 as room = (f.size - (o + 20)) / 2;
+        if (k > room) { k = room; }
+        return _each(f, s, first, first + k - 1, bits);
+    }
+    if (s.format == 4) {
+        // Each character looked at once at most: segments are sorted and
+        // apart in a valid table, and past the end of the last one nothing
+        // is looked at again.
+        let is i64 as segs = table.u16_at(f, o + 6) / 2;
+        let is i64 as ends = o + 14;
+        if (table.inside(f.cmap, ends, segs * 8 + 2) == 0) { return 0; }
+        let is i64 as n with mut = 0;
+        let is i64 as from with mut = 0;
+        i = 0;
+        while (i < segs) {
+            let is i64 as lo with mut = table.u16_at(f, ends + segs * 2 + 2 + i * 2);
+            let is i64 as hi = table.u16_at(f, ends + i * 2);
+            if (lo < from) { lo = from; }
+            if (lo <= hi) {
+                n = n + _each(f, s, lo, hi, bits);
+                from = hi + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+    if (s.format == 12) { return _groups(f, o, 0, bits); }
+    if (s.format == 13) { return _groups(f, o, 1, bits); }
+    return 0;
+}
+
+// The pages the face's mapping reaches: its subtable's, and for a symbol
+// font the first page as well when U+F000..F0FF has anything, since
+// glyph() looks the first 256 characters up there.
+fn coverage(f as *table.Face, bits as *u8) as i64 {
+    let is Subtable as s;
+    s.off = f.cmap_sub;
+    s.format = f.cmap_fmt;
+    let is i64 as n = pages(f, &s, bits);
+    if (f.symbol == 1 && _marked(bits, 240) == 1) { return n + _mark(bits, 0); }
+    return n;
+}

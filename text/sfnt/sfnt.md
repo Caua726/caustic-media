@@ -47,6 +47,19 @@ A font carries several subtables for several platform and encoding pairs, and th
 loader picks: format 12 with Unicode encoding if present, otherwise format 4.
 Choosing wrong means everything above U+FFFF silently maps to nothing.
 
+### Coverage
+
+Finding a font for a character ([`../fonts`](../fonts/fonts.md)) needs to know,
+of every face on the system, which characters it has — without opening 4000
+files for each character. `cmap.pages` gives the **pages** of 256 characters a
+subtable reaches, as 544 bytes of bits, and `cmap.coverage` the face's: exactly
+the pages where some character maps to a glyph, as `lookup` and `glyph` would
+answer. Segments and groups are read by arithmetic where they can be and
+character by character where a glyph array decides; each character is looked at
+once at most and each page left at its first hit, so a malformed table of
+overlapping segments costs no more than a valid one — its pages then a subset of
+what `lookup` finds.
+
 ---
 
 ## WOFF2 is nearly free here
@@ -127,13 +140,17 @@ more is read at its default instance, which, as above, looks right.
 `table.cst` (the directory, single faces and `.ttc` collections, reads checked
 against the file), `head.cst` (`head`, `hhea`, `maxp`, `OS/2`, `post`, and the
 line metrics by the browsers' convention), `hmtx.cst`, `cmap.cst` (formats 0, 4,
-6, 10, 12 and 13, Windows Symbol, and format 14's variation sequences), `name.cst`
+6, 10, 12 and 13, Windows Symbol, format 14's variation sequences, and the pages
+a mapping reaches), `name.cst`
 (UTF-16 and Mac Roman to UTF-8, the record an English-reading user should see)
 and the legacy `kern.cst`; `sfnt.open` does it all. `sfnt_test` holds every face
 of the fonts in [`../testdata`](../testdata/README.md) to what fontTools reads
 from them — every table field, name, subtable mapping, advance and kerning pair,
-and for the mappings every character of Unicode not listed mapping to nothing —
-then reads fonts cut at every length and with their counts corrupted, laid
+and for the mappings every character of Unicode not listed mapping to nothing,
+and every subtable's pages — then subtables made by hand for the pages at every
+edge (a page's first and last character, groups past the glyphs or past
+Unicode, overlapping segments held to their bound by a count of the work), then
+reads fonts cut at every length and with their counts corrupted, laid
 against an unreadable page so a read one byte too far faults. Mutation-tested:
 every mutant killed, the checks no test could tell apart removed.
 

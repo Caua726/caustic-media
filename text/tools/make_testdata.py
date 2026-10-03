@@ -770,8 +770,158 @@ def synthetic_var_cff2():
     print("var.otf", os.path.getsize(os.path.join(OUT, "var.otf")), "bytes")
 
 
+FONTS = os.path.join(OUT, "fonts")
+
+BASIC = "".join(chr(c) for c in range(0x20, 0x7F))
+GREEK = " " + "".join(chr(c) for c in range(0x3B1, 0x3CA))
+CYRILLIC = " абвгд"
+CJK_CHARS = "Aa一か가ㄅＡ\u02EA\uFF66\u1160"
+
+
+def make_face(family, style, chars, weight=400, width=5, selection=0x40, typo=None, cff=False,
+              mono=False, colr=False, axes=None, os2=True, mac_style=0, short_os2=False, nameless=False):
+    # A face whose glyphs are squares, one per character, and whose names,
+    # OS/2 and fvar say what font matching reads: everything else is the
+    # least a valid font has. typo is (typographic family, typographic
+    # style) when the face has them.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+    cps = sorted(set(ord(c) for c in chars))
+    names = [".notdef"] + ["u%04X" % c for c in cps]
+    fb = FontBuilder(1000, isTTF=not cff)
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({c: "u%04X" % c for c in cps})
+    if cff:
+        glyphs = {}
+        for n in names:
+            pen = T2CharStringPen(500, None)
+            pen.moveTo((100, 0)); pen.lineTo((100, 700)); pen.lineTo((400, 700)); pen.lineTo((400, 0)); pen.closePath()
+            glyphs[n] = pen.getCharString()
+        fb.setupCFF(family.replace(" ", "") + "-" + style.replace(" ", ""), {"FullName": family + " " + style},
+                    glyphs, {})
+    else:
+        pen = TTGlyphPen(None)
+        pen.moveTo((100, 0)); pen.lineTo((100, 700)); pen.lineTo((400, 700)); pen.lineTo((400, 0)); pen.closePath()
+        sq = pen.glyph()
+        fb.setupGlyf({n: sq for n in names})
+    fb.setupHorizontalMetrics({n: (500, 100) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    strings = {"familyName": family, "styleName": style,
+               "uniqueFontIdentifier": family + " " + style,
+               "fullName": family + " " + style,
+               "psName": (family + "-" + style).replace(" ", "")}
+    if typo:
+        strings["typographicFamily"] = typo[0]
+        strings["typographicSubfamily"] = typo[1]
+    fb.setupNameTable({} if nameless else strings, mac=False)
+    if os2:
+        fb.setupOS2(usWeightClass=weight, usWidthClass=width, fsSelection=selection, version=4,
+                    sTypoAscender=800, sTypoDescender=-200, usWinAscent=800, usWinDescent=200)
+    fb.setupPost(isFixedPitch=1 if mono else 0)
+    if os2 and not short_os2:
+        mac_style = (1 if selection & 0x20 else 0) | (2 if selection & 0x01 else 0)
+    fb.updateHead(macStyle=mac_style, created=3786825600, modified=3786825600)
+    if axes:
+        fb.setupFvar(axes, [])
+    if colr:
+        fb.setupCPAL([[(1.0, 0.0, 0.0, 1.0), (0.0, 0.0, 1.0, 1.0)]])
+        fb.setupCOLR({n: [(n, 0), (n, 1)] for n in names[1:]})
+    if short_os2:
+        # An OS/2 table cut to its first 20 bytes: too short to be read.
+        from fontTools.ttLib.tables.DefaultTable import DefaultTable
+        t = DefaultTable("OS/2")
+        t.data = bytes(range(20))
+        fb.font["OS/2"] = t
+    return fb.font
+
+
+def save_face(font, rel):
+    path = os.path.join(FONTS, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    font.save(path)
+    print("fonts/" + rel, os.path.getsize(path), "bytes")
+
+
+def synthetic_fonts():
+    # The fonts of a pretend system, for text/fonts: a static family in
+    # weights from 100 to 900, two widths, italic and oblique, one face of it
+    # a CFF one and some with their legacy family split from their
+    # typographic one; a variable family over weight, width, slant and
+    # optical size; one with an italic axis; Greek for fallback, once on its
+    # own and once as the family's own companion; Cyrillic in two
+    # companions, one condensed; a collection of two CJK faces, with the CJK
+    # letters that are not wide; a colour face standing for emoji, with a
+    # flag; a monospaced one; weights written the old way, no OS/2, an OS/2
+    # too short, axes past CSS's ranges, no names; weights between 400 and
+    # 500, off the first page. Then what is not a font. Made from nothing, so
+    # under no licence.
+    import shutil
+    from fontTools.ttLib import TTCollection
+    shutil.rmtree(FONTS, ignore_errors=True)
+    sans = "Caustic Test Sans"
+    with_eng = BASIC + "é"
+    save_face(make_face(sans, "Thin", with_eng, weight=100), "sans/TestSans-Thin.ttf")
+    save_face(make_face(sans + " Light", "Regular", with_eng, weight=300, cff=True, typo=(sans, "Light")),
+              "sans/TestSans-Light.otf")
+    save_face(make_face(sans, "Regular", with_eng), "sans/TestSans-Regular.ttf")
+    save_face(make_face(sans, "Italic", with_eng, selection=0x01), "sans/TestSans-Italic.ttf")
+    save_face(make_face(sans, "Bold", with_eng + "ŋд", weight=700, selection=0x20), "sans/TestSans-Bold.TTF")
+    save_face(make_face(sans, "Bold Italic", with_eng, weight=700, selection=0x21), "sans/TestSans-BoldItalic.ttf")
+    save_face(make_face(sans + " Black", "Regular", with_eng, weight=900, typo=(sans, "Black")),
+              "sans/TestSans-Black.ttf")
+    save_face(make_face(sans, "Oblique", with_eng, selection=0x200), "sans/TestSans-Oblique.ttf")
+    save_face(make_face(sans + " Condensed", "Regular", with_eng, width=3, typo=(sans, "Condensed")),
+              "sans/TestSans-Condensed.ttf")
+    save_face(make_face(sans + " Expanded", "Regular", with_eng, width=7, typo=(sans, "Expanded")),
+              "sans/TestSans-Expanded.ttf")
+    # Variable: weight 200 to 800, width 75% to 100%, slant 0 to -12 degrees.
+    save_face(make_face("Caustic Test Var", "Regular", BASIC + "ß",
+                        axes=[("wght", 200, 400, 800, "Weight"), ("wdth", 75, 100, 100, "Width"),
+                              ("slnt", -12, 0, 0, "Slant"), ("opsz", 8, 14, 144, "Optical size")]), "var/TestVar.ttf")
+    save_face(make_face("Caustic Test Ital", "Regular", BASIC, axes=[("ital", 0, 0, 1, "Italic")]),
+              "var/TestItal.ttf")
+    save_face(make_face("Caustic Test Greek", "Regular", GREEK), "more/deeper/TestGreek.ttf")
+    save_face(make_face("Caustic Test Sans Greek", "Regular", GREEK), "more/TestSansGreek-Regular.ttf")
+    save_face(make_face("Caustic Test Sans Greek", "Bold", GREEK, weight=700, selection=0x20),
+              "more/TestSansGreek-Bold.ttf")
+    # Two companions with Cyrillic: one only condensed, first by name, and
+    # one of normal width.
+    save_face(make_face("Caustic Test Sans Cyr", "Condensed", CYRILLIC, width=3), "more/TestSansCyr.ttf")
+    save_face(make_face("Caustic Test Sans Cyrillic", "Regular", CYRILLIC), "more/TestSansCyrillic.ttf")
+    tc = TTCollection()
+    tc.fonts = [make_face("Caustic Test CJK JP", "Regular", CJK_CHARS),
+                make_face("Caustic Test CJK SC", "Regular", CJK_CHARS)]
+    os.makedirs(os.path.join(FONTS, "cjk"), exist_ok=True)
+    tc.save(os.path.join(FONTS, "cjk", "TestCJK.ttc"))
+    print("fonts/cjk/TestCJK.ttc", os.path.getsize(os.path.join(FONTS, "cjk", "TestCJK.ttc")), "bytes")
+    save_face(make_face("Caustic Test Emoji", "Regular", "#α☺\U0001F600\U0001F1E6", colr=True), "emoji/TestEmoji.ttf")
+    save_face(make_face("Caustic Test Mono", "Regular", BASIC, mono=True), "mono/TestMono.ttf")
+    save_face(make_face("Caustic Test Odd", "Bold", BASIC + "Ω", weight=7, width=0, selection=0x20), "odd/TestOdd.ttf")
+    save_face(make_face("Caustic Test Plain", "Bold Italic", BASIC + "Ω", os2=False, mac_style=3), "odd/TestPlain.ttf")
+    # Axes past CSS's ranges, an italic axis on a face italic already, and
+    # 512 pages in a row beyond the first plane.
+    save_face(make_face("Caustic Test Wild", "Italic", BASIC + "".join(chr(0x10041 + p * 256) for p in range(512)),
+                        selection=0x01,
+                        axes=[("wght", 0, 400, 1000.5, "Weight"), ("wdth", 25, 100, 1500, "Width"),
+                              ("ital", 0, 1, 1, "Italic"), ("slnt", -20, 0, 0, "Slant")]), "odd/TestWild.ttf")
+    # OS/2 too short to read, head saying bold and italic, and a slant axis.
+    save_face(make_face("Caustic Test Short", "Bold Italic", BASIC, short_os2=True, mac_style=3,
+                        axes=[("slnt", -15, 0, 0, "Slant")]), "odd/TestShort.ttf")
+    # Weights between 400 and 500, where CSS looks heavier first, and no
+    # character on the first page.
+    for w in (300, 460, 480, 500):
+        save_face(make_face("Caustic Test Weights", "W%d" % w, "ежз", weight=w), "weights/TestWeights-%d.ttf" % w)
+    # No names at all.
+    save_face(make_face("", "", BASIC, nameless=True), "odd/TestNameless.ttf")
+    open(os.path.join(FONTS, "odd", "broken.ttf"), "wb").write(b"\x00\x01\x00\x00" + b"\xff" * 60)
+    open(os.path.join(FONTS, "odd", "empty.otf"), "wb").write(b"")
+    open(os.path.join(FONTS, "odd", "readme.txt"), "w").write("Not a font; ignored for its name.\n")
+
+
 def main():
     os.makedirs(os.path.join(OUT, "licenses"), exist_ok=True)
+    synthetic_fonts()
     synthetic_big()
     synthetic_var()
     synthetic_var_cff2()

@@ -28,6 +28,7 @@ window/
   cursor.cst      shape, visibility, capture
   clipboard.cst   text and data
   settings.cst    the desktop's settings: dark, accent, fonts, timings
+  fonts.cst       where the platform keeps fonts, and the font index
   native.cst      native handle accessors — the public contract
 
   x11/      done — 8 modules over bind/, see x11/x11.md
@@ -393,6 +394,11 @@ the pump hands every event to the watcher first, since the daemon's window and
 the root belong to no window here. The portal needs a D-Bus connection, so it
 is read by whoever holds one (the toolkit). The Windows registry comes with
 the Win32 backend, whose WM_SETTINGCHANGE is a window message.
+
+**Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
+the system's and the user's font directories, and where the font index is
+kept, on Linux from `HOME` and the XDG variables, on Windows from `WINDIR` and
+`LOCALAPPDATA` — tested on both, the Windows build under wine (`fonts_test`).
 
 ---
 

@@ -7,8 +7,9 @@ sprite.
 ```
 text/
   text.cst      hub
-  font.cst      the handle: faces, sizes, styles, fallback chains
   atlas.cst     glyph cache over image/'s packer
+
+  fonts/        the system's fonts found and chosen; chains   fonts/fonts.md
 
   sfnt/         the container: tables, cmap, metrics    sfnt/sfnt.md
   outline/      glyf quadratic and CFF charstrings      outline/outline.md
@@ -145,6 +146,14 @@ missing glyph rather than like nothing.
 Fontconfig exists for finding faces by name and is 485 KB. Enumerating
 `/usr/share/fonts` — 4459 files on this machine — and reading each `name` table
 does the same job with no dependency, and cached, once.
+
+That is [`fonts/`](fonts/fonts.md): the system's font files walked and every
+face described once — names, weights, widths, styles, which pages of Unicode
+it reaches — kept in an index file that the next start brings up to date in
+90 ms; a family's face chosen by CSS's matching; and chains that put behind
+the faces asked for the faces that draw what those lack — the family's own
+other faces and its companions first, the preferred CJK families in the
+locale's order and the emoji ones, then any face, nearest the request.
 
 ---
 

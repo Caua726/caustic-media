@@ -1,0 +1,192 @@
+// text/fonts/face.cst — a face as font matching sees it: what it is called,
+// the weights, widths and styles it can be drawn at, whether it is
+// monospaced or in colour, and which pages of Unicode it reaches.
+//
+// Names: the typographic family and style (name IDs 16 and 17) when the
+// face has them — "Noto Sans" and "Light" — and the legacy ones (1 and 2)
+// otherwise; the legacy family is kept too, "Noto Sans Light", because a
+// program may ask for it. Then the full name (4) and the PostScript name (6).
+//
+// Weight and width are CSS's: a weight from 1 to 1000, a width as a
+// percentage of normal. A static face has one of each, from OS/2 — a weight
+// class of 0 read as 400, one from 1 to 9 as written in hundreds, as some old
+// fonts do, past 1000 as 1000; width classes 1 to 9 as CSS maps them, any
+// other as 100%. A face without OS/2 is 700 when head says bold. A variable
+// face is the range of its wght and wdth axes.
+//
+// Style: OS/2's oblique bit, else its italic bit, else head's italic bit; a
+// variable face adds italic for an ital axis reaching 1, oblique for a slnt
+// axis leaning right (below 0), and normal for either reaching 0.
+use "../sfnt/sfnt.cst" as sfnt;
+use "pool.cst" as pool;
+
+// What a request asks for, and what a face is drawn as.
+let is i64 as NORMAL  with imut = 0;
+let is i64 as ITALIC  with imut = 1;
+let is i64 as OBLIQUE with imut = 2;
+
+// What a face can be: its styles, as bits.
+let is i64 as CAN_NORMAL  with imut = 1;
+let is i64 as CAN_ITALIC  with imut = 2;
+let is i64 as CAN_OBLIQUE with imut = 4;
+
+// Flags.
+let is i64 as MONO     with imut = 1;   // post says fixed pitch
+let is i64 as COLOR    with imut = 2;   // COLR, CBDT or sbix
+let is i64 as VARIABLE with imut = 4;   // fvar has axes
+
+let is i64 as TAG_WGHT with imut = 0x77676874;
+let is i64 as TAG_WDTH with imut = 0x77647468;
+let is i64 as TAG_ITAL with imut = 0x6974616C;
+let is i64 as TAG_SLNT with imut = 0x736C6E74;
+let is i64 as TAG_COLR with imut = 0x434F4C52;
+let is i64 as TAG_CBDT with imut = 0x43424454;
+let is i64 as TAG_SBIX with imut = 0x73626978;
+
+// The longest name kept, in bytes; a longer one is cut at a character.
+let is i64 as NAME_MAX with imut = 256;
+
+// Names are offsets into the index's text, NUL-terminated, "" for a name the
+// face does not have; pages is an offset there too, of runs pairs of a first
+// page and a count, each two bytes, little-endian.
+struct Desc {
+    file       as i64;   // which of the index's files
+    index      as i64;   // which face in it
+    family     as i64;
+    legacy     as i64;
+    style      as i64;
+    full       as i64;
+    postscript as i64;
+    weight_lo  as f64;
+    weight_hi  as f64;
+    width_lo   as f64;
+    width_hi   as f64;
+    styles     as i64;   // CAN_* bits
+    flags      as i64;
+    pages      as i64;
+    runs       as i64;
+}
+
+fn css_weight(cls as i64) as f64 {
+    if (cls <= 0) { return 400.0; }
+    if (cls < 10) { return cast(f64, cls * 100); }
+    if (cls > 1000) { return 1000.0; }
+    return cast(f64, cls);
+}
+
+fn css_width(cls as i64) as f64 {
+    if (cls == 1) { return 50.0; }
+    if (cls == 2) { return 62.5; }
+    if (cls == 3) { return 75.0; }
+    if (cls == 4) { return 87.5; }
+    if (cls == 6) { return 112.5; }
+    if (cls == 7) { return 125.0; }
+    if (cls == 8) { return 150.0; }
+    if (cls == 9) { return 200.0; }
+    return 100.0;
+}
+
+fn _clamp(v as f64, lo as f64, hi as f64) as f64 {
+    if (v >= hi) { return hi; }
+    if (v >= lo) { return v; }
+    return lo;
+}
+
+// Name id into the text, or the first of id and other the face has; the
+// offset of "" — 0, the text's first byte — for neither.
+fn _name(f as *sfnt.table.Face, text as *pool.Pool, id as i64, other as i64) as i64 {
+    let is [256]u8 as buf;
+    let is i64 as n with mut = sfnt.name.get(f, id, cast(*u8, &buf), NAME_MAX);
+    if (n <= 0 && other > 0) { n = sfnt.name.get(f, other, cast(*u8, &buf), NAME_MAX); }
+    if (n <= 0) { return 0; }
+    return pool.add(text, cast(*u8, &buf), n + 1);
+}
+
+// The face's coverage as runs of pages into text; how many runs, -1 when
+// the memory is refused.
+fn _runs(f as *sfnt.table.Face, text as *pool.Pool, at as *i64) as i64 {
+    let is [544]u8 as bits;
+    sfnt.cmap.coverage(f, cast(*u8, &bits));
+    *at = text.len;
+    let is i64 as runs with mut = 0;
+    let is i64 as p with mut = 0;
+    while (p < sfnt.cmap.PAGES) {
+        if (((cast(i64, bits[p >> 3]) >> (p & 7)) & 1) == 1) {
+            let is i64 as start = p;
+            while (p < sfnt.cmap.PAGES && ((cast(i64, bits[p >> 3]) >> (p & 7)) & 1) == 1) { p = p + 1; }
+            let is [4]u8 as r;
+            r[0] = cast(u8, start & 255);
+            r[1] = cast(u8, start >> 8);
+            r[2] = cast(u8, (p - start) & 255);
+            r[3] = cast(u8, (p - start) >> 8);
+            if (pool.add(text, cast(*u8, &r), 4) < 0) { return 0 - 1; }
+            runs = runs + 1;
+        } else {
+            p = p + 1;
+        }
+    }
+    return runs;
+}
+
+// f described into d, its names and coverage added to text; d's file and
+// index are the caller's. 0 when the memory is refused.
+fn describe(f as *sfnt.table.Face, text as *pool.Pool, d as *Desc) as i32 {
+    d.family = _name(f, text, sfnt.name.TYPOGRAPHIC_FAMILY, sfnt.name.FAMILY);
+    d.legacy = _name(f, text, sfnt.name.FAMILY, 0);
+    d.style = _name(f, text, sfnt.name.TYPOGRAPHIC_STYLE, sfnt.name.STYLE);
+    d.full = _name(f, text, sfnt.name.FULL, 0);
+    d.postscript = _name(f, text, sfnt.name.POSTSCRIPT, 0);
+    if (d.family < 0 || d.legacy < 0 || d.style < 0 || d.full < 0 || d.postscript < 0) { return 0; }
+    let is sfnt.head.Head as h = sfnt.head.head(f);
+    if (sfnt.table.inside(f.os2, f.os2.off, 78) == 1) {
+        let is sfnt.head.Os2 as o = sfnt.head.os2(f);
+        d.weight_lo = css_weight(o.weight);
+        d.width_lo = css_width(o.width);
+        if ((o.fs_selection & sfnt.head.SEL_OBLIQUE) != 0) {
+            d.styles = CAN_OBLIQUE;
+        } else if ((o.fs_selection & sfnt.head.SEL_ITALIC) != 0) {
+            d.styles = CAN_ITALIC;
+        } else {
+            d.styles = CAN_NORMAL;
+        }
+    } else {
+        d.weight_lo = 400.0;
+        if ((h.mac_style & 1) != 0) { d.weight_lo = 700.0; }
+        d.width_lo = 100.0;
+        d.styles = CAN_NORMAL;
+        if ((h.mac_style & 2) != 0) { d.styles = CAN_ITALIC; }
+    }
+    d.weight_hi = d.weight_lo;
+    d.width_hi = d.width_lo;
+    d.flags = 0;
+    let is i64 as axes = sfnt.var.axis_count(f);
+    if (axes > 0) { d.flags = VARIABLE; }
+    let is i64 as i with mut = 0;
+    while (i < axes) {
+        let is sfnt.var.Axis as a = sfnt.var.axis(f, i);
+        if (a.tag == TAG_WGHT && a.max >= a.min) {
+            d.weight_lo = _clamp(a.min, 1.0, 1000.0);
+            d.weight_hi = _clamp(a.max, 1.0, 1000.0);
+        }
+        if (a.tag == TAG_WDTH && a.max >= a.min) {
+            d.width_lo = _clamp(a.min, 0.0, 1000.0);
+            d.width_hi = _clamp(a.max, 0.0, 1000.0);
+        }
+        if (a.tag == TAG_ITAL && a.max >= 1.0) {
+            d.styles = d.styles | CAN_ITALIC;
+            if (a.min <= 0.0) { d.styles = d.styles | CAN_NORMAL; }
+        }
+        if (a.tag == TAG_SLNT && a.min < 0.0) {
+            d.styles = d.styles | CAN_OBLIQUE;
+            if (a.max >= 0.0) { d.styles = d.styles | CAN_NORMAL; }
+        }
+        i = i + 1;
+    }
+    if (sfnt.head.post(f).fixed_pitch != 0) { d.flags = d.flags | MONO; }
+    if (sfnt.table.find(f, TAG_COLR).len > 0 || sfnt.table.find(f, TAG_CBDT).len > 0 || sfnt.table.find(f, TAG_SBIX).len > 0) {
+        d.flags = d.flags | COLOR;
+    }
+    d.runs = _runs(f, text, &d.pages);
+    if (d.runs < 0) { return 0; }
+    return 1;
+}

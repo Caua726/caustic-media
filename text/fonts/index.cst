@@ -1,0 +1,528 @@
+// text/fonts/index.cst — every face of every font file found, described
+// once and kept in a file between runs.
+//
+// update() makes an index from a walk and the index before it: a file at the
+// same path with the same size and modification time is taken from the old
+// one as it was, any other file is read. So the first start reads every font
+// on the system and the next ones read what changed. A file that does not
+// open as a font is kept as a file of no faces, and read again only when it
+// changes.
+//
+// The file is the index as it is in memory, behind a header that says what
+// it is: magic, version, the sizes of the two records, their counts, and the
+// text's length. A file that is not exactly that — cut, grown, from another
+// version, with a record pointing outside it — is refused, and the index
+// made again from the fonts. It is written whole to another name and moved
+// over the old one, so a reader never sees half of it.
+//
+// Families are found by name in an order kept beside the records: the faces
+// sorted by family, ASCII letters compared without case as CSS compares
+// family names, faces of a family in the index's order. A face is found by
+// its legacy family too, when no face has it as its family.
+use "std/mem.cst" as mem;
+use "std/io.cst" as io;
+use "std/os/linux.cst" as linux;
+use "../sfnt/sfnt.cst" as sfnt;
+use "pool.cst" as pool;
+use "scan.cst" as scan;
+use "face.cst" as face;
+
+let is i64 as MAGIC     with imut = 6361972362212281667;   // "CMFONTIX"
+let is i64 as VERSION   with imut = 1;
+let is i64 as HEADER    with imut = 64;
+let is i64 as MAX_FACES with imut = 256;   // faces read of one file
+
+struct File {
+    path  as i64;   // in the text
+    size  as i64;
+    mtime as i64;
+    first as i64;   // its faces are first to first + faces - 1
+    faces as i64;
+}
+
+struct Index {
+    files  as pool.Pool;
+    faces  as pool.Pool;
+    text   as pool.Pool;
+    order  as pool.Pool;   // face numbers by family
+    legacy as pool.Pool;   // face numbers by legacy family
+    heads  as pool.Pool;   // where in order each family begins
+    nfiles as i64;
+    nfaces as i64;
+    reads  as i64;   // files update() read
+    kept   as i64;   // files it took from the index before
+}
+
+// Faces of a family: n face numbers at faces, valid until the index changes.
+struct Run {
+    faces as *i64;
+    n     as i64;
+}
+
+fn empty() as Index {
+    let is Index as ix;
+    ix.files = pool.empty();
+    ix.faces = pool.empty();
+    ix.text = pool.empty();
+    ix.order = pool.empty();
+    ix.legacy = pool.empty();
+    ix.heads = pool.empty();
+    ix.nfiles = 0;
+    ix.nfaces = 0;
+    ix.reads = 0;
+    ix.kept = 0;
+    return ix;
+}
+
+fn close(ix as *Index) as void {
+    pool.free(&ix.files);
+    pool.free(&ix.faces);
+    pool.free(&ix.text);
+    pool.free(&ix.order);
+    pool.free(&ix.legacy);
+    pool.free(&ix.heads);
+    ix.nfiles = 0;
+    ix.nfaces = 0;
+}
+
+fn file_count(ix as *Index) as i64 { return ix.nfiles; }
+fn face_count(ix as *Index) as i64 { return ix.nfaces; }
+fn file(ix as *Index, i as i64) as *File { return cast(*File, pool.at(&ix.files, i * sizeof(File))); }
+fn desc(ix as *Index, i as i64) as *face.Desc { return cast(*face.Desc, pool.at(&ix.faces, i * sizeof(face.Desc))); }
+fn text(ix as *Index, off as i64) as *u8 { return pool.at(&ix.text, off); }
+fn family_of(ix as *Index, i as i64) as *u8 { return text(ix, desc(ix, i).family); }
+fn path_of(ix as *Index, i as i64) as *u8 { return text(ix, file(ix, desc(ix, i).file).path); }
+
+fn _byte(p as *u8, i as i64) as i64 { return cast(i64, *cast(*u8, cast(i64, p) + i)); }
+
+// --- Coverage ---
+
+fn _run_at(ix as *Index, d as *face.Desc, k as i64, field as i64) as i64 {
+    let is *u8 as r = text(ix, d.pages + k * 4 + field * 2);
+    return _byte(r, 0) | (_byte(r, 1) << 8);
+}
+
+// Whether face i reaches page p, 256 characters from p * 256.
+fn covers_page(ix as *Index, i as i64, p as i64) as i32 {
+    let is *face.Desc as d = desc(ix, i);
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = d.runs;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as start = _run_at(ix, d, mid, 0);
+        if (p < start) { hi = mid; }
+        else if (p >= start + _run_at(ix, d, mid, 1)) { lo = mid + 1; }
+        else { return 1; }
+    }
+    return 0;
+}
+
+// Whether face i's coverage reaches cp's page: whether to ask its cmap. A
+// code point outside Unicode is on a page no face reaches.
+fn covers(ix as *Index, i as i64, cp as i64) as i32 { return covers_page(ix, i, cp >> 8); }
+
+// --- Families ---
+
+fn _fold(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// -1, 0 or 1 as a sorts before, with or after b, without case.
+fn compare(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (_byte(a, i) != 0 && _fold(_byte(a, i)) == _fold(_byte(b, i))) { i = i + 1; }
+    let is i64 as x = _fold(_byte(a, i));
+    let is i64 as y = _fold(_byte(b, i));
+    if (x < y) { return 0 - 1; }
+    if (x > y) { return 1; }
+    return 0;
+}
+
+fn _key(ix as *Index, i as i64, legacy as i32) as *u8 {
+    if (legacy == 1) { return text(ix, desc(ix, i).legacy); }
+    return text(ix, desc(ix, i).family);
+}
+
+// order, holding n face numbers, sorted by family (or legacy family),
+// stably; tmp holds n more.
+fn _sort(ix as *Index, order as *i64, tmp as *i64, n as i64, legacy as i32) as void {
+    let is i64 as width with mut = 1;
+    let is *i64 as src with mut = order;
+    let is *i64 as dst with mut = tmp;
+    while (width < n) {
+        let is i64 as lo with mut = 0;
+        while (lo < n) {
+            let is i64 as mid with mut = lo + width;
+            if (mid > n) { mid = n; }
+            let is i64 as hi with mut = lo + 2 * width;
+            if (hi > n) { hi = n; }
+            let is i64 as a with mut = lo;
+            let is i64 as b with mut = mid;
+            let is i64 as k with mut = lo;
+            while (k < hi) {
+                let is i32 as left with mut = 0;
+                if (a < mid && b >= hi) { left = 1; }
+                if (a < mid && b < hi) {
+                    let is i64 as fa = *cast(*i64, cast(i64, src) + a * 8);
+                    let is i64 as fb = *cast(*i64, cast(i64, src) + b * 8);
+                    if (compare(_key(ix, fa, legacy), _key(ix, fb, legacy)) <= 0) { left = 1; }
+                }
+                if (left == 1) {
+                    *cast(*i64, cast(i64, dst) + k * 8) = *cast(*i64, cast(i64, src) + a * 8);
+                    a = a + 1;
+                } else {
+                    *cast(*i64, cast(i64, dst) + k * 8) = *cast(*i64, cast(i64, src) + b * 8);
+                    b = b + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        let is *i64 as t = src;
+        src = dst;
+        dst = t;
+        width = width * 2;
+    }
+    if (src != order) { mem.memcpy(cast(*u8, order), cast(*u8, src), n * 8); }
+}
+
+// The orders and the families' heads, made again.
+fn _order(ix as *Index) as i32 {
+    pool.free(&ix.order);
+    pool.free(&ix.legacy);
+    pool.free(&ix.heads);
+    let is i64 as n = ix.nfaces;
+    if (n == 0) { return 1; }
+    let is pool.Pool as tmp with mut = pool.empty();
+    if (pool.add(&ix.order, cast(*u8, 0), n * 8) < 0 || pool.add(&ix.legacy, cast(*u8, 0), n * 8) < 0
+        || pool.add(&tmp, cast(*u8, 0), n * 8) < 0) {
+        pool.free(&tmp);
+        return 0;
+    }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        pool.set_i64(&ix.order, i, i);
+        pool.set_i64(&ix.legacy, i, i);
+        i = i + 1;
+    }
+    _sort(ix, cast(*i64, ix.order.base), cast(*i64, tmp.base), n, 0);
+    _sort(ix, cast(*i64, ix.legacy.base), cast(*i64, tmp.base), n, 1);
+    pool.free(&tmp);
+    i = 0;
+    while (i < n) {
+        if (i == 0 || compare(family_of(ix, pool.i64_at(&ix.order, i)), family_of(ix, pool.i64_at(&ix.order, i - 1))) != 0) {
+            if (pool.add_i64(&ix.heads, i) < 0) { return 0; }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _run(o as *pool.Pool, at as i64, n as i64) as Run {
+    let is Run as r;
+    r.faces = cast(*i64, cast(i64, o.base) + at * 8);
+    r.n = n;
+    return r;
+}
+
+fn _find(ix as *Index, o as *pool.Pool, name as *u8, legacy as i32) as Run {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = ix.nfaces;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        if (compare(_key(ix, pool.i64_at(o, mid), legacy), name) < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    let is i64 as end with mut = lo;
+    while (end < ix.nfaces && compare(_key(ix, pool.i64_at(o, end), legacy), name) == 0) { end = end + 1; }
+    return _run(o, lo, end - lo);
+}
+
+// The faces of the family called name, as CSS finds them: its faces, or
+// failing that the faces whose legacy family it is.
+fn family(ix as *Index, name as *u8) as Run {
+    if (ix.nfaces == 0 || _byte(name, 0) == 0) { return _run(&ix.order, 0, 0); }
+    let is Run as r = _find(ix, &ix.order, name, 0);
+    if (r.n > 0) { return r; }
+    return _find(ix, &ix.legacy, name, 1);
+}
+
+fn family_count(ix as *Index) as i64 { return ix.heads.len / 8; }
+
+// The k-th family in order, its faces.
+fn family_run(ix as *Index, k as i64) as Run {
+    let is i64 as at = pool.i64_at(&ix.heads, k);
+    let is i64 as end with mut = ix.nfaces;
+    if (k + 1 < family_count(ix)) { end = pool.i64_at(&ix.heads, k + 1); }
+    return _run(&ix.order, at, end - at);
+}
+
+fn family_name(ix as *Index, k as i64) as *u8 { return family_of(ix, pool.i64_at(&ix.order, pool.i64_at(&ix.heads, k))); }
+
+// --- Making it ---
+
+fn _copy_str(n as *Index, prev as *Index, off as i64) as i64 { return pool.add_str(&n.text, text(prev, off)); }
+
+// File k of prev and its faces into n, as they were.
+fn _keep(n as *Index, prev as *Index, k as i64) as void {
+    let is File as f = *file(prev, k);
+    let is i64 as j with mut = 0;
+    while (j < f.faces) {
+        let is face.Desc as d = *desc(prev, f.first + j);
+        d.file = n.nfiles;
+        d.family = _copy_str(n, prev, d.family);
+        d.legacy = _copy_str(n, prev, d.legacy);
+        d.style = _copy_str(n, prev, d.style);
+        d.full = _copy_str(n, prev, d.full);
+        d.postscript = _copy_str(n, prev, d.postscript);
+        let is i64 as runs_at = n.text.len;
+        if (pool.add(&n.text, text(prev, d.pages), d.runs * 4) >= 0) { d.pages = runs_at; }
+        if (pool.add(&n.faces, cast(*u8, &d), sizeof(face.Desc)) >= 0) { n.nfaces = n.nfaces + 1; }
+        j = j + 1;
+    }
+}
+
+// The faces of the file at path into n; its size is the file's own now,
+// which a walk may have seen otherwise.
+fn _read(n as *Index, path as *u8) as void {
+    let is i64 as fd = linux.open(path, 524288, 0);   // O_RDONLY|O_CLOEXEC
+    if (fd < 0) { return; }
+    let is [144]u8 as st;
+    let is i64 as size with mut = 0;
+    if (linux.fstat(fd, cast(*u8, &st)) == 0) { size = *cast(*i64, cast(i64, &st) + 48); }
+    // An empty file is refused by mmap, as anything else it cannot map.
+    let is *u8 as data = linux.mmap(cast(*u8, 0), size, 1, 2, fd, 0);   // PROT_READ, MAP_PRIVATE
+    linux.close(fd);
+    let is i64 as v = cast(i64, data);
+    if (v < 0 && v > 0 - 4096) { return; }
+    let is i64 as count with mut = sfnt.table.face_count(data, size);
+    if (count > MAX_FACES) { count = MAX_FACES; }
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is sfnt.table.Face as f with mut = sfnt.open(data, size, i);
+        if (f.ok == 1) {
+            let is face.Desc as d;
+            d.file = n.nfiles;
+            d.index = i;
+            if (face.describe(&f, &n.text, &d) == 1 && pool.add(&n.faces, cast(*u8, &d), sizeof(face.Desc)) >= 0) {
+                n.nfaces = n.nfaces + 1;
+            }
+        }
+        i = i + 1;
+    }
+    linux.munmap(data, size);
+}
+
+fn _hash(p as *u8) as i64 {
+    let is i64 as h with mut = 0 - 3750763034362895579;   // FNV-1a's offset basis
+    let is i64 as i with mut = 0;
+    while (_byte(p, i) != 0) {
+        h = (h ^ _byte(p, i)) * 1099511628211;
+        i = i + 1;
+    }
+    return (h >> 17) & 4611686018427387903;
+}
+
+// An index of the files s found, the files prev has unchanged taken from it.
+fn update(prev as *Index, s as *scan.Scan) as Index {
+    let is Index as n with mut = empty();
+    pool.add(&n.text, cast(*u8, 0), 1);
+    // prev's files by path: file numbers plus one, 0 for an empty slot.
+    let is pool.Pool as table with mut = pool.empty();
+    let is i64 as slots with mut = 16;
+    while (slots < prev.nfiles * 2) { slots = slots * 2; }
+    let is i32 as hashed with mut = 0;
+    if (prev.nfiles > 0 && pool.add(&table, cast(*u8, 0), slots * 8) >= 0) {
+        hashed = 1;
+        let is i64 as k with mut = 0;
+        while (k < prev.nfiles) {
+            let is i64 as at with mut = _hash(text(prev, file(prev, k).path)) & (slots - 1);
+            while (pool.i64_at(&table, at) != 0) { at = (at + 1) & (slots - 1); }
+            pool.set_i64(&table, at, k + 1);
+            k = k + 1;
+        }
+    }
+    let is i64 as i with mut = 0;
+    while (i < scan.count(s)) {
+        let is *scan.File as sf = scan.file(s, i);
+        let is *u8 as p = scan.path(s, i);
+        let is i64 as found with mut = 0 - 1;
+        if (hashed == 1) {
+            let is i64 as at with mut = _hash(p) & (slots - 1);
+            while (found < 0 && pool.i64_at(&table, at) != 0) {
+                let is i64 as k = pool.i64_at(&table, at) - 1;
+                if (compare_bytes(text(prev, file(prev, k).path), p) == 0) { found = k; }
+                at = (at + 1) & (slots - 1);
+            }
+        }
+        let is File as f;
+        f.path = pool.add_str(&n.text, p);
+        f.size = sf.size;
+        f.mtime = sf.mtime;
+        f.first = n.nfaces;
+        if (found >= 0 && file(prev, found).size == sf.size && file(prev, found).mtime == sf.mtime) {
+            _keep(&n, prev, found);
+            n.kept = n.kept + 1;
+        } else {
+            _read(&n, p);
+            n.reads = n.reads + 1;
+        }
+        f.faces = n.nfaces - f.first;
+        if (f.path >= 0 && pool.add(&n.files, cast(*u8, &f), sizeof(File)) >= 0) { n.nfiles = n.nfiles + 1; }
+        i = i + 1;
+    }
+    pool.free(&table);
+    _order(&n);
+    return n;
+}
+
+// Bytes compared exactly, as paths are.
+fn compare_bytes(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (_byte(a, i) != 0 && _byte(a, i) == _byte(b, i)) { i = i + 1; }
+    return _byte(a, i) - _byte(b, i);
+}
+
+// Whether now, made by update() from prev, differs from it: a file read, or
+// one of prev's gone.
+fn changed(prev as *Index, now as *Index) as i32 {
+    if (now.reads > 0 || now.kept != prev.nfiles) { return 1; }
+    return 0;
+}
+
+// --- The file ---
+
+// The directories above path made, each that is not there yet.
+fn _parents(path as *u8) as void {
+    let is [512]u8 as p;
+    let is i64 as n with mut = 0;
+    while (_byte(path, n) != 0) { n = n + 1; }
+    if (n >= 512) { return; }
+    mem.memcpy(cast(*u8, &p), path, n + 1);
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        if (p[i] == 47) {
+            p[i] = cast(u8, 0);
+            io.mkdir(cast(*u8, &p));
+            p[i] = cast(u8, 47);
+        }
+        i = i + 1;
+    }
+}
+
+// The index written to path, the directories above it made. 1, or 0 when it
+// could not be.
+fn save(ix as *Index, path as *u8) as i32 {
+    let is pool.Pool as b with mut = pool.empty();
+    let is [8]i64 as h;
+    h[0] = MAGIC;
+    h[1] = VERSION;
+    h[2] = sizeof(File);
+    h[3] = sizeof(face.Desc);
+    h[4] = ix.nfiles;
+    h[5] = ix.nfaces;
+    h[6] = ix.text.len;
+    h[7] = 0;
+    let is i32 as ok with mut = 1;
+    if (pool.add(&b, cast(*u8, &h), HEADER) < 0 || pool.add(&b, ix.files.base, ix.nfiles * sizeof(File)) < 0
+        || pool.add(&b, ix.faces.base, ix.nfaces * sizeof(face.Desc)) < 0 || pool.add(&b, ix.text.base, ix.text.len) < 0) {
+        ok = 0;
+    }
+    if (ok == 1) {
+        _parents(path);
+        if (io.write_file_atomic(path, b.base, b.len) != 0) { ok = 0; }
+    }
+    pool.free(&b);
+    return ok;
+}
+
+fn _i64(b as *u8, at as i64) as i64 { return *cast(*i64, cast(i64, b) + at); }
+
+// Whether the bytes are an index this version wrote, every record within
+// them.
+fn _valid(b as *u8, n as i64) as i32 {
+    if (n < HEADER || _i64(b, 0) != MAGIC || _i64(b, 8) != VERSION) { return 0; }
+    if (_i64(b, 16) != sizeof(File) || _i64(b, 24) != sizeof(face.Desc)) { return 0; }
+    let is i64 as files = _i64(b, 32);
+    let is i64 as faces = _i64(b, 40);
+    let is i64 as tlen = _i64(b, 48);
+    // Counts past the file's length would let the sizes below wrap round
+    // to it.
+    if (files < 0 || faces < 0 || tlen < 1 || files > n || faces > n) { return 0; }
+    let is i64 as fo = HEADER;
+    let is i64 as dof = fo + files * sizeof(File);
+    let is i64 as to = dof + faces * sizeof(face.Desc);
+    if (to + tlen != n) { return 0; }
+    if (_byte(b, n - 1) != 0) { return 0; }
+    let is i64 as running with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < files) {
+        let is *File as f = cast(*File, cast(i64, b) + fo + i * sizeof(File));
+        if (f.path < 0 || f.path >= tlen || f.faces < 0 || f.first != running) { return 0; }
+        running = running + f.faces;
+        i = i + 1;
+    }
+    if (running != faces) { return 0; }
+    i = 0;
+    while (i < faces) {
+        let is *face.Desc as d = cast(*face.Desc, cast(i64, b) + dof + i * sizeof(face.Desc));
+        if (d.file < 0 || d.file >= files) { return 0; }
+        let is *File as f = cast(*File, cast(i64, b) + fo + d.file * sizeof(File));
+        if (i < f.first || i >= f.first + f.faces) { return 0; }
+        if (d.index < 0 || d.index >= MAX_FACES) { return 0; }
+        if (d.family < 0 || d.family >= tlen || d.legacy < 0 || d.legacy >= tlen || d.style < 0 || d.style >= tlen
+            || d.full < 0 || d.full >= tlen || d.postscript < 0 || d.postscript >= tlen) { return 0; }
+        // Comparisons that NaN fails.
+        if (!(d.weight_lo >= 1.0 && d.weight_hi >= d.weight_lo && d.width_lo >= 0.0 && d.width_hi >= d.width_lo)) { return 0; }
+        if (d.pages < 0 || d.runs < 0 || d.runs > tlen || d.pages + d.runs * 4 > tlen) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The index kept at path into ix, which is left empty when there is none or
+// it is refused. 1 when read.
+fn load(path as *u8, ix as *Index) as i32 {
+    *ix = empty();
+    let is i64 as fd = linux.open(path, 524288, 0);
+    if (fd < 0) { return 0; }
+    let is [144]u8 as st;
+    let is i64 as size with mut = 0 - 1;
+    if (linux.fstat(fd, cast(*u8, &st)) == 0) { size = *cast(*i64, cast(i64, &st) + 48); }
+    let is pool.Pool as b with mut = pool.empty();
+    if (pool.add(&b, cast(*u8, 0), size) < 0) {
+        linux.close(fd);
+        pool.free(&b);
+        return 0;
+    }
+    let is i64 as got with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && got < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, b.base) + got), size - got);
+        if (r > 0) { got = got + r; }
+    }
+    linux.close(fd);
+    if (got != size || _valid(b.base, size) == 0) {
+        pool.free(&b);
+        return 0;
+    }
+    let is i64 as files = _i64(b.base, 32);
+    let is i64 as faces = _i64(b.base, 40);
+    let is i64 as dof = HEADER + files * sizeof(File);
+    let is i64 as to = dof + faces * sizeof(face.Desc);
+    let is i32 as ok with mut = 1;
+    if (pool.add(&ix.files, cast(*u8, cast(i64, b.base) + HEADER), files * sizeof(File)) < 0
+        || pool.add(&ix.faces, cast(*u8, cast(i64, b.base) + dof), faces * sizeof(face.Desc)) < 0
+        || pool.add(&ix.text, cast(*u8, cast(i64, b.base) + to), size - to) < 0) {
+        ok = 0;
+    }
+    pool.free(&b);
+    ix.nfiles = files;
+    ix.nfaces = faces;
+    if (ok == 0 || _order(ix) == 0) {
+        close(ix);
+        *ix = empty();
+        return 0;
+    }
+    return 1;
+}

@@ -1,0 +1,613 @@
+// text/fonts/chain.cst — the faces a text is drawn with: the faces of the
+// families asked for, and behind them the faces that draw what those lack.
+// A character is drawn by the first that has it:
+//
+//   1. the faces asked for, in their order — a list like CSS's
+//      font-family, generic names (sans-serif, serif, monospace, system-ui,
+//      emoji) standing for the families the program prefers for them;
+//   2. for an emoji, the preferred emoji families; for Han, kana, Hangul,
+//      Bopomofo and the wide forms beside them, the preferred CJK families,
+//      the text's language's first — Japanese and Chinese draw the same
+//      ideographs differently;
+//   3. any family that has it: first the first family's other faces and
+//      the families whose names begin with its name ("Noto Sans Devanagari"
+//      for "Noto Sans"), then the others, colour faces after the rest except
+//      for an emoji; in each of those, faces at the width and style asked
+//      for before the others, so a condensed family is not taken for normal
+//      text only because its name sorts first; then by name. Within a
+//      family, the face CSS matching gives among those reaching the
+//      character's page, so a bold text falls back to bold.
+//
+// No face has it: the first face draws it, as its missing glyph — the box
+// that says something is missing, never nothing.
+//
+// The index knows which 256-character pages a face reaches, not which
+// characters: a face is opened and its cmap asked. When it does not have the
+// character, the chain learns the whole page of that face, 256 bits, and
+// does not open it for that page again; nor is the face kept. Answers are
+// remembered by character.
+//
+// Faces are opened when first asked, their files mapped. A chain holds at
+// most MAX_MEMBERS: past that, what no member has is drawn as missing.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "caustic-unicode/src/ucd/props.cst" as props;
+use "caustic-unicode/src/ucd/tables/script.cst" as script;
+use "caustic-unicode/src/ucd/tables/eaw.cst" as eaw;
+use "caustic-unicode/src/ucd/tables/extpict.cst" as extpict;
+use "../sfnt/sfnt.cst" as sfnt;
+use "pool.cst" as pool;
+use "face.cst" as face;
+use "index.cst" as index;
+use "match.cst" as matching;
+
+let is i64 as MAX_MEMBERS with imut = 64;
+let is i64 as MEMO        with imut = 1024;
+
+// The CJK families' languages.
+let is i64 as SC with imut = 0;   // Simplified Chinese
+let is i64 as TC with imut = 1;   // Traditional Chinese
+let is i64 as JP with imut = 2;
+let is i64 as KR with imut = 3;
+
+// Families the program prefers, each a list separated by commas.
+struct Prefs {
+    sans  as *u8;
+    serif as *u8;
+    mono  as *u8;
+    ui    as *u8;    // system-ui; sans-serif's when empty
+    emoji as *u8;
+    cjk   as [4]*u8; // by SC, TC, JP, KR
+    lang  as i64;    // whose CJK list comes first
+}
+
+struct Member {
+    face   as i64;   // in the index
+    weight as f64;   // drawn at, as matched
+    width  as f64;
+    style  as i64;
+    data   as *u8;   // its file, mapped
+    size   as i64;
+    state  as i64;   // 0 not opened yet, 1 open, -1 would not open
+    f      as sfnt.table.Face;
+}
+
+struct Chain {
+    ix         as *index.Index;
+    prefs      as Prefs;
+    weight     as f64;
+    width      as f64;
+    style      as i64;
+    lead       as i64;   // members asked for; those after were found for characters
+    n          as i64;
+    opens      as i64;   // files mapped, all told: for tests, and the curious
+    mapped     as i64;   // files mapped now
+    members    as pool.Pool;   // MAX_MEMBERS, reserved at open, so never moved
+    memo       as pool.Pool;   // MEMO slots: code point + 1, member
+    leaves     as pool.Pool;   // learned pages: face * 4352 + page + 1, then 32 bytes
+    leaf_slots as i64;
+    leaf_used  as i64;
+}
+
+// The families the platforms ship.
+fn defaults() as Prefs {
+    let is Prefs as p;
+    p.sans = "Noto Sans, DejaVu Sans, Liberation Sans, Cantarell, Segoe UI, Arial";
+    p.serif = "Noto Serif, DejaVu Serif, Liberation Serif, Times New Roman";
+    p.mono = "Noto Sans Mono, DejaVu Sans Mono, Liberation Mono, Cascadia Mono, Consolas, Courier New";
+    p.ui = "";
+    if (__target_is_windows == 1) { p.ui = "Segoe UI Variable, Segoe UI"; }
+    p.emoji = "Noto Color Emoji, Segoe UI Emoji, Apple Color Emoji, Twemoji";
+    p.cjk[SC] = "Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei";
+    p.cjk[TC] = "Noto Sans CJK TC, Source Han Sans TC, Microsoft JhengHei";
+    p.cjk[JP] = "Noto Sans CJK JP, Source Han Sans, Yu Gothic, Meiryo";
+    p.cjk[KR] = "Noto Sans CJK KR, Source Han Sans K, Malgun Gothic";
+    p.lang = SC;
+    return p;
+}
+
+fn _byte(p as *u8, i as i64) as i64 { return cast(i64, *cast(*u8, cast(i64, p) + i)); }
+
+fn _lower(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// Whether the n bytes at s are word, without case.
+fn _is(s as *u8, n as i64, word as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (_byte(word, i) == 0 || _lower(_byte(s, i)) != _byte(word, i)) { return 0; }
+        i = i + 1;
+    }
+    if (_byte(word, n) != 0) { return 0; }
+    return 1;
+}
+
+// Whose CJK families a language tag or locale asks for first: zh with
+// Hant, or of Taiwan, Hong Kong or Macau, Traditional; other zh
+// Simplified; ja; ko. Simplified for any other.
+fn lang_of(tag as *u8) as i64 {
+    if (cast(i64, tag) == 0) { return SC; }
+    let is i64 as n with mut = 0;
+    while (_byte(tag, n) != 0 && _byte(tag, n) != 46 && _byte(tag, n) != 64) { n = n + 1; }
+    // The first subtag.
+    let is i64 as k with mut = 0;
+    while (k < n && _byte(tag, k) != 45 && _byte(tag, k) != 95) { k = k + 1; }
+    if (_is(tag, k, "ja") == 1) { return JP; }
+    if (_is(tag, k, "ko") == 1) { return KR; }
+    if (_is(tag, k, "zh") == 0) { return SC; }
+    let is i64 as region with mut = SC;
+    while (k < n) {
+        let is i64 as at = k + 1;
+        k = at;
+        while (k < n && _byte(tag, k) != 45 && _byte(tag, k) != 95) { k = k + 1; }
+        let is *u8 as sub = cast(*u8, cast(i64, tag) + at);
+        if (_is(sub, k - at, "hant") == 1) { return TC; }
+        if (_is(sub, k - at, "hans") == 1) { return SC; }
+        if (_is(sub, k - at, "tw") == 1 || _is(sub, k - at, "hk") == 1 || _is(sub, k - at, "mo") == 1) { region = TC; }
+    }
+    return region;
+}
+
+fn _clamp(v as f64, lo as f64, hi as f64) as f64 {
+    if (v >= hi) { return hi; }
+    if (v >= lo) { return v; }
+    return lo;
+}
+
+fn count(c as *Chain) as i64 { return c.n; }
+
+fn member(c as *Chain, m as i64) as *Member { return cast(*Member, pool.at(&c.members, m * sizeof(Member))); }
+
+// --- Members ---
+
+fn _open(c as *Chain, mb as *Member) as void {
+    mb.state = 0 - 1;
+    // A file that will not open has no size either.
+    let is i64 as fd = linux.open(index.path_of(c.ix, mb.face), 524288, 0);
+    let is [144]u8 as st;
+    let is i64 as size with mut = 0;
+    if (linux.fstat(fd, cast(*u8, &st)) == 0) { size = *cast(*i64, cast(i64, &st) + 48); }
+    if (size <= 0) {
+        linux.close(fd);
+        return;
+    }
+    let is *u8 as data = linux.mmap(cast(*u8, 0), size, 1, 2, fd, 0);
+    linux.close(fd);
+    let is i64 as v = cast(i64, data);
+    if (v < 0 && v > 0 - 4096) { return; }
+    c.opens = c.opens + 1;
+    mb.f = sfnt.open(data, size, index.desc(c.ix, mb.face).index);
+    if (mb.f.ok != 1) {
+        linux.munmap(data, size);
+        return;
+    }
+    mb.data = data;
+    mb.size = size;
+    mb.state = 1;
+    c.mapped = c.mapped + 1;
+}
+
+fn _unmap(c as *Chain, mb as *Member) as void {
+    if (mb.state == 1) {
+        linux.munmap(mb.data, mb.size);
+        c.mapped = c.mapped - 1;
+    }
+    mb.state = 0;
+}
+
+// The face of member m, opened if it was not; null when it will not open.
+fn face(c as *Chain, m as i64) as *sfnt.table.Face {
+    let is *Member as mb = member(c, m);
+    if (mb.state == 0) { _open(c, mb); }
+    if (mb.state != 1) { return cast(*sfnt.table.Face, 0); }
+    return &mb.f;
+}
+
+fn _has(c as *Chain, m as i64, cp as i64) as i32 {
+    let is *Member as mb = member(c, m);
+    if (index.covers(c.ix, mb.face, cp) == 0) { return 0; }
+    let is *sfnt.table.Face as f = face(c, m);
+    if (cast(i64, f) == 0) { return 0; }
+    if (sfnt.cmap.glyph(f, cp) != 0) { return 1; }
+    return 0;
+}
+
+fn _member_of(c as *Chain, fc as i64) as i64 {
+    let is i64 as m with mut = 0;
+    while (m < c.n) {
+        if (member(c, m).face == fc) { return m; }
+        m = m + 1;
+    }
+    return 0 - 1;
+}
+
+// The choice in the next member's place, not yet counted.
+fn _stage(c as *Chain, ch as *matching.Choice) as *Member {
+    let is *Member as mb = member(c, c.n);
+    mb.face = ch.face;
+    mb.weight = ch.weight;
+    mb.width = ch.width;
+    mb.style = ch.style;
+    mb.state = 0;
+    return mb;
+}
+
+// --- What was learned ---
+
+fn _leaf_slot(c as *Chain, i as i64) as *i64 { return cast(*i64, pool.at(&c.leaves, i * 40)); }
+
+fn _leaf_hash(key as i64) as i64 { return ((key * (0 - 7046029254386353131)) >> 29) & 4611686018427387903; }
+
+// The page learned of a face: its 32 bytes, or null when not learned.
+fn _leaf(c as *Chain, fc as i64, page as i64) as *u8 {
+    if (c.leaf_slots == 0) { return cast(*u8, 0); }
+    let is i64 as key = fc * 4352 + page + 1;
+    let is i64 as i with mut = _leaf_hash(key) & (c.leaf_slots - 1);
+    while (*_leaf_slot(c, i) != 0) {
+        if (*_leaf_slot(c, i) == key) { return cast(*u8, cast(i64, _leaf_slot(c, i)) + 8); }
+        i = (i + 1) & (c.leaf_slots - 1);
+    }
+    return cast(*u8, 0);
+}
+
+fn _leaf_put(c as *Chain, key as i64, bits as *u8) as void {
+    let is i64 as i with mut = _leaf_hash(key) & (c.leaf_slots - 1);
+    while (*_leaf_slot(c, i) != 0) { i = (i + 1) & (c.leaf_slots - 1); }
+    *_leaf_slot(c, i) = key;
+    mem.memcpy(cast(*u8, cast(i64, _leaf_slot(c, i)) + 8), bits, 32);
+    c.leaf_used = c.leaf_used + 1;
+}
+
+// What face f (null: none, it would not open) maps on page, remembered.
+fn _learn(c as *Chain, fc as i64, page as i64, f as *sfnt.table.Face) as void {
+    if ((c.leaf_used + 1) * 2 > c.leaf_slots) {
+        let is pool.Pool as old = c.leaves;
+        let is i64 as old_slots = c.leaf_slots;
+        let is i64 as slots with mut = c.leaf_slots * 2;
+        if (slots < 64) { slots = 64; }
+        c.leaves = pool.empty();
+        if (pool.add(&c.leaves, cast(*u8, 0), slots * 40) < 0) {
+            c.leaves = old;
+            return;
+        }
+        c.leaf_slots = slots;
+        c.leaf_used = 0;
+        let is i64 as k with mut = 0;
+        while (k < old_slots) {
+            let is *i64 as e = cast(*i64, pool.at(&old, k * 40));
+            if (*e != 0) { _leaf_put(c, *e, cast(*u8, cast(i64, e) + 8)); }
+            k = k + 1;
+        }
+        pool.free(&old);
+    }
+    let is [32]u8 as bits;
+    mem.memzero(cast(*u8, &bits), 32);
+    let is i64 as k with mut = 0;
+    while (cast(i64, f) != 0 && k < 256) {
+        if (sfnt.cmap.glyph(f, page * 256 + k) != 0) { bits[k >> 3] = cast(u8, cast(i64, bits[k >> 3]) | (1 << (k & 7))); }
+        k = k + 1;
+    }
+    _leaf_put(c, fc * 4352 + page + 1, cast(*u8, &bits));
+}
+
+// The member drawing cp with the choice's face: a member already, or opened
+// and kept when it has cp; -1 when it has not, which is learned.
+fn _try(c as *Chain, ch as *matching.Choice, cp as i64) as i64 {
+    let is i64 as m = _member_of(c, ch.face);
+    if (m >= 0) {
+        if (_has(c, m, cp) == 1) { return m; }
+        return 0 - 1;
+    }
+    let is *u8 as leaf = _leaf(c, ch.face, cp >> 8);
+    if (cast(i64, leaf) != 0 && ((_byte(leaf, (cp & 255) >> 3) >> (cp & 7)) & 1) == 0) { return 0 - 1; }
+    if (c.n >= MAX_MEMBERS) { return 0 - 1; }
+    let is *Member as mb = _stage(c, ch);
+    _open(c, mb);
+    if (mb.state == 1 && sfnt.cmap.glyph(&mb.f, cp) != 0) {
+        c.n = c.n + 1;
+        return c.n - 1;
+    }
+    if (mb.state == 1) { _learn(c, ch.face, cp >> 8, &mb.f); } else { _learn(c, ch.face, cp >> 8, cast(*sfnt.table.Face, 0)); }
+    _unmap(c, mb);
+    return 0 - 1;
+}
+
+// --- Families by name ---
+
+// Calls each family named in list, trimmed and unquoted, into name; the
+// list's next position, or -1 at its end.
+fn _next(list as *u8, at as i64, name as *u8) as i64 {
+    if (cast(i64, list) == 0 || _byte(list, at) == 0) { return 0 - 1; }
+    let is i64 as end with mut = at;
+    while (_byte(list, end) != 0 && _byte(list, end) != 44) { end = end + 1; }
+    let is i64 as a with mut = at;
+    let is i64 as b with mut = end;
+    while (a < b && _byte(list, a) == 32) { a = a + 1; }
+    while (b > a && _byte(list, b - 1) == 32) { b = b - 1; }
+    if (b - a >= 2 && (_byte(list, a) == 34 || _byte(list, a) == 39) && _byte(list, b - 1) == _byte(list, a)) {
+        a = a + 1;
+        b = b - 1;
+    }
+    let is i64 as n with mut = b - a;
+    if (n > 255) { n = 255; }
+    mem.memcpy(name, cast(*u8, cast(i64, list) + a), n);
+    *cast(*u8, cast(i64, name) + n) = cast(u8, 0);
+    if (_byte(list, end) == 44) { return end + 1; }
+    return end;
+}
+
+fn _generic(c as *Chain, name as *u8) as *u8 {
+    let is i64 as n with mut = 0;
+    while (_byte(name, n) != 0) { n = n + 1; }
+    if (_is(name, n, "sans-serif") == 1 || _is(name, n, "ui-sans-serif") == 1) { return c.prefs.sans; }
+    if (_is(name, n, "serif") == 1 || _is(name, n, "ui-serif") == 1) { return c.prefs.serif; }
+    if (_is(name, n, "monospace") == 1 || _is(name, n, "ui-monospace") == 1) { return c.prefs.mono; }
+    if (_is(name, n, "emoji") == 1) { return c.prefs.emoji; }
+    if (_is(name, n, "system-ui") == 1) {
+        if (cast(i64, c.prefs.ui) != 0 && _byte(c.prefs.ui, 0) != 0) { return c.prefs.ui; }
+        return c.prefs.sans;
+    }
+    return cast(*u8, 0);
+}
+
+// Each family of list that exists added as a member asked for; generic
+// names through the preferences, once deep.
+fn _add_list(c as *Chain, list as *u8, deep as i32) as void {
+    let is [256]u8 as name;
+    let is i64 as at with mut = _next(list, 0, cast(*u8, &name));
+    while (at >= 0) {
+        let is *u8 as g = _generic(c, cast(*u8, &name));
+        if (cast(i64, g) != 0 && deep == 0) {
+            _add_list(c, g, 1);
+        } else if (cast(i64, g) == 0) {
+            let is matching.Choice as ch = matching.best(c.ix, cast(*u8, &name), c.weight, c.width, c.style);
+            if (ch.face >= 0 && _member_of(c, ch.face) < 0 && c.n < MAX_MEMBERS) {
+                _stage(c, &ch);
+                c.n = c.n + 1;
+            }
+        }
+        at = _next(list, at, cast(*u8, &name));
+    }
+}
+
+// The face of a family of list that draws cp, in the list's order.
+fn _preferred(c as *Chain, list as *u8, cp as i64) as i64 {
+    let is [256]u8 as name;
+    let is i64 as at with mut = _next(list, 0, cast(*u8, &name));
+    while (at >= 0) {
+        let is index.Run as run = index.family(c.ix, cast(*u8, &name));
+        let is matching.Choice as ch = matching.narrow(c.ix, run.faces, run.n, cp >> 8, c.weight, c.width, c.style);
+        if (ch.face >= 0) {
+            let is i64 as m = _try(c, &ch, cp);
+            if (m >= 0) { return m; }
+        }
+        at = _next(list, at, cast(*u8, &name));
+    }
+    return 0 - 1;
+}
+
+// Whether name is lead's, or begins with it and a space, without case.
+fn _near(name as *u8, lead as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (_byte(lead, i) != 0) {
+        if (_lower(_byte(name, i)) != _lower(_byte(lead, i))) { return 0; }
+        i = i + 1;
+    }
+    if (i > 0 && (_byte(name, i) == 0 || _byte(name, i) == 32)) { return 1; }
+    return 0;
+}
+
+// Any family's face drawing cp, in the order of step 3 above: the families
+// near the first one's name, then those whose faces suit the character —
+// colour for an emoji, not for anything else — then the rest; in each, the
+// faces at the width and style asked for first; then by name.
+fn _any(c as *Chain, cp as i64, emoji as i32) as i64 {
+    let is *u8 as lead with mut = "";
+    if (c.lead > 0) { lead = index.family_of(c.ix, member(c, 0).face); }
+    // A style that is none of the three fits no face, which moves every
+    // family down alike.
+    let is f64 as width = _clamp(c.width, 0.0, 1000.0);
+    // Each family with a face for cp's page: its rank and its choice.
+    let is pool.Pool as cands with mut = pool.empty();
+    let is i64 as k with mut = 0;
+    while (k < index.family_count(c.ix)) {
+        let is index.Run as run = index.family_run(c.ix, k);
+        let is i64 as j with mut = 0;
+        let is i32 as reaches with mut = 0;
+        while (j < run.n && reaches == 0) {
+            reaches = index.covers_page(c.ix, *cast(*i64, cast(i64, run.faces) + j * 8), cp >> 8);
+            j = j + 1;
+        }
+        if (reaches == 1) {
+            let is matching.Choice as ch = matching.narrow(c.ix, run.faces, run.n, cp >> 8, c.weight, c.width, c.style);
+            let is i64 as rank with mut = 0;
+            if (_near(index.family_name(c.ix, k), lead) == 0) {
+                rank = 2;
+                let is i32 as colour = (index.desc(c.ix, ch.face).flags & face.COLOR) != 0;
+                if (colour != emoji) { rank = 4; }
+            }
+            if (ch.width != width || ch.style != c.style) { rank = rank + 1; }
+            let is [5]i64 as rec;
+            rec[0] = rank;
+            rec[1] = ch.face;
+            rec[2] = ch.style;
+            *cast(*f64, cast(i64, &rec) + 24) = ch.weight;
+            *cast(*f64, cast(i64, &rec) + 32) = ch.width;
+            pool.add(&cands, cast(*u8, &rec), 40);
+        }
+        k = k + 1;
+    }
+    let is i64 as n = cands.len / 40;
+    let is i64 as m with mut = 0 - 1;
+    let is i64 as rank with mut = 0;
+    while (m < 0 && rank < 6) {
+        k = 0;
+        while (m < 0 && k < n) {
+            let is *i64 as rec = cast(*i64, pool.at(&cands, k * 40));
+            if (*rec == rank) {
+                let is matching.Choice as ch;
+                ch.face = *cast(*i64, cast(i64, rec) + 8);
+                ch.style = *cast(*i64, cast(i64, rec) + 16);
+                ch.weight = *cast(*f64, cast(i64, rec) + 24);
+                ch.width = *cast(*f64, cast(i64, rec) + 32);
+                m = _try(c, &ch, cp);
+            }
+            k = k + 1;
+        }
+        rank = rank + 1;
+    }
+    pool.free(&cands);
+    return m;
+}
+
+fn _is_emoji(cp as i64) as i32 {
+    if (cp >= 127462 && cp <= 127487) { return 1; }   // regional indicators: flags
+    if (extpict.extpict_get(cast(i32, cp)) == 1) { return 1; }
+    return 0;
+}
+
+// Han and kana are wide, and with them the CJK punctuation and fullwidth
+// forms; the scripts named are those with letters that are not —
+// halfwidth katakana, Hangul's conjoining jamo, two Bopomofo tone marks.
+fn _is_cjk(cp as i64) as i32 {
+    let is i64 as w = props.east_asian_width(cast(i32, cp));
+    if (w == eaw.EAW_W || w == eaw.EAW_F) { return 1; }
+    let is i64 as sc = props.script(cast(i32, cp));
+    if (sc == script.SC_Katakana || sc == script.SC_Hangul || sc == script.SC_Bopomofo) { return 1; }
+    return 0;
+}
+
+// The first member that opens: what draws a character no face has.
+fn _first(c as *Chain) as i64 {
+    let is i64 as m with mut = 0;
+    while (m < c.n) {
+        if (cast(i64, face(c, m)) != 0) { return m; }
+        m = m + 1;
+    }
+    return 0 - 1;
+}
+
+// --- The chain ---
+
+// A chain for the families of list — a comma-separated list, names quoted
+// or not, generic names among them — at weight, width and style, with the
+// program's preferences, which must outlive it. 0 when no face in the index
+// answers, not even as a last resort.
+fn open(c as *Chain, ix as *index.Index, list as *u8, weight as f64, width as f64, style as i64, prefs as *Prefs) as i32 {
+    c.ix = ix;
+    c.prefs = *prefs;
+    c.weight = weight;
+    c.width = width;
+    c.style = style;
+    c.lead = 0;
+    c.n = 0;
+    c.opens = 0;
+    c.mapped = 0;
+    c.members = pool.empty();
+    c.memo = pool.empty();
+    c.leaves = pool.empty();
+    c.leaf_slots = 0;
+    c.leaf_used = 0;
+    if (pool.add(&c.members, cast(*u8, 0), MAX_MEMBERS * sizeof(Member)) < 0 || pool.add(&c.memo, cast(*u8, 0), MEMO * 16) < 0) {
+        return 0;
+    }
+    _add_list(c, list, 0);
+    if (c.n == 0) { _add_list(c, c.prefs.sans, 1); }
+    // The last resort: the first family by name with a face for the first
+    // page that is not in colour — a family with a name: one without has
+    // none to show in a menu, and sorts first.
+    let is i64 as k with mut = 0;
+    while (c.n == 0 && k < index.family_count(ix)) {
+        let is index.Run as run = index.family_run(ix, k);
+        let is matching.Choice as ch = matching.narrow(ix, run.faces, run.n, 0, weight, width, style);
+        if (ch.face >= 0 && (index.desc(ix, ch.face).flags & face.COLOR) == 0 && _byte(index.family_name(ix, k), 0) != 0) {
+            _stage(c, &ch);
+            c.n = 1;
+        }
+        k = k + 1;
+    }
+    c.lead = c.n;
+    if (c.n == 0) { return 0; }
+    return 1;
+}
+
+fn close(c as *Chain) as void {
+    let is i64 as m with mut = 0;
+    while (m < c.n) {
+        _unmap(c, member(c, m));
+        m = m + 1;
+    }
+    pool.free(&c.members);
+    pool.free(&c.memo);
+    pool.free(&c.leaves);
+    c.n = 0;
+    c.lead = 0;
+    c.leaf_slots = 0;
+    c.leaf_used = 0;
+}
+
+// The member that draws cp; when none has it the first that opens, to draw
+// it as missing; -1 when no member opens at all.
+fn find(c as *Chain, cp as i64) as i64 {
+    if (c.n == 0) { return 0 - 1; }
+    if (cp < 0 || cp > 1114111) { return _first(c); }
+    let is i64 as slot = (((cp * (0 - 7046029254386353131)) >> 40) & (MEMO - 1)) * 2;
+    if (pool.i64_at(&c.memo, slot) == cp + 1) { return pool.i64_at(&c.memo, slot + 1); }
+    let is i64 as m with mut = 0 - 1;
+    let is i64 as k with mut = 0;
+    while (m < 0 && k < c.lead) {
+        if (_has(c, k, cp) == 1) { m = k; }
+        k = k + 1;
+    }
+    let is i32 as emoji = _is_emoji(cp);
+    if (m < 0 && emoji == 1) { m = _preferred(c, c.prefs.emoji, cp); }
+    if (m < 0 && emoji == 0 && _is_cjk(cp) == 1) {
+        // The language's list, then all four in order: the language's
+        // again costs nothing, its faces members by then.
+        m = _preferred(c, c.prefs.cjk[c.prefs.lang & 3], cp);
+        k = 0;
+        while (m < 0 && k < 4) {
+            m = _preferred(c, c.prefs.cjk[k], cp);
+            k = k + 1;
+        }
+    }
+    if (m < 0) { m = _any(c, cp, emoji); }
+    if (m < 0) { m = _first(c); }
+    if (m >= 0) {
+        pool.set_i64(&c.memo, slot, cp + 1);
+        pool.set_i64(&c.memo, slot + 1, m);
+    }
+    return m;
+}
+
+// The instance member m is drawn at, for text px CSS pixels high: its
+// matched weight and width, its style on an ital or slnt axis — oblique at
+// CSS's 14 degrees, as far as the axis goes — and its optical size
+// following px. No axes for a static face, or one that will not open.
+fn design(c as *Chain, m as i64, px as f64, d as *sfnt.var.Design) as void {
+    d.n = 0;
+    let is *sfnt.table.Face as f = face(c, m);
+    if (cast(i64, f) == 0) { return; }
+    let is *Member as mb = member(c, m);
+    *d = sfnt.var.design(f);
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        let is sfnt.var.Axis as a = sfnt.var.axis(f, i);
+        let is i32 as given with mut = 1;
+        let is f64 as v with mut = 0.0;
+        if (a.tag == face.TAG_WGHT) { v = mb.weight; }
+        else if (a.tag == face.TAG_WDTH) { v = mb.width; }
+        else if (a.tag == face.TAG_ITAL) {
+            if (mb.style == face.ITALIC) { v = 1.0; }
+        } else if (a.tag == face.TAG_SLNT) {
+            if (mb.style == face.OBLIQUE) { v = 0.0 - 14.0; }
+        } else {
+            given = 0;
+        }
+        if (given == 1) { d.v[i] = _clamp(v, a.min, a.max); }
+        i = i + 1;
+    }
+    sfnt.var.optical(d, f, px);
+}
