@@ -369,7 +369,12 @@ with an era, the tree sized at open and never grown, children kept in order,
 recursive destruction children-first with each kind's `destroy` entry, reparent
 refusing cycles, inserting before a given sibling and moving among siblings
 (`create_before`, `insert`, `move_before`, with `index_of` and `child_at`), hidden and disabled inherited from ancestors, and layout
-invalidation that climbs to the root.
+invalidation that climbs to the root. It carries what the application lends
+its widgets: the text service (`set_text_service`, a bare pointer so that the
+tree does not bring the text stack into programs that show none), the
+program's function for text copied to the clipboard or the primary selection
+(`set_clipboard`, `copy`), and which widget names which (`set_labelled_by`,
+forgotten when the label goes).
 
 **The application** (`app.cst`, tested by `app_test`): one per program,
 holding what no single window owns — the system's settings, which every
@@ -377,7 +382,8 @@ window's router takes, and the timers, one clock for one loop — and a bounded
 table of windows named by handles with an era. Each window has its own tree
 and its own router, its logical size, its scale and whether the platform says
 it is active (a change repaints all of it); `app.frame` lays it out at its size
-and collects what to repaint. It is fed by calls, as the router is: the
+and collects what to repaint. `app.set_text_service` lends every window, open
+and to come, the application's text service. It is fed by calls, as the router is: the
 platform loop that opens real windows and presents frames sits above it.
 
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
@@ -571,8 +577,8 @@ over them what the tree and the router know: visible, showing, enabled,
 focusable, focused — those are theirs alone, whatever a kind says. The root is
 the window. `access.act` asks a widget to do one of its actions, with a value
 for setting one; one that is gone or disabled, or whose kind does not list the
-action, is not asked. The bridges to the platform come later and read nothing
-else.
+action, is not asked. A widget with no name of its own takes its label's. The
+bridges to the platform come later and read nothing else.
 
 ## For scale
 
