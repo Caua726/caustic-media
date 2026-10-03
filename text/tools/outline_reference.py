@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# text/tools/outline_reference.py — every glyph's outline as fontTools draws
-# it, written as text for outline_test.cst to hold the outline readers to.
+# text/tools/outline_reference.py — every glyph's outline at the default
+# instance, written as text for outline_test.cst to hold the outline readers to.
 #
-# Development tool: needs fontTools; its output is versioned. One file per
-# font, <font>.outline.ref:
+# Development tool: needs fontTools and uharfbuzz (see reference_common.py);
+# its output is versioned. One file per font, <font>.outline.ref:
 #
 #   faces N
 #   face I
@@ -17,79 +17,35 @@
 # TrueType contours as fontTools draws them: starting at the first on-curve
 # point, the line back to it left to the close, off-curve pairs split at their
 # midpoint, a contour of off-curve points alone starting at the midpoint of its
-# last and first. Composites are expanded by fontTools' own getCoordinates —
-# offsets, scales, point matching — and drawn the same way. CFF and CFF2 at the
-# default instance, as fontTools' charstring interpreter draws them.
+# last and first. Glyphs composed as HarfBuzz composes them, the first phantom
+# point at the origin (reference_common.py). CFF and CFF2 as fontTools'
+# charstring interpreter draws them. Every glyph is drawn by HarfBuzz too, and
+# the two must pass through the same points.
 #
-#   python3 text/tools/outline_reference.py
+#   ~/.cache/caustic-media/venv/bin/python text/tools/outline_reference.py
 import glob
 import os
 
-from fontTools.pens.basePen import BasePen
 from fontTools.ttLib import TTFont, TTCollection
-from fontTools.ttLib.tables._g_l_y_f import Glyph
+
+from reference_common import Segments, draw_glyf, hb_font, check_against_hb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "..", "testdata")
 
 
-def num(v):
-    if v == int(v):
-        return "%d" % int(v)
-    return repr(float(v))
-
-
-class Segments(BasePen):
-    # Every segment explicit: BasePen splits quadratic runs at their implied
-    # on-curve points before they reach _qCurveToOne.
-    def __init__(self, out, glyphs=None):
-        # The glyph set draws components: endchar's accent building.
-        super().__init__(glyphs)
-        self.out = out
-
-    def _moveTo(self, p):
-        self.out.append("M %s %s" % (num(p[0]), num(p[1])))
-
-    def _lineTo(self, p):
-        self.out.append("L %s %s" % (num(p[0]), num(p[1])))
-
-    def _qCurveToOne(self, p1, p2):
-        self.out.append("Q %s %s %s %s" % (num(p1[0]), num(p1[1]), num(p2[0]), num(p2[1])))
-
-    def _curveToOne(self, p1, p2, p3):
-        self.out.append("C %s %s %s %s %s %s" % tuple(num(v) for v in (p1[0], p1[1], p2[0], p2[1], p3[0], p3[1])))
-
-    def _closePath(self):
-        self.out.append("Z")
-
-    def _endPath(self):
-        self.out.append("Z")
-
-
-def glyf_glyph(font, name, out):
-    glyf = font["glyf"]
-    g = glyf[name]
-    if g.numberOfContours == 0:
-        return
-    coords, ends, flags = g.getCoordinates(glyf)
-    simple = Glyph()
-    simple.numberOfContours = len(ends)
-    simple.coordinates = coords
-    simple.endPtsOfContours = list(ends)
-    simple.flags = flags
-    simple.program = None
-    simple.draw(Segments(out), glyf)
-
-
-def face(out, font):
+def face(out, font, hbf, what):
     order = font.getGlyphOrder()
     gs = font.getGlyphSet()
     for gid, name in enumerate(order):
         out.append("glyph %d" % gid)
+        lines = []
         if "glyf" in font:
-            glyf_glyph(font, name, out)
+            draw_glyf(font, name, {}, lines)
         else:
-            gs[name].draw(Segments(out, gs))
+            gs[name].draw(Segments(lines, gs))
+        check_against_hb(hbf, gid, lines, what)
+        out += lines
 
 
 def main():
@@ -99,11 +55,12 @@ def main():
         # The bombs are for refusing, not drawing.
         if os.path.basename(p).startswith("bomb"):
             continue
+        data = open(p, "rb").read()
         fonts = TTCollection(p).fonts if p.endswith(".ttc") else [TTFont(p)]
         out = ["faces %d" % len(fonts)]
         for i, f in enumerate(fonts):
             out.append("face %d" % i)
-            face(out, f)
+            face(out, f, hb_font(data, i), os.path.basename(p))
         with open(p + ".outline.ref", "w") as fh:
             fh.write("\n".join(out) + "\n")
         print(os.path.basename(p) + ".outline.ref", len(out), "lines")

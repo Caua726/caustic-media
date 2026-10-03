@@ -1,0 +1,1242 @@
+// text/sfnt/var_test.cst — variable fonts: axes, named instances, an
+// instance's coordinates, and HVAR's and MVAR's deltas, held to HarfBuzz at
+// chosen instances (text/testdata/*.var.ref, written by
+// text/tools/var_reference.py). Then tables made by hand for what no test
+// font has: fvar refused, avar's edges and version 2 without its parts, every
+// DeltaSetIndexMap form, 32-bit deltas, regions the specification calls
+// invalid, MVAR's records searched, line metrics at an instance from each of
+// their sources, and optical size following the text's.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "sfnt.cst" as sfnt;
+
+let is i32 as fails with mut = 0;
+let is *u8 as current with mut;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s (%s)\n", name, current);
+        fails = fails + 1;
+    }
+}
+
+// --- Files ---
+
+let is i64 as loaded with mut = 0;
+
+// The whole file, mapped; 0 when it cannot be read.
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+// --- The reference, a token at a time ---
+
+let is *u8 as ref with mut;
+let is i64 as ref_len with mut = 0;
+let is i64 as pos with mut = 0;
+
+fn _c(i as i64) as i64 {
+    if (i >= ref_len) { return 0; }
+    return cast(i64, *cast(*u8, cast(i64, ref) + i));
+}
+
+fn _skip() as void {
+    while (pos < ref_len && (_c(pos) == 32 || _c(pos) == 10)) { pos = pos + 1; }
+}
+
+let is [64]u8 as word;
+
+// The next word into word; 0 at the end.
+fn next_word() as i32 {
+    _skip();
+    if (pos >= ref_len) { return 0; }
+    let is i64 as n with mut = 0;
+    while (pos < ref_len && _c(pos) != 32 && _c(pos) != 10 && n < 63) {
+        word[n] = cast(u8, _c(pos));
+        n = n + 1;
+        pos = pos + 1;
+    }
+    word[n] = 0;
+    return 1;
+}
+
+fn is_word(w as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (1 == 1) {
+        let is i64 as a = cast(i64, word[i]);
+        let is i64 as b = cast(i64, *cast(*u8, cast(i64, w) + i));
+        if (a != b) { return 0; }
+        if (a == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _peek() as i64 {
+    _skip();
+    return _c(pos);
+}
+
+// A decimal number as Python writes it: sign, digits, a fraction, an exponent.
+fn num() as f64 {
+    _skip();
+    let is f64 as sign with mut = 1.0;
+    if (_c(pos) == 45) { sign = 0.0 - 1.0; pos = pos + 1; }
+    let is f64 as v with mut = 0.0;
+    while (_c(pos) >= 48 && _c(pos) <= 57) {
+        v = v * 10.0 + cast(f64, _c(pos) - 48);
+        pos = pos + 1;
+    }
+    if (_c(pos) == 46) {
+        pos = pos + 1;
+        let is f64 as scale with mut = 0.1;
+        while (_c(pos) >= 48 && _c(pos) <= 57) {
+            v = v + cast(f64, _c(pos) - 48) * scale;
+            scale = scale / 10.0;
+            pos = pos + 1;
+        }
+    }
+    if (_c(pos) == 101) {
+        pos = pos + 1;
+        let is i64 as es with mut = 1;
+        if (_c(pos) == 45) { es = 0 - 1; pos = pos + 1; }
+        let is i64 as e with mut = 0;
+        while (_c(pos) >= 48 && _c(pos) <= 57) {
+            e = e * 10 + (_c(pos) - 48);
+            pos = pos + 1;
+        }
+        while (e > 0) {
+            if (es > 0) { v = v * 10.0; } else { v = v / 10.0; }
+            e = e - 1;
+        }
+    }
+    return sign * v;
+}
+
+fn inum() as i64 { return cast(i64, num()); }
+
+// Within a millionth, of the larger when it passes 1 — written with >= alone,
+// which a NaN fails.
+fn near(a as f64, b as f64) as i32 {
+    let is f64 as tol with mut = 0.000001;
+    if (b >= 1.0) { tol = b * 0.000001; }
+    if (0.0 - b >= 1.0) { tol = (0.0 - b) * 0.000001; }
+    let is f64 as d = a - b;
+    if (d >= 0.0 - tol && tol >= d) { return 1; }
+    return 0;
+}
+
+// Halves away from zero, as C's roundf.
+fn rnd(x as f64) as i64 {
+    if (x >= 0.0) { return cast(i64, x + 0.5); }
+    return 0 - cast(i64, 0.5 - x);
+}
+
+// x rounded to single precision through memory, which the compiler does not
+// skip.
+fn r32(x as f64) as f64 {
+    let is [2]f32 as t;
+    t[0] = cast(f32, x);
+    return cast(f64, t[0]);
+}
+
+fn tag_of(s as *u8) as i64 {
+    let is i64 as t with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        t = (t << 8) | cast(i64, *cast(*u8, cast(i64, s) + i));
+        i = i + 1;
+    }
+    return t;
+}
+
+fn word_tag() as i64 { return tag_of(cast(*u8, &word)); }
+
+// Past a glyph's segments, which var_test does not read.
+fn skip_segments() as void {
+    while (1 == 1) {
+        let is i64 as c = _peek();
+        if (c == 77 || c == 76 || c == 81 || c == 67 || c == 90 || c == 45 || (c >= 48 && c <= 57)) {
+            next_word();
+        } else {
+            return;
+        }
+    }
+}
+
+// --- One font, held to its reference ---
+
+fn var_font(file as *u8, refpath as *u8) as void {
+    current = file;
+    let is *u8 as data = load(file);
+    let is i64 as size = loaded;
+    ref = load(refpath);
+    ref_len = loaded;
+    pos = 0;
+    check("the font and its reference", size > 0 && ref_len > 0);
+    let is sfnt.table.Face as f = sfnt.open(data, size, 0);
+    let is i64 as n = sfnt.var.axis_count(&f);
+    let is sfnt.var.Design as d with mut = sfnt.var.design(&f);
+    let is sfnt.var.Coords as c with mut = sfnt.var.default_coords();
+    let is i64 as ax with mut = 0;
+    let is i64 as ins with mut = 0;
+    let is i32 as hvar = sfnt.var.has_hvar(&f);
+    let is i64 as advances with mut = 0;
+    while (next_word() == 1) {
+        if (is_word("axes") == 1) {
+            check("axes", n == inum() && n > 0);
+        } else if (is_word("axis") == 1) {
+            next_word();
+            let is i64 as t = word_tag();
+            let is f64 as lo = num();
+            let is f64 as def = num();
+            let is f64 as hi = num();
+            let is i64 as flags = inum();
+            let is i64 as name_id = inum();
+            let is sfnt.var.Axis as a = sfnt.var.axis(&f, ax);
+            check("axis tag", a.tag == t);
+            check("axis range", near(a.min, lo) == 1 && near(a.def, def) == 1 && near(a.max, hi) == 1);
+            check("axis flags and name", a.flags == flags && a.name_id == name_id);
+            ax = ax + 1;
+        } else if (is_word("instances") == 1) {
+            check("instances", sfnt.var.instance_count(&f) == inum());
+        } else if (is_word("instance") == 1) {
+            let is i64 as name_id = inum();
+            let is i64 as ps = inum();
+            let is i64 as flags = inum();
+            let is sfnt.var.Design as nd with mut = sfnt.var.design(&f);
+            let is sfnt.var.Named as nm = sfnt.var.named(&f, ins, &nd);
+            check("instance names", nm.name_id == name_id && nm.ps_name_id == ps && nm.flags == flags);
+            let is i64 as k with mut = 0;
+            while (k < n) {
+                let is f64 as v = num();
+                check("instance coordinates", near(nd.v[k], v) == 1 && nd.set[k] == 1);
+                k = k + 1;
+            }
+            ins = ins + 1;
+        } else if (is_word("location") == 1) {
+            inum();
+            d = sfnt.var.design(&f);
+        } else if (is_word("set") == 1) {
+            next_word();
+            let is i64 as t = word_tag();
+            check("an axis to set", sfnt.var.set(&d, &f, t, num()) == 1);
+        } else if (is_word("named") == 1) {
+            d = sfnt.var.design(&f);
+            check("a named instance", sfnt.var.named(&f, inum(), &d).name_id >= 0);
+        } else if (is_word("normalized") == 1) {
+            c = sfnt.var.coords(&f, &d);
+            check("coordinates for every axis", c.n == n);
+            let is i64 as k with mut = 0;
+            while (k < n) {
+                let is i64 as want = inum();
+                if (c.v[k] != want) {
+                    io.printf("  axis %d: %d, want %d (at byte %d)\n", k, c.v[k], want, pos);
+                    check("normalized as HarfBuzz", 0);
+                }
+                k = k + 1;
+            }
+        } else if (is_word("advance") == 1) {
+            let is i64 as gid = inum();
+            let is i64 as hb = inum();
+            let is f64 as exact = num();
+            if (hvar == 1) {
+                let is f64 as e = cast(f64, sfnt.hmtx.advance(&f, gid)) + sfnt.var.advance_delta(&f, &c, gid);
+                check("HVAR's advance", near(e, exact) == 1);
+                check("rounded as HarfBuzz rounds", rnd(e) == hb || (0.0 > e && hb == 0));
+                advances = advances + 1;
+            }
+        } else if (is_word("metric") == 1) {
+            next_word();
+            let is i64 as t = word_tag();
+            let is f64 as want = num();
+            check("MVAR's delta", near(sfnt.var.metric(&f, &c, t), want) == 1);
+        } else if (is_word("glyph") == 1) {
+            inum();
+            skip_segments();
+        } else if (is_word("end") == 1) {
+            c = sfnt.var.default_coords();
+        } else {
+            io.printf("  unknown record %s\n", cast(*u8, &word));
+            check("the reference understood", 0);
+        }
+    }
+    check("every axis", ax == n);
+    check("no axis before the first, or after the last", sfnt.var.axis(&f, 0 - 1).tag == 0 && sfnt.var.axis(&f, n).tag == 0);
+    check("every instance", ins == sfnt.var.instance_count(&f));
+    check("advances, when HVAR has them", hvar == 0 || advances > 0);
+}
+
+// --- Tables made by hand ---
+
+let is [16384]u8 as fab;
+let is i64 as fab_n with mut = 0;
+
+fn f8(v as i64) as void { fab[fab_n] = cast(u8, v & 255); fab_n = fab_n + 1; }
+fn f16(v as i64) as void { f8(v >> 8); f8(v); }
+fn f32(v as i64) as void { f16(v >> 16); f16(v); }
+fn put16(at as i64, v as i64) as void {
+    fab[at] = cast(u8, (v >> 8) & 255);
+    fab[at + 1] = cast(u8, v & 255);
+}
+fn put32(at as i64, v as i64) as void { put16(at, v >> 16); put16(at + 2, v); }
+fn fixed(v as f64) as void { f32(cast(i64, v * 65536.0)); }
+fn f2(v as f64) as void { f16(rnd(v * 16384.0)); }
+
+fn table_at(off as i64, len as i64) as sfnt.table.Table {
+    let is sfnt.table.Table as t;
+    t.off = off;
+    t.len = len;
+    return t;
+}
+
+// A face over fab's bytes with no tables but those the caller sets.
+fn crafted() as sfnt.table.Face {
+    let is sfnt.table.Face as f with mut = sfnt.table.directory(cast(*u8, &fab), 0, 0);
+    f.data = cast(*u8, &fab);
+    f.size = 16384;
+    f.glyphs = 100;
+    f.hmetrics = 1;
+    f.upem = 1000;
+    f.fvar = table_at(0, 0);
+    f.avar = table_at(0, 0);
+    f.hvar = table_at(0, 0);
+    f.mvar = table_at(0, 0);
+    return f;
+}
+
+let is i64 as WGHT with imut = 0x77676874;
+let is i64 as WDTH with imut = 0x77647468;
+let is i64 as OPSZ with imut = 0x6F70737A;
+
+// fvar at fab's start: n axes, the first three wght 100..400..900, wdth
+// 75..100..125 and opsz 8..12..72, the rest made-up tags 0..0..1; two
+// instances of isize bytes each. Its length.
+fn fvar(n as i64, isize as i64) as i64 {
+    fab_n = 0;
+    f16(1); f16(0); f16(16); f16(2); f16(n); f16(20); f16(2); f16(isize);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (i == 0) { f32(WGHT); fixed(100.0); fixed(400.0); fixed(900.0); f16(0); f16(256); }
+        else if (i == 1) { f32(WDTH); fixed(75.0); fixed(100.0); fixed(125.0); f16(0); f16(257); }
+        else if (i == 2) { f32(OPSZ); fixed(8.0); fixed(12.0); fixed(72.0); f16(1); f16(258); }
+        else { f32(0x41000000 + i); fixed(0.0); fixed(0.0); fixed(1.0); f16(0); f16(259); }
+        i = i + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < 2) {
+        let is i64 as start = fab_n;
+        f16(270 + k); f16(k * 3 + 1);
+        i = 0;
+        while (i < n) {
+            if (i == 0) { fixed(700.0 - cast(f64, k) * 400.0); } else if (i == 1) { fixed(100.0); } else { fixed(0.0); }
+            i = i + 1;
+        }
+        if (isize >= n * 4 + 6) {
+            if (k == 0) { f16(300); } else { f16(65535); }
+        }
+        while (fab_n < start + isize) { f8(0); }
+        k = k + 1;
+    }
+    return fab_n;
+}
+
+fn with_fvar(len as i64) as sfnt.table.Face {
+    let is sfnt.table.Face as f with mut = crafted();
+    f.fvar = table_at(0, len);
+    return f;
+}
+
+fn fvar_cases() as void {
+    current = "fvar, by hand";
+    let is i64 as len with mut = fvar(3, 3 * 4 + 6);
+    let is sfnt.table.Face as f with mut = with_fvar(len);
+    check("three axes", sfnt.var.axis_count(&f) == 3);
+    let is sfnt.var.Axis as a with mut = sfnt.var.axis(&f, 2);
+    check("the third", a.tag == OPSZ && near(a.min, 8.0) == 1 && near(a.def, 12.0) == 1 && near(a.max, 72.0) == 1
+          && a.flags == sfnt.var.HIDDEN && a.name_id == 258);
+    a = sfnt.var.axis(&f, 3);
+    check("no fourth", a.tag == 0 && a.name_id == 0);
+    a = sfnt.var.axis(&f, 0 - 1);
+    check("nor one before the first", a.tag == 0);
+    check("two instances", sfnt.var.instance_count(&f) == 2);
+    let is sfnt.var.Design as d with mut = sfnt.var.design(&f);
+    let is sfnt.var.Named as nm with mut = sfnt.var.named(&f, 0, &d);
+    check("the first, with its PostScript name", nm.name_id == 270 && nm.ps_name_id == 300 && near(d.v[0], 700.0) == 1
+          && nm.flags == 1);
+    nm = sfnt.var.named(&f, 1, &d);
+    check("the second, 0xFFFF for none", nm.name_id == 271 && nm.ps_name_id == 0 - 1 && near(d.v[0], 300.0) == 1
+          && nm.flags == 4);
+    nm = sfnt.var.named(&f, 2, &d);
+    check("no third", nm.name_id == 0 - 1 && nm.ps_name_id == 0 - 1);
+    nm = sfnt.var.named(&f, 0 - 1, &d);
+    check("nor one before the first", nm.name_id == 0 - 1);
+    len = fvar(3, 3 * 4 + 4);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    check("instances too short for PostScript names", sfnt.var.named(&f, 0, &d).ps_name_id == 0 - 1
+          && sfnt.var.instance_count(&f) == 2);
+    // What HarfBuzz refuses, refused.
+    len = fvar(3, 3 * 4 + 2);
+    f = with_fvar(len);
+    check("instances too short for their coordinates", sfnt.var.axis_count(&f) == 0 && sfnt.var.instance_count(&f) == 0);
+    len = fvar(3, 3 * 4 + 3);
+    f = with_fvar(len);
+    check("a byte short", sfnt.var.axis_count(&f) == 0);
+    len = fvar(3, 3 * 4 + 4);
+    put16(0, 2);
+    f = with_fvar(len);
+    check("fvar version 2", sfnt.var.axis_count(&f) == 0);
+    put16(0, 1);
+    put16(10, 24);
+    f = with_fvar(len);
+    check("axes of 24 bytes", sfnt.var.axis_count(&f) == 0);
+    put16(10, 20);
+    f = with_fvar(len - 1);
+    check("the last instance cut", sfnt.var.axis_count(&f) == 0);
+    f = with_fvar(15);
+    check("a header cut", sfnt.var.axis_count(&f) == 0);
+    f = with_fvar(len);
+    check("restored", sfnt.var.axis_count(&f) == 3);
+    len = fvar(64, 64 * 4 + 4);
+    f = with_fvar(len);
+    check("64 axes", sfnt.var.axis_count(&f) == 64);
+    len = fvar(65, 65 * 4 + 4);
+    f = with_fvar(len);
+    check("65 axes: read at the default instance", sfnt.var.axis_count(&f) == 0
+          && sfnt.var.design(&f).n == 0 && sfnt.var.coords(&f, &d).n == 0);
+
+    // Normalized: clamped, scaled on each side, rounded halves away from zero.
+    len = fvar(3, 3 * 4 + 4);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    check("the default", sfnt.var.coords(&f, &d).v[0] == 0 && sfnt.var.coords(&f, &d).n == 3);
+    sfnt.var.set(&d, &f, WGHT, 650.0);
+    check("half the way up", sfnt.var.coords(&f, &d).v[0] == 8192);
+    sfnt.var.set(&d, &f, WGHT, 250.0);
+    check("half the way down", sfnt.var.coords(&f, &d).v[0] == 0 - 8192);
+    sfnt.var.set(&d, &f, WGHT, 50.0);
+    check("below the minimum", sfnt.var.coords(&f, &d).v[0] == 0 - 16384);
+    sfnt.var.set(&d, &f, WGHT, 1000.0);
+    check("above the maximum", sfnt.var.coords(&f, &d).v[0] == 16384);
+    sfnt.var.set(&d, &f, WGHT, 400.0152587890625);
+    check("half a step up: one", sfnt.var.coords(&f, &d).v[0] == 1);
+    // HarfBuzz rounds 16.16 to 2.14 halves up, not away from zero.
+    sfnt.var.set(&d, &f, WGHT, 400.0 - 0.0091552734375);
+    check("half a step down: zero", sfnt.var.coords(&f, &d).v[0] == 0);
+    sfnt.var.set(&d, &f, WGHT, 400.0 - 0.01373291015625);
+    check("three quarters down: minus one", sfnt.var.coords(&f, &d).v[0] == 0 - 1);
+    sfnt.var.set(&d, &f, WGHT, 400.0076293945312);
+    check("under half a step: zero", sfnt.var.coords(&f, &d).v[0] == 0);
+    sfnt.var.set(&d, &f, WDTH, 112.5);
+    check("each axis its own", sfnt.var.coords(&f, &d).v[1] == 8192);
+    check("an axis no instance names", sfnt.var.set(&d, &f, 0x7A7A7A7A, 1.0) == 0);
+    // A minimum above the default counts as the default; so does a maximum
+    // below it.
+    len = fvar(1, 8);
+    put32(16 + 4, cast(i64, 500.0 * 65536.0));
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.set(&d, &f, WGHT, 300.0);
+    check("a minimum above the default", sfnt.var.coords(&f, &d).v[0] == 0);
+    sfnt.var.set(&d, &f, WGHT, 650.0);
+    check("and the other side unchanged", sfnt.var.coords(&f, &d).v[0] == 8192);
+    len = fvar(1, 8);
+    put32(16 + 12, cast(i64, 300.0 * 65536.0));
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.set(&d, &f, WGHT, 650.0);
+    check("a maximum below the default", sfnt.var.coords(&f, &d).v[0] == 0);
+    sfnt.var.set(&d, &f, WGHT, 250.0);
+    check("and the other side unchanged ", sfnt.var.coords(&f, &d).v[0] == 0 - 8192);
+    // Single precision where it decides: an axis whose values need more than
+    // its 24 bits, and quotients either side of the default.
+    len = fvar(1, 8);
+    put32(16 + 4, 6553600);
+    put32(16 + 8, 26277337);
+    put32(16 + 12, 67123333);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.set(&d, &f, WGHT, 686.546875);
+    check("an axis past single precision", sfnt.var.coords(&f, &d).v[0] == 7507);
+    put32(16 + 4, 12713984);
+    put32(16 + 8, 12910592);
+    put32(16 + 12, 39574381);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.set(&d, &f, WGHT, r32(513.4013061523438));
+    check("a quotient above the default", sfnt.var.coords(&f, &d).v[0] == 12742);
+    put32(16 + 4, 4390912);
+    put32(16 + 8, 66715648);
+    put32(16 + 12, 86245376);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.set(&d, &f, WGHT, r32(175.04249572753906));
+    check("a quotient below the default", sfnt.var.coords(&f, &d).v[0] == 0 - 14523);
+    // The value itself taken in single precision, as HarfBuzz's interface
+    // takes it.
+    put32(16 + 4, 8388608);
+    put32(16 + 8, 139657216);
+    put32(16 + 12, 150798336);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.set(&d, &f, WGHT, 2277.574853188678);
+    check("a value in single precision", sfnt.var.coords(&f, &d).v[0] == 14127);
+    // Two axes of one tag: both set.
+    len = fvar(2, 12);
+    put32(16 + 20, WGHT);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    check("a tag twice", sfnt.var.set(&d, &f, WGHT, 650.0) == 1 && near(d.v[0], 650.0) == 1 && near(d.v[1], 650.0) == 1
+          && d.set[0] == 1 && d.set[1] == 1);
+
+    // Optical size follows the text's unless set.
+    len = fvar(3, 3 * 4 + 4);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.optical(&d, &f, 20.0);
+    check("opsz from the size", near(d.v[2], 20.0) == 1 && d.set[2] == 0 && near(d.v[0], 400.0) == 1);
+    sfnt.var.optical(&d, &f, 30.0);
+    check("and again", near(d.v[2], 30.0) == 1);
+    sfnt.var.set(&d, &f, OPSZ, 9.0);
+    sfnt.var.optical(&d, &f, 40.0);
+    check("not once set", near(d.v[2], 9.0) == 1);
+    len = fvar(2, 12);
+    f = with_fvar(len);
+    d = sfnt.var.design(&f);
+    sfnt.var.optical(&d, &f, 20.0);
+    check("no opsz, nothing", near(d.v[0], 400.0) == 1 && near(d.v[1], 100.0) == 1);
+
+    // A face that is not variable.
+    f = crafted();
+    d = sfnt.var.design(&f);
+    let is sfnt.var.Coords as c = sfnt.var.coords(&f, &d);
+    check("not variable", sfnt.var.axis_count(&f) == 0 && sfnt.var.instance_count(&f) == 0 && d.n == 0 && c.n == 0
+          && sfnt.var.set(&d, &f, WGHT, 700.0) == 0);
+    check("default coordinates", sfnt.var.default_coords().n == 0 && sfnt.var.is_default(&c) == 1);
+    let is sfnt.var.Coords as below with mut = sfnt.var.default_coords();
+    below.n = 2;
+    below.v[0] = 0;
+    below.v[1] = 0 - 5;
+    check("below the default is not the default", sfnt.var.is_default(&below) == 0);
+    below.v[1] = 0;
+    check("at it", sfnt.var.is_default(&below) == 1);
+    // A design with fewer axes than the face: the rest at their defaults.
+    len = fvar(1, 8);
+    f = with_fvar(len);
+    let is sfnt.var.Design as one_axis with mut = sfnt.var.design(&f);
+    len = fvar(2, 12);
+    f = with_fvar(len);
+    check("axes past a design's at their defaults", sfnt.var.coords(&f, &one_axis).n == 2
+          && sfnt.var.coords(&f, &one_axis).v[1] == 0);
+}
+
+// --- avar ---
+
+// avar after a one-axis fvar (wght 100..400..900): version major, one map
+// of n pairs from fab's pairs; the fvar's length into fvar_len.
+let is [16]f64 as from;
+let is [16]f64 as to;
+let is i64 as fvar_len with mut = 0;
+
+fn avar(major as i64, n as i64) as i64 {
+    fvar_len = fvar(1, 8);
+    let is i64 as start = fab_n;
+    f16(major); f16(0); f16(0); f16(1);
+    f16(n);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        f2(from[i]);
+        f2(to[i]);
+        i = i + 1;
+    }
+    return start;
+}
+
+fn with_avar(start as i64) as sfnt.table.Face {
+    let is sfnt.table.Face as f with mut = crafted();
+    f.fvar = table_at(0, fvar_len);
+    f.avar = table_at(start, fab_n - start);
+    return f;
+}
+
+// wght at v, normalized and mapped.
+fn mapped(f as *sfnt.table.Face, v as f64) as i64 {
+    let is sfnt.var.Design as d with mut = sfnt.var.design(f);
+    sfnt.var.set(&d, f, WGHT, v);
+    return sfnt.var.coords(f, &d).v[0];
+}
+
+fn avar_cases() as void {
+    current = "avar, by hand";
+    let is i64 as at with mut = avar(1, 0);
+    let is sfnt.table.Face as f with mut = with_avar(at);
+    check("no pairs: as it was", mapped(&f, 650.0) == 8192);
+    from[0] = 0.25; to[0] = 0.5;
+    at = avar(1, 1);
+    f = with_avar(at);
+    check("one pair: moved by its difference", mapped(&f, 650.0) == 12288 && mapped(&f, 100.0) == 0 - 16384 + 4096);
+    from[0] = 0.0 - 1.0; to[0] = 0.0 - 1.0;
+    from[1] = 0.0; to[1] = 0.0;
+    from[2] = 0.5; to[2] = 0.25;
+    from[3] = 1.0; to[3] = 1.0;
+    at = avar(1, 4);
+    f = with_avar(at);
+    check("on a pair", mapped(&f, 650.0) == 4096);
+    check("between pairs", mapped(&f, 525.0) == 2048 && mapped(&f, 775.0) == 10240);
+    check("rounded halves away from zero", mapped(&f, 401.0) == 17);
+    check("the first", mapped(&f, 100.0) == 0 - 16384 && mapped(&f, 400.0) == 0);
+    check("the last", mapped(&f, 900.0) == 16384);
+    from[0] = 0.0 - 0.5; to[0] = 0.0 - 0.25;
+    from[1] = 0.0; to[1] = 0.0;
+    from[2] = 1.0; to[2] = 1.0;
+    at = avar(1, 3);
+    f = with_avar(at);
+    check("below the first pair: moved as it is", mapped(&f, 100.0) == 0 - 12288);
+    check("between the first two", mapped(&f, 325.0) == 0 - 2048);
+    from[0] = 0.0 - 1.0; to[0] = 0.0 - 1.0;
+    from[1] = 0.0; to[1] = 0.0;
+    from[2] = 0.5; to[2] = 0.75;
+    at = avar(1, 3);
+    f = with_avar(at);
+    check("above the last pair: moved as it is, past 1", mapped(&f, 900.0) == 20480);
+    // HarfBuzz's way with maps the specification does not allow.
+    from[0] = 0.0 - 1.0; to[0] = 0.0 - 1.0;
+    from[1] = 0.0; to[1] = 0.0;
+    from[2] = 0.5; to[2] = 0.2;
+    from[3] = 0.5; to[3] = 0.4;
+    from[4] = 0.5; to[4] = 0.6;
+    from[5] = 1.0; to[5] = 1.0;
+    at = avar(1, 6);
+    f = with_avar(at);
+    check("three pairs from one value: the middle", mapped(&f, 650.0) == 6554);
+    from[3] = 1.0; to[3] = 1.0;
+    from[3] = 0.5; to[3] = 0.6;
+    from[4] = 1.0; to[4] = 1.0;
+    at = avar(1, 5);
+    f = with_avar(at);
+    check("two, above 0: the first", mapped(&f, 650.0) == 3277);
+    from[1] = 0.0 - 0.5; to[1] = 0.0 - 0.2;
+    from[2] = 0.0 - 0.5; to[2] = 0.0 - 0.3;
+    from[3] = 0.0 - 0.5; to[3] = 0.0 - 0.4;
+    from[4] = 0.0 - 0.5; to[4] = 0.0 - 0.6;
+    from[5] = 0.0; to[5] = 0.0;
+    from[6] = 1.0; to[6] = 1.0;
+    at = avar(1, 7);
+    f = with_avar(at);
+    check("four, below 0: the last", mapped(&f, 250.0) == 0 - 9830);
+    from[1] = 0.0; to[1] = 0.25;
+    from[2] = 0.0; to[2] = 0.0 - 0.125;
+    from[3] = 1.0; to[3] = 1.0;
+    at = avar(1, 4);
+    f = with_avar(at);
+    check("two from 0: the nearer 0", mapped(&f, 400.0) == 0 - 2048);
+    to[1] = 0.125; to[2] = 0.0 - 0.25;
+    at = avar(1, 4);
+    f = with_avar(at);
+    check("the nearer the other way", mapped(&f, 400.0) == 2048);
+    to[2] = 0.0 - 0.125;
+    at = avar(1, 4);
+    f = with_avar(at);
+    check("as near: the last", mapped(&f, 400.0) == 0 - 2048);
+    from[1] = 0.0 - 1.0; to[1] = 0.0 - 0.5;
+    from[2] = 0.0 - 1.0; to[2] = 0.0 - 0.25;
+    from[3] = 0.0; to[3] = 0.0;
+    from[4] = 1.0; to[4] = 1.0;
+    at = avar(1, 5);
+    f = with_avar(at);
+    check("a -1 to -1 before more -1s passed over", mapped(&f, 100.0) == 0 - 4096);
+    from[1] = 0.0; to[1] = 0.0;
+    from[2] = 1.0; to[2] = 0.25;
+    from[3] = 1.0; to[3] = 0.5;
+    from[4] = 1.0; to[4] = 1.0;
+    at = avar(1, 5);
+    f = with_avar(at);
+    check("a +1 to +1 after more +1s passed over", mapped(&f, 900.0) == 4096);
+    from[2] = 0.3; to[2] = 0.7;
+    from[3] = 1.0; to[3] = 1.0;
+    at = avar(1, 4);
+    f = with_avar(at);
+    check("between pairs, in single precision", mapped(&f, 463.0) == 4818);
+    // A lone pair is a shift, whatever lies after the table.
+    from[0] = 0.0 - 1.0; to[0] = 0.0 - 1.0;
+    at = avar(1, 1);
+    f = with_avar(at);
+    f16(0xC000);
+    f16(0x2000);
+    check("a lone pair from -1 to -1", mapped(&f, 650.0) == 8192);
+    // Ends passed over only when they map to themselves.
+    from[0] = 0.0 - 1.0; to[0] = 0.0 - 0.5;
+    from[1] = 0.0 - 1.0; to[1] = 0.0 - 0.25;
+    from[2] = 0.0 - 1.0; to[2] = 0.0 - 0.125;
+    from[3] = 0.0; to[3] = 0.0;
+    from[4] = 1.0; to[4] = 1.0;
+    at = avar(1, 5);
+    f = with_avar(at);
+    check("a -1 not to -1 is kept", mapped(&f, 100.0) == 0 - 4096);
+    from[0] = 0.0 - 1.0; to[0] = 0.0 - 1.0;
+    from[1] = 0.0; to[1] = 0.0;
+    from[2] = 1.0; to[2] = 0.125;
+    from[3] = 1.0; to[3] = 0.25;
+    from[4] = 1.0; to[4] = 0.5;
+    at = avar(1, 5);
+    f = with_avar(at);
+    check("a +1 not to +1 is kept", mapped(&f, 900.0) == 4096);
+    // The interpolation's operations in HarfBuzz's order, in single precision.
+    from[1] = 0.0; to[1] = 0.0;
+    from[2] = 0.4; to[2] = 0.2;
+    from[3] = 1.0; to[3] = 1.0;
+    at = avar(1, 4);
+    f = with_avar(at);
+    check("multiplied, then divided", mapped(&f, 461.0) == 1000);
+    from[2] = 0.84393310546875; to[2] = 0.4937744140625;
+    at = avar(1, 4);
+    f = with_avar(at);
+    check("interpolated in single precision", mapped(&f, 716.8359375) == 6075);
+    // More maps than the face has axes: the rest not read.
+    fvar_len = fvar(1, 8);
+    at = fab_n;
+    f16(1); f16(0); f16(0); f16(100);
+    let is i64 as k with mut = 0;
+    while (k < 100) { f16(1); f2(0.0); f2(0.5); k = k + 1; }
+    f = with_avar(at);
+    check("maps past the face's axes", mapped(&f, 650.0) == 16384 && mapped(&f, 400.0) == 8192);
+    // Not read at all: a version it is not, a map cut short.
+    from[0] = 0.0; to[0] = 0.5;
+    at = avar(3, 1);
+    f = with_avar(at);
+    check("avar version 3", mapped(&f, 650.0) == 8192);
+    at = avar(1, 1);
+    f = with_avar(at);
+    check("version 1", mapped(&f, 650.0) == 16384);
+    f.avar.len = f.avar.len - 1;
+    check("a map cut short", mapped(&f, 650.0) == 8192);
+    put16(at + 6, 2);
+    f = with_avar(at);
+    check("a second map past the table", mapped(&f, 650.0) == 8192);
+    f.avar.len = 7;
+    check("a header cut short", mapped(&f, 650.0) == 8192);
+    // Version 2 without its tail: not read; with offsets of 0, its maps alone.
+    at = avar(2, 1);
+    f = with_avar(at);
+    check("version 2 without its offsets", mapped(&f, 650.0) == 8192);
+    f32(0); f32(0);
+    f = with_avar(at);
+    check("version 2, nothing to add", mapped(&f, 650.0) == 16384);
+    f.avar.len = f.avar.len - 1;
+    check("its offsets cut", mapped(&f, 650.0) == 8192);
+
+    // Version 2 with a store and no index map: axis i takes row i. One
+    // region, weight up; a delta of +4000 at its peak, then -40000.
+    from[0] = 0.0 - 1.0; to[0] = 0.0 - 1.0;
+    from[1] = 1.0; to[1] = 1.0;
+    at = avar(2, 2);
+    let is i64 as tail = fab_n;
+    f32(0); f32(tail + 8 - at);
+    store_one_region(4000);
+    f = with_avar(at);
+    check("version 2: added", mapped(&f, 650.0) == 8192 + 2000);
+    check("and clamped", mapped(&f, 900.0) == 16384);
+    check("outside its region, nothing", mapped(&f, 250.0) == 0 - 8192 && mapped(&f, 400.0) == 0);
+    put32(store_rows, 0 - 40000);
+    f = with_avar(at);
+    check("32-bit deltas, the other way", mapped(&f, 650.0) == 8192 - 20000);
+    check("clamped there too", mapped(&f, 900.0) == 0 - 16384);
+    // Rounded: a third of 4000 at a third of the way.
+    put32(store_rows, 4001);
+    f = with_avar(at);
+    check("deltas rounded", mapped(&f, 400.0 + 500.0 / 3.0) == 5461 + 1334);
+    // Weighed at the mapped coordinates rounded to 2.14, not cut.
+    check("weighed at 2.14", mapped(&f, 402.0) == 82);
+    // The delta scaled to 16.16 before it is rounded.
+    put32(store_rows, 1);
+    f = with_avar(at);
+    check("a delta of a seventh of a unit, scaled then rounded", mapped(&f, 470.5) == 2311);
+    // An index map at offset 0 is none, even where avar's own header would
+    // read as one: minor version 1, two axes, rows that differ.
+    fvar_len = fvar(2, 12);
+    at = fab_n;
+    f16(2); f16(1); f16(0); f16(2);
+    f16(2); f2(0.0 - 1.0); f2(0.0 - 1.0); f2(1.0); f2(1.0);
+    f16(2); f2(0.0 - 1.0); f2(0.0 - 1.0); f2(1.0); f2(1.0);
+    let is i64 as tail2 = fab_n;
+    f32(0); f32(tail2 + 8 - at);
+    f16(1); f32(12); f16(1); f32(28);
+    f16(2); f16(1); f2(0.0); f2(1.0); f2(1.0); f2(0.0); f2(0.0); f2(0.0);
+    f16(2); f16(1); f16(1); f16(0); f16(1000); f16(3000);
+    f = with_avar(at);
+    let is sfnt.var.Design as d2 with mut = sfnt.var.design(&f);
+    sfnt.var.set(&d2, &f, WGHT, 650.0);
+    let is sfnt.var.Coords as c2 = sfnt.var.coords(&f, &d2);
+    check("no index map: axis i, row i", c2.v[0] == 8192 + 500 && c2.v[1] == 1500);
+}
+
+// An item variation store at fab_n: one region (weight 0..1..1), one set of
+// data with one row whose delta is d, 32-bit when it must be. Where its rows
+// start into store_rows.
+let is i64 as store_rows with mut = 0;
+
+fn store_one_region(d as i64) as void {
+    let is i64 as s = fab_n;
+    f16(1); f32(12); f16(1); f32(22);
+    // Regions: one axis, one region.
+    f16(1); f16(1); f2(0.0); f2(1.0); f2(1.0);
+    // Data: one item, one word column (32 bits: LONG_WORDS), one region.
+    f16(2); f16(0x8001); f16(1); f16(0);
+    store_rows = fab_n;
+    f32(d);
+    f32(0);
+    check("a store laid out", fab_n - s == 38);
+}
+
+// --- The item variation store ---
+
+fn coords2(a as i64, b as i64) as sfnt.var.Coords {
+    let is sfnt.var.Coords as c with mut = sfnt.var.default_coords();
+    c.n = 2;
+    c.v[0] = a;
+    c.v[1] = b;
+    return c;
+}
+
+fn whole(len as i64) as sfnt.table.Table { return table_at(0, len); }
+
+// A store at fab's start: three regions over two axes — weight up (width's
+// peak 0, so width does not count), width up, both up — and two sets of
+// data: the first 16- and 8-bit, three rows over regions 0 and 1; the second
+// 32- and 16-bit, one row over region 2 and a region past the last. Its
+// length; the second data's offset into data1.
+let is i64 as data1 with mut = 0;
+
+fn store_two() as i64 {
+    fab_n = 0;
+    f16(1); f32(16); f16(2); f32(56); f32(75);
+    f16(2); f16(3);
+    f2(0.0); f2(1.0); f2(1.0); f2(0.0); f2(0.0); f2(0.0);
+    f2(0.0); f2(0.0); f2(0.0); f2(0.0); f2(1.0); f2(1.0);
+    f2(0.0); f2(1.0); f2(1.0); f2(0.0); f2(1.0); f2(1.0);
+    check("the first data where its offset says", fab_n == 56);
+    f16(3); f16(1); f16(2); f16(0); f16(1);
+    f16(300); f8(0 - 5);
+    f16(0 - 300); f8(100);
+    f16(0); f8(0 - 128);
+    data1 = fab_n;
+    check("the second data where its offset says", fab_n == 75);
+    f16(1); f16(0x8001); f16(2); f16(2); f16(5);
+    f32(70000); f16(1000);
+    return fab_n;
+}
+
+fn store_cases() as void {
+    current = "item variation store, by hand";
+    // An axis's share of a region, by the specification's rules.
+    check("peak 0: the axis does not count", sfnt.var.axis_scalar(5000, 0, 0, 0) == 1.0);
+    check("start past the peak: does not count", sfnt.var.axis_scalar(5000, 9000, 8000, 16384) == 1.0);
+    check("peak past the end: does not count", sfnt.var.axis_scalar(5000, 0, 9000, 8000) == 1.0);
+    check("across zero: does not count", sfnt.var.axis_scalar(5000, 0 - 100, 8000, 16384) == 1.0);
+    check("at the peak", sfnt.var.axis_scalar(8000, 0, 8000, 16384) == 1.0);
+    check("at the start", sfnt.var.axis_scalar(0, 0, 8000, 16384) == 0.0);
+    check("at the end", sfnt.var.axis_scalar(16384, 0, 8000, 16384) == 0.0);
+    check("before the start", sfnt.var.axis_scalar(0 - 1, 0, 8000, 16384) == 0.0);
+    check("past the end", sfnt.var.axis_scalar(16385, 0, 8000, 16384) == 0.0);
+    check("rising", near(sfnt.var.axis_scalar(4000, 0, 8000, 16384), 0.5) == 1);
+    check("falling", near(sfnt.var.axis_scalar(12192, 0, 8000, 16384), 0.5) == 1);
+    check("on the negative side", near(sfnt.var.axis_scalar(0 - 4000, 0 - 8000, 0 - 8000, 0), 0.5) == 1);
+    check("intermediate", near(sfnt.var.axis_scalar(6000, 4000, 8000, 12000), 0.5) == 1);
+    check("a start below 0, the end at it", near(sfnt.var.axis_scalar(0 - 2000, 0 - 8000, 0 - 4000, 0), 0.5) == 1);
+    // HarfBuzz's order: a coordinate of 0 weighs nothing, even where the
+    // specification would not count the axis.
+    check("0 in a region whose start lies past its peak", sfnt.var.axis_scalar(0, 9000, 8000, 16384) == 0.0);
+    check("0 in a region across zero", sfnt.var.axis_scalar(0, 0 - 100, 8000, 16384) == 0.0);
+    check("0 at a peak of 0", sfnt.var.axis_scalar(0, 0 - 100, 0, 16384) == 1.0);
+    // In single precision, as HarfBuzz weighs.
+    let is f64 as one_third = r32(1.0 / 3.0);
+    check("a third, in single precision", one_third != 1.0 / 3.0 && sfnt.var.axis_scalar(1, 0, 3, 16384) == one_third
+          && sfnt.var.axis_scalar(16383, 0, 16381, 16384) == one_third);
+    // The same rules in double precision, for outlines.
+    check("weight: peak 0", sfnt.var.axis_weight(5000, 0, 0, 0) == 1.0);
+    check("weight: at the peak", sfnt.var.axis_weight(8000, 0, 8000, 16384) == 1.0);
+    check("weight: 0", sfnt.var.axis_weight(0, 0 - 100, 8000, 16384) == 0.0);
+    check("weight: start past the peak", sfnt.var.axis_weight(5000, 9000, 8000, 16384) == 1.0);
+    check("weight: peak past the end", sfnt.var.axis_weight(5000, 0, 9000, 8000) == 1.0);
+    check("weight: across zero", sfnt.var.axis_weight(5000, 0 - 100, 8000, 16384) == 1.0);
+    check("weight: before the start", sfnt.var.axis_weight(0 - 1, 0, 8000, 16384) == 0.0);
+    check("weight: at the start", sfnt.var.axis_weight(100, 100, 8000, 16384) == 0.0);
+    check("weight: at the end", sfnt.var.axis_weight(16384, 0, 8000, 16384) == 0.0);
+    check("weight: past the end", sfnt.var.axis_weight(16385, 0, 8000, 16384) == 0.0);
+    check("weight: rising, in double precision", sfnt.var.axis_weight(1, 0, 3, 16384) == 1.0 / 3.0);
+    check("weight: falling", sfnt.var.axis_weight(16383, 0, 16381, 16384) == 1.0 / 3.0);
+    check("weight: on the negative side", near(sfnt.var.axis_weight(0 - 4000, 0 - 8000, 0 - 8000, 0), 0.5) == 1);
+
+    let is i64 as len = store_two();
+    let is sfnt.table.Face as f with mut = crafted();
+    let is sfnt.var.Store as st with mut = sfnt.var.store(&f, whole(len), 0);
+    let is sfnt.var.Coords as c with mut = coords2(8192, 16384);
+    check("16 and 8 bits", near(sfnt.var.delta(&f, &st, 0, &c), 145.0) == 1);
+    check("the second row", near(sfnt.var.delta(&f, &st, 1, &c), 0.0 - 50.0) == 1);
+    check("-128", near(sfnt.var.delta(&f, &st, 2, &c), 0.0 - 128.0) == 1);
+    check("no fourth row", sfnt.var.delta(&f, &st, 3, &c) == 0.0);
+    check("32 and 16 bits, a region past the last weighing nothing", near(sfnt.var.delta(&f, &st, 65536, &c), 35000.0) == 1);
+    check("no second row there", sfnt.var.delta(&f, &st, 65537, &c) == 0.0);
+    check("no third data", sfnt.var.delta(&f, &st, 131072, &c) == 0.0);
+    check("no region past the last", sfnt.var.region_scalar(&f, &st, 3, &c) == 0.0);
+    check("weights in double precision", near(sfnt.var.region_weight(&f, &st, 2, &c), 0.5) == 1
+          && sfnt.var.region_weight(&f, &st, 1, &c) == 1.0 && sfnt.var.region_weight(&f, &st, 3, &c) == 0.0);
+    let is sfnt.var.Coords as third with mut = coords2(1, 16384);
+    check("a third", sfnt.var.region_weight(&f, &st, 0, &third) == 1.0 / 16384.0
+          && sfnt.var.region_weight(&f, &st, 2, &third) == 1.0 / 16384.0);
+    third.v[0] = 0;
+    check("a weight of 0 is 0", sfnt.var.region_weight(&f, &st, 2, &third) == 0.0);
+    check("data's regions", sfnt.var.data_regions(&f, &st, 0) == 2 && sfnt.var.data_regions(&f, &st, 1) == 2
+          && sfnt.var.data_region(&f, &st, 1, 0) == 2 && sfnt.var.data_region(&f, &st, 1, 1) == 5
+          && sfnt.var.data_region(&f, &st, 0, 1) == 1);
+    check("no data past the last", sfnt.var.data_regions(&f, &st, 2) == 0 - 1 && sfnt.var.data_regions(&f, &st, 0 - 1) == 0 - 1);
+    let is sfnt.var.Store as cut with mut = sfnt.var.store(&f, whole(data1 + 7), 0);
+    check("data whose regions are cut", sfnt.var.data_regions(&f, &cut, 1) == 0 - 1 && sfnt.var.data_regions(&f, &cut, 0) == 2);
+    cut = sfnt.var.store(&f, whole(data1 + 5), 0);
+    check("data whose header is cut", sfnt.var.data_regions(&f, &cut, 1) == 0 - 1);
+    cut = sfnt.var.store(&f, whole(data1 + 9), 0);
+    check("data a byte short of its regions", sfnt.var.data_regions(&f, &cut, 1) == 0 - 1);
+    cut = sfnt.var.store(&f, whole(19), 0);
+    check("weights of a list cut", sfnt.var.region_weight(&f, &cut, 0, &c) == 0.0 && sfnt.var.region_scalar(&f, &cut, 0, &c) == 0.0);
+    cut = sfnt.var.store(&f, whole(55), 0);
+    check("weights of regions cut", sfnt.var.region_weight(&f, &cut, 0, &c) == 0.0 && sfnt.var.region_scalar(&f, &cut, 0, &c) == 0.0);
+    let is sfnt.var.Store as nostore = sfnt.var.no_store(whole(len));
+    check("no store, no weight", sfnt.var.region_weight(&f, &nostore, 0, &c) == 0.0
+          && sfnt.var.region_scalar(&f, &nostore, 0, &c) == 0.0 && sfnt.var.data_regions(&f, &nostore, 0) == 0 - 1);
+    check("a region's share", near(sfnt.var.region_scalar(&f, &st, 2, &c), 0.5) == 1);
+    let is sfnt.var.Coords as one with mut = sfnt.var.default_coords();
+    one.n = 1;
+    one.v[0] = 8192;
+    check("axes past the coordinates are at 0", near(sfnt.var.delta(&f, &st, 0, &one), 150.0) == 1);
+    let is sfnt.var.Coords as none = sfnt.var.default_coords();
+    check("the default instance moves nothing", sfnt.var.delta(&f, &st, 0, &none) == 0.0
+          && sfnt.var.delta(&f, &st, 65536, &none) == 0.0);
+    // A row past the table; more word columns than regions; no store.
+    st = sfnt.var.store(&f, whole(74), 0);
+    check("a set of data cut: none of its rows", sfnt.var.delta(&f, &st, 2, &c) == 0.0 && sfnt.var.delta(&f, &st, 1, &c) == 0.0);
+    put16(58, 3);
+    st = sfnt.var.store(&f, whole(len), 0);
+    check("more word columns than regions", sfnt.var.delta(&f, &st, 0, &c) == 0.0);
+    put16(58, 1);
+    put16(0, 2);
+    st = sfnt.var.store(&f, whole(len), 0);
+    check("a store of format 2", sfnt.var.delta(&f, &st, 0, &c) == 0.0);
+    put16(0, 1);
+    st = sfnt.var.store(&f, whole(7), 0);
+    check("a store cut short", sfnt.var.delta(&f, &st, 0, &c) == 0.0);
+    st = sfnt.var.store(&f, whole(len), 0);
+    check("restored", near(sfnt.var.delta(&f, &st, 0, &c), 145.0) == 1);
+
+    let is sfnt.var.Coords as both with mut = sfnt.var.default_coords();
+    both.n = 1;
+    both.v[0] = 8192;
+    both.v[1] = 16384;
+    check("an axis past the coordinates though the array has a value there",
+          sfnt.var.region_weight(&f, &st, 1, &both) == 0.0 && sfnt.var.region_scalar(&f, &st, 1, &both) == 0.0);
+
+    // A region of two axes weighing a third each, and a row of 7: products
+    // and sums in single precision.
+    fab_n = 0;
+    f16(1); f32(12); f16(1); f32(28);
+    f16(2); f16(1); f16(0); f16(3); f16(16384); f16(0); f16(3); f16(16384);
+    f16(1); f16(1); f16(1); f16(0); f16(7);
+    st = sfnt.var.store(&f, whole(fab_n), 0);
+    let is sfnt.var.Coords as thirds = coords2(1, 1);
+    let is f64 as third1 = r32(1.0 / 3.0);
+    check("a product in single precision", sfnt.var.region_scalar(&f, &st, 0, &thirds) == r32(third1 * third1));
+    check("and in double, for outlines", sfnt.var.region_weight(&f, &st, 0, &thirds) == (1.0 / 3.0) * (1.0 / 3.0));
+    thirds.v[1] = 3;
+    check("a sum in single precision", sfnt.var.delta(&f, &st, 0, &thirds) == r32(third1 * 7.0)
+          && r32(third1 * 7.0) != third1 * 7.0);
+
+    // An offset and a region past their counts, lying where they would be.
+    fab_n = 0;
+    f16(1); f32(16); f16(1); f32(32); f32(42);
+    f16(1); f16(1); f2(0.0); f2(1.0); f2(1.0); f2(0.0); f2(0.5); f2(1.0);
+    f16(1); f16(1); f16(1); f16(0); f16(10);
+    f16(1); f16(1); f16(1); f16(0); f16(20);
+    st = sfnt.var.store(&f, whole(fab_n), 0);
+    let is sfnt.var.Coords as half with mut = sfnt.var.default_coords();
+    half.n = 1;
+    half.v[0] = 8192;
+    check("the data there is", near(sfnt.var.delta(&f, &st, 0, &half), 5.0) == 1);
+    check("not data past the count", sfnt.var.delta(&f, &st, 65536, &half) == 0.0 && sfnt.var.data_regions(&f, &st, 1) == 0 - 1);
+    check("not a region past the count", sfnt.var.region_scalar(&f, &st, 1, &half) == 0.0
+          && sfnt.var.region_weight(&f, &st, 1, &half) == 0.0);
+    // A negative set of data: none, though the bytes before the offsets would
+    // read as one — the region list's offset 0, a count of 1.
+    fab_n = 0;
+    f16(1); f32(0); f16(1); f32(12);
+    f16(1); f16(1); f16(1); f16(0); f16(10);
+    st = sfnt.var.store(&f, whole(fab_n), 0);
+    check("no data before the first", sfnt.var.data_regions(&f, &st, 0 - 1) == 0 - 1);
+    // No store reads nothing, though the bytes around would read as one.
+    fab_n = 0;
+    f8(0); f32(17); f16(1); f32(41);
+    while (fab_n < 16) { f8(0); }
+    f16(1); f16(1); f2(0.0); f2(1.0); f2(1.0);
+    while (fab_n < 40) { f8(0); }
+    f16(1); f16(1); f16(1); f16(0); f16(100);
+    let is sfnt.var.Store as gone = sfnt.var.no_store(whole(fab_n));
+    let is sfnt.var.Coords as full with mut = sfnt.var.default_coords();
+    full.n = 1;
+    full.v[0] = 16384;
+    check("no store: no delta", sfnt.var.delta(&f, &gone, 0, &full) == 0.0);
+    check("no store: no regions", sfnt.var.region_scalar(&f, &gone, 0, &full) == 0.0
+          && sfnt.var.region_weight(&f, &gone, 0, &full) == 0.0 && sfnt.var.data_regions(&f, &gone, 0) == 0 - 1);
+
+    // Delta-set index maps, every width and both formats.
+    current = "DeltaSetIndexMap, by hand";
+    fab_n = 0;
+    f8(0); f8(0x03); f16(2); f8(0x12); f8(0x34);
+    let is sfnt.table.Table as t with mut = whole(fab_n);
+    check("one byte, four inner bits", sfnt.var.map_index(&f, t, 0, 0) == 65536 + 2 && sfnt.var.map_index(&f, t, 0, 1) == 196608 + 4);
+    check("past the count: the last", sfnt.var.map_index(&f, t, 0, 5) == 196608 + 4);
+    t.len = 5;
+    check("entries past the table: as it is", sfnt.var.map_index(&f, t, 0, 1) == 1);
+    t.len = 3;
+    check("a header cut: as it is", sfnt.var.map_index(&f, t, 0, 1) == 1);
+    fab_n = 0;
+    f8(0); f8(0x1F); f16(1); f16(0x0102);
+    check("two bytes, sixteen inner bits", sfnt.var.map_index(&f, whole(fab_n), 0, 0) == 0x0102);
+    fab_n = 0;
+    f8(0); f8(0x27); f16(1); f8(1); f8(2); f8(3);
+    check("three bytes, eight inner bits", sfnt.var.map_index(&f, whole(fab_n), 0, 0) == 0x01020003);
+    fab_n = 0;
+    f8(0); f8(0x3F); f16(1); f32(0x00050006);
+    check("four bytes", sfnt.var.map_index(&f, whole(fab_n), 0, 0) == 0x00050006);
+    fab_n = 0;
+    f8(0); f8(0x30); f16(1); f32(0x00000003);
+    check("one inner bit", sfnt.var.map_index(&f, whole(fab_n), 0, 0) == 65536 + 1);
+    fab_n = 0;
+    f8(0); f8(0x47); f16(1); f8(5);
+    check("an entry width of two bits", sfnt.var.map_index(&f, whole(fab_n), 0, 0) == 5);
+    fab_n = 0;
+    f8(0); f8(0x30); f16(1); f32(0x80000001);
+    check("an outer index past 16 bits, cut as HarfBuzz's 32 bits cut it", sfnt.var.map_index(&f, whole(fab_n), 0, 0) == 1);
+    fab_n = 0;
+    f8(1); f8(0x07); f32(3); f8(7); f8(8); f8(9);
+    check("format 1", sfnt.var.map_index(&f, whole(fab_n), 0, 2) == 9 && sfnt.var.map_index(&f, whole(fab_n), 0, 10) == 9);
+    check("format 1's header cut", sfnt.var.map_index(&f, whole(5), 0, 2) == 2);
+    fab_n = 0;
+    f8(2); f8(0x07); f32(3); f8(7); f8(8); f8(9);
+    check("format 2: as it is", sfnt.var.map_index(&f, whole(fab_n), 0, 2) == 2);
+    fab_n = 0;
+    f8(0); f8(0x07); f16(0);
+    check("no entries: as it is", sfnt.var.map_index(&f, whole(fab_n), 0, 7) == 7);
+}
+
+// A store at fab_n of one region, weight up, five 16-bit rows of 10 to 50.
+fn store_five() as void {
+    f16(1); f32(12); f16(1); f32(22);
+    f16(1); f16(1); f2(0.0); f2(1.0); f2(1.0);
+    f16(5); f16(1); f16(1); f16(0);
+    f16(10); f16(20); f16(30); f16(40); f16(50);
+}
+
+let is i64 as T_AAAA with imut = 0x61616161;
+let is i64 as T_CCCC with imut = 0x63636363;
+let is i64 as T_EEEE with imut = 0x65656565;
+
+// MVAR at fab's start: five records of size bytes, aaaa to eeee, rows 0 to
+// 4 of a store after them. Its length.
+fn mvar(size as i64) as i64 {
+    fab_n = 0;
+    f16(1); f16(0); f16(0); f16(size); f16(5); f16(12 + 5 * size);
+    let is i64 as k with mut = 0;
+    while (k < 5) {
+        let is i64 as start = fab_n;
+        f32(0x61616161 + k * 0x01010101); f16(0); f16(k);
+        while (fab_n < start + size) { f8(0); }
+        k = k + 1;
+    }
+    store_five();
+    return fab_n;
+}
+
+fn metric_of(len as i64, tag as i64) as f64 {
+    let is sfnt.table.Face as f with mut = crafted();
+    f.mvar = table_at(0, len);
+    let is sfnt.var.Coords as c with mut = sfnt.var.default_coords();
+    c.n = 1;
+    c.v[0] = 16384;
+    return sfnt.var.metric(&f, &c, tag);
+}
+
+// HVAR at fab's start: the store, then a map (one byte, eight bits: 4, 0)
+// when mapped. Its length.
+fn hvar(mapped as i32) as i64 {
+    fab_n = 0;
+    f16(1); f16(0); f32(20);
+    if (mapped == 1) { f32(60); } else { f32(0); }
+    f32(0); f32(0);
+    store_five();
+    check("the map where HVAR says", fab_n == 60);
+    f8(0); f8(0x07); f16(2); f8(4); f8(0);
+    return fab_n;
+}
+
+fn advance_of(len as i64, gid as i64) as f64 {
+    let is sfnt.table.Face as f with mut = crafted();
+    f.hvar = table_at(0, len);
+    let is sfnt.var.Coords as c with mut = sfnt.var.default_coords();
+    c.n = 1;
+    c.v[0] = 16384;
+    return sfnt.var.advance_delta(&f, &c, gid);
+}
+
+fn mvar_hvar_cases() as void {
+    current = "MVAR, by hand";
+    let is i64 as len with mut = mvar(8);
+    check("the first record", near(metric_of(len, T_AAAA), 10.0) == 1);
+    check("the middle", near(metric_of(len, T_CCCC), 30.0) == 1);
+    check("the last", near(metric_of(len, T_EEEE), 50.0) == 1);
+    check("the others", near(metric_of(len, 0x62626262), 20.0) == 1 && near(metric_of(len, 0x64646464), 40.0) == 1);
+    check("a tag between", metric_of(len, 0x61626364) == 0.0);
+    check("a tag before the first", metric_of(len, 0x30303030) == 0.0);
+    check("a tag after the last", metric_of(len, 0x7A7A7A7A) == 0.0);
+    len = mvar(12);
+    check("records of 12 bytes", near(metric_of(len, T_CCCC), 30.0) == 1 && near(metric_of(len, T_EEEE), 50.0) == 1);
+    len = mvar(6);
+    check("records of 6 bytes", metric_of(len, T_AAAA) == 0.0);
+    len = mvar(7);
+    check("records of 7 bytes", metric_of(len, T_AAAA) == 0.0 && metric_of(len, T_CCCC) == 0.0);
+    len = mvar(8);
+    put16(0, 2);
+    check("MVAR version 2", metric_of(len, T_AAAA) == 0.0);
+    put16(0, 1);
+    check("records cut", metric_of(12 + 4 * 8 + 7, T_EEEE) == 0.0);
+    put16(10, 0);
+    check("no store", metric_of(len, T_AAAA) == 0.0);
+    put16(10, 52);
+    check("a header cut", metric_of(11, T_AAAA) == 0.0);
+    let is sfnt.table.Face as f with mut = crafted();
+    f.mvar = table_at(0, len);
+    let is sfnt.var.Coords as none = sfnt.var.default_coords();
+    check("at the default instance, nothing", sfnt.var.metric(&f, &none, T_AAAA) == 0.0);
+
+    current = "HVAR, by hand";
+    len = hvar(0);
+    check("glyph by glyph", near(advance_of(len, 2), 30.0) == 1 && near(advance_of(len, 0), 10.0) == 1);
+    check("a glyph past the rows", advance_of(len, 7) == 0.0);
+    // No map, even where HVAR's own header would read as one: minor version 1.
+    put16(2, 1);
+    check("no map at offset 0", near(advance_of(len, 2), 30.0) == 1);
+    put16(2, 0);
+    len = hvar(1);
+    check("mapped", near(advance_of(len, 0), 50.0) == 1 && near(advance_of(len, 1), 10.0) == 1);
+    check("mapped past the map: its last", near(advance_of(len, 9), 10.0) == 1);
+    f = crafted();
+    f.hvar = table_at(0, len);
+    check("HVAR there", sfnt.var.has_hvar(&f) == 1);
+    put16(0, 2);
+    check("HVAR version 2", advance_of(len, 0) == 0.0 && sfnt.var.has_hvar(&f) == 0);
+    put16(0, 1);
+    f.hvar.len = 19;
+    check("a header cut", advance_of(19, 0) == 0.0 && sfnt.var.has_hvar(&f) == 0);
+    f = crafted();
+    check("no HVAR", sfnt.var.has_hvar(&f) == 0 && sfnt.var.advance_delta(&f, &none, 0) == 0.0);
+}
+
+// --- Line metrics at an instance, from each source ---
+
+let is *u8 as copy with mut;
+let is i64 as copy_size with mut = 0;
+
+fn wb16(at as i64, v as i64) as void {
+    *cast(*u8, cast(i64, copy) + at) = cast(u8, (v >> 8) & 255);
+    *cast(*u8, cast(i64, copy) + at + 1) = cast(u8, v & 255);
+}
+
+fn metrics_cases() as void {
+    current = "metrics at an instance";
+    let is *u8 as data = load("text/testdata/var.ttf");
+    copy_size = loaded;
+    copy = mem.core.mmap_anon(copy_size + 16);
+    mem.memcpy(copy, data, copy_size);
+    let is sfnt.table.Face as f with mut = sfnt.open(copy, copy_size, 0);
+    let is sfnt.var.Design as d with mut = sfnt.var.design(&f);
+    sfnt.var.set(&d, &f, WGHT, 650.0);
+    sfnt.var.set(&d, &f, WDTH, 110.0);
+    let is sfnt.var.Coords as c = sfnt.var.coords(&f, &d);
+    let is sfnt.head.Metrics as base with mut = sfnt.head.metrics(&f);
+    let is sfnt.head.Metrics as m with mut = sfnt.var.metrics(&f, &c);
+    check("hhea's, moved", base.source == sfnt.head.LINES_HHEA
+          && m.ascender == base.ascender + rnd(sfnt.var.metric(&f, &c, 0x68617363))
+          && m.descender == base.descender + rnd(sfnt.var.metric(&f, &c, 0x68647363))
+          && m.line_gap == base.line_gap + rnd(sfnt.var.metric(&f, &c, 0x686C6770)));
+    check("moved by a fraction", rnd(sfnt.var.metric(&f, &c, 0x686C6770)) != 0);
+    check("heights, lines", m.x_height == base.x_height + rnd(sfnt.var.metric(&f, &c, 0x78686774))
+          && m.cap_height == base.cap_height + rnd(sfnt.var.metric(&f, &c, 0x63706874))
+          && m.underline_pos == base.underline_pos + rnd(sfnt.var.metric(&f, &c, 0x756E646F))
+          && m.underline_thickness == base.underline_thickness + rnd(sfnt.var.metric(&f, &c, 0x756E6473))
+          && m.strike_pos == base.strike_pos + rnd(sfnt.var.metric(&f, &c, 0x7374726F))
+          && m.strike_size == base.strike_size + rnd(sfnt.var.metric(&f, &c, 0x73747273)));
+    check("and the rest as they were", m.upem == base.upem && m.weight == base.weight && m.italic == base.italic
+          && m.source == base.source);
+    let is sfnt.var.Coords as none = sfnt.var.default_coords();
+    m = sfnt.var.metrics(&f, &none);
+    check("the default instance", m.ascender == base.ascender && m.strike_size == base.strike_size);
+    // OS/2's typographic values, asked for.
+    let is i64 as sel = f.os2.off + 62;
+    wb16(sel, 128);
+    f = sfnt.open(copy, copy_size, 0);
+    base = sfnt.head.metrics(&f);
+    m = sfnt.var.metrics(&f, &c);
+    check("typographic, moved", base.source == sfnt.head.LINES_TYPO
+          && m.ascender == base.ascender + rnd(sfnt.var.metric(&f, &c, 0x68617363))
+          && m.descender == base.descender + rnd(sfnt.var.metric(&f, &c, 0x68647363))
+          && m.line_gap == base.line_gap + rnd(sfnt.var.metric(&f, &c, 0x686C6770)));
+    // Neither saying anything: the Windows ones, moved by their own tags.
+    wb16(sel, 0);
+    wb16(f.hhea.off + 4, 0);
+    wb16(f.hhea.off + 6, 0);
+    wb16(f.os2.off + 68, 0);
+    wb16(f.os2.off + 70, 0);
+    f = sfnt.open(copy, copy_size, 0);
+    base = sfnt.head.metrics(&f);
+    m = sfnt.var.metrics(&f, &c);
+    check("Windows', moved", base.source == sfnt.head.LINES_WIN
+          && m.ascender == base.ascender + rnd(sfnt.var.metric(&f, &c, 0x68636C61))
+          && m.descender == base.descender - rnd(sfnt.var.metric(&f, &c, 0x68636C64))
+          && m.line_gap == 0);
+    check("which move", rnd(sfnt.var.metric(&f, &c, 0x68636C61)) != 0 && rnd(sfnt.var.metric(&f, &c, 0x68636C64)) != 0);
+}
+
+fn main() as i32 {
+    var_font("text/testdata/vf.ttf", "text/testdata/vf.ttf.var.ref");
+    var_font("text/testdata/cff2.otf", "text/testdata/cff2.otf.var.ref");
+    var_font("text/testdata/var.ttf", "text/testdata/var.ttf.var.ref");
+    var_font("text/testdata/var.otf", "text/testdata/var.otf.var.ref");
+    fvar_cases();
+    avar_cases();
+    store_cases();
+    mvar_hvar_cases();
+    metrics_cases();
+
+    if (fails > 0) {
+        io.printf("var: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("var: all checks passed\n");
+    return 0;
+}

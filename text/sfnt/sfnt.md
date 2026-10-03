@@ -13,7 +13,7 @@ sfnt/
   name.cst     family, style, and identifying a face
   hmtx.cst     advances and side bearings
   woff.cst     WOFF and WOFF2 wrappers
-  var.cst      variable fonts: fvar, avar, HVAR
+  var.cst      variable fonts: fvar, avar, the variation store, HVAR, MVAR
 ```
 
 ---
@@ -74,6 +74,52 @@ rendered at its default instance looks correct**, so it is safe to ignore
 initially and support later without anything looking broken in the meantime. That
 is unusual and worth taking advantage of.
 
+### Coordinates, as HarfBuzz computes them
+
+An instance is chosen in the axes' own units — weight 650, optical size 20 — and
+everything downstream works in **normalized coordinates**: -1 at an axis's
+minimum, 0 at its default, +1 at its maximum. `var.cst` gets from one to the other
+exactly as HarfBuzz 14 does — in single precision, as it does — so a glyph here is
+the glyph every HarfBuzz-based program draws:
+
+1. the value clamped to the axis's range and scaled to -1..+1 on its side of the
+   default, rounded to 16.16 fixed point;
+2. `avar`'s segment maps, interpolated in single precision — with HarfBuzz's
+   answers for maps the specification does not allow: several pairs from one
+   value, doubled ends, values outside every pair;
+3. `avar` version 2's deltas, weighed at the coordinates step 2 gave rounded to
+   2.14, added and clamped;
+4. rounded to 2.14 — an integer in -16384..16384, halves rounded up.
+
+Nothing after that sees an axis's own units again. The reference tool records
+HarfBuzz's own coordinates for each test instance, and `var_test` must match them
+exactly.
+
+### One variation store, four readers
+
+`HVAR` (advance widths), `MVAR` (ascender, x-height, underline and the rest),
+`avar` 2 and `CFF2`'s `blend` all store their deltas the same way: an **item
+variation store** — regions of the design space, and rows of deltas weighed by
+how far the coordinates are into each region. `var.cst` reads it once for all
+four, weighing regions as HarfBuzz does and summing in single precision; where
+HarfBuzz departs from the specification — a coordinate of 0 weighs nothing even
+in a region the specification would ignore — this follows HarfBuzz.
+
+Deltas come back unrounded; where HarfBuzz rounds — an advance width, a line
+metric — the caller does, so the layout can keep the fraction when it wants it.
+
+### Optical size
+
+A font with an `opsz` axis has shapes drawn for each size — thinner hairlines
+and tighter spacing large, sturdier and looser small. Left unset, `opsz` follows
+the text's size **in CSS pixels**, as `font-optical-sizing: auto` does in every
+browser; a program that sets it explicitly keeps its value.
+
+### Bounds
+
+At most 64 axes — the most any shipping font has is in the teens. A font with
+more is read at its default instance, which, as above, looks right.
+
 ---
 
 ## Current state
@@ -91,6 +137,17 @@ then reads fonts cut at every length and with their counts corrupted, laid
 against an unreadable page so a read one byte too far faults. Mutation-tested:
 every mutant killed, the checks no test could tell apart removed.
 
+`var.cst` reads variable fonts: `fvar`'s axes and named instances, an instance
+chosen by axis values or by name, `opsz` from the text's size, HarfBuzz's
+coordinates for it (`avar` versions 1 and 2), the item variation store and
+its delta-set index maps, `HVAR`'s advance deltas and `MVAR`'s line metrics.
+`var_test` holds the four variable fonts of the test data to HarfBuzz at chosen
+instances — every coordinate exactly, every advance and `MVAR` delta as
+HarfBuzz rounds it — then `fvar`, `avar` and the stores written by hand: every
+special case of HarfBuzz's segment maps, inputs where single and double
+precision part, every form of index map, offsets and counts past their tables.
+Mutation-tested as the rest.
+
 ## Order of work
 
 First of the layer — nothing else can start without a table directory and a
@@ -100,4 +157,6 @@ First of the layer — nothing else can start without a table directory and a
 2. **`cmap` formats 4 and 12**, which is every font that matters.
 3. **`name`**, so faces can be enumerated and chosen.
 4. **WOFF/WOFF2**, once Brotli is wired up from caustic-compact.
-5. **Variable font axes**, when a design calls for one.
+5. **Variable font axes**, when a design calls for one. Done, with the
+   variation store's readers — the outlines' deltas are in
+   [`../outline`](../outline/outline.md).

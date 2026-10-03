@@ -1,5 +1,5 @@
 // text/outline/glyf.cst — TrueType outlines: points on and off the curve,
-// and composites made of other glyphs.
+// composites made of other glyphs, and gvar's variations of both.
 //
 // A glyph is first expanded into points — a composite's components loaded,
 // one after another, each moved and scaled into place — and only then drawn,
@@ -16,7 +16,22 @@
 // themselves, or fan out, fails the glyph rather than looping. A component's
 // offset is applied after its scale unless it asks otherwise
 // (SCALED_COMPONENT_OFFSET), as on Windows and in fontTools.
+//
+// Every glyph has four phantom points after its own: the ends of its left
+// side bearing and of its advance, and two for vertical text. The glyph is
+// drawn with the first at the origin, as FreeType and HarfBuzz draw it. At a
+// variable font's instance, gvar's deltas move the points — a composite's
+// points being its components' offsets — and the phantom points with them,
+// as HarfBuzz moves them: each tuple of deltas weighed by how far the
+// coordinates are into its region, the points a tuple does not name moved by
+// interpolation along their contour (IUP), a composite's components varied
+// each as a glyph of its own, and a component marked USE_MY_METRICS giving
+// the composite its phantom points. Variation data that cannot be read from
+// its start leaves the glyph as it is, as in HarfBuzz; a tuple that cannot be
+// read fails it.
 use "../sfnt/table.cst" as table;
+use "../sfnt/hmtx.cst" as hmtx;
+use "../sfnt/var.cst" as var;
 use "path.cst" as path;
 use "std/mem.cst" as mem;
 
@@ -38,13 +53,33 @@ let is i64 as HAVE_SCALE     with imut = 8;
 let is i64 as MORE           with imut = 32;
 let is i64 as HAVE_XY_SCALE  with imut = 64;
 let is i64 as HAVE_2X2       with imut = 128;
+let is i64 as USE_MY_METRICS with imut = 512;
 let is i64 as SCALED_OFFSET  with imut = 2048;
 let is i64 as UNSCALED_OFFSET with imut = 4096;
+
+// gvar's flags.
+let is i64 as SHARED_POINTS    with imut = 32768;   // in a glyph's tuple count
+let is i64 as EMBEDDED_PEAK    with imut = 32768;   // in a tuple's index
+let is i64 as INTERMEDIATE     with imut = 16384;
+let is i64 as PRIVATE_POINTS   with imut = 8192;
+
+// The four phantom points: left and right side bearings' ends, top, bottom.
+struct Phantoms {
+    x as [4]f64;
+    y as [4]f64;
+}
 
 // The expanded points of one glyph: coordinates, on-curve flags and where
 // each contour ends. Sized once; a glyph that does not fit fails. Every
 // contour has a point of its own, so room for the points is room for the
 // contours.
+//
+// For variations, per point (and four phantoms): the deltas summed over the
+// tuples, a tuple's own and which points it names; point numbers as a tuple
+// lists them, shared and its own, and their deltas in that order — as many as
+// there is room for points, which is more than a tuple can list when the
+// points are as many as the reader's; and each composite's offsets' deltas, at
+// its components' places in the glyph's count of them.
 struct Points {
     block      as *u8;
     bytes      as i64;
@@ -56,21 +91,48 @@ struct Points {
     n          as i64;
     nc         as i64;
     components as i64;   // loaded so far for the glyph being expanded
+    accx       as *f64;
+    accy       as *f64;
+    tx         as *f64;
+    ty         as *f64;
+    touched    as *u8;
+    shared     as *i64;
+    own        as *i64;
+    lx         as *f64;
+    ly         as *f64;
+    nshared    as i64;
+    cdx        as *f64;
+    cdy        as *f64;
 }
 
 fn points_open(cap as i64) as Points {
     let is Points as s;
+    let is i64 as w = cap + 4;
     s.cap = cap;
-    s.bytes = cap * 25;
+    s.bytes = cap * 25 + w * 65 + MAX_COMPONENTS * 16;
     s.block = mem.core.mmap_anon(s.bytes);
-    s.xs = cast(*f64, s.block);
-    s.ys = cast(*f64, cast(i64, s.block) + cap * 8);
-    s.on = cast(*u8, cast(i64, s.block) + cap * 16);
-    s.ends = cast(*i64, cast(i64, s.block) + cap * 17);
+    let is i64 as b = cast(i64, s.block);
+    s.xs = cast(*f64, b);
+    s.ys = cast(*f64, b + cap * 8);
+    s.on = cast(*u8, b + cap * 16);
+    s.ends = cast(*i64, b + cap * 17);
+    let is i64 as v = b + cap * 25;
+    s.accx = cast(*f64, v);
+    s.accy = cast(*f64, v + w * 8);
+    s.tx = cast(*f64, v + w * 16);
+    s.ty = cast(*f64, v + w * 24);
+    s.shared = cast(*i64, v + w * 32);
+    s.own = cast(*i64, v + w * 40);
+    s.lx = cast(*f64, v + w * 48);
+    s.ly = cast(*f64, v + w * 56);
+    s.touched = cast(*u8, v + w * 64);
+    s.cdx = cast(*f64, v + w * 65);
+    s.cdy = cast(*f64, v + w * 65 + MAX_COMPONENTS * 8);
     s.n = 0;
     s.nc = 0;
     s.components = 0;
-    if (cast(i64, s.block) == 0) { s.cap = 0; }
+    s.nshared = 0;
+    if (b == 0) { s.cap = 0; }
     return s;
 }
 
@@ -88,6 +150,13 @@ fn _set(s as *Points, i as i64, x as f64, y as f64) as void {
     *cast(*f64, cast(i64, s.ys) + i * 8) = y;
 }
 fn _end(s as *Points, i as i64) as i64 { return *cast(*i64, cast(i64, s.ends) + i * 8); }
+
+fn _get(a as *f64, i as i64) as f64 { return *cast(*f64, cast(i64, a) + i * 8); }
+fn _put(a as *f64, i as i64, v as f64) as void { *cast(*f64, cast(i64, a) + i * 8) = v; }
+fn _geti(a as *i64, i as i64) as i64 { return *cast(*i64, cast(i64, a) + i * 8); }
+fn _puti(a as *i64, i as i64, v as i64) as void { *cast(*i64, cast(i64, a) + i * 8) = v; }
+fn _touched(s as *Points, i as i64) as i64 { return cast(i64, *cast(*u8, cast(i64, s.touched) + i)); }
+fn _touch(s as *Points, i as i64, v as i64) as void { *cast(*u8, cast(i64, s.touched) + i) = cast(u8, v); }
 
 // Where glyph gid's data starts in the file, its length into len; -1 for a
 // glyph past the face's last or one whose loca entries are out of order or
@@ -111,21 +180,62 @@ fn extent(f as *table.Face, gid as i64, len as *i64) as i64 {
     return f.glyf.off + a;
 }
 
-// Appends glyph gid's points to s. 1, or 0 for a glyph that is malformed,
-// too deep or does not fit.
-fn _load(f as *table.Face, s as *Points, gid as i64, depth as i64) as i32 {
+fn _varied(c as *var.Coords) as i32 {
+    if (var.is_default(c) == 1) { return 0; }
+    return 1;
+}
+
+// Appends glyph gid's points to s, its phantom points into ph. 1, or 0 for
+// a glyph that is malformed, too deep or does not fit.
+fn _load(f as *table.Face, s as *Points, gid as i64, depth as i64, c as *var.Coords, ph as *Phantoms) as i32 {
     if (depth > MAX_DEPTH) { return 0; }
     let is i64 as len with mut = 0;
     let is i64 as g = extent(f, gid, &len);
     if (g < 0) { return 0; }
-    if (len == 0) { return 1; }
+    // An empty glyph's xMin is 0.
+    let is i64 as xmin with mut = 0;
+    if (len > 0) {
+        if (len < 10) { return 0; }
+        xmin = table.i16_at(f, g + 2);
+    }
+    let is f64 as left = cast(f64, xmin - hmtx.lsb(f, gid));
+    ph.x[0] = left;
+    ph.x[1] = left + cast(f64, hmtx.advance(f, gid));
+    ph.x[2] = 0.0;
+    ph.x[3] = 0.0;
+    ph.y[0] = 0.0;
+    ph.y[1] = 0.0;
+    ph.y[2] = 0.0;
+    ph.y[3] = 0.0;
     let is table.Table as t;
     t.off = g;
     t.len = len;
-    if (table.inside(t, g, 10) == 0) { return 0; }
-    let is i64 as nc = table.i16_at(f, g);
-    if (nc >= 0) { return _simple(f, s, t, nc); }
-    return _composite(f, s, t, depth);
+    let is i64 as nc with mut = 0;
+    if (len > 0) { nc = table.i16_at(f, g); }
+    if (nc < 0) { return _composite(f, s, t, gid, depth, c, ph); }
+    let is i64 as base = s.n;
+    let is i64 as nc0 = s.nc;
+    if (len > 0 && _simple(f, s, t, nc) == 0) { return 0; }
+    if (_varied(c) == 0) { return 1; }
+    let is i64 as n = s.n - base;
+    if (_deltas(f, s, gid, c, base, n, nc0, s.nc - nc0) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        _set(s, base + i, _px(s, base + i) + _get(s.accx, i), _py(s, base + i) + _get(s.accy, i));
+        i = i + 1;
+    }
+    _phantoms(s, n, ph);
+    return 1;
+}
+
+// The phantom points moved by the deltas after the glyph's n points.
+fn _phantoms(s as *Points, n as i64, ph as *Phantoms) as void {
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        ph.x[k] = ph.x[k] + _get(s.accx, n + k);
+        ph.y[k] = ph.y[k] + _get(s.accy, n + k);
+        k = k + 1;
+    }
 }
 
 fn _simple(f as *table.Face, s as *Points, t as table.Table, nc as i64) as i32 {
@@ -212,40 +322,81 @@ fn _simple(f as *table.Face, s as *Points, t as table.Table, nc as i64) as i32 {
 
 fn _f2dot14(f as *table.Face, at as i64) as f64 { return cast(f64, table.i16_at(f, at)) / 16384.0; }
 
-fn _composite(f as *table.Face, s as *Points, t as table.Table, depth as i64) as i32 {
-    let is i64 as start = s.n;
+// A component record's size, from its flags: flags, glyph, two arguments of
+// a byte or a word each, and a scale of none, one, two or four numbers.
+fn _record(fl as i64) as i64 {
+    let is i64 as n with mut = 6;
+    if ((fl & ARG_WORDS) != 0) { n = n + 2; }
+    if ((fl & HAVE_SCALE) != 0) { n = n + 2; }
+    else if ((fl & HAVE_XY_SCALE) != 0) { n = n + 4; }
+    else if ((fl & HAVE_2X2) != 0) { n = n + 8; }
+    return n;
+}
+
+// How many components the composite in t has; -1 when its records run past
+// it. Every record is then known to lie within it.
+fn _count(f as *table.Face, t as table.Table) as i64 {
     let is i64 as at with mut = t.off + 10;
+    let is i64 as k with mut = 0;
     let is i64 as more with mut = MORE;
     while (more != 0) {
-        if (table.inside(t, at, 4) == 0) { return 0; }
+        let is i64 as fl = table.u16_at(f, at);
+        if (table.inside(t, at, _record(fl)) == 0) { return 0 - 1; }
+        at = at + _record(fl);
+        k = k + 1;
+        more = fl & MORE;
+    }
+    return k;
+}
+
+// The composite's components are counted into the glyph's before any is
+// loaded — the glyph fails as soon as it has too many — and their offsets'
+// deltas kept at their places in that count while they are.
+fn _composite(f as *table.Face, s as *Points, t as table.Table, gid as i64, depth as i64,
+              c as *var.Coords, ph as *Phantoms) as i32 {
+    let is i64 as k = _count(f, t);
+    if (k < 0) { return 0; }
+    let is i64 as slot = s.components;
+    s.components = slot + k;
+    if (s.components > MAX_COMPONENTS) { return 0; }
+    let is i32 as varied = _varied(c);
+    if (varied == 1) {
+        if (_deltas(f, s, gid, c, 0 - 1, k, 0, 0) == 0) { return 0; }
+        let is i64 as i with mut = 0;
+        while (i < k) {
+            _put(s.cdx, slot + i, _get(s.accx, i));
+            _put(s.cdy, slot + i, _get(s.accy, i));
+            i = i + 1;
+        }
+        _phantoms(s, k, ph);
+    }
+    let is i64 as start = s.n;
+    let is i64 as at with mut = t.off + 10;
+    let is i64 as ci with mut = 0;
+    while (ci < k) {
         let is i64 as fl = table.u16_at(f, at);
         let is i64 as comp = table.u16_at(f, at + 2);
-        at = at + 4;
-        s.components = s.components + 1;
-        if (s.components > MAX_COMPONENTS) { return 0; }
         let is i64 as a1 with mut = 0;
         let is i64 as a2 with mut = 0;
         let is i32 as xy with mut = 0;
         if ((fl & ARGS_XY) != 0) { xy = 1; }
+        let is i64 as sc with mut = at + 6;
         if ((fl & ARG_WORDS) != 0) {
-            if (table.inside(t, at, 4) == 0) { return 0; }
             if (xy == 1) {
-                a1 = table.i16_at(f, at);
-                a2 = table.i16_at(f, at + 2);
+                a1 = table.i16_at(f, at + 4);
+                a2 = table.i16_at(f, at + 6);
             } else {
-                a1 = table.u16_at(f, at);
-                a2 = table.u16_at(f, at + 2);
+                a1 = table.u16_at(f, at + 4);
+                a2 = table.u16_at(f, at + 6);
             }
-            at = at + 4;
+            sc = at + 8;
         } else {
-            if (table.inside(t, at, 2) == 0) { return 0; }
-            a1 = table.u8_at(f, at);
-            a2 = table.u8_at(f, at + 1);
+            a1 = table.u8_at(f, at + 4);
+            a2 = table.u8_at(f, at + 5);
             if (xy == 1) {
                 if (a1 >= 128) { a1 = a1 - 256; }
                 if (a2 >= 128) { a2 = a2 - 256; }
             }
-            at = at + 2;
         }
         let is f64 as xx with mut = 1.0;
         let is f64 as xy_ with mut = 0.0;
@@ -253,34 +404,35 @@ fn _composite(f as *table.Face, s as *Points, t as table.Table, depth as i64) as
         let is f64 as yy with mut = 1.0;
         let is i32 as scaled with mut = 0;
         if ((fl & HAVE_SCALE) != 0) {
-            if (table.inside(t, at, 2) == 0) { return 0; }
-            xx = _f2dot14(f, at);
+            xx = _f2dot14(f, sc);
             yy = xx;
-            at = at + 2;
             scaled = 1;
         } else if ((fl & HAVE_XY_SCALE) != 0) {
-            if (table.inside(t, at, 4) == 0) { return 0; }
-            xx = _f2dot14(f, at);
-            yy = _f2dot14(f, at + 2);
-            at = at + 4;
+            xx = _f2dot14(f, sc);
+            yy = _f2dot14(f, sc + 2);
             scaled = 1;
         } else if ((fl & HAVE_2X2) != 0) {
-            if (table.inside(t, at, 8) == 0) { return 0; }
-            xx = _f2dot14(f, at);
-            xy_ = _f2dot14(f, at + 2);
-            yx = _f2dot14(f, at + 4);
-            yy = _f2dot14(f, at + 6);
-            at = at + 8;
+            xx = _f2dot14(f, sc);
+            xy_ = _f2dot14(f, sc + 2);
+            yx = _f2dot14(f, sc + 4);
+            yy = _f2dot14(f, sc + 6);
             scaled = 1;
         }
+        at = at + _record(fl);
         let is i64 as from = s.n;
-        if (_load(f, s, comp, depth + 1) == 0) { return 0; }
+        let is Phantoms as cph;
+        if (_load(f, s, comp, depth + 1, c, &cph) == 0) { return 0; }
+        if ((fl & USE_MY_METRICS) != 0) { *ph = cph; }
         let is f64 as dx with mut = cast(f64, a1);
         let is f64 as dy with mut = cast(f64, a2);
+        if (varied == 1) {
+            dx = dx + _get(s.cdx, slot + ci);
+            dy = dy + _get(s.cdy, slot + ci);
+        }
         if (xy == 0) {
             // Matched points: a1 is one of the composite's points so far,
             // a2 one of this component's, which is moved onto it after its
-            // own transform.
+            // own transform — whatever deltas its offset has.
             if (a1 >= from - start || a2 >= s.n - from) { return 0; }
             if (scaled == 1) { _transform(s, from, xx, xy_, yx, yy); }
             dx = _px(s, start + a1) - _px(s, from + a2);
@@ -295,7 +447,7 @@ fn _composite(f as *table.Face, s as *Points, t as table.Table, depth as i64) as
             _transform(s, from, xx, xy_, yx, yy);
             _translate(s, from, dx, dy);
         }
-        more = fl & MORE;
+        ci = ci + 1;
     }
     return 1;
 }
@@ -318,6 +470,314 @@ fn _transform(s as *Points, from as i64, xx as f64, xy as f64, yx as f64, yy as 
         _set(s, i, x * xx + y * yx, x * xy + y * yy);
         i = i + 1;
     }
+}
+
+// --- gvar ---
+
+// A tuple's weight at the coordinates, as HarfBuzz weighs it: peaks embedded
+// or shared, an intermediate region or the span between 0 and the peak; an
+// axis whose peak is 0 does not count, a coordinate of 0 weighs nothing, and
+// an intermediate region the specification calls invalid does not count.
+fn _tuple(f as *table.Face, hdr as i64, axes as i64, c as *var.Coords, shared_at as i64, shared_n as i64) as f64 {
+    let is i64 as index = table.u16_at(f, hdr + 2);
+    let is i64 as peaks with mut = hdr + 4;
+    let is i64 as at with mut = hdr + 4;
+    if ((index & EMBEDDED_PEAK) != 0) {
+        at = at + axes * 2;
+    } else {
+        if ((index & 4095) >= shared_n) { return 0.0; }
+        peaks = shared_at + (index & 4095) * axes * 2;
+    }
+    let is f64 as scalar with mut = 1.0;
+    let is i64 as i with mut = 0;
+    while (i < axes) {
+        let is i64 as peak = table.i16_at(f, peaks + i * 2);
+        let is i64 as v with mut = 0;
+        if (i < c.n) { v = c.v[i]; }
+        // At the peak, or with none, the axis weighs 1; v is not the peak below.
+        if (peak != 0 && v != peak) {
+            if (v == 0) { return 0.0; }
+            if ((index & INTERMEDIATE) != 0) {
+                let is i64 as lo = table.i16_at(f, at + i * 2);
+                let is i64 as hi = table.i16_at(f, at + axes * 2 + i * 2);
+                if (lo <= peak && peak <= hi && (lo >= 0 || hi <= 0)) {
+                    if (v < lo || v > hi) { return 0.0; }
+                    if (v < peak) { scalar = scalar * cast(f64, v - lo) / cast(f64, peak - lo); }
+                    else { scalar = scalar * cast(f64, hi - v) / cast(f64, hi - peak); }
+                }
+            } else {
+                // Between 0 and the peak.
+                let is i64 as lo with mut = 0;
+                let is i64 as hi with mut = 0;
+                if (peak < 0) { lo = peak; } else { hi = peak; }
+                if (v < lo || v > hi) { return 0.0; }
+                scalar = scalar * cast(f64, v) / cast(f64, peak);
+            }
+        }
+        i = i + 1;
+    }
+    return scalar;
+}
+
+// Packed point numbers at *p, before end, into list, which has room for
+// room of them; a longer list does not fit. How many, 0 meaning every point,
+// or -1 when they are malformed or do not fit. Each run's control byte is
+// read unchecked: past end, the run after it is too.
+fn _point_numbers(f as *table.Face, p as *i64, end as i64, list as *i64, room as i64) as i64 {
+    let is i64 as at with mut = *p;
+    if (at + 1 > end) { return 0 - 1; }
+    let is i64 as count with mut = table.u8_at(f, at);
+    at = at + 1;
+    if ((count & 128) != 0) {
+        if (at + 1 > end) { return 0 - 1; }
+        count = ((count & 127) << 8) | table.u8_at(f, at);
+        at = at + 1;
+    }
+    if (count > room) { return 0 - 1; }
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is i64 as control = table.u8_at(f, at);
+        at = at + 1;
+        let is i64 as stop = i + (control & 127) + 1;
+        if (stop > count) { return 0 - 1; }
+        if ((control & 128) != 0) {
+            if (at + (stop - i) * 2 > end) { return 0 - 1; }
+            while (i < stop) {
+                n = n + table.u16_at(f, at);
+                _puti(list, i, n);
+                at = at + 2;
+                i = i + 1;
+            }
+        } else {
+            if (at + (stop - i) > end) { return 0 - 1; }
+            while (i < stop) {
+                n = n + table.u8_at(f, at);
+                _puti(list, i, n);
+                at = at + 1;
+                i = i + 1;
+            }
+        }
+    }
+    *p = at;
+    return count;
+}
+
+// count packed deltas at *p, before end, into out; 0 when they are malformed.
+// A run's control byte is read unchecked, as a point run's is.
+fn _packed(f as *table.Face, p as *i64, end as i64, out as *f64, count as i64) as i32 {
+    let is i64 as at with mut = *p;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is i64 as control = table.u8_at(f, at);
+        at = at + 1;
+        let is i64 as stop = i + (control & 63) + 1;
+        if (stop > count) { return 0; }
+        let is i64 as kind = control & 192;
+        // Zeros, bytes, 16-bit words or 32-bit longs.
+        let is i64 as w with mut = 1;
+        if (kind == 128) { w = 0; }
+        if (kind == 64) { w = 2; }
+        if (kind == 192) { w = 4; }
+        if (at + (stop - i) * w > end) { return 0; }
+        while (i < stop) {
+            let is i64 as v with mut = 0;
+            if (w == 1) {
+                v = table.u8_at(f, at);
+                if (v >= 128) { v = v - 256; }
+            } else if (w == 2) {
+                v = table.i16_at(f, at);
+            } else if (w == 4) {
+                v = table.i32_at(f, at);
+            }
+            _put(out, i, cast(f64, v));
+            at = at + w;
+            i = i + 1;
+        }
+    }
+    *p = at;
+    return 1;
+}
+
+fn _min(a as f64, b as f64) as f64 { if (a > b) { return b; } return a; }
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+// An untouched point's delta, from the touched points before and after it
+// along its contour: theirs when they agree on where they are, the nearer's
+// when it lies outside them, interpolated between them otherwise — HarfBuzz's
+// comparisons, though at either end the interpolation gives the same.
+fn _infer(t as f64, a as f64, b as f64, da as f64, db as f64) as f64 {
+    if (a == b) {
+        if (da == db) { return da; }
+        return 0.0;
+    }
+    if (_min(a, b) >= t) {
+        if (b > a) { return da; }
+        return db;
+    }
+    if (t >= _max(a, b)) {
+        if (a > b) { return da; }
+        return db;
+    }
+    return da + (t - a) / (b - a) * (db - da);
+}
+
+// IUP for one contour, first to last of the glyph's points: the untouched
+// points between each pair of touched ones, around the contour.
+fn _iup(s as *Points, base as i64, first as i64, last as i64) as void {
+    let is i64 as size = last - first + 1;
+    let is i64 as start with mut = 0 - 1;
+    let is i64 as k with mut = first;
+    while (k <= last && start < 0) {
+        if (_touched(s, k) == 1) { start = k; }
+        k = k + 1;
+    }
+    if (start < 0) { return; }
+    let is i64 as prev with mut = start;
+    let is i64 as j with mut = 1;
+    while (j <= size) {
+        let is i64 as i = first + (start - first + j) % size;
+        if (_touched(s, i) == 1) {
+            let is i64 as m with mut = first + (prev - first + 1) % size;
+            while (m != i) {
+                _put(s.tx, m, _infer(_px(s, base + m), _px(s, base + prev), _px(s, base + i), _get(s.tx, prev), _get(s.tx, i)));
+                _put(s.ty, m, _infer(_py(s, base + m), _py(s, base + prev), _py(s, base + i), _get(s.ty, prev), _get(s.ty, i)));
+                m = first + (m - first + 1) % size;
+            }
+            prev = i;
+        }
+        j = j + 1;
+    }
+}
+
+// Whether the face has gvar as HarfBuzz takes it: version 1, its shared
+// tuples and every glyph's offsets within it.
+fn has_gvar(f as *table.Face) as i32 {
+    let is table.Table as t = f.gvar;
+    let is i64 as o = t.off;
+    if (table.u16_at(f, o) != 1) { return 0; }
+    let is i64 as axes = table.u16_at(f, o + 4);
+    let is i64 as shared_n = table.u16_at(f, o + 6);
+    let is i64 as wide = table.u16_at(f, o + 14) & 1;
+    if (table.inside(t, o + table.u32_at(f, o + 8), shared_n * axes * 2) == 0) { return 0; }
+    // Past the header, which is then within the table too.
+    if (table.inside(t, o + 20, (f.glyphs + 1) * (2 + wide * 2)) == 0) { return 0; }
+    return 1;
+}
+
+// gvar's deltas for glyph gid at the coordinates: n points — the glyph's,
+// from base, or a composite's offsets when base is -1 — and four phantoms,
+// summed into accx and accy. The glyph's contours, nc of them from contour
+// nc0, take IUP. 0 when the data fails the glyph.
+fn _deltas(f as *table.Face, s as *Points, gid as i64, c as *var.Coords, base as i64, n as i64,
+           nc0 as i64, nc as i64) as i32 {
+    let is i64 as count = n + 4;
+    if (count > s.cap + 4) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        _put(s.accx, i, 0.0);
+        _put(s.accy, i, 0.0);
+        i = i + 1;
+    }
+    if (has_gvar(f) == 0) { return 1; }
+    let is table.Table as t = f.gvar;
+    let is i64 as o = t.off;
+    let is i64 as axes = table.u16_at(f, o + 4);
+    let is i64 as shared_n = table.u16_at(f, o + 6);
+    let is i64 as shared_at = o + table.u32_at(f, o + 8);
+    let is i64 as wide = table.u16_at(f, o + 14) & 1;
+    let is i64 as data = o + table.u32_at(f, o + 16);
+    let is i64 as a with mut = table.u16_at(f, o + 20 + gid * 2) * 2;
+    let is i64 as b with mut = table.u16_at(f, o + 22 + gid * 2) * 2;
+    if (wide == 1) {
+        a = table.u32_at(f, o + 20 + gid * 4);
+        b = table.u32_at(f, o + 24 + gid * 4);
+    }
+    // The glyph's data, cut to the table. Everything in it is read checked
+    // against its end, so data shorter than its own header, or ending before
+    // it starts, has no tuples.
+    let is i64 as start = data + a;
+    let is i64 as end with mut = data + b;
+    if (end > o + t.len) { end = o + t.len; }
+    let is i64 as tuples = table.u16_at(f, start) & 4095;
+    let is i64 as p with mut = start + table.u16_at(f, start + 2);
+    s.nshared = 0;
+    if ((table.u16_at(f, start) & SHARED_POINTS) != 0) {
+        s.nshared = _point_numbers(f, &p, end, s.shared, s.cap + 4);
+        if (s.nshared < 0) { return 1; }
+    }
+    let is i64 as hdr with mut = start + 4;
+    let is i64 as left with mut = tuples;
+    while (left > 0) {
+        let is i64 as index = table.u16_at(f, hdr + 2);
+        let is i64 as size with mut = 4;
+        if ((index & EMBEDDED_PEAK) != 0) { size = size + axes * 2; }
+        if ((index & INTERMEDIATE) != 0) { size = size + axes * 4; }
+        if (hdr + size > end) { return 1; }
+        let is i64 as dsize = table.u16_at(f, hdr);
+        let is f64 as scalar = _tuple(f, hdr, axes, c, shared_at, shared_n);
+        if (scalar != 0.0) {
+            if (p + dsize > end) { return 0; }
+            let is i64 as q with mut = p;
+            let is i64 as tend = p + dsize;
+            let is *i64 as list with mut = s.shared;
+            let is i64 as listed with mut = s.nshared;
+            if ((index & PRIVATE_POINTS) != 0) {
+                list = s.own;
+                listed = _point_numbers(f, &q, tend, s.own, s.cap + 4);
+                if (listed < 0) { return 0; }
+            }
+            let is i64 as nd with mut = listed;
+            if (listed == 0) { nd = count; }
+            if (_packed(f, &q, tend, s.lx, nd) == 0 || _packed(f, &q, tend, s.ly, nd) == 0) { return 0; }
+            if (listed == 0) {
+                i = 0;
+                while (i < count) {
+                    _put(s.accx, i, _get(s.accx, i) + _get(s.lx, i) * scalar);
+                    _put(s.accy, i, _get(s.accy, i) + _get(s.ly, i) * scalar);
+                    i = i + 1;
+                }
+            } else {
+                // The points named, and the rest of each contour inferred.
+                i = 0;
+                while (i < count) {
+                    _put(s.tx, i, 0.0);
+                    _put(s.ty, i, 0.0);
+                    _touch(s, i, 0);
+                    i = i + 1;
+                }
+                i = 0;
+                while (i < listed) {
+                    let is i64 as pt = _geti(list, i);
+                    if (pt < count) {
+                        _touch(s, pt, 1);
+                        _put(s.tx, pt, _get(s.tx, pt) + _get(s.lx, i) * scalar);
+                        _put(s.ty, pt, _get(s.ty, pt) + _get(s.ly, i) * scalar);
+                    }
+                    i = i + 1;
+                }
+                // A composite's offsets are no contour: nc is 0.
+                let is i64 as first with mut = 0;
+                i = 0;
+                while (i < nc) {
+                    let is i64 as last = _end(s, nc0 + i) - base;
+                    _iup(s, base, first, last);
+                    first = last + 1;
+                    i = i + 1;
+                }
+                i = 0;
+                while (i < count) {
+                    _put(s.accx, i, _get(s.accx, i) + _get(s.tx, i));
+                    _put(s.accy, i, _get(s.accy, i) + _get(s.ty, i));
+                    i = i + 1;
+                }
+            }
+        }
+        p = p + dsize;
+        hdr = hdr + size;
+        left = left - 1;
+    }
+    return 1;
 }
 
 fn _mid(a as f64, b as f64) as f64 { return 0.5 * (a + b); }
@@ -383,18 +843,38 @@ fn draw(s as *Points, p as *path.Path) as void {
     }
 }
 
-// Glyph gid's outline into p, cleared first. 1, or 0 for a glyph that is
-// malformed or does not fit, with p empty.
-fn glyph(f as *table.Face, s as *Points, gid as i64, p as *path.Path) as i32 {
-    path.clear(p);
+fn _expand(f as *table.Face, s as *Points, gid as i64, c as *var.Coords, ph as *Phantoms) as i32 {
     s.n = 0;
     s.nc = 0;
     s.components = 0;
-    if (_load(f, s, gid, 0) == 0) { return 0; }
+    return _load(f, s, gid, 0, c, ph);
+}
+
+// Glyph gid's outline at the coordinates into p, cleared first, its first
+// phantom point at the origin. 1, or 0 for a glyph that is malformed or does
+// not fit, with p empty.
+fn glyph(f as *table.Face, s as *Points, gid as i64, c as *var.Coords, p as *path.Path) as i32 {
+    path.clear(p);
+    let is Phantoms as ph;
+    if (_expand(f, s, gid, c, &ph) == 0) { return 0; }
+    _translate(s, 0, 0.0 - ph.x[0], 0.0);
     draw(s, p);
     if (p.full == 1) {
         path.clear(p);
         return 0;
     }
     return 1;
+}
+
+// Glyph gid's advance at the coordinates, from its phantom points — the
+// distance between the first two — as HarfBuzz finds it for a font with gvar
+// and no HVAR: 0 for a glyph past those loca has, half the em for one that
+// cannot be expanded.
+fn advance(f as *table.Face, s as *Points, gid as i64, c as *var.Coords) as f64 {
+    let is i64 as w with mut = 2;
+    if (f.loc_long == 1) { w = 4; }
+    if (gid < 0 || gid >= f.glyphs || gid >= f.loca.len / w - 1) { return 0.0; }
+    let is Phantoms as ph;
+    if (_expand(f, s, gid, c, &ph) == 0) { return cast(f64, f.upem / 2); }
+    return ph.x[1] - ph.x[0];
 }

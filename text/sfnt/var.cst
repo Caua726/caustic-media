@@ -1,0 +1,626 @@
+// text/sfnt/var.cst — variable fonts: the axes and named instances fvar
+// declares, an instance's normalized coordinates, and the item variation
+// store in which HVAR, MVAR, avar 2 and CFF2 keep their deltas. See sfnt.md.
+//
+// An instance is chosen in the axes' own units (a Design) and turned into
+// normalized coordinates (Coords) exactly as HarfBuzz 14 turns it, in single
+// precision as it does: clamped, scaled to -1..+1 on its side of the default
+// and rounded to 16.16 fixed point; mapped through avar's segment maps —
+// with HarfBuzz's handling of maps the specification does not allow — and
+// moved by avar 2's deltas; then rounded to 2.14. Coordinates with n = 0 are
+// the default instance, which is every face that is not variable.
+//
+// A region's weight and a delta are HarfBuzz's too, single precision
+// included: a coordinate of 0 weighs nothing even in a region the
+// specification would ignore.
+//
+// Single precision is done in double, each operation's result rounded to
+// single through memory (_r32): rounding a double sum, difference, product or
+// quotient of two singles gives the single one exactly. (The compiler keeps
+// f32 values in double precision between stores — at -O2 even across them —
+// so f32 arithmetic would not round where HarfBuzz's does.)
+//
+// Every structure is checked against its table before what it says is used.
+// What HarfBuzz refuses outright — an fvar of another version or record
+// size, an avar cut short, a variation store of another format — is not read
+// at all; an index past a count reads as no delta.
+use "table.cst" as table;
+use "head.cst" as head;
+
+let is i64 as MAX_AXES with imut = 64;
+let is i64 as HIDDEN   with imut = 1;   // an axis's flag: not for users' menus
+let is i64 as TAG_OPSZ with imut = 0x6F70737A;
+
+struct Axis {
+    tag     as i64;
+    min     as f64;
+    def     as f64;
+    max     as f64;
+    flags   as i64;
+    name_id as i64;
+}
+
+// A named instance's names; -1 for none.
+struct Named {
+    name_id    as i64;
+    ps_name_id as i64;
+    flags      as i64;
+}
+
+// An instance in the axes' own units: one value per axis, and whether the
+// program set it (optical() leaves those alone).
+struct Design {
+    n   as i64;
+    v   as [64]f64;
+    set as [64]u8;
+}
+
+// Normalized coordinates, 2.14 fixed point: -16384 at an axis's minimum,
+// 0 at its default, 16384 at its maximum.
+struct Coords {
+    n as i64;
+    v as [64]i64;
+}
+
+// An item variation store: where it is, -1 for none, and the table it is in.
+struct Store {
+    t   as table.Table;
+    off as i64;
+}
+
+fn _fixed(f as *table.Face, at as i64) as f64 { return cast(f64, table.i32_at(f, at)) / 65536.0; }
+// x rounded to the nearest single-precision value, through memory.
+fn _r32(x as f64) as f64 {
+    let is [2]f32 as t;
+    t[0] = cast(f32, x);
+    return cast(f64, t[0]);
+}
+
+fn _fixed32(f as *table.Face, at as i64) as f64 { return _r32(cast(f64, table.i32_at(f, at))) / 65536.0; }
+fn _f2(f as *table.Face, at as i64) as f64 { return cast(f64, table.i16_at(f, at)) / 16384.0; }
+
+fn _i8(f as *table.Face, at as i64) as i64 {
+    let is i64 as v = table.u8_at(f, at);
+    if (v >= 128) { return v - 256; }
+    return v;
+}
+
+// Halves away from zero, as C's roundf — exact for a single-precision value,
+// which adding a half in double precision does not round.
+fn _round(x as f64) as i64 {
+    if (x >= 0.0) { return cast(i64, x + 0.5); }
+    return cast(i64, x - 0.5);
+}
+
+// --- fvar ---
+
+// How many axes the face has: 0 for a face that is not variable, one whose
+// fvar HarfBuzz would refuse, or one of more than MAX_AXES — read, all of
+// them, at the default instance.
+fn axis_count(f as *table.Face) as i64 {
+    let is table.Table as t = f.fvar;
+    let is i64 as o = t.off;
+    if (table.u16_at(f, o) != 1) { return 0; }
+    let is i64 as n = table.u16_at(f, o + 8);
+    let is i64 as isize = table.u16_at(f, o + 14);
+    if (n > MAX_AXES || table.u16_at(f, o + 10) != 20 || isize < n * 4 + 4) { return 0; }
+    if (table.inside(t, o + table.u16_at(f, o + 4), n * 20 + table.u16_at(f, o + 12) * isize) == 0) { return 0; }
+    return n;
+}
+
+fn _axes(f as *table.Face) as i64 { return f.fvar.off + table.u16_at(f, f.fvar.off + 4); }
+
+// Axis i; tag 0 for no such axis.
+fn axis(f as *table.Face, i as i64) as Axis {
+    let is Axis as a;
+    a.tag = 0;
+    a.min = 0.0;
+    a.def = 0.0;
+    a.max = 0.0;
+    a.flags = 0;
+    a.name_id = 0;
+    if (i < 0 || i >= axis_count(f)) { return a; }
+    let is i64 as at = _axes(f) + i * 20;
+    a.tag = table.u32_at(f, at);
+    a.min = _fixed(f, at + 4);
+    a.def = _fixed(f, at + 8);
+    a.max = _fixed(f, at + 12);
+    a.flags = table.u16_at(f, at + 16);
+    a.name_id = table.u16_at(f, at + 18);
+    return a;
+}
+
+fn instance_count(f as *table.Face) as i64 {
+    if (axis_count(f) == 0) { return 0; }
+    return table.u16_at(f, f.fvar.off + 12);
+}
+
+// The default instance's values, none set.
+fn design(f as *table.Face) as Design {
+    let is Design as d;
+    d.n = axis_count(f);
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        d.v[i] = axis(f, i).def;
+        d.set[i] = 0;
+        i = i + 1;
+    }
+    return d;
+}
+
+// Named instance i's values into d, every one set; its names, -1 for no such
+// instance.
+fn named(f as *table.Face, i as i64, d as *Design) as Named {
+    let is Named as nm;
+    nm.name_id = 0 - 1;
+    nm.ps_name_id = 0 - 1;
+    nm.flags = 0;
+    if (i < 0 || i >= instance_count(f)) { return nm; }
+    let is i64 as n = axis_count(f);
+    let is i64 as isize = table.u16_at(f, f.fvar.off + 14);
+    let is i64 as at = _axes(f) + n * 20 + i * isize;
+    nm.name_id = table.u16_at(f, at);
+    nm.flags = table.u16_at(f, at + 2);
+    // A PostScript name when the record has room for one; 0xFFFF says none.
+    if (isize >= n * 4 + 6 && table.u16_at(f, at + 4 + n * 4) != 65535) {
+        nm.ps_name_id = table.u16_at(f, at + 4 + n * 4);
+    }
+    d.n = n;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        d.v[k] = _fixed(f, at + 4 + k * 4);
+        d.set[k] = 1;
+        k = k + 1;
+    }
+    return nm;
+}
+
+// Every axis tagged tag to value; 0 when the face has none.
+fn set(d as *Design, f as *table.Face, tag as i64, value as f64) as i32 {
+    let is i32 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        if (axis(f, i).tag == tag) {
+            d.v[i] = value;
+            d.set[i] = 1;
+            found = 1;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+// Optical size following the text's, px in CSS pixels, unless set.
+fn optical(d as *Design, f as *table.Face, px as f64) as void {
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        if (d.set[i] == 0 && axis(f, i).tag == TAG_OPSZ) { d.v[i] = px; }
+        i = i + 1;
+    }
+}
+
+// --- Coordinates ---
+
+fn default_coords() as Coords {
+    let is Coords as c;
+    c.n = 0;
+    return c;
+}
+
+fn is_default(c as *Coords) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < c.n) {
+        if (c.v[i] != 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The value v of axis i, normalized to 16.16 in single precision: a
+// minimum above the default, or a maximum below it, counts as the default.
+fn _normalize(f as *table.Face, i as i64, v as f64) as i64 {
+    let is i64 as at = _axes(f) + i * 20;
+    let is f64 as def = _fixed32(f, at + 8);
+    let is f64 as lo with mut = _fixed32(f, at + 4);
+    let is f64 as hi with mut = _fixed32(f, at + 12);
+    if (lo > def) { lo = def; }
+    if (def > hi) { hi = def; }
+    let is f64 as x with mut = _r32(v);
+    if (lo > x) { x = lo; }
+    if (x > hi) { x = hi; }
+    if (x == def) { return 0; }
+    let is f64 as n with mut = _r32(_r32(x - def) / _r32(hi - def));
+    if (def > x) { n = _r32(_r32(x - def) / _r32(def - lo)); }
+    return _round(n * 65536.0);
+}
+
+fn _abs(v as f64) as f64 {
+    if (0.0 > v) { return 0.0 - v; }
+    return v;
+}
+
+// The segment map at at applied to value, -1..+1, as HarfBuzz applies it:
+// beyond the specification, which wants -1, 0 and +1 mapped and nothing
+// else odd, a lone pair shifts everything; a doubled -1 or +1 end is passed
+// over; several pairs from one value give the middle of three, or the one
+// nearest 0; outside the pairs, the value shifts with the nearest.
+fn _map(f as *table.Face, at as i64, value as f64) as f64 {
+    let is i64 as len = table.u16_at(f, at);
+    let is i64 as p = at + 2;
+    if (len == 0) { return value; }
+    if (len == 1) { return _r32(_r32(value - _f2(f, p)) + _f2(f, p + 2)); }
+    let is f64 as one = 1.0;
+    let is f64 as minus = 0.0 - 1.0;
+    let is f64 as zero = 0.0;
+    let is i64 as start with mut = 0;
+    let is i64 as end with mut = len;
+    if (_f2(f, p) == minus && _f2(f, p + 2) == minus && _f2(f, p + 4) == minus) { start = 1; }
+    if (_f2(f, p + end * 4 - 4) == one && _f2(f, p + end * 4 - 2) == one && _f2(f, p + end * 4 - 8) == one) { end = end - 1; }
+    let is i64 as i with mut = start;
+    while (i < end && value != _f2(f, p + i * 4)) { i = i + 1; }
+    if (i < end) {
+        let is i64 as j with mut = i;
+        while (j + 1 < end && value == _f2(f, p + j * 4 + 4)) { j = j + 1; }
+        let is f64 as ti = _f2(f, p + i * 4 + 2);
+        let is f64 as tj = _f2(f, p + j * 4 + 2);
+        if (i + 2 == j) { return _f2(f, p + i * 4 + 6); }
+        if (zero > value) { return tj; }
+        if (value > zero) { return ti; }
+        if (_abs(tj) > _abs(ti)) { return ti; }
+        return tj;
+    }
+    i = start;
+    while (i < end && (_f2(f, p + i * 4) > value) == 0) { i = i + 1; }
+    if (i == start) { return _r32(_r32(value - _f2(f, p + start * 4)) + _f2(f, p + start * 4 + 2)); }
+    if (i == end) { return _r32(_r32(value - _f2(f, p + end * 4 - 4)) + _f2(f, p + end * 4 - 2)); }
+    let is f64 as from0 = _f2(f, p + i * 4 - 4);
+    let is f64 as to0 = _f2(f, p + i * 4 - 2);
+    let is f64 as from1 = _f2(f, p + i * 4);
+    let is f64 as to1 = _f2(f, p + i * 4 + 2);
+    let is f64 as rise = _r32(_r32(to1 - to0) * _r32(value - from0));
+    return _r32(to0 + _r32(rise / _r32(from1 - from0)));
+}
+
+// avar applied to c, in 16.16: every segment map within the table, and
+// version 2's offsets, or nothing at all.
+fn _avar(f as *table.Face, c as *Coords) as void {
+    let is table.Table as t = f.avar;
+    let is i64 as o = t.off;
+    let is i64 as major = table.u16_at(f, o);
+    if (major != 1 && major != 2) { return; }
+    let is i64 as n = table.u16_at(f, o + 6);
+    let is i64 as end with mut = o + 8;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as len = 2 + table.u16_at(f, end) * 4;
+        if (table.inside(t, end, len) == 0) { return; }
+        end = end + len;
+        i = i + 1;
+    }
+    if (major == 2 && table.inside(t, end, 8) == 0) { return; }
+    let is i64 as at with mut = o + 8;
+    i = 0;
+    while (i < n && i < c.n) {
+        c.v[i] = _round(_map(f, at, cast(f64, c.v[i]) / 65536.0) * 65536.0);
+        at = at + 2 + table.u16_at(f, at) * 4;
+        i = i + 1;
+    }
+    if (major == 1) { return; }
+    // Version 2: each axis moved by a delta weighed at the mapped
+    // coordinates, rounded to 2.14 — all of them, before any is moved. An
+    // offset of 0 is none: an index map lands on avar's own version, a store
+    // on a version no store has, but neither is left to that.
+    let is i64 as map = table.u32_at(f, end);
+    let is i64 as so = table.u32_at(f, end + 4);
+    let is Store as s with mut = no_store(t);
+    if (so != 0) { s = store(f, t, o + so); }
+    let is Coords as mapped = *c;
+    i = 0;
+    while (i < c.n) {
+        mapped.v[i] = _round(cast(f64, c.v[i]) / 4.0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < c.n) {
+        let is i64 as idx with mut = i;
+        if (map != 0) { idx = map_index(f, t, o + map, i); }
+        let is i64 as v with mut = c.v[i] + _round(_delta(f, &s, idx, &mapped) * 4.0);
+        if (v > 65536) { v = 65536; }
+        if (0 - 65536 > v) { v = 0 - 65536; }
+        c.v[i] = v;
+        i = i + 1;
+    }
+}
+
+// The instance d normalized, avar applied, rounded to 2.14.
+fn coords(f as *table.Face, d as *Design) as Coords {
+    let is Coords as c;
+    c.n = axis_count(f);
+    let is i64 as i with mut = 0;
+    while (i < c.n) {
+        let is f64 as v with mut = axis(f, i).def;
+        if (i < d.n) { v = d.v[i]; }
+        c.v[i] = _normalize(f, i, v);
+        i = i + 1;
+    }
+    _avar(f, &c);
+    i = 0;
+    while (i < c.n) {
+        c.v[i] = (c.v[i] + 2) >> 2;
+        i = i + 1;
+    }
+    return c;
+}
+
+// --- The item variation store ---
+
+// The store at off in table t; none when it is not one. Its parts are each
+// checked against the table when they are used.
+fn store(f as *table.Face, t as table.Table, off as i64) as Store {
+    let is Store as s = no_store(t);
+    if (table.u16_at(f, off) == 1) { s.off = off; }
+    return s;
+}
+
+fn no_store(t as table.Table) as Store {
+    let is Store as s;
+    s.t = t;
+    s.off = 0 - 1;
+    return s;
+}
+
+// One axis's share of a region, coordinates and region in 2.14, as HarfBuzz
+// weighs it: a peak of 0 or a coordinate at the peak counts whole; a
+// coordinate of 0 nothing; then an axis whose start lies past its peak,
+// whose peak lies past its end, or which crosses zero does not count.
+fn axis_scalar(coord as i64, start as i64, peak as i64, end as i64) as f64 {
+    if (peak == 0 || coord == peak) { return 1.0; }
+    if (coord == 0) { return 0.0; }
+    if (start > peak || peak > end) { return 1.0; }
+    if (start < 0 && end > 0) { return 1.0; }
+    if (coord <= start || end <= coord) { return 0.0; }
+    if (coord < peak) { return _r32(cast(f64, coord - start) / cast(f64, peak - start)); }
+    return _r32(cast(f64, end - coord) / cast(f64, end - peak));
+}
+
+// How much of region r the coordinates are into; 0 for no such region, or
+// any region when the list does not lie within the table.
+fn _region(f as *table.Face, s as *Store, r as i64, c as *Coords) as f64 {
+    let is f64 as zero = 0.0;
+    let is i64 as rl = s.off + table.u32_at(f, s.off + 2);
+    let is i64 as axes = table.u16_at(f, rl);
+    let is i64 as count = table.u16_at(f, rl + 2);
+    if (r >= count || table.inside(s.t, rl + 4, count * axes * 6) == 0) { return zero; }
+    let is i64 as at with mut = rl + 4 + r * axes * 6;
+    let is f64 as v with mut = 1.0;
+    let is i64 as i with mut = 0;
+    while (i < axes) {
+        let is i64 as coord with mut = 0;
+        if (i < c.n) { coord = c.v[i]; }
+        let is f64 as k = axis_scalar(coord, table.i16_at(f, at), table.i16_at(f, at + 2), table.i16_at(f, at + 4));
+        v = _r32(v * k);
+        at = at + 6;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn region_scalar(f as *table.Face, s as *Store, r as i64, c as *Coords) as f64 {
+    if (s.off < 0) { return 0.0; }
+    return _region(f, s, r, c);
+}
+
+// The delta at variation index idx — outer data set in the high 16 bits,
+// inner row in the low — at the coordinates, summed in single precision;
+// 0 for none. A set of data whose rows do not all lie within the table, or
+// with more word columns than regions, is none.
+fn _delta(f as *table.Face, s as *Store, idx as i64, c as *Coords) as f64 {
+    let is f64 as sum with mut = 0.0;
+    if (s.off < 0) { return sum; }
+    let is i64 as outer = idx >> 16;
+    let is i64 as inner = idx & 65535;
+    if (outer >= table.u16_at(f, s.off + 6)) { return sum; }
+    let is i64 as d = s.off + table.u32_at(f, s.off + 8 + outer * 4);
+    let is i64 as items = table.u16_at(f, d);
+    let is i64 as wsc = table.u16_at(f, d + 2);
+    let is i64 as regions = table.u16_at(f, d + 4);
+    // LONG_WORDS: the word columns 32-bit and the rest 16; otherwise 16 and 8.
+    let is i64 as words = wsc & 32767;
+    let is i64 as long with mut = 0;
+    if ((wsc & 32768) != 0) { long = 1; }
+    let is i64 as row_size = (words + regions) * (long + 1);
+    let is i64 as rows = d + 6 + regions * 2;
+    if (words > regions || table.inside(s.t, rows, items * row_size) == 0 || inner >= items) {
+        return sum;
+    }
+    let is i64 as at with mut = rows + inner * row_size;
+    let is i64 as i with mut = 0;
+    while (i < regions) {
+        let is i64 as v with mut = 0;
+        if (long == 1 && i < words) { v = table.i32_at(f, at); at = at + 4; }
+        else if (long == 1 || i < words) { v = table.i16_at(f, at); at = at + 2; }
+        else { v = _i8(f, at); at = at + 1; }
+        let is f64 as k = _region(f, s, table.u16_at(f, d + 6 + i * 2), c);
+        sum = _r32(sum + _r32(k * _r32(cast(f64, v))));
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn delta(f as *table.Face, s as *Store, idx as i64, c as *Coords) as f64 {
+    return _delta(f, s, idx, c);
+}
+
+// --- Outlines' weights ---
+//
+// gvar's tuples and CFF2's blend weigh regions in double precision, as
+// HarfBuzz weighs gvar's — the points they move are fractions of a unit, and
+// no integer is rounded from them — by the same rules as above.
+
+// One axis's share of a region, in double precision.
+fn axis_weight(coord as i64, start as i64, peak as i64, end as i64) as f64 {
+    if (peak == 0 || coord == peak) { return 1.0; }
+    if (coord == 0) { return 0.0; }
+    if (start > peak || peak > end) { return 1.0; }
+    if (start < 0 && end > 0) { return 1.0; }
+    if (coord <= start || end <= coord) { return 0.0; }
+    if (coord < peak) { return cast(f64, coord - start) / cast(f64, peak - start); }
+    return cast(f64, end - coord) / cast(f64, end - peak);
+}
+
+// How much of the store's region r the coordinates are into, in double
+// precision.
+fn region_weight(f as *table.Face, s as *Store, r as i64, c as *Coords) as f64 {
+    if (s.off < 0) { return 0.0; }
+    let is i64 as rl = s.off + table.u32_at(f, s.off + 2);
+    let is i64 as axes = table.u16_at(f, rl);
+    let is i64 as count = table.u16_at(f, rl + 2);
+    if (r >= count || table.inside(s.t, rl + 4, count * axes * 6) == 0) { return 0.0; }
+    let is i64 as at with mut = rl + 4 + r * axes * 6;
+    let is f64 as v with mut = 1.0;
+    let is i64 as i with mut = 0;
+    while (i < axes) {
+        let is i64 as coord with mut = 0;
+        if (i < c.n) { coord = c.v[i]; }
+        let is f64 as k = axis_weight(coord, table.i16_at(f, at), table.i16_at(f, at + 2), table.i16_at(f, at + 4));
+        v = v * k;
+        at = at + 6;
+        i = i + 1;
+    }
+    return v;
+}
+
+// Data set outer's header, absolute; -1 for no such set.
+fn _data(f as *table.Face, s as *Store, outer as i64) as i64 {
+    if (s.off < 0 || outer < 0 || outer >= table.u16_at(f, s.off + 6)) { return 0 - 1; }
+    let is i64 as d = s.off + table.u32_at(f, s.off + 8 + outer * 4);
+    let is i64 as regions = table.u16_at(f, d + 4);
+    if (table.inside(s.t, d + 6, regions * 2) == 0) { return 0 - 1; }
+    return d;
+}
+
+// How many regions data set outer weighs; -1 for no such set.
+fn data_regions(f as *table.Face, s as *Store, outer as i64) as i64 {
+    let is i64 as d = _data(f, s, outer);
+    if (d < 0) { return 0 - 1; }
+    return table.u16_at(f, d + 4);
+}
+
+// The k-th region data set outer weighs, which data_regions says it has.
+fn data_region(f as *table.Face, s as *Store, outer as i64, k as i64) as i64 {
+    return table.u16_at(f, _data(f, s, outer) + 6 + k * 2);
+}
+
+// The variation index entry i of the DeltaSetIndexMap at at maps to; past
+// its entries, the last. i itself for a map with no entries, of another
+// format or not within the table — as HarfBuzz reads one it cannot use.
+fn map_index(f as *table.Face, t as table.Table, at as i64, i as i64) as i64 {
+    let is i64 as format = table.u8_at(f, at);
+    let is i64 as ef = table.u8_at(f, at + 1);
+    let is i64 as count with mut = 0;
+    let is i64 as data with mut = 0;
+    if (format == 0) {
+        count = table.u16_at(f, at + 2);
+        data = at + 4;
+    } else if (format == 1) {
+        count = table.u32_at(f, at + 2);
+        data = at + 6;
+    }
+    let is i64 as w = ((ef >> 4) & 3) + 1;
+    if (count == 0 || table.inside(t, data, count * w) == 0) { return i; }
+    let is i64 as k with mut = i;
+    if (k >= count) { k = count - 1; }
+    let is i64 as u with mut = 0;
+    let is i64 as b with mut = 0;
+    while (b < w) {
+        u = (u << 8) | table.u8_at(f, data + k * w + b);
+        b = b + 1;
+    }
+    let is i64 as bits = (ef & 15) + 1;
+    return (((u >> bits) << 16) | (u & ((1 << bits) - 1))) & 4294967295;
+}
+
+// --- HVAR, MVAR ---
+
+fn has_hvar(f as *table.Face) as i32 {
+    if (table.inside(f.hvar, f.hvar.off, 20) == 1 && table.u16_at(f, f.hvar.off) == 1) { return 1; }
+    return 0;
+}
+
+// How much glyph gid's advance moves at the coordinates; 0 without HVAR.
+fn advance_delta(f as *table.Face, c as *Coords, gid as i64) as f64 {
+    if (has_hvar(f) == 0) { return 0.0; }
+    let is table.Table as t = f.hvar;
+    let is i64 as o = t.off;
+    // An offset of 0 is none: HVAR's own header would read as a store of no
+    // data, but is not left to that.
+    let is Store as s with mut = no_store(t);
+    if (table.u32_at(f, o + 4) != 0) { s = store(f, t, o + table.u32_at(f, o + 4)); }
+    let is i64 as idx with mut = gid;
+    if (table.u32_at(f, o + 8) != 0) { idx = map_index(f, t, o + table.u32_at(f, o + 8), gid); }
+    return delta(f, &s, idx, c);
+}
+
+// MVAR's delta for the value tagged tag — 'hasc', 'xhgt', 'undo' and the
+// rest — at the coordinates; 0 when it has none.
+fn metric(f as *table.Face, c as *Coords, tag as i64) as f64 {
+    let is table.Table as t = f.mvar;
+    let is i64 as o = t.off;
+    if (table.u16_at(f, o) != 1) { return 0.0; }
+    let is i64 as size = table.u16_at(f, o + 6);
+    let is i64 as n = table.u16_at(f, o + 8);
+    if (size < 8) { return 0.0; }
+    // The records are sorted by tag.
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = n;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as r = o + 12 + mid * size;
+        let is i64 as rt = table.u32_at(f, r);
+        if (tag < rt) { hi = mid; }
+        else if (tag > rt) { lo = mid + 1; }
+        else {
+            // An offset of 0 is no store, though MVAR's own header would
+            // not read as one with deltas.
+            let is Store as s with mut = no_store(t);
+            if (table.u16_at(f, o + 10) != 0) { s = store(f, t, o + table.u16_at(f, o + 10)); }
+            return delta(f, &s, (table.u16_at(f, r + 4) << 16) | table.u16_at(f, r + 6), c);
+        }
+    }
+    return 0.0;
+}
+
+let is i64 as TAG_HASC with imut = 0x68617363;
+let is i64 as TAG_HDSC with imut = 0x68647363;
+let is i64 as TAG_HLGP with imut = 0x686C6770;
+let is i64 as TAG_HCLA with imut = 0x68636C61;
+let is i64 as TAG_HCLD with imut = 0x68636C64;
+let is i64 as TAG_XHGT with imut = 0x78686774;
+let is i64 as TAG_CPHT with imut = 0x63706874;
+let is i64 as TAG_UNDO with imut = 0x756E646F;
+let is i64 as TAG_UNDS with imut = 0x756E6473;
+let is i64 as TAG_STRO with imut = 0x7374726F;
+let is i64 as TAG_STRS with imut = 0x73747273;
+
+// The face's metrics at the coordinates, each moved by its MVAR delta,
+// rounded: the line metrics by hasc, hdsc and hlgp whether they came from
+// hhea or OS/2's typographic values, as HarfBuzz moves them, and by hcla and
+// hcld when they are the Windows ones.
+fn metrics(f as *table.Face, c as *Coords) as head.Metrics {
+    let is head.Metrics as m with mut = head.metrics(f);
+    if (m.source == head.LINES_WIN) {
+        m.ascender = m.ascender + _round(metric(f, c, TAG_HCLA));
+        m.descender = m.descender - _round(metric(f, c, TAG_HCLD));
+    } else {
+        m.ascender = m.ascender + _round(metric(f, c, TAG_HASC));
+        m.descender = m.descender + _round(metric(f, c, TAG_HDSC));
+        m.line_gap = m.line_gap + _round(metric(f, c, TAG_HLGP));
+    }
+    m.x_height = m.x_height + _round(metric(f, c, TAG_XHGT));
+    m.cap_height = m.cap_height + _round(metric(f, c, TAG_CPHT));
+    m.underline_pos = m.underline_pos + _round(metric(f, c, TAG_UNDO));
+    m.underline_thickness = m.underline_thickness + _round(metric(f, c, TAG_UNDS));
+    m.strike_pos = m.strike_pos + _round(metric(f, c, TAG_STRO));
+    m.strike_size = m.strike_size + _round(metric(f, c, TAG_STRS));
+    return m;
+}

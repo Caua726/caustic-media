@@ -360,7 +360,8 @@ def synthetic_bombs():
     # Fonts a reader must refuse rather than follow. bomb.ttf: composites
     # fourteen deep, each holding the next twice — 16384 components with no
     # points, past the reader's limit though no deeper than it allows — and a
-    # composite holding itself. bomb.otf: ten subroutines, each calling the
+    # composite holding itself; composites of 4096 components all told, the
+    # limit, and of 4097. bomb.otf: ten subroutines, each calling the
     # next four times, nested no deeper than allowed, a quarter of a million
     # calls. No outline reference is written for either.
     from fontTools.fontBuilder import FontBuilder
@@ -371,7 +372,7 @@ def synthetic_bombs():
     depth = 14
     chain = 18
     names = ([".notdef", "empty", "loop"] + ["dag%d" % i for i in range(depth)]
-             + ["chain%d" % i for i in range(chain)] + ["big", "twice", "dot"])
+             + ["chain%d" % i for i in range(chain)] + ["big", "twice", "dot", "edge", "over"])
     fb = FontBuilder(1000, isTTF=True)
     fb.setupGlyphOrder(names)
 
@@ -419,6 +420,10 @@ def synthetic_bombs():
     dot.program = ttProgram.Program()
     dot.program.fromBytecode(b"")
     glyphs["dot"] = dot
+    # dag3 is 4094 components below it: with itself and one more, 4096; with
+    # two more, 4097.
+    glyphs["edge"] = composite(["dag3", "empty"])
+    glyphs["over"] = composite(["dag3", "empty", "empty"])
     fb.setupGlyf(glyphs, validateGlyphFormat=False)
     fb.font.recalcBBoxes = False
     fb.setupHorizontalMetrics({n: (500, 0) for n in names})
@@ -521,9 +526,255 @@ def synthetic_big():
     print("big.otf", os.path.getsize(os.path.join(OUT, "big.otf")), "bytes")
 
 
+def synthetic_var():
+    # A variable TrueType font for what real ones seldom show: deltas on
+    # every point and on a few, left to interpolation (IUP) in each of its
+    # cases; regions with an intermediate start and end, over two axes, on the
+    # negative side; point numbers past 255, more than 255 of them, and runs
+    # past 128; deltas of every width, 32 bits included; components moved by
+    # deltas, scaled every way with more after them, matched ones that are
+    # not — by points past 255 too —, one lending the composite its metrics,
+    # an empty one lending them too; phantom points moving the
+    # side bearings and advance, with no HVAR to say otherwise; an axis whose
+    # minimum is its default, hidden; avar version 2; and MVAR.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.ttLib import newTable
+    from fontTools.ttLib.tables import otTables as ot
+    from fontTools.ttLib.tables.TupleVariation import TupleVariation
+    from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphComponent, GlyphCoordinates
+    from fontTools.ttLib.tables import _g_l_y_f as G
+    from fontTools.ttLib.tables import ttProgram
+    from fontTools.varLib.builder import buildVarRegionList, buildVarData, buildVarStore
+    names = [".notdef", "square", "iup", "many", "comp", "matched", "mymetrics", "phantom", "space", "nested",
+             "spaces", "scales", "manymatched"]
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(names)
+
+    def simple(points, flags, ends):
+        g = Glyph()
+        g.numberOfContours = len(ends)
+        g.coordinates = GlyphCoordinates(points)
+        g.flags = bytearray(flags)
+        g.endPtsOfContours = ends
+        g.program = ttProgram.Program()
+        g.program.fromBytecode(b"")
+        return g
+
+    def comp(name, x=0, y=0, transform=None, flags=0, first=None, second=None):
+        c = GlyphComponent()
+        c.glyphName = name
+        c.flags = flags
+        if first is not None:
+            c.firstPt, c.secondPt = first, second
+        else:
+            c.x, c.y = x, y
+            c.flags |= G.ARGS_ARE_XY_VALUES
+        if transform is not None:
+            c.transform = transform
+        return c
+
+    def composite(comps):
+        g = Glyph()
+        g.numberOfContours = -1
+        g.components = comps
+        return g
+
+    square = simple([(100, 0), (100, 700), (500, 700), (500, 0)], [1, 1, 1, 1], [3])
+    # Four contours for interpolation: one moved point moves its contour
+    # whole; a contour with none stays; two moved points at the same x with
+    # different deltas, untouched points outside and between them; the first
+    # moved point not the first of its contour, so a run wraps around.
+    iup_pts = [(0, 0), (0, 100), (100, 100), (100, 0), (50, -50), (20, 10),
+               (200, 0), (200, 100), (300, 100), (300, 0), (250, 50),
+               (400, 0), (400, 300), (450, 400), (500, 300), (500, 0), (450, -100), (380, 150), (520, 150),
+               (600, 0), (600, 200), (700, 250), (800, 200), (800, 0), (700, -50)]
+    iup_ends = [5, 10, 18, 24]
+    iup = simple(iup_pts, [1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0], iup_ends)
+    # A zigzag of 300 points.
+    many_pts = [(i * 3, (i % 2) * 40) for i in range(300)]
+    many = simple(many_pts, [1] * 300, [299])
+    space = Glyph()
+    glyphs = {
+        ".notdef": simple([(50, 0), (50, 500), (350, 500), (350, 0)], [1, 1, 1, 1], [3]),
+        "square": square, "iup": iup, "many": many,
+        "comp": composite([comp("square", 50, 10), comp("square", 600, 0, [[0.5, 0], [0, 0.5]])]),
+        "matched": composite([comp("square", 0, 0), comp("square", first=2, second=0)]),
+        "mymetrics": composite([comp("iup", 600, 0), comp("square", 0, 0, flags=G.USE_MY_METRICS)]),
+        "phantom": simple([(150, 0), (150, 300), (350, 300)], [1, 1, 1], [2]),
+        "space": space,
+        "nested": composite([comp("comp", 0, 100)]),
+        # More components than points, the empty glyph's metrics the whole's.
+        "spaces": composite([comp("phantom", 0, 0), comp("space", 30, 0, flags=G.USE_MY_METRICS),
+                             comp("space", 60, 0), comp("space", 90, 0)]),
+        "scales": composite([comp("square", 10, 0, [[0.5, 0], [0, 0.75]]),
+                             comp("square", 300, 0, [[0.5, 0.25], [0.25, 0.5]]),
+                             comp("square", 600, 0, [[0.5, 0], [0, 0.5]]),
+                             comp("square", 900, 0)]),
+        "manymatched": composite([comp("many", 0, 0), comp("square", first=299, second=2)]),
+    }
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics({".notdef": (400, 50), "square": (600, 100), "iup": (900, 0), "many": (900, 0),
+                               "comp": (900, 50), "matched": (1000, 0), "mymetrics": (1500, 0),
+                               "phantom": (500, 150), "space": (250, 0), "nested": (900, 50),
+                               "spaces": (700, 150), "scales": (1400, 60), "manymatched": (1300, 0)})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "Caustic Test Var", "styleName": "Regular"})
+    fb.setupCharacterMap({0x41 + i: n for i, n in enumerate(names[1:])})
+    fb.setupOS2(sxHeight=500, sCapHeight=700, sTypoAscender=800, sTypoDescender=-200, sTypoLineGap=100,
+                usWinAscent=900, usWinDescent=250, yStrikeoutSize=50, yStrikeoutPosition=300)
+    fb.setupPost(underlinePosition=-100, underlineThickness=50)
+    fb.setupFvar([("wght", 100, 400, 900, "Weight"), ("wdth", 75, 100, 125, "Width"),
+                  ("ZHID", 0, 0, 100, "Hidden")],
+                 [{"location": {"wght": 400, "wdth": 100, "ZHID": 0}, "stylename": "Regular",
+                   "postscriptfontname": "CausticTestVar-Regular"},
+                  {"location": {"wght": 700, "wdth": 100, "ZHID": 0}, "stylename": "Bold",
+                   "postscriptfontname": "CausticTestVar-Bold"},
+                  {"location": {"wght": 250, "wdth": 75, "ZHID": 40}, "stylename": "Light Condensed",
+                   "postscriptfontname": "CausticTestVar-LightCondensed"}])
+    fb.font["fvar"].axes[2].flags = 1   # HIDDEN_AXIS
+
+    def deltas(n, pts):
+        # Deltas for points pts (a dict), None for the rest: n points and four
+        # phantom points.
+        return [pts.get(i) for i in range(n + 4)]
+
+    W = {"wght": (0, 1, 1)}
+    Wn = {"wght": (-1, -1, 0)}
+    D = {"wdth": (0, 1, 1)}
+    variations = {
+        "square": [
+            TupleVariation(W, [(10, 0), (10, 20), (30, 20), (30, 0), (-20, 0), (60, 0), (0, 0), (0, 0)]),
+            TupleVariation(Wn, deltas(4, {0: (-5, 0), 2: (5, -10)})),
+            TupleVariation({"wdth": (0, 0.5, 1)}, deltas(4, {1: (0, 40), 5: (25, 0)})),
+            TupleVariation({"wght": (0, 1, 1), "wdth": (0, 1, 1)}, deltas(4, {3: (7, 7)})),
+            TupleVariation({"ZHID": (0, 1, 1)}, deltas(4, {0: (0, -30), 1: (0, 30)})),
+        ],
+        "iup": [
+            TupleVariation(W, deltas(25, {2: (10, 20),
+                                          12: (5, 8), 15: (-5, 8),
+                                          21: (30, -10), 23: (0, 4)})),
+            TupleVariation(D, deltas(25, {0: (-4, 0), 3: (6, 2), 8: (1, 1), 9: (3, 3),
+                                          11: (0, 0), 12: (0, 0), 14: (10, 10), 16: (2, -2)})),
+        ],
+        "many": [
+            TupleVariation(W, deltas(300, {0: (1, 1), 5: (200, -300), 270: (40000, 0), 299: (0, 129)})),
+            TupleVariation(D, deltas(300, {i: (i % 7 - 3, 0) for i in range(0, 260)})),
+        ],
+        "comp": [TupleVariation(W, [(30, 5), (0, 40), (0, 0), (80, 0), (0, 0), (0, 0)])],
+        "matched": [TupleVariation(W, [(30, 5), (500, 500), (0, 0), (0, 0), (0, 0), (0, 0)])],
+        "mymetrics": [TupleVariation(W, [(0, 0), (0, 0), (-300, 0), (300, 0), (0, 0), (0, 0)])],
+        "phantom": [TupleVariation(W, deltas(3, {3: (40, 0), 4: (100, 0)}))],
+        "space": [TupleVariation(W, deltas(0, {1: (150, 0)}))],
+        "nested": [TupleVariation(D, [(0, -60), (0, 0), (0, 0), (0, 0), (0, 0)])],
+        "spaces": [TupleVariation(W, [(20, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)])],
+        "scales": [TupleVariation(W, [(20, 5), (-30, 10), (40, 0), (0, 7), (0, 0), (60, 0), (0, 0), (0, 0)])],
+        "manymatched": [TupleVariation(D, [(0, 0), (500, 500), (0, 0), (-80, 0), (0, 0), (0, 0)])],
+    }
+    fb.setupGvar(variations)
+    axisTags = ["wght", "wdth", "ZHID"]
+    avar = newTable("avar")
+    avar.majorVersion = 2
+    avar.minorVersion = 0
+    avar.segments = {"wght": {-1.0: -1.0, -0.5: -0.75, 0.0: 0.0, 0.5: 0.25, 1.0: 1.0},
+                     "wdth": {-1.0: -1.0, 0.0: 0.0, 1.0: 1.0},
+                     "ZHID": {}}
+    avar.table = ot.avar()
+    avar.table.VarIdxMap = ot.DeltaSetIndexMap()
+    avar.table.VarIdxMap.Format = 0
+    avar.table.VarIdxMap.mapping = [0, 1, 1]
+    avar.table.VarStore = buildVarStore(buildVarRegionList([{"wdth": (0, 1, 1)}], axisTags),
+                                        [buildVarData([0], [[2000], [0]], optimize=False)])
+    fb.font["avar"] = avar
+    # MVAR: line metrics and the rest over weight, one past 16 bits.
+    tags = ["hasc", "hcla", "hcld", "hdsc", "hlgp", "cpht", "stro", "strs", "undo", "unds", "xhgt"]
+    rows = [[40, -10], [60, 0], [-30, 5], [-20, 0], [10, 10], [25, 0], [-15, 3], [40000, 0], [7, 0], [-3, 0], [33, -8]]
+    store = buildVarStore(buildVarRegionList([W, D], axisTags), [buildVarData([0, 1], rows, optimize=False)])
+    mvar = newTable("MVAR")
+    mvar.table = ot.MVAR()
+    mvar.table.Version = 0x00010000
+    mvar.table.Reserved = 0
+    mvar.table.ValueRecordSize = 8
+    mvar.table.VarStore = store
+    mvar.table.ValueRecord = []
+    # Sorted by tag, which readers search by halves.
+    for t, i in sorted((t, i) for i, t in enumerate(tags)):
+        r = ot.MetricsValueRecord()
+        r.ValueTag = t
+        r.VarIdx = i
+        mvar.table.ValueRecord.append(r)
+    mvar.table.ValueRecordCount = len(tags)
+    fb.font["MVAR"] = mvar
+    fb.updateHead(created=3786825600, modified=3786825600)
+    fb.save(os.path.join(OUT, "var.ttf"))
+    print("var.ttf", os.path.getsize(os.path.join(OUT, "var.ttf")), "bytes")
+
+
+def synthetic_var_cff2():
+    # A variable CFF2 font: two sets of variation data, the second chosen by
+    # the Private DICT (three regions a value) and the first by vsindex in a
+    # charstring (two); regions
+    # over two axes, one intermediate; blends of one value and of several;
+    # and HVAR without a mapping, glyph by glyph.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.misc.psCharStrings import T2CharString
+    from fontTools.ttLib import newTable
+    from fontTools.ttLib.tables import otTables as ot
+    from fontTools.varLib.builder import buildVarRegionList, buildVarData, buildVarStore
+    from fontTools.cffLib import VarStoreData
+    names = [".notdef", "box", "vs0", "multi", "curve"]
+    axisTags = ["wght", "wdth"]
+    fb = FontBuilder(1000, isTTF=False)
+    fb.setupGlyphOrder(names)
+    fb.setupNameTable({"familyName": "Caustic Test Var CFF2", "styleName": "Regular"})
+    fb.setupFvar([("wght", 100, 400, 900, "Weight"), ("wdth", 75, 100, 125, "Width")], [])
+    # Data 0 weighs regions 0 and 1; data 1, the Private DICT's, regions 2, 3, 0.
+    regions = [{"wght": (0, 1, 1)}, {"wdth": (0, 1, 1)}, {"wght": (-1, -1, 0)},
+               {"wght": (0, 0.5, 1), "wdth": (0, 1, 1)}]
+    progs = {
+        ".notdef": [50, 0, "rmoveto", 300, 500, -300, "hlineto"],
+        "box": [100, 10, -20, 5, 1, "blend", 0, "rmoveto", 400, 30, 0, 60, 1, "blend", "hlineto",
+                700, 0, 40, -15, 1, "blend", "vlineto", -400, -30, 0, -60, 1, "blend", "hlineto"],
+        "vs0": [0, "vsindex", 50, 0, 10, 20, 0, 0, 2, "blend", "rmoveto", 200, 15, 25, 1, "blend", 300, "rlineto"],
+        "multi": [10, 20, 1, 2, 3, 4, 5, 6, 2, "blend", "rmoveto", 100, 0, 0, 0, 1, "blend", "hlineto"],
+        "curve": [0, 0, "rmoveto", 100, 50, 100, 100, 0, 100, 4, 4, 4, 0, 0, 0, 8, 8, 8, -8, -8, -8,
+                  0, 0, 0, 3, 3, 3, 6, "blend", "rrcurveto"],
+    }
+    fb.setupCFF2({n: T2CharString(program=progs[n]) for n in names}, fdArrayList=[{"vsindex": 1}])
+    top = fb.font["CFF2"].cff.topDictIndex[0]
+    store = buildVarStore(buildVarRegionList(regions, axisTags),
+                          [buildVarData([0, 1], None, optimize=False), buildVarData([2, 3, 0], None, optimize=False)])
+    vstore = VarStoreData(otVarStore=store)
+    top.VarStore = vstore
+    for fd in top.FDArray:
+        fd.Private.vstore = vstore
+    for n in names:
+        top.CharStrings[n].private = top.FDArray[0].Private
+    fb.setupHorizontalMetrics({n: (500, 0) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupCharacterMap({0x41 + i: n for i, n in enumerate(names[1:])})
+    fb.setupOS2()
+    fb.setupPost()
+    # HVAR, glyph by glyph: advance deltas over weight and width.
+    hstore = buildVarStore(buildVarRegionList([regions[0], regions[1]], axisTags),
+                           [buildVarData([0, 1], [[0, 0], [100, -50], [20, 0], [0, 33], [-7, 7]], optimize=False)])
+    hvar = newTable("HVAR")
+    hvar.table = ot.HVAR()
+    hvar.table.Version = 0x00010000
+    hvar.table.VarStore = hstore
+    hvar.table.AdvWidthMap = None
+    hvar.table.LsbMap = None
+    hvar.table.RsbMap = None
+    fb.font["HVAR"] = hvar
+    fb.updateHead(created=3786825600, modified=3786825600)
+    fb.save(os.path.join(OUT, "var.otf"))
+    print("var.otf", os.path.getsize(os.path.join(OUT, "var.otf")), "bytes")
+
+
 def main():
     os.makedirs(os.path.join(OUT, "licenses"), exist_ok=True)
     synthetic_big()
+    synthetic_var()
+    synthetic_var_cff2()
     synthetic_cmaps()
     synthetic_composites()
     synthetic_ops()
