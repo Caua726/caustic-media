@@ -1,0 +1,290 @@
+// text/layout/items.cst — the text as characters, and the runs it is shaped
+// in: each character's style, paragraph, bidi level, script and face; where
+// graphemes begin and lines may break; and the items — the longest stretches
+// of a paragraph alike in level, script, face and style.
+use "std/mem.cst" as mem;
+use "caustic-unicode/src/ucd/props.cst" as ucd;
+use "caustic-unicode/src/bidi/bidi.cst" as bidi;
+use "caustic-unicode/src/linebreak/linebreak.cst" as linebreak;
+use "caustic-unicode/src/segment/grapheme.cst" as grapheme;
+use "../shape/shape.cst" as shape;
+use "../shape/chars.cst" as chars;
+use "../shape/scripts.cst" as scripts;
+use "../shape/tables.cst" as tables;
+use "model.cst" as model;
+use "font.cst" as font;
+
+struct Para {
+    start as i64;   // characters
+    end   as i64;   // where its content ends, its separator left out
+    next  as i64;   // where the next begins
+    level as i64;   // 0 left to right, 1 right to left
+}
+
+struct Item {
+    start  as i64;   // characters
+    end    as i64;
+    level  as i64;
+    script as i64;
+    face   as i64;
+    style  as i64;
+    para   as i64;
+    gfirst as i64;   // its glyphs, as shaped whole
+    gcount as i64;
+}
+
+struct Chars {
+    block   as *u8;
+    bytes   as i64;
+    n       as i64;     // characters
+    nbytes  as i64;
+    cps     as *i32;
+    at      as *i64;    // each one's byte offset; at[n] is the text's length
+    style   as *i64;
+    script  as *i64;
+    face    as *i64;
+    level   as *u8;
+    brk     as *u8;     // linebreak's opportunity before each
+    starts  as *u8;     // 1 where a grapheme begins
+    cp_of   as *i64;    // the character at each byte offset; -1 inside one
+    paras   as model.Arr;
+    items   as model.Arr;
+}
+
+fn open() as Chars {
+    let is Chars as c;
+    mem.memzero(cast(*u8, &c), sizeof(Chars));
+    c.paras = model.arr(sizeof(Para));
+    c.items = model.arr(sizeof(Item));
+    return c;
+}
+
+fn close(c as *Chars) as void {
+    if (c.bytes > 0) { mem.core.munmap(c.block, c.bytes); }
+    c.bytes = 0;
+    model.arr_close(&c.paras);
+    model.arr_close(&c.items);
+}
+
+fn para(c as *Chars, i as i64) as *Para { return cast(*Para, model.arr_at(&c.paras, i)); }
+fn item(c as *Chars, i as i64) as *Item { return cast(*Item, model.arr_at(&c.items, i)); }
+
+// Room for n characters of a text of nbytes.
+fn _room(c as *Chars, n as i64, nbytes as i64) as i32 {
+    let is i64 as need = (n + 1) * (4 + 8 * 4 + 3) + (nbytes + 1) * 8 + 64;
+    if (need > c.bytes) {
+        if (c.bytes > 0) { mem.core.munmap(c.block, c.bytes); }
+        let is i64 as b with mut = 4096;
+        while (b < need) { b = b * 2; }
+        c.block = mem.core.mmap_anon(b);
+        if (cast(i64, c.block) <= 0) {
+            c.bytes = 0;
+            return 0;
+        }
+        c.bytes = b;
+    }
+    let is i64 as p with mut = cast(i64, c.block);
+    c.at = cast(*i64, p);
+    p = p + (n + 1) * 8;
+    c.style = cast(*i64, p);
+    p = p + (n + 1) * 8;
+    c.script = cast(*i64, p);
+    p = p + (n + 1) * 8;
+    c.face = cast(*i64, p);
+    p = p + (n + 1) * 8;
+    c.cp_of = cast(*i64, p);
+    p = p + (nbytes + 1) * 8;
+    c.cps = cast(*i32, p);
+    p = p + (n + 1) * 4;
+    c.level = cast(*u8, p);
+    p = p + (n + 1);
+    c.brk = cast(*u8, p);
+    p = p + (n + 1);
+    c.starts = cast(*u8, p);
+    return 1;
+}
+
+fn is_paragraph_end(u as i64) as i32 {
+    return cast(i32, u == 10 || u == 13 || u == 133 || u == 8233);
+}
+
+// Whether u is drawn as nothing at a line's end: a space, a tab, a line
+// separator.
+fn is_space(u as i64) as i32 {
+    return cast(i32, u == 9 || u == 8232 || chars.category(u) == ucd.GC_ZS);
+}
+
+fn _iso(sc as i64) as i64 {
+    if (sc < 0 || sc >= tables.SCRIPT_COUNT) { return scripts.of("Zzzz"); }
+    return scripts.of(cast(*u8, cast(i64, tables.SCRIPTS) + sc * 4));
+}
+
+// The text read, and everything above found for it.
+fn read(c as *Chars, text as *u8, nbytes as i64, styles as *model.Style, spans as *model.Span, nspans as i64,
+        dir as i64) as i32 {
+    // How many characters, then each one.
+    let is i64 as n with mut = 0;
+    let is i64 as b with mut = 0;
+    while (b < nbytes) {
+        let is i64 as u with mut = 0;
+        b = shape.decode(text, b, nbytes, &u);
+        n = n + 1;
+    }
+    if (_room(c, n, nbytes) == 0) { return 0; }
+    c.n = n;
+    c.nbytes = nbytes;
+    let is i64 as i with mut = 0;
+    while (i <= nbytes) {
+        c.cp_of[i] = 0 - 1;
+        i = i + 1;
+    }
+    b = 0;
+    i = 0;
+    while (b < nbytes) {
+        let is i64 as u with mut = 0;
+        let is i64 as next = shape.decode(text, b, nbytes, &u);
+        c.cps[i] = cast(i32, u);
+        c.at[i] = b;
+        c.cp_of[b] = i;
+        c.style[i] = 0;
+        b = next;
+        i = i + 1;
+    }
+    c.at[n] = nbytes;
+    c.cp_of[nbytes] = n;
+
+    // Styles: the later span over the earlier.
+    let is i64 as s with mut = 0;
+    while (s < nspans) {
+        let is model.Span as sp = spans[s];
+        i = 0;
+        while (i < n) {
+            if (c.at[i] >= sp.start && c.at[i] < sp.end) { c.style[i] = sp.style; }
+            i = i + 1;
+        }
+        s = s + 1;
+    }
+
+    // Paragraphs, and their levels. A text that ends with a separator ends
+    // with an empty paragraph.
+    c.paras.n = 0;
+    let is i64 as base with mut = 2;
+    if (dir == model.DIR_LTR) { base = 0; }
+    if (dir == model.DIR_RTL) { base = 1; }
+    let is i64 as start with mut = 0;
+    let is i32 as going with mut = 1;
+    while (going == 1) {
+        let is i64 as k with mut = start;
+        while (k < n && is_paragraph_end(cast(i64, c.cps[k])) == 0) { k = k + 1; }
+        let is i64 as next with mut = n;
+        if (k < n) {
+            next = k + 1;
+            if (c.cps[k] == cast(i32, 13) && k + 1 < n && c.cps[k + 1] == cast(i32, 10)) { next = k + 2; }
+        }
+        let is *Para as p = cast(*Para, model.arr_push(&c.paras));
+        if (cast(i64, p) == 0) { return 0; }
+        p.start = start;
+        p.end = k;
+        p.next = next;
+        p.level = base & 1;
+        if (k > start) {
+            let is i64 as level = bidi.resolve_levels(cast(*i32, cast(i64, c.cps) + start * 4), k - start, base,
+                                                      cast(*u8, cast(i64, c.level) + start));
+            if (level >= 0) { p.level = level & 1; }
+            linebreak.line_break_fill(cast(*i32, cast(i64, c.cps) + start * 4), k - start,
+                                      cast(*u8, cast(i64, c.brk) + start));
+        }
+        let is i64 as q with mut = k;
+        while (q < next) {
+            c.level[q] = cast(u8, p.level);
+            c.brk[q] = cast(u8, 0);
+            q = q + 1;
+        }
+        if (k >= n) { going = 0; }
+        start = next;
+    }
+
+    // Scripts: the common and inherited take their neighbours'.
+    let is i64 as pi with mut = 0;
+    while (pi < c.paras.n) {
+        let is *Para as p = para(c, pi);
+        let is i64 as last with mut = 0;
+        let is i64 as first_real with mut = 0;
+        i = p.start;
+        while (i < p.next) {
+            let is i64 as sc = _iso(ucd.script(c.cps[i]));
+            if (scripts.is_none(sc) == 0) {
+                last = sc;
+                if (first_real == 0) { first_real = sc; }
+            }
+            c.script[i] = last;
+            i = i + 1;
+        }
+        if (first_real == 0) { first_real = scripts.of("Zyyy"); }
+        i = p.start;
+        while (i < p.next && c.script[i] == 0) {
+            c.script[i] = first_real;
+            i = i + 1;
+        }
+        pi = pi + 1;
+    }
+
+    // Graphemes.
+    i = 0;
+    while (i < n) {
+        c.starts[i] = cast(u8, grapheme.grapheme_is_boundary(c.cps, n, i));
+        i = i + 1;
+    }
+    if (n > 0) { c.starts[0] = cast(u8, 1); }
+    c.starts[n] = cast(u8, 1);
+
+    // Faces: a grapheme's first character finds one, and the rest stay in
+    // it when it has them.
+    let is i64 as g with mut = 0 - 1;
+    i = 0;
+    while (i < n) {
+        let is *model.Style as st = &styles[c.style[i]];
+        let is i64 as u = cast(i64, c.cps[i]);
+        if (c.starts[i] == cast(u8, 1) || g < 0 || c.style[i] != c.style[i - 1]) {
+            g = font.find(st.font, u);
+            c.face[i] = g;
+        } else if (chars.is_ignorable(u) == 1 || font.has(st.font, g, u) == 1) {
+            c.face[i] = g;
+        } else {
+            let is i64 as other = font.find(st.font, u);
+            c.face[i] = g;
+            if (font.has(st.font, other, u) == 1) { c.face[i] = other; }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The items of each paragraph's content.
+fn itemize(c as *Chars) as i32 {
+    c.items.n = 0;
+    let is i64 as pi with mut = 0;
+    while (pi < c.paras.n) {
+        let is *Para as p = para(c, pi);
+        let is i64 as i with mut = p.start;
+        while (i < p.end) {
+            let is i64 as j with mut = i + 1;
+            while (j < p.end && c.level[j] == c.level[i] && c.script[j] == c.script[i] && c.face[j] == c.face[i] &&
+                   c.style[j] == c.style[i]) {
+                j = j + 1;
+            }
+            let is *Item as it = cast(*Item, model.arr_push(&c.items));
+            if (cast(i64, it) == 0) { return 0; }
+            it.start = i;
+            it.end = j;
+            it.level = cast(i64, c.level[i]);
+            it.script = c.script[i];
+            it.face = c.face[i];
+            it.style = c.style[i];
+            it.para = pi;
+            i = j;
+        }
+        pi = pi + 1;
+    }
+    return 1;
+}

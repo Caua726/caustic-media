@@ -6,99 +6,156 @@ answers where they go — and it is the part [`ui/`](../../ui/ui.md) talks to.
 
 ```
 layout/
-  run.cst      splitting a string into script, direction and font runs
-  line.cst     breaking, and fitting shaped runs into a width
-  align.cst    left, right, centre, justify
-  bidi.cst     reordering visual runs from logical order
-  cursor.cst   caret positions, hit-testing, selection rectangles
-  vertical.cst CJK vertical writing
+  layout.cst   the hub: text, styles and a box in; lines of glyphs out
+  font.cst     what text is set in: faces found for characters, opened at a size
+  items.cst    paragraphs, bidi levels, scripts, faces: the runs shaping takes
+  lines.cst    breaking into lines, fitting, ellipsis, bidi reordering, alignment
+  cursor.cst   carets, hit-testing, selection — the questions a text field asks
 ```
+
+Everything here is in pixels, as `f64`, as `ui/` measures: a style says how
+many pixels its em is, and font units are scaled to it.
 
 ---
 
 ## Runs come before shaping
 
 A string is not shaped as one unit. It is split into runs that are uniform in
-three things — **one script, one direction, one font** — because a shaper needs
-all three fixed, and because a fallback chain means different parts of a sentence
-may come from different faces.
+what the shaper needs fixed — **one script, one direction, one face, one
+style** — because a fallback chain means different parts of a sentence may come
+from different faces.
 
-All three splits come from
-[caustic-unicode](https://github.com/Caua726/caustic-unicode): script
-identification, the bidirectional algorithm's embedding levels, and the grapheme
-boundaries that keep a cluster from being split across runs.
-
-That ordering is why `run.cst` is first in this directory and why shaping has no
-opinion about Unicode.
-
----
+- **Paragraphs** end at a paragraph separator, a line feed, a carriage return
+  (with the line feed after it) or a next line; each is laid out on its own,
+  in its own direction.
+- **Directions** are the bidirectional algorithm's levels, caustic-unicode's
+  UAX #9, over each paragraph — its base direction given, or found from its
+  first strong character.
+- **Scripts** come from caustic-unicode's Script property; characters common
+  to scripts (spaces, digits, punctuation) and inherited ones (marks) take the
+  script of the text before them, or after them at the start.
+- **Faces**: the style's font finds the first face with a glyph for each
+  grapheme's first character, and the grapheme stays in it when the face has
+  the rest.
 
 ## Breaking is not splitting on spaces
 
-Line breaking is UAX #14, and caustic-unicode implements it. It matters because
-the naive version is wrong in most of the world: Chinese and Japanese break
-between almost any two characters and have no spaces; Thai has no spaces and
-needs dictionary-based segmentation; and even in English, a break may not fall
-after an opening bracket or before a closing one.
+Line breaking is UAX #14, and caustic-unicode implements it: Chinese and
+Japanese break between almost any two characters and have no spaces, and even
+in English a break may not fall after an opening bracket or before a closing
+one. This layer asks for the break **opportunities** and fits greedily: each
+line takes as many as fit the width, a word longer than a line is broken
+between graphemes, and spaces at the end of a line hang past it. (Knuth and
+Plass's paragraph optimisation is what a document renderer needs, and can
+come later without disturbing the rest.)
 
-So this layer asks for the break **opportunities** and decides which to use given
-a width — which is a different and much simpler problem, and one where the
-classic choice appears: greedy fitting, or Knuth-Plass paragraph optimisation
-that minimises raggedness across the whole paragraph.
+A line ends where a break falls between two clusters the shaper said are
+**safe to break** between: the glyphs on each side stay as they were shaped.
+Where it is not safe — inside a kerned pair, a contextual form — each side is
+shaped again on its own.
 
-Greedy is what a UI needs. Knuth-Plass is what a document renderer needs, and it
-is worth naming as a thing that can be added later without disturbing the rest.
-
----
+A text may be held to a number of lines; the last then ends in an **ellipsis**
+(U+2026, in the style of what it follows) when there is more. A **tab** moves to
+the next multiple of the tab width from the start of the line.
 
 ## Bidirectional text reorders after breaking
 
-The bidi algorithm produces embedding levels over the logical string;
-reordering into visual order happens **per line**, after the break points are
-known, because a run split across two lines reorders independently on each.
+The levels are resolved over the logical paragraph; reordering into visual
+order happens **per line**, after the break points are known, because a run
+split across two lines reorders independently on each (UAX #9's L1 and L2:
+trailing whitespace back at the paragraph level, then the highest levels
+reversed first).
 
-Getting the order wrong is the visible failure. Getting the *edges* wrong is the
-subtle one: where an Arabic run meets a Latin one, the boundary belongs to a
-level rather than to either side, and a caret placed there has two valid positions
-— one for each direction.
+## Lines
 
----
+A line is as tall as the tallest face on it — its ascender, descender and
+line gap at its size (`OS/2`'s typographic values when the face says to use
+them, `hhea`'s otherwise) — times the line height asked for. Lines are aligned
+to the start or the end of the paragraph's direction, to the left, the right,
+the centre, or justified: the space left on a line, but the last of a
+paragraph, shared between its spaces.
+
+Underline and strikethrough are where each face puts them (`post`, `OS/2`), at
+the thickness it gives, along the glyphs of the spans that ask.
 
 ## The three questions a text field asks
 
-`ui/`'s text field needs exactly these, and answering them afterwards from
-positioned glyphs is much harder than recording them while laying out:
+`ui/`'s text field needs these, and answering them afterwards from positioned
+glyphs is much harder than recording them while laying out:
 
-- **Where is the caret for this byte offset?** Not per glyph — a grapheme cluster
-  may be several codepoints and one caret stop, and a ligature is one glyph with
-  a caret position inside it.
-- **Which offset is under this point?** The inverse, including the half-glyph rule
-  that puts the caret on the nearer side.
+- **Where is the caret for this byte offset?** Not per glyph — a grapheme
+  cluster may be several codepoints and one caret stop, and a ligature is one
+  glyph with caret positions inside it, shared out by its graphemes.
+- **Which offset is under this point?** The inverse, including the half-glyph
+  rule that puts the caret on the nearer side.
 - **What does the selection look like?** In bidirectional text, a logically
-  contiguous selection can be **two or more disjoint rectangles**, which is the
-  thing implementations get wrong and users notice immediately.
+  contiguous selection can be **two or more disjoint rectangles**.
 
-These are why `cursor.cst` exists as its own file rather than being a couple of
-functions on the side.
-
----
+Where an Arabic run meets a Latin one, the boundary belongs to a level rather
+than to either side, and a caret placed there has two valid positions — one
+for each direction; the caret says which it is and where the other is. Which
+one is the position's: upstream it goes with the text before it, as at a
+wrap it is the end of the line before. Moving left and right goes from place
+to place as they are drawn, so each stop inside a run of the other direction
+is reached from either side. Moving up and down keeps the x the caret had;
+moving by word uses caustic-unicode's word boundaries, by character its
+grapheme boundaries.
 
 ## Vertical writing
 
 CJK set vertically is not rotated horizontal text: some glyphs rotate, some do
-not, punctuation moves to different positions in the em box, and the line advance
-runs horizontally. `vertical.cst` is small but it cannot be faked with a
-transform, and pretending otherwise produces text a reader can see is wrong.
-
-Not urgent, and worth naming so that the line model is not built in a way that
-assumes horizontal.
+not, punctuation moves to different positions in the em box, and the line
+advance runs horizontally. That is [B], and the line model keeps an axis so as
+not to assume horizontal.
 
 ---
 
-## Order of work
+## Tests
 
-1. **`run` and `line`**, greedy, horizontal, left-to-right — enough for a label.
-2. **`align`.**
-3. **`cursor`**, which `ui/`'s text field blocks on entirely.
-4. **`bidi`**, once a script that needs it is supported by shaping.
-5. **`vertical`** and Knuth-Plass, when something asks.
+`layout_test` sets text in the test fonts (`text/testdata`) through a font of
+those faces and checks what layout promises: where lines break — before a
+width is passed, at opportunities, by graphemes when a word is too long and
+as many as fit, giving back a grapheme when a part shaped alone is wider, at
+paragraph ends; that each line's glyphs are the shaper's for that stretch,
+features ranged per paragraph, an item that shapes to nothing; alignment of
+every glyph, line and decoration, justification of every space, the
+ellipsis in the style of what it follows, tabs at and between stops, line
+heights; bidirectional lines in visual order; decorations, side by side and
+not under hanging spaces; paragraphs, scripts, faces and styles found for
+each character, the face found again where a style changes inside a
+grapheme; more faces at sizes than can be open, refused; a long text, and
+one whose memory ends where it does. For the cursor: every caret stop
+round-trips through hit-testing; moving right and left visits each stop
+once, the caret moving the one way — through wrapped lines, runs of both
+directions and marks; graphemes and words from any offset, inside a
+character too; and selections cover exactly what they select.
+
+Mutation testing changed every comparison, sum, constant and return value of
+the layout's modules and the cursor's, one at a time; a case was added
+wherever a change went unseen and could be seen — one of them showed moving
+right and left skipping the inside of a run of the other direction, where
+an offset's two places meet, which was then put right. Of the 282 changes
+that still go unseen, most are of kinds no output shows: memory refused and
+faces that cannot be opened; sentinels any negative value serves;
+capacities; one past an end where nothing is read; equal values and ties; a
+first guess at a line's end, too short, that measuring corrects; text shaped
+again where it need not be, to the same glyphs; what no test font has (a
+line gap, a font without strikeout metrics). Some 25 are paths no case tells
+apart yet: tabs in a right-to-left line, spaces hanging over several parts,
+a justified line of several parts, trailing whitespace of another level than
+its paragraph's, a line given back to an opportunity once shaped alone, an
+ellipsis wider than the box.
+
+## Current state
+
+Text is itemized by paragraph, bidi level, script, face and style; broken at
+caustic-unicode's opportunities, by graphemes when a word is wider than the
+box, at most `max_lines` lines with an ellipsis; reshaped where a break falls
+inside what the shaper marked unsafe; reordered with bidi per line; aligned
+(start, end, left, right, centre, justified on spaces), with tabs and line
+heights from the faces' metrics; underlined and struck through from `post`
+and `OS/2`. The cursor answers carets (two at a direction boundary), hit
+tests, selection rectangles across bidi runs, and moves by graphemes, words,
+visual left and right, and lines with a preferred x.
+
+Vertical writing and hyphenation are [B].

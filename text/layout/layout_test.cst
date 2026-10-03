@@ -1,0 +1,1269 @@
+// text/layout/layout_test.cst — layout held to what layout.md promises, on the
+// test fonts: shape-plain.ttf first, glyf.ttf behind it for what it lacks,
+// at an em of 20 pixels (0.02 of a unit). Where lines break — before the
+// width is passed, at opportunities, between graphemes in a word too long,
+// at separators and paragraph ends; that a line's glyphs are the shaper's
+// for its text alone; alignment, justification, the ellipsis, tabs, line
+// heights; bidirectional lines in the order they are drawn, whitespace at
+// their end back at the paragraph's level; faces found for what the first
+// lacks; lines under and through the text. And the cursor's answers: the
+// caret before and after each grapheme, both of its places where directions
+// meet, a ligature's advance shared; every caret stop found again by
+// hitting it; selections over runs of both directions; moving by grapheme,
+// by word, left and right as drawn, up and down.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../sfnt/sfnt.cst" as sfnt;
+use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
+use "../sfnt/cmap.cst" as cmap;
+use "../outline/outline.cst" as outline;
+use "../shape/shape.cst" as shape;
+use "../shape/scripts.cst" as scripts;
+use "model.cst" as model;
+use "font.cst" as font;
+use "items.cst" as items;
+use "../fonts/scan.cst" as scan;
+use "../fonts/face.cst" as fface;
+use "../fonts/index.cst" as index;
+use "../fonts/chain.cst" as chain;
+use "layout.cst" as layout;
+use "cursor.cst" as cursor;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn near(a as f64, b as f64) as i32 {
+    let is f64 as d = a - b;
+    return cast(i32, d < 0.0001 && d > 0.0 - 0.0001);
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// --- The fonts, the shaper alone ---
+
+let is [2]table.Face as faces;
+let is font.List as list;
+let is font.Font as fo with mut;
+let is font.List as glyf_list;
+let is font.Font as glyf_first with mut;
+let is outline.Reader as plain with mut;
+let is shape.Shaper as sh;
+let is layout.Layout as lay;
+let is table.Face as lookups_face with mut;
+let is font.List as lookups_list;
+let is font.Font as lookups_font with mut;
+let is [2]table.Face as swapped;
+let is font.List as swapped_list;
+let is font.Font as swapped_font with mut;
+let is [1]shape.Feature as ss05;
+let is layout.Layout as lay2;
+let is [8]model.Style as styles;
+let is f64 as PX with imut = 20.0;
+let is f64 as SCALE with imut = 0.02;
+
+// How wide text is, shaped alone in shape-plain.ttf, left to right.
+fn width_of(text as *u8) as f64 {
+    let is shape.Text as t;
+    t.bytes = text;
+    t.n = len(text);
+    t.start = 0;
+    t.length = 0 - 1;
+    t.dir = shape.LTR;
+    t.script = scripts.of("Latn");
+    t.lang = cast(*u8, 0);
+    t.features = cast(*shape.Feature, 0);
+    t.nfeatures = 0;
+    t.flags = shape.AT_START;
+    shape.shape(&sh, &plain, &t);
+    let is f64 as w with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < shape.count(&sh)) {
+        w = w + cast(f64, shape.place(&sh, i).xa) * SCALE;
+        i = i + 1;
+    }
+    return w;
+}
+
+// Whether line li's glyphs are the shaper's for its text alone, at the
+// advances it gives them.
+fn line_as_shaped(text as *u8, li as i64) as i32 {
+    let is *model.Line as l = layout.line(&lay, li);
+    let is shape.Text as t;
+    t.bytes = text;
+    t.n = len(text);
+    t.start = l.start;
+    t.length = l.end - l.start;
+    t.dir = shape.LTR;
+    t.script = scripts.of("Latn");
+    t.lang = cast(*u8, 0);
+    t.features = cast(*shape.Feature, 0);
+    t.nfeatures = 0;
+    t.flags = 0;
+    if (l.start == 0) { t.flags = shape.AT_START; }
+    shape.shape(&sh, &plain, &t);
+    if (shape.count(&sh) != l.count) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < l.count) {
+        let is *model.Glyph as g = layout.glyph(&lay, l.first + i);
+        if (cast(i64, g.id) != cast(i64, shape.glyph(&sh, i).id)) { return 0; }
+        if (near(g.adv, cast(f64, shape.place(&sh, i).xa) * SCALE) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn style(px as f64) as model.Style {
+    let is model.Style as s;
+    mem.memzero(cast(*u8, &s), sizeof(model.Style));
+    s.font = &fo;
+    s.px = px;
+    s.lang = cast(*u8, 0);
+    s.features = cast(*shape.Feature, 0);
+    s.nfeatures = 0;
+    return s;
+}
+
+fn lay_out(text as *u8, p as *model.Params) as i32 {
+    return layout.set(&lay, text, len(text), cast(*model.Style, &styles), 8, cast(*model.Span, 0), 0, p);
+}
+
+fn lay_spans(text as *u8, p as *model.Params, spans as *model.Span, n as i64) as i32 {
+    return layout.set(&lay, text, len(text), cast(*model.Style, &styles), 8, spans, n, p);
+}
+
+fn line_count() as i64 { return layout.line_count(&lay); }
+fn line(i as i64) as *model.Line { return layout.line(&lay, i); }
+fn glyph(i as i64) as *model.Glyph { return layout.glyph(&lay, i); }
+
+// --- Lines ---
+
+fn one_line() as void {
+    let is model.Params as p = model.params();
+    let is *u8 as text = "Hello world";
+    check("one line: laid out", lay_out(text, &p) == 1);
+    check("one line: one line", line_count() == 1);
+    let is f64 as w = width_of(text);
+    check("one line: as wide as the text", near(line(0).width, w) == 1 && near(layout.width(&lay), w) == 1);
+    check("one line: the shaper's glyphs", line_as_shaped(text, 0) == 1);
+    let is f64 as x with mut = 0.0;
+    let is i32 as placed with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < line(0).count) {
+        if (near(glyph(i).x, x) == 0) { placed = 0; }
+        x = x + glyph(i).adv;
+        i = i + 1;
+    }
+    check("one line: each glyph after the last", placed);
+    check("one line: 20 pixels high, the baseline 16 down",
+          near(line(0).height, 20.0) == 1 && near(line(0).y, 16.0) == 1 && near(glyph(0).y, 16.0) == 1);
+    check("one line: the layout as high", near(layout.height(&lay), 20.0) == 1);
+    check("one line: its bytes", line(0).start == 0 && line(0).end == 11 && line(0).last == 1);
+    check("one line: clusters are bytes", glyph(1).cluster == cast(u32, 1) && glyph(6).cluster == cast(u32, 6));
+}
+
+fn breaking() as void {
+    let is model.Params as p = model.params();
+    let is *u8 as text = "aaa aaa aaa";
+    let is f64 as two = width_of("aaa aaa");
+    p.width = two + 0.5;
+    check("breaking: laid out", lay_out(text, &p) == 1);
+    check("breaking: two lines", line_count() == 2);
+    check("breaking: the first to its space", line(0).start == 0 && line(0).end == 8 && line(0).last == 0);
+    check("breaking: the second the rest", line(1).start == 8 && line(1).end == 11 && line(1).last == 1);
+    check("breaking: the space hangs", near(line(0).width, two) == 1);
+    check("breaking: the second under the first", near(line(1).top, 20.0) == 1 && near(line(1).y, 36.0) == 1);
+    check("breaking: each line the shaper's", line_as_shaped(text, 0) == 1 && line_as_shaped(text, 1) == 1);
+    p.width = two;
+    lay_out(text, &p);
+    check("breaking: a line exactly as wide fits", line_count() == 2 && line(0).end == 8);
+    p.width = two - 0.5;
+    lay_out(text, &p);
+    check("breaking: narrower, three lines", line_count() == 3 && line(0).end == 4 && line(1).end == 8);
+}
+
+// How wide bytes a .. b of text are, shaped alone in shape-plain.ttf.
+fn part_width(text as *u8, a as i64, b as i64) as f64 {
+    let is shape.Text as t;
+    t.bytes = text;
+    t.n = len(text);
+    t.start = a;
+    t.length = b - a;
+    t.dir = shape.LTR;
+    t.script = scripts.of("Latn");
+    t.lang = cast(*u8, 0);
+    t.features = cast(*shape.Feature, 0);
+    t.nfeatures = 0;
+    t.flags = 0;
+    if (a == 0) { t.flags = shape.AT_START; }
+    shape.shape(&sh, &plain, &t);
+    let is f64 as w with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < shape.count(&sh)) {
+        w = w + cast(f64, shape.place(&sh, i).xa) * SCALE;
+        i = i + 1;
+    }
+    return w;
+}
+
+fn long_words() as void {
+    let is model.Params as p = model.params();
+    let is *u8 as text = "AVAVAVAVAV";
+    p.width = width_of("AVA") + 0.5;
+    check("a long word: laid out", lay_out(text, &p) == 1);
+    check("a long word: broken between graphemes", line_count() >= 3);
+    let is i32 as alone with mut = 1;
+    let is i32 as fit with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < line_count()) {
+        if (line_as_shaped(text, i) == 0) { alone = 0; }
+        if (line(i).width > p.width + 0.0001) { fit = 0; }
+        i = i + 1;
+    }
+    check("a long word: each part shaped alone, its kerning at the cut gone", alone);
+    check("a long word: each part fits", fit);
+    let is i32 as most with mut = 1;
+    i = 0;
+    while (i + 1 < line_count()) {
+        if (part_width(text, line(i).start, line(i).end + 1) <= p.width) { most = 0; }
+        i = i + 1;
+    }
+    check("a long word: each part as long as fits", most);
+    // AVA alone is wider than as part of the word, its last A not kerned
+    // there: a box between the two gives that line back its last grapheme.
+    p.width = width_of("AVA") - 0.4;
+    check("a long word: a part too wide once shaped alone, given back", lay_out(text, &p) == 1 &&
+          line(0).end == 2 && line(0).width <= p.width);
+    p.width = 1.0;
+    lay_out(text, &p);
+    check("a long word in no room: a grapheme a line", line_count() == 10);
+    // Graphemes of two characters, x and an acute: two of them a line.
+    let is *u8 as marks = "x\xcc\x81x\xcc\x81x\xcc\x81x\xcc\x81x\xcc\x81";
+    p.width = width_of("x\xcc\x81x\xcc\x81") + 0.5;
+    lay_out(marks, &p);
+    check("a long word of graphemes of two: two a line", line_count() == 3 && line(0).end == 6 && line(1).end == 12);
+}
+
+fn separators() as void {
+    let is model.Params as p = model.params();
+    let is *u8 as text = "ab\xe2\x80\xa8cd";
+    check("a line separator: laid out", lay_out(text, &p) == 1);
+    check("a line separator: two lines", line_count() == 2);
+    check("a line separator: ends the first", line(0).end == 5 && line(0).last == 1 && line(1).start == 5);
+    check("a line separator: hangs", near(line(0).width, width_of("ab")) == 1);
+    let is *u8 as paras = "ab\ncd\n";
+    check("paragraphs: laid out", lay_out(paras, &p) == 1);
+    check("paragraphs: three lines, the last empty", line_count() == 3 && line(2).count == 0);
+    check("paragraphs: the separators left out", line(0).end == 2 && line(1).start == 3 && line(1).end == 5);
+    check("paragraphs: the empty one where the text ends", line(2).start == 6 && line(2).end == 6);
+    check("paragraphs: one under another", near(line(1).top, 20.0) == 1 && near(line(2).top, 40.0) == 1 &&
+          near(layout.height(&lay), 60.0) == 1);
+    check("nothing: laid out", lay_out("", &p) == 1);
+    check("nothing: a line of no glyphs, as high as the font", line_count() == 1 && line(0).count == 0 &&
+          near(line(0).height, 20.0) == 1 && near(layout.width(&lay), 0.0) == 1);
+}
+
+fn alignment() as void {
+    let is model.Params as p = model.params();
+    let is f64 as w = width_of("ab");
+    p.width = 300.0;
+    p.align = model.ALIGN_RIGHT;
+    lay_out("ab", &p);
+    check("right: against the right", near(line(0).x, 300.0 - w) == 1 && near(glyph(0).x, 300.0 - w) == 1);
+    p.align = model.ALIGN_CENTER;
+    lay_out("ab", &p);
+    check("centre: in the middle", near(line(0).x, (300.0 - w) / 2.0) == 1);
+    p.align = model.ALIGN_END;
+    lay_out("ab", &p);
+    check("end, left to right: right", near(line(0).x, 300.0 - w) == 1);
+    p.align = model.ALIGN_LEFT;
+    lay_out("ab", &p);
+    check("left: at 0", near(line(0).x, 0.0) == 1 && near(glyph(0).x, 0.0) == 1);
+    p.align = model.ALIGN_START;
+    lay_out("\xde\x80\xde\x81", &p);
+    check("start, right to left: right", line(0).level == 1 && near(line(0).x + line(0).width, 300.0) == 1);
+    p.align = model.ALIGN_END;
+    lay_out("\xde\x80\xde\x81", &p);
+    check("end, right to left: left", near(line(0).x, 0.0) == 1);
+    p.align = model.ALIGN_RIGHT;
+    lay_out("ab", &p);
+    check("right: every glyph moved, and the caret with them", near(glyph(1).x, glyph(0).x + glyph(0).adv) == 1 &&
+          near(at(0).x, line(0).x) == 1);
+    lay_out("ab \xde\x80\xde\x81 cd", &p);
+    check("right: each of a line's runs moved", near(at(5).x, line(0).x + width_of("ab ") + width_of("\xde\x81")) == 1 &&
+          near(at(10).x, 300.0) == 1);
+    p.align = model.ALIGN_CENTER;
+    lay_out("ab\nabab", &p);
+    check("centre: every line in the middle", near(line(1).x, (300.0 - width_of("abab")) / 2.0) == 1);
+    let is [1]model.Span as sp;
+    sp[0].start = 0;
+    sp[0].end = 7;
+    sp[0].style = 1;
+    lay_spans("ab\nabab", &p, cast(*model.Span, &sp), 1);
+    check("centre: every line's underline with it", layout.deco_count(&lay) == 2 &&
+          near(layout.deco(&lay, 0).x, glyph(0).x) == 1 && near(layout.deco(&lay, 1).x, glyph(line(1).first).x) == 1);
+    p.width = 0.0 - 1.0;
+    p.align = model.ALIGN_RIGHT;
+    lay_out("ab\nabab", &p);
+    check("no width: aligned in the widest line", near(line(0).x, width_of("abab") - w) == 1 &&
+          near(line(1).x, 0.0) == 1);
+}
+
+fn justified() as void {
+    let is model.Params as p = model.params();
+    let is f64 as w = width_of("aa bb");
+    p.width = w + 10.0;
+    p.align = model.ALIGN_JUSTIFY;
+    check("justified: laid out", lay_out("aa bb cc", &p) == 1);
+    check("justified: two lines", line_count() == 2 && line(0).end == 6);
+    check("justified: the first as wide as the box", near(line(0).width, p.width) == 1);
+    check("justified: the space between the words wider",
+          near(glyph(3).x, width_of("aa ") + 10.0) == 1 && near(glyph(2).adv, width_of(" ") + 10.0) == 1);
+    check("justified: the last line as it is", near(line(1).width, width_of("cc")) == 1 && near(line(1).x, 0.0) == 1);
+    p.width = width_of("aa bb cc") + 10.0;
+    lay_out("aa bb cc dd", &p);
+    check("justified: each space a share", line(0).end == 9 && near(glyph(2).adv, width_of(" ") + 5.0) == 1 &&
+          near(glyph(5).adv, width_of(" ") + 5.0) == 1);
+}
+
+// How wide the first n bytes of text are.
+fn prefix_width(text as *u8, n as i64) as f64 {
+    let is [64]u8 as b;
+    mem.memcpy(cast(*u8, &b), text, n);
+    b[n] = cast(u8, 0);
+    return width_of(cast(*u8, &b));
+}
+
+fn ellipsis() as void {
+    let is model.Params as p = model.params();
+    let is *u8 as text = "aaa aaa aaa";
+    p.width = width_of("aaa aa");
+    p.max_lines = 1;
+    p.ellipsis = 1;
+    check("ellipsis: laid out", lay_out(text, &p) == 1);
+    check("ellipsis: one line, the text cut", line_count() == 1 && layout.cut(&lay) == 1);
+    let is *model.Glyph as last = glyph(line(0).count - 1);
+    let is f64 as dots = last.adv;
+    let is i64 as e = line(0).end;
+    check("ellipsis: last, from the face that has it", last.slot != glyph(0).slot);
+    check("ellipsis: where the text was cut", cast(i64, last.cluster) == e && e > 0 && text[e - 1] != cast(u8, 32));
+    check("ellipsis: within the width", line(0).width <= p.width + 0.0001 &&
+          near(line(0).width, prefix_width(text, e) + last.adv) == 1);
+    let is i64 as k with mut = e;
+    while (text[k] == cast(u8, 32)) { k = k + 1; }
+    check("ellipsis: not a letter more would fit", prefix_width(text, k + 1) + last.adv > p.width);
+    p.ellipsis = 0;
+    p.max_lines = 2;
+    p.width = width_of("aaa") + 0.5;
+    lay_out(text, &p);
+    check("two lines at most: two, cut", line_count() == 2 && layout.cut(&lay) == 1 && line(1).end == 8);
+    p.max_lines = 3;
+    lay_out(text, &p);
+    check("three at most: all of it", line_count() == 3 && layout.cut(&lay) == 0);
+    p.max_lines = 2;
+    p.width = 0.0 - 1.0;
+    lay_out("ab\ncd\nef", &p);
+    check("at most two, the second ending its paragraph: cut there", line_count() == 2 && layout.cut(&lay) == 1);
+    // The ellipsis in the style of the letter before it: b twice the size.
+    let is [1]model.Span as sp;
+    sp[0].start = 5;
+    sp[0].end = 13;
+    sp[0].style = 3;
+    p.max_lines = 1;
+    p.ellipsis = 1;
+    p.width = width_of("aaaa ") + 3.0 * width_of("b") + 2.0 * dots;
+    lay_spans("aaaa bbbbbbbb", &p, cast(*model.Span, &sp), 1);
+    let is *model.Glyph as big = glyph(line(0).count - 1);
+    check("ellipsis: in the style of what it follows", line(0).end == 6 && near(big.adv, 2.0 * dots) == 1);
+}
+
+fn tabs() as void {
+    let is model.Params as p = model.params();
+    p.tab = 100.0;
+    lay_out("a\tb", &p);
+    check("a tab: to the next stop", near(glyph(2).x, 100.0) == 1);
+    lay_out("a\tb\tc", &p);
+    check("two tabs: to the stops after", near(glyph(4).x, 200.0) == 1);
+    lay_out("\t\tb", &p);
+    check("a tab at a stop: to the next", near(glyph(2).x, 200.0) == 1);
+    p.tab = 0.0;
+    lay_out("a\tb", &p);
+    check("a tab of eight spaces", near(glyph(2).x, 8.0 * width_of(" ")) == 1);
+}
+
+// --- Both directions ---
+
+fn bidi() as void {
+    let is model.Params as p = model.params();
+    // ab, Thaana, cd: three pieces drawn left to right, the middle reversed.
+    let is *u8 as text = "ab \xde\x80\xde\x81\xde\x82 cd";
+    check("mixed: laid out", lay_out(text, &p) == 1);
+    let is *model.Line as l with mut = line(0);
+    check("mixed: left to right", l.level == 0 && l.pcount == 3);
+    let is *model.Piece as a = layout.piece(&lay, l.pfirst);
+    let is *model.Piece as b = layout.piece(&lay, l.pfirst + 1);
+    let is *model.Piece as c = layout.piece(&lay, l.pfirst + 2);
+    check("mixed: pieces in order", a.level == 0 && b.level == 1 && c.level == 0 && a.start == 0 && b.start == 3 &&
+          c.start == 9);
+    check("mixed: each after the last", near(b.x, a.x + a.width) == 1 && near(c.x, b.x + b.width) == 1);
+    check("mixed: the Thaana drawn from its end",
+          glyph(b.first).cluster == cast(u32, 7) && glyph(b.first + 2).cluster == cast(u32, 3));
+    // Thaana first: a right-to-left paragraph, its Latin drawn first.
+    let is *u8 as rtl = "\xde\x80\xde\x81 ab";
+    lay_out(rtl, &p);
+    l = line(0);
+    check("found right to left: its level", l.level == 1);
+    check("found right to left: ab drawn first", layout.piece(&lay, l.pfirst).start == 5);
+    // Broken after its space, a right-to-left line's space hangs on the left.
+    p.width = width_of("\xde\x80\xde\x81") + 0.5;
+    lay_out("\xde\x80\xde\x81 \xde\x80\xde\x81", &p);
+    check("right to left, broken: two lines", line_count() == 2);
+    l = line(0);
+    check("right to left, broken: the space past the left edge", glyph(l.first).cluster == cast(u32, 4) &&
+          glyph(l.first).x < l.x);
+}
+
+// --- Faces, styles, decorations ---
+
+fn faces_found() as void {
+    let is model.Params as p = model.params();
+    check("a letter shape-plain lacks: laid out", lay_out("a\xd0\x91c", &p) == 1);
+    check("a letter shape-plain lacks: from the next face", glyph(1).slot != glyph(0).slot && glyph(2).slot == glyph(0).slot);
+    let is *font.Sized as z = layout.face(&lay, cast(i64, glyph(1).slot));
+    let is f64 as asc = cast(f64, z.m.ascender) * SCALE;
+    let is f64 as desc = 0.0 - cast(f64, z.m.descender) * SCALE;
+    check("a letter shape-plain lacks: the line as tall as its face",
+          near(line(0).height, asc + desc + cast(f64, z.m.line_gap) * SCALE) == 1 && near(line(0).y, asc) == 1);
+}
+
+fn styled() as void {
+    let is model.Params as p = model.params();
+    let is [1]model.Span as sp;
+    sp[0].start = 3;
+    sp[0].end = 5;
+    sp[0].style = 1;
+    check("a span underlined: laid out", lay_spans("aa bb cc", &p, cast(*model.Span, &sp), 1) == 1);
+    check("a span underlined: one line under it", layout.deco_count(&lay) == 1);
+    let is *model.Deco as d with mut = layout.deco(&lay, 0);
+    check("a span underlined: from its first glyph, as wide as it", near(d.x, glyph(3).x) == 1 &&
+          near(d.w, width_of("bb")) == 1 && d.style == 1);
+    check("a span underlined: under the baseline", d.y > line(0).y && d.h > 0.0);
+    sp[0].style = 2;
+    lay_spans("aa bb cc", &p, cast(*model.Span, &sp), 1);
+    d = layout.deco(&lay, 0);
+    check("a span struck: through the letters", layout.deco_count(&lay) == 1 && d.y < line(0).y &&
+          d.y > line(0).y - 16.0 && near(d.w, width_of("bb")) == 1);
+    let is [2]model.Span as two;
+    two[0].start = 0;
+    two[0].end = 2;
+    two[0].style = 1;
+    two[1].start = 2;
+    two[1].end = 5;
+    two[1].style = 2;
+    lay_spans("aa bb", &p, cast(*model.Span, &two), 2);
+    check("underlined, then struck: two lines", layout.deco_count(&lay) == 2 &&
+          near(layout.deco(&lay, 0).w, width_of("aa")) == 1 && near(layout.deco(&lay, 1).x, glyph(2).x) == 1);
+    sp[0].start = 0;
+    sp[0].end = 5;
+    sp[0].style = 1;
+    p.width = width_of("aa ") + 0.5;
+    lay_spans("aa bb", &p, cast(*model.Span, &sp), 1);
+    check("underlined: not the space hanging at a line's end", layout.deco_count(&lay) == 2 &&
+          near(layout.deco(&lay, 0).w, width_of("aa")) == 1);
+    p.width = 0.0 - 1.0;
+    sp[0].start = 2;
+    sp[0].end = 3;
+    sp[0].style = 3;
+    lay_spans("ab\n", &p, cast(*model.Span, &sp), 1);
+    check("an empty last paragraph: as high as its separator's style", line_count() == 2 &&
+          near(line(1).height, 40.0) == 1);
+    sp[0].start = 3;
+    sp[0].end = 5;
+    sp[0].style = 3;
+    lay_spans("aa bb cc", &p, cast(*model.Span, &sp), 1);
+    check("a span twice the size: the line twice as high", near(line(0).height, 40.0) == 1 &&
+          near(line(0).y, 32.0) == 1);
+    check("a span twice the size: its glyphs twice as wide", near(glyph(3).adv, 2.0 * width_of("b")) == 1);
+    p.line_height = 1.5;
+    lay_out("ab", &p);
+    check("half again as high: the line", near(line(0).height, 30.0) == 1 && near(line(0).y, 21.0) == 1);
+    sp[0].style = 9;
+    check("a span's style out of range: refused", lay_spans("aa bb cc", &p, cast(*model.Span, &sp), 1) == 0);
+    sp[0].style = 8;
+    check("one just past the last: refused", lay_spans("aa bb cc", &p, cast(*model.Span, &sp), 1) == 0);
+    sp[0].style = 0;
+    check("a span of the first style: laid out", lay_spans("aa bb cc", &p, cast(*model.Span, &sp), 1) == 1);
+    let is [2]model.Span as pair;
+    pair[0] = sp[0];
+    pair[1] = sp[0];
+    pair[1].style = 8;
+    check("a second span out of range: refused", lay_spans("aa bb cc", &p, cast(*model.Span, &pair), 2) == 0);
+    styles[0].underline = 1;
+    lay_out("ab", &p);
+    check("the first style underlined: a line under it", layout.deco_count(&lay) == 1);
+    styles[0].underline = 0;
+}
+
+// --- The cursor ---
+
+fn at(offset as i64) as cursor.Caret { return cursor.caret(&lay, cursor.position(offset, 0)); }
+fn at_end(offset as i64) as cursor.Caret { return cursor.caret(&lay, cursor.position(offset, 1)); }
+
+fn carets() as void {
+    let is model.Params as p = model.params();
+    lay_out("abc", &p);
+    check("caret: before a, at 0", near(at(0).x, 0.0) == 1 && at(0).rtl == 0 && near(at(0).x2, 0.0) == 1);
+    check("caret: before b, after a", near(at(1).x, width_of("a")) == 1);
+    check("caret: at the end, after c", near(at(3).x, width_of("abc")) == 1 && at(3).line == 0);
+    check("caret: as high as the line", near(at(1).top, 0.0) == 1 && near(at(1).height, 20.0) == 1);
+    // A ligature: fi, one glyph of glyf.ttf, its advance halved.
+    let is [1]model.Span as sp;
+    sp[0].start = 0;
+    sp[0].end = 2;
+    sp[0].style = 4;
+    lay_spans("fi", &p, cast(*model.Span, &sp), 1);
+    check("caret: fi, one glyph", line(0).count == 1);
+    check("caret: between f and i, half way", near(at(1).x, glyph(0).adv / 2.0) == 1);
+    // Right to left: from the right edge.
+    let is *u8 as thaana = "\xde\x80\xde\x81";
+    lay_out(thaana, &p);
+    let is f64 as r = line(0).x + line(0).width;
+    check("caret right to left: the start on the right", near(at(0).x, r) == 1 && at(0).rtl == 1);
+    check("caret right to left: after the first letter", near(at(2).x, r - width_of("\xde\x80")) == 1);
+    check("caret right to left: the end on the left", near(at(4).x, line(0).x) == 1);
+    // Where directions meet: after the space, and before the Thaana's start
+    // at its right.
+    lay_out("ab \xde\x80\xde\x81", &p);
+    let is cursor.Caret as c = at(3);
+    check("caret where directions meet: after the space", near(c.x2, width_of("ab ")) == 1);
+    check("caret where directions meet: before the Thaana, at its right",
+          near(c.x, width_of("ab ") + width_of(thaana)) == 1 && c.rtl == 1);
+    // A wrapped line's end: upstream on the first line, else the next's start.
+    p.width = width_of("aaa ") + 0.5;
+    lay_out("aaa aaa", &p);
+    check("caret at a wrap: the next line's start", at(4).line == 1 && near(at(4).x, 0.0) == 1);
+    check("caret at a wrap, upstream: the first line's end", at_end(4).line == 0 &&
+          near(at_end(4).x, width_of("aaa ")) == 1);
+}
+
+// Every grapheme boundary of the layout, upstream or not, hit where its
+// caret is drawn: a position drawn there — one of its own places — on the
+// same line. (Where directions meet, two offsets may be drawn at one x.)
+fn round_trips(text as *u8) as i32 {
+    let is i64 as n = len(text);
+    let is i64 as o with mut = 0;
+    let is i32 as going with mut = 1;
+    while (going == 1) {
+        let is i32 as up with mut = 0;
+        while (up < 2) {
+            let is cursor.Caret as c = cursor.caret(&lay, cursor.position(o, up));
+            let is cursor.Position as got = cursor.hit(&lay, c.x, c.top + c.height / 2.0);
+            let is cursor.Caret as again = cursor.caret(&lay, got);
+            if (again.line != c.line || (near(again.x, c.x) == 0 && near(again.x2, c.x) == 0)) { return 0; }
+            up = up + 1;
+        }
+        if (o >= n) { going = 0; } else { o = cursor.next_grapheme(&lay, o); }
+    }
+    return 1;
+}
+
+fn hitting() as void {
+    let is model.Params as p = model.params();
+    lay_out("abc", &p);
+    let is f64 as a = width_of("a");
+    let is f64 as b = width_of("ab");
+    check("hit: the left of b, before it", cursor.hit(&lay, a + 0.1, 10.0).offset == 1);
+    check("hit: the right of b, after it", cursor.hit(&lay, b - 0.1, 10.0).offset == 2);
+    check("hit: left of the text, its start", cursor.hit(&lay, 0.0 - 50.0, 10.0).offset == 0);
+    check("hit: right of the text, its end", cursor.hit(&lay, 500.0, 10.0).offset == 3);
+    check("hit: above the lines, the first", cursor.hit(&lay, a + 0.1, 0.0 - 30.0).offset == 1);
+    check("hit: below them, the last", cursor.hit(&lay, a + 0.1, 300.0).offset == 1);
+    check("hit: every stop of abc found again", round_trips("abc"));
+    let is *u8 as mixed = "ab \xde\x80\xde\x81 cd";
+    lay_out(mixed, &p);
+    check("hit: every stop of a mixed line found again", round_trips(mixed));
+    let is f64 as edge = width_of("ab ") + width_of("\xde\x80\xde\x81");
+    check("hit: where the runs meet, the grapheme that starts there", cursor.hit(&lay, edge, 10.0).offset == 7);
+    p.width = width_of("aaa ") + 0.5;
+    lay_out("aaa aaa", &p);
+    let is cursor.Position as q = cursor.hit(&lay, 400.0, 10.0);
+    check("hit: past a wrapped line's end, its end upstream", q.offset == 4 && q.upstream == 1);
+    check("hit: every stop of wrapped lines found again", round_trips("aaa aaa"));
+    lay_out("\xde\x80\xde\x81", &p);
+    check("hit: right of right-to-left text, its start", cursor.hit(&lay, 500.0, 10.0).offset == 0);
+}
+
+fn selections() as void {
+    let is model.Params as p = model.params();
+    let is [8]cursor.Rect as r;
+    lay_out("abc", &p);
+    check("selection: b alone, one rectangle", cursor.selection(&lay, 1, 2, cast(*cursor.Rect, &r), 8) == 1 &&
+          near(r[0].x, width_of("a")) == 1 && near(r[0].w, width_of("b")) == 1 && near(r[0].h, 20.0) == 1);
+    check("selection: backwards is the same", cursor.selection(&lay, 2, 1, cast(*cursor.Rect, &r), 8) == 1 &&
+          near(r[0].x, width_of("a")) == 1);
+    let is *u8 as mixed = "ab \xde\x80\xde\x81 cd";
+    lay_out(mixed, &p);
+    // b, the space and the first Thaana letter: the letter at the right of
+    // its run, apart from the rest.
+    let is i64 as n = cursor.selection(&lay, 1, 5, cast(*cursor.Rect, &r), 8);
+    let is f64 as run_right = width_of("ab ") + width_of("\xde\x80\xde\x81");
+    check("selection across directions: two rectangles", n == 2);
+    check("selection across directions: b and the space", near(r[0].x, width_of("a")) == 1 &&
+          near(r[0].w, width_of("b ")) == 1);
+    check("selection across directions: the letter at its run's right",
+          near(r[1].x + r[1].w, run_right) == 1 && near(r[1].w, width_of("\xde\x80")) == 1);
+    check("selection: all of it, one rectangle", cursor.selection(&lay, 0, 12, cast(*cursor.Rect, &r), 8) == 1);
+    p.width = width_of("aaa ") + 0.5;
+    lay_out("aaa aaa", &p);
+    check("selection over a wrap: one on each line", cursor.selection(&lay, 2, 6, cast(*cursor.Rect, &r), 8) == 2 &&
+          near(r[1].y, 20.0) == 1 && near(r[1].x, 0.0) == 1);
+    check("selection: only as many written as asked", cursor.selection(&lay, 2, 6, cast(*cursor.Rect, &r), 1) == 2);
+}
+
+fn moving() as void {
+    let is model.Params as p = model.params();
+    lay_out("e\xcc\x81x", &p);
+    check("next grapheme: past e and its accent", cursor.next_grapheme(&lay, 0) == 3);
+    check("previous grapheme: back over them", cursor.prev_grapheme(&lay, 3) == 0);
+    check("next grapheme at the end: the end", cursor.next_grapheme(&lay, 4) == 4);
+    check("previous grapheme at the start: the start", cursor.prev_grapheme(&lay, 0) == 0);
+    lay_out("hello, world", &p);
+    check("next word: the end of hello", cursor.next_word(&lay, 0) == 5);
+    check("next word: then of world", cursor.next_word(&lay, 5) == 12);
+    check("previous word: the start of world", cursor.prev_word(&lay, 12) == 7);
+    check("previous word: then of hello", cursor.prev_word(&lay, 7) == 0);
+    lay_out("abc", &p);
+    check("right: to the next stop", cursor.right(&lay, cursor.position(0, 0)).offset == 1);
+    check("left: to the one before", cursor.left(&lay, cursor.position(1, 0)).offset == 0);
+    check("left at the start: nowhere", cursor.left(&lay, cursor.position(0, 0)).offset == 0);
+    lay_out("\xde\x80\xde\x81", &p);
+    check("left, right to left: onward in the text", cursor.left(&lay, cursor.position(0, 0)).offset == 2);
+    check("right, right to left: back", cursor.right(&lay, cursor.position(2, 0)).offset == 0);
+    p.width = width_of("aaa ") + 0.5;
+    lay_out("aaa aaa", &p);
+    check("right at a line's end: the next line", cursor.right(&lay, cursor.position(4, 1)).offset == 4 &&
+          cursor.right(&lay, cursor.position(4, 1)).upstream == 0);
+    let is f64 as x = at(1).x;
+    check("down: the same x on the next line", cursor.down(&lay, cursor.position(1, 0), x).offset == 5);
+    check("up: back", cursor.up(&lay, cursor.position(5, 0), x).offset == 1);
+    check("up from the first line: the start", cursor.up(&lay, cursor.position(1, 0), x).offset == 0);
+    check("down from the last: the end", cursor.down(&lay, cursor.position(5, 0), x).offset == 7);
+}
+
+// --- Items ---
+
+// Paragraphs, each one's direction, scripts and faces, as the layout found
+// them.
+fn itemized() as void {
+    let is model.Params as p with mut = model.params();
+    let is *items.Chars as c = &lay.chars;
+    lay_out("ab\r\ncd\ref\ngh", &p);
+    check("paragraphs: CR LF ends one, CR and LF each one", c.paras.n == 4 && items.para(c, 0).end == 2 &&
+          items.para(c, 0).next == 4 && items.para(c, 1).start == 4 && items.para(c, 1).next == 7 &&
+          items.para(c, 2).next == 10 && items.para(c, 3).start == 10 && items.para(c, 3).end == 12 &&
+          items.para(c, 3).next == 12);
+    check("a line each", line_count() == 4);
+    lay_out("ab\n\xde\x80\xde\x81", &p);
+    check("each paragraph its own direction: left to right, then right to left",
+          items.para(c, 0).level == 0 && items.para(c, 1).level == 1 && c.level[0] == cast(u8, 0) &&
+          c.level[3] == cast(u8, 1));
+    check("the second paragraph's script its own", c.script[3] == scripts.of("Thaa"));
+    lay_out("\xde\x80\xde\x81\nab", &p);
+    check("and the other way", items.para(c, 0).level == 1 && items.para(c, 1).level == 0 &&
+          c.level[3] == cast(u8, 0));
+    lay_out("(\xde\x80) a", &p);
+    check("common characters take the script before them, the first the first real one",
+          c.script[0] == scripts.of("Thaa") && c.script[2] == scripts.of("Thaa") && c.script[3] == scripts.of("Thaa") &&
+          c.script[4] == scripts.of("Latn"));
+    lay_out("12 3", &p);
+    check("a paragraph of common characters: common", c.script[0] == scripts.of("Zyyy") &&
+          c.script[3] == scripts.of("Zyyy"));
+    lay_out("a\xc4\x80\xcc\x81b", &p);
+    check("a mark in its base's face, which has it", c.face[0] == 0 && c.face[1] == 1 && c.face[2] == 1 &&
+          c.face[3] == 0);
+    lay_out("\xc4\x80\xcc\x8ab", &p);
+    check("a mark its base's face lacks, in one that has it", c.face[0] == 1 && c.face[1] == 0 && c.face[2] == 0);
+    lay_out("ab\r\n", &p);
+    check("a CR LF at the end: one separator, then an empty paragraph", c.paras.n == 2 &&
+          items.para(c, 0).next == 4 && items.para(c, 1).start == 4 && items.para(c, 1).end == 4);
+    lay_out("a\r\nb", &p);
+    lay_out("a\r", &p);
+    check("a CR at the end, after a text with CR LF there: nothing past it read", c.paras.n == 2 &&
+          items.para(c, 0).next == 2 && items.para(c, 1).start == 2);
+    lay_out("ab\ncd", &p);
+    check("items end where their paragraph's content does", c.items.n == 2 && items.item(c, 0).end == 2 &&
+          items.item(c, 1).start == 3 && items.item(c, 1).end == 5);
+    lay_out("b\xc4\x80", &p);
+    check("each byte's character, -1 inside one", c.cp_of[0] == 0 && c.cp_of[1] == 1 && c.cp_of[2] == 0 - 1 &&
+          c.cp_of[3] == 2);
+    let is [2]model.Span as two;
+    two[0].start = 0;
+    two[0].end = 2;
+    two[0].style = 1;
+    two[1].start = 1;
+    two[1].end = 3;
+    two[1].style = 2;
+    lay_spans("abcd", &p, cast(*model.Span, &two), 2);
+    check("spans: the later over the earlier", c.style[0] == 1 && c.style[1] == 2 && c.style[2] == 2 &&
+          c.style[3] == 0);
+    // Ā, then two variation selectors in glyf.ttf's font: the first finds
+    // its face again in that font — none has it, so its first.
+    let is [1]model.Span as one;
+    one[0].start = 2;
+    one[0].end = 8;
+    one[0].style = 4;
+    lay_spans("\xc4\x80\xef\xb8\x80\xef\xb8\x80", &p, cast(*model.Span, &one), 1);
+    check("a style changing inside a grapheme: the face found again", c.face[0] == 1 && c.face[1] == 0 &&
+          c.face[2] == 0);
+    // a, a ring above in the faces the other way round (shape-plain's, the
+    // second), an acute back in the first style: found again there, not
+    // kept in the second face.
+    one[0].start = 1;
+    one[0].end = 3;
+    one[0].style = 7;
+    lay_spans("a\xcc\x8a\xcc\x81", &p, cast(*model.Span, &one), 1);
+    check("a style changing back inside a grapheme: the face found again", c.face[0] == 0 && c.face[1] == 1 &&
+          c.face[2] == 0);
+}
+
+// --- Fonts ---
+
+// A font of faces the program opened, and the faces it opens at sizes.
+fn fonts_listed() as void {
+    check("a face has a glyph", font.has(&fo, 0, 97) == 1);
+    check("not for one it lacks", font.has(&fo, 0, 256) == 0 && font.has(&fo, 1, 256) == 1);
+    check("no face before the first or past the last", font.has(&fo, 0 - 1, 97) == 0 && font.has(&fo, 2, 97) == 0);
+    check("found in the first face with it", font.find(&fo, 97) == 0 && font.find(&fo, 256) == 1);
+    check("one no face has: the first, to draw it missing", font.find(&fo, 19968) == 0);
+    let is font.List as empty;
+    empty.faces = cast(*table.Face, &faces);
+    empty.n = 0;
+    let is font.Font as nothing with mut = font.of_list(&empty);
+    check("a font of no faces finds none", font.find(&nothing, 97) == 0 - 1);
+
+    let is font.Sizes as s with mut = font.sizes();
+    check("no face past the last, slots free", font.sized(&s, &fo, 2, 10.0, 0) == 0 - 1);
+    let is i64 as first = font.sized(&s, &fo, 0, 10.0, 0);
+    check("a face opened at a size", first >= 0 && s.list[first].open == 1 && near(s.list[first].scale, 10.0 / 1000.0) == 1);
+    check("the same again: the same", font.sized(&s, &fo, 0, 10.0, 0) == first);
+    check("another size: another", font.sized(&s, &fo, 0, 11.0, 0) != first);
+    let is i64 as at12 = font.sized(&s, &fo, 1, 12.0, 0);
+    let is i64 as k with mut = 3;
+    while (k < font.MAX_SIZED) {
+        font.sized(&s, &fo, 1, 10.0 + cast(f64, k), 0);
+        k = k + 1;
+    }
+    // Every slot held now; the two opened first used again, so the one at 12
+    // is the one used longest ago — and may go, used before now.
+    font.sized(&s, &fo, 0, 10.0, 0);
+    font.sized(&s, &fo, 0, 11.0, 0);
+    let is i64 as next = font.sized(&s, &fo, 0, 30.0, s.clock);
+    check("full: the one used longest ago given back", next == at12 && s.list[next].px == 30.0);
+    check("and the others kept", font.sized(&s, &fo, 0, 10.0, 0) == first);
+    check("none given back that was used since the layout began", font.sized(&s, &fo, 0, 31.0, 1) == 0 - 1);
+    check("no face past the last", font.sized(&s, &fo, 2, 10.0, 0) == 0 - 1);
+    font.close_sizes(&s);
+}
+
+// A font of a chain from the system's fonts: a variable face opened at the
+// instance the chain asks for — its optical size the size it is set at.
+fn fonts_chained() as void {
+    let is scan.Scan as sc with mut = scan.open();
+    scan.walk(&sc, "text/testdata/fonts");
+    let is index.Index as none with mut = index.empty();
+    let is index.Index as ix with mut = index.update(&none, &sc);
+    scan.close(&sc);
+    let is chain.Prefs as p with mut = chain.defaults();
+    let is chain.Chain as ch with mut;
+    check("a chain", chain.open(&ch, &ix, "Caustic Test Var", 700.0, 87.5, fface.NORMAL, &p) == 1);
+    let is font.Font as cf with mut = font.of_chain(&ch);
+    check("its face for a letter", font.find(&cf, 65) == chain.find(&ch, 65) && font.has(&cf, 0, 65) == 1);
+    let is font.Sizes as s with mut = font.sizes();
+    let is i64 as small = font.sized(&s, &cf, 0, 9.0, 0);
+    let is i64 as big = font.sized(&s, &cf, 0, 30.0, 0);
+    let is var.Design as d;
+    chain.design(&ch, 0, 9.0, &d);
+    let is *table.Face as f = chain.face(&ch, 0);
+    let is var.Coords as want9 = var.coords(f, &d);
+    let is i32 as same with mut = cast(i32, small >= 0 && s.list[small].r.coords.n == want9.n);
+    let is i64 as i with mut = 0;
+    while (same == 1 && i < want9.n) {
+        if (s.list[small].r.coords.v[i] != want9.v[i]) { same = 0; }
+        i = i + 1;
+    }
+    check("at the chain's instance for 9 pixels", same == 1 && var.is_default(&s.list[small].r.coords) == 0);
+    let is i32 as differ with mut = 0;
+    i = 0;
+    while (big >= 0 && i < want9.n) {
+        if (s.list[big].r.coords.v[i] != want9.v[i]) { differ = 1; }
+        i = i + 1;
+    }
+    check("at 30 pixels another optical size", differ == 1);
+    check("no face past the chain's", font.sized(&s, &cf, chain.count(&ch), 9.0, 0) == 0 - 1);
+    font.close_sizes(&s);
+    chain.close(&ch);
+    index.close(&ix);
+}
+
+// --- Faces at sizes, again ---
+
+// The stack under what comes next made of ones.
+fn dirty() as void {
+    let is [262144]u8 as junk;
+    let is i64 as i with mut = 0;
+    while (i < 262144) {
+        junk[i] = cast(u8, 1);
+        i = i + 1;
+    }
+}
+
+fn all_closed(s as *font.Sizes) as i32 {
+    let is i64 as k with mut = 0;
+    while (k < font.MAX_SIZED) {
+        if (s.list[k].open != 0) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn fresh_closed() as i32 {
+    let is font.Sizes as s with mut = font.sizes();
+    return all_closed(&s);
+}
+
+fn sizes_reused() as void {
+    dirty();
+    check("new sizes: every slot closed, whatever their memory held", fresh_closed());
+    let is font.Sizes as s with mut = font.sizes();
+    let is [16]i64 as got;
+    let is i32 as own with mut = 1;
+    let is i64 as k with mut = 0;
+    while (k < font.MAX_SIZED) {
+        got[k] = font.sized(&s, &fo, 0, 10.0 + cast(f64, k), 0);
+        if (got[k] < 0) { own = 0; }
+        let is i64 as q with mut = 0;
+        while (q < k) {
+            if (got[q] == got[k]) { own = 0; }
+            q = q + 1;
+        }
+        k = k + 1;
+    }
+    check("sixteen sizes at once, each in a slot of its own", own);
+    check("a seventeenth, none to be given back: none", font.sized(&s, &fo, 0, 40.0, 0) == 0 - 1);
+    check("the size used longest ago given back", font.sized(&s, &fo, 0, 40.0, s.clock) == got[0]);
+    check("one used just when the layout began: kept", font.sized(&s, &fo, 0, 41.0, s.list[got[1]].used) == 0 - 1);
+    font.close_sizes(&s);
+    check("closed: every slot", all_closed(&s));
+}
+
+// --- Shaped, again ---
+
+fn shaped_more() as void {
+    let is model.Params as p = model.params();
+    lay_out("\xcc\x81a", &p);
+    check("a paragraph that begins with a mark: a dotted circle to carry it", line(0).count == 3 &&
+          cast(i64, glyph(0).id) == cmap.glyph(&faces[0], 9676));
+    // Kerning off for a range of each paragraph: AV kerned by -80 units.
+    let is [2]shape.Feature as nokern;
+    nokern[0].tag = scripts.of("kern");
+    nokern[0].value = 0;
+    nokern[0].start = 0;
+    nokern[0].end = 2;
+    nokern[1] = nokern[0];
+    nokern[1].start = 3;
+    nokern[1].end = 5;
+    styles[0].features = cast(*shape.Feature, &nokern);
+    styles[0].nfeatures = 2;
+    lay_out("AV\nAVAV", &p);
+    // The kerning shared between the pair's two glyphs, as HarfBuzz does.
+    let is f64 as a = width_of("A");
+    let is i64 as f = line(1).first;
+    check("a feature's range: the first paragraph's pair not kerned", near(glyph(0).adv, a) == 1);
+    check("the second's first pair not kerned, its range counted from its paragraph", near(glyph(f).adv, a) == 1);
+    check("its second pair kerned", glyph(f + 2).adv < a - 0.5 &&
+          near(glyph(f + 2).adv + glyph(f + 3).adv, width_of("AV")) == 1);
+    check("the kerned glyph drawn back by its offset", near(glyph(f + 3).x - glyph(f + 2).x - glyph(f + 2).adv, 0.0 - 0.8) == 1);
+    styles[0].features = cast(*shape.Feature, 0);
+    styles[0].nfeatures = 0;
+    // q is deleted: an item of no glyphs.
+    let is [1]model.Span as sp;
+    sp[0].start = 1;
+    sp[0].end = 2;
+    sp[0].style = 5;
+    check("an item shaped to nothing: laid out", lay_spans("aqa", &p, cast(*model.Span, &sp), 1) == 1 &&
+          line(0).count == 2);
+    // More sizes than can be open at once, each character its own.
+    let is [17]model.Style as many;
+    let is [17]model.Span as each;
+    let is i64 as k with mut = 0;
+    while (k < 17) {
+        many[k] = style(10.0 + cast(f64, k));
+        each[k].start = k;
+        each[k].end = k + 1;
+        each[k].style = k;
+        k = k + 1;
+    }
+    check("a text in more sizes than can be open at once: refused",
+          layout.set(&lay, "abcdefghijklmnopq", 17, cast(*model.Style, &many), 17, cast(*model.Span, &each), 17, &p) == 0);
+    check("and the next laid out as ever", lay_out("ab", &p) == 1 && line_count() == 1 && line(0).count == 2);
+}
+
+// --- Lines, again ---
+
+fn lines_more() as void {
+    let is model.Params as p = model.params();
+    p.width = width_of("aa a");
+    lay_out("aa aa\naa aa\naa aa", &p);
+    check("three paragraphs, each broken in two", line_count() == 6 && line(0).start == 0 && line(1).start == 3 &&
+          line(2).start == 6 && line(3).start == 9 && line(4).start == 12 && line(5).start == 15);
+    // A long text: 2000 words, three to a line.
+    let is *u8 as long = mem.core.mmap_anon(16384);
+    let is i64 as i with mut = 0;
+    while (i < 10000) {
+        let is i64 as m = i % 5;
+        long[i] = cast(u8, 32);
+        if (m == 0) { long[i] = cast(u8, 119); }
+        if (m == 1) { long[i] = cast(u8, 111); }
+        if (m == 2) { long[i] = cast(u8, 114); }
+        if (m == 3) { long[i] = cast(u8, 100); }
+        i = i + 1;
+    }
+    p.width = width_of("word word word") + 0.5;
+    check("a long text: laid out", layout.set(&lay, long, 10000, cast(*model.Style, &styles), 8,
+                                              cast(*model.Span, 0), 0, &p) == 1);
+    let is i32 as starts with mut = 1;
+    i = 0;
+    while (i < line_count()) {
+        if (line(i).start != 15 * i) { starts = 0; }
+        i = i + 1;
+    }
+    check("a long text: three words a line", line_count() == 667 && starts == 1 && line(666).end == 10000);
+    mem.core.munmap(long, 16384);
+    // A text whose memory ends where it does.
+    let is *u8 as page = mem.core.mmap_anon(8192);
+    mem.core.munmap(cast(*u8, cast(i64, page) + 4096), 4096);
+    let is *u8 as edge = cast(*u8, cast(i64, page) + 4091);
+    let is *u8 as src = "ab\ncd";
+    i = 0;
+    while (i < 5) {
+        edge[i] = src[i];
+        i = i + 1;
+    }
+    p.width = 0.0 - 1.0;
+    check("a text that ends where its memory does: nothing past it read",
+          layout.set(&lay, edge, 5, cast(*model.Style, &styles), 8, cast(*model.Span, 0), 0, &p) == 1 &&
+          line_count() == 2);
+    mem.core.munmap(page, 4096);
+    // An ellipsis in the first face opened: a layout of its own, glyf.ttf's
+    // font its first style.
+    layout.open(&lay2);
+    let is [1]model.Style as gs;
+    gs[0] = style(PX);
+    gs[0].font = &glyf_first;
+    p.width = 60.0;
+    p.max_lines = 1;
+    p.ellipsis = 1;
+    let is *u8 as words = "aaaa aaaa aaaa aaaa";
+    check("an ellipsis in the first face opened: laid out",
+          layout.set(&lay2, words, len(words), cast(*model.Style, &gs), 1, cast(*model.Span, 0), 0, &p) == 1);
+    let is *model.Line as l0 = layout.line(&lay2, 0);
+    check("its ellipsis last", layout.line_count(&lay2) == 1 &&
+          cast(i64, layout.glyph(&lay2, l0.first + l0.count - 1).id) == cmap.glyph(&faces[1], 8230));
+    layout.close(&lay2);
+}
+
+// --- The cursor, again ---
+
+// Moving right from at until it moves no more: how many stops, the caret's
+// x rising on each line.
+fn walk(at as cursor.Position, dir as i32) as i64 {
+    let is cursor.Position as now with mut = at;
+    let is i64 as n with mut = 1;
+    let is i32 as going with mut = 1;
+    while (going == 1 && n < 100) {
+        let is cursor.Position as next with mut = now;
+        if (dir == 1) { next = cursor.right(&lay, now); } else { next = cursor.left(&lay, now); }
+        if (next.offset == now.offset && next.upstream == now.upstream) {
+            going = 0;
+        } else {
+            let is cursor.Caret as a = cursor.caret(&lay, now);
+            let is cursor.Caret as b = cursor.caret(&lay, next);
+            if (a.line == b.line && (b.x - a.x) * cast(f64, dir) <= 0.0) { return 0 - 1; }
+            now = next;
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+fn carets_more() as void {
+    let is model.Params as p = model.params();
+    // x and an acute, which do not compose: two glyphs of one cluster.
+    lay_out("x\xcc\x81y", &p);
+    check("caret: after a base and its mark", line(0).count == 3 &&
+          near(at(3).x, glyph(0).adv + glyph(1).adv) == 1 && near(at(3).x, width_of("x\xcc\x81")) == 1);
+    check("caret: an offset inside a grapheme, after it", near(at(1).x, at(3).x) == 1);
+    check("a mark drawn above its base", glyph(1).y < glyph(0).y && near(glyph(0).y, line(0).y) == 1);
+    check("caret: left to right, at the end", at(4).rtl == 0);
+    let is *u8 as marks = "e\xcc\x81\xcc\x88xy";
+    lay_out(marks, &p);
+    check("hit: every stop of a mark's text found again", round_trips(marks));
+    let is [1]model.Span as sp;
+    sp[0].start = 0;
+    sp[0].end = 3;
+    sp[0].style = 4;
+    lay_spans("afi", &p, cast(*model.Span, &sp), 1);
+    check("caret: half way through a ligature after a letter",
+          line(0).count == 2 && near(at(2).x, glyph(0).adv + glyph(1).adv / 2.0) == 1);
+    // H, ss05's h and i: a cluster of two glyphs with advances.
+    sp[0].style = 5;
+    lay_spans("aHb", &p, cast(*model.Span, &sp), 1);
+    check("caret: after a cluster of two glyphs", line(0).count == 4 &&
+          near(at(2).x, glyph(0).adv + glyph(1).adv + glyph(2).adv) == 1);
+    lay_out("\xde\x80\xde\xa6\xde\x81", &p);
+    check("caret right to left: an offset inside a grapheme, after it", near(at(2).x, at(4).x) == 1);
+    lay_out("\xde\x80\xde\x81", &p);
+    check("caret right to left: at the end", at(4).rtl == 1);
+    // A right-to-left paragraph with letters left to right at its end,
+    // drawn first: where they meet, after the space is right of ab.
+    lay_out("\xde\x80\xde\x81 ab", &p);
+    let is cursor.Caret as c = at(5);
+    check("caret where a right-to-left paragraph meets its last run",
+          near(c.x, line(0).x) == 1 && near(c.x2, line(0).x + width_of("ab")) == 1);
+    p.dir = model.DIR_RTL;
+    lay_out("", &p);
+    check("caret in an empty right-to-left paragraph", at(0).rtl == 1);
+    p.dir = model.DIR_AUTO;
+    lay_out("", &p);
+    check("and left to right", at(0).rtl == 0);
+    // The caret at an ellipsized line's end: before the ellipsis.
+    p.width = 60.0;
+    p.max_lines = 1;
+    p.ellipsis = 1;
+    lay_out("aaaa aaaa aaaa aaaa", &p);
+    let is *model.Glyph as dots = glyph(line(0).first + line(0).count - 1);
+    check("caret at an ellipsized line's end: before the ellipsis", near(at(line(0).end).x, dots.x) == 1);
+    p.max_lines = 0;
+    p.ellipsis = 0;
+    p.width = width_of("aaa ") + 0.5;
+    lay_out("aaa aaa", &p);
+    check("hit: a line's top is its own", cursor.caret(&lay, cursor.hit(&lay, 1.0, line(1).top)).line == 1);
+    // Every stop, right and left.
+    p.width = width_of("ab ") + 0.5;
+    lay_out("ab cd", &p);
+    check("right through wrapped lines: every stop once", walk(cursor.position(0, 0), 1) == 7);
+    check("left back: every stop once", walk(cursor.position(5, 0), 0 - 1) == 7);
+    p.width = width_of("\xde\x80\xde\x81 ") + 0.5;
+    lay_out("\xde\x80\xde\x81 \xde\x80\xde\x81", &p);
+    check("right to left wrapped: two lines", line_count() == 2 && line(1).start == 5);
+    check("right through them: every stop once", walk(cursor.position(9, 0), 1) == 7);
+    check("left back: every stop once", walk(cursor.position(0, 0), 0 - 1) == 7);
+    check("hit: every stop of right-to-left lines found again", round_trips("\xde\x80\xde\x81 \xde\x80\xde\x81"));
+    p.width = 0.0 - 1.0;
+    lay_out("e\xcc\x81\xcc\x88x", &p);
+    check("right over marks: a stop at each grapheme", walk(cursor.position(0, 0), 1) == 3 &&
+          cursor.right(&lay, cursor.position(0, 0)).offset == 5);
+    let is *u8 as pair = "x\xcc\x81y";
+    lay_out(pair, &p);
+    check("hit: every stop of a grapheme of two found again", round_trips(pair));
+    // Into a run of the other direction and out of it: each of its stops,
+    // where they meet the place on the side moved from.
+    lay_out("ab \xde\x80\xde\x81 cd", &p);
+    check("right through runs of both directions: every stop once", walk(cursor.position(0, 0), 1) == 9);
+    check("left back through them: every stop once", walk(cursor.position(10, 0), 0 - 1) == 9);
+}
+
+fn moving_more() as void {
+    let is model.Params as p = model.params();
+    // a, e acute (2 bytes), the euro (3), b.
+    lay_out("a\xc3\xa9\xe2\x82\xacb", &p);
+    check("from inside a character: the next grapheme", cursor.next_grapheme(&lay, 2) == 3 &&
+          cursor.next_grapheme(&lay, 4) == 6);
+    check("from inside a character: the one it is in", cursor.prev_grapheme(&lay, 2) == 1 &&
+          cursor.prev_grapheme(&lay, 5) == 3);
+    check("from inside a character: the word's end", cursor.next_word(&lay, 2) == 3);
+    check("from inside a character: the word's start", cursor.prev_word(&lay, 5) == 0);
+    // e with two marks, x, CR LF (one grapheme), y, z.
+    lay_out("e\xcc\x81\xcc\x88x\r\nyz", &p);
+    let is [7]i64 as fwd;
+    fwd[0] = 0;
+    fwd[1] = 5;
+    fwd[2] = 6;
+    fwd[3] = 8;
+    fwd[4] = 9;
+    fwd[5] = 10;
+    fwd[6] = 10;
+    let is i32 as ok with mut = 1;
+    let is i64 as k with mut = 0;
+    while (k < 6) {
+        if (cursor.next_grapheme(&lay, fwd[k]) != fwd[k + 1]) { ok = 0; }
+        if (k > 0 && cursor.prev_grapheme(&lay, fwd[k + 1]) != fwd[k] && fwd[k + 1] != fwd[k]) { ok = 0; }
+        k = k + 1;
+    }
+    check("graphemes, each way: marks, CR LF", ok == 1 && cursor.prev_grapheme(&lay, 5) == 0);
+    lay_out("A b c", &p);
+    check("next word: a capital alone", cursor.next_word(&lay, 0) == 1);
+    check("next word: past one space", cursor.next_word(&lay, 1) == 3);
+    check("next word at the end: the end", cursor.next_word(&lay, 5) == 5);
+    check("previous word at the start: the start", cursor.prev_word(&lay, 0) == 0);
+    lay_out("abcd e", &p);
+    check("next word: a word of four", cursor.next_word(&lay, 0) == 4);
+    lay_out(", x", &p);
+    check("previous word with none before: the start", cursor.prev_word(&lay, 2) == 0);
+    lay_out("\xc2\xb2 b", &p);
+    check("next word: a number of another kind", cursor.next_word(&lay, 0) == 2);
+    lay_out("hello, world foo", &p);
+    check("previous word, each in turn", cursor.prev_word(&lay, 16) == 13 && cursor.prev_word(&lay, 13) == 7 &&
+          cursor.prev_word(&lay, 12) == 7 && cursor.prev_word(&lay, 6) == 0);
+    lay_out("A b c", &p);
+    check("previous word: words of one letter", cursor.prev_word(&lay, 5) == 4 && cursor.prev_word(&lay, 4) == 2);
+    lay_out("x abcd", &p);
+    check("previous word: a word of four", cursor.prev_word(&lay, 6) == 2);
+    lay_out("ab \xc3\xa9", &p);
+    check("previous word from inside its first character: its start", cursor.prev_word(&lay, 4) == 3);
+}
+
+fn selections_more() as void {
+    let is model.Params as p = model.params();
+    let is [8]cursor.Rect as r;
+    lay_out("abc", &p);
+    check("selection: of nothing, nothing", cursor.selection(&lay, 2, 2, cast(*cursor.Rect, &r), 8) == 0);
+    let is *u8 as mixed = "ab \xde\x80\xde\x81 cd";
+    lay_out(mixed, &p);
+    check("selection up to where directions meet: one", cursor.selection(&lay, 0, 3, cast(*cursor.Rect, &r), 8) == 1);
+    check("selection: all of it, as wide as the line",
+          cursor.selection(&lay, 0, 12, cast(*cursor.Rect, &r), 8) == 1 && near(r[0].w, line(0).width) == 1);
+    check("selection: all of it, room for one", cursor.selection(&lay, 0, 12, cast(*cursor.Rect, &r), 1) == 1);
+    check("selection: all but the first letter, one as wide as the rest",
+          cursor.selection(&lay, 1, 12, cast(*cursor.Rect, &r), 8) == 1 &&
+          near(r[0].w, line(0).width - width_of("a")) == 1);
+    r[1].x = 12345.0;
+    r[1].w = 0.0;
+    check("selection: more than room for, only as many written",
+          cursor.selection(&lay, 1, 5, cast(*cursor.Rect, &r), 1) == 2 && r[1].x == 12345.0 && r[1].w == 0.0);
+}
+
+fn main() as i32 {
+    let is *u8 as d0 = load("text/testdata/shape-plain.ttf");
+    let is i64 as n0 = loaded;
+    let is *u8 as d1 = load("text/testdata/glyf.ttf");
+    let is i64 as n1 = loaded;
+    let is *u8 as d2 = load("text/testdata/lookups.ttf");
+    let is i64 as n2 = loaded;
+    if (cast(i64, d0) == 0 || cast(i64, d1) == 0 || cast(i64, d2) == 0) {
+        io.printf("FAIL: cannot read the test fonts\n");
+        return 1;
+    }
+    faces[0] = sfnt.open(d0, n0, 0);
+    faces[1] = sfnt.open(d1, n1, 0);
+    list.faces = cast(*table.Face, &faces);
+    list.n = 2;
+    fo = font.of_list(&list);
+    plain = outline.open(&faces[0]);
+    shape.open(&sh);
+    styles[0] = style(PX);
+    styles[1] = style(PX);
+    styles[1].underline = 1;
+    styles[2] = style(PX);
+    styles[2].strike = 1;
+    styles[3] = style(2.0 * PX);
+    glyf_list.faces = &faces[1];
+    glyf_list.n = 1;
+    glyf_first = font.of_list(&glyf_list);
+    styles[4] = style(PX);
+    styles[4].font = &glyf_first;
+    // lookups.ttf with ss05 on, twice: H made h and i, I J before K varied,
+    // q deleted (ccmp).
+    lookups_face = sfnt.open(d2, n2, 0);
+    lookups_list.faces = &lookups_face;
+    lookups_list.n = 1;
+    lookups_font = font.of_list(&lookups_list);
+    ss05[0].tag = scripts.of("ss05");
+    ss05[0].value = 1;
+    ss05[0].start = 0;
+    ss05[0].end = shape.ALL;
+    styles[5] = style(PX);
+    styles[5].font = &lookups_font;
+    styles[5].features = cast(*shape.Feature, &ss05);
+    styles[5].nfeatures = 1;
+    styles[6] = styles[5];
+    styles[6].underline = 1;
+    // The two faces the other way round.
+    swapped[0] = faces[1];
+    swapped[1] = faces[0];
+    swapped_list.faces = cast(*table.Face, &swapped);
+    swapped_list.n = 2;
+    swapped_font = font.of_list(&swapped_list);
+    styles[7] = style(PX);
+    styles[7].font = &swapped_font;
+    fonts_listed();
+    sizes_reused();
+    fonts_chained();
+    layout.open(&lay);
+    itemized();
+    one_line();
+    breaking();
+    long_words();
+    separators();
+    alignment();
+    justified();
+    ellipsis();
+    tabs();
+    bidi();
+    faces_found();
+    styled();
+    carets();
+    hitting();
+    selections();
+    moving();
+    shaped_more();
+    lines_more();
+    carets_more();
+    moving_more();
+    selections_more();
+    layout.close(&lay);
+    shape.close(&sh);
+    outline.close(&plain);
+    if (fails > 0) {
+        io.printf("layout: %d of %d checks failed\n", fails, checks);
+        return 1;
+    }
+    io.printf("layout: all %d checks hold\n", checks);
+    return 0;
+}

@@ -1,0 +1,178 @@
+// text/layout/font.cst — what text is set in: a font, which finds the face
+// for each character among its faces; and those faces opened at the sizes
+// text asks for.
+//
+// A Font is two functions and what they need: find, the face that draws a
+// character; face, a face and the instance it is drawn at for an em of px
+// pixels (its optical size follows px). A font chain from ../fonts is one
+// (of_chain); a list of faces the program opened itself is another
+// (of_list), the first face with a glyph for a character drawing it.
+use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
+use "../sfnt/head.cst" as head;
+use "../sfnt/cmap.cst" as cmap;
+use "../outline/outline.cst" as outline;
+use "../fonts/chain.cst" as chain;
+
+type FindFn = fn(*u8, i64) as i64;
+type FaceFn = fn(*u8, i64, f64, *var.Coords) as *table.Face;
+
+struct Font {
+    user as *u8;
+    find as FindFn;
+    face as FaceFn;
+}
+
+// The face of font for character cp; -1 for none.
+fn find(fo as *Font, cp as i64) as i64 { return call(fo.find, fo.user, cp); }
+
+// Whether face index of font has a glyph for cp.
+fn has(fo as *Font, index as i64, cp as i64) as i32 {
+    if (index < 0) { return 0; }
+    let is var.Coords as c;
+    let is *table.Face as f = call(fo.face, fo.user, index, 0.0, &c);
+    if (cast(i64, f) == 0) { return 0; }
+    return cast(i32, cmap.glyph(f, cp) != 0);
+}
+
+// --- A list of faces ---
+
+struct List {
+    faces as *table.Face;
+    n     as i64;
+}
+
+fn _list_find(user as *u8, cp as i64) as i64 {
+    let is *List as l = cast(*List, user);
+    let is i64 as i with mut = 0;
+    while (i < l.n) {
+        if (cmap.glyph(&l.faces[i], cp) != 0) { return i; }
+        i = i + 1;
+    }
+    if (l.n > 0) { return 0; }
+    return 0 - 1;
+}
+
+fn _list_face(user as *u8, index as i64, px as f64, c as *var.Coords) as *table.Face {
+    let is *List as l = cast(*List, user);
+    *c = var.default_coords();
+    if (index < 0 || index >= l.n) { return cast(*table.Face, 0); }
+    return &l.faces[index];
+}
+
+fn of_list(l as *List) as Font {
+    let is Font as fo;
+    fo.user = cast(*u8, l);
+    fo.find = fn_ptr(_list_find);
+    fo.face = fn_ptr(_list_face);
+    return fo;
+}
+
+// --- A font chain ---
+
+fn _chain_find(user as *u8, cp as i64) as i64 { return chain.find(cast(*chain.Chain, user), cp); }
+
+fn _chain_face(user as *u8, index as i64, px as f64, c as *var.Coords) as *table.Face {
+    let is *chain.Chain as ch = cast(*chain.Chain, user);
+    let is *table.Face as f = chain.face(ch, index);
+    *c = var.default_coords();
+    if (cast(i64, f) == 0) { return f; }
+    let is var.Design as d;
+    chain.design(ch, index, px, &d);
+    if (d.n > 0) { *c = var.coords(f, &d); }
+    return f;
+}
+
+fn of_chain(ch as *chain.Chain) as Font {
+    let is Font as fo;
+    fo.user = cast(*u8, ch);
+    fo.find = fn_ptr(_chain_find);
+    fo.face = fn_ptr(_chain_face);
+    return fo;
+}
+
+// --- Faces at sizes ---
+
+// A face opened for text px pixels high: its outlines at the instance, its
+// metrics there, and the scale from its units to pixels.
+struct Sized {
+    font   as *Font;
+    index  as i64;
+    px     as f64;
+    face   as *table.Face;
+    r      as outline.Reader;
+    m      as head.Metrics;
+    scale  as f64;
+    used   as i64;
+    open   as i32;
+    _pad0  as i32;
+}
+
+let is i64 as MAX_SIZED with imut = 16;
+
+// The faces a layout has open, least recently used given back first.
+struct Sizes {
+    list  as [16]Sized;
+    clock as i64;
+}
+
+fn sizes() as Sizes {
+    let is Sizes as s;
+    let is i64 as i with mut = 0;
+    while (i < MAX_SIZED) {
+        s.list[i].open = 0;
+        i = i + 1;
+    }
+    s.clock = 0;
+    return s;
+}
+
+fn close_sizes(s as *Sizes) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_SIZED) {
+        if (s.list[i].open == 1) { outline.close(&s.list[i].r); }
+        s.list[i].open = 0;
+        i = i + 1;
+    }
+}
+
+// Face index of fo at px, opened if it is not; its slot, or -1 when the font
+// has no such face — or every slot is held: one used since keep is not given
+// back, so that a layout's glyphs keep their faces while it is being made.
+fn sized(s as *Sizes, fo as *Font, index as i64, px as f64, keep as i64) as i64 {
+    s.clock = s.clock + 1;
+    let is i64 as free with mut = 0 - 1;
+    let is i64 as oldest with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_SIZED) {
+        let is *Sized as z = &s.list[i];
+        if (z.open == 1 && z.font == fo && z.index == index && z.px == px) {
+            z.used = s.clock;
+            return i;
+        }
+        if (z.open == 0 && free < 0) { free = i; }
+        if (z.open == 1 && z.used < keep && (oldest < 0 || z.used < s.list[oldest].used)) { oldest = i; }
+        i = i + 1;
+    }
+    if (free < 0 && oldest < 0) { return 0 - 1; }
+    let is var.Coords as c;
+    let is *table.Face as f = call(fo.face, fo.user, index, px, &c);
+    if (cast(i64, f) == 0) { return 0 - 1; }
+    let is i64 as slot with mut = free;
+    if (slot < 0) {
+        slot = oldest;
+        outline.close(&s.list[slot].r);
+    }
+    let is *Sized as z = &s.list[slot];
+    z.font = fo;
+    z.index = index;
+    z.px = px;
+    z.face = f;
+    z.r = outline.open(f);
+    outline.vary(&z.r, &c);
+    z.m = var.metrics(f, &c);
+    z.scale = px / cast(f64, f.upem);
+    z.used = s.clock;
+    z.open = 1;
+    return slot;
+}

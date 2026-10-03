@@ -1,0 +1,169 @@
+// text/layout/model.cst — what layout takes and what it gives back.
+//
+// It takes UTF-8 text, styles and the spans of text each applies to (the
+// later of two overlapping spans wins; text in none is in style 0), and the
+// box's parameters. It gives back lines of glyphs, each glyph placed — in
+// pixels, from the box's top left, y down — the pieces of each line in the
+// order they are drawn, each of one direction, and the rectangles of the
+// lines underneath and through the text that asks for them.
+use "std/mem.cst" as mem;
+use "font.cst" as font;
+use "../shape/shape.cst" as shape;
+
+struct Style {
+    font      as *font.Font;
+    px        as f64;            // the em, in pixels
+    lang      as *u8;            // BCP 47, or null
+    features  as *shape.Feature;
+    nfeatures as i64;
+    underline as i32;
+    strike    as i32;
+    color     as u32;            // the renderer's: layout only carries it
+    _pad0     as u32;
+}
+
+struct Span {
+    start as i64;   // bytes
+    end   as i64;
+    style as i64;
+}
+
+let is i64 as ALIGN_START with imut = 0;
+let is i64 as ALIGN_END with imut = 1;
+let is i64 as ALIGN_LEFT with imut = 2;
+let is i64 as ALIGN_RIGHT with imut = 3;
+let is i64 as ALIGN_CENTER with imut = 4;
+let is i64 as ALIGN_JUSTIFY with imut = 5;
+
+let is i64 as DIR_AUTO with imut = 0;
+let is i64 as DIR_LTR with imut = 4;
+let is i64 as DIR_RTL with imut = 5;
+
+struct Params {
+    width       as f64;   // the box's; below 0, as wide as the text, broken only where it must be
+    align       as i64;
+    dir         as i64;   // each paragraph's base direction
+    max_lines   as i64;   // 0 for no limit
+    ellipsis    as i32;   // a text cut short by max_lines ends in "…"
+    _pad0       as i32;
+    line_height as f64;   // times the faces' own
+    tab         as f64;   // the distance between tab stops; 0 for eight spaces of style 0
+}
+
+fn params() as Params {
+    let is Params as p;
+    p.width = 0.0 - 1.0;
+    p.align = ALIGN_START;
+    p.dir = DIR_AUTO;
+    p.max_lines = 0;
+    p.ellipsis = 0;
+    p._pad0 = 0;
+    p.line_height = 1.0;
+    p.tab = 0.0;
+    return p;
+}
+
+// A glyph placed: drawn from (x, y), its pen's position plus its offset, y
+// the baseline's; the face it is in (a slot of the layout's Sizes) and the
+// style it was set in.
+struct Glyph {
+    id      as u32;
+    slot    as i32;
+    cluster as u32;   // the byte offset of the first character it came from
+    style   as i32;
+    x       as f64;
+    y       as f64;
+    adv     as f64;   // its advance, along the line
+}
+
+// A run of a line in one direction, in the order the line is drawn.
+struct Piece {
+    first as i64;    // glyphs
+    count as i64;
+    start as i64;    // bytes
+    end   as i64;
+    level as i64;    // its bidi level: odd right to left
+    x     as f64;
+    width as f64;
+}
+
+struct Line {
+    first   as i64;    // glyphs
+    count   as i64;
+    pfirst  as i64;    // pieces
+    pcount  as i64;
+    start   as i64;    // bytes
+    end     as i64;
+    x       as f64;    // the left of its content
+    top     as f64;
+    y       as f64;    // its baseline
+    height  as f64;
+    ascent  as f64;
+    descent as f64;
+    width   as f64;    // of its content, what hangs past its end left out
+    level   as i64;    // its paragraph's
+    last    as i32;    // 1 when the text ends it: its paragraph's end, or a line separator
+    _pad0   as i32;
+}
+
+// A line under or through text: underline or strikethrough.
+struct Deco {
+    x     as f64;
+    y     as f64;      // its top
+    w     as f64;
+    h     as f64;
+    style as i64;
+    line  as i64;
+}
+
+// --- Arrays that grow ---
+
+struct Arr {
+    block as *u8;
+    bytes as i64;
+    n     as i64;
+    size  as i64;
+}
+
+fn arr(size as i64) as Arr {
+    let is Arr as a;
+    a.block = cast(*u8, 0);
+    a.bytes = 0;
+    a.n = 0;
+    a.size = size;
+    return a;
+}
+
+fn arr_close(a as *Arr) as void {
+    if (a.bytes > 0) { mem.core.munmap(a.block, a.bytes); }
+    a.bytes = 0;
+    a.n = 0;
+}
+
+// Room for k elements; 0 when memory is refused.
+fn arr_room(a as *Arr, k as i64) as i32 {
+    let is i64 as need = k * a.size;
+    if (need <= a.bytes) { return 1; }
+    let is i64 as bytes with mut = 4096;
+    while (bytes < need) { bytes = bytes * 2; }
+    let is *u8 as b = mem.core.mmap_anon(bytes);
+    if (cast(i64, b) <= 0) { return 0; }
+    if (a.bytes > 0) {
+        mem.memcpy(b, a.block, a.n * a.size);
+        mem.core.munmap(a.block, a.bytes);
+    }
+    a.block = b;
+    a.bytes = bytes;
+    return 1;
+}
+
+// A new element at the end, zeroed; null when memory is refused.
+fn arr_push(a as *Arr) as *u8 {
+    if (arr_room(a, a.n + 1) == 0) { return cast(*u8, 0); }
+    let is *u8 as p = cast(*u8, cast(i64, a.block) + a.n * a.size);
+    mem.memzero(p, a.size);
+    a.n = a.n + 1;
+    return p;
+}
+
+fn arr_at(a as *Arr, i as i64) as *u8 { return cast(*u8, cast(i64, a.block) + i * a.size); }

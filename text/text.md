@@ -181,6 +181,8 @@ answer while the layout is being built than afterwards.
    ([`shape/shape.md`](shape/shape.md)). The scripts with shapers of their
    own (Arabic joining, Indic reordering, Hangul, Thai, Khmer, Myanmar, USE)
    are [B].
-4. **Layout**, with caustic-unicode for breaking and bidi.
-5. **Caret and hit-testing**, which `ui/` blocks on.
+4. **Layout**, with caustic-unicode for breaking and bidi — done
+   ([`layout/layout.md`](layout/layout.md)).
+5. **Caret and hit-testing**, which `ui/` blocks on — done, in
+   `layout/cursor.cst`.
 6. **SDF**, when text in a 3D scene does.

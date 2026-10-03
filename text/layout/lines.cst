@@ -1,0 +1,959 @@
+// text/layout/lines.cst — the items shaped; the text broken into lines that
+// fit; each line's runs put in the order they are drawn, placed and aligned;
+// and the lines under and through the text.
+//
+// Each item is shaped whole, once. What the shaper gives each character —
+// the advance of the cluster it begins, whether the text may be broken before
+// it — is what lines are fitted by. A line that begins or ends inside an item
+// where breaking is unsafe has that part of the item shaped again on its own,
+// and is measured again: a line that no longer fits gives back its last
+// opportunity.
+use "std/mem.cst" as mem;
+use "caustic-unicode/src/ucd/props.cst" as ucd;
+use "caustic-unicode/src/ucd/tables/bidi.cst" as bc;
+use "caustic-unicode/src/bidi/bidi.cst" as bidi;
+use "../sfnt/cmap.cst" as cmap;
+use "../outline/outline.cst" as outline;
+use "../shape/shape.cst" as shape;
+use "../shape/glyphs.cst" as glyphs;
+use "../shape/scripts.cst" as scripts;
+use "model.cst" as model;
+use "font.cst" as font;
+use "items.cst" as items;
+
+// Widths are compared with this much room, for sums of fractions.
+let is f64 as SLACK with imut = 0.000001;
+
+let is i64 as ELLIPSIS with imut = 8230;
+
+// A glyph as shaped, in pixels.
+struct Shaped {
+    id      as u32;
+    cluster as u32;   // bytes, from the text's start
+    slot    as i32;
+    unsafe  as i32;
+    xa      as f64;
+    xo      as f64;
+    yo      as f64;
+}
+
+// What shaping says of a character: the advance of the cluster it begins,
+// whether one begins at it, whether breaking before it is unsafe.
+struct Char {
+    adv    as f64;
+    starts as i32;
+    unsafe as i32;
+}
+
+// A run of a line before it is placed: characters a .. b of an item (-1: the
+// ellipsis) at one level, its glyphs in the order they are drawn.
+struct Part {
+    a     as i64;
+    b     as i64;
+    level as i64;
+    item  as i64;
+    style as i64;
+    slot  as i64;
+    first as i64;    // in pglyphs
+    count as i64;
+}
+
+struct Lines {
+    shaped  as model.Arr;   // Shaped: every item's, then a line's parts shaped again
+    chars   as model.Arr;   // Char
+    feats   as model.Arr;   // shape.Feature: a style's, counted from its paragraph
+    parts   as model.Arr;   // Part: a line's, in logical order
+    pglyphs as model.Arr;   // Shaped: theirs
+    levels  as model.Arr;   // u8: the parts' levels
+    order   as model.Arr;   // i64: the parts in the order they are drawn
+    glyphs  as model.Arr;   // model.Glyph
+    pieces  as model.Arr;   // model.Piece
+    lines   as model.Arr;   // model.Line
+    decos   as model.Arr;   // model.Deco
+    keep    as i64;         // faces used since this are the layout's
+    width   as f64;         // the widest line's content
+    height  as f64;
+    cut     as i32;         // text was left out for max_lines
+    _pad0   as i32;
+}
+
+fn open() as Lines {
+    let is Lines as ln;
+    mem.memzero(cast(*u8, &ln), sizeof(Lines));
+    ln.shaped = model.arr(sizeof(Shaped));
+    ln.chars = model.arr(sizeof(Char));
+    ln.feats = model.arr(sizeof(shape.Feature));
+    ln.parts = model.arr(sizeof(Part));
+    ln.pglyphs = model.arr(sizeof(Shaped));
+    ln.levels = model.arr(1);
+    ln.order = model.arr(8);
+    ln.glyphs = model.arr(sizeof(model.Glyph));
+    ln.pieces = model.arr(sizeof(model.Piece));
+    ln.lines = model.arr(sizeof(model.Line));
+    ln.decos = model.arr(sizeof(model.Deco));
+    return ln;
+}
+
+fn close(ln as *Lines) as void {
+    model.arr_close(&ln.shaped);
+    model.arr_close(&ln.chars);
+    model.arr_close(&ln.feats);
+    model.arr_close(&ln.parts);
+    model.arr_close(&ln.pglyphs);
+    model.arr_close(&ln.levels);
+    model.arr_close(&ln.order);
+    model.arr_close(&ln.glyphs);
+    model.arr_close(&ln.pieces);
+    model.arr_close(&ln.lines);
+    model.arr_close(&ln.decos);
+}
+
+fn glyph(ln as *Lines, i as i64) as *model.Glyph { return cast(*model.Glyph, model.arr_at(&ln.glyphs, i)); }
+fn piece(ln as *Lines, i as i64) as *model.Piece { return cast(*model.Piece, model.arr_at(&ln.pieces, i)); }
+fn line(ln as *Lines, i as i64) as *model.Line { return cast(*model.Line, model.arr_at(&ln.lines, i)); }
+fn deco(ln as *Lines, i as i64) as *model.Deco { return cast(*model.Deco, model.arr_at(&ln.decos, i)); }
+
+// What laying out one text needs.
+struct Job {
+    ln     as *Lines;
+    c      as *items.Chars;
+    sz     as *font.Sizes;
+    s      as *shape.Shaper;
+    text   as *u8;
+    styles as *model.Style;
+    p      as *model.Params;
+    tab    as f64;    // the distance between tab stops
+    base   as i64;    // the items' glyphs in ln.shaped; a line's own come after
+    ifirst as i64;    // the paragraph's first item
+    hang   as f64;    // the line measured: what hangs past its end
+    ink    as f64;    // and its content's width
+    hs     as i64;    // where the spaces that hang begin
+}
+
+fn _sh(j as *Job, i as i64) as *Shaped { return cast(*Shaped, model.arr_at(&j.ln.shaped, i)); }
+fn _pg(j as *Job, i as i64) as *Shaped { return cast(*Shaped, model.arr_at(&j.ln.pglyphs, i)); }
+fn _ch(j as *Job, i as i64) as *Char { return cast(*Char, model.arr_at(&j.ln.chars, i)); }
+fn _part_at(j as *Job, i as i64) as *Part { return cast(*Part, model.arr_at(&j.ln.parts, i)); }
+fn _cp(j as *Job, i as i64) as i64 { return cast(i64, j.c.cps[i]); }
+
+fn _min(a as i64, b as i64) as i64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn _max(a as i64, b as i64) as i64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+// --- Shaping ---
+
+// The face of a style, open at its size: its slot, or -1.
+fn _slot(j as *Job, style as i64, face as i64) as i64 {
+    let is *model.Style as st = &j.styles[style];
+    return font.sized(j.sz, st.font, face, st.px, j.ln.keep);
+}
+
+// The style's features, their ranges counted from pb rather than the text's
+// start.
+fn _features(j as *Job, st as *model.Style, pb as i64) as *shape.Feature {
+    let is *model.Arr as fa = &j.ln.feats;
+    fa.n = 0;
+    if (model.arr_room(fa, st.nfeatures + 1) == 0) { return cast(*shape.Feature, 0); }
+    let is i64 as i with mut = 0;
+    while (i < st.nfeatures) {
+        let is *shape.Feature as f = cast(*shape.Feature, model.arr_push(fa));
+        *f = st.features[i];
+        if (f.start > 0) { f.start = _max(f.start - pb, 0); }
+        if (f.end != shape.ALL) { f.end = _max(f.end - pb, 0); }
+        i = i + 1;
+    }
+    return cast(*shape.Feature, fa.block);
+}
+
+// The shaper's glyphs added to ln.shaped, in pixels, their clusters moved by
+// pb; how many, or -1.
+fn _take(j as *Job, slot as i64, pb as i64) as i64 {
+    let is f64 as scale = j.sz.list[slot].scale;
+    let is i64 as n = shape.count(j.s);
+    let is *model.Arr as sa = &j.ln.shaped;
+    if (model.arr_room(sa, sa.n + n) == 0) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *glyphs.Glyph as g = shape.glyph(j.s, i);
+        let is *glyphs.Place as pl = shape.place(j.s, i);
+        let is *Shaped as h = cast(*Shaped, model.arr_push(sa));
+        h.id = g.id;
+        h.cluster = cast(u32, cast(i64, g.cluster) + pb);
+        h.slot = cast(i32, slot);
+        h.unsafe = cast(i32, g.unsafe);
+        h.xa = cast(f64, pl.xa) * scale;
+        h.xo = cast(f64, pl.xo) * scale;
+        h.yo = cast(f64, pl.yo) * scale;
+        i = i + 1;
+    }
+    return n;
+}
+
+// Characters a .. b of item k shaped, the rest of its paragraph their
+// context; how many glyphs were added to ln.shaped, or -1.
+fn _shape(j as *Job, k as i64, a as i64, b as i64) as i64 {
+    let is *items.Chars as c = j.c;
+    let is *items.Item as it = items.item(c, k);
+    let is *items.Para as p = items.para(c, it.para);
+    let is *model.Style as st = &j.styles[it.style];
+    let is i64 as slot = _slot(j, it.style, it.face);
+    if (slot < 0) { return 0 - 1; }
+    let is i64 as pb = c.at[p.start];
+    let is shape.Text as t;
+    t.bytes = cast(*u8, cast(i64, j.text) + pb);
+    t.n = c.at[p.end] - pb;
+    t.start = c.at[a] - pb;
+    t.length = c.at[b] - c.at[a];
+    t.dir = shape.LTR;
+    if ((it.level & 1) == 1) { t.dir = shape.RTL; }
+    t.script = it.script;
+    t.lang = st.lang;
+    t.features = _features(j, st, pb);
+    if (cast(i64, t.features) == 0) { return 0 - 1; }
+    t.nfeatures = st.nfeatures;
+    t.flags = 0;
+    if (a == p.start) { t.flags = shape.AT_START; }
+    if (shape.shape(j.s, &j.sz.list[slot].r, &t) == 0) { return 0 - 1; }
+    return _take(j, slot, pb);
+}
+
+// An ellipsis in a style, its glyphs added to ln.shaped with their slot in
+// *slot; how many, or -1.
+fn _ellipsis(j as *Job, style as i64, level as i64, slot as *i64) as i64 {
+    let is *model.Style as st = &j.styles[style];
+    *slot = _slot(j, style, font.find(st.font, ELLIPSIS));
+    if (*slot < 0) { return 0 - 1; }
+    let is [4]u8 as e;
+    e[0] = cast(u8, 226);
+    e[1] = cast(u8, 128);
+    e[2] = cast(u8, 166);
+    e[3] = cast(u8, 0);
+    let is shape.Text as t;
+    t.bytes = cast(*u8, &e);
+    t.n = 3;
+    t.start = 0;
+    t.length = 3;
+    t.dir = shape.LTR;
+    if ((level & 1) == 1) { t.dir = shape.RTL; }
+    t.script = scripts.of("Zyyy");
+    t.lang = st.lang;
+    t.features = cast(*shape.Feature, 0);
+    t.nfeatures = 0;
+    t.flags = shape.NO_DOTTED_CIRCLE;
+    if (shape.shape(j.s, &j.sz.list[*slot].r, &t) == 0) { return 0 - 1; }
+    return _take(j, *slot, 0);
+}
+
+// Every item shaped, and what each character is given.
+fn _items(j as *Job) as i32 {
+    let is *items.Chars as c = j.c;
+    let is *Lines as ln = j.ln;
+    ln.shaped.n = 0;
+    if (model.arr_room(&ln.chars, c.n + 1) == 0) { return 0; }
+    ln.chars.n = c.n + 1;
+    mem.memzero(ln.chars.block, (c.n + 1) * sizeof(Char));
+    let is i64 as k with mut = 0;
+    while (k < c.items.n) {
+        let is i64 as first = ln.shaped.n;
+        let is *items.Item as it = items.item(c, k);
+        let is i64 as count = _shape(j, k, it.start, it.end);
+        if (count < 0) { return 0; }
+        it.gfirst = first;
+        it.gcount = count;
+        let is i64 as g with mut = first;
+        while (g < first + count) {
+            let is *Shaped as h = _sh(j, g);
+            let is i64 as ci = c.cp_of[cast(i64, h.cluster)];
+            if (ci >= 0) {
+                let is *Char as ch = _ch(j, ci);
+                ch.adv = ch.adv + h.xa;
+                ch.starts = 1;
+                if (h.unsafe != 0) { ch.unsafe = 1; }
+            }
+            g = g + 1;
+        }
+        k = k + 1;
+    }
+    j.base = ln.shaped.n;
+    return 1;
+}
+
+// Whether item it may be broken before character i as it was shaped.
+fn _safe(j as *Job, it as *items.Item, i as i64) as i32 {
+    if (i <= it.start || i >= it.end) { return 1; }
+    let is *Char as ch = _ch(j, i);
+    return cast(i32, ch.starts == 1 && ch.unsafe == 0);
+}
+
+// --- Fitting ---
+
+// The next tab stop after x.
+fn _stop(j as *Job, x as f64) as f64 {
+    return j.tab * cast(f64, cast(i64, (x + SLACK) / j.tab) + 1);
+}
+
+// Where the pen is after character i, from x.
+fn _after(j as *Job, i as i64, x as f64) as f64 {
+    if (_cp(j, i) == 9) { return _stop(j, x); }
+    return x + _ch(j, i).adv;
+}
+
+fn _fits(j as *Job, w as f64) as i32 { return cast(i32, j.p.width < 0.0 || w <= j.p.width + SLACK); }
+
+// Where the grapheme that begins at i ends.
+fn _grapheme_end(j as *Job, i as i64, end as i64) as i64 {
+    let is i64 as k with mut = i + 1;
+    while (k < end && j.c.starts[k] == cast(u8, 0)) { k = k + 1; }
+    return k;
+}
+
+// The end of a line from ls that breaks a word too long for one: as many of
+// its graphemes as fit, and at least one.
+fn _fit_graphemes(j as *Job, ls as i64, end as i64) as i64 {
+    let is f64 as x with mut = 0.0;
+    let is i64 as last with mut = 0 - 1;
+    let is i64 as i with mut = ls;
+    while (i < end) {
+        let is i64 as k = _grapheme_end(j, i, end);
+        let is i64 as q with mut = i;
+        while (q < k) {
+            x = _after(j, q, x);
+            q = q + 1;
+        }
+        if (last < 0 || _fits(j, x) == 1) {
+            last = k;
+            i = k;
+        } else {
+            i = end;
+        }
+    }
+    return last;
+}
+
+// The end of the line from ls in a paragraph whose content ends at end: as
+// many break opportunities as fit, the spaces before each hanging; a word
+// longer than the width broken between graphemes; a line separator ending it.
+fn _fit(j as *Job, ls as i64, end as i64) as i64 {
+    let is *items.Chars as c = j.c;
+    let is f64 as x with mut = 0.0;
+    let is f64 as ink with mut = 0.0;
+    let is i64 as best with mut = 0 - 1;
+    let is i64 as i with mut = ls;
+    while (i < end) {
+        if (i > ls && c.brk[i] != cast(u8, 0)) {
+            if (_fits(j, ink) == 0) {
+                if (best > ls) { return best; }
+                return _fit_graphemes(j, ls, end);
+            }
+            if (c.brk[i] == cast(u8, 2)) { return i; }
+            best = i;
+        }
+        x = _after(j, i, x);
+        if (items.is_space(_cp(j, i)) == 0) { ink = x; }
+        i = i + 1;
+    }
+    if (_fits(j, ink) == 1) { return end; }
+    if (best > ls) { return best; }
+    return _fit_graphemes(j, ls, end);
+}
+
+// The end before le a line from ls gives back when it does not fit: its
+// last opportunity, or else its last grapheme; ls when it has neither.
+fn _before(j as *Job, ls as i64, le as i64) as i64 {
+    let is i64 as i with mut = le - 1;
+    while (i > ls) {
+        if (j.c.brk[i] == cast(u8, 1)) { return i; }
+        i = i - 1;
+    }
+    i = le - 1;
+    while (i > ls) {
+        if (j.c.starts[i] == cast(u8, 1)) { return i; }
+        i = i - 1;
+    }
+    return ls;
+}
+
+// le without the spaces before it.
+fn _trim(j as *Job, ls as i64, le as i64) as i64 {
+    let is i64 as e with mut = le;
+    while (e > ls && items.is_space(_cp(j, e - 1)) == 1) { e = e - 1; }
+    return e;
+}
+
+// --- A line's parts ---
+
+// Whether u goes back to its paragraph's level at the end of a line (UAX #9,
+// L1): whitespace, and the isolate and embedding controls.
+fn _trailing(u as i64) as i32 {
+    let is i64 as t = ucd.bidi_class(cast(i32, u));
+    return cast(i32, t == bc.BIDI_WS || t == bc.BIDI_LRI || t == bc.BIDI_RLI || t == bc.BIDI_FSI ||
+                     t == bc.BIDI_PDI || t == bc.BIDI_LRE || t == bc.BIDI_RLE || t == bc.BIDI_LRO ||
+                     t == bc.BIDI_RLO || t == bc.BIDI_PDF || t == bc.BIDI_BN);
+}
+
+fn _level(j as *Job, i as i64, tail as i64, plevel as i64) as i64 {
+    if (i >= tail) { return plevel; }
+    return cast(i64, j.c.level[i]);
+}
+
+// A part of glyphs gfirst .. gfirst + gcount: those of characters a .. b, or
+// every one; turned round when the part is in the other direction from how
+// they were shaped.
+fn _part(j as *Job, a as i64, b as i64, level as i64, item as i64, style as i64, slot as i64, gfirst as i64,
+         gcount as i64, flip as i32, every as i32) as i32 {
+    let is *Part as pt = cast(*Part, model.arr_push(&j.ln.parts));
+    if (cast(i64, pt) == 0) { return 0; }
+    pt.a = a;
+    pt.b = b;
+    pt.level = level;
+    pt.item = item;
+    pt.style = style;
+    pt.slot = slot;
+    pt.first = j.ln.pglyphs.n;
+    let is i64 as lo = j.c.at[a];
+    let is i64 as hi = j.c.at[b];
+    let is i64 as m with mut = 0;
+    while (m < gcount) {
+        let is i64 as g with mut = gfirst + m;
+        if (flip == 1) { g = gfirst + gcount - 1 - m; }
+        let is Shaped as h = *_sh(j, g);
+        let is i64 as cl = cast(i64, h.cluster);
+        if (every == 1 || (cl >= lo && cl < hi)) {
+            let is *Shaped as d = cast(*Shaped, model.arr_push(&j.ln.pglyphs));
+            if (cast(i64, d) == 0) { return 0; }
+            *d = h;
+        }
+        m = m + 1;
+    }
+    pt.count = j.ln.pglyphs.n - pt.first;
+    return 1;
+}
+
+// The parts of the line ls .. le of paragraph pi, in logical order; with an
+// ellipsis in style ell after them, unless ell is -1.
+fn _build(j as *Job, pi as i64, ls as i64, le as i64, ell as i64) as i32 {
+    let is *items.Chars as c = j.c;
+    let is *Lines as ln = j.ln;
+    let is i64 as plevel = items.para(c, pi).level;
+    ln.shaped.n = j.base;
+    ln.parts.n = 0;
+    ln.pglyphs.n = 0;
+    let is i64 as tail with mut = le;
+    while (tail > ls && _trailing(_cp(j, tail - 1)) == 1) { tail = tail - 1; }
+    let is i64 as k with mut = j.ifirst;
+    while (k < c.items.n && items.item(c, k).para == pi && items.item(c, k).start < le) {
+        let is items.Item as it = *items.item(c, k);
+        if (it.end > ls) {
+            let is i64 as a = _max(ls, it.start);
+            let is i64 as b = _min(le, it.end);
+            let is i64 as gfirst with mut = it.gfirst;
+            let is i64 as gcount with mut = it.gcount;
+            if ((a > it.start && _safe(j, &it, a) == 0) || (b < it.end && _safe(j, &it, b) == 0)) {
+                gfirst = ln.shaped.n;
+                gcount = _shape(j, k, a, b);
+                if (gcount < 0) { return 0; }
+            }
+            let is i64 as slot = _slot(j, it.style, it.face);
+            let is i64 as q with mut = a;
+            while (q < b) {
+                let is i64 as lv = _level(j, q, tail, plevel);
+                let is i64 as r with mut = q + 1;
+                while (r < b && _level(j, r, tail, plevel) == lv) { r = r + 1; }
+                let is i32 as flip = cast(i32, (lv & 1) != (it.level & 1));
+                if (_part(j, q, r, lv, k, it.style, slot, gfirst, gcount, flip, 0) == 0) { return 0; }
+                q = r;
+            }
+        }
+        k = k + 1;
+    }
+    if (ell >= 0) {
+        let is i64 as eslot with mut = 0;
+        let is i64 as gfirst = ln.shaped.n;
+        let is i64 as gcount = _ellipsis(j, ell, plevel, &eslot);
+        if (gcount < 0) { return 0; }
+        let is i64 as g with mut = gfirst;
+        while (g < gfirst + gcount) {
+            _sh(j, g).cluster = cast(u32, c.at[le]);
+            g = g + 1;
+        }
+        if (_part(j, le, le, plevel, 0 - 1, ell, eslot, gfirst, gcount, 0, 1) == 0) { return 0; }
+    }
+    return 1;
+}
+
+// --- A line measured, placed ---
+
+// The parts put in the order they are drawn (UAX #9, L2): each is of one
+// level, its glyphs already in its direction's order, so reordering the
+// parts by their levels reorders the characters.
+fn _order(j as *Job) as i32 {
+    let is *Lines as ln = j.ln;
+    let is i64 as np = ln.parts.n;
+    if (model.arr_room(&ln.levels, np + 1) == 0 || model.arr_room(&ln.order, np + 1) == 0) { return 0; }
+    let is *u8 as lv = ln.levels.block;
+    let is *i64 as vis = cast(*i64, ln.order.block);
+    let is i64 as i with mut = 0;
+    while (i < np) {
+        lv[i] = cast(u8, _part_at(j, i).level);
+        vis[i] = i;
+        i = i + 1;
+    }
+    if (np > 0) { bidi.reorder(lv, np, vis); }
+    return 1;
+}
+
+fn _vis(j as *Job, v as i64) as *Part {
+    let is *i64 as vis = cast(*i64, j.ln.order.block);
+    return _part_at(j, vis[v]);
+}
+
+// The line's parts ordered, its tabs set — each to the next stop from the
+// line's start, in its paragraph's direction — and its width and what hangs
+// past its end found: j.ink, j.hang and j.hs.
+fn _measure(j as *Job, plevel as i64, ls as i64, le as i64) as i32 {
+    if (_order(j) == 0) { return 0; }
+    let is *items.Chars as c = j.c;
+    let is i64 as np = j.ln.parts.n;
+    let is i32 as rtl = cast(i32, (plevel & 1) == 1);
+    let is f64 as s with mut = 0.0;
+    let is i64 as prev with mut = 0 - 1;
+    let is i64 as v with mut = 0;
+    while (v < np) {
+        let is i64 as vi with mut = v;
+        if (rtl == 1) { vi = np - 1 - v; }
+        let is *Part as pt = _vis(j, vi);
+        let is i64 as m with mut = 0;
+        while (m < pt.count) {
+            let is i64 as gi with mut = pt.first + m;
+            if (rtl == 1) { gi = pt.first + pt.count - 1 - m; }
+            let is *Shaped as h = _pg(j, gi);
+            let is i64 as cl = cast(i64, h.cluster);
+            if (pt.item >= 0 && _cp(j, c.cp_of[cl]) == 9) {
+                h.xa = 0.0;
+                if (cl != prev) { h.xa = _stop(j, s) - s; }
+            }
+            prev = cl;
+            s = s + h.xa;
+            m = m + 1;
+        }
+        v = v + 1;
+    }
+    j.hs = _trim(j, ls, le);
+    let is f64 as hang with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < np) {
+        let is *Part as pt = _part_at(j, i);
+        if (pt.item >= 0 && pt.b > j.hs) {
+            let is i64 as m with mut = 0;
+            while (m < pt.count) {
+                let is *Shaped as h = _pg(j, pt.first + m);
+                if (c.cp_of[cast(i64, h.cluster)] >= j.hs) { hang = hang + h.xa; }
+                m = m + 1;
+            }
+        }
+        i = i + 1;
+    }
+    j.hang = hang;
+    j.ink = s - hang;
+    return 1;
+}
+
+// Whether a justified line's glyph h, of part pt, takes a share of the space
+// left: the first glyph of a space between words.
+fn _stretches(j as *Job, pt as *Part, h as *Shaped, prev as i64) as i32 {
+    if (pt.item < 0 || cast(i64, h.cluster) == prev) { return 0; }
+    let is i64 as ci = j.c.cp_of[cast(i64, h.cluster)];
+    if (ci >= j.hs) { return 0; }
+    return cast(i32, ucd.general_category(j.c.cps[ci]) == ucd.GC_ZS);
+}
+
+// The space left on a line shared between its spaces.
+fn _justify(j as *Job) as void {
+    let is f64 as left = j.p.width - j.ink;
+    if (left <= SLACK) { return; }
+    let is i64 as count with mut = 0;
+    let is i64 as prev with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < j.ln.parts.n) {
+        let is *Part as pt = _part_at(j, i);
+        let is i64 as m with mut = 0;
+        while (m < pt.count) {
+            let is *Shaped as h = _pg(j, pt.first + m);
+            if (_stretches(j, pt, h, prev) == 1) { count = count + 1; }
+            prev = cast(i64, h.cluster);
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+    if (count == 0) { return; }
+    let is f64 as share = left / cast(f64, count);
+    prev = 0 - 1;
+    i = 0;
+    while (i < j.ln.parts.n) {
+        let is *Part as pt = _part_at(j, i);
+        let is i64 as m with mut = 0;
+        while (m < pt.count) {
+            let is *Shaped as h = _pg(j, pt.first + m);
+            if (_stretches(j, pt, h, prev) == 1) { h.xa = h.xa + share; }
+            prev = cast(i64, h.cluster);
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+    j.ink = j.p.width;
+}
+
+// The rectangles under and through glyphs x0 .. x1 of style, in face slot.
+fn _decorate(j as *Job, style as i64, slot as i64, x0 as f64, x1 as f64, base as f64, li as i64) as i32 {
+    let is *model.Style as st = &j.styles[style];
+    let is *font.Sized as z = &j.sz.list[slot];
+    let is f64 as em = cast(f64, z.m.upem);
+    let is f64 as thick with mut = cast(f64, z.m.underline_thickness);
+    if (thick <= 0.0) { thick = em / 14.0; }
+    if (st.underline == 1) {
+        let is *model.Deco as d = cast(*model.Deco, model.arr_push(&j.ln.decos));
+        if (cast(i64, d) == 0) { return 0; }
+        let is f64 as pos with mut = cast(f64, z.m.underline_pos);
+        if (pos == 0.0) { pos = 0.0 - em / 10.0; }
+        d.x = x0;
+        d.y = base - pos * z.scale;
+        d.w = x1 - x0;
+        d.h = thick * z.scale;
+        d.style = style;
+        d.line = li;
+    }
+    if (st.strike == 1) {
+        let is *model.Deco as d = cast(*model.Deco, model.arr_push(&j.ln.decos));
+        if (cast(i64, d) == 0) { return 0; }
+        let is f64 as size with mut = cast(f64, z.m.strike_size);
+        if (size <= 0.0) { size = thick; }
+        let is f64 as pos with mut = cast(f64, z.m.strike_pos);
+        if (pos <= 0.0) {
+            pos = em / 4.0 + size / 2.0;
+            if (z.m.x_height > 0) { pos = cast(f64, z.m.x_height) / 2.0 + size / 2.0; }
+        }
+        d.x = x0;
+        d.y = base - pos * z.scale;
+        d.w = x1 - x0;
+        d.h = size * z.scale;
+        d.style = style;
+        d.line = li;
+    }
+    return 1;
+}
+
+fn _decorates(j as *Job, style as i64) as i32 {
+    let is *model.Style as st = &j.styles[style];
+    return cast(i32, st.underline == 1 || st.strike == 1);
+}
+
+// The line measured added to the layout, its top at top, its content's left
+// at 0 until it is aligned; eslot the face an empty line takes its height
+// from. Its height.
+fn _emit(j as *Job, pi as i64, ls as i64, le as i64, last as i32, eslot as i64, top as f64) as f64 {
+    let is *items.Chars as c = j.c;
+    let is *Lines as ln = j.ln;
+    let is i64 as plevel = items.para(c, pi).level;
+    let is i64 as np = ln.parts.n;
+    if (j.p.align == model.ALIGN_JUSTIFY && last == 0 && j.p.width >= 0.0) { _justify(j); }
+
+    // Its height: the tallest face's.
+    let is f64 as asc with mut = 0.0;
+    let is f64 as desc with mut = 0.0;
+    let is f64 as gap with mut = 0.0;
+    let is i64 as i with mut = 0 - 1;
+    while (i < np) {
+        let is i64 as slot with mut = eslot;
+        if (i >= 0) { slot = _part_at(j, i).slot; }
+        if (slot >= 0) {
+            let is *font.Sized as z = &j.sz.list[slot];
+            let is f64 as a = cast(f64, z.m.ascender) * z.scale;
+            let is f64 as d = 0.0 - cast(f64, z.m.descender) * z.scale;
+            let is f64 as g = cast(f64, z.m.line_gap) * z.scale;
+            if (a > asc) { asc = a; }
+            if (d > desc) { desc = d; }
+            if (g > gap) { gap = g; }
+        }
+        i = i + 1;
+    }
+    let is f64 as height = (asc + desc + gap) * j.p.line_height;
+    let is f64 as base = top + (height - asc - desc) / 2.0 + asc;
+
+    // Its pieces and glyphs, left to right.
+    let is i64 as li = ln.lines.n;
+    let is model.Line as l;
+    mem.memzero(cast(*u8, &l), sizeof(model.Line));
+    l.first = ln.glyphs.n;
+    l.pfirst = ln.pieces.n;
+    let is f64 as pen with mut = 0.0;
+    if ((plevel & 1) == 1) { pen = 0.0 - j.hang; }
+    let is i64 as dstyle with mut = 0 - 1;
+    let is i64 as dslot with mut = 0 - 1;
+    let is f64 as dx0 with mut = 0.0;
+    let is f64 as dx1 with mut = 0.0;
+    let is i64 as v with mut = 0;
+    while (v < np) {
+        let is *Part as pt = _vis(j, v);
+        // A part of the level of the piece before it goes on with that
+        // piece: what reordering keeps together is logically together.
+        let is *model.Piece as pc with mut = cast(*model.Piece, 0);
+        if (ln.pieces.n > l.pfirst && piece(ln, ln.pieces.n - 1).level == pt.level) {
+            pc = piece(ln, ln.pieces.n - 1);
+            pc.count = pc.count + pt.count;
+            if (c.at[pt.a] < pc.start) { pc.start = c.at[pt.a]; }
+            if (c.at[pt.b] > pc.end) { pc.end = c.at[pt.b]; }
+        } else {
+            pc = cast(*model.Piece, model.arr_push(&ln.pieces));
+            if (cast(i64, pc) == 0) { return 0.0 - 1.0; }
+            pc.first = ln.glyphs.n;
+            pc.count = pt.count;
+            pc.start = c.at[pt.a];
+            pc.end = c.at[pt.b];
+            pc.level = pt.level;
+            pc.x = pen;
+        }
+        let is i64 as m with mut = 0;
+        while (m < pt.count) {
+            let is *Shaped as h = _pg(j, pt.first + m);
+            let is *model.Glyph as g = cast(*model.Glyph, model.arr_push(&ln.glyphs));
+            if (cast(i64, g) == 0) { return 0.0 - 1.0; }
+            g.id = h.id;
+            g.slot = h.slot;
+            g.cluster = h.cluster;
+            g.style = cast(i32, pt.style);
+            g.x = pen + h.xo;
+            g.y = base - h.yo;
+            g.adv = h.xa;
+            let is i32 as hangs = cast(i32, pt.item >= 0 && c.cp_of[cast(i64, h.cluster)] >= j.hs);
+            let is i64 as gslot = cast(i64, h.slot);
+            if (hangs == 0 && _decorates(j, pt.style) == 1) {
+                if (dstyle == pt.style && dslot == gslot && dx1 == pen) {
+                    dx1 = pen + h.xa;
+                } else {
+                    if (dstyle >= 0 && _decorate(j, dstyle, dslot, dx0, dx1, base, li) == 0) { return 0.0 - 1.0; }
+                    dstyle = pt.style;
+                    dslot = gslot;
+                    dx0 = pen;
+                    dx1 = pen + h.xa;
+                }
+            }
+            pen = pen + h.xa;
+            m = m + 1;
+        }
+        pc = piece(ln, ln.pieces.n - 1);
+        pc.width = pen - pc.x;
+        v = v + 1;
+    }
+    if (dstyle >= 0 && _decorate(j, dstyle, dslot, dx0, dx1, base, li) == 0) { return 0.0 - 1.0; }
+    l.count = ln.glyphs.n - l.first;
+    l.pcount = ln.pieces.n - l.pfirst;
+    l.start = c.at[ls];
+    l.end = c.at[le];
+    l.x = 0.0;
+    l.top = top;
+    l.y = base;
+    l.height = height;
+    l.ascent = asc;
+    l.descent = desc;
+    l.width = j.ink;
+    l.level = plevel;
+    l.last = last;
+    let is *model.Line as lp = cast(*model.Line, model.arr_push(&ln.lines));
+    if (cast(i64, lp) == 0) { return 0.0 - 1.0; }
+    *lp = l;
+    if (j.ink > ln.width) { ln.width = j.ink; }
+    return height;
+}
+
+// --- Paragraphs into lines ---
+
+// The face an empty line at character i takes its height from: a space's,
+// in i's style.
+fn _empty_slot(j as *Job, i as i64) as i64 {
+    let is i64 as style with mut = 0;
+    if (i < j.c.n) { style = j.c.style[i]; } else if (j.c.n > 0) { style = j.c.style[j.c.n - 1]; }
+    return _slot(j, style, font.find(j.styles[style].font, 32));
+}
+
+// The line from ls built to fit: its end.
+fn _fitted(j as *Job, pi as i64, ls as i64, end as i64) as i64 {
+    let is i64 as plevel = items.para(j.c, pi).level;
+    let is i64 as le with mut = _fit(j, ls, end);
+    if (_build(j, pi, ls, le, 0 - 1) == 0 || _measure(j, plevel, ls, le) == 0) { return 0 - 1; }
+    while (_fits(j, j.ink) == 0 && _before(j, ls, le) > ls) {
+        le = _before(j, ls, le);
+        if (_build(j, pi, ls, le, 0 - 1) == 0 || _measure(j, plevel, ls, le) == 0) { return 0 - 1; }
+    }
+    return le;
+}
+
+// The style of what an ellipsis follows: the last character kept's.
+fn _ellipsis_style(j as *Job, ls as i64, e as i64) as i64 {
+    if (e > ls) { return j.c.style[e - 1]; }
+    if (ls < j.c.n) { return j.c.style[ls]; }
+    if (j.c.n > 0) { return j.c.style[j.c.n - 1]; }
+    return 0;
+}
+
+// The last line max_lines allows, from ls: what of the rest fits with an
+// ellipsis after it — graphemes, the spaces before the ellipsis left out —
+// or, with no width, the line as it would end. Its end.
+fn _ellipsized(j as *Job, pi as i64, ls as i64, end as i64, natural as i64) as i64 {
+    let is i64 as plevel = items.para(j.c, pi).level;
+    let is i64 as e with mut = _trim(j, ls, natural);
+    if (j.p.width >= 0.0) {
+        // The ellipsis' width, then as many graphemes as fit with it.
+        if (_build(j, pi, ls, ls, _ellipsis_style(j, ls, ls)) == 0 || _measure(j, plevel, ls, ls) == 0) { return 0 - 1; }
+        let is f64 as ew = j.ink;
+        let is f64 as x with mut = 0.0;
+        let is f64 as ink with mut = 0.0;
+        let is i64 as i with mut = ls;
+        e = ls;
+        while (i < end) {
+            let is i64 as k = _grapheme_end(j, i, end);
+            let is i64 as q with mut = i;
+            while (q < k) {
+                x = _after(j, q, x);
+                if (items.is_space(_cp(j, q)) == 0) { ink = x; }
+                q = q + 1;
+            }
+            if (_fits(j, ink + ew) == 1) {
+                e = k;
+                i = k;
+            } else {
+                i = end;
+            }
+        }
+        e = _trim(j, ls, e);
+    }
+    if (_build(j, pi, ls, e, _ellipsis_style(j, ls, e)) == 0 || _measure(j, plevel, ls, e) == 0) { return 0 - 1; }
+    while (_fits(j, j.ink) == 0 && e > ls) {
+        let is i64 as k with mut = e - 1;
+        while (k > ls && j.c.starts[k] == cast(u8, 0)) { k = k - 1; }
+        e = _trim(j, ls, k);
+        if (_build(j, pi, ls, e, _ellipsis_style(j, ls, e)) == 0 || _measure(j, plevel, ls, e) == 0) { return 0 - 1; }
+    }
+    return e;
+}
+
+// Every line aligned in the box — or, with no width, in the widest line.
+fn _align(j as *Job) as void {
+    let is *Lines as ln = j.ln;
+    let is f64 as avail with mut = j.p.width;
+    if (avail < 0.0) { avail = ln.width; }
+    let is i64 as li with mut = 0;
+    while (li < ln.lines.n) {
+        let is *model.Line as l = line(ln, li);
+        let is i32 as rtl = cast(i32, (l.level & 1) == 1);
+        let is i64 as mode with mut = j.p.align;
+        if (mode == model.ALIGN_JUSTIFY) { mode = model.ALIGN_START; }
+        if (mode == model.ALIGN_START) {
+            mode = model.ALIGN_LEFT;
+            if (rtl == 1) { mode = model.ALIGN_RIGHT; }
+        } else if (mode == model.ALIGN_END) {
+            mode = model.ALIGN_RIGHT;
+            if (rtl == 1) { mode = model.ALIGN_LEFT; }
+        }
+        let is f64 as off with mut = 0.0;
+        if (mode == model.ALIGN_RIGHT) { off = avail - l.width; }
+        if (mode == model.ALIGN_CENTER) { off = (avail - l.width) / 2.0; }
+        l.x = off;
+        let is i64 as g with mut = l.first;
+        while (g < l.first + l.count) {
+            let is *model.Glyph as gp = glyph(ln, g);
+            gp.x = gp.x + off;
+            g = g + 1;
+        }
+        let is i64 as k with mut = l.pfirst;
+        while (k < l.pfirst + l.pcount) {
+            let is *model.Piece as pc = piece(ln, k);
+            pc.x = pc.x + off;
+            k = k + 1;
+        }
+        li = li + 1;
+    }
+    let is i64 as d with mut = 0;
+    while (d < ln.decos.n) {
+        let is *model.Deco as dp = deco(ln, d);
+        dp.x = dp.x + line(ln, dp.line).x;
+        d = d + 1;
+    }
+}
+
+// The distance between tab stops: the one asked for, or eight spaces of
+// style 0.
+fn _tab(j as *Job) as i32 {
+    if (j.p.tab > 0.0) {
+        j.tab = j.p.tab;
+        return 1;
+    }
+    let is i64 as slot = _slot(j, 0, font.find(j.styles[0].font, 32));
+    if (slot < 0) { return 0; }
+    let is *font.Sized as z = &j.sz.list[slot];
+    let is f64 as space with mut = outline.advance(&z.r, cmap.glyph(z.face, 32)) * z.scale;
+    if (space <= 0.0) { space = j.styles[0].px / 4.0; }
+    j.tab = space * 8.0;
+    return 1;
+}
+
+// The text's items, read into j.c, set in lines: 1, or 0 when they could not
+// be.
+fn make(j as *Job) as i32 {
+    let is *items.Chars as c = j.c;
+    let is *Lines as ln = j.ln;
+    ln.glyphs.n = 0;
+    ln.pieces.n = 0;
+    ln.lines.n = 0;
+    ln.decos.n = 0;
+    ln.width = 0.0;
+    ln.height = 0.0;
+    ln.cut = 0;
+    ln.keep = j.sz.clock + 1;
+    if (_tab(j) == 0 || _items(j) == 0) { return 0; }
+    let is i64 as most = j.p.max_lines;
+    let is f64 as top with mut = 0.0;
+    let is i64 as kfirst with mut = 0;
+    let is i32 as going with mut = 1;
+    let is i64 as pi with mut = 0;
+    while (going == 1 && pi < c.paras.n) {
+        let is items.Para as p = *items.para(c, pi);
+        while (kfirst < c.items.n && items.item(c, kfirst).para < pi) { kfirst = kfirst + 1; }
+        j.ifirst = kfirst;
+        let is i64 as ls with mut = p.start;
+        let is i32 as first with mut = 1;
+        while (going == 1 && (ls < p.end || first == 1)) {
+            first = 0;
+            let is i64 as eslot with mut = 0 - 1;
+            if (p.end == p.start) { eslot = _empty_slot(j, p.start); }
+            let is i64 as le with mut = p.end;
+            if (ls < p.end) { le = _fitted(j, pi, ls, p.end); }
+            else if (_build(j, pi, ls, ls, 0 - 1) == 0 || _measure(j, p.level, ls, ls) == 0) { le = 0 - 1; }
+            if (le < 0) { return 0; }
+            let is i32 as more = cast(i32, le < p.end || pi + 1 < c.paras.n);
+            let is i32 as last with mut = cast(i32, le >= p.end || c.brk[le] == cast(u8, 2));
+            if (most > 0 && ln.lines.n == most - 1 && more == 1) {
+                ln.cut = 1;
+                going = 0;
+                last = 1;
+                if (j.p.ellipsis == 1) {
+                    le = _ellipsized(j, pi, ls, p.end, le);
+                    if (le < 0) { return 0; }
+                }
+            }
+            let is f64 as h = _emit(j, pi, ls, le, last, eslot, top);
+            if (h < 0.0) { return 0; }
+            top = top + h;
+            ls = le;
+        }
+        pi = pi + 1;
+    }
+    ln.height = top;
+    _align(j);
+    return 1;
+}

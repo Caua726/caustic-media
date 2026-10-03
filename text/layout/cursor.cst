@@ -1,0 +1,455 @@
+// text/layout/cursor.cst — the questions a text field asks of a layout:
+// where the caret for a byte offset is drawn, which offset a point is over,
+// what a selection covers; and where the caret goes by grapheme, by word,
+// to the left and right as the text is drawn, and up and down.
+//
+// A caret stands before a grapheme or at the end of a run of one direction.
+// Its x comes from the glyphs: before a grapheme left to right is the left
+// edge of its cluster's glyphs, right to left the right edge; a cluster of
+// several graphemes (a ligature) shares its advance among them. Where a run
+// of one direction meets one of the other, an offset has two places — after
+// the text before it, before the text after it — and the caret has both.
+//
+// Upstream (Position.upstream) says a position goes with the text before
+// it: an offset where a line wraps is then the end of the line before, not
+// the start of the line after; one where directions meet is drawn after the
+// text before it. Moving left and right goes through both places.
+use "caustic-unicode/src/ucd/props.cst" as ucd;
+use "caustic-unicode/src/segment/word.cst" as word;
+use "model.cst" as model;
+use "items.cst" as items;
+use "layout.cst" as layout;
+
+struct Position {
+    offset   as i64;   // bytes
+    upstream as i32;   // 1: with the text before it, where that is another line
+    _pad0    as i32;
+}
+
+struct Caret {
+    line   as i64;
+    x      as f64;   // where it is drawn: before the text after the offset, or upstream after the text before
+    x2     as f64;   // the offset's other place where directions meet; x elsewhere
+    top    as f64;
+    height as f64;
+    rtl    as i32;   // the text after the offset is right to left
+    _pad0  as i32;
+}
+
+struct Rect {
+    x as f64;
+    y as f64;
+    w as f64;
+    h as f64;
+}
+
+fn position(offset as i64, upstream as i32) as Position {
+    let is Position as p;
+    p.offset = offset;
+    p.upstream = upstream;
+    p._pad0 = 0;
+    return p;
+}
+
+// --- Characters ---
+
+fn _c(l as *layout.Layout) as *items.Chars { return &l.chars; }
+
+// The character an offset is at: the one that begins there, or that holds
+// it; n at the end.
+fn _char(l as *layout.Layout, offset as i64) as i64 {
+    let is *items.Chars as c = _c(l);
+    if (offset <= 0) { return 0; }
+    if (offset >= c.nbytes) { return c.n; }
+    let is i64 as b with mut = offset;
+    while (b > 0 && c.cp_of[b] < 0) { b = b - 1; }
+    return c.cp_of[b];
+}
+
+fn _byte(l as *layout.Layout, i as i64) as i64 { return _c(l).at[i]; }
+
+fn _starts(l as *layout.Layout, i as i64) as i32 { return cast(i32, _c(l).starts[i] == cast(u8, 1)); }
+
+// --- Places within a line ---
+
+// Where offset o is in piece p, which holds it or ends at it: before the
+// grapheme at o in the piece's direction, or after its text when o is its
+// end.
+fn _x_in(l as *layout.Layout, p as *model.Piece, o as i64) as f64 {
+    let is i32 as rtl = cast(i32, (p.level & 1) == 1);
+    let is f64 as pen with mut = p.x;
+    let is f64 as left with mut = p.x;      // the text's ink, the ellipsis left out
+    let is f64 as right with mut = p.x;
+    let is i32 as any with mut = 0;
+    let is i64 as k with mut = p.first;
+    while (k < p.first + p.count) {
+        let is i64 as cl = cast(i64, layout.glyph(l, k).cluster);
+        // The cluster's glyphs, and where it ends in the text.
+        let is i64 as e with mut = k + 1;
+        while (e < p.first + p.count && cast(i64, layout.glyph(l, e).cluster) == cl) { e = e + 1; }
+        let is f64 as x0 = pen;
+        let is i64 as g with mut = k;
+        while (g < e) {
+            pen = pen + layout.glyph(l, g).adv;
+            g = g + 1;
+        }
+        let is f64 as x1 = pen;
+        if (cl < p.end) {
+            if (any == 0 || x0 < left) { left = x0; }
+            if (any == 0 || x1 > right) { right = x1; }
+            any = 1;
+            let is i64 as stop with mut = p.end;
+            if (rtl == 0 && e < p.first + p.count) { stop = cast(i64, layout.glyph(l, e).cluster); }
+            if (rtl == 1 && k > p.first) { stop = cast(i64, layout.glyph(l, k - 1).cluster); }
+            if (stop > p.end || stop <= cl) { stop = p.end; }
+            if (o >= cl && o < stop) {
+                // Its graphemes share its advance.
+                let is i64 as a = _char(l, cl);
+                let is i64 as b = _char(l, stop);
+                let is i64 as n with mut = 0;
+                let is i64 as before with mut = 0;
+                let is i64 as q with mut = a;
+                while (q < b) {
+                    if (q == a || _starts(l, q) == 1) {
+                        if (_byte(l, q) < o) { before = before + 1; }
+                        n = n + 1;
+                    }
+                    q = q + 1;
+                }
+                let is f64 as part = (x1 - x0) * cast(f64, before) / cast(f64, n);
+                if (rtl == 1) { return x1 - part; }
+                return x0 + part;
+            }
+        }
+        k = e;
+    }
+    if (any == 0) { return p.x; }
+    if (rtl == 1) { return left; }
+    return right;
+}
+
+// The piece of line li that holds offset o, or ends at it when after is 1
+// (or holds nothing there); null for none.
+fn _piece(l as *layout.Layout, li as i64, o as i64, after as i32) as *model.Piece {
+    let is *model.Line as ln = layout.line(l, li);
+    let is i64 as k with mut = ln.pfirst;
+    while (k < ln.pfirst + ln.pcount) {
+        let is *model.Piece as p = layout.piece(l, k);
+        if (after == 0 && o >= p.start && o < p.end) { return p; }
+        if (after == 1 && o > p.start && o <= p.end) { return p; }
+        k = k + 1;
+    }
+    return cast(*model.Piece, 0);
+}
+
+// The line an offset is on: the last that starts at or before it — or,
+// upstream, the one it ends where the next begins.
+fn line_of(l as *layout.Layout, at as Position) as i64 {
+    let is i64 as n = layout.line_count(l);
+    let is i64 as li with mut = 0;
+    while (li + 1 < n && layout.line(l, li + 1).start <= at.offset) { li = li + 1; }
+    if (at.upstream == 1 && li > 0 && layout.line(l, li).start == at.offset &&
+        layout.line(l, li - 1).end == at.offset) {
+        li = li - 1;
+    }
+    return li;
+}
+
+// The caret for a position.
+fn caret(l as *layout.Layout, at as Position) as Caret {
+    let is Caret as c;
+    let is i64 as li = line_of(l, at);
+    let is *model.Line as ln = layout.line(l, li);
+    let is i64 as o with mut = at.offset;
+    if (o < ln.start) { o = ln.start; }
+    if (o > ln.end) { o = ln.end; }
+    c.line = li;
+    c.top = ln.top;
+    c.height = ln.height;
+    c._pad0 = 0;
+    let is *model.Piece as next = _piece(l, li, o, 0);
+    let is *model.Piece as prev = _piece(l, li, o, 1);
+    // A line of nothing: where its text would start.
+    let is f64 as x with mut = ln.x;
+    if ((ln.level & 1) == 1) { x = ln.x + ln.width; }
+    c.rtl = cast(i32, (ln.level & 1) == 1);
+    c.x = x;
+    c.x2 = x;
+    if (cast(i64, next) != 0) {
+        c.x = _x_in(l, next, o);
+        c.rtl = cast(i32, (next.level & 1) == 1);
+    }
+    if (cast(i64, prev) != 0) {
+        c.x2 = _x_in(l, prev, o);
+        if (cast(i64, next) == 0) {
+            c.x = c.x2;
+            c.rtl = cast(i32, (prev.level & 1) == 1);
+        }
+    } else {
+        c.x2 = c.x;
+    }
+    if (at.upstream == 1) {
+        let is f64 as other = c.x;
+        c.x = c.x2;
+        c.x2 = other;
+    }
+    return c;
+}
+
+// --- Hitting ---
+
+// The offset nearest x on line li: within the grapheme under it, the side
+// it is nearer; past either end of the line, that end.
+fn _hit_line(l as *layout.Layout, li as i64, x as f64) as Position {
+    let is *model.Line as ln = layout.line(l, li);
+    let is f64 as best_d with mut = 0.0;
+    let is Position as best with mut = position(ln.start, 0);
+    let is i32 as any with mut = 0;
+    // Each grapheme's place: from the caret before it to the caret after.
+    let is i64 as a = _char(l, ln.start);
+    let is i64 as b = _char(l, ln.end);
+    let is i64 as i with mut = a;
+    while (i < b) {
+        let is i64 as j with mut = i + 1;
+        while (j < b && _starts(l, j) == 0) { j = j + 1; }
+        let is i64 as o0 = _byte(l, i);
+        let is i64 as o1 = _byte(l, j);
+        let is *model.Piece as p = _piece(l, li, o0, 0);
+        if (cast(i64, p) != 0) {
+            let is f64 as xa = _x_in(l, p, o0);
+            let is f64 as xb = _x_in(l, p, o1);
+            let is f64 as lo with mut = xa;
+            let is f64 as hi with mut = xb;
+            if (xb < xa) {
+                lo = xb;
+                hi = xa;
+            }
+            // Under it (its left edge in, its right out), or this far away.
+            let is f64 as d with mut = 0.0 - 1.0;
+            if (x < lo) { d = lo - x; }
+            if (x >= hi) { d = x - hi; }
+            if (any == 0 || d < best_d) {
+                any = 1;
+                best_d = d;
+                // The nearer side: before it or after it.
+                let is f64 as da with mut = x - xa;
+                if (da < 0.0) { da = 0.0 - da; }
+                let is f64 as db with mut = x - xb;
+                if (db < 0.0) { db = 0.0 - db; }
+                if (da <= db) { best = position(o0, 0); } else { best = position(o1, 1); }
+            }
+        }
+        i = j;
+    }
+    if (any == 0) { return position(ln.start, 0); }
+    // After the last grapheme of a line that does not end its paragraph is
+    // its end, upstream; of one that does, the paragraph's end.
+    if (best.offset == ln.end && ln.last == 1) { best.upstream = 0; }
+    return best;
+}
+
+// The position under (x, y): on the line y is in (the first above them all,
+// the last below), nearest x.
+fn hit(l as *layout.Layout, x as f64, y as f64) as Position {
+    let is i64 as n = layout.line_count(l);
+    let is i64 as li with mut = 0;
+    while (li + 1 < n && y >= layout.line(l, li + 1).top) { li = li + 1; }
+    return _hit_line(l, li, x);
+}
+
+// --- Selections ---
+
+// The rectangles text a .. b covers, at most max into out: one for each run
+// of a direction on each line it touches, those that meet made one; how
+// many there are, though only max are written.
+fn selection(l as *layout.Layout, a0 as i64, b0 as i64, out as *Rect, max as i64) as i64 {
+    let is i64 as a with mut = a0;
+    let is i64 as b with mut = b0;
+    if (b < a) {
+        a = b0;
+        b = a0;
+    }
+    let is i64 as n with mut = 0;
+    let is i64 as li with mut = 0;
+    while (li < layout.line_count(l)) {
+        let is *model.Line as ln = layout.line(l, li);
+        let is i64 as k with mut = ln.pfirst;
+        let is i64 as first = n;
+        while (k < ln.pfirst + ln.pcount) {
+            let is *model.Piece as p = layout.piece(l, k);
+            let is i64 as s with mut = a;
+            let is i64 as e with mut = b;
+            if (s < p.start) { s = p.start; }
+            if (e > p.end) { e = p.end; }
+            if (s < e) {
+                let is f64 as xs = _x_in(l, p, s);
+                let is f64 as xe = _x_in(l, p, e);
+                let is f64 as x0 with mut = xs;
+                let is f64 as x1 with mut = xe;
+                if (xe < xs) {
+                    x0 = xe;
+                    x1 = xs;
+                }
+                // Meeting the last one on this line: one rectangle.
+                let is i32 as merged with mut = 0;
+                if (n > first && n - 1 < max) {
+                    let is *Rect as r = &out[n - 1];
+                    if (r.x + r.w >= x0 - 0.0001 && r.x + r.w <= x0 + 0.0001) {
+                        r.w = x1 - r.x;
+                        merged = 1;
+                    }
+                }
+                if (merged == 0) {
+                    if (n < max) {
+                        out[n].x = x0;
+                        out[n].y = ln.top;
+                        out[n].w = x1 - x0;
+                        out[n].h = ln.height;
+                    }
+                    n = n + 1;
+                }
+            }
+            k = k + 1;
+        }
+        li = li + 1;
+    }
+    return n;
+}
+
+// --- Moving ---
+
+// The grapheme boundary after offset; the text's end at the end.
+fn next_grapheme(l as *layout.Layout, offset as i64) as i64 {
+    let is *items.Chars as c = _c(l);
+    let is i64 as i with mut = _char(l, offset);
+    if (i >= c.n) { return c.nbytes; }
+    i = i + 1;
+    while (i < c.n && c.starts[i] == cast(u8, 0)) { i = i + 1; }
+    return c.at[i];
+}
+
+// The grapheme boundary before offset; 0 at the start.
+fn prev_grapheme(l as *layout.Layout, offset as i64) as i64 {
+    let is *items.Chars as c = _c(l);
+    let is i64 as i with mut = _char(l, offset);
+    if (c.at[i] < offset) { i = i + 1; }
+    if (i <= 0) { return 0; }
+    i = i - 1;
+    while (i > 0 && c.starts[i] == cast(u8, 0)) { i = i - 1; }
+    return c.at[i];
+}
+
+// Whether character i is part of a word: a letter, a mark, a number or a
+// connector.
+fn _wordy(l as *layout.Layout, i as i64) as i32 {
+    let is i64 as gc = ucd.general_category(_c(l).cps[i]);
+    return cast(i32, (gc >= ucd.GC_LU && gc <= ucd.GC_NO) || gc == ucd.GC_PC);
+}
+
+fn _word_boundary(l as *layout.Layout, i as i64) as i32 {
+    let is *items.Chars as c = _c(l);
+    return cast(i32, word.word_is_boundary(c.cps, c.n, i) == 1);
+}
+
+// The end of the word at or after offset (UAX #29's boundaries); the text's
+// end when there is none.
+fn next_word(l as *layout.Layout, offset as i64) as i64 {
+    let is *items.Chars as c = _c(l);
+    let is i64 as i with mut = _char(l, offset);
+    // Past what is not a word, then to the word's end.
+    while (i < c.n && _wordy(l, i) == 0) { i = i + 1; }
+    if (i >= c.n) { return c.nbytes; }
+    i = i + 1;
+    while (i < c.n && _word_boundary(l, i) == 0) { i = i + 1; }
+    return c.at[i];
+}
+
+// The start of the word before offset; 0 when there is none.
+fn prev_word(l as *layout.Layout, offset as i64) as i64 {
+    let is i64 as i with mut = _char(l, offset);
+    if (_c(l).at[i] < offset) { i = i + 1; }
+    while (i > 0 && _wordy(l, i - 1) == 0) { i = i - 1; }
+    if (i <= 0) { return 0; }
+    i = i - 1;
+    while (i > 0 && _word_boundary(l, i) == 0) { i = i - 1; }
+    return _c(l).at[i];
+}
+
+// The caret stop on the caret's line nearest its place and on side dir of
+// it (1 right, -1 left) — each offset's places stops of their own, upstream
+// the one after the text before it; at itself when there is none.
+fn _beside(l as *layout.Layout, at as Position, dir as f64) as Position {
+    let is i64 as li = line_of(l, at);
+    let is *model.Line as ln = layout.line(l, li);
+    let is Caret as now = caret(l, at);
+    let is Position as best with mut = at;
+    let is f64 as best_d with mut = 0.0;
+    let is i32 as any with mut = 0;
+    let is i64 as a = _char(l, ln.start);
+    let is i64 as b = _char(l, ln.end);
+    let is i64 as i with mut = a;
+    while (i <= b) {
+        if (i == a || i == b || _starts(l, i) == 1) {
+            // Both of its places: before the text after it, then after the
+            // text before it. A wrapped line's end is upstream either way.
+            let is i64 as side with mut = 0;
+            while (side < 2) {
+                let is i32 as up with mut = cast(i32, side == 1);
+                if (i == b && i > a) { up = 1; }
+                let is Position as p = position(_byte(l, i), up);
+                let is Caret as c = caret(l, p);
+                // Upstream at the line's start is the line before's end.
+                if ((p.offset != at.offset || p.upstream != at.upstream) && c.line == li) {
+                    let is f64 as d = (c.x - now.x) * dir;
+                    if (d > 0.0001 && (any == 0 || d < best_d)) {
+                        any = 1;
+                        best_d = d;
+                        best = p;
+                    }
+                }
+                side = side + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// The position the caret goes to moving right as the text is drawn: the
+// next stop to its right on its line, or on to the line after (left to
+// right) or before (right to left) at the end.
+fn right(l as *layout.Layout, at as Position) as Position {
+    let is Position as p = _beside(l, at, 1.0);
+    if (p.offset != at.offset || p.upstream != at.upstream) { return p; }
+    let is i64 as li = line_of(l, at);
+    let is *model.Line as ln = layout.line(l, li);
+    if ((ln.level & 1) == 0 && li + 1 < layout.line_count(l)) { return position(layout.line(l, li + 1).start, 0); }
+    if ((ln.level & 1) == 1 && li > 0) { return position(layout.line(l, li - 1).end, 1); }
+    return at;
+}
+
+fn left(l as *layout.Layout, at as Position) as Position {
+    let is Position as p = _beside(l, at, 0.0 - 1.0);
+    if (p.offset != at.offset || p.upstream != at.upstream) { return p; }
+    let is i64 as li = line_of(l, at);
+    let is *model.Line as ln = layout.line(l, li);
+    if ((ln.level & 1) == 1 && li + 1 < layout.line_count(l)) { return position(layout.line(l, li + 1).start, 0); }
+    if ((ln.level & 1) == 0 && li > 0) { return position(layout.line(l, li - 1).end, 1); }
+    return at;
+}
+
+// The position on the line below the caret's nearest x — the x it wants to
+// keep, which moving up and down does not change; the text's end below the
+// last line.
+fn down(l as *layout.Layout, at as Position, x as f64) as Position {
+    let is i64 as li = line_of(l, at);
+    if (li + 1 >= layout.line_count(l)) { return position(_c(l).nbytes, 0); }
+    return _hit_line(l, li + 1, x);
+}
+
+// Above; the text's start above the first line.
+fn up(l as *layout.Layout, at as Position, x as f64) as Position {
+    let is i64 as li = line_of(l, at);
+    if (li == 0) { return position(0, 0); }
+    return _hit_line(l, li - 1, x);
+}
