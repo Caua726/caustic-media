@@ -432,7 +432,9 @@ per-widget enter and leave kept as a chain so a destroyed widget does not
 confuse it, click counting and the drag threshold from settings, scrolling that
 bubbles, context menus by right click, Menu key or Shift+F10, focus with Tab
 order, focus ring only after keyboard use, a modal scope, window shortcuts with
-the override, mnemonics, and timers with ids that stay dead once cancelled.
+the override, mnemonics — what one chooses takes the focus when it can, as by
+Tab, then hears `ACTIVATE`; Alt going down or up repaints the window — and
+timers with ids that stay dead once cancelled.
 A long press — a finger or pen held still for `long_press_ms`, or a mouse when
 the settings ask — opens the context menu where the press was: the widget that
 captured the press hears `POINTER_CANCEL`, and the release that follows is no
@@ -471,7 +473,8 @@ own rectangle cut by its ancestors' and the region, with one clip on the
 canvas's stack at a time, so a tree forty deep clips right and a partial
 repaint is pixel for pixel what a full one would be. A paint entry gets the
 canvas, the theme, its rectangle, its clip and its state — hover, pressed,
-focused, focus visible, focus within, disabled, backdrop — and the router
+focused, focus visible, focus within, disabled, backdrop, mnemonics shown
+while Alt is held — and the router
 repaints whatever widget those change for (focus within only for widgets that
 ask, with `tree.F_FOCUS_WITHIN_LOOK`). A widget on a higher layer
 (`tree.set_layer`) escapes its ancestors' clips, draws above everything below
