@@ -1,0 +1,146 @@
+// text/raster/flatten.cst — a path's curves as line segments, in pixels.
+//
+// The path's points are transformed first — an affine map takes a curve's
+// control points to the controls of the mapped curve — so that the
+// subdivision is chosen where it shows, in pixels. Each curve is cut at
+// evenly spaced t into as many chords as Wang's formula says keep every chord
+// within TOLERANCE of the curve: from the largest second difference of the
+// control points, which bounds the curve's second derivative. A glyph at 8
+// pixels gets a chord or two a curve, the same glyph at 200 a dozen; the error
+// is bounded either way, and the work follows the size.
+//
+// Every contour is closed, as the fill needs. A path closes each contour as
+// the next starts; the last, which it may leave open, is closed here by a line
+// back to where it started — of no length when it was closed, drawing
+// nothing.
+use "std/math.cst" as fm;
+use "../outline/path.cst" as path;
+use "fill.cst" as fill;
+
+// How far a chord may stray from its curve, in pixels: a 64th, under a level
+// of 255 along an edge.
+let is f64 as TOLERANCE with imut = 0.015625;
+
+// More chords than a curve as large as any bitmap the rasterizer draws
+// needs; a curve that would want more is cut no finer.
+let is i64 as MAX_SEGMENTS with imut = 1024;
+
+// x' = xx x + xy y + dx, y' = yx x + yy y + dy.
+struct Transform {
+    xx as f64;
+    xy as f64;
+    yx as f64;
+    yy as f64;
+    dx as f64;
+    dy as f64;
+}
+
+fn x_of(t as *Transform, x as f64, y as f64) as f64 { return t.xx * x + t.xy * y + t.dx; }
+fn y_of(t as *Transform, x as f64, y as f64) as f64 { return t.yx * x + t.yy * y + t.dy; }
+
+// A curve of no bend is 0 chords: the line to its end is drawn all the same.
+fn _count(n as f64) as i64 {
+    let is i64 as k = cast(i64, fm.ceil(n));
+    if (k > MAX_SEGMENTS) { return MAX_SEGMENTS; }
+    return k;
+}
+
+// Chords for a quadratic: its second difference is constant, and a chord of
+// 1/n of it strays by a quarter of that over n squared.
+fn quad_segments(x0 as f64, y0 as f64, x1 as f64, y1 as f64, x2 as f64, y2 as f64) as i64 {
+    let is f64 as ddx = x0 - 2.0 * x1 + x2;
+    let is f64 as ddy = y0 - 2.0 * y1 + y2;
+    let is f64 as dd = fm.sqrt(ddx * ddx + ddy * ddy);
+    return _count(fm.sqrt(dd / (4.0 * TOLERANCE)));
+}
+
+// Chords for a cubic: three quarters of the larger second difference over n
+// squared.
+fn cubic_segments(x0 as f64, y0 as f64, x1 as f64, y1 as f64, x2 as f64, y2 as f64,
+                  x3 as f64, y3 as f64) as i64 {
+    let is f64 as ax = x0 - 2.0 * x1 + x2;
+    let is f64 as ay = y0 - 2.0 * y1 + y2;
+    let is f64 as bx = x1 - 2.0 * x2 + x3;
+    let is f64 as by = y1 - 2.0 * y2 + y3;
+    let is f64 as m = fm.max_f64(fm.sqrt(ax * ax + ay * ay), fm.sqrt(bx * bx + by * by));
+    return _count(fm.sqrt(3.0 * m / (4.0 * TOLERANCE)));
+}
+
+// The path drawn with t into the canvas, whose top left is (left, top) in
+// the transformed space. Points are kept as transformed, and moved to the
+// canvas only as lines are drawn.
+fn into(c as *fill.Canvas, p as *path.Path, t as *Transform, left as f64, top as f64) as void {
+    let is path.Cursor as cur = path.cursor();
+    let is path.Seg as s;
+    // The current point and the contour's start.
+    let is f64 as x with mut = 0.0;
+    let is f64 as y with mut = 0.0;
+    let is f64 as sx with mut = 0.0;
+    let is f64 as sy with mut = 0.0;
+    while (path.next(p, &cur, &s) == 1) {
+        if (s.kind == path.MOVE) {
+            x = x_of(t, s.x1, s.y1);
+            y = y_of(t, s.x1, s.y1);
+            sx = x;
+            sy = y;
+        } else if (s.kind == path.LINE) {
+            let is f64 as nx = x_of(t, s.x1, s.y1);
+            let is f64 as ny = y_of(t, s.x1, s.y1);
+            fill.line(c, x - left, y - top, nx - left, ny - top);
+            x = nx;
+            y = ny;
+        } else if (s.kind == path.CLOSE) {
+            fill.line(c, x - left, y - top, sx - left, sy - top);
+            x = sx;
+            y = sy;
+        } else if (s.kind == path.QUAD) {
+            let is f64 as x1 = x_of(t, s.x1, s.y1);
+            let is f64 as y1 = y_of(t, s.x1, s.y1);
+            let is f64 as x2 = x_of(t, s.x2, s.y2);
+            let is f64 as y2 = y_of(t, s.x2, s.y2);
+            let is i64 as n = quad_segments(x, y, x1, y1, x2, y2);
+            // The chords' ends relative to the canvas, the last the curve's.
+            let is f64 as px with mut = x - left;
+            let is f64 as py with mut = y - top;
+            let is i64 as i with mut = 1;
+            while (i < n) {
+                let is f64 as u = cast(f64, i) / cast(f64, n);
+                let is f64 as m = 1.0 - u;
+                let is f64 as nx = m * m * x + 2.0 * m * u * x1 + u * u * x2 - left;
+                let is f64 as ny = m * m * y + 2.0 * m * u * y1 + u * u * y2 - top;
+                fill.line(c, px, py, nx, ny);
+                px = nx;
+                py = ny;
+                i = i + 1;
+            }
+            fill.line(c, px, py, x2 - left, y2 - top);
+            x = x2;
+            y = y2;
+        } else if (s.kind == path.CUBIC) {
+            let is f64 as x1 = x_of(t, s.x1, s.y1);
+            let is f64 as y1 = y_of(t, s.x1, s.y1);
+            let is f64 as x2 = x_of(t, s.x2, s.y2);
+            let is f64 as y2 = y_of(t, s.x2, s.y2);
+            let is f64 as x3 = x_of(t, s.x3, s.y3);
+            let is f64 as y3 = y_of(t, s.x3, s.y3);
+            let is i64 as n = cubic_segments(x, y, x1, y1, x2, y2, x3, y3);
+            let is f64 as px with mut = x - left;
+            let is f64 as py with mut = y - top;
+            let is i64 as i with mut = 1;
+            while (i < n) {
+                let is f64 as u = cast(f64, i) / cast(f64, n);
+                let is f64 as m = 1.0 - u;
+                let is f64 as nx = m * m * m * x + 3.0 * m * m * u * x1 + 3.0 * m * u * u * x2 + u * u * u * x3 - left;
+                let is f64 as ny = m * m * m * y + 3.0 * m * m * u * y1 + 3.0 * m * u * u * y2 + u * u * u * y3 - top;
+                fill.line(c, px, py, nx, ny);
+                px = nx;
+                py = ny;
+                i = i + 1;
+            }
+            fill.line(c, px, py, x3 - left, y3 - top);
+            x = x3;
+            y = y3;
+        }
+    }
+    fill.line(c, x - left, y - top, sx - left, sy - top);
+}

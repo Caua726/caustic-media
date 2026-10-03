@@ -34,20 +34,23 @@ fontTools draws it, described at the top of `../tools/outline_reference.py`; the
 bombs have none, being for refusing. `*.var.ref`, for the four variable fonts,
 is each at chosen instances: HarfBuzz's coordinates for them, every glyph's
 outline and advance, every `MVAR` delta — described at the top of
-`../tools/var_reference.py`.
+`../tools/var_reference.py`. `raster.ref` is paths and glyphs of these fonts
+drawn as coverage, described at the top of `../tools/raster_reference.py`.
 
 All are made by development tools that need fontTools and the source fonts; the
 output is versioned so the tests need none of them, and is the same byte for byte
 each time the tools run. The outline and variation references also hold each
-glyph, advance and coordinate to HarfBuzz, through uharfbuzz, which they run
-from a virtual environment of their own:
+glyph, advance and coordinate to HarfBuzz, through uharfbuzz, and the raster
+reference each glyph to FreeType, through freetype-py; they run from a virtual
+environment of their own:
 
 ```
 python3 -m venv --system-site-packages ~/.cache/caustic-media/venv
-~/.cache/caustic-media/venv/bin/pip install uharfbuzz
+~/.cache/caustic-media/venv/bin/pip install uharfbuzz freetype-py
 
 python3 text/tools/make_testdata.py
 python3 text/tools/sfnt_reference.py
 ~/.cache/caustic-media/venv/bin/python text/tools/outline_reference.py
 ~/.cache/caustic-media/venv/bin/python text/tools/var_reference.py
+~/.cache/caustic-media/venv/bin/python text/tools/raster_reference.py
 ```

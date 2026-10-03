@@ -1,0 +1,175 @@
+// text/raster/fill.cst — coverage from line segments, by area.
+//
+// A closed path's winding number, integrated over a pixel's square, is the sum
+// over its edges of the signed area each leaves to its right within the
+// pixel's row. Each line adds that area cell by cell — and, past its right
+// end, the whole of its height in the row — as differences from the cell
+// before, so that summing a row from the left gives every cell's integral in
+// one pass. That is the accumulation of font-rs and FreeType's gray
+// rasterizer: exact wherever contours do not cross within a pixel, one pass,
+// no samples.
+//
+// The integral's magnitude is the coverage under the non-zero rule, clamped to
+// 1 where contours overlap; under the even-odd rule it is folded into 0..1, so
+// that 2 — inside twice — is outside. Both are exact where no two edges share a
+// pixel, which is everywhere but a few pixels of a glyph.
+//
+// Each row's part of a line is cut to the canvas's sides, and the line to its
+// top and bottom: a line to the left becomes one down the left edge, which
+// adds the same height to every cell, and one to the right adds nothing to
+// any. That is exact for lines within the canvas — raster.draw sizes the
+// canvas to hold every line — and keeps any line, even one of NaNs, inside the
+// cells. Values are doubles: the error a row accumulates is far below the
+// 1/255 a byte resolves.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+
+let is i32 as NONZERO with imut = 0;
+let is i32 as EVENODD with imut = 1;
+
+// Cells for a canvas of w by h: w + 2 a row, room for a line's area on both
+// sides of the last pixel.
+struct Canvas {
+    block as *u8;
+    bytes as i64;
+    acc   as *f64;
+    cap   as i64;   // cells
+    w     as i64;
+    h     as i64;
+}
+
+fn open(cells as i64) as Canvas {
+    let is Canvas as c;
+    c.cap = cells;
+    c.bytes = cells * 8;
+    c.block = mem.core.mmap_anon(c.bytes);
+    c.acc = cast(*f64, c.block);
+    c.w = 0;
+    c.h = 0;
+    if (cast(i64, c.block) == 0) { c.cap = 0; }
+    return c;
+}
+
+fn close(c as *Canvas) as void {
+    if (cast(i64, c.block) != 0) { mem.core.munmap(c.block, c.bytes); }
+    c.block = cast(*u8, 0);
+    c.cap = 0;
+}
+
+// Starts a canvas of w by h, cleared; 0 when it does not fit.
+fn begin(c as *Canvas, w as i64, h as i64) as i32 {
+    if (w < 0 || h < 0 || (w + 2) * h > c.cap) { return 0; }
+    c.w = w;
+    c.h = h;
+    mem.memset(c.block, 0, (w + 2) * h * 8);
+    return 1;
+}
+
+fn _add(c as *Canvas, row as i64, x as i64, v as f64) as void {
+    let is *f64 as a = cast(*f64, cast(i64, c.acc) + (row * (c.w + 2) + x) * 8);
+    *a = *a + v;
+}
+
+// v cut to 0..hi, written with >= alone so that a NaN is 0.
+fn _clamp(v as f64, hi as f64) as f64 {
+    if (v >= 0.0) {
+        if (v >= hi) { return hi; }
+        return v;
+    }
+    return 0.0;
+}
+
+// A line from (xa, ya) to (xb, yb), in pixels from the canvas's top left.
+fn line(c as *Canvas, xa as f64, ya as f64, xb as f64, yb as f64) as void {
+    let is f64 as w = cast(f64, c.w);
+    let is f64 as x0 with mut = xa;
+    let is f64 as y0 with mut = _clamp(ya, cast(f64, c.h));
+    let is f64 as x1 with mut = xb;
+    let is f64 as y1 with mut = _clamp(yb, cast(f64, c.h));
+    // Flat: in no row's band. (Without this, the line would add nothing
+    // anyway, once through a row of no height.)
+    if (y0 == y1) { return; }
+    // Downwards; the winding's sign is the direction's.
+    let is f64 as dir with mut = 1.0;
+    if (y0 > y1) {
+        let is f64 as tx = x0;
+        let is f64 as ty = y0;
+        x0 = x1;
+        y0 = y1;
+        x1 = tx;
+        y1 = ty;
+        dir = 0.0 - 1.0;
+    }
+    let is f64 as dxdy = (x1 - x0) / (y1 - y0);
+    let is i64 as row with mut = cast(i64, fm.floor(y0));
+    let is i64 as last = cast(i64, fm.ceil(y1));
+    while (row < last) {
+        // The part of the line within this row: from top to bottom, its x
+        // from xt to xn.
+        let is f64 as top = fm.max_f64(y0, cast(f64, row));
+        let is f64 as bottom = fm.min_f64(y1, cast(f64, row + 1));
+        let is f64 as xt = _clamp(x0 + (top - y0) * dxdy, w);
+        let is f64 as xn = _clamp(x0 + (bottom - y0) * dxdy, w);
+        let is f64 as d = (bottom - top) * dir;
+        let is f64 as lo = fm.min_f64(xt, xn);
+        let is f64 as hi = fm.max_f64(xt, xn);
+        let is f64 as lo_floor = fm.floor(lo);
+        let is i64 as i0 = cast(i64, lo_floor);
+        let is f64 as hi_ceil = fm.ceil(hi);
+        let is i64 as i1 = cast(i64, hi_ceil);
+        if (i1 <= i0 + 1) {
+            // Within one column: the area right of the line's middle. (Not
+            // d - d * mid: at -O2 the compiler subtracts a spilled product
+            // from memory, which its assembler cannot encode.)
+            let is f64 as mid = 0.5 * (xt + xn) - lo_floor;
+            _add(c, row, i0, d * (1.0 - mid));
+            _add(c, row, i0 + 1, d * mid);
+        } else {
+            // Across columns: a triangle in the first, a band of s in each
+            // between, the rest in the last.
+            let is f64 as s = 1.0 / (hi - lo);
+            let is f64 as f0 = lo - lo_floor;
+            let is f64 as a0 = 0.5 * s * (1.0 - f0) * (1.0 - f0);
+            let is f64 as f1 = hi - hi_ceil + 1.0;
+            let is f64 as am = 0.5 * s * f1 * f1;
+            _add(c, row, i0, d * a0);
+            if (i1 == i0 + 2) {
+                _add(c, row, i0 + 1, d * (1.0 - a0 - am));
+            } else {
+                let is f64 as a1 = s * (1.5 - f0);
+                _add(c, row, i0 + 1, d * (a1 - a0));
+                let is i64 as x with mut = i0 + 2;
+                while (x < i1 - 1) {
+                    _add(c, row, x, d * s);
+                    x = x + 1;
+                }
+                let is f64 as a2 = a1 + cast(f64, i1 - i0 - 3) * s;
+                _add(c, row, i1 - 1, d * (1.0 - a2 - am));
+            }
+            _add(c, row, i1, d * am);
+        }
+        row = row + 1;
+    }
+}
+
+// The canvas's coverage under rule, a byte a pixel, rows stride apart.
+fn sweep(c as *Canvas, rule as i32, out as *u8, stride as i64) as void {
+    let is i64 as row with mut = 0;
+    while (row < c.h) {
+        let is f64 as sum with mut = 0.0;
+        let is i64 as x with mut = 0;
+        while (x < c.w) {
+            sum = sum + *cast(*f64, cast(i64, c.acc) + (row * (c.w + 2) + x) * 8);
+            let is f64 as v with mut = fm.abs_f64(sum);
+            if (rule == EVENODD) {
+                v = fm.fmod(v, 2.0);
+                if (v > 1.0) { v = 2.0 - v; }
+            } else if (v > 1.0) {
+                v = 1.0;
+            }
+            *cast(*u8, cast(i64, out) + row * stride + x) = cast(u8, cast(i64, fm.floor(v * 255.0 + 0.5)));
+            x = x + 1;
+        }
+        row = row + 1;
+    }
+}

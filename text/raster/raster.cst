@@ -1,0 +1,144 @@
+// text/raster/raster.cst — paths to coverage: a glyph's outline, or any
+// path — an icon, a shape — under any affine transform, as a byte a pixel.
+// See raster.md.
+//
+// bounds() says which pixels a path drawn with a transform can reach — the
+// box of its points and control points, as FreeType takes it — so that the
+// caller can find room for them, in an atlas or a bitmap of its own; draw()
+// then writes the coverage there. Unhinted, analytic, either winding rule.
+//
+// A glyph is drawn with glyph_transform(): font units, y up, scaled to pixels,
+// y down, from a pen position that may fall between pixels — subpixel()
+// places it on a grid of so many steps a pixel, so that a cache keeps a few
+// renderings of a glyph rather than one per position.
+use "std/math.cst" as fm;
+use "../outline/path.cst" as path;
+use "fill.cst" as fill;
+use "flatten.cst" as flatten;
+
+let is i32 as NONZERO with imut = 0;
+let is i32 as EVENODD with imut = 1;
+
+// No box is larger than this on a side, nor starts farther than MAX_COORD
+// from the origin: a path that would is refused before anything is computed
+// from it.
+let is i64 as MAX_SIDE with imut = 32768;
+let is i64 as MAX_COORD with imut = 1073741824;
+
+// The pixels a path covers: from (left, top), w wide and h high, in pixels
+// from the transform's origin, y down.
+struct Box {
+    left as i64;
+    top  as i64;
+    w    as i64;
+    h    as i64;
+}
+
+// A rasterizer, with room for bitmaps of up to max_w by max_h pixels — or
+// any other shape of as many cells: max_w + 2 a row.
+struct Raster {
+    canvas as fill.Canvas;
+}
+
+fn open(max_w as i64, max_h as i64) as Raster {
+    let is Raster as r;
+    r.canvas = fill.open((max_w + 2) * max_h);
+    return r;
+}
+
+fn ok(r as *Raster) as i32 {
+    if (r.canvas.cap > 0) { return 1; }
+    return 0;
+}
+
+fn close(r as *Raster) as void { fill.close(&r.canvas); }
+
+fn transform(xx as f64, xy as f64, yx as f64, yy as f64, dx as f64, dy as f64) as flatten.Transform {
+    let is flatten.Transform as t;
+    t.xx = xx;
+    t.xy = xy;
+    t.yx = yx;
+    t.yy = yy;
+    t.dx = dx;
+    t.dy = dy;
+    return t;
+}
+
+// Font units to pixels at scale pixels a unit, the origin at (x, y): y turned
+// down.
+fn glyph_transform(scale as f64, x as f64, y as f64) as flatten.Transform {
+    return transform(scale, 0.0, 0.0, 0.0 - scale, x, y);
+}
+
+// x on a grid of steps a pixel: the whole pixel into *whole, and which step
+// past it — 0 to steps - 1 — returned. Halves go up.
+// Fewer than one step is one: whole pixels.
+fn subpixel(x as f64, steps as i64, whole as *i64) as i64 {
+    let is i64 as n with mut = steps;
+    if (n < 1) { n = 1; }
+    let is i64 as q = cast(i64, fm.floor(x * cast(f64, n) + 0.5));
+    let is i64 as w with mut = q / n;
+    if (q < 0 && w * n != q) { w = w - 1; }
+    *whole = w;
+    return q - w * n;
+}
+
+// Whether v is a number and not an infinity — written with >= alone, which
+// is a comparison that sees NaN.
+fn _finite(v as f64) as i32 {
+    if (v - v >= 0.0) { return 1; }
+    return 0;
+}
+
+// The box of the path's points and control points drawn with t into *b,
+// empty for a path of none. 1, or 0 when a point drawn is not finite — the
+// transform's fault or the path's — or the box would be larger than any
+// bitmap.
+fn bounds(p as *path.Path, t as *flatten.Transform, b as *Box) as i32 {
+    b.left = 0;
+    b.top = 0;
+    b.w = 0;
+    b.h = 0;
+    // A path of no points has the empty box at the origin.
+    let is f64 as x0 with mut = 0.0;
+    let is f64 as y0 with mut = 0.0;
+    let is f64 as x1 with mut = 0.0;
+    let is f64 as y1 with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < p.npt) {
+        let is f64 as px = *cast(*f64, cast(i64, p.xs) + i * 8);
+        let is f64 as py = *cast(*f64, cast(i64, p.ys) + i * 8);
+        let is f64 as x = flatten.x_of(t, px, py);
+        let is f64 as y = flatten.y_of(t, px, py);
+        if (_finite(x) == 0 || _finite(y) == 0) { return 0; }
+        if (i == 0 || x0 > x) { x0 = x; }
+        if (i == 0 || x > x1) { x1 = x; }
+        if (i == 0 || y0 > y) { y0 = y; }
+        if (i == 0 || y > y1) { y1 = y; }
+        i = i + 1;
+    }
+    // The box's sides, refused before they are made integers.
+    let is f64 as side = cast(f64, MAX_SIDE);
+    let is f64 as far = cast(f64, MAX_COORD);
+    if (x1 - x0 >= side || y1 - y0 >= side || fm.abs_f64(x0) >= far || fm.abs_f64(y0) >= far) {
+        return 0;
+    }
+    let is f64 as left = fm.floor(x0);
+    let is f64 as top = fm.floor(y0);
+    b.left = cast(i64, left);
+    b.top = cast(i64, top);
+    b.w = cast(i64, fm.ceil(x1)) - b.left;
+    b.h = cast(i64, fm.ceil(y1)) - b.top;
+    return 1;
+}
+
+// The path drawn with t into box b's pixels, as bounds() gave it: coverage
+// under rule, a byte a pixel, rows stride apart from out. 1, or 0 when the
+// box is larger than the rasterizer holds, or no box, with nothing written.
+fn draw(r as *Raster, p as *path.Path, t as *flatten.Transform, b as *Box, rule as i32,
+        out as *u8, stride as i64) as i32 {
+    if (fill.begin(&r.canvas, b.w, b.h) == 0) { return 0; }
+    flatten.into(&r.canvas, p, t, cast(f64, b.left), cast(f64, b.top));
+    fill.sweep(&r.canvas, rule, out, stride);
+    return 1;
+}
