@@ -1,0 +1,766 @@
+// ui/widgets/tabs.cst — pages one at a time, chosen from a strip of tabs.
+//
+// A strip along the top (or the bottom) holds a tab for each page, its title
+// a label with an optional mnemonic; under it a stack shows the current page,
+// as large as the largest, so choosing another moves nothing around it. A
+// tab's index is its place in the strip, and its page's in the stack.
+//
+// Chosen by a press on its tab; by the arrows along the strip while a tab has
+// the focus — only the current tab takes it, so the strip is one stop for Tab
+// — with Home and End to the ends; from anywhere inside by Ctrl and Page Down
+// or Tab for the next and Ctrl and Page Up or Shift and Tab for the one
+// before, round from the ends; by Alt and a title's mnemonic; by assistive
+// technology. Each change says VALUE_CHANGED. A tab can carry a close button,
+// which says CLOSED with the tab's index (an i64) — closing is the program's
+// to do, with remove().
+//
+// More tabs than fit: arrows at the strip's ends move them along, as the
+// wheel over them does, and the tab chosen is brought into view.
+//
+// Drawn: the current tab underlined in the accent on the side facing its page
+// and titled in the text's colour, the others dimmer, a tab under the pointer
+// lit, a line between the strip and the pages. Told: the strip a list of
+// tabs, each a tab named by its title, selected when current.
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../stack.cst" as stack;
+use "label.cst" as label;
+
+// Where the strip goes.
+let is i32 as TOP    with imut = 0;
+let is i32 as BOTTOM with imut = 1;
+
+// How far an arrow or a notch of the wheel moves the tabs.
+let is f64 as STEP with imut = 40.0;
+
+struct Data {
+    strip as i64;
+    view  as i64;   // inside the strip: the tabs themselves
+    back  as i64;   // the strip's arrows
+    fwd   as i64;
+    pages as i64;   // the stack
+    cur   as i64;   // the current index, -1 for none
+    side  as i32;
+    _pad0 as i32;
+}
+
+struct Strip {
+    owner  as i64;
+    offset as f64;   // how far the tabs are moved along
+    over   as i32;   // more than fit
+    reveal as i32;   // bring the current one into view at the next pass
+}
+
+struct Tab {
+    owner as i64;
+    title as i64;
+    close as i64;   // its close button, 0 for none
+}
+
+struct Part {
+    owner as i64;   // the tabs
+    tab   as i64;   // a close button's tab; 0 for an arrow
+    dir   as i32;   // an arrow's way: -1 back, 1 on
+    _pad0 as i32;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _strip_kind with mut;
+let is tree.Kind as _view_kind with mut;
+let is tree.Kind as _tab_kind with mut;
+let is tree.Kind as _close_kind with mut;
+let is tree.Kind as _arrow_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("tabs", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.event = fn_ptr(_event);
+    _strip_kind = widget.kind("tab strip", sizeof(Strip));
+    _strip_kind.measure = fn_ptr(_strip_measure);
+    _strip_kind.arrange = fn_ptr(_strip_arrange);
+    _strip_kind.paint = fn_ptr(_strip_paint);
+    _strip_kind.event = fn_ptr(_strip_event);
+    _strip_kind.role = access.ROLE_TAB_LIST;
+    _view_kind = widget.kind("tab view", 8);
+    _view_kind.measure = fn_ptr(_view_measure);
+    _view_kind.arrange = fn_ptr(_view_arrange);
+    _tab_kind = widget.kind("tab", sizeof(Tab));
+    _tab_kind.measure = fn_ptr(_tab_measure);
+    _tab_kind.arrange = fn_ptr(_tab_arrange);
+    _tab_kind.paint = fn_ptr(_tab_paint);
+    _tab_kind.event = fn_ptr(_tab_event);
+    _tab_kind.role = access.ROLE_TAB;
+    _tab_kind.access = fn_ptr(_tab_access);
+    _close_kind = widget.kind("tab close", sizeof(Part));
+    _close_kind.measure = fn_ptr(_part_measure);
+    _close_kind.paint = fn_ptr(_close_paint);
+    _close_kind.event = fn_ptr(_part_event);
+    _close_kind.role = access.ROLE_BUTTON;
+    _close_kind.access = fn_ptr(_part_access);
+    _arrow_kind = _close_kind;
+    _arrow_kind.name = "tab arrow";
+    _arrow_kind.paint = fn_ptr(_arrow_paint);
+    _ready = 1;
+}
+
+// New tabs, with no pages yet, as the last child of parent. Its handle, or 0
+// with the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.cur = 0 - 1;
+    d.side = TOP;
+    d.strip = tree.create(t, &_strip_kind, w);
+    d.pages = stack.create(t, w);
+    if (d.strip == 0 || d.pages == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    cast(*Strip, tree.data(t, d.strip)).owner = w;
+    d.back = tree.create(t, &_arrow_kind, d.strip);
+    d.view = tree.create(t, &_view_kind, d.strip);
+    d.fwd = tree.create(t, &_arrow_kind, d.strip);
+    if (d.back == 0 || d.view == 0 || d.fwd == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    let is *Part as b = cast(*Part, tree.data(t, d.back));
+    b.owner = w;
+    b.dir = cast(i32, 0 - 1);
+    let is *Part as f = cast(*Part, tree.data(t, d.fwd));
+    f.owner = w;
+    f.dir = 1;
+    tree.set_visible(t, d.back, 0);
+    tree.set_visible(t, d.fwd, 0);
+    return w;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn _nil(d as *Data) as i32 {
+    if (cast(i64, d) == 0) { return 1; }
+    return 0;
+}
+
+// The i-th child of w, 0 past the last.
+fn _nth(t as *tree.Tree, w as i64, i as i64) as i64 {
+    if (i < 0) { return 0; }
+    let is i64 as ch with mut = tree.first_child(t, w);
+    let is i64 as k with mut = 0;
+    while (ch != 0 && k < i) {
+        ch = tree.next_sibling(t, ch);
+        k = k + 1;
+    }
+    return ch;
+}
+
+fn _index(t as *tree.Tree, parent as i64, w as i64) as i64 {
+    let is i64 as ch with mut = tree.first_child(t, parent);
+    let is i64 as k with mut = 0;
+    while (ch != 0) {
+        if (ch == w) { return k; }
+        ch = tree.next_sibling(t, ch);
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// w is a, or inside it.
+fn _inside(t as *tree.Tree, w as i64, a as i64) as i32 {
+    let is i64 as x with mut = w;
+    while (x != 0) {
+        if (x == a) { return 1; }
+        x = tree.parent(t, x);
+    }
+    return 0;
+}
+
+// --- Pages ---
+
+fn count(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return 0; }
+    return tree.child_count(t, d.view);
+}
+
+fn current(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return 0 - 1; }
+    return d.cur;
+}
+
+// Page i, where its content goes — an overlay: each child aligned on its own.
+fn page(t as *tree.Tree, w as i64, i as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return 0; }
+    return _nth(t, d.pages, i);
+}
+
+fn tab(t as *tree.Tree, w as i64, i as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return 0; }
+    return _nth(t, d.view, i);
+}
+
+// Tab i's title: a label.
+fn title(t as *tree.Tree, w as i64, i as i64) as i64 {
+    let is i64 as tb = tab(t, w, i);
+    if (tb == 0) { return 0; }
+    return cast(*Tab, tree.data(t, tb)).title;
+}
+
+fn strip(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return 0; }
+    return d.strip;
+}
+
+// A new page, last, under a tab titled s — n bytes, an underscore before its
+// mnemonic. The first one made is current. The page's handle, or 0.
+fn add(t as *tree.Tree, w as i64, s as *u8, n as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return 0; }
+    let is i64 as tb = tree.create(t, &_tab_kind, d.view);
+    if (tb == 0) { return 0; }
+    let is i64 as pg = stack.create_overlay(t, d.pages);
+    let is i64 as lb = label.create(t, tb, "", 0);
+    if (pg == 0 || lb == 0) {
+        tree.destroy(t, tb);
+        if (pg != 0) { tree.destroy(t, pg); }
+        return 0;
+    }
+    label.set_text_mnemonic(t, lb, s, n);
+    label.set_target(t, lb, tb);
+    let is *Tab as td = cast(*Tab, tree.data(t, tb));
+    td.owner = w;
+    td.title = lb;
+    tree.set_labelled_by(t, tb, lb);
+    tree.set_visible(t, pg, 0);
+    if (d.cur < 0) {
+        d.cur = 0;
+        stack.set_current(t, d.pages, pg);
+        tree.set_focusable(t, tb, 1);
+    }
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return pg;
+}
+
+// Page i current, its tab the one that takes the focus, brought into view.
+// 1 if it changed.
+fn set_current(t as *tree.Tree, w as i64, i as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1 || i < 0 || i >= count(t, w) || i == d.cur) { return 0; }
+    let is i64 as old = tab(t, w, d.cur);
+    let is i64 as left = page(t, w, d.cur);
+    // The focus inside the page about to go — or on the tab losing it: on to
+    // the tab chosen.
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    let is i32 as hand with mut = 0;
+    if (cast(i64, r) != 0 && left != 0) {
+        let is i64 as f = router.focused(t, r);
+        hand = cast(i32, _inside(t, f, left) == 1 || (f == old && old != 0));
+    }
+    if (old != 0) { tree.set_focusable(t, old, 0); }
+    d.cur = i;
+    tree.set_focusable(t, tab(t, w, i), 1);
+    stack.set_current(t, d.pages, page(t, w, i));
+    if (hand == 1) { router.focus(t, r, tab(t, w, i), router.focus_visible(r)); }
+    cast(*Strip, tree.data(t, d.strip)).reveal = 1;
+    widget.changed(t, d.strip, widget.CHANGED_LAYOUT);
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    let is i64 as at = i;
+    signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, &at));
+    return 1;
+}
+
+// Tab i and its page gone. The current one gone, the next is current — or the
+// last, when it was the last. 1 if there was one.
+fn remove(t as *tree.Tree, w as i64, i as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1 || i < 0 || i >= count(t, w)) { return 0; }
+    let is i32 as was_current = cast(i32, i == d.cur);
+    tree.destroy(t, tab(t, w, i));
+    tree.destroy(t, page(t, w, i));
+    let is i64 as n = count(t, w);
+    if (i < d.cur) { d.cur = d.cur - 1; }
+    if (was_current == 1) {
+        d.cur = i;
+        if (d.cur >= n) { d.cur = n - 1; }
+        if (d.cur >= 0) {
+            tree.set_focusable(t, tab(t, w, d.cur), 1);
+            stack.set_current(t, d.pages, page(t, w, d.cur));
+            let is i64 as at = d.cur;
+            signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, &at));
+        }
+    }
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return 1;
+}
+
+// Along the TOP or the BOTTOM.
+fn set_side(t as *tree.Tree, w as i64, side as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return; }
+    d.side = side;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// A close button on tab i, or none.
+fn set_closable(t as *tree.Tree, w as i64, i as i64, on as i32) as void {
+    let is i64 as tb = tab(t, w, i);
+    if (tb == 0) { return; }
+    let is *Tab as td = cast(*Tab, tree.data(t, tb));
+    if (on == 1 && td.close == 0) {
+        td.close = tree.create(t, &_close_kind, tb);
+        if (td.close != 0) {
+            let is *Part as p = cast(*Part, tree.data(t, td.close));
+            p.owner = w;
+            p.tab = tb;
+        }
+    } else if (on == 0 && td.close != 0) {
+        tree.destroy(t, td.close);
+        td.close = 0;
+    }
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// Tab i's close button, in the window; empty for none.
+fn close_rect(t as *tree.Tree, w as i64, i as i64) as math.rect.Rect {
+    let is i64 as tb = tab(t, w, i);
+    if (tb == 0 || cast(*Tab, tree.data(t, tb)).close == 0) { return math.rect.rect_zero(); }
+    return layout.window_rect(t, cast(*Tab, tree.data(t, tb)).close);
+}
+
+// More tabs than fit: 1.
+fn overflowing(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1) { return 0; }
+    return cast(*Strip, tree.data(t, d.strip)).over;
+}
+
+// The arrow back (0) or on (1), in the window; empty when all fit.
+fn arrow_rect(t as *tree.Tree, w as i64, which as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (_nil(d) == 1 || overflowing(t, w) == 0) { return math.rect.rect_zero(); }
+    if (which == 0) { return layout.window_rect(t, d.back); }
+    return layout.window_rect(t, d.fwd);
+}
+
+// Alt and each title's mnemonic choose its tab from now on.
+fn bind_mnemonics(t as *tree.Tree, r as *router.Router, w as i64) as void {
+    let is i64 as n = count(t, w);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        label.bind_mnemonic(t, r, title(t, w, i));
+        i = i + 1;
+    }
+}
+
+// --- Measuring and arranging ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+fn _min(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+
+fn _rtl(t as *tree.Tree, w as i64) as i32 { return cast(i32, layout.direction(t, w) == layout.RTL); }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is geom.Size as ss;
+    layout.measure(t, d.strip, c, &ss);
+    let is geom.Constraint as rest = geom.constraint(c.w, _max(0.0, c.h - ss.pref_h));
+    if (c.h >= layout.UNBOUNDED) { rest.h = layout.UNBOUNDED; }
+    let is geom.Size as ps;
+    layout.measure(t, d.pages, &rest, &ps);
+    out.min_w = _max(ss.min_w, ps.min_w);
+    out.pref_w = _max(ss.pref_w, ps.pref_w);
+    out.min_h = ss.pref_h + ps.min_h;
+    out.pref_h = ss.pref_h + ps.pref_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is geom.Constraint as c = geom.constraint(r.w, r.h);
+    let is geom.Size as ss;
+    layout.measure(t, d.strip, &c, &ss);
+    let is f64 as sh = _min(ss.pref_h, r.h);
+    let is math.rect.Rect as sr with mut = math.rect.rect(0.0, 0.0, r.w, sh);
+    let is math.rect.Rect as pr with mut = math.rect.rect(0.0, sh, r.w, r.h - sh);
+    if (d.side == BOTTOM) {
+        sr.y = r.h - sh;
+        pr.y = 0.0;
+    }
+    layout.place(t, d.strip, &sr);
+    layout.place(t, d.pages, &pr);
+}
+
+fn _strip_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is i64 as owner = cast(*Strip, data).owner;
+    let is *Data as d = cast(*Data, tree.data(t, owner));
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as vs;
+    layout.measure(t, d.view, &free, &vs);
+    let is f64 as h = _max(th.metrics.control_height, vs.pref_h);
+    geom.size_zero(out);
+    out.pref_w = vs.pref_w;
+    out.min_w = 2.0 * h;
+    out.pref_h = h;
+    out.min_h = h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = h;
+}
+
+// The tabs side by side, from the start edge, moved along by the offset; the
+// arrows at the ends when they do not all fit.
+fn _strip_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Strip as s = cast(*Strip, data);
+    let is *Data as d = cast(*Data, tree.data(t, s.owner));
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as vs;
+    layout.measure(t, d.view, &free, &vs);
+    let is f64 as aw = r.h;
+    let is f64 as vx with mut = 0.0;
+    let is f64 as vw with mut = r.w;
+    s.over = cast(i32, vs.pref_w > r.w + 0.001);
+    tree.set_visible(t, d.back, s.over);
+    tree.set_visible(t, d.fwd, s.over);
+    if (s.over == 1) {
+        vx = aw;
+        vw = _max(0.0, r.w - 2.0 * aw);
+        let is math.rect.Rect as start = math.rect.rect(0.0, 0.0, aw, r.h);
+        let is math.rect.Rect as end = math.rect.rect(r.w - aw, 0.0, aw, r.h);
+        if (_rtl(t, w) == 1) {
+            layout.place(t, d.back, &end);
+            layout.place(t, d.fwd, &start);
+        } else {
+            layout.place(t, d.back, &start);
+            layout.place(t, d.fwd, &end);
+        }
+    }
+    if (s.reveal == 1 && d.cur >= 0) {
+        let is f64 as a = _tab_start(t, d, d.cur);
+        let is f64 as b = a + _tab_width(t, d, d.cur);
+        if (a < s.offset) { s.offset = a; }
+        if (b > s.offset + vw) { s.offset = b - vw; }
+    }
+    s.reveal = 0;
+    s.offset = _max(0.0, _min(s.offset, vs.pref_w - vw));
+    let is math.rect.Rect as vr = math.rect.rect(vx, 0.0, vw, r.h);
+    layout.place(t, d.view, &vr);
+    // Moved along with its size the same: its tabs placed again all the same.
+    _view_arrange(t, d.view, tree.data(t, d.view), &vr);
+}
+
+fn _tab_width(t as *tree.Tree, d as *Data, i as i64) as f64 {
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, _nth(t, d.view, i), &free, &s);
+    return s.pref_w;
+}
+
+// Where tab i starts along the row of them, the offset aside.
+fn _tab_start(t as *tree.Tree, d as *Data, i as i64) as f64 {
+    let is f64 as x with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < i) {
+        x = x + _tab_width(t, d, k);
+        k = k + 1;
+    }
+    return x;
+}
+
+fn _view_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    let is geom.Constraint as free = geom.unbounded();
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is geom.Size as s;
+        layout.measure(t, ch, &free, &s);
+        out.pref_w = out.pref_w + s.pref_w;
+        out.pref_h = _max(out.pref_h, s.pref_h);
+        ch = tree.next_sibling(t, ch);
+    }
+    out.min_h = out.pref_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _view_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Strip as s = cast(*Strip, tree.data(t, tree.parent(t, w)));
+    let is i32 as rtl = _rtl(t, w);
+    let is geom.Constraint as free = geom.unbounded();
+    let is f64 as x with mut = 0.0 - s.offset;
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is geom.Size as cs;
+        layout.measure(t, ch, &free, &cs);
+        let is math.rect.Rect as at with mut = math.rect.rect(x, 0.0, cs.pref_w, r.h);
+        if (rtl == 1) { at.x = r.w - x - cs.pref_w; }
+        layout.place(t, ch, &at);
+        x = x + cs.pref_w;
+        ch = tree.next_sibling(t, ch);
+    }
+}
+
+fn _pad(th as *style.Theme) as f64 { return th.metrics.control_pad_x; }
+fn _close_size(th as *style.Theme) as f64 { return th.fonts.body.size; }
+
+fn _tab_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Tab as td = cast(*Tab, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as ls;
+    layout.measure(t, td.title, &free, &ls);
+    let is f64 as wd with mut = 2.0 * _pad(&th) + ls.pref_w;
+    if (td.close != 0) { wd = wd + th.metrics.space_s + _close_size(&th); }
+    geom.size_zero(out);
+    out.pref_w = wd;
+    out.min_w = wd;
+    out.pref_h = _max(th.metrics.control_height, ls.pref_h);
+    out.min_h = out.pref_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _tab_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Tab as td = cast(*Tab, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as ls;
+    layout.measure(t, td.title, &free, &ls);
+    let is i32 as rtl = _rtl(t, w);
+    let is f64 as pad = _pad(&th);
+    let is math.rect.Rect as lr with mut = math.rect.rect(pad, (r.h - ls.pref_h) / 2.0, ls.pref_w, ls.pref_h);
+    if (rtl == 1) { lr.x = r.w - pad - ls.pref_w; }
+    layout.place(t, td.title, &lr);
+    if (td.close != 0) {
+        let is f64 as cs = _close_size(&th);
+        let is math.rect.Rect as cr with mut = math.rect.rect(r.w - pad - cs, (r.h - cs) / 2.0, cs, cs);
+        if (rtl == 1) { cr.x = pad; }
+        layout.place(t, td.close, &cr);
+    }
+}
+
+fn _part_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+// --- Choosing ---
+
+fn _choose(t as *tree.Tree, w as i64, i as i64, focus as i32) as void {
+    set_current(t, w, i);
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (focus == 1 && cast(i64, r) != 0) { router.focus(t, r, tab(t, w, i), 1); }
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind != event.KEY_DOWN) { return 0; }
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    let is i32 as shift = cast(i32, (e.mods & keys.MOD_SHIFT) != 0);
+    let is i32 as other = cast(i32, (e.mods & (keys.MOD_ALT | keys.MOD_SUPER)) != 0);
+    let is i64 as n = count(t, w);
+    if (ctrl == 0 || other == 1 || n == 0) { return 0; }
+    let is i64 as step with mut = 0;
+    if (e.key == keys.PAGE_DOWN && shift == 0) { step = 1; }
+    if (e.key == keys.PAGE_UP && shift == 0) { step = 0 - 1; }
+    if (e.key == keys.TAB) {
+        step = 1;
+        if (shift == 1) { step = 0 - 1; }
+    }
+    if (step == 0) { return 0; }
+    set_current(t, w, (d.cur + step + n) % n);
+    return 1;
+}
+
+fn _tab_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Tab as td = cast(*Tab, data);
+    let is *Data as d = cast(*Data, tree.data(t, td.owner));
+    let is i64 as i = _index(t, d.view, w);
+    if (e.kind == event.POINTER_DOWN && e.button == 1) {
+        set_current(t, td.owner, i);
+        return 1;
+    }
+    if (e.kind == event.ACTIVATE) {
+        _choose(t, td.owner, i, 1);
+        return 1;
+    }
+    if (e.kind != event.KEY_DOWN || e.phase != event.TARGET || e.mods != 0) { return 0; }
+    let is i64 as n = count(t, td.owner);
+    let is i64 as to with mut = 0 - 1;
+    let is i64 as ahead with mut = 1;
+    if (_rtl(t, w) == 1) { ahead = 0 - 1; }
+    if (e.key == keys.RIGHT) { to = i + ahead; }
+    if (e.key == keys.LEFT) { to = i - ahead; }
+    if (e.key == keys.HOME) { to = 0; }
+    if (e.key == keys.END) { to = n - 1; }
+    if (to == 0 - 1 && e.key != keys.RIGHT && e.key != keys.LEFT) { return 0; }
+    if (to >= 0 && to < n) { _choose(t, td.owner, to, 1); }
+    return 1;
+}
+
+fn _strip_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Strip as s = cast(*Strip, data);
+    if (e.kind != event.SCROLL || s.over == 0) { return 0; }
+    let is f64 as by with mut = e.dy + e.dx;
+    if (e.discrete == 1) { by = by * STEP; }
+    return _move(t, w, s, by);
+}
+
+// The tabs moved along by `by`, held to the ends. 1 if they moved.
+fn _move(t as *tree.Tree, w as i64, s as *Strip, by as f64) as i64 {
+    let is *Data as d = cast(*Data, tree.data(t, s.owner));
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as vs;
+    layout.measure(t, d.view, &free, &vs);
+    let is f64 as was = s.offset;
+    s.offset = _max(0.0, _min(s.offset + by, vs.pref_w - layout.rect(t, d.view).w));
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return cast(i64, s.offset != was);
+}
+
+fn _part_act(t as *tree.Tree, w as i64, p as *Part) as void {
+    let is *Data as d = cast(*Data, tree.data(t, p.owner));
+    if (p.tab != 0) {
+        let is i64 as at = _index(t, d.view, p.tab);
+        signal.emit(t, p.owner, signal.CLOSED, cast(*u8, &at));
+        return;
+    }
+    _move(t, d.strip, cast(*Strip, tree.data(t, d.strip)), cast(f64, p.dir) * STEP);
+}
+
+fn _part_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Part as p = cast(*Part, data);
+    if (e.kind == event.POINTER_DOWN && e.button == 1) {
+        if (p.tab == 0) { _part_act(t, w, p); }
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP && e.button == 1 && p.tab != 0) {
+        let is math.rect.Rect as r = layout.rect(t, w);
+        if (e.local_x >= 0.0 && e.local_x < r.w && e.local_y >= 0.0 && e.local_y < r.h) { _part_act(t, w, p); }
+        return 1;
+    }
+    return 0;
+}
+
+// --- Drawn ---
+
+fn _strip_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Strip as s = cast(*Strip, data);
+    let is *Data as d = cast(*Data, tree.data(t, s.owner));
+    let is style.Theme as th = *p.theme;
+    let is f64 as bw = th.metrics.border_width;
+    let is f64 as y with mut = p.rect.y + p.rect.h - bw;
+    if (d.side == BOTTOM) { y = p.rect.y; }
+    shapes.fill_rect(p.canvas, p.rect.x, y, p.rect.w, bw, th.palette.separator);
+}
+
+fn _tab_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Tab as td = cast(*Tab, data);
+    let is *Data as d = cast(*Data, tree.data(t, td.owner));
+    let is *style.Theme as th = p.theme;
+    let is i32 as chosen = cast(i32, _index(t, d.view, w) == d.cur);
+    if ((p.state & painter.S_PRESSED) != 0) {
+        shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, style.with_alpha(th.palette.fg, 0.1));
+    } else if ((p.state & painter.S_HOVER) != 0) {
+        shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, style.with_alpha(th.palette.fg, 0.06));
+    }
+    p.fg = th.palette.fg_dim;
+    if (chosen == 1) {
+        p.fg = th.palette.fg;
+        let is f64 as line = 3.0;
+        let is f64 as y with mut = p.rect.y + p.rect.h - line;
+        if (d.side == BOTTOM) { y = p.rect.y; }
+        shapes.fill_rect(p.canvas, p.rect.x, y, p.rect.w, line, th.palette.accent);
+    }
+}
+
+fn _close_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is math.rect.Rect as r = p.rect;
+    if ((p.state & painter.S_HOVER) != 0) {
+        shapes.fill_circle(p.canvas, r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0, style.with_alpha(p.theme.palette.fg, 0.12));
+    }
+    let is f64 as k = r.w * 0.3;
+    let is f64 as cx = r.x + r.w / 2.0;
+    let is f64 as cy = r.y + r.h / 2.0;
+    let is f64 as lw = _max(1.0, r.w * 0.1);
+    shapes.line(p.canvas, cx - k, cy - k, cx + k, cy + k, lw, p.fg);
+    shapes.line(p.canvas, cx - k, cy + k, cx + k, cy - k, lw, p.fg);
+}
+
+// A chevron the way the arrow moves the tabs: towards the start or the end,
+// mirrored in right to left.
+fn _arrow_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Part as pt = cast(*Part, data);
+    let is math.rect.Rect as r = p.rect;
+    if ((p.state & painter.S_HOVER) != 0) {
+        shapes.fill_rect(p.canvas, r.x, r.y, r.w, r.h, style.with_alpha(p.theme.palette.fg, 0.06));
+    }
+    let is f64 as dir with mut = cast(f64, pt.dir);
+    if (_rtl(t, w) == 1) { dir = 0.0 - dir; }
+    let is f64 as a = _min(r.w, r.h) * 0.2;
+    let is f64 as cx = r.x + r.w / 2.0;
+    let is f64 as cy = r.y + r.h / 2.0;
+    let is f64 as lw = _max(1.5, a * 0.3);
+    shapes.line(p.canvas, cx - dir * a * 0.5, cy - a, cx + dir * a * 0.5, cy, lw, p.theme.palette.fg);
+    shapes.line(p.canvas, cx + dir * a * 0.5, cy, cx - dir * a * 0.5, cy + a, lw, p.theme.palette.fg);
+}
+
+// --- Told ---
+
+fn _tab_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Tab as td = cast(*Tab, data);
+    let is *Data as d = cast(*Data, tree.data(t, td.owner));
+    let is i64 as i = _index(t, d.view, w);
+    if (q.action == access.ASK) {
+        q.states = q.states | access.SELECTABLE;
+        if (i == d.cur) { q.states = q.states | access.SELECTED; }
+        q.actions = access.SELECT;
+        return 1;
+    }
+    if (q.action == access.SELECT) {
+        set_current(t, td.owner, i);
+        return 1;
+    }
+    return 0;
+}
+
+fn _part_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Part as p = cast(*Part, data);
+    if (q.action == access.ASK) {
+        q.actions = access.PRESS;
+        return 1;
+    }
+    if (q.action == access.PRESS) {
+        _part_act(t, w, p);
+        return 1;
+    }
+    return 0;
+}

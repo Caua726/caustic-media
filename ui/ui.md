@@ -940,6 +940,25 @@ checked, its group's others not, first; closing emits CLOSED. Told as a
 menu of items, check items and radio items, checkable, checked, expandable
 and expanded as they are, chosen by assistive technology's press.
 
+**Tabs** (`widgets/tabs.cst`, tested by `tabs_test`): pages one at a time
+under a strip of tabs — along the top or the bottom, from the right in right
+to left — a stack showing the current page, as large as the largest, so
+choosing another moves nothing around it. A tab's index is its place in the
+strip and its page's in the stack; the first page made is current, and a page
+taken away hands on to the next, or the last. Chosen by a press on its tab;
+by the arrows while a tab has the focus — only the current tab takes it, so
+the strip is one stop for Tab — Home and End to the ends; from anywhere inside
+by Ctrl and Page Down or Tab for the next and Ctrl and Page Up or Shift and Tab
+for the one before, round from the ends, the focus moved to the tab chosen when
+it was in the page going away; by Alt and a title's mnemonic; by assistive
+technology's select. Each change says VALUE_CHANGED. A tab may carry a close
+button, which says CLOSED with the tab's index and leaves the closing to the
+program. More tabs than fit: arrows at the strip's ends and the wheel move them
+along, and the one chosen is brought into view. Drawn with the current tab
+underlined in the accent on the side facing its page and titled in the text's
+colour, the others dimmer, the one under the pointer lit; told as a list of
+tabs, each named by its title and selected when current.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
