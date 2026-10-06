@@ -1,0 +1,260 @@
+// window/x11/frame.cst — what a window drawing its own frame asks of X11.
+//
+// A window that draws its own title bar, edges and shadow (the toolkit's
+// ui/widgets/decoration.cst) has to tell the window manager three things it
+// would otherwise assume, and hand it two jobs only it can do:
+//
+//   no decorations of its own      _MOTIF_WM_HINTS, flags DECORATIONS, 0 —
+//                                  every window manager still honours Motif's
+//   where the window really is     _GTK_FRAME_EXTENTS: the shadow around it,
+//                                  left, right, top, bottom, so snapping and
+//                                  tiling go by the window and not its shadow
+//   where the pointer is taken     the SHAPE input region: the window and its
+//                                  edges' reach, never the rest of the shadow
+//   moving and resizing it         _NET_WM_MOVERESIZE from a press: the window
+//                                  manager follows the pointer from there,
+//                                  snapping as it does for its own frames
+//   its menu                       _GTK_SHOW_WINDOW_MENU at the pointer
+//
+// And it has to hear its state, for its frame changes with it: maximized and
+// full screen from _NET_WM_STATE, tiled sides from _GTK_EDGE_CONSTRAINTS,
+// which Mutter and KWin set. window.cst turns a change to either into a STATE
+// event (events.cst).
+//
+// Like wm.cst this takes a display and an xid; everything is libX11 but the
+// input region, which is libXext — already linked for MIT-SHM, so it costs
+// nothing.
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+use "bind/xshape.cst" as xshape;
+
+// _NET_WM_MOVERESIZE's directions, as EWMH numbers them.
+let is i64 as MOVERESIZE_SIZE_TOPLEFT     with imut = 0;
+let is i64 as MOVERESIZE_SIZE_TOP         with imut = 1;
+let is i64 as MOVERESIZE_SIZE_TOPRIGHT    with imut = 2;
+let is i64 as MOVERESIZE_SIZE_RIGHT       with imut = 3;
+let is i64 as MOVERESIZE_SIZE_BOTTOMRIGHT with imut = 4;
+let is i64 as MOVERESIZE_SIZE_BOTTOM      with imut = 5;
+let is i64 as MOVERESIZE_SIZE_BOTTOMLEFT  with imut = 6;
+let is i64 as MOVERESIZE_SIZE_LEFT        with imut = 7;
+let is i64 as MOVERESIZE_MOVE             with imut = 8;
+
+// A window's state, as a STATE event carries it.
+let is i32 as STATE_MAXIMIZED    with imut = 1;
+let is i32 as STATE_FULLSCREEN   with imut = 2;
+let is i32 as STATE_TILED_TOP    with imut = 16;
+let is i32 as STATE_TILED_RIGHT  with imut = 32;
+let is i32 as STATE_TILED_BOTTOM with imut = 64;
+let is i32 as STATE_TILED_LEFT   with imut = 128;
+
+// Motif's hints: five longs, the first saying which of the others count.
+let is i64 as _MWM_HINTS_DECORATIONS with imut = 2;
+
+// The core pointer's device, as GTK names it in _GTK_SHOW_WINDOW_MENU.
+let is i64 as _CORE_POINTER with imut = 2;
+
+struct State {
+    ready            as i32;
+    _pad0            as i32;
+    motif            as i64;
+    frame_extents    as i64;
+    moveresize       as i64;
+    show_menu        as i64;
+    edge_constraints as i64;
+    net_wm_state     as i64;
+    cardinal         as i64;
+}
+
+// The atoms, asked of the server the first time any is needed.
+fn init(st as *State, d as *u8) as void {
+    if (st.ready == 1) { return; }
+    st.motif = xlib.XInternAtom(d, "_MOTIF_WM_HINTS", 0);
+    st.frame_extents = xlib.XInternAtom(d, "_GTK_FRAME_EXTENTS", 0);
+    st.moveresize = xlib.XInternAtom(d, "_NET_WM_MOVERESIZE", 0);
+    st.show_menu = xlib.XInternAtom(d, "_GTK_SHOW_WINDOW_MENU", 0);
+    st.edge_constraints = xlib.XInternAtom(d, "_GTK_EDGE_CONSTRAINTS", 0);
+    st.net_wm_state = xlib.XInternAtom(d, "_NET_WM_STATE", 0);
+    st.cardinal = xlib.XInternAtom(d, "CARDINAL", 0);
+    st.ready = 1;
+}
+
+// --- Properties of longs ---
+
+let is [5]i64 as _out;
+let is i64 as _type with mut = 0;
+let is i32 as _format with mut = 0;
+let is i64 as _n with mut = 0;
+let is i64 as _after with mut = 0;
+let is *u8 as _prop with mut;
+
+// Property p as longs, left in _prop: how many; 0 for none. _done() after.
+fn _read(d as *u8, xid as i64, p as i64) as i64 {
+    _prop = cast(*u8, 0);
+    if (xlib.XGetWindowProperty(d, xid, p, 0, 16, 0, 0, cast(*u8, &_type), cast(*u8, &_format), cast(*u8, &_n),
+                                cast(*u8, &_after), cast(*u8, &_prop)) != 0) {
+        _prop = cast(*u8, 0);
+        return 0;
+    }
+    if (cast(i64, _prop) == 0) { return 0; }
+    if (_format != 32) {
+        _done();
+        return 0;
+    }
+    return _n;
+}
+
+fn _at(i as i64) as i64 { return *cast(*i64, cast(i64, _prop) + i * 8); }
+
+fn _done() as void {
+    if (cast(i64, _prop) != 0) { xlib.XFree(_prop); }
+    _prop = cast(*u8, 0);
+}
+
+// --- What it tells the window manager ---
+
+// Decorations of the window manager's own (1), or none (0): 1 when asked.
+fn set_decorated(st as *State, d as *u8, xid as i64, on as i32) as i32 {
+    init(st, d);
+    _out[0] = _MWM_HINTS_DECORATIONS;
+    _out[1] = 0;
+    _out[2] = cast(i64, on != 0);
+    _out[3] = 0;
+    _out[4] = 0;
+    xlib.XChangeProperty(d, xid, st.motif, st.motif, 32, x.PropModeReplace, cast(*u8, &_out), 5);
+    xlib.XFlush(d);
+    return 1;
+}
+
+// Whether the window manager is to decorate it: 1 unless told not to.
+fn decorated(st as *State, d as *u8, xid as i64) as i32 {
+    init(st, d);
+    let is i64 as n = _read(d, xid, st.motif);
+    let is i32 as on with mut = 1;
+    if (n >= 3 && (_at(0) & _MWM_HINTS_DECORATIONS) != 0) { on = cast(i32, _at(2) != 0); }
+    _done();
+    return on;
+}
+
+// The frame's reach past the window, in pixels: 1 when told.
+fn set_client_extents(st as *State, d as *u8, xid as i64, l as i64, r as i64, t as i64, b as i64) as i32 {
+    init(st, d);
+    _out[0] = l;
+    _out[1] = r;
+    _out[2] = t;
+    _out[3] = b;
+    xlib.XChangeProperty(d, xid, st.frame_extents, st.cardinal, 32, x.PropModeReplace, cast(*u8, &_out), 4);
+    xlib.XFlush(d);
+    return 1;
+}
+
+fn client_extents(st as *State, d as *u8, xid as i64, l as *i64, r as *i64, t as *i64, b as *i64) as i32 {
+    init(st, d);
+    if (_read(d, xid, st.frame_extents) < 4) {
+        _done();
+        return 0;
+    }
+    *l = _at(0);
+    *r = _at(1);
+    *t = _at(2);
+    *b = _at(3);
+    _done();
+    return 1;
+}
+
+// Where the pointer is taken: one rectangle of the window, x, y, w by h.
+fn set_input_region(d as *u8, xid as i64, rx as i64, ry as i64, rw as i64, rh as i64) as i32 {
+    let is xlib.XRectangle as r;
+    r.x = cast(i16, rx);
+    r.y = cast(i16, ry);
+    r.width = cast(u16, rw);
+    r.height = cast(u16, rh);
+    xshape.XShapeCombineRectangles(d, xid, xshape.ShapeInput, 0, 0, cast(*u8, &r), 1, xshape.ShapeSet, x.Unsorted);
+    xlib.XFlush(d);
+    return 1;
+}
+
+// The input region when it is one rectangle: 1, into the pointers.
+fn input_region(d as *u8, xid as i64, rx as *i64, ry as *i64, rw as *i64, rh as *i64) as i32 {
+    let is i32 as count with mut = 0;
+    let is i32 as order with mut = 0;
+    let is *u8 as rects = xshape.XShapeGetRectangles(d, xid, xshape.ShapeInput, cast(*u8, &count), cast(*u8, &order));
+    if (cast(i64, rects) == 0) { return 0; }
+    let is i32 as one = cast(i32, count == 1);
+    if (one == 1) {
+        let is *xlib.XRectangle as r = cast(*xlib.XRectangle, rects);
+        *rx = cast(i64, r.x);
+        *ry = cast(i64, r.y);
+        *rw = cast(i64, r.width);
+        *rh = cast(i64, r.height);
+    }
+    xlib.XFree(rects);
+    return one;
+}
+
+// --- What it asks the window manager to do ---
+
+let is xev.XEvent as _msg;
+
+fn _send(d as *u8, root as i64, xid as i64, t as i64, a as i64, b as i64, c as i64, e as i64, f as i64) as void {
+    xev.clear(&_msg);
+    let is *xev.XClientMessageEvent as m = xev.client(&_msg);
+    m.kind = x.ClientMessage;
+    m.send_event = 1;
+    m.display = d;
+    m.window = xid;
+    m.message_type = t;
+    m.format = 32;
+    m.data[0] = a;
+    m.data[1] = b;
+    m.data[2] = c;
+    m.data[3] = e;
+    m.data[4] = f;
+    xlib.XSendEvent(d, root, 0, x.SubstructureNotifyMask | x.SubstructureRedirectMask, cast(*u8, &_msg));
+    xlib.XFlush(d);
+}
+
+// Moved (MOVERESIZE_MOVE) or resized from an edge, from a press of button at
+// rx, ry on the screen: the pointer let go of first, for the window manager
+// to grab it. 1 when asked.
+fn begin_move_resize(st as *State, d as *u8, root as i64, xid as i64, rx as i64, ry as i64, direction as i64,
+                     button as i64) as i32 {
+    init(st, d);
+    xlib.XUngrabPointer(d, 0);
+    _send(d, root, xid, st.moveresize, rx, ry, direction, button, 1);
+    return 1;
+}
+
+// The window's own menu at rx, ry on the screen: 1 when asked.
+fn show_window_menu(st as *State, d as *u8, root as i64, xid as i64, rx as i64, ry as i64) as i32 {
+    init(st, d);
+    xlib.XUngrabPointer(d, 0);
+    _send(d, root, xid, st.show_menu, _CORE_POINTER, rx, ry, 0, 0);
+    return 1;
+}
+
+// --- What it hears ---
+
+// The sides the window manager tiled it to, as STATE_TILED_* bits, from GTK's
+// edge constraints: a pair of bits a side, tiled then resizable, top, right,
+// bottom, left.
+fn tiled(st as *State, d as *u8, xid as i64) as i32 {
+    init(st, d);
+    let is i64 as n = _read(d, xid, st.edge_constraints);
+    let is i32 as bits with mut = 0;
+    if (n >= 1) {
+        let is i64 as c = _at(0);
+        if ((c & 1) != 0) { bits = bits | STATE_TILED_TOP; }
+        if ((c & 4) != 0) { bits = bits | STATE_TILED_RIGHT; }
+        if ((c & 16) != 0) { bits = bits | STATE_TILED_BOTTOM; }
+        if ((c & 64) != 0) { bits = bits | STATE_TILED_LEFT; }
+    }
+    _done();
+    return bits;
+}
+
+// Whether a property is one of those a window's state lives in.
+fn is_state(st as *State, d as *u8, atom as i64) as i32 {
+    init(st, d);
+    return cast(i32, atom == st.net_wm_state || atom == st.edge_constraints);
+}

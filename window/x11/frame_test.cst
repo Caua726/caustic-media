@@ -1,0 +1,268 @@
+// window/x11/frame_test.cst — a window drawing its own frame, on a real
+// server, the test playing the window manager on a second connection.
+//
+// Xvfb has no window manager, so the test can be one: it selects
+// SubstructureRedirect on the root from a connection of its own, and the
+// client messages a window sends a window manager — move, resize, the window
+// menu — arrive there to be read. The properties a window sets for one — no
+// decorations, the frame's extents — are read back from that connection, its
+// input shape asked of the server, and the window manager's word on the
+// window's state — maximized, full screen, tiled — written as one would and
+// seen arriving as events.
+//
+// Run by tools/run_headless.sh. Exit code is the number of failures.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+use "bind/xshape.cst" as xshape;
+use "../../gpu/software/target.cst" as tgt;
+use "events.cst" as events;
+use "frame.cst" as frame;
+use "x11.cst" as x11;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        fails = fails + 1;
+        io.printf("  FAIL %s\n", name);
+    }
+}
+
+fn settle(w as *x11.window.Window, ms as i64) as void {
+    let is i64 as deadline = time.now_ns() + ms * 1000000;
+    while (time.now_ns() < deadline) {
+        if (x11.next_frame(w) == 0) { return; }
+    }
+}
+
+// --- The window manager's side ---
+
+let is *u8 as wm with mut;
+let is i64 as root with mut = 0;
+let is xev.XEvent as got;
+
+fn atom(name as *u8) as i64 { return xlib.XInternAtom(wm, name, 0); }
+
+// The next client message of type t sent to the root, within a second.
+fn message(t as i64) as *xev.XClientMessageEvent {
+    let is i64 as deadline = time.now_ns() + 1000000000;
+    while (time.now_ns() < deadline) {
+        while (xlib.XPending(wm) > 0) {
+            xlib.XNextEvent(wm, cast(*u8, &got));
+            if (xev.kind(&got) == x.ClientMessage && xev.client(&got).message_type == t) { return xev.client(&got); }
+        }
+        time.sleep_ms(5);
+    }
+    return cast(*xev.XClientMessageEvent, 0);
+}
+
+let is i64 as _type with mut = 0;
+let is i32 as _format with mut = 0;
+let is i64 as _n with mut = 0;
+let is i64 as _after with mut = 0;
+let is *u8 as _data with mut;
+
+// Property p of window xid as longs, as the window manager reads it: how many.
+fn longs(xid as i64, p as i64) as i64 {
+    _data = cast(*u8, 0);
+    if (xlib.XGetWindowProperty(wm, xid, p, 0, 64, 0, 0, cast(*u8, &_type), cast(*u8, &_format), cast(*u8, &_n),
+                                cast(*u8, &_after), cast(*u8, &_data)) != 0) { return 0; }
+    if (cast(i64, _data) == 0) { return 0; }
+    return _n;
+}
+
+fn long_at(i as i64) as i64 { return *cast(*i64, cast(i64, _data) + i * 8); }
+
+fn done() as void {
+    if (cast(i64, _data) != 0) { xlib.XFree(_data); }
+    _data = cast(*u8, 0);
+}
+
+// The next STATE event on our side, within a second: its state, or -1.
+fn state_event(w as *x11.window.Window) as i64 {
+    let is i64 as deadline = time.now_ns() + 1000000000;
+    let is events.Event as e;
+    while (time.now_ns() < deadline) {
+        if (x11.next_frame(w) == 0) { return 0 - 1; }
+        while (x11.poll_event(w, &e) == 1) {
+            if (e.kind == events.STATE) { return cast(i64, e.state); }
+        }
+        time.sleep_ms(5);
+    }
+    return 0 - 1;
+}
+
+let is [4]i64 as vals;
+
+// Errors heard and let go: a window gone is asked about on purpose.
+fn quiet(d as *u8, e as *u8) as i32 { return 0; }
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is x11.window.Config as c with mut = x11.config("caustic-frame-test", 320, 240);
+    c.transparent = 1;
+    let is x11.window.Window as w = x11.open_with(&c);
+    if (x11.is_open(&w) == 0) {
+        io.printf("  FAIL open: %s\n", x11.error_name(x11.last_error(&w)));
+        return 1;
+    }
+    settle(&w, 200);
+    let is i64 as xid = x11.xid(&w);
+
+    wm = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, wm) == 0) {
+        io.printf("  FAIL a second connection\n");
+        return 1;
+    }
+    root = xlib.XDefaultRootWindow(wm);
+    xlib.XSelectInput(wm, root, x.SubstructureRedirectMask | x.SubstructureNotifyMask);
+    xlib.XSync(wm, 0);
+
+    // --- See-through: a visual with alpha, pixels premultiplied ---
+    chk("a window with alpha: 32 bits deep", x11.transparent(&w) == 1);
+    if (x11.next_frame(&w) == 1) {
+        let is tgt.Target as t = x11.acquire(&w);
+        // Half-seen red, as the rasterizer packs it: 0xAABBGGRR; nothing; an
+        // opaque blue; every channel half seen.
+        *cast(*i32, t.color) = cast(i32, 2147483903);   // 0x800000FF
+        *cast(*i32, cast(i64, t.color) + 4) = cast(i32, 0);
+        *cast(*i32, cast(i64, t.color) + 8) = cast(i32, 0 - 65536);   // 0xFFFF0000
+        *cast(*i32, cast(i64, t.color) + 12) = cast(i32, 2151710975);   // 0x804080FF
+        x11.submit(&w);
+        // What the server was given: ARGB, premultiplied, as compositors read it.
+        let is i64 as p0 = cast(i64, *cast(*i32, t.color)) & 4294967295;
+        let is i64 as p1 = cast(i64, *cast(*i32, cast(i64, t.color) + 4)) & 4294967295;
+        chk("premultiplied: half red is half its red", p0 == 2155872256);   // 0x80800000
+        chk("nothing stays nothing", p1 == 0);
+        let is i64 as p2 = cast(i64, *cast(*i32, cast(i64, t.color) + 8)) & 4294967295;
+        let is i64 as p3 = cast(i64, *cast(*i32, cast(i64, t.color) + 12)) & 4294967295;
+        chk("every pixel turned round: opaque blue", p2 == 4278190335);   // 0xFF0000FF
+        chk("every channel times its alpha, rounded", p3 == 2155888672);   // 0x80804020
+    }
+
+    // --- No decorations of the window manager's ---
+    let is i64 as motif = atom("_MOTIF_WM_HINTS");
+    chk("decorated at first", x11.decorated(&w) == 1);
+    chk("asked for none", x11.set_decorated(&w, 0) == 1);
+    xlib.XSync(x11.display(&w), 0);
+    let is i64 as n with mut = longs(xid, motif);
+    chk("_MOTIF_WM_HINTS: the decorations flag, none", n == 5 && long_at(0) == 2 && long_at(1) == 0 && long_at(2) == 0);
+    done();
+    chk("read back", x11.decorated(&w) == 0);
+    x11.set_decorated(&w, 1);
+    xlib.XSync(x11.display(&w), 0);
+    n = longs(xid, motif);
+    chk("and back", n == 5 && long_at(0) == 2 && long_at(2) == 1 && x11.decorated(&w) == 1);
+    done();
+    // Hints as others write them: three longs; eight-bit bytes, not longs.
+    vals[0] = 2;
+    vals[1] = 0;
+    vals[2] = 0;
+    xlib.XChangeProperty(wm, xid, motif, motif, 32, x.PropModeReplace, cast(*u8, &vals), 3);
+    xlib.XSync(wm, 0);
+    chk("three longs: read", x11.decorated(&w) == 0);
+    xlib.XChangeProperty(wm, xid, motif, motif, 8, x.PropModeReplace, cast(*u8, &vals), 20);
+    xlib.XSync(wm, 0);
+    chk("bytes, not longs: as if none", x11.decorated(&w) == 1);
+
+    // --- The frame's shadow, outside the window ---
+    chk("extents set", x11.set_client_extents(&w, 24, 24, 20, 28) == 1);
+    xlib.XSync(x11.display(&w), 0);
+    n = longs(xid, atom("_GTK_FRAME_EXTENTS"));
+    chk("_GTK_FRAME_EXTENTS: left, right, top, bottom", n == 4 && long_at(0) == 24 && long_at(1) == 24 && long_at(2) == 20 &&
+        long_at(3) == 28);
+    done();
+    chk("read back", x11.client_extents(&w, cast(*i64, &vals), cast(*i64, cast(i64, &vals) + 8), cast(*i64, cast(i64, &vals) + 16),
+        cast(*i64, cast(i64, &vals) + 24)) == 1 && vals[0] == 24 && vals[2] == 20 && vals[3] == 28);
+    xlib.XChangeProperty(wm, xid, atom("_GTK_FRAME_EXTENTS"), atom("CARDINAL"), 32, x.PropModeReplace, cast(*u8, &vals), 2);
+    xlib.XSync(wm, 0);
+    let is i64 as junk with mut = 0;
+    chk("two of four: none", x11.client_extents(&w, &junk, &junk, &junk, &junk) == 0);
+
+    // --- Where the pointer is taken ---
+    chk("input region set", x11.set_input_region(&w, 16, 16, 288, 208) == 1);
+    xlib.XSync(x11.display(&w), 0);
+    let is i32 as count with mut = 0;
+    let is i32 as order with mut = 0;
+    let is *u8 as rects = xshape.XShapeGetRectangles(wm, xid, xshape.ShapeInput, cast(*u8, &count), cast(*u8, &order));
+    let is *xlib.XRectangle as r0 = cast(*xlib.XRectangle, rects);
+    chk("the server's input shape: that rectangle", count == 1 && r0.x == 16 && r0.y == 16 && r0.width == 288 &&
+        r0.height == 208);
+    if (cast(i64, rects) != 0) { xlib.XFree(rects); }
+    let is i64 as ix with mut = 0;
+    let is i64 as iy with mut = 0;
+    let is i64 as iw with mut = 0;
+    let is i64 as ih with mut = 0;
+    chk("read back", x11.input_region(&w, &ix, &iy, &iw, &ih) == 1 && ix == 16 && iw == 288 && ih == 208);
+    x11.set_input_region(&w, 0, 0, 0, 0);
+    chk("an empty region: not one rectangle", x11.input_region(&w, &ix, &iy, &iw, &ih) == 0);
+    x11.set_input_region(&w, 16, 16, 288, 208);
+
+    // --- Moved and resized by the window manager, from a press ---
+    let is i64 as rx with mut = 0;
+    let is i64 as ry with mut = 0;
+    x11.position(&w, &rx, &ry);
+    chk("move asked", x11.begin_move_resize(&w, 50, 10, x11.MOVERESIZE_MOVE, 1) == 1);
+    let is *xev.XClientMessageEvent as m with mut = message(atom("_NET_WM_MOVERESIZE"));
+    chk("_NET_WM_MOVERESIZE: the window, where on the screen, move, the button", cast(i64, m) != 0 && m.window == xid &&
+        m.format == 32 && m.data[0] == rx + 50 && m.data[1] == ry + 10 && m.data[2] == 8 && m.data[3] == 1 && m.data[4] == 1);
+    x11.begin_move_resize(&w, 300, 230, x11.MOVERESIZE_SIZE_BOTTOMRIGHT, 1);
+    m = message(atom("_NET_WM_MOVERESIZE"));
+    chk("resize from the bottom right corner", cast(i64, m) != 0 && m.data[0] == rx + 300 && m.data[1] == ry + 230 && m.data[2] == 4);
+    chk("the window's menu asked", x11.show_window_menu(&w, 30, 5) == 1);
+    m = message(atom("_GTK_SHOW_WINDOW_MENU"));
+    chk("_GTK_SHOW_WINDOW_MENU: where on the screen", cast(i64, m) != 0 && m.window == xid && m.data[1] == rx + 30 &&
+        m.data[2] == ry + 5);
+
+    // --- The window manager's word on its state ---
+    let is i64 as net_state = atom("_NET_WM_STATE");
+    vals[0] = atom("_NET_WM_STATE_MAXIMIZED_VERT");
+    vals[1] = atom("_NET_WM_STATE_MAXIMIZED_HORZ");
+    xlib.XChangeProperty(wm, xid, net_state, atom("ATOM"), 32, x.PropModeReplace, cast(*u8, &vals), 2);
+    xlib.XSync(wm, 0);
+    chk("maximized: said", state_event(&w) == x11.STATE_MAXIMIZED);
+    vals[0] = atom("_NET_WM_STATE_FULLSCREEN");
+    xlib.XChangeProperty(wm, xid, net_state, atom("ATOM"), 32, x.PropModeReplace, cast(*u8, &vals), 1);
+    xlib.XSync(wm, 0);
+    chk("full screen: said", state_event(&w) == x11.STATE_FULLSCREEN);
+    // GTK's edge constraints, as Mutter sets them: tiled at the top and left.
+    vals[0] = 1 | 64;
+    xlib.XChangeProperty(wm, xid, atom("_GTK_EDGE_CONSTRAINTS"), atom("CARDINAL"), 32, x.PropModeReplace, cast(*u8, &vals), 1);
+    xlib.XSync(wm, 0);
+    let is i64 as st = state_event(&w);
+    chk("tiled: said, top and left", st == (x11.STATE_FULLSCREEN | x11.STATE_TILED_TOP | x11.STATE_TILED_LEFT) &&
+        x11.tiled(&w) == (x11.STATE_TILED_TOP | x11.STATE_TILED_LEFT));
+    xlib.XDeleteProperty(wm, xid, net_state);
+    xlib.XSync(wm, 0);
+    chk("none of it any more", state_event(&w) == (x11.STATE_TILED_TOP | x11.STATE_TILED_LEFT));
+    // Another property: not the window's state.
+    vals[0] = 1;
+    xlib.XChangeProperty(wm, xid, atom("_CAUSTIC_TEST"), atom("CARDINAL"), 32, x.PropModeReplace, cast(*u8, &vals), 1);
+    xlib.XSync(wm, 0);
+    chk("another property: no state said", state_event(&w) == 0 - 1);
+    let is events.Event as last;
+    chk("nothing more: none", x11.poll_event(&w, &last) == 0);
+
+    // --- A window gone: nothing read, nothing broken ---
+    let is i64 as gone = xlib.XCreateSimpleWindow(wm, root, 0, 0, 10, 10, 0, 0, 0);
+    xlib.XDestroyWindow(wm, gone);
+    xlib.XSync(wm, 0);
+    let is *u8 as old = xlib.XSetErrorHandler(fn_ptr(quiet));
+    let is frame.State as fst;
+    fst.ready = 0;
+    chk("a window gone: no sides tiled, decorated as by default",
+        frame.tiled(&fst, x11.display(&w), gone) == 0 && frame.decorated(&fst, x11.display(&w), gone) == 1);
+    xlib.XSync(x11.display(&w), 0);
+    xlib.XSetErrorHandler(old);
+
+    xlib.XCloseDisplay(wm);
+    x11.close(&w);
+    if (fails == 0) {
+        io.printf("x11 frame: all checks passed\n");
+        return 0;
+    }
+    io.printf("x11 frame: %d failures\n", fails);
+    return fails;
+}

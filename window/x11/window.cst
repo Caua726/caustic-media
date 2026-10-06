@@ -58,6 +58,7 @@ use "keys.cst" as keys;
 use "events.cst" as events;
 use "clipboard.cst" as clipboard;
 use "wm.cst" as wm;
+use "frame.cst" as frame;
 use "text.cst" as text;
 use "framesync.cst" as framesync;
 use "dnd.cst" as dnd;
@@ -111,6 +112,10 @@ struct Config {
     // compositor that is also the difference between a window and a tile the
     // size of the monitor — see _set_size_hints.
     resizable  as i32;
+    // A 32-bit visual with alpha, for a window that draws its own frame and
+    // shadow (frame.cst): what it leaves transparent shows what is behind it
+    // under a compositor. The default visual when the server has none.
+    transparent as i32;
 }
 
 let is i64 as DEFAULT_RING with imut = 256;
@@ -126,6 +131,7 @@ fn config(title as *u8, width as i64, height as i64) as Config {
     c.min_height = 0;
     c.prefer_shm = 1;
     c.resizable = 1;
+    c.transparent = 0;
     return c;
 }
 
@@ -166,6 +172,9 @@ struct Window {
     // it interns thirteen atoms, and thirteen round trips is not something to
     // spend at open on a program that never asks for any of them.
     wmst as wm.State;
+    // What a window drawing its own frame asks of the window manager. libX11
+    // and the SHAPE input region of libXext, already linked: free to forward.
+    frst as frame.State;
     // text.cst is here for the same reason wm.cst is: everything it calls is
     // libX11. The libc half — setlocale, which an input method needs before it
     // can be found — is deliberately NOT, and lives in locale.cst.
@@ -195,7 +204,7 @@ struct Window {
     framed as i32;      // next_frame ran for this frame; acquire refuses without it
     err    as i32;
     ok     as i32;
-    _pad0  as i32;
+    argb   as i32;      // a 32-bit visual with alpha, and a colormap of its own
 }
 
 // One scratch event for the pump. The pump is not reentrant and neither is X11
@@ -212,6 +221,17 @@ fn _slot(w as *Window, i as i64) as *xev.XEvent {
 // framebuffer means. On a PseudoColor visual those bytes are colormap indices
 // and the picture is wrong rather than absent, so failing here is better than
 // drawing.
+// The visual with alpha a transparent window asks for: 1 when the server has
+// one, w.visual and w.xdepth then its.
+let is xutil.XVisualInfo as _vinfo;
+
+fn _pick_argb(w as *Window, d as *u8, scr as i32) as i32 {
+    if (xutil.XMatchVisualInfo(d, scr, 32, x.TrueColor, cast(*u8, &_vinfo)) == 0) { return 0; }
+    w.visual = _vinfo.visual;
+    w.xdepth = cast(u32, 32);
+    return 1;
+}
+
 fn _pick_visual(w as *Window, d as *u8, scr as i32) as i32 {
     w.visual = xlib.XDefaultVisual(d, scr);
     w.xdepth = cast(u32, xlib.XDefaultDepth(d, scr));
@@ -306,7 +326,7 @@ fn open_with(c as *Config) as Window {
     w.visual = cast(*u8, 0); w.colormap = 0; w.screen = 0; w.xdepth = 0;
     w.wm_delete = 0; w.wm_protocols = 0;
     w.ring = cast(*u8, 0); w.ring_cap = 0; w.ring_head = 0; w.ring_len = 0;
-    w.dropped = 0; w.frames = 0; w.framed = 0; w.err = OK; w.ok = 0;
+    w.dropped = 0; w.frames = 0; w.framed = 0; w.err = OK; w.ok = 0; w.argb = 0;
     w.back.ok = 0;
 
     if (c.width <= 0 || c.height <= 0) { w.err = BAD_ARGUMENT; return w; }
@@ -324,9 +344,23 @@ fn open_with(c as *Config) as Window {
 
     let is i64 as root = xlib.XRootWindow(d, w.screen);
     let is i64 as black = xlib.XBlackPixel(d, w.screen);
-    w.xid = xlib.XCreateSimpleWindow(d, root, 0, 0,
-                                     cast(u32, c.width), cast(u32, c.height), 0,
-                                     black, black);
+    if (c.transparent == 1 && _pick_argb(&w, d, w.screen) == 1) {
+        // A visual not the root's needs a colormap and a border pixel of its
+        // own, or the server refuses the window with BadMatch.
+        w.argb = 1;
+        w.colormap = xlib.XCreateColormap(d, root, w.visual, x.AllocNone);
+        let is xlib.XSetWindowAttributes as at;
+        at.colormap = w.colormap;
+        at.border_pixel = 0;
+        at.background_pixel = 0;
+        w.xid = xlib.XCreateWindow(d, root, 0, 0, cast(u32, c.width), cast(u32, c.height), 0, 32,
+                                   cast(u32, x.InputOutput), w.visual, x.CWColormap | x.CWBorderPixel | x.CWBackPixel,
+                                   cast(*u8, &at));
+    } else {
+        w.xid = xlib.XCreateSimpleWindow(d, root, 0, 0,
+                                         cast(u32, c.width), cast(u32, c.height), 0,
+                                         black, black);
+    }
     if (w.xid == 0) {
         _display_release(); w.display = cast(*u8, 0);
         w.err = NO_WINDOW; return w;
@@ -388,6 +422,7 @@ fn open_with(c as *Config) as Window {
     // program that never asks for fullscreen should not pay thirteen round
     // trips at open. _need_wm does it on first use.
     w.wmst.ready = 0;
+    w.frst.ready = 0;
     // The first tier costs nothing to set up: no locale, no input method, no
     // round trip. An input method is opened only if the program asks.
     text.init(&w.txt);
@@ -423,6 +458,7 @@ fn close(w as *Window) as void {
     }
     if (cast(i64, w.gc) != 0) { xlib.XFreeGC(w.display, w.gc); }
     if (w.xid != 0) { xlib.XDestroyWindow(w.display, w.xid); }
+    if (w.argb == 1) { xlib.XFreeColormap(w.display, w.colormap); }
     // Not XCloseDisplay: the connection is shared, and the last window out
     // turns off the light. Closing it here would leave every other open window
     // holding a freed Display.
@@ -820,7 +856,15 @@ fn wait_xevent(w as *Window, out as *xev.XEvent) as i32 {
 fn poll_event(w as *Window, out as *events.Event) as i32 {
     let is xev.XEvent as raw;
     while (poll_xevent(w, &raw) == 1) {
-        if (events.decode(&raw, &w.km, out) == 1) { return 1; }
+        if (events.decode(&raw, &w.km, out) == 1) {
+            // The window manager writing the window's state: a STATE event,
+            // with what it is now.
+            if (xev.kind(&raw) == x.PropertyNotify && frame.is_state(&w.frst, w.display, xev.property(&raw).atom) == 1) {
+                out.kind = events.STATE;
+                out.state = state(w);
+            }
+            return 1;
+        }
     }
     return 0;
 }
@@ -1179,3 +1223,56 @@ fn clear_drop(w as *Window) as void { dnd.clear(&w.drop); }
 fn dragging(w as *Window) as i32 { return dnd.dragging(&w.drop); }
 fn drag_x(w as *Window) as i64 { return dnd.pointer_x(&w.drop); }
 fn drag_y(w as *Window) as i64 { return dnd.pointer_y(&w.drop); }
+
+// --- A frame of the window's own (frame.cst) ---
+
+// Whether it has a visual with alpha: asked for with Config.transparent, and
+// the server had one.
+fn transparent(w as *Window) as i32 { return w.argb; }
+
+fn set_decorated(w as *Window, on as i32) as i32 { return frame.set_decorated(&w.frst, w.display, w.xid, on); }
+fn decorated(w as *Window) as i32 { return frame.decorated(&w.frst, w.display, w.xid); }
+
+fn set_client_extents(w as *Window, l as i64, r as i64, t as i64, b as i64) as i32 {
+    return frame.set_client_extents(&w.frst, w.display, w.xid, l, r, t, b);
+}
+
+fn client_extents(w as *Window, l as *i64, r as *i64, t as *i64, b as *i64) as i32 {
+    return frame.client_extents(&w.frst, w.display, w.xid, l, r, t, b);
+}
+
+fn set_input_region(w as *Window, x0 as i64, y0 as i64, cw as i64, ch as i64) as i32 {
+    return frame.set_input_region(w.display, w.xid, x0, y0, cw, ch);
+}
+
+fn input_region(w as *Window, x0 as *i64, y0 as *i64, cw as *i64, ch as *i64) as i32 {
+    return frame.input_region(w.display, w.xid, x0, y0, cw, ch);
+}
+
+// Moved or resized (frame.MOVERESIZE_*) by the window manager from a press of
+// button at wx, wy in the window.
+fn begin_move_resize(w as *Window, wx as i64, wy as i64, direction as i64, button as i64) as i32 {
+    let is i64 as rx with mut = 0;
+    let is i64 as ry with mut = 0;
+    position(w, &rx, &ry);
+    return frame.begin_move_resize(&w.frst, w.display, root(w), w.xid, rx + wx, ry + wy, direction, button);
+}
+
+// The window's own menu at wx, wy in the window.
+fn show_window_menu(w as *Window, wx as i64, wy as i64) as i32 {
+    let is i64 as rx with mut = 0;
+    let is i64 as ry with mut = 0;
+    position(w, &rx, &ry);
+    return frame.show_window_menu(&w.frst, w.display, root(w), w.xid, rx + wx, ry + wy);
+}
+
+fn tiled(w as *Window) as i32 { return frame.tiled(&w.frst, w.display, w.xid); }
+
+// Its state as the window manager has it: maximized, full screen, tiled
+// sides (frame.STATE_* bits).
+fn state(w as *Window) as i32 {
+    let is i32 as s with mut = tiled(w);
+    if (maximized(w) == 1) { s = s | frame.STATE_MAXIMIZED; }
+    if (fullscreen(w) == 1) { s = s | frame.STATE_FULLSCREEN; }
+    return s;
+}
