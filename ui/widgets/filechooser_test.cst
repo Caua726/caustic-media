@@ -1,0 +1,613 @@
+// ui/widgets/filechooser_test.cst — a file chooser: a folder's entries in a
+// table, places to start from, up a folder and into one, filters and hidden
+// files; a file opened, a name to save to — asked before replacing one — a
+// folder chosen.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "std/env.cst" as env;
+use "../../math/math.cst" as math;
+use "../../gpu/gpu.cst" as gpu;
+use "../../window/keys.cst" as keys;
+use "../../text/sfnt/sfnt.cst" as sfnt;
+use "../../text/sfnt/table.cst" as table;
+use "../../text/layout/font.cst" as font;
+use "../tree.cst" as tree;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../style.cst" as style;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../text.cst" as text;
+use "label.cst" as label;
+use "../model.cst" as model;
+use "dialog.cst" as dialog;
+use "filechooser.cst" as filechooser;
+use "tableview.cst" as tableview;
+use "listview.cst" as listview;
+use "combo.cst" as combo;
+use "button.cst" as button;
+use "entry.cst" as entry;
+
+let is i64 as W with imut = 640;
+let is i64 as H with imut = 480;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (b[i] == 0 || a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, b[n] == 0);
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is *text.Service as svc with mut;
+let is gpu.device.Device as dv with mut;
+
+fn click(t as *tree.Tree, r as *router.Router, x as f64, y as f64, time as i64) as void {
+    router.pointer_move(t, r, x, y, time);
+    router.pointer_button(t, r, 1, 1, x, y, time);
+    router.pointer_button(t, r, 1, 0, x, y, time + 1);
+}
+
+fn key(t as *tree.Tree, r as *router.Router, k as i32, mods as i32, time as i64) as void {
+    router.key(t, r, k, mods, 1, 0, time);
+    router.key(t, r, k, mods, 0, 0, time + 1);
+}
+
+fn tree_for() as tree.Tree {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_text_service(&t, cast(*u8, svc));
+    return t;
+}
+
+
+
+
+fn near(a as f64, b as f64) as i32 {
+    let is f64 as d = a - b;
+    return cast(i32, d < 0.01 && d > 0.0 - 0.01);
+}
+
+fn mx(t as *tree.Tree, w as i64) as f64 { return layout.window_rect(t, w).x + layout.window_rect(t, w).w / 2.0; }
+fn my(t as *tree.Tree, w as i64) as f64 { return layout.window_rect(t, w).y + layout.window_rect(t, w).h / 2.0; }
+
+fn len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+let is [256]u8 as root with mut;
+let is [512]u8 as pathbuf with mut;
+
+fn at(rel as *u8) as *u8 {
+    let is i64 as n = len(cast(*u8, &root));
+    mem.memcpy(cast(*u8, &pathbuf), cast(*u8, &root), n);
+    pathbuf[n] = cast(u8, 47);
+    mem.memcpy(cast(*u8, cast(i64, &pathbuf) + n + 1), rel, len(rel) + 1);
+    return cast(*u8, &pathbuf);
+}
+
+fn file(rel as *u8, size as i64) as void {
+    let is i64 as fd = linux.open(at(rel), 577, 420);
+    let is [64]u8 as bytes;
+    mem.memset(cast(*u8, &bytes), 120, 64);
+    if (size > 0) { linux.write(fd, cast(*u8, &bytes), size); }
+    linux.close(fd);
+}
+
+fn digits(v as i64, out as *u8) as i64 {
+    let is [24]u8 as tmp;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    while (x > 0) {
+        tmp[n] = cast(u8, 48 + x % 10);
+        n = n + 1;
+        x = x / 10;
+    }
+    let is i64 as k with mut = 0;
+    while (n > 0) {
+        n = n - 1;
+        out[k] = tmp[n];
+        k = k + 1;
+    }
+    return k;
+}
+
+//   sub/                  A.md 20   b.txt 3   .hidden 1
+//     Documents/
+//       only.txt 0
+// Home is sub: its Documents a place, no Desktop nor Downloads there.
+fn made_dir() as void {
+    let is *u8 as base = "/tmp/caustic-chooser-";
+    let is i64 as bn = len(base);
+    mem.memcpy(cast(*u8, &root), base, bn);
+    let is i64 as k = digits(linux.getpid(), cast(*u8, cast(i64, &root) + bn));
+    root[bn + k] = cast(u8, 0);
+    linux.mkdir(cast(*u8, &root), 493);
+    linux.mkdir(at("sub"), 493);
+    linux.mkdir(at("sub/Documents"), 493);
+    file("sub/Documents/only.txt", 0);
+    file("A.md", 20);
+    file("b.txt", 3);
+    file(".hidden", 1);
+}
+
+fn unmade_dir() as void {
+    linux.unlink(at("A.md"));
+    linux.unlink(at("b.txt"));
+    linux.unlink(at(".hidden"));
+    linux.unlink(at("sub/Documents/only.txt"));
+    linux.rmdir(at("sub/Documents"));
+    linux.rmdir(at("sub"));
+    linux.rmdir(cast(*u8, &root));
+}
+
+let is i64 as answered with mut = 0;
+let is i64 as answers with mut = 0;
+fn on_answer(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    answered = *cast(*i64, arg);
+    answers = answers + 1;
+}
+
+// The names the table shows, in order, joined by spaces.
+let is [512]u8 as names with mut;
+
+fn listed(t as *tree.Tree, fc as i64) as *u8 {
+    let is *model.Model as m = listview.model_of(t, tableview.list(t, filechooser.table(t, fc)));
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < model.count(m, 0)) {
+        let is model.Value as v;
+        model.cell(m, model.row_id(m, 0, i), 0, model.TEXT, &v);
+        if (i > 0) {
+            names[k] = cast(u8, 32);
+            k = k + 1;
+        }
+        mem.memcpy(cast(*u8, cast(i64, &names) + k), v.p, v.len);
+        k = k + v.len;
+        i = i + 1;
+    }
+    names[k] = cast(u8, 0);
+    return cast(*u8, &names);
+}
+
+fn shows(t as *tree.Tree, fc as i64, s as *u8) as i32 {
+    let is *u8 as got = listed(t, fc);
+    return same(got, len(got), s);
+}
+
+fn in_folder(t as *tree.Tree, fc as i64, p as *u8) as i32 { return same(filechooser.folder(t, fc), filechooser.folder_length(t, fc), p); }
+
+fn was_chosen(t as *tree.Tree, fc as i64, p as *u8) as i32 {
+    let is [512]u8 as out;
+    let is i64 as n = filechooser.chosen(t, fc, cast(*u8, &out), 512);
+    return same(cast(*u8, &out), n, p);
+}
+
+fn row(t as *tree.Tree, fc as i64, i as i64) as i64 { return listview.row_widget(t, tableview.list(t, filechooser.table(t, fc)), i); }
+
+fn dbl(t as *tree.Tree, r as *router.Router, w as i64, time as i64) as void {
+    click(t, r, mx(t, w), my(t, w), time);
+    click(t, r, mx(t, w), my(t, w), time + 50);
+}
+
+fn button_says(t as *tree.Tree, fc as i64, s as *u8) as i32 {
+    let is i64 as l = button.content(t, dialog.button_for(t, fc, dialog.OK));
+    return same(label.text(t, l), label.text_length(t, l), s);
+}
+
+fn says_path(t as *tree.Tree, fc as i64, p as *u8) as i32 {
+    let is i64 as l = filechooser.path_label(t, fc);
+    return same(label.text(t, l), label.text_length(t, l), p);
+}
+
+// A key pressed and let go: whether the press was taken.
+fn taken(t as *tree.Tree, r as *router.Router, k as i32, mods as i32, time as i64) as i32 {
+    let is i32 as done = router.key(t, r, k, mods, 1, 0, time);
+    router.key(t, r, k, mods, 0, 0, time + 1);
+    return done;
+}
+
+// Home from HOME when the program does not say: shown at first.
+fn homed() as void {
+    let is *u8 as h = env.getenv("HOME");
+    if (cast(i64, h) == 0) { return; }
+    let is tree.Tree as t = tree_for();
+    let is i64 as fc = filechooser.create(&t, filechooser.OPEN, "Open", 4);
+    check("home from HOME, shown at first", fc != 0 && in_folder(&t, fc, h) == 1 && says_path(&t, fc, h) == 1);
+    tree.close(&t);
+}
+
+fn opened() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as fc = filechooser.create(&t, filechooser.OPEN, "Open", 4);
+    signal.connect(&t, fc, signal.ACTIVATED, fn_ptr(on_answer), cast(*u8, 0));
+    check("home shown at first", in_folder(&t, fc, at("sub")) == 1 && button_says(&t, fc, "Open") == 1);
+    check("a folder set", filechooser.set_folder(&t, fc, cast(*u8, &root), len(cast(*u8, &root))) == 1);
+    check("one there is not: where it was", filechooser.set_folder(&t, fc, "/no/such/place", 14) == 0 &&
+          in_folder(&t, fc, cast(*u8, &root)) == 1 && says_path(&t, fc, cast(*u8, &root)) == 1);
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("its entries, folders first, hidden ones not", shows(&t, fc, "sub A.md b.txt") == 1 && in_folder(&t, fc, cast(*u8, &root)) == 1);
+    check("where it is said", says_path(&t, fc, cast(*u8, &root)) == 1);
+    // Into a folder and up.
+    dbl(&t, &r, row(&t, fc, 0), 10);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("a folder opened: into it", in_folder(&t, fc, at("sub")) == 1 && shows(&t, fc, "Documents") == 1 && dialog.is_shown(&t, fc) == 1);
+    click(&t, &r, mx(&t, filechooser.up_button(&t, fc)), my(&t, filechooser.up_button(&t, fc)), 1000);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("up: back, and said", in_folder(&t, fc, cast(*u8, &root)) == 1 && says_path(&t, fc, cast(*u8, &root)) == 1);
+    // Open with nothing chosen: nothing.
+    answers = 0;
+    let is i64 as open = dialog.button_for(&t, fc, dialog.OK);
+    click(&t, &r, mx(&t, open), my(&t, open), 2000);
+    check("open, nothing chosen: still shown", answers == 0 && dialog.is_shown(&t, fc) == 1);
+    // A folder chosen, open: into it.
+    click(&t, &r, mx(&t, row(&t, fc, 0)), my(&t, row(&t, fc, 0)), 3000);
+    click(&t, &r, mx(&t, open), my(&t, open), 3100);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("a folder chosen, open: into it, still shown", in_folder(&t, fc, at("sub")) == 1 && answers == 0);
+    filechooser.set_folder(&t, fc, cast(*u8, &root), len(cast(*u8, &root)));
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    // A file chosen, open: given.
+    click(&t, &r, mx(&t, row(&t, fc, 2)), my(&t, row(&t, fc, 2)), 4000);
+    click(&t, &r, mx(&t, open), my(&t, open), 4100);
+    check("a file chosen, open: given", answers == 1 && answered == dialog.OK && was_chosen(&t, fc, at("b.txt")) == 1 &&
+          dialog.is_shown(&t, fc) == 0);
+    let is [512]u8 as out;
+    let is i64 as bn = len(at("b.txt"));
+    check("what was chosen, where it fits", filechooser.chosen(&t, fc, cast(*u8, &out), bn) == bn &&
+          filechooser.chosen(&t, fc, cast(*u8, &out), bn - 1) == 0);
+    // Opened again, a file activated: given.
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    dbl(&t, &r, row(&t, fc, 1), 5000);
+    check("a file opened: given", answers == 2 && was_chosen(&t, fc, at("A.md")) == 1);
+    // Hidden files.
+    dialog.show(&t, &r, fc, 1);
+    router.focus(&t, &r, tableview.list(&t, filechooser.table(&t, fc)), 1);
+    check("control H: hidden ones too", taken(&t, &r, keys.H, keys.MOD_CONTROL, 6000) == 1 && shows(&t, fc, "sub .hidden A.md b.txt") == 1);
+    key(&t, &r, keys.H, keys.MOD_CONTROL, 6010);
+    check("and not", shows(&t, fc, "sub A.md b.txt") == 1);
+    key(&t, &r, keys.H, keys.MOD_CONTROL, 6020);
+    check("and again", shows(&t, fc, "sub .hidden A.md b.txt") == 1);
+    key(&t, &r, keys.H, keys.MOD_CONTROL, 6030);
+    // Backspace: up.
+    filechooser.set_folder(&t, fc, at("sub"), len(at("sub")));
+    check("backspace: up", taken(&t, &r, keys.BACKSPACE, 0, 6100) == 1 && in_folder(&t, fc, cast(*u8, &root)) == 1);
+    // Filters: the first added used.
+    check("a filter added: used", filechooser.add_filter(&t, fc, "Text", 4, "*.txt", 5) == 0 &&
+          combo.selected(&t, filechooser.filter_combo(&t, fc)) == 0 && shows(&t, fc, "sub b.txt") == 1);
+    check("another added", filechooser.add_filter(&t, fc, "All files", 9, "", 0) == 1 && shows(&t, fc, "sub b.txt") == 1);
+    filechooser.set_filter(&t, fc, 1);
+    check("it chosen: all", combo.selected(&t, filechooser.filter_combo(&t, fc)) == 1 && shows(&t, fc, "sub A.md b.txt") == 1);
+    combo.set_selected(&t, filechooser.filter_combo(&t, fc), 0);
+    check("one chosen in its combo", shows(&t, fc, "sub b.txt") == 1);
+    let is [256]u8 as long;
+    mem.memset(cast(*u8, &long), 42, 256);
+    check("names past 63 bytes, patterns past 255: none", filechooser.add_filter(&t, fc, cast(*u8, &long), 64, "", 0) == 0 - 1 &&
+          filechooser.add_filter(&t, fc, "x", 1, cast(*u8, &long), 256) == 0 - 1);
+    check("63, 255: kept", filechooser.add_filter(&t, fc, cast(*u8, &long), 63, "", 0) == 2 &&
+          filechooser.add_filter(&t, fc, "x", 1, cast(*u8, &long), 255) == 3);
+    let is i64 as k with mut = 4;
+    while (k < 8) {
+        filechooser.add_filter(&t, fc, "x", 1, "", 0);
+        k = k + 1;
+    }
+    check("eight at most", filechooser.add_filter(&t, fc, "x", 1, "", 0) == 0 - 1);
+    // The filters' model, in the list its combo opens.
+    combo.open(&t, filechooser.filter_combo(&t, fc));
+    let is *model.Model as fm = listview.model_of(&t, combo.list_of(&t, filechooser.filter_combo(&t, fc)));
+    let is model.Value as v;
+    model.cell(fm, 1, 0, model.TEXT, &v);
+    let is i32 as first = same(v.p, v.len, "Text");
+    check("the filters' model", model.count(fm, 0) == 8 && model.count(fm, 1) == 0 && model.row_id(fm, 0, 7) == 8 &&
+          model.row_id(fm, 0, 0) == 1 && first == 1 &&
+          model.row_id(fm, 0, 8) == 0 && model.row_id(fm, 0, 0 - 1) == 0 && model.row_id(fm, 1, 0) == 0 &&
+          model.cell(fm, 8, 0, model.TEXT, &v) == 1 && model.cell(fm, 9, 0, model.TEXT, &v) == 0 &&
+          model.cell(fm, 0, 0, model.TEXT, &v) == 0 && model.cell(fm, 1, 1, model.TEXT, &v) == 0 &&
+          model.cell(fm, 1, 0, model.SORT, &v) == 0);
+    key(&t, &r, keys.ESCAPE, 0, 6200);
+    check("closed again", combo.is_open(&t, filechooser.filter_combo(&t, fc)) == 0 && dialog.is_shown(&t, fc) == 1);
+    // Places.
+    let is i64 as pl = filechooser.places(&t, fc);
+    let is *model.Model as pm = listview.model_of(&t, pl);
+    model.cell(pm, model.row_id(pm, 0, 0), 0, model.TEXT, &v);
+    let is i32 as home = same(v.p, v.len, "Home");
+    model.cell(pm, model.row_id(pm, 0, 1), 0, model.TEXT, &v);
+    let is i32 as docs = same(v.p, v.len, "Documents");
+    model.cell(pm, model.row_id(pm, 0, 2), 0, model.TEXT, &v);
+    check("places: home, those there under it, the computer", model.count(pm, 0) == 3 && home == 1 && docs == 1 &&
+          same(v.p, v.len, "Computer") == 1);
+    check("the places' model", model.count(pm, 1) == 0 && model.row_id(pm, 0, 3) == 0 && model.row_id(pm, 0, 0 - 1) == 0 &&
+          model.row_id(pm, 1, 0) == 0 && model.cell(pm, 4, 0, model.TEXT, &v) == 0 && model.cell(pm, 0, 0, model.TEXT, &v) == 0 &&
+          model.cell(pm, 1, 1, model.TEXT, &v) == 0 && model.cell(pm, 1, 0, model.SORT, &v) == 0);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is i64 as crow = listview.row_widget(&t, pl, 2);
+    click(&t, &r, mx(&t, crow), my(&t, crow), 7000);
+    check("a place clicked: there", in_folder(&t, fc, "/") == 1);
+    let is i64 as hrow = listview.row_widget(&t, pl, 0);
+    click(&t, &r, mx(&t, hrow), my(&t, hrow), 7100);
+    check("home clicked", in_folder(&t, fc, at("sub")) == 1);
+    let is i64 as drow = listview.row_widget(&t, pl, 1);
+    click(&t, &r, mx(&t, drow), my(&t, drow), 7200);
+    check("its documents", in_folder(&t, fc, at("sub/Documents")) == 1);
+    // Escape in the table, Cancel: not given.
+    answers = 0;
+    router.focus(&t, &r, tableview.list(&t, filechooser.table(&t, fc)), 1);
+    key(&t, &r, keys.ESCAPE, 0, 8000);
+    check("escape: cancelled", answers == 1 && answered == dialog.CANCEL && dialog.is_shown(&t, fc) == 0);
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is i64 as cancel = dialog.button_for(&t, fc, dialog.CANCEL);
+    click(&t, &r, mx(&t, cancel), my(&t, cancel), 8100);
+    check("cancel: cancelled", answers == 2 && answered == dialog.CANCEL && dialog.is_shown(&t, fc) == 0);
+    let is i64 as top = tree.root(&t);
+    check("not a file chooser: nothing", filechooser.set_folder(&t, top, "/", 1) == 0 && filechooser.table(&t, top) == 0 &&
+          filechooser.folder_length(&t, top) == 0 && cast(i64, filechooser.folder(&t, top)) == 0 &&
+          filechooser.places(&t, top) == 0 && filechooser.up_button(&t, top) == 0 && filechooser.path_label(&t, top) == 0 &&
+          filechooser.name_entry(&t, top) == 0 && filechooser.filter_combo(&t, top) == 0 &&
+          filechooser.confirm_dialog(&t, top) == 0 && filechooser.chosen(&t, top, cast(*u8, &out), 512) == 0 &&
+          filechooser.add_filter(&t, top, "x", 1, "", 0) == 0 - 1);
+    filechooser.set_filter(&t, top, 0);
+    filechooser.set_name(&t, top, "x", 1);
+    tree.close(&t);
+}
+
+fn saved() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as fc = filechooser.create(&t, filechooser.SAVE, "Save", 4);
+    signal.connect(&t, fc, signal.ACTIVATED, fn_ptr(on_answer), cast(*u8, 0));
+    filechooser.set_folder(&t, fc, cast(*u8, &root), len(cast(*u8, &root)));
+    filechooser.set_name(&t, fc, "new.txt", 7);
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is i64 as e = filechooser.name_entry(&t, fc);
+    check("a name to type, focused", e != 0 && router.focused(&t, &r) == e && button_says(&t, fc, "Save") == 1);
+    answers = 0;
+    key(&t, &r, keys.RETURN, 0, 10);
+    check("a new name, enter: given", answers == 1 && answered == dialog.OK && was_chosen(&t, fc, at("new.txt")) == 1);
+    // One that is there: asked first.
+    dialog.show(&t, &r, fc, 1);
+    filechooser.set_name(&t, fc, "b.txt", 5);
+    key(&t, &r, keys.RETURN, 0, 20);
+    let is i64 as ask = filechooser.confirm_dialog(&t, fc);
+    check("one that is there: asked first", answers == 1 && ask != 0 && dialog.is_shown(&t, ask) == 1 && dialog.is_shown(&t, fc) == 1);
+    key(&t, &r, keys.ESCAPE, 0, 30);
+    check("not replaced: the chooser still there", answers == 1 && dialog.is_shown(&t, ask) == 0 && dialog.is_shown(&t, fc) == 1);
+    key(&t, &r, keys.RETURN, 0, 40);
+    check("asked again: the same question", filechooser.confirm_dialog(&t, fc) == ask && dialog.is_shown(&t, ask) == 1);
+    key(&t, &r, keys.RETURN, 0, 50);
+    check("replaced: given", answers == 2 && was_chosen(&t, fc, at("b.txt")) == 1 && dialog.is_shown(&t, fc) == 0);
+    // An empty name: nothing.
+    dialog.show(&t, &r, fc, 1);
+    filechooser.set_name(&t, fc, "", 0);
+    key(&t, &r, keys.RETURN, 0, 60);
+    check("no name: nothing", answers == 2 && dialog.is_shown(&t, fc) == 1);
+    // A file chosen in the table: its name to save to.
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    click(&t, &r, mx(&t, row(&t, fc, 1)), my(&t, row(&t, fc, 1)), 70);
+    check("a file chosen: its name", same(entry.text(&t, e), entry.length(&t, e), "A.md") == 1);
+    // Another typed, the file then activated: its own name, asked first. (A
+    // second apart: not a double click.)
+    click(&t, &r, mx(&t, row(&t, fc, 2)), my(&t, row(&t, fc, 2)), 1080);
+    filechooser.set_name(&t, fc, "other.txt", 9);
+    key(&t, &r, keys.RETURN, 0, 1090);
+    check("a file activated: its name, asked first", same(entry.text(&t, e), entry.length(&t, e), "b.txt") == 1 &&
+          answers == 2 && dialog.is_shown(&t, ask) == 1);
+    key(&t, &r, keys.ESCAPE, 0, 1100);
+    // The first row a file.
+    filechooser.set_folder(&t, fc, at("sub/Documents"), len(at("sub/Documents")));
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    click(&t, &r, mx(&t, row(&t, fc, 0)), my(&t, row(&t, fc, 0)), 2110);
+    check("the first file chosen: its name", same(entry.text(&t, e), entry.length(&t, e), "only.txt") == 1);
+    // At the top: one slash.
+    filechooser.set_folder(&t, fc, "/", 1);
+    filechooser.set_name(&t, fc, "caustic-no-such-file", 20);
+    key(&t, &r, keys.RETURN, 0, 3120);
+    check("at the top: one slash", answers == 3 && was_chosen(&t, fc, "/caustic-no-such-file") == 1);
+    // The question goes with the chooser.
+    tree.destroy(&t, fc);
+    check("the question goes with it", tree.is_valid(&t, ask) == 0);
+    tree.close(&t);
+}
+
+fn foldered() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as fc = filechooser.create(&t, filechooser.FOLDER, "Choose", 6);
+    signal.connect(&t, fc, signal.ACTIVATED, fn_ptr(on_answer), cast(*u8, 0));
+    filechooser.set_folder(&t, fc, cast(*u8, &root), len(cast(*u8, &root)));
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("folders only", shows(&t, fc, "sub") == 1 && button_says(&t, fc, "Select") == 1);
+    answers = 0;
+    let is i64 as sel = dialog.button_for(&t, fc, dialog.OK);
+    click(&t, &r, mx(&t, sel), my(&t, sel), 10);
+    check("nothing chosen: the folder it is in", answers == 1 && was_chosen(&t, fc, cast(*u8, &root)) == 1);
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    click(&t, &r, mx(&t, row(&t, fc, 0)), my(&t, row(&t, fc, 0)), 100);
+    click(&t, &r, mx(&t, sel), my(&t, sel), 200);
+    check("a folder chosen: it", answers == 2 && was_chosen(&t, fc, at("sub")) == 1);
+    tree.close(&t);
+}
+
+// Where a part is, against the chooser: its start, from the right when right
+// to left.
+fn start(t as *tree.Tree, w as i64, ch as i64) as f64 {
+    let is math.rect.Rect as o = layout.window_rect(t, w);
+    let is math.rect.Rect as c = layout.window_rect(t, ch);
+    if (layout.direction(t, w) == layout.RTL) { return o.x + o.w - (c.x + c.w); }
+    return c.x - o.x;
+}
+
+fn top_of(t as *tree.Tree, w as i64, ch as i64) as f64 { return layout.window_rect(t, ch).y - layout.window_rect(t, w).y; }
+
+// Its parts: the places down the start; past them the name, up and where it
+// is, the table, and the filters at the end of the foot.
+fn arranged_in(t as *tree.Tree, r as *router.Router, fc as i64) as i32 {
+    let is i64 as w = tree.first_child(t, dialog.content(t, fc));
+    let is math.rect.Rect as o = layout.window_rect(t, w);
+    let is f64 as gap = theme.metrics.space_s;
+    let is f64 as x0 = filechooser.PLACES_W + gap;
+    let is i64 as pl = filechooser.places(t, fc);
+    let is i64 as nm = filechooser.name_entry(t, fc);
+    let is i64 as up = filechooser.up_button(t, fc);
+    let is i64 as pa = filechooser.path_label(t, fc);
+    let is i64 as tb = filechooser.table(t, fc);
+    let is i64 as fi = filechooser.filter_combo(t, fc);
+    let is math.rect.Rect as pr = layout.window_rect(t, pl);
+    let is math.rect.Rect as nr = layout.window_rect(t, nm);
+    let is math.rect.Rect as ur = layout.window_rect(t, up);
+    let is math.rect.Rect as ar = layout.window_rect(t, pa);
+    let is math.rect.Rect as tr = layout.window_rect(t, tb);
+    let is math.rect.Rect as fr = layout.window_rect(t, fi);
+    let is i32 as ok with mut = 1;
+    if (near(start(t, w, pl), 0.0) == 0 || near(pr.y, o.y) == 0 || near(pr.w, filechooser.PLACES_W) == 0 || near(pr.h, o.h) == 0) {
+        io.printf("  places %f,%f %fx%f\n", start(t, w, pl), pr.y - o.y, pr.w, pr.h);
+        ok = 0;
+    }
+    if (near(start(t, w, nm), x0) == 0 || near(top_of(t, w, nm), 0.0) == 0 || near(nr.w, o.w - x0) == 0 || nr.h < 10.0) {
+        io.printf("  name %f,%f %fx%f\n", start(t, w, nm), top_of(t, w, nm), nr.w, nr.h);
+        ok = 0;
+    }
+    if (near(start(t, w, up), x0) == 0 || near(top_of(t, w, up), nr.h + gap) == 0 || ur.w < 10.0) {
+        io.printf("  up %f,%f %fx%f\n", start(t, w, up), top_of(t, w, up), ur.w, ur.h);
+        ok = 0;
+    }
+    if (near(start(t, w, pa), x0 + ur.w + gap) == 0 || near(ar.w, o.w - x0 - ur.w - gap) == 0 ||
+        near(ar.y + ar.h / 2.0, ur.y + ur.h / 2.0) == 0 || ar.h < 10.0 || ar.h >= ur.h) {
+        io.printf("  path %f,%f %fx%f\n", start(t, w, pa), top_of(t, w, pa), ar.w, ar.h);
+        ok = 0;
+    }
+    if (near(start(t, w, fi), o.w - fr.w) == 0 || near(fr.y + fr.h, o.y + o.h) == 0 || fr.w < 160.0 || fr.h < 10.0) {
+        io.printf("  filters %f,%f %fx%f\n", start(t, w, fi), top_of(t, w, fi), fr.w, fr.h);
+        ok = 0;
+    }
+    if (near(start(t, w, tb), x0) == 0 || near(tr.y, ur.y + ur.h + gap) == 0 || near(tr.w, o.w - x0) == 0 ||
+        near(tr.y + tr.h, fr.y - gap) == 0) {
+        io.printf("  table %f,%f %fx%f\n", start(t, w, tb), top_of(t, w, tb), tr.w, tr.h);
+        ok = 0;
+    }
+    return ok;
+}
+
+fn arranged() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    // Without filters or a name: up at the top, the table down to the foot.
+    let is i64 as fc with mut = filechooser.create(&t, filechooser.OPEN, "Open", 4);
+    filechooser.set_folder(&t, fc, cast(*u8, &root), len(cast(*u8, &root)));
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is i64 as w = tree.first_child(&t, dialog.content(&t, fc));
+    let is math.rect.Rect as o = layout.window_rect(&t, w);
+    let is math.rect.Rect as tr = layout.window_rect(&t, filechooser.table(&t, fc));
+    check("no name, no filters: up at the top, the table to the foot", near(top_of(&t, w, filechooser.up_button(&t, fc)), 0.0) == 1 &&
+          near(tr.y + tr.h, o.y + o.h) == 1);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(&t, w, &free, &s);
+    check("its size", near(s.pref_w, filechooser.PLACES_W + 480.0) == 1 && near(s.pref_h, 320.0) == 1 &&
+          near(s.min_w, filechooser.PLACES_W + 200.0) == 1 && near(s.min_h, 200.0) == 1);
+    dialog.hide(&t, fc);
+    tree.destroy(&t, fc);
+    // Saving, with filters: all of them.
+    fc = filechooser.create(&t, filechooser.SAVE, "Save", 4);
+    filechooser.set_folder(&t, fc, cast(*u8, &root), len(cast(*u8, &root)));
+    filechooser.add_filter(&t, fc, "Text", 4, "*.txt", 5);
+    dialog.show(&t, &r, fc, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("its parts", arranged_in(&t, &r, fc) == 1);
+    layout.set_direction(&t, tree.first_child(&t, dialog.content(&t, fc)), layout.RTL);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("its parts, right to left", arranged_in(&t, &r, fc) == 1);
+    tree.close(&t);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as d = load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 1;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    theme = style.light();
+    theme.fonts.body.size = 16.0;
+
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is text.Limits as lim = text.limits_default();
+    svc = text.open(&dv, &lim, fn_ptr(resolve), cast(*u8, 0), theme.fonts.family);
+
+    made_dir();
+    homed();
+    filechooser.set_home(at("sub"), len(at("sub")));
+    opened();
+    saved();
+    foldered();
+    arranged();
+    unmade_dir();
+
+    if (fails == 0) {
+        io.printf("filechooser: %d checks passed\n", checks);
+        return 0;
+    }
+    io.printf("filechooser: %d of %d checks failed\n", fails, checks);
+    return 1;
+}

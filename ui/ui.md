@@ -1121,6 +1121,24 @@ answer hides the dialog, then ACTIVATED says it. `message()` makes a message
 box: an icon for information, a warning, an error or a question beside its
 text, and a set of buttons. Told as a dialog, a message box as an alert.
 
+**Folders as models** (`dirmodel.cst`, tested by `dirmodel_test`): one
+folder's entries, read with getdents64 and stat, as a flat model of three
+columns — the name; the size as a person reads it, sorted by its bytes; when
+it changed, sorted by its seconds. Folders first, then names with letters'
+case aside; hidden names, files no pattern of a filter matches ("*.txt;*.md",
+`*` and `?`), or all files when only folders are wanted, left out. Another
+path, up, or the same again says a reset.
+
+**File choosers** (`widgets/filechooser.cst`, tested by `filechooser_test`):
+our own, a dialog holding the places a person starts from (home, its
+desktop, documents and downloads when there, the computer's top) beside the
+current folder — its path, a button up, its entries in a table, the filters
+in a combo box once added. To open a file, to save to a name typed (asking
+first before replacing one), or to choose a folder; a folder activated
+opens, Backspace goes up, Control+H shows the hidden ones. Open, Save or
+Select does nothing until the answer is right; then `chosen()` is the whole
+path.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
@@ -1152,8 +1170,8 @@ widget set applications actually use, done properly, not parity.
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
    *Scroll areas, tabs, splitters, stacks and assistants, expanders, toolbars,
    status bars, header bars, menus and menu bars, lists, trees, tables, combo
-   boxes, popovers, menu buttons, dialogs and message boxes done; the file
-   chooser next.*
+   boxes, popovers and menu buttons done; dialogs, message boxes and our
+   own file chooser done.*
 7. **The accessibility bridges**, AT-SPI first.
 
 ## Not now, and deliberately

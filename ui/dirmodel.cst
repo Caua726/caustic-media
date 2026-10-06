@@ -1,0 +1,539 @@
+// ui/dirmodel.cst — a folder's entries as a flat model.
+//
+// What a file chooser lists: the entries of one folder, read with
+// getdents64 and stat — "." and ".." left out, as are names starting with a
+// dot unless hidden ones are asked for (set_hidden), and files no pattern of
+// the filter matches (set_filter: "*.txt;*.md", '*' and '?' as the shell
+// has them, letters' case aside), or all files when only folders are wanted
+// (set_folders_only). Folders come first, then by name with
+// letters' case aside. Three columns: the name; the size, as a person reads
+// it ("3 bytes", "2.0 kB", "1.5 MB" — powers of 1000, as GNOME counts) and
+// sorted by its bytes, nothing for a folder; and when it last changed,
+// "YYYY-MM-DD HH:MM" in UTC, sorted by its seconds. Rows are numbered from 1
+// in the order shown; reading another folder, or the same again, says a
+// reset. Linux for now: Windows lists folders with FindFirstFileW, which
+// comes with its window backend.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "model.cst" as model;
+
+let is i64 as MAX_PATH   with imut = 4096;
+let is i64 as MAX_FILTER with imut = 256;
+
+let is i64 as _O_DIRECTORY with imut = 65536;
+let is i64 as _DT_DIR      with imut = 4;
+let is i64 as _DT_REG      with imut = 8;
+
+// An entry: its name in the blob, and what stat said.
+struct Ent {
+    at    as i64;
+    len   as i64;
+    size  as i64;
+    mtime as i64;
+    dir   as i64;
+}
+
+struct Dir {
+    out     as model.Model;   // what views read
+    n       as i64;
+    cap     as i64;
+    ents    as *Ent;
+    blob    as *u8;
+    bcap    as i64;
+    bn      as i64;
+    hidden  as i32;
+    folders as i32;           // folders only
+    plen    as i64;
+    flen    as i64;
+    scratch as [64]u8;        // a cell's text, until the next is asked
+    path    as [4096]u8;
+    filter  as [256]u8;
+}
+
+// The folder at path, n bytes, read; null when it cannot be, or memory is
+// refused.
+fn open(p as *u8, n as i64) as *Dir {
+    let is *u8 as m = mem.core.mmap_anon(sizeof(Dir));
+    if (cast(i64, m) <= 0) { return cast(*Dir, 0); }
+    let is *Dir as d = cast(*Dir, m);
+    d.out = model.make(m, fn_ptr(_count), fn_ptr(_row_id), fn_ptr(_cell));
+    d.out.columns = fn_ptr(_columns);
+    d.out.index_of = fn_ptr(_index_of);
+    if (set_path(d, p, n) == 0) {
+        close(d);
+        return cast(*Dir, 0);
+    }
+    return d;
+}
+
+fn close(d as *Dir) as void {
+    if (cast(i64, d) == 0) { return; }
+    _free(d);
+    mem.core.munmap(cast(*u8, d), sizeof(Dir));
+}
+
+fn _free(d as *Dir) as void {
+    if (cast(i64, d.ents) != 0) { mem.core.munmap(cast(*u8, d.ents), d.cap * sizeof(Ent)); }
+    if (cast(i64, d.blob) != 0) { mem.core.munmap(d.blob, d.bcap); }
+    d.ents = cast(*Ent, 0);
+    d.blob = cast(*u8, 0);
+    d.n = 0;
+    d.cap = 0;
+    d.bn = 0;
+    d.bcap = 0;
+}
+
+fn model_of(d as *Dir) as *model.Model { return &d.out; }
+
+fn path(d as *Dir) as *u8 { return cast(*u8, &d.path); }
+
+fn path_length(d as *Dir) as i64 { return d.plen; }
+
+fn count(d as *Dir) as i64 { return d.n; }
+
+fn is_dir(d as *Dir, index as i64) as i32 {
+    if (index < 0 || index >= d.n) { return 0; }
+    return cast(i32, d.ents[index].dir);
+}
+
+fn name(d as *Dir, index as i64) as *u8 {
+    if (index < 0 || index >= d.n) { return cast(*u8, 0); }
+    return cast(*u8, cast(i64, d.blob) + d.ents[index].at);
+}
+
+fn name_length(d as *Dir, index as i64) as i64 {
+    if (index < 0 || index >= d.n) { return 0; }
+    return d.ents[index].len;
+}
+
+// Where the entry named s, n bytes, is shown; -1 when it is not.
+fn index_of_name(d as *Dir, s as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        if (d.ents[i].len == n && mem.core.memcmp(name(d, i), s, n) == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The folder's path, "/", and the entry's name into out, cap bytes; how
+// many, 0 when it does not fit or there is no such entry.
+fn full_path(d as *Dir, index as i64, out as *u8, cap as i64) as i64 {
+    if (index < 0 || index >= d.n) { return 0; }
+    let is i64 as k with mut = d.plen;
+    let is i64 as slash = cast(i64, d.plen > 0 && d.path[d.plen - 1] != cast(u8, 47));
+    if (k + slash + d.ents[index].len > cap) { return 0; }
+    mem.memcpy(out, cast(*u8, &d.path), d.plen);
+    if (slash == 1) {
+        out[k] = cast(u8, 47);
+        k = k + 1;
+    }
+    mem.memcpy(cast(*u8, cast(i64, out) + k), name(d, index), d.ents[index].len);
+    return k + d.ents[index].len;
+}
+
+// --- Reading ---
+
+fn _fold(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// Whether the n bytes at s match pattern p, pn bytes: '*' any run, '?' any
+// one, letters' case aside.
+fn _glob(p as *u8, pn as i64, s as *u8, n as i64) as i32 {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as star with mut = 0 - 1;
+    let is i64 as back with mut = 0;
+    while (j < n) {
+        if (i < pn && p[i] == cast(u8, 42)) {
+            star = i;
+            back = j;
+            i = i + 1;
+        } else if (i < pn && (p[i] == cast(u8, 63) || _fold(cast(i64, p[i])) == _fold(cast(i64, s[j])))) {
+            i = i + 1;
+            j = j + 1;
+        } else if (star >= 0) {
+            i = star + 1;
+            back = back + 1;
+            j = back;
+        } else {
+            return 0;
+        }
+    }
+    while (i < pn && p[i] == cast(u8, 42)) { i = i + 1; }
+    return cast(i32, i == pn);
+}
+
+// Whether a file named s, n bytes, passes the filter: any of its patterns,
+// split at ';' and spaces; no filter, all.
+fn _passes(d as *Dir, s as *u8, n as i64) as i32 {
+    if (d.flen == 0) { return 1; }
+    let is *u8 as f = cast(*u8, &d.filter);
+    let is i64 as a with mut = 0;
+    while (a < d.flen) {
+        let is i64 as b with mut = a;
+        while (b < d.flen && f[b] != cast(u8, 59) && f[b] != cast(u8, 32)) { b = b + 1; }
+        if (b > a && _glob(cast(*u8, cast(i64, f) + a), b - a, s, n) == 1) { return 1; }
+        a = b + 1;
+    }
+    return 0;
+}
+
+fn _room(d as *Dir, ents as i64, bytes as i64) as i32 {
+    if (ents > d.cap) {
+        let is i64 as cap with mut = 64;
+        while (cap < ents) { cap = cap * 2; }
+        let is *u8 as p = mem.core.mmap_anon(cap * sizeof(Ent));
+        if (cast(i64, p) <= 0) { return 0; }
+        if (cast(i64, d.ents) != 0) {
+            mem.memcpy(p, cast(*u8, d.ents), d.n * sizeof(Ent));
+            mem.core.munmap(cast(*u8, d.ents), d.cap * sizeof(Ent));
+        }
+        d.ents = cast(*Ent, p);
+        d.cap = cap;
+    }
+    if (bytes > d.bcap) {
+        let is i64 as cap with mut = 4096;
+        while (cap < bytes) { cap = cap * 2; }
+        let is *u8 as p = mem.core.mmap_anon(cap);
+        if (cast(i64, p) <= 0) { return 0; }
+        if (cast(i64, d.blob) != 0) {
+            mem.memcpy(p, d.blob, d.bn);
+            mem.core.munmap(d.blob, d.bcap);
+        }
+        d.blob = p;
+        d.bcap = cap;
+    }
+    return 1;
+}
+
+// Entry a before entry b: folders first, then names with case aside, then
+// their bytes.
+fn _before(d as *Dir, a as *Ent, b as *Ent) as i32 {
+    if (a.dir != b.dir) { return cast(i32, a.dir > b.dir); }
+    let is *u8 as x = cast(*u8, cast(i64, d.blob) + a.at);
+    let is *u8 as y = cast(*u8, cast(i64, d.blob) + b.at);
+    let is i64 as i with mut = 0;
+    while (i < a.len && i < b.len) {
+        let is i64 as p = _fold(cast(i64, x[i]));
+        let is i64 as q = _fold(cast(i64, y[i]));
+        if (p != q) { return cast(i32, p < q); }
+        i = i + 1;
+    }
+    if (a.len != b.len) { return cast(i32, a.len < b.len); }
+    return cast(i32, mem.core.memcmp(x, y, a.len) < 0);
+}
+
+// Entries lo to hi, hi not among them, sorted through tmp.
+fn _sort(d as *Dir, tmp as *Ent, lo as i64, hi as i64) as void {
+    if (hi - lo < 2) { return; }
+    let is i64 as mid = (lo + hi) / 2;
+    _sort(d, tmp, lo, mid);
+    _sort(d, tmp, mid, hi);
+    let is i64 as i with mut = lo;
+    let is i64 as j with mut = mid;
+    let is i64 as k with mut = lo;
+    while (i < mid && j < hi) {
+        if (_before(d, &d.ents[j], &d.ents[i]) == 1) {
+            tmp[k] = d.ents[j];
+            j = j + 1;
+        } else {
+            tmp[k] = d.ents[i];
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    while (i < mid) {
+        tmp[k] = d.ents[i];
+        i = i + 1;
+        k = k + 1;
+    }
+    while (j < hi) {
+        tmp[k] = d.ents[j];
+        j = j + 1;
+        k = k + 1;
+    }
+    mem.memcpy(cast(*u8, cast(i64, d.ents) + lo * sizeof(Ent)), cast(*u8, cast(i64, tmp) + lo * sizeof(Ent)),
+               (hi - lo) * sizeof(Ent));
+}
+
+// The folder at p, n bytes, read into d: 1, or 0 when it cannot be opened,
+// d as it was.
+fn _read(d as *Dir, p as *u8, n as i64) as i32 {
+    if (n <= 0 || n >= MAX_PATH - 1) { return 0; }
+    let is [4096]u8 as at;
+    mem.memcpy(cast(*u8, &at), p, n);
+    at[n] = cast(u8, 0);
+    let is i64 as fd = linux.open(cast(*u8, &at), _O_DIRECTORY, 0);
+    if (fd < 0) { return 0; }
+    _free(d);
+    let is [8192]u8 as buf;
+    let is [4096]u8 as child;
+    let is i64 as base with mut = n;
+    mem.memcpy(cast(*u8, &child), p, n);
+    if (child[n - 1] != cast(u8, 47)) {
+        child[n] = cast(u8, 47);
+        base = n + 1;
+    }
+    let is i64 as got with mut = linux.getdents64(fd, cast(*u8, &buf), 8192);
+    while (got > 0) {
+        let is i64 as pos with mut = 0;
+        while (pos < got) {
+            let is i64 as e = cast(i64, &buf) + pos;
+            let is i64 as reclen = cast(i64, *cast(*u8, e + 16)) + cast(i64, *cast(*u8, e + 17)) * 256;
+            let is i64 as kind = cast(i64, *cast(*u8, e + 18));
+            let is *u8 as nm = cast(*u8, e + 19);
+            let is i64 as nl with mut = 0;
+            while (nm[nl] != 0) { nl = nl + 1; }
+            let is i32 as dots = cast(i32, (nl == 1 && nm[0] == cast(u8, 46)) || (nl == 2 && nm[0] == cast(u8, 46) && nm[1] == cast(u8, 46)));
+            let is i32 as hidden = cast(i32, nl > 0 && nm[0] == cast(u8, 46));
+            if (dots == 0 && (hidden == 0 || d.hidden == 1) && base + nl < MAX_PATH) {
+                mem.memcpy(cast(*u8, cast(i64, &child) + base), nm, nl + 1);
+                let is [144]u8 as st;
+                let is i64 as size with mut = 0;
+                let is i64 as mtime with mut = 0;
+                let is i64 as dir with mut = cast(i64, kind == _DT_DIR);
+                if (linux.stat(cast(*u8, &child), cast(*u8, &st)) == 0) {
+                    let is i64 as mode = cast(i64, *cast(*u32, cast(i64, &st) + 24));
+                    dir = cast(i64, (mode & 61440) == 16384);
+                    size = *cast(*i64, cast(i64, &st) + 48);
+                    mtime = *cast(*i64, cast(i64, &st) + 88);
+                }
+                let is i32 as wanted = cast(i32, dir == 1 || (d.folders == 0 && _passes(d, nm, nl) == 1));
+                if (wanted == 1 && _room(d, d.n + 1, d.bn + nl) == 1) {
+                    d.ents[d.n].at = d.bn;
+                    d.ents[d.n].len = nl;
+                    d.ents[d.n].size = size;
+                    d.ents[d.n].mtime = mtime;
+                    d.ents[d.n].dir = dir;
+                    mem.memcpy(cast(*u8, cast(i64, d.blob) + d.bn), nm, nl);
+                    d.bn = d.bn + nl;
+                    d.n = d.n + 1;
+                }
+            }
+            pos = pos + reclen;
+        }
+        got = linux.getdents64(fd, cast(*u8, &buf), 8192);
+    }
+    linux.close(fd);
+    if (d.n > 1) {
+        let is *u8 as tmp = mem.core.mmap_anon(d.n * sizeof(Ent));
+        if (cast(i64, tmp) > 0) {
+            _sort(d, cast(*Ent, tmp), 0, d.n);
+            mem.core.munmap(tmp, d.n * sizeof(Ent));
+        }
+    }
+    // The path kept, a slash at its end only for the top.
+    let is i64 as k with mut = n;
+    while (k > 1 && p[k - 1] == cast(u8, 47)) { k = k - 1; }
+    mem.memcpy(cast(*u8, &d.path), p, k);
+    d.path[k] = cast(u8, 0);
+    d.plen = k;
+    return 1;
+}
+
+// The folder at p, n bytes, read instead: 1, said as a reset; 0 when it
+// cannot be, d as it was.
+fn set_path(d as *Dir, p as *u8, n as i64) as i32 {
+    if (_read(d, p, n) == 0) { return 0; }
+    model.reset(&d.out);
+    return 1;
+}
+
+// The same folder read again.
+fn reload(d as *Dir) as i32 {
+    let is [4096]u8 as p;
+    mem.memcpy(cast(*u8, &p), cast(*u8, &d.path), d.plen);
+    return set_path(d, cast(*u8, &p), d.plen);
+}
+
+// The folder it is in read instead; 0 at the top.
+fn up(d as *Dir) as i32 {
+    if (d.plen <= 1) { return 0; }
+    let is i64 as k with mut = d.plen - 1;
+    while (k > 0 && d.path[k] != cast(u8, 47)) { k = k - 1; }
+    if (k == 0) { k = 1; }
+    let is [4096]u8 as p;
+    mem.memcpy(cast(*u8, &p), cast(*u8, &d.path), k);
+    return set_path(d, cast(*u8, &p), k);
+}
+
+// Names starting with a dot shown (1) or not (0, at first); read again.
+fn set_hidden(d as *Dir, on as i32) as void {
+    d.hidden = on;
+    reload(d);
+}
+
+// Folders only (1), as when a folder is to be chosen, or files too (0, at
+// first); read again.
+fn set_folders_only(d as *Dir, on as i32) as void {
+    d.folders = on;
+    reload(d);
+}
+
+// The files shown from now on, s, n bytes: patterns split at ';' or spaces;
+// empty for all. Read again.
+fn set_filter(d as *Dir, s as *u8, n as i64) as void {
+    let is i64 as k with mut = n;
+    if (k > MAX_FILTER) { k = MAX_FILTER; }
+    mem.memcpy(cast(*u8, &d.filter), s, k);
+    d.flen = k;
+    reload(d);
+}
+
+// --- What a cell says ---
+
+fn _digits(v as i64, out as *u8) as i64 {
+    if (v == 0) {
+        out[0] = cast(u8, 48);
+        return 1;
+    }
+    let is [24]u8 as tmp;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    while (x > 0) {
+        tmp[n] = cast(u8, 48 + x % 10);
+        n = n + 1;
+        x = x / 10;
+    }
+    let is i64 as k with mut = 0;
+    while (n > 0) {
+        n = n - 1;
+        out[k] = tmp[n];
+        k = k + 1;
+    }
+    return k;
+}
+
+fn _put(out as *u8, at as i64, s as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (s[k] != 0) {
+        out[at + k] = s[k];
+        k = k + 1;
+    }
+    return at + k;
+}
+
+// A size as a person reads it, into out (32 bytes); how many bytes: bytes
+// under 1000, then one decimal of kB, MB or GB.
+fn size_text(v as i64, out as *u8) as i64 {
+    if (v < 1000) {
+        let is i64 as k = _digits(v, out);
+        if (v == 1) { return _put(out, k, " byte"); }
+        return _put(out, k, " bytes");
+    }
+    let is i64 as unit with mut = 1000;
+    let is *u8 as name with mut = " kB";
+    if (v >= 1000000) {
+        unit = 1000000;
+        name = " MB";
+    }
+    if (v >= 1000000000) {
+        unit = 1000000000;
+        name = " GB";
+    }
+    // Tenths, rounded.
+    let is i64 as tenths = (v * 10 + unit / 2) / unit;
+    let is i64 as k with mut = _digits(tenths / 10, out);
+    out[k] = cast(u8, 46);
+    out[k + 1] = cast(u8, 48 + tenths % 10);
+    return _put(out, k + 2, name);
+}
+
+fn _two(v as i64, out as *u8, at as i64) as void {
+    out[at] = cast(u8, 48 + v / 10);
+    out[at + 1] = cast(u8, 48 + v % 10);
+}
+
+// Seconds since 1970 as "YYYY-MM-DD HH:MM", in UTC, into out (16 bytes):
+// the days turned into a date as the proleptic Gregorian calendar has them.
+fn date_text(secs as i64, out as *u8) as i64 {
+    let is i64 as days with mut = secs / 86400;
+    let is i64 as rest with mut = secs - days * 86400;
+    if (rest < 0) {
+        rest = rest + 86400;
+        days = days - 1;
+    }
+    let is i64 as z = days + 719468;
+    let is i64 as era = z / 146097;
+    let is i64 as doe = z - era * 146097;
+    let is i64 as yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let is i64 as doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let is i64 as mp = (5 * doy + 2) / 153;
+    let is i64 as day = doy - (153 * mp + 2) / 5 + 1;
+    let is i64 as month with mut = mp + 3;
+    if (month > 12) { month = month - 12; }
+    let is i64 as year with mut = yoe + era * 400;
+    if (month <= 2) { year = year + 1; }
+    _two(year / 100, out, 0);
+    _two(year % 100, out, 2);
+    out[4] = cast(u8, 45);
+    _two(month, out, 5);
+    out[7] = cast(u8, 45);
+    _two(day, out, 8);
+    out[10] = cast(u8, 32);
+    _two(rest / 3600, out, 11);
+    out[13] = cast(u8, 58);
+    _two((rest / 60) % 60, out, 14);
+    return 16;
+}
+
+// --- The model's entries ---
+
+fn _count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Dir, self).n;
+}
+
+fn _row_id(self as *u8, parent as i64, index as i64) as i64 {
+    let is *Dir as d = cast(*Dir, self);
+    if (parent != 0 || index < 0 || index >= d.n) { return 0; }
+    return index + 1;
+}
+
+fn _index_of(self as *u8, id as i64) as i64 {
+    let is *Dir as d = cast(*Dir, self);
+    if (id < 1 || id > d.n) { return 0 - 1; }
+    return id - 1;
+}
+
+fn _columns(self as *u8) as i64 { return 3; }
+
+fn _cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    let is *Dir as d = cast(*Dir, self);
+    let is i64 as i = id - 1;
+    if (i < 0 || i >= d.n) { return 0; }
+    let is *Ent as e = &d.ents[i];
+    let is *u8 as s = cast(*u8, &d.scratch);
+    if (column == 0 && role == model.TEXT) {
+        *out = model.text(name(d, i), e.len);
+        return 1;
+    }
+    if (column == 1 && role == model.TEXT) {
+        if (e.dir == 1) {
+            *out = model.text(s, 0);
+            return 1;
+        }
+        *out = model.text(s, size_text(e.size, s));
+        return 1;
+    }
+    if (column == 1 && role == model.SORT) {
+        if (e.dir == 1) {
+            *out = model.integer(0 - 1);
+            return 1;
+        }
+        *out = model.integer(e.size);
+        return 1;
+    }
+    if (column == 2 && role == model.TEXT) {
+        *out = model.text(s, date_text(e.mtime, s));
+        return 1;
+    }
+    if (column == 2 && role == model.SORT) {
+        *out = model.integer(e.mtime);
+        return 1;
+    }
+    return 0;
+}

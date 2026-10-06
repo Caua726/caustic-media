@@ -1,0 +1,603 @@
+// ui/widgets/filechooser.cst — a file, a name to save to, or a folder, chosen.
+//
+// A file chooser is a dialog (dialog.cst) holding, on one side, the places a
+// person starts from — home, its desktop, documents and downloads when they
+// are there, the computer's top — and on the other the current folder: where
+// it is, a button up, its entries in a table (dirmodel.cst: folders first;
+// name, size, when changed) and, when filters were added, a combo box of
+// them. Choosing a file to save to, a name to type is above them, a file
+// chosen in the table giving its name. Our own; the desktop's own is the XDG
+// portal's, window/linux/filechooser.cst; Windows' comes with its backend.
+//
+// A place clicked opens it; a folder activated — a double click, Enter —
+// opens it, as Up and Backspace go up; Control+H shows the hidden ones or not.
+// Its answer: OPEN takes the file chosen, a folder chosen opening instead;
+// SAVE the name typed, in the folder shown, asking first before replacing a
+// file that is there; FOLDER the folder chosen, or the one shown. Until one
+// is right, Open, Save or Select keeps the dialog shown. Then the dialog
+// says ACTIVATED with OK, and chosen() is the whole path; or CANCEL.
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../style.cst" as style;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../model.cst" as model;
+use "../dirmodel.cst" as dirmodel;
+use "label.cst" as label;
+use "button.cst" as button;
+use "entry.cst" as entry;
+use "listview.cst" as listview;
+use "tableview.cst" as tableview;
+use "combo.cst" as combo;
+use "dialog.cst" as dialog;
+
+// What it chooses.
+let is i32 as OPEN   with imut = 0;
+let is i32 as SAVE   with imut = 1;
+let is i32 as FOLDER with imut = 2;
+
+let is i64 as MAX_PLACES  with imut = 6;
+let is i64 as MAX_FILTERS with imut = 8;
+let is f64 as PLACES_W    with imut = 150.0;
+
+// Where home is: HOME, unless the program says (set_home).
+let is [1024]u8 as _home with mut;
+let is i64 as _home_len with mut = 0;
+
+// What does not fit a widget's data.
+struct Side {
+    places     as model.Model;
+    np         as i64;
+    pname      as [6]*u8;
+    pname_len  as [6]i64;
+    ppath      as [6][1024]u8;
+    ppath_len  as [6]i64;
+    filters    as model.Model;
+    nf         as i64;
+    fname      as [8][64]u8;
+    fname_len  as [8]i64;
+    fpat       as [8][256]u8;
+    fpat_len   as [8]i64;
+    chosen     as [4096]u8;
+    chosen_len as i64;
+}
+
+struct Data {
+    t         as *tree.Tree;
+    self      as i64;
+    dlg       as i64;
+    mode      as i32;
+    hidden    as i32;
+    confirmed as i32;   // replacing was agreed to
+    _pad0     as i32;
+    dir       as *dirmodel.Dir;
+    side      as *Side;
+    table     as i64;
+    places    as i64;
+    up        as i64;
+    path      as i64;
+    name      as i64;   // save only
+    filter    as i64;   // its combo box, shown once a filter is added
+    confirm   as i64;   // the question before replacing, made the first time
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("file chooser", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.event = fn_ptr(_event);
+    _kind.destroy = fn_ptr(_destroy);
+    _ready = 1;
+}
+
+// Home from now on: s, n bytes.
+fn set_home(s as *u8, n as i64) as void {
+    let is i64 as k with mut = n;
+    if (k > 1023) { k = 1023; }
+    mem.memcpy(cast(*u8, &_home), s, k);
+    _home[k] = cast(u8, 0);
+    _home_len = k;
+}
+
+fn _home_path() as i64 {
+    if (_home_len > 0) { return _home_len; }
+    let is *u8 as h = env.getenv("HOME");
+    if (cast(i64, h) == 0) { return 0; }
+    let is i64 as n with mut = 0;
+    while (h[n] != 0) { n = n + 1; }
+    set_home(h, n);
+    return _home_len;
+}
+
+// Whether the n bytes at p name a folder.
+fn _is_folder(p as *u8, n as i64) as i32 {
+    if (n <= 0 || n >= 4095) { return 0; }
+    let is [4096]u8 as z;
+    mem.memcpy(cast(*u8, &z), p, n);
+    z[n] = cast(u8, 0);
+    let is [144]u8 as st;
+    if (linux.stat(cast(*u8, &z), cast(*u8, &st)) != 0) { return 0; }
+    let is i64 as mode = cast(i64, *cast(*u32, cast(i64, &st) + 24));
+    return cast(i32, (mode & 61440) == 16384);
+}
+
+fn _exists(p as *u8, n as i64) as i32 {
+    if (n <= 0 || n >= 4095) { return 0; }
+    let is [4096]u8 as z;
+    mem.memcpy(cast(*u8, &z), p, n);
+    z[n] = cast(u8, 0);
+    let is [144]u8 as st;
+    return cast(i32, linux.stat(cast(*u8, &z), cast(*u8, &st)) == 0);
+}
+
+// A place named s at path p — home, and sub under it when sub is not null —
+// when it is a folder.
+fn _place(g as *Side, s as *u8, sn as i64, p as *u8, pn as i64, sub as *u8, subn as i64) as void {
+    if (g.np >= MAX_PLACES || pn + 1 + subn >= 1024) { return; }
+    let is *u8 as at = cast(*u8, &g.ppath[g.np]);
+    mem.memcpy(at, p, pn);
+    let is i64 as k with mut = pn;
+    if (subn > 0) {
+        at[k] = cast(u8, 47);
+        mem.memcpy(cast(*u8, cast(i64, at) + k + 1), sub, subn);
+        k = k + 1 + subn;
+    }
+    if (_is_folder(at, k) == 0) { return; }
+    g.pname[g.np] = s;
+    g.pname_len[g.np] = sn;
+    g.ppath_len[g.np] = k;
+    g.np = g.np + 1;
+}
+
+// A new chooser of mode — OPEN, SAVE or FOLDER — titled s, n bytes: a
+// dialog, hidden, showing home. Its handle (the dialog's), or 0.
+fn create(t as *tree.Tree, mode as i32, s as *u8, n as i64) as i64 {
+    _init();
+    let is i64 as dlg = dialog.create(t, s, n);
+    if (dlg == 0) { return 0; }
+    let is i64 as w = tree.create(t, &_kind, dialog.content(t, dlg));
+    let is *u8 as p = mem.core.mmap_anon(sizeof(Side));
+    if (w == 0 || cast(i64, p) <= 0) {
+        tree.destroy(t, dlg);
+        return 0;
+    }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.dlg = dlg;
+    d.mode = mode;
+    d.side = cast(*Side, p);
+    let is *Side as g = d.side;
+    g.places = model.make(p, fn_ptr(_places_count), fn_ptr(_places_row_id), fn_ptr(_places_cell));
+    g.filters = model.make(p, fn_ptr(_filters_count), fn_ptr(_filters_row_id), fn_ptr(_filters_cell));
+    let is i64 as hn = _home_path();
+    if (hn > 0) {
+        _place(g, "Home", 4, cast(*u8, &_home), hn, cast(*u8, 0), 0);
+        _place(g, "Desktop", 7, cast(*u8, &_home), hn, "Desktop", 7);
+        _place(g, "Documents", 9, cast(*u8, &_home), hn, "Documents", 9);
+        _place(g, "Downloads", 9, cast(*u8, &_home), hn, "Downloads", 9);
+    }
+    _place(g, "Computer", 8, "/", 1, cast(*u8, 0), 0);
+    // A name to type, first in the tree so the focus starts there.
+    if (mode == SAVE) {
+        d.name = entry.create(t, w);
+        entry.set_activates_default(t, d.name, 1);
+    }
+    d.places = listview.create(t, w, &g.places);
+    listview.set_single_click(t, d.places, 1);
+    signal.connect(t, d.places, signal.ACTIVATED, fn_ptr(_place_chosen), cast(*u8, d));
+    d.up = button.create(t, w, "_Up", 3);
+    signal.connect(t, d.up, signal.CLICKED, fn_ptr(_up_clicked), cast(*u8, d));
+    d.path = label.create(t, w, "", 0);
+    label.set_lines(t, d.path, 1, 1);
+    if (hn > 0) {
+        d.dir = dirmodel.open(cast(*u8, &_home), hn);
+    }
+    if (cast(i64, d.dir) == 0) { d.dir = dirmodel.open("/", 1); }
+    if (cast(i64, d.dir) == 0) {
+        tree.destroy(t, dlg);
+        return 0;
+    }
+    if (mode == FOLDER) { dirmodel.set_folders_only(d.dir, 1); }
+    d.table = tableview.create(t, w, dirmodel.model_of(d.dir));
+    tableview.add_column(t, d.table, "Name", 4, 240.0);
+    tableview.add_column(t, d.table, "Size", 4, 80.0);
+    tableview.add_column(t, d.table, "Modified", 8, 140.0);
+    let is i64 as lv = tableview.list(t, d.table);
+    signal.connect(t, lv, signal.ACTIVATED, fn_ptr(_entry_activated), cast(*u8, d));
+    signal.connect(t, lv, signal.SELECTION_CHANGED, fn_ptr(_selected), cast(*u8, d));
+    d.filter = combo.create(t, w, &g.filters);
+    tree.set_visible(t, d.filter, 0);
+    signal.connect(t, d.filter, signal.VALUE_CHANGED, fn_ptr(_filter_chosen), cast(*u8, d));
+    _show_path(t, d);
+    dialog.add_button(t, dlg, "_Cancel", 7, dialog.CANCEL);
+    if (mode == SAVE) {
+        dialog.add_button(t, dlg, "_Save", 5, dialog.OK);
+    } else if (mode == FOLDER) {
+        dialog.add_button(t, dlg, "_Select", 7, dialog.OK);
+    } else {
+        dialog.add_button(t, dlg, "_Open", 5, dialog.OK);
+    }
+    dialog.set_default_response(t, dlg, dialog.OK);
+    dialog.set_check(t, dlg, fn_ptr(_check), cast(*u8, d));
+    return dlg;
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    if (d.confirm != 0 && tree.is_valid(t, d.confirm) == 1) { tree.destroy(t, d.confirm); }
+    dirmodel.close(d.dir);
+    mem.core.munmap(cast(*u8, d.side), sizeof(Side));
+}
+
+// The chooser in dialog fc.
+fn _data(t as *tree.Tree, fc as i64) as *Data {
+    let is i64 as w = tree.first_child(t, dialog.content(t, fc));
+    if (w == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// --- Where it is ---
+
+fn _show_path(t as *tree.Tree, d as *Data) as void {
+    label.set_text(t, d.path, dirmodel.path(d.dir), dirmodel.path_length(d.dir));
+}
+
+// The folder at p, n bytes, shown: 1, or 0 when it cannot be read.
+fn set_folder(t as *tree.Tree, fc as i64, p as *u8, n as i64) as i32 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return _go(t, d, p, n);
+}
+
+fn _go(t as *tree.Tree, d as *Data, p as *u8, n as i64) as i32 {
+    if (dirmodel.set_path(d.dir, p, n) == 0) { return 0; }
+    _show_path(t, d);
+    return 1;
+}
+
+fn folder(t as *tree.Tree, fc as i64) as *u8 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return cast(*u8, 0); }
+    return dirmodel.path(d.dir);
+}
+
+fn folder_length(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return dirmodel.path_length(d.dir);
+}
+
+fn _up(t as *tree.Tree, d as *Data) as void {
+    if (dirmodel.up(d.dir) == 1) { _show_path(t, d); }
+}
+
+fn _up_clicked(t as *tree.Tree, b as i64, arg as *u8, user as *u8) as void { _up(t, cast(*Data, user)); }
+
+fn _place_chosen(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is i64 as i = listview.cursor(t, d.places);
+    if (i < 0 || i >= d.side.np) { return; }
+    _go(t, d, cast(*u8, &d.side.ppath[i]), d.side.ppath_len[i]);
+}
+
+// --- What is chosen ---
+
+// The path chosen, into out, cap bytes; how many — 0 before an answer.
+fn chosen(t as *tree.Tree, fc as i64, out as *u8, cap as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0 || d.side.chosen_len > cap) { return 0; }
+    mem.memcpy(out, cast(*u8, &d.side.chosen), d.side.chosen_len);
+    return d.side.chosen_len;
+}
+
+// The name to save to, s, n bytes.
+fn set_name(t as *tree.Tree, fc as i64, s as *u8, n as i64) as void {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0 || d.name == 0) { return; }
+    entry.set_text(t, d.name, s, n);
+}
+
+fn _choose_row(d as *Data, i as i64) as void {
+    d.side.chosen_len = dirmodel.full_path(d.dir, i, cast(*u8, &d.side.chosen), 4096);
+}
+
+// The folder shown, and "/" and n bytes at s, as what is chosen.
+fn _choose_named(d as *Data, s as *u8, n as i64) as i32 {
+    let is *u8 as out = cast(*u8, &d.side.chosen);
+    let is i64 as pl = dirmodel.path_length(d.dir);
+    let is i64 as slash = cast(i64, pl > 0 && dirmodel.path(d.dir)[pl - 1] != cast(u8, 47));
+    if (pl + slash + n > 4096) { return 0; }
+    mem.memcpy(out, dirmodel.path(d.dir), pl);
+    if (slash == 1) { out[pl] = cast(u8, 47); }
+    mem.memcpy(cast(*u8, cast(i64, out) + pl + slash), s, n);
+    d.side.chosen_len = pl + slash + n;
+    return 1;
+}
+
+// An entry activated in the table: a folder opened; a file taken.
+fn _entry_activated(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is i64 as i = listview.cursor(t, l);
+    if (i < 0) { return; }
+    if (dirmodel.is_dir(d.dir, i) == 1) {
+        let is [4096]u8 as p;
+        let is i64 as n = dirmodel.full_path(d.dir, i, cast(*u8, &p), 4096);
+        _go(t, d, cast(*u8, &p), n);
+        return;
+    }
+    if (d.mode == SAVE) { entry.set_text(t, d.name, dirmodel.name(d.dir, i), dirmodel.name_length(d.dir, i)); }
+    dialog.respond(t, d.dlg, dialog.OK);
+}
+
+// A file chosen in the table of one saving: its name to save to.
+fn _selected(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (d.mode != SAVE) { return; }
+    let is i64 as i = listview.cursor(t, l);
+    if (i < 0 || dirmodel.is_dir(d.dir, i) == 1) { return; }
+    entry.set_text(t, d.name, dirmodel.name(d.dir, i), dirmodel.name_length(d.dir, i));
+}
+
+// Replacing agreed to, or not.
+fn _replace(t as *tree.Tree, c as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (*cast(*i64, arg) != dialog.YES) { return; }
+    d.confirmed = 1;
+    dialog.respond(t, d.dlg, dialog.OK);
+}
+
+// The question before replacing a file, made the first time.
+fn confirm_dialog(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.confirm;
+}
+
+fn _ask(t as *tree.Tree, d as *Data) as void {
+    if (d.confirm == 0 || tree.is_valid(t, d.confirm) == 0) {
+        d.confirm = dialog.message(t, dialog.QUESTION, "Replace the file?", 17, "A file with this name is there already.", 39,
+                                   dialog.YES_NO);
+        if (d.confirm == 0) { return; }
+        signal.connect(t, d.confirm, signal.ACTIVATED, fn_ptr(_replace), cast(*u8, d));
+    }
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) != 0) { dialog.show(t, r, d.confirm, 1); }
+}
+
+// An answer looked at before it is given.
+fn _check(user as *u8, response as i64) as i32 {
+    let is *Data as d = cast(*Data, user);
+    let is *tree.Tree as t = d.t;
+    if (response != dialog.OK) { return 1; }
+    let is i64 as i = listview.cursor(t, tableview.list(t, d.table));
+    if (d.mode == OPEN) {
+        if (i < 0) { return 0; }
+        if (dirmodel.is_dir(d.dir, i) == 1) {
+            _entry_activated(t, tableview.list(t, d.table), cast(*u8, 0), user);
+            return 0;
+        }
+        _choose_row(d, i);
+        return 1;
+    }
+    if (d.mode == FOLDER) {
+        if (i >= 0 && dirmodel.is_dir(d.dir, i) == 1) {
+            _choose_row(d, i);
+        } else {
+            mem.memcpy(cast(*u8, &d.side.chosen), dirmodel.path(d.dir), dirmodel.path_length(d.dir));
+            d.side.chosen_len = dirmodel.path_length(d.dir);
+        }
+        return 1;
+    }
+    let is i64 as n = entry.length(t, d.name);
+    if (n == 0 || _choose_named(d, entry.text(t, d.name), n) == 0) { return 0; }
+    if (d.confirmed == 0 && _exists(cast(*u8, &d.side.chosen), d.side.chosen_len) == 1) {
+        _ask(t, d);
+        return 0;
+    }
+    d.confirmed = 0;
+    return 1;
+}
+
+// --- Filters ---
+
+// A filter named s showing the files patterns match ("*.txt;*.md", "" for
+// all), at the end of its combo box; the first added is the one used. Its
+// index, or -1.
+fn add_filter(t as *tree.Tree, fc as i64, s as *u8, n as i64, patterns as *u8, pn as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0 || d.side.nf >= MAX_FILTERS || n > 63 || pn > 255) { return 0 - 1; }
+    let is *Side as g = d.side;
+    let is i64 as k = g.nf;
+    mem.memcpy(cast(*u8, &g.fname[k]), s, n);
+    g.fname_len[k] = n;
+    mem.memcpy(cast(*u8, &g.fpat[k]), patterns, pn);
+    g.fpat_len[k] = pn;
+    g.nf = k + 1;
+    model.inserted(&g.filters, 0, k, 1);
+    tree.set_visible(t, d.filter, 1);
+    if (k == 0) { combo.set_selected(t, d.filter, 0); }
+    widget.changed(t, d.self, widget.CHANGED_LAYOUT);
+    return k;
+}
+
+// Filter i the one used.
+fn set_filter(t as *tree.Tree, fc as i64, i as i64) as void {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return; }
+    combo.set_selected(t, d.filter, i);
+}
+
+fn _filter_chosen(t as *tree.Tree, c as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is i64 as i = *cast(*i64, arg);
+    if (i < 0 || i >= d.side.nf) { return; }
+    dirmodel.set_filter(d.dir, cast(*u8, &d.side.fpat[i]), d.side.fpat_len[i]);
+}
+
+// --- Its parts, for the program and its tests ---
+
+fn table(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.table;
+}
+
+fn places(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.places;
+}
+
+fn up_button(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.up;
+}
+
+fn path_label(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.path;
+}
+
+fn name_entry(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.name;
+}
+
+fn filter_combo(t as *tree.Tree, fc as i64) as i64 {
+    let is *Data as d = _data(t, fc);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.filter;
+}
+
+// --- Keys: up, hidden ones ---
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind != event.KEY_DOWN) { return 0; }
+    if (e.key == keys.H && e.mods == keys.MOD_CONTROL) {
+        d.hidden = 1 - d.hidden;
+        dirmodel.set_hidden(d.dir, d.hidden);
+        return 1;
+    }
+    if (e.key == keys.BACKSPACE && e.mods == 0) {
+        _up(t, d);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Measured and arranged ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _pref(t as *tree.Tree, w as i64) as geom.Size {
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, w, &free, &s);
+    return s;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.pref_w = PLACES_W + 480.0;
+    out.pref_h = 320.0;
+    out.min_w = PLACES_W + 200.0;
+    out.min_h = 200.0;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+// The places down the start; past them, from the top: the name to save to,
+// up and where it is, the table, and its filters at the end of the foot.
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as gap = th.metrics.space_s;
+    let is i32 as rtl = cast(i32, layout.direction(t, w) == layout.RTL);
+    let is f64 as x0 = PLACES_W + gap;
+    let is f64 as rw = _max(0.0, r.w - x0);
+    _put(t, d.places, 0.0, 0.0, PLACES_W, r.h, r.w, rtl);
+    let is f64 as y with mut = 0.0;
+    if (d.name != 0) {
+        let is geom.Size as ns = _pref(t, d.name);
+        _put(t, d.name, x0, y, rw, ns.pref_h, r.w, rtl);
+        y = y + ns.pref_h + gap;
+    }
+    let is geom.Size as us = _pref(t, d.up);
+    let is geom.Size as ps = _pref(t, d.path);
+    _put(t, d.up, x0, y, us.pref_w, us.pref_h, r.w, rtl);
+    _put(t, d.path, x0 + us.pref_w + gap, y + (us.pref_h - ps.pref_h) / 2.0, _max(0.0, rw - us.pref_w - gap), ps.pref_h, r.w, rtl);
+    y = y + us.pref_h + gap;
+    let is f64 as bottom with mut = r.h;
+    if (tree.is_hidden_here(t, d.filter) == 0) {
+        let is geom.Size as fs = _pref(t, d.filter);
+        let is f64 as fw = _max(fs.pref_w, 160.0);
+        bottom = r.h - fs.pref_h;
+        _put(t, d.filter, r.w - fw, bottom, fw, fs.pref_h, r.w, rtl);
+        bottom = bottom - gap;
+    }
+    _put(t, d.table, x0, y, rw, _max(0.0, bottom - y), r.w, rtl);
+}
+
+fn _put(t as *tree.Tree, ch as i64, x as f64, y as f64, w as f64, h as f64, across as f64, rtl as i32) as void {
+    let is math.rect.Rect as at with mut = math.rect.rect(x, y, w, h);
+    if (rtl == 1) { at.x = across - x - w; }
+    layout.place(t, ch, &at);
+}
+
+// --- The places' and the filters' models ---
+
+fn _places_count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Side, self).np;
+}
+
+fn _places_row_id(self as *u8, parent as i64, index as i64) as i64 {
+    let is *Side as g = cast(*Side, self);
+    if (parent != 0 || index < 0 || index >= g.np) { return 0; }
+    return index + 1;
+}
+
+fn _places_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    let is *Side as g = cast(*Side, self);
+    let is i64 as i = id - 1;
+    if (i < 0 || i >= g.np || column != 0 || role != model.TEXT) { return 0; }
+    *out = model.text(g.pname[i], g.pname_len[i]);
+    return 1;
+}
+
+fn _filters_count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Side, self).nf;
+}
+
+fn _filters_row_id(self as *u8, parent as i64, index as i64) as i64 {
+    let is *Side as g = cast(*Side, self);
+    if (parent != 0 || index < 0 || index >= g.nf) { return 0; }
+    return index + 1;
+}
+
+fn _filters_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    let is *Side as g = cast(*Side, self);
+    let is i64 as i = id - 1;
+    if (i < 0 || i >= g.nf || column != 0 || role != model.TEXT) { return 0; }
+    *out = model.text(cast(*u8, &g.fname[i]), g.fname_len[i]);
+    return 1;
+}
