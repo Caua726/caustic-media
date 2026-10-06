@@ -502,7 +502,11 @@ past a minimum or maximum, and a press within `grab` of it takes it — the
 splitter claims those points from the panes. It takes focus: the arrows along
 its axis move the current handle, Home and End as far as it goes, F8 and
 Shift+F8 go round the handles. Right to left puts the first pane on the right
-and counts positions from there.
+and counts positions from there. Drawn as a line down each handle's middle,
+the one held in the accent colour, and with the focus shown by keyboard a ring
+round the current handle, not the whole splitter; told as a split pane across
+or up and down, its value the current handle's place, which assistive
+technology sets or steps.
 
 **Events** (`event.cst`, `router.cst`, `timer.cst`, tested by `router_test`,
 `focus_test`, `shortcut_test` and `timer_test` with synthetic events): hit-testing

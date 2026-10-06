@@ -1,5 +1,6 @@
 // ui/splitter_test.cst — panes divided by handles the user drags.
 use "std/io.cst" as io;
+use "std/math.cst" as fm;
 use "../math/math.cst" as math;
 use "../window/keys.cst" as keys;
 use "tree.cst" as tree;
@@ -10,6 +11,14 @@ use "event.cst" as event;
 use "router.cst" as router;
 use "signal.cst" as signal;
 use "splitter.cst" as splitter;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
+use "damage.cst" as damage;
+use "paint.cst" as paint;
+use "painter.cst" as painter;
+use "style.cst" as style;
+use "access.cst" as access;
 
 let is i32 as fails with mut = 0;
 
@@ -43,6 +52,7 @@ struct Pane {
     pref as f64;
     min  as f64;
     max  as f64;
+    wrap as f64;   // above 0: that many square units of text, 10 a line, as wide as it is offered
 }
 
 fn pane_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
@@ -53,6 +63,12 @@ fn pane_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, o
     out.pref_h = d.pref;
     out.max_w = d.max;
     out.max_h = d.max;
+    if (d.wrap > 0.0) {
+        let is f64 as width with mut = c.w;
+        if (width >= layout.UNBOUNDED) { width = d.wrap; }
+        out.pref_h = fm.ceil(d.wrap / width) * 10.0;
+        out.min_h = out.pref_h;
+    }
 }
 
 let is tree.Kind as pane_kind with mut;
@@ -99,6 +115,346 @@ fn drag(t as *tree.Tree, r as *router.Router, x0 as f64, y0 as f64, x1 as f64, y
 }
 
 fn w_of(t as *tree.Tree, p as i64) as f64 { return layout.rect(t, p).w; }
+
+
+// --- Told, and drawn ---
+
+fn told_split() as void {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    let is i64 as s = split(&t, splitter.ROW, 206.0, 100.0);
+    pane(&t, s, 100.0);
+    pane(&t, s, 100.0);
+    layout.run(&t, 800.0, 600.0);
+    let is tree.Access as q;
+    access.describe(&t, cast(*router.Router, 0), s, &q);
+    check("told: a split pane, across, the handle's place its value", q.role == access.ROLE_SPLIT_PANE &&
+          (q.states & access.HORIZONTAL) != 0 && q.has_value == 1 && q.value == 100.0 && q.min == 0.0 &&
+          q.max == 206.0 && (q.actions & access.SET_VALUE) != 0 && (q.actions & access.INCREMENT) != 0);
+    check("its handle moved by assistive technology", access.act(&t, s, access.SET_VALUE, 60.0) == 1);
+    layout.run(&t, 800.0, 600.0);
+    near("set: there", splitter.position(&t, s, 0), 60.0);
+    access.act(&t, s, access.INCREMENT, 0.0);
+    layout.run(&t, 800.0, 600.0);
+    near("a step on", splitter.position(&t, s, 0), 60.0 + splitter.step(&t, s));
+    access.act(&t, s, access.DECREMENT, 0.0);
+    layout.run(&t, 800.0, 600.0);
+    access.act(&t, s, access.DECREMENT, 0.0);
+    layout.run(&t, 800.0, 600.0);
+    near("two back", splitter.position(&t, s, 0), 60.0 - splitter.step(&t, s));
+    let is i64 as c = split(&t, splitter.COLUMN, 100.0, 100.0);
+    pane(&t, c, 40.0);
+    pane(&t, c, 40.0);
+    layout.run(&t, 800.0, 600.0);
+    access.describe(&t, cast(*router.Router, 0), c, &q);
+    check("a column: up and down", (q.states & access.VERTICAL) != 0);
+    tree.close(&t);
+}
+
+// What bubbles out of a splitter: the presses and keys it does not take.
+let is i64 as caught with mut = 0;
+
+fn catch(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    if (e.phase == event.BUBBLE && (e.kind == event.KEY_DOWN || e.kind == event.POINTER_DOWN)) {
+        caught = caught + 1;
+        return 1;
+    }
+    return 0;
+}
+
+let is tree.Kind as catcher with mut;
+
+fn more_split() as void {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    let is router.Router as r = router.init(router.settings_default());
+    let is i64 as root = tree.root(&t);
+    // Not a splitter: nothing, and no harm.
+    splitter.set_step(&t, root, 5.0);
+    splitter.set_grab(&t, root, 5.0);
+    splitter.set_handle_size(&t, root, 5.0);
+    check("not a splitter: nothing", splitter.step(&t, root) == 0.0 && splitter.current_handle(&t, root) == 0 &&
+          splitter.handle_count(&t, root) == 0 && splitter.position(&t, root, 0) == 0.0 &&
+          splitter.set_position(&t, root, 0, 10.0) == 0 && splitter.handle_rect(&t, root, 0).w == 0.0);
+    // Inside something that catches what it does not take.
+    catcher = widget.kind("catcher", 8);
+    catcher.measure = fn_ptr(catch_measure);
+    catcher.event = fn_ptr(catch);
+    catcher.arrange = fn_ptr(catch_arrange);
+    let is i64 as holder = tree.create(&t, &catcher, root);
+    layout.set_align(&t, holder, layout.START, layout.START);
+    let is i64 as s = splitter.create(&t, holder, splitter.ROW);
+    layout.set_min_size(&t, s, 206.0, 100.0);
+    layout.set_max_size(&t, s, 206.0, 100.0);
+    let is i64 as a = pane(&t, s, 100.0);
+    let is i64 as b = pane(&t, s, 100.0);
+    layout.run(&t, 800.0, 600.0);
+    splitter.set_handle_size(&t, s, 10.0);
+    layout.run(&t, 800.0, 600.0);
+    check("a handle's thickness set", splitter.handle_rect(&t, s, 0).w == 10.0);
+    splitter.set_grab(&t, s, 8.0);
+    let is math.rect.Rect as h = splitter.handle_rect(&t, s, 0);
+    check("a press's reach set", router.hit(&t, h.x - 7.0, 50.0) == s && router.hit(&t, h.x - 9.0, 50.0) == a);
+    splitter.set_step(&t, s, 25.0);
+    splitter.set_step(&t, s, 0.0);
+    check("a key's step set; none of nothing", splitter.step(&t, s) == 25.0);
+    check("no handle past the last", splitter.handle_rect(&t, s, 1).w == 0.0 && splitter.set_position(&t, s, 1, 50.0) == 0);
+    check("to where it is: no move", splitter.set_position(&t, s, 0, splitter.position(&t, s, 0)) == 0);
+    // Keys.
+    router.focus(&t, &r, s, 1);
+    caught = 0;
+    let is f64 as p0 = splitter.position(&t, s, 0);
+    router.key(&t, &r, keys.RIGHT, 0, 1, 0, 10);
+    layout.run(&t, 800.0, 600.0);
+    near("right: a step", splitter.position(&t, s, 0), p0 + 25.0);
+    router.key(&t, &r, keys.HOME, 0, 1, 0, 20);
+    router.key(&t, &r, keys.END, 0, 1, 0, 30);
+    router.key(&t, &r, keys.F8, 0, 1, 0, 40);
+    check("its keys its own", caught == 0);
+    router.key(&t, &r, keys.RIGHT, keys.MOD_CONTROL, 1, 0, 50);
+    router.key(&t, &r, keys.X, 0, 1, 0, 60);
+    check("others passed on", caught == 2);
+    // A press in a pane: on up.
+    caught = 0;
+    router.pointer_button(&t, &r, 1, 1, 20.0, 50.0, 70);
+    router.pointer_button(&t, &r, 1, 0, 20.0, 50.0, 80);
+    check("a press in a pane: passed on", caught == 1);
+    // A key in a pane: on up, past the splitter.
+    tree.set_focusable(&t, b, 1);
+    router.focus(&t, &r, b, 1);
+    caught = 0;
+    router.key(&t, &r, keys.RIGHT, 0, 1, 0, 90);
+    check("a key in a pane: not the splitter's", caught == 1);
+    tree.destroy(&t, holder);
+    // One pane: no handle.
+    let is i64 as one = splitter.create(&t, root, splitter.ROW);
+    pane(&t, one, 50.0);
+    layout.run(&t, 800.0, 600.0);
+    check("one pane: no handle", splitter.handle_count(&t, one) == 0);
+    tree.destroy(&t, one);
+    // Its maximum: the panes' and the handles'.
+    let is i64 as m = splitter.create(&t, root, splitter.ROW);
+    splitter.set_handle_size(&t, m, 6.0);
+    let is i64 as m1 = pane(&t, m, 50.0);
+    let is i64 as m2 = pane(&t, m, 50.0);
+    pane_data(&t, m1).max = 100.0;
+    pane_data(&t, m2).max = 100.0;
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as ms;
+    layout.measure(&t, m, &free, &ms);
+    check("as wide at most as its panes and handle", ms.max_w == 206.0 && ms.pref_w == 106.0);
+    tree.destroy(&t, m);
+    // A column of three: measured down, its handles, its keys, its reach.
+    let is i64 as c = splitter.create(&t, root, splitter.COLUMN);
+    layout.set_align(&t, c, layout.START, layout.START);
+    splitter.set_handle_size(&t, c, 6.0);
+    let is i64 as c1 = pane(&t, c, 40.0);
+    let is i64 as c2 = pane(&t, c, 40.0);
+    pane(&t, c, 40.0);
+    pane_data(&t, c1).min = 30.0;
+    pane_data(&t, c2).min = 30.0;
+    layout.measure(&t, c, &free, &ms);
+    check("a column: as tall as its panes and handles", ms.pref_h == 132.0 && ms.pref_w == 40.0);
+    layout.run(&t, 800.0, 600.0);
+    let is math.rect.Rect as h1 = splitter.handle_rect(&t, c, 1);
+    check("its second handle under the second pane", h1.y == 86.0 && h1.h == 6.0);
+    check("held to its panes' least heights", splitter.set_position(&t, c, 0, 10.0) == 1);
+    layout.run(&t, 800.0, 600.0);
+    near("not past the first's least height", splitter.position(&t, c, 0), 30.0);
+    splitter.set_grab(&t, c, 4.0);
+    let is math.rect.Rect as h0 = splitter.handle_rect(&t, c, 0);
+    check("a column's reach: above its handle too", router.hit(&t, 20.0, h0.y - 3.0) == c);
+    router.focus(&t, &r, c, 1);
+    let is f64 as q0 = splitter.position(&t, c, 0);
+    router.key(&t, &r, keys.DOWN, 0, 1, 0, 100);
+    layout.run(&t, 800.0, 600.0);
+    router.key(&t, &r, keys.UP, 0, 1, 0, 110);
+    router.key(&t, &r, keys.UP, 0, 1, 0, 120);
+    layout.run(&t, 800.0, 600.0);
+    near("a column: down and up twice", splitter.position(&t, c, 0), q0 + splitter.step(&t, c) - splitter.step(&t, c));
+    tree.destroy(&t, c);
+    // Right to left: the handle as thick.
+    let is i64 as rt = splitter.create(&t, root, splitter.ROW);
+    layout.set_align(&t, rt, layout.START, layout.START);
+    splitter.set_handle_size(&t, rt, 6.0);
+    pane(&t, rt, 50.0);
+    pane(&t, rt, 50.0);
+    layout.set_direction(&t, rt, layout.RTL);
+    layout.run(&t, 800.0, 600.0);
+    check("right to left: the handle as thick", splitter.handle_rect(&t, rt, 0).w == 6.0);
+    pane(&t, rt, 50.0);
+    layout.run(&t, 800.0, 600.0);
+    check("right to left, three: each handle as thick", splitter.handle_rect(&t, rt, 0).w == 6.0 &&
+          splitter.handle_rect(&t, rt, 1).w == 6.0);
+    tree.destroy(&t, rt);
+    // Text that wraps in a pane: measured at the width the pane will get.
+    let is i64 as wr = splitter.create(&t, root, splitter.ROW);
+    splitter.set_handle_size(&t, wr, 6.0);
+    pane(&t, wr, 100.0);
+    let is i64 as wp = pane(&t, wr, 100.0);
+    pane(&t, wr, 100.0);
+    pane_data(&t, wp).wrap = 1050.0;
+    let is geom.Constraint as at312 = geom.constraint(312.0, layout.UNBOUNDED);
+    layout.measure(&t, wr, &at312, &ms);
+    check("a row: a pane's wrapped text measured at its share", ms.pref_h == 110.0);
+    tree.destroy(&t, wr);
+    let is i64 as wc = splitter.create(&t, root, splitter.COLUMN);
+    splitter.set_handle_size(&t, wc, 6.0);
+    let is i64 as wq = pane(&t, wc, 40.0);
+    pane(&t, wc, 40.0);
+    pane_data(&t, wq).wrap = 1000.0;
+    let is geom.Constraint as at50 = geom.constraint(50.0, layout.UNBOUNDED);
+    layout.measure(&t, wc, &at50, &ms);
+    check("a column: a pane's wrapped text measured at its width", ms.pref_h == 200.0 + 40.0 + 6.0);
+    layout.set_align(&t, wc, layout.START, layout.START);
+    layout.set_min_size(&t, wc, 50.0, 300.0);
+    layout.set_max_size(&t, wc, 50.0, 300.0);
+    layout.run(&t, 800.0, 600.0);
+    splitter.set_position(&t, wc, 0, 0.0);
+    layout.run(&t, 800.0, 600.0);
+    near("a column held to a pane's least height, not its width", splitter.position(&t, wc, 0), 200.0);
+    tree.destroy(&t, wc);
+    // A column's keys, far from its panes' least heights.
+    let is i64 as kc = splitter.create(&t, root, splitter.COLUMN);
+    layout.set_align(&t, kc, layout.START, layout.START);
+    splitter.set_handle_size(&t, kc, 6.0);
+    splitter.set_step(&t, kc, 10.0);
+    pane(&t, kc, 60.0);
+    pane(&t, kc, 60.0);
+    layout.run(&t, 800.0, 600.0);
+    router.focus(&t, &r, kc, 1);
+    router.key(&t, &r, keys.DOWN, 0, 1, 0, 200);
+    layout.run(&t, 800.0, 600.0);
+    router.key(&t, &r, keys.DOWN, 0, 1, 0, 210);
+    layout.run(&t, 800.0, 600.0);
+    router.key(&t, &r, keys.UP, 0, 1, 0, 220);
+    layout.run(&t, 800.0, 600.0);
+    near("a column: down twice, up once", splitter.position(&t, kc, 0), 70.0);
+    tree.destroy(&t, kc);
+    // One pane, no handle: its keys go on.
+    let is i64 as holder2 = tree.create(&t, &catcher, root);
+    let is i64 as lone = splitter.create(&t, holder2, splitter.ROW);
+    pane(&t, lone, 50.0);
+    layout.run(&t, 800.0, 600.0);
+    router.focus(&t, &r, lone, 1);
+    caught = 0;
+    router.key(&t, &r, keys.RIGHT, 0, 1, 0, 300);
+    check("no handle: its keys passed on", caught == 1);
+    tree.close(&t);
+}
+
+fn catch_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    layout.overlay_measure(t, w, c, out);
+}
+
+fn catch_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    layout.overlay_arrange(t, w, r);
+}
+
+let is i64 as W with imut = 120;
+let is i64 as H with imut = 60;
+let is [7200]i32 as px with mut;
+
+fn lum(x as f64, y as f64) as i64 {
+    let is i64 as i = (cast(i64, y) * W + cast(i64, x)) * 4;
+    let is *u8 as b = cast(*u8, &px);
+    return cast(i64, b[i]) + cast(i64, b[i + 1]) + cast(i64, b[i + 2]);
+}
+
+fn same_as(x as f64, y as f64, col as math.color.Color) as i32 {
+    let is i64 as i = (cast(i64, y) * W + cast(i64, x)) * 4;
+    let is *u8 as b = cast(*u8, &px);
+    let is i64 as dr with mut = cast(i64, b[i]) - cast(i64, col.r * 255.0 + 0.5);
+    let is i64 as dg with mut = cast(i64, b[i + 1]) - cast(i64, col.g * 255.0 + 0.5);
+    let is i64 as db with mut = cast(i64, b[i + 2]) - cast(i64, col.b * 255.0 + 0.5);
+    if (dr < 0) { dr = 0 - dr; }
+    if (dg < 0) { dg = 0 - dg; }
+    if (db < 0) { db = 0 - db; }
+    return cast(i32, dr <= 2 && dg <= 2 && db <= 2);
+}
+
+fn drawn_split() as void {
+    let is style.Theme as th = style.light();
+    let is gpu.device.Device as dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    let is i64 as target = gpu.texture.create(&dv, &td);
+    let is i64 as cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as limits = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &limits);
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &th);
+    let is router.Router as r = router.init(router.settings_default());
+    let is i64 as s = split(&t, splitter.ROW, 106.0, 50.0);
+    pane(&t, s, 50.0);
+    pane(&t, s, 50.0);
+    let is i32 as round with mut = 0;
+    let is f64 as mid = 53.0;
+    let is i64 as rest with mut = 0;
+    while (round < 3) {
+        if (round == 1) {
+            router.pointer_move(&t, &r, mid, 25.0, 10);
+            router.pointer_button(&t, &r, 1, 1, mid, 25.0, 10);
+        }
+        if (round == 2) {
+            router.pointer_button(&t, &r, 1, 0, mid, 25.0, 20);
+            router.focus(&t, &r, s, 1);
+        }
+        layout.run(&t, cast(f64, W), cast(f64, H));
+        let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, cast(f64, W), cast(f64, H));
+        tree.damage_add(&t, &all);
+        damage.collect(&t);
+        draw2d.begin(&c, cast(f64, W), cast(f64, H), 1.0);
+        let is paint.Options as o = paint.options(&th);
+        o.router = &r;
+        paint.frame(&t, &c, &o, cast(*paint.Stats, 0));
+        gpu.command.begin(&dv, cmd);
+        let is gpu.command.Pass as ps = gpu.command.pass_load(target, 0);
+        gpu.command.begin_pass(&dv, cmd, &ps);
+        draw2d.flush(&c, cmd);
+        gpu.command.end_pass(&dv, cmd);
+        gpu.command.end(&dv, cmd);
+        gpu.command.submit(&dv, cmd);
+        gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+        tree.damage_clear(&t);
+        if (round == 0) {
+            rest = lum(mid, 25.0);
+            check("drawn: a line down the handle's middle", same_as(mid, 25.0, th.palette.separator) == 1 &&
+                  same_as(mid - 2.0, 25.0, th.palette.window_bg) == 1);
+        }
+        if (round == 1) { check("held: in the accent colour", same_as(mid, 25.0, th.palette.accent) == 1); }
+        if (round == 2) {
+            check("focused by keyboard: a ring round the current handle", same_as(50.0, 25.0, th.palette.focus) == 1 &&
+                  same_as(1.0, 25.0, th.palette.focus) == 0);
+        }
+        round = round + 1;
+    }
+    // Three panes: a line down each handle.
+    router.focus(&t, &r, 0, 0);
+    pane(&t, s, 50.0);
+    layout.set_min_size(&t, s, 116.0, 50.0);
+    layout.set_max_size(&t, s, 116.0, 50.0);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as all2 = math.rect.rect(0.0, 0.0, cast(f64, W), cast(f64, H));
+    tree.damage_add(&t, &all2);
+    damage.collect(&t);
+    draw2d.begin(&c, cast(f64, W), cast(f64, H), 1.0);
+    let is paint.Options as o2 = paint.options(&th);
+    paint.frame(&t, &c, &o2, cast(*paint.Stats, 0));
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps2 = gpu.command.pass_load(target, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps2);
+    draw2d.flush(&c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    let is math.rect.Rect as k0 = splitter.handle_rect(&t, s, 0);
+    let is math.rect.Rect as k1 = splitter.handle_rect(&t, s, 1);
+    check("three panes: a line down each handle", same_as(fm.floor(k0.x + k0.w / 2.0), 25.0, th.palette.separator) == 1 &&
+          same_as(fm.floor(k1.x + k1.w / 2.0), 25.0, th.palette.separator) == 1);
+    tree.close(&t);
+}
 
 fn main() as i32 {
     pane_kind = widget.kind("pane", sizeof(Pane));
@@ -364,6 +720,9 @@ fn main() as i32 {
     tree.destroy(&t, sc);
 
     tree.close(&t);
+    told_split();
+    drawn_split();
+    more_split();
     if (fails > 0) {
         io.printf("splitter: %d failures\n", cast(i64, fails));
         return 1;
