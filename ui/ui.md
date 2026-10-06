@@ -754,20 +754,21 @@ technology, named by its text. Leaving the widget, a press or a key (the
 router counts them) hides it, and it does not show again until the pointer
 leaves and comes back.
 
-**Spin boxes** (`widgets/spin.cst`, tested by `spin_test`): a number in a
-field held to its range and step, with as many decimals as the step has
+**Spin boxes** (`widgets/spin.cst`, tested by `spin_test`): a number in an
+entry held to its range and step, with as many decimals as the step has
 (six at most) or as set, as wide as the widest value the range holds; two
 flat buttons at its end — mirrored right to left — each disabled at its end
-of the range. The arrows step it as they go down, Page Up and Down move ten
-steps, Ctrl+Home and Ctrl+End go to the ends, the wheel a step a notch.
-Typed into, it has a small editing of its own until the entry can take its
-place: what is typed takes the place of the value at first, then goes on
-after it, up to thirty-two characters of what a number can hold (a comma
-for the point too); Backspace takes the last away; Enter, leaving it or a
-step commits it held to range and step, or puts the value back when it is
-no number; Escape puts it back. While something is typed, Enter and Escape
-are its own, ahead of the window's default and cancel buttons. A caret after
-its text while it has the focus.
+of the range, giving the focus to the entry. One field is drawn around the
+frameless entry and the buttons, in its focused look while the entry has
+the focus. The arrows step it as they go down, Page Up and Down move ten
+steps, Control and Page Up or Down go to the ends, as GTK's do, the wheel a
+step a notch — over a disabled button too. Typed into, the entry edits as
+any does, taking only what a number can hold (a comma for the point too),
+thirty-two at most; Enter, the focus leaving, a button or a step commits it
+held to range and step, or puts the value back when it is no number; Escape
+puts it back. While something is typed, Enter and Escape are its own, ahead
+of the window's default and cancel buttons; otherwise Enter is the default
+button's.
 
 **The text buffer** (`textbuf.cst`, tested by `textbuf_test`): what an entry or
 a text view edits — a gap buffer, any range had in one piece for laying out
@@ -808,7 +809,9 @@ a shorter limit cuts the text; a filter lets in only the characters it says
 yes to, typed, pasted or dropped. Read-only it is still selected and copied.
 Focused by the keyboard, all of it is selected. It is laid out again when the
 theme's text changes; eight of the body's ems wide by preference, a line
-tall and padded. Its caret blinks, and is not drawn while its window is not
+tall and padded — or room for so many characters (`set_width_chars`), none
+leaving its width to what holds it — and drawn without its frame inside a
+field of its holder's (`set_frame`). Its caret blinks, and is not drawn while its window is not
 the active one. Told as an entry, or as password text, editable or
 read-only.
 
