@@ -709,6 +709,14 @@ set; told its fraction, or busy. A separator is a line the theme's border
 thick in its separator colour, across or up and down, in the middle of what
 it is given on whole physical pixels.
 
+**Group boxes** (`widgets/group.cst`, tested by `group_test`): a title — a
+label in the theme's strong body style, with its mnemonic — on top, then after
+the theme's small space a frame, a rounded border in the theme's border colour,
+around the content, the theme's medium space in from it; least and preferred
+sizes both carried through. The title names the group to assistive
+technology, and its mnemonic gives the focus to the first thing inside that
+can take it.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
