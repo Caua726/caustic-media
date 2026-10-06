@@ -1,0 +1,238 @@
+// ui/popup.cst — something shown over the window until it is dismissed.
+//
+// A popup holds what is made with it as parent — a list to choose from, a
+// popover's controls — framed in the popover colour on a layer above the
+// window, out of sight until opened against a rectangle of the window: placed
+// by the positioner from an anchor point of it, growing as a gravity says,
+// flipped from an edge it would cross, slid back inside, cut to the window's
+// height. Until the native popups of window/ can carry it outside, it is drawn
+// inside the window, a child of the tree's root, as menus are.
+//
+// While it is open the window's input is its own: it is the router's modal
+// scope, so Tab goes round what it holds; a press outside closes it, spent on
+// that, and so does Escape from anywhere in it. Opened, the focus goes to the
+// first of what it holds that takes it, or to the popup itself — or stays
+// where it is, what has it let through the scope, as an entry typed in while
+// what it suggests is shown; closed, it goes back where it was. CLOSED says
+// it closed, by whatever. Told as a panel.
+use "../math/math.cst" as math;
+use "../window/keys.cst" as keys;
+use "../render/shapes2d.cst" as shapes;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "event.cst" as event;
+use "painter.cst" as painter;
+use "style.cst" as style;
+use "access.cst" as access;
+use "router.cst" as router;
+use "signal.cst" as signal;
+use "positioner.cst" as positioner;
+
+let is i64 as LAYER with imut = 900;   // under menus, which a popup's controls may open
+
+// Where the focus goes as it opens: to the popup, to the first of what it
+// holds, or left where it is — an entry typed in while what it suggests is
+// shown.
+let is i32 as FOCUS_SELF  with imut = 0;
+let is i32 as FOCUS_FIRST with imut = 1;
+let is i32 as KEEP_FOCUS  with imut = 2;
+
+struct Data {
+    r          as *router.Router;   // while it is open
+    prev_scope as i64;
+    prev_focus as i64;
+    prev_ring  as i32;
+    open       as i32;
+    at         as math.rect.Rect;   // where it is, in the window
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("popup", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.role = access.ROLE_PANEL;
+    _ready = 1;
+}
+
+// A new popup, closed, as the last child of the tree's root. Its handle, or 0.
+fn create(t as *tree.Tree) as i64 {
+    _init();
+    let is i64 as p = tree.create(t, &_kind, tree.root(t));
+    if (p == 0) { return 0; }
+    tree.set_visible(t, p, 0);
+    tree.set_focusable(t, p, 1);
+    tree.set_layer(t, p, LAYER);
+    layout.set_align(t, p, layout.START, layout.START);
+    return p;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// What it holds: its first child.
+fn content(t as *tree.Tree, p as i64) as i64 {
+    if (cast(i64, _data(t, p)) == 0) { return 0; }
+    return tree.first_child(t, p);
+}
+
+fn is_open(t as *tree.Tree, p as i64) as i32 {
+    let is *Data as d = _data(t, p);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.open;
+}
+
+// Where it was put, in the window.
+fn placed(t as *tree.Tree, p as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, p);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    return d.at;
+}
+
+// Opened against rect — the window's coordinates — from its anchor point,
+// growing as gravity says, kept inside the window; the focus as focus says
+// (FOCUS_SELF, FOCUS_FIRST or KEEP_FOCUS). Opened again, it moves. 1, or 0
+// for no popup.
+fn open_at(t as *tree.Tree, r as *router.Router, p as i64, rect as math.rect.Rect, anchor as i32, gravity as i32,
+           focus as i32) as i32 {
+    let is *Data as d = _data(t, p);
+    if (cast(i64, d) == 0) { return 0; }
+    if (d.open == 0) {
+        d.prev_scope = router.scope(r);
+        d.prev_focus = router.focused(t, r);
+        d.prev_ring = router.focus_visible(r);
+    }
+    let is i64 as kept = router.focused(t, r);
+    d.r = r;
+    d.open = 1;
+    tree.set_visible(t, p, 1);
+    _place(t, p, d, rect, anchor, gravity);
+    layout.run(t, layout.rect(t, tree.root(t)).w, layout.rect(t, tree.root(t)).h);
+    // Keeping the focus, what has it is let through the scope.
+    if (focus == KEEP_FOCUS) { router.set_scope_also(t, r, p, kept); } else { router.set_scope(t, r, p); }
+    // What the hover asked for as the scope moved is not what is chosen.
+    tree.take_focus_request(t);
+    // It holds the focus itself only when nothing it holds takes it — or when
+    // asked to: otherwise it would be a stop for Tab among them.
+    if (focus == KEEP_FOCUS) {
+        tree.set_focusable(t, p, 0);
+        return 1;
+    }
+    tree.set_focusable(t, p, 1);
+    router.focus(t, r, p, 0);
+    if (focus == FOCUS_FIRST) {
+        router.focus_next(t, r, 1);
+        if (router.focused(t, r) != p) { tree.set_focusable(t, p, 0); }
+    }
+    return 1;
+}
+
+// Where it goes: measured whole, placed, and cut to the window.
+fn _place(t as *tree.Tree, p as i64, d as *Data, rect as math.rect.Rect, anchor as i32, gravity as i32) as void {
+    layout.set_max_size(t, p, layout.UNBOUNDED, layout.UNBOUNDED);
+    layout.set_margin(t, p, 0.0, 0.0, 0.0, 0.0);
+    let is geom.Constraint as c = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, p, &c, &s);
+    let is positioner.Positioner as ps with mut = positioner.make(s.pref_w, s.pref_h, rect);
+    ps.anchor = anchor;
+    ps.gravity = gravity;
+    ps.adjust = positioner.FLIP_X | positioner.FLIP_Y | positioner.SLIDE_X | positioner.SLIDE_Y | positioner.RESIZE_Y;
+    d.at = positioner.place(&ps, layout.rect(t, tree.root(t)));
+    layout.set_max_size(t, p, d.at.w, d.at.h);
+    // At the window's coordinates whatever its direction: right to left, the
+    // end is the left.
+    layout.set_margin(t, p, d.at.x, d.at.y, 0.0, 0.0);
+    if (layout.direction(t, p) == layout.RTL) {
+        layout.set_align(t, p, layout.END, layout.START);
+    } else {
+        layout.set_align(t, p, layout.START, layout.START);
+    }
+    widget.changed(t, p, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    widget.changed(t, tree.root(t), widget.CHANGED_LAYOUT);
+}
+
+// Closed: the window's input and the focus given back as they were; CLOSED.
+fn close(t as *tree.Tree, p as i64) as void {
+    let is *Data as d = _data(t, p);
+    if (cast(i64, d) == 0 || d.open == 0) { return; }
+    d.open = 0;
+    tree.set_visible(t, p, 0);
+    let is *router.Router as r = d.r;
+    d.r = cast(*router.Router, 0);
+    router.restore(t, r, d.prev_scope, d.prev_focus, d.prev_ring);
+    signal.emit(t, p, signal.CLOSED, cast(*u8, 0));
+}
+
+// Destroyed open, its scope must not outlive it.
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    if (d.open == 1 && cast(i64, d.r) != 0) { router.set_scope(t, d.r, d.prev_scope); }
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (d.open == 0) { return 0; }
+    if (e.kind == event.PRESS_OUTSIDE) {
+        close(t, w);
+        return 1;
+    }
+    if (e.kind == event.KEY_DOWN && e.key == keys.ESCAPE && e.mods == 0) {
+        close(t, w);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Measured, arranged, drawn ---
+
+fn _pad(th as *style.Theme) as f64 { return th.metrics.space_xs + th.metrics.border_width; }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as pad = _pad(&th);
+    geom.size_zero(out);
+    let is i64 as ch = tree.first_child(t, w);
+    if (ch != 0) {
+        let is geom.Constraint as free = geom.unbounded();
+        layout.measure(t, ch, &free, out);
+    }
+    out.pref_w = out.pref_w + 2.0 * pad;
+    out.pref_h = out.pref_h + 2.0 * pad;
+    out.min_w = out.min_w + 2.0 * pad;
+    out.min_h = 2.0 * pad;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as pad = _pad(&th);
+    let is i64 as ch = tree.first_child(t, w);
+    if (ch == 0) { return; }
+    let is math.rect.Rect as at = math.rect.rect(pad, pad, r.w - 2.0 * pad, r.h - 2.0 * pad);
+    layout.place(t, ch, &at);
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as rc = p.rect;
+    let is f64 as rad = th.metrics.radius_m;
+    shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.palette.popover_bg);
+    if (th.metrics.border_width > 0.0) {
+        shapes.stroke_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.metrics.border_width, th.palette.border);
+    }
+    p.fg = th.palette.fg;
+}

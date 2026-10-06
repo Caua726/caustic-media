@@ -1,0 +1,759 @@
+// ui/widgets/combo.cst — one of a list's rows chosen, from a list that drops
+// down.
+//
+// A combo box shows the row of a flat model that is chosen — its TEXT, a
+// number in its digits — in a control, an arrow pointing down at its end.
+// Pressed, or Space, Enter, Alt+Down or F4 with the focus on it, it opens a
+// list of the rows under it (a popup, popup.cst), as wide as it or wider, no
+// more than MAX_ROWS rows tall, the chosen row chosen there with the keyboard
+// on it: a click on a row, or Enter, chooses that row and closes the list;
+// Escape or a press outside closes it as it was. Closed, Up and Down choose
+// the row before or after at once, Home and End the first and last.
+// Everything mirrors in right to left.
+//
+// It follows the model: the chosen row stays chosen as rows come and go
+// before it, and when it goes none is. VALUE_CHANGED says another row is
+// chosen, its argument the row's position, an i64, -1 for none. Told as a
+// combo box, what is chosen its description, expandable, expanded while open.
+//
+// One to type in (create_entry) is an entry with a button at its end. The
+// button, Alt+Down or F4 open the list of all the rows, as above; typing
+// shows under it the rows whose text starts with what is typed, letters'
+// case aside, the focus staying in the entry: Up and Down move through them,
+// Enter or a click takes one — its text into the entry — and Escape, Tab or
+// typing what no row starts close them. A row taken is chosen until the text
+// is edited again.
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../model.cst" as model;
+use "std/mem.cst" as mem;
+use "../positioner.cst" as positioner;
+use "../popup.cst" as popup;
+use "label.cst" as label;
+use "listview.cst" as listview;
+use "entry.cst" as entry;
+
+let is i64 as MAX_ROWS with imut = 10;   // its list's height, at most, in rows
+
+struct Data {
+    t      as *tree.Tree;
+    self   as i64;
+    m      as *model.Model;
+    obs    as i64;
+    text   as i64;    // the chosen row's label; 0 for one typed in
+    pop    as i64;    // its popup, made the first time it opens
+    list   as i64;    // the list in it
+    index  as i64;    // the chosen row, -1 for none
+    edit   as i64;    // its entry, for one typed in
+    button as i64;    // and its button
+    sugg   as *Sugg;  // the rows what is typed starts
+    all    as i32;    // the list shows all the rows, not those suggested
+    quiet  as i32;    // its own text being set
+}
+
+// The rows what is typed starts, as a flat model of their own.
+struct Sugg {
+    owner as *Data;
+    n     as i64;
+    cap   as i64;
+    at    as *i64;    // their positions in the model
+    out   as model.Model;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _entry_kind with mut;
+let is tree.Kind as _button_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("combo box", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.role = access.ROLE_COMBO_BOX;
+    _kind.access = fn_ptr(_access);
+    _entry_kind = widget.kind("combo entry", sizeof(Data));
+    _entry_kind.measure = fn_ptr(_entry_measure);
+    _entry_kind.arrange = fn_ptr(_entry_arrange);
+    _entry_kind.event = fn_ptr(_entry_event);
+    _entry_kind.destroy = fn_ptr(_destroy);
+    _entry_kind.role = access.ROLE_COMBO_BOX;
+    _entry_kind.access = fn_ptr(_entry_access);
+    _button_kind = widget.kind("combo button", 8);
+    _button_kind.measure = fn_ptr(_button_measure);
+    _button_kind.paint = fn_ptr(_button_paint);
+    _button_kind.event = fn_ptr(_button_event);
+    _button_kind.role = access.ROLE_BUTTON;
+    _button_kind.access = fn_ptr(_button_access);
+    _ready = 1;
+}
+
+// A new combo box of m's rows, none chosen, as the last child of parent. m
+// stays where it is while the combo box has it. Its handle, or 0.
+fn create(t as *tree.Tree, parent as i64, m as *model.Model) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.m = m;
+    d.index = 0 - 1;
+    d.text = label.create(t, w, "", 0);
+    if (d.text == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    label.set_lines(t, d.text, 1, 1);
+    tree.set_focusable(t, w, 1);
+    d.obs = model.observe(m, fn_ptr(_changed), cast(*u8, d));
+    return w;
+}
+
+// A new combo box to type in, of m's rows, empty, as the last child of
+// parent: an entry, a button at its end. Its handle, or 0.
+fn create_entry(t as *tree.Tree, parent as i64, m as *model.Model) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_entry_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.m = m;
+    d.index = 0 - 1;
+    d.edit = entry.create(t, w);
+    d.button = tree.create(t, &_button_kind, w);
+    let is *u8 as p = mem.core.mmap_anon(sizeof(Sugg));
+    if (d.edit == 0 || d.button == 0 || cast(i64, p) <= 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    d.sugg = cast(*Sugg, p);
+    d.sugg.owner = d;
+    d.sugg.out = model.make(p, fn_ptr(_sugg_count), fn_ptr(_sugg_row_id), fn_ptr(_sugg_cell));
+    signal.connect(t, d.edit, signal.CHANGED, fn_ptr(_edited), cast(*u8, d));
+    signal.connect(t, d.edit, signal.ACTIVATED, fn_ptr(_entered), cast(*u8, d));
+    d.obs = model.observe(m, fn_ptr(_changed), cast(*u8, d));
+    return w;
+}
+
+// Its popup goes with it, and the model hears no more of it.
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    model.unobserve(d.m, d.obs);
+    if (d.pop != 0 && tree.is_valid(t, d.pop) == 1) { tree.destroy(t, d.pop); }
+    if (cast(i64, d.sugg) != 0) {
+        if (cast(i64, d.sugg.at) != 0) { mem.core.munmap(cast(*u8, d.sugg.at), d.sugg.cap * 8); }
+        mem.core.munmap(cast(*u8, d.sugg), sizeof(Sugg));
+    }
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0) { return cast(*Data, 0); }
+    let is i64 as k = cast(i64, tree.kind(t, w));
+    if (k != cast(i64, &_kind) && k != cast(i64, &_entry_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// Its entry and its button, for one typed in.
+fn entry_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.edit;
+}
+
+fn button_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.button;
+}
+
+// How many rows are suggested for what is typed.
+fn suggestions(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || cast(i64, d.sugg) == 0) { return 0; }
+    return d.sugg.n;
+}
+
+// --- What is chosen ---
+
+fn selected(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    return d.index;
+}
+
+// The chosen row's id, 0 for none.
+fn selected_id(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.index < 0) { return 0; }
+    return model.row_id(d.m, 0, d.index);
+}
+
+// The label it shows the chosen row in.
+fn text_label(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.text;
+}
+
+// Shows what is chosen now — in its label; one typed in shows what is typed.
+fn _show(t as *tree.Tree, d as *Data) as void {
+    if (d.text == 0) { return; }
+    if (d.index < 0) {
+        label.set_text(t, d.text, "", 0);
+    } else {
+        listview.show_text(t, d.text, d.m, model.row_id(d.m, 0, d.index), 0);
+    }
+    widget.changed(t, d.self, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// Row index chosen — -1 for none — shown and said. Nothing for a row there
+// is not, or the one chosen already.
+fn set_selected(t as *tree.Tree, w as i64, index as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || index < 0 - 1 || index >= model.count(d.m, 0) || index == d.index) { return; }
+    d.index = index;
+    _show(t, d);
+    let is i64 as at = index;
+    signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, &at));
+}
+
+fn _changed(user as *u8, c as *model.Change) as void {
+    let is *Data as d = cast(*Data, user);
+    let is *tree.Tree as t = d.t;
+    // What is suggested is found again.
+    if (d.edit != 0 && d.all == 0 && d.pop != 0 && popup.is_open(t, d.pop) == 1) { _suggest(t, d); }
+    if (c.kind == model.RESET) {
+        if (d.index >= 0) { set_selected(t, d.self, 0 - 1); }
+        return;
+    }
+    if (c.parent != 0 || d.index < 0) { return; }
+    if (c.kind == model.INSERTED && c.first <= d.index) {
+        d.index = d.index + c.count;
+    } else if (c.kind == model.REMOVED && c.first <= d.index) {
+        if (d.index < c.first + c.count) {
+            // Its row gone: none chosen.
+            d.index = 0 - 1;
+            _show(t, d);
+            let is i64 as none = 0 - 1;
+            signal.emit(t, d.self, signal.VALUE_CHANGED, cast(*u8, &none));
+            return;
+        }
+        d.index = d.index - c.count;
+    } else if (c.kind == model.CHANGED && c.first <= d.index && d.index < c.first + c.count) {
+        _show(t, d);
+    }
+}
+
+// --- Its list ---
+
+fn is_open(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.pop == 0) { return 0; }
+    return popup.is_open(t, d.pop);
+}
+
+fn popup_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.pop;
+}
+
+fn list_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.list;
+}
+
+// A row activated in its list: chosen, the list closed — its text into
+// the entry of one typed in.
+fn _picked(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is i64 as i with mut = listview.cursor(t, d.list);
+    if (d.edit != 0 && d.all == 0) {
+        if (i < 0 || i >= d.sugg.n) { return; }
+        i = d.sugg.at[i];
+    }
+    popup.close(t, d.pop);
+    if (d.edit != 0) {
+        _take(t, d, i);
+        return;
+    }
+    set_selected(t, d.self, i);
+}
+
+// Row i's text into the entry, the caret at its end; row i chosen, said.
+fn _take(t as *tree.Tree, d as *Data, i as i64) as void {
+    let is model.Value as v;
+    model.cell(d.m, model.row_id(d.m, 0, i), 0, model.TEXT, &v);
+    d.quiet = 1;
+    if (v.kind == model.V_TEXT) {
+        entry.set_text(t, d.edit, v.p, v.len);
+    } else if (v.kind == model.V_INT) {
+        let is [24]u8 as num;
+        entry.set_text(t, d.edit, cast(*u8, &num), listview.digits(v.i, cast(*u8, &num)));
+    } else {
+        entry.set_text(t, d.edit, "", 0);
+    }
+    entry.select(t, d.edit, entry.length(t, d.edit), entry.length(t, d.edit));
+    d.quiet = 0;
+    d.index = i;
+    let is i64 as at = i;
+    signal.emit(t, d.self, signal.VALUE_CHANGED, cast(*u8, &at));
+}
+
+fn _closed(t as *tree.Tree, p as i64, arg as *u8, user as *u8) as void {
+    widget.changed(t, cast(*Data, user).self, widget.CHANGED_PAINT);
+}
+
+// Made the first time: a popup with a list of the rows, a click choosing.
+fn _make(t as *tree.Tree, d as *Data) as i32 {
+    if (d.pop != 0 && tree.is_valid(t, d.pop) == 1) { return 1; }
+    d.pop = popup.create(t);
+    if (d.pop == 0) { return 0; }
+    d.list = listview.create(t, d.pop, d.m);
+    if (d.list == 0) {
+        tree.destroy(t, d.pop);
+        d.pop = 0;
+        return 0;
+    }
+    listview.set_single_click(t, d.list, 1);
+    signal.connect(t, d.list, signal.ACTIVATED, fn_ptr(_picked), cast(*u8, d));
+    signal.connect(t, d.pop, signal.CLOSED, fn_ptr(_closed), cast(*u8, d));
+    return 1;
+}
+
+// Its list opened under it, the chosen row chosen there, the keyboard on it.
+fn open(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = _data(t, w);
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, d) == 0 || cast(i64, r) == 0 || _make(t, d) == 0) { return; }
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    let is i32 as anchor with mut = positioner.BOTTOM_LEFT;
+    let is i32 as gravity with mut = positioner.BOTTOM_RIGHT;
+    if (layout.direction(t, w) == layout.RTL) {
+        anchor = positioner.BOTTOM_RIGHT;
+        gravity = positioner.BOTTOM_LEFT;
+        layout.set_direction(t, d.pop, layout.RTL);
+    } else {
+        layout.set_direction(t, d.pop, layout.LTR);
+    }
+    if (d.edit != 0 && d.all == 0) {
+        listview.set_model(t, d.list, d.m);
+        d.all = 1;
+    }
+    let is style.Theme as th;
+    widget.theme(t, d.pop, &th);
+    let is f64 as pad = th.metrics.space_xs + th.metrics.border_width;
+    layout.set_min_size(t, d.list, wr.w - 2.0 * pad, 0.0);
+    layout.set_max_size(t, d.list, layout.UNBOUNDED, layout.UNBOUNDED);
+    popup.open_at(t, r, d.pop, wr, anchor, gravity, 0);
+    // Its rows' height is known once it is laid out: no taller than MAX_ROWS.
+    let is f64 as rh = listview.row_height(t, d.list);
+    if (rh > 0.0) {
+        layout.set_max_size(t, d.list, layout.UNBOUNDED, rh * cast(f64, MAX_ROWS));
+        popup.open_at(t, r, d.pop, wr, anchor, gravity, 0);
+    }
+    listview.unselect_all(t, d.list);
+    if (d.index >= 0) {
+        listview.select(t, d.list, d.index);
+        listview.set_cursor(t, d.list, d.index);
+    }
+    router.focus(t, r, d.list, 1);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// --- What is typed: the rows it starts ---
+
+fn _fold(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// The rows the entry's text starts found again, and shown under it — or
+// nothing shown when it is empty or none does.
+fn _suggest(t as *tree.Tree, d as *Data) as void {
+    let is *Sugg as g = d.sugg;
+    let is *u8 as typed = entry.text(t, d.edit);
+    let is i64 as tn = entry.length(t, d.edit);
+    let is i64 as n = model.count(d.m, 0);
+    g.n = 0;
+    if (tn > 0 && n > g.cap) {
+        let is i64 as cap with mut = 64;
+        while (cap < n) { cap = cap * 2; }
+        let is *u8 as p = mem.core.mmap_anon(cap * 8);
+        if (cast(i64, p) <= 0) { return; }
+        if (cast(i64, g.at) != 0) { mem.core.munmap(cast(*u8, g.at), g.cap * 8); }
+        g.at = cast(*i64, p);
+        g.cap = cap;
+    }
+    let is i64 as i with mut = 0;
+    while (tn > 0 && i < n) {
+        let is model.Value as v;
+        model.cell(d.m, model.row_id(d.m, 0, i), 0, model.TEXT, &v);
+        if (v.kind == model.V_TEXT && v.len >= tn) {
+            let is i32 as starts with mut = 1;
+            let is i64 as k with mut = 0;
+            while (k < tn) {
+                if (_fold(cast(i64, v.p[k])) != _fold(cast(i64, typed[k]))) { starts = 0; }
+                k = k + 1;
+            }
+            if (starts == 1) {
+                g.at[g.n] = i;
+                g.n = g.n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (g.n == 0) {
+        if (d.pop != 0) { popup.close(t, d.pop); }
+        model.reset(&g.out);
+        return;
+    }
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) == 0 || _make(t, d) == 0) { return; }
+    if (d.all == 1 || listview.model_of(t, d.list) != &g.out) {
+        listview.set_model(t, d.list, &g.out);
+        d.all = 0;
+    } else {
+        model.reset(&g.out);
+    }
+    let is style.Theme as th;
+    widget.theme(t, d.pop, &th);
+    let is f64 as pad = th.metrics.space_xs + th.metrics.border_width;
+    let is math.rect.Rect as wr = layout.window_rect(t, d.self);
+    layout.set_min_size(t, d.list, wr.w - 2.0 * pad, 0.0);
+    let is i32 as anchor with mut = positioner.BOTTOM_LEFT;
+    let is i32 as gravity with mut = positioner.BOTTOM_RIGHT;
+    if (layout.direction(t, d.self) == layout.RTL) {
+        anchor = positioner.BOTTOM_RIGHT;
+        gravity = positioner.BOTTOM_LEFT;
+    }
+    popup.open_at(t, r, d.pop, wr, anchor, gravity, popup.KEEP_FOCUS);
+    let is f64 as rh = listview.row_height(t, d.list);
+    if (rh > 0.0) {
+        layout.set_max_size(t, d.list, layout.UNBOUNDED, rh * cast(f64, MAX_ROWS));
+        popup.open_at(t, r, d.pop, wr, anchor, gravity, popup.KEEP_FOCUS);
+    }
+}
+
+// The entry's text changed: by the program or as it was taken, nothing
+// more; typed, no row chosen any more, and what it starts suggested.
+fn _edited(t as *tree.Tree, e as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (d.quiet == 1) { return; }
+    if (d.index >= 0) {
+        d.index = 0 - 1;
+        let is i64 as none = 0 - 1;
+        signal.emit(t, d.self, signal.VALUE_CHANGED, cast(*u8, &none));
+    }
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) == 0 || router.focused(t, r) != d.edit) { return; }
+    _suggest(t, d);
+}
+
+// Enter in the entry: the suggestion the keyboard is on, taken.
+fn _entered(t as *tree.Tree, e as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (d.all == 1 || d.pop == 0 || popup.is_open(t, d.pop) == 0) { return; }
+    let is i64 as c = listview.cursor(t, d.list);
+    if (c < 0 || c >= d.sugg.n) { return; }
+    popup.close(t, d.pop);
+    _take(t, d, d.sugg.at[c]);
+}
+
+// Keys the entry has no use for: the list of all the rows, and moving
+// through what is suggested.
+fn _entry_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind != event.KEY_DOWN) { return 0; }
+    let is i32 as k = e.key;
+    if ((e.mods == keys.MOD_ALT && k == keys.DOWN) || (e.mods == 0 && k == keys.F4)) {
+        open(t, w);
+        return 1;
+    }
+    let is i32 as shown = cast(i32, d.all == 0 && d.pop != 0 && popup.is_open(t, d.pop) == 1);
+    if (shown == 0) { return 0; }
+    if (k == keys.TAB) {
+        // Closed, and on: the router moves the focus as Tab would.
+        popup.close(t, d.pop);
+        return 0;
+    }
+    if (e.mods != 0) { return 0; }
+    if (k == keys.ESCAPE) {
+        popup.close(t, d.pop);
+        return 1;
+    }
+    let is i64 as c = listview.cursor(t, d.list);
+    if (k == keys.DOWN) {
+        listview.go_to(t, d.list, c + 1);
+        return 1;
+    }
+    if (k == keys.UP) {
+        if (c > 0) { listview.go_to(t, d.list, c - 1); }
+        return 1;
+    }
+    return 0;
+}
+
+// --- The suggestions' model ---
+
+fn _sugg_count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Sugg, self).n;
+}
+
+fn _sugg_row_id(self as *u8, parent as i64, index as i64) as i64 {
+    let is *Sugg as g = cast(*Sugg, self);
+    if (parent != 0 || index < 0 || index >= g.n) { return 0; }
+    return model.row_id(g.owner.m, 0, g.at[index]);
+}
+
+fn _sugg_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    return cast(i64, model.cell(cast(*Sugg, self).owner.m, id, column, role, out));
+}
+
+// --- Keys and the pointer ---
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind == event.POINTER_DOWN && e.button == 1) {
+        open(t, w);
+        return 1;
+    }
+    if (e.kind != event.KEY_DOWN) { return 0; }
+    let is i32 as k = e.key;
+    if (e.mods == keys.MOD_ALT && k == keys.DOWN) {
+        open(t, w);
+        return 1;
+    }
+    if (e.mods != 0) { return 0; }
+    if (k == keys.SPACE || k == keys.RETURN || k == keys.F4) {
+        open(t, w);
+        return 1;
+    }
+    let is i64 as n = model.count(d.m, 0);
+    let is i64 as to with mut = 0 - 2;
+    if (k == keys.DOWN) { to = d.index + 1; }
+    if (k == keys.UP) { to = d.index - 1; }
+    if (k == keys.HOME) { to = 0; }
+    if (k == keys.END) { to = n - 1; }
+    if (to == 0 - 2) { return 0; }
+    if (to < 0) { to = 0; }
+    if (to >= n) { to = n - 1; }
+    set_selected(t, w, to);
+    return 1;
+}
+
+// --- Measuring, arranging, drawing ---
+
+fn _arrow(th as *style.Theme) as f64 { return th.metrics.indicator; }
+
+fn _rtl(t as *tree.Tree, w as i64) as i32 { return cast(i32, layout.direction(t, w) == layout.RTL); }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as ls;
+    layout.measure(t, d.text, &free, &ls);
+    let is f64 as edge = 2.0 * th.metrics.control_pad_x + th.metrics.space_s + _arrow(&th);
+    geom.size_zero(out);
+    out.pref_w = edge + ls.pref_w;
+    out.min_w = edge;
+    out.pref_h = th.metrics.control_height;
+    if (ls.pref_h > out.pref_h) { out.pref_h = ls.pref_h; }
+    out.min_h = out.pref_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = out.pref_h;
+}
+
+// Its text from the start, what is left beside the arrow.
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as px = th.metrics.control_pad_x;
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as ls;
+    layout.measure(t, d.text, &free, &ls);
+    let is f64 as room with mut = r.w - 2.0 * px - th.metrics.space_s - _arrow(&th);
+    if (room < 0.0) { room = 0.0; }
+    let is math.rect.Rect as at with mut = math.rect.rect(px, (r.h - ls.pref_h) / 2.0, room, ls.pref_h);
+    if (_rtl(t, w) == 1) { at.x = r.w - px - room; }
+    layout.place(t, d.text, &at);
+}
+
+// Its arrow's place, in the window.
+fn arrow_rect(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    let is f64 as k = _arrow(&th);
+    let is f64 as x with mut = wr.x + wr.w - th.metrics.control_pad_x - k;
+    if (_rtl(t, w) == 1) { x = wr.x + th.metrics.control_pad_x; }
+    return math.rect.rect(x, wr.y + (wr.h - k) / 2.0, k, k);
+}
+
+// A control, pressed while its list is open; an arrow pointing down.
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as rc = p.rect;
+    let is i64 as state with mut = p.state;
+    if (d.pop != 0 && popup.is_open(t, d.pop) == 1) { state = state | painter.S_PRESSED; }
+    let is style.Look as look = style.pick(&th.control, state, 0);
+    let is f64 as rad = th.metrics.radius_m;
+    shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, look.bg);
+    if (look.border.a > 0.0) {
+        shapes.stroke_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.metrics.border_width, look.border);
+    }
+    p.fg = look.fg;
+    let is math.rect.Rect as ar = arrow_rect(t, w);
+    let is f64 as cx = ar.x + ar.w / 2.0;
+    let is f64 as cy = ar.y + ar.h / 2.0;
+    let is f64 as a = ar.w * 0.3;
+    let is [3]f64 as xs;
+    let is [3]f64 as ys;
+    xs[0] = cx - a; ys[0] = cy - a * 0.5;
+    xs[1] = cx + a; ys[1] = cy - a * 0.5;
+    xs[2] = cx;     ys[2] = cy + a * 0.5;
+    shapes.fill_convex(p.canvas, cast(*f64, &xs), cast(*f64, &ys), 3, look.fg);
+}
+
+// --- One typed in: the entry, its button square at the end ---
+
+fn _entry_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as es;
+    layout.measure(t, d.edit, &free, &es);
+    let is f64 as h with mut = th.metrics.control_height;
+    if (es.pref_h > h) { h = es.pref_h; }
+    geom.size_zero(out);
+    out.pref_w = es.pref_w + h;
+    out.min_w = es.min_w + h;
+    out.pref_h = h;
+    out.min_h = h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = h;
+}
+
+fn _entry_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is f64 as b = r.h;
+    let is f64 as ew with mut = r.w - b;
+    if (ew < 0.0) { ew = 0.0; }
+    let is math.rect.Rect as er with mut = math.rect.rect(0.0, 0.0, ew, r.h);
+    let is math.rect.Rect as br with mut = math.rect.rect(ew, 0.0, b, r.h);
+    if (_rtl(t, w) == 1) {
+        br.x = 0.0;
+        er.x = b;
+    }
+    layout.place(t, d.edit, &er);
+    layout.place(t, d.button, &br);
+}
+
+fn _button_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    geom.size_zero(out);
+    out.pref_w = th.metrics.control_height;
+    out.pref_h = th.metrics.control_height;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _button_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    if (e.kind == event.POINTER_DOWN && e.button == 1) {
+        open(t, tree.parent(t, w));
+        return 1;
+    }
+    return 0;
+}
+
+// A control, an arrow pointing down in its middle.
+fn _button_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as rc = p.rect;
+    let is style.Look as look = style.pick(&th.control, p.state, 0);
+    let is f64 as rad = th.metrics.radius_m;
+    shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, look.bg);
+    let is f64 as cx = rc.x + rc.w / 2.0;
+    let is f64 as cy = rc.y + rc.h / 2.0;
+    let is f64 as a = _arrow(th) * 0.3;
+    let is [3]f64 as xs;
+    let is [3]f64 as ys;
+    xs[0] = cx - a; ys[0] = cy - a * 0.5;
+    xs[1] = cx + a; ys[1] = cy - a * 0.5;
+    xs[2] = cx;     ys[2] = cy + a * 0.5;
+    shapes.fill_convex(p.canvas, cast(*f64, &xs), cast(*f64, &ys), 3, look.fg);
+}
+
+fn _button_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    if (q.action == access.ASK) {
+        access.set_name(q, "Show all", 8);
+        q.actions = access.PRESS;
+        return 1;
+    }
+    if (q.action == access.PRESS) { open(t, tree.parent(t, w)); }
+    return 1;
+}
+
+fn _entry_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        q.states = q.states | access.EXPANDABLE | access.EDITABLE;
+        if (is_open(t, w) == 1) {
+            q.states = q.states | access.EXPANDED;
+            q.actions = access.COLLAPSE;
+        } else {
+            q.actions = access.EXPAND;
+        }
+        return 1;
+    }
+    if (q.action == access.EXPAND) { open(t, w); }
+    if (q.action == access.COLLAPSE) { popup.close(t, d.pop); }
+    return 1;
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        q.description = label.text(t, d.text);
+        q.description_len = label.text_length(t, d.text);
+        q.states = q.states | access.EXPANDABLE;
+        if (is_open(t, w) == 1) {
+            q.states = q.states | access.EXPANDED;
+            q.actions = access.COLLAPSE;
+        } else {
+            q.actions = access.PRESS | access.EXPAND;
+        }
+        return 1;
+    }
+    if (q.action == access.PRESS || q.action == access.EXPAND) { open(t, w); }
+    if (q.action == access.COLLAPSE) { popup.close(t, d.pop); }
+    return 1;
+}

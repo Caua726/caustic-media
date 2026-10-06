@@ -545,7 +545,9 @@ nowhere, but the scope hears of it (`PRESS_OUTSIDE`), so a popup closes; the
 press is spent on that, and opens no context menu where it landed; the pointer
 moving outside it, over nothing it may reach, is told to it too
 (`MOVE_OUTSIDE`), for a menu bar's open menu to find the pointer on another
-title. When the popup ends, `restore` puts the scope back and gives the focus
+title. One subtree outside a scope may be let through it (`set_scope_also`):
+an entry keeps the focus, and its presses, while what it suggests is shown.
+When the popup ends, `restore` puts the scope back and gives the focus
 back in one step (`give_back`: the ring as it was, but no move by keyboard, so
 an entry does not select all of itself), nothing else focused on the way; a
 scope destroyed while set is none, so the window is never left shut.
@@ -1073,6 +1075,27 @@ to resize it, never below `MIN_WIDTH`; a sortable column's header clicked
 asks the sort hook for the rows sorted by it, up and then down, and shows the
 arrow. Told as a table of table rows under column headers.
 
+**Popups** (`popup.cst`, tested by `popup_test`): what is made with one as
+parent, framed in the popover colour on a layer above the window, opened
+against a rectangle and placed by the positioner — flipped, slid, cut to the
+window's height. Open, it is the router's modal scope: Tab goes round what it
+holds, a press outside or Escape closes it, and the focus goes to the first
+of what it holds, to the popup, or stays where it is (`KEEP_FOCUS`, what has
+it let through the scope), coming back when it closes. CLOSED says it
+closed. What combo boxes drop down, and popovers later.
+
+**Combo boxes** (`widgets/combo.cst`, tested by `combo_test`): the chosen row
+of a flat model in a control with an arrow; pressed, or Space, Enter,
+Alt+Down or F4, a list of the rows drops down under it — as wide or wider, at
+most `MAX_ROWS` tall, the chosen row chosen there — where a click or Enter
+chooses and Escape or a press outside leaves it as it was; closed, Up and
+Down choose at once. It follows the model, the chosen row staying chosen as
+rows come and go before it. One to type in is an entry with a button at its
+end: the button, Alt+Down or F4 show all the rows; typing shows the rows its
+text starts, the focus staying in the entry, Up and Down moving through them
+and Enter or a click taking one's text. VALUE_CHANGED says another row is
+chosen. Told as a combo box, editable when typed in, expanded while open.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
@@ -1103,8 +1126,8 @@ widget set applications actually use, done properly, not parity.
    composed text. *Done, with the text view.*
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
    *Scroll areas, tabs, splitters, stacks and assistants, expanders, toolbars,
-   status bars, header bars, menus and menu bars done; lists, trees and tables
-   next.*
+   status bars, header bars, menus and menu bars, lists, trees, tables and
+   combo boxes done; popovers and dialogs next.*
 7. **The accessibility bridges**, AT-SPI first.
 
 ## Not now, and deliberately
