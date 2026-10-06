@@ -959,6 +959,15 @@ underlined in the accent on the side facing its page and titled in the text's
 colour, the others dimmer, the one under the pointer lit; told as a list of
 tabs, each named by its title and selected when current.
 
+**Expanders** (`widgets/expander.cst`, tested by `expander_test`): a title
+with a small triangle at its start — at the right in right to left — and under
+it, while expanded, what it holds, in an overlay the program fills; closed, only
+as tall as its title, what it holds hidden through the tree. Turned by a press
+on its title, Space or Enter with the focus, Alt and its title's mnemonic, and
+assistive technology, saying TOGGLED each time; the triangle points along the
+line when closed and down when open, and the focus ring goes round the title's
+row only. Told as a button that expands, named by its title.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
