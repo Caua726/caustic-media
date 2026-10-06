@@ -212,7 +212,9 @@ be lost. The toolkit routes them:
 - **keyboard**: the window's shortcuts and mnemonics are resolved before the
   focused widget sees the key — except that the focused widget is asked first,
   with `SHORTCUT_OVERRIDE`, whether it wants the key itself, which is how an
-  entry keeps Ctrl+A while the window has a shortcut for it. Then the context
+  entry keeps Ctrl+A while the window has a shortcut for it; the question
+  bubbles, so what holds the focused widget may keep a key for it, as a spin
+  box keeps Enter for its entry while something is typed. Then the context
   menu keys, then the key to the focused widget and up the tree, and only if
   nobody took it do Tab and Shift+Tab walk the focus chain.
 - **text**: composed text and the IME's pre-edit string from `input/`'s
@@ -468,9 +470,12 @@ and counts positions from there.
 that respects clipping, bubbling, capture by whoever handles the press,
 per-widget enter and leave kept as a chain so a destroyed widget does not
 confuse it, click counting and the drag threshold from settings, scrolling that
-bubbles, context menus by right click, Menu key or Shift+F10, focus with Tab
-order, focus ring only after keyboard use, a modal scope, window shortcuts with
-the override, mnemonics — what one chooses takes the focus when it can, as by
+bubbles — past a disabled widget, as GTK lets it, where a press stops —
+context menus by right click, Menu key or Shift+F10, focus with Tab order,
+focus ring only after keyboard use, what holds the focus told as it comes in
+and leaves (`FOCUS_ENTER`, `FOCUS_LEAVE`, for a composite that commits when
+its part loses the focus), a modal scope, window shortcuts with the override
+that bubbles, mnemonics — what one chooses takes the focus when it can, as by
 Tab, then hears `ACTIVATE`; Alt going down or up repaints the window — and
 timers with ids that stay dead once cancelled.
 A long press — a finger or pen held still for `long_press_ms`, or a mouse when
