@@ -981,6 +981,14 @@ stays in the row: one that leaves it, or is destroyed, hands it to the last
 button still there, or to the menu button when none fits. Told as a tool bar,
 across.
 
+**Status bars** (`widgets/statusbar.cst`, tested by `statusbar_test`): a
+message, the newest pushed, in the dimmer text colour, and a row at the end
+for what the program keeps there, under a line. Messages are pushed under a
+context the program picks for each part of itself that speaks, popped by it —
+its newest — or taken away by the id push gave; one flashed goes by itself
+after a while through the window's timers, and a newer flash takes its place.
+Told as a status bar named by its message.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
