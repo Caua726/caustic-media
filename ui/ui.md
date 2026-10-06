@@ -1029,6 +1029,27 @@ own menu where it was pressed. Drawn in the header's colour over a line, all
 mirrored in right to left; told as a title bar named by its title, its buttons
 named for what they do.
 
+**List views** (`widgets/listview.cst`, tested by `listview_test`): the rows
+of a flat model in a scroll area of their own, each as tall as the first,
+with widgets only for the rows in view and one past them; scrolled, each is
+given to the row that comes into view in its place — row i always in the
+same one while it is seen, so a scroll by a row binds one row again. A row
+shows its model's TEXT of column 0, or what the program's factory makes of
+it (`set_factory`: setup a new row widget, bind a row to one). Selection is
+of positions, none, one or many, kept as ranges — a million rows chosen is
+two numbers — that move with the rows inserted and removed. The keyboard's
+row moves with the arrows, Page Up and Down, Home and End, choosing it
+alone, from the anchor with Shift, nothing with Control; Space chooses,
+Control+Space turns over, Control+A all and Shift+Control+A none; a click
+chooses, with Control turns over, with Shift from the anchor, a double click
+or Enter activates; the right button chooses the row it is on unless chosen
+already, and goes on for whoever shows a menu. Typing finds the next row
+starting with what was typed in the last second, the same letter again going
+on. Rows in the theme's row look, the keyboard's row ringed instead of the
+list. Told as a list, many selectable when so, of list items; those built on
+it say other roles and add to what a row says (`set_roles`,
+`set_row_access`).
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a

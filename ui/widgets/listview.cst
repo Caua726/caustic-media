@@ -1,0 +1,1228 @@
+// ui/widgets/listview.cst — rows read from a model, only those seen made.
+//
+// A list view shows the rows of a flat model (model.cst, the rows under
+// parent 0) in a scroll area of its own, one under another, each as tall as
+// the first. It holds widgets only for the rows in view and a few past them,
+// and as it scrolls each is given to the row that comes into view in its
+// place — row i always in the same one of them while it is seen, so a
+// scroll by a row binds one row again, not all. A row shows its model's
+// TEXT of column 0 in a label, unless the program makes its own: set_factory
+// gives it each new row widget to fill (setup) and each row to show in one
+// (bind).
+//
+// Selection is of row positions, none, one (SINGLE) or any (MULTIPLE), kept
+// as ranges, so selecting a million rows is two numbers; rows inserted or
+// removed move the ranges with them. The cursor is the row the keyboard is
+// on: the arrows, Page Up and Down, Home and End move it, choosing it alone;
+// with Shift from the anchor to it; with Control without choosing. Space
+// chooses it, Control+Space turns it over, Control+A chooses all and
+// Shift+Control+A none. A click chooses a row, with Control turns it over,
+// with Shift chooses from the anchor; a double click or Enter activates it.
+// Typing finds the next row whose text starts with what was typed in the
+// last second, the same letter again going on to the next.
+//
+// SELECTION_CHANGED says the selection changed, ACTIVATED that a row was
+// activated, its argument the row's id, an i64. Told as a list — many
+// selectable in MULTIPLE — of list items, selectable, each named by its
+// text.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../scroll.cst" as scroll;
+use "../model.cst" as model;
+use "label.cst" as label;
+
+// Selection modes.
+let is i32 as NONE     with imut = 0;
+let is i32 as SINGLE   with imut = 1;
+let is i32 as MULTIPLE with imut = 2;
+
+let is i64 as SEARCH_MS  with imut = 1000;   // typed this long apart, a new search
+let is i64 as MAX_SEARCH with imut = 64;     // bytes of it kept
+let is i64 as SPARE      with imut = 1;      // rows made past those in view
+
+// A program's rows: setup(user, t, row) fills a new row widget with its
+// children; bind(user, t, row, id, index) shows row id, at index, in it.
+type SetupFn = fn(*u8, *tree.Tree, i64) as void;
+type BindFn = fn(*u8, *tree.Tree, i64, i64, i64) as void;
+
+// What more a row says of itself, and does: row_access(user, t, row, index,
+// q) is asked after the list's own answer — to add states and actions on
+// ASK, to do one of those on another action; 1 for done.
+type RowAccessFn = fn(*u8, *tree.Tree, i64, i64, *tree.Access) as i64;
+
+// Rows a to b, b not among them.
+struct Range {
+    a as i64;
+    b as i64;
+}
+
+// What was typed to find a row.
+struct Search {
+    len  as i64;
+    time as i64;
+    text as [64]u8;
+}
+
+struct Data {
+    t       as *tree.Tree;
+    self    as i64;
+    m       as *model.Model;
+    obs     as i64;          // its observer's id with the model
+    area    as i64;
+    body    as i64;
+    mode    as i32;
+    _pad0   as i32;
+    n       as i64;          // rows in the model
+    row_h   as f64;
+    cursor  as i64;          // -1 for none
+    anchor  as i64;
+    sel     as *Range;       // sorted, apart, none empty
+    nsel    as i64;
+    capsel  as i64;
+    rows    as *i64;         // the row widgets, row i in rows[i % nrows]
+    nrows   as i64;
+    caprows as i64;
+    setup   as SetupFn;
+    bind    as BindFn;
+    fuser   as *u8;
+    search  as *Search;
+    reveal  as i64;          // a row to show once there is a view, -1 for none
+    role    as i64;          // told as, 0 for a list
+    row_role as i64;         // its rows, 0 for list items
+    racc    as RowAccessFn;
+    racc_user as *u8;
+}
+
+struct Row {
+    owner as i64;
+    index as i64;   // the row it shows, -1 for none
+    id    as i64;
+    cell  as i64;   // its label, for rows of its own making; 0 for the program's
+}
+
+struct Body {
+    owner as i64;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _body_kind with mut;
+let is tree.Kind as _row_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("list view", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.event = fn_ptr(_event);
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.paint = fn_ptr(_paint);
+    _kind.role = access.ROLE_LIST;
+    _kind.access = fn_ptr(_access);
+    _body_kind = widget.kind("list body", sizeof(Body));
+    _body_kind.measure = fn_ptr(_body_measure);
+    _body_kind.arrange = fn_ptr(_body_arrange);
+    _row_kind = widget.kind("list row", sizeof(Row));
+    _row_kind.measure = fn_ptr(_row_measure);
+    _row_kind.arrange = fn_ptr(_row_arrange);
+    _row_kind.paint = fn_ptr(_row_paint);
+    _row_kind.role = access.ROLE_LIST_ITEM;
+    _row_kind.access = fn_ptr(_row_access);
+    _ready = 1;
+}
+
+// A new list view of m's rows — m stays where it is while the list has it —
+// as the last child of parent, choosing one row at a time. Its handle, or 0.
+fn create(t as *tree.Tree, parent as i64, m as *model.Model) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.mode = SINGLE;
+    d.cursor = 0 - 1;
+    d.anchor = 0 - 1;
+    d.reveal = 0 - 1;
+    d.area = scroll.create(t, w);
+    if (d.area == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    scroll.set_policy(t, d.area, scroll.NEVER, scroll.AUTO);
+    d.body = tree.create(t, &_body_kind, d.area);
+    if (d.body == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    cast(*Body, tree.data(t, d.body)).owner = w;
+    signal.connect(t, d.area, signal.VALUE_CHANGED, fn_ptr(_scrolled), cast(*u8, d));
+    tree.set_focusable(t, w, 1);
+    set_model(t, w, m);
+    return w;
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    if (cast(i64, d.m) != 0) { model.unobserve(d.m, d.obs); }
+    if (cast(i64, d.sel) != 0) { mem.core.munmap(cast(*u8, d.sel), d.capsel * sizeof(Range)); }
+    if (cast(i64, d.rows) != 0) { mem.core.munmap(cast(*u8, d.rows), d.caprows * 8); }
+    if (cast(i64, d.search) != 0) { mem.core.munmap(cast(*u8, d.search), sizeof(Search)); }
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn _row(t as *tree.Tree, w as i64) as *Row {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_row_kind)) { return cast(*Row, 0); }
+    return cast(*Row, tree.data(t, w));
+}
+
+// --- The model ---
+
+// Its rows from now on m's — or none for null — the selection and the cursor
+// gone with the old ones.
+fn set_model(t as *tree.Tree, w as i64, m as *model.Model) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    if (cast(i64, d.m) != 0) { model.unobserve(d.m, d.obs); }
+    d.m = m;
+    d.obs = 0;
+    if (cast(i64, m) != 0) { d.obs = model.observe(m, fn_ptr(_changed), cast(*u8, d)); }
+    _restart(t, d);
+}
+
+fn model_of(t as *tree.Tree, w as i64) as *model.Model {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return cast(*model.Model, 0); }
+    return d.m;
+}
+
+fn _count(d as *Data) as i64 {
+    if (cast(i64, d.m) == 0) { return 0; }
+    return model.count(d.m, 0);
+}
+
+// Everything read again: nothing chosen, no cursor, every row bound anew.
+fn _restart(t as *tree.Tree, d as *Data) as void {
+    let is i32 as had = cast(i32, d.nsel > 0);
+    d.nsel = 0;
+    d.cursor = 0 - 1;
+    d.anchor = 0 - 1;
+    d.reveal = 0 - 1;
+    d.n = _count(d);
+    _unbind_all(t, d);
+    widget.changed(t, d.body, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    if (had == 1) { signal.emit(t, d.self, signal.SELECTION_CHANGED, cast(*u8, 0)); }
+}
+
+fn _changed(user as *u8, c as *model.Change) as void {
+    let is *Data as d = cast(*Data, user);
+    let is *tree.Tree as t = d.t;
+    if (c.kind == model.RESET) {
+        _restart(t, d);
+        return;
+    }
+    if (c.parent != 0) { return; }
+    if (c.kind == model.INSERTED) {
+        d.n = d.n + c.count;
+        _sel_open(d, c.first, c.count);
+        if (d.cursor >= c.first) { d.cursor = d.cursor + c.count; }
+        if (d.anchor >= c.first) { d.anchor = d.anchor + c.count; }
+        _unbind_from(t, d, c.first);
+    } else if (c.kind == model.REMOVED) {
+        let is i64 as had = _sel_count(d);
+        d.n = d.n - c.count;
+        _sel_close(d, c.first, c.count);
+        d.cursor = _past_cut(d.cursor, c.first, c.count, d.n);
+        d.anchor = _past_cut(d.anchor, c.first, c.count, d.n);
+        _unbind_from(t, d, c.first);
+        if (_sel_count(d) != had) { signal.emit(t, d.self, signal.SELECTION_CHANGED, cast(*u8, 0)); }
+    } else if (c.kind == model.CHANGED) {
+        _unbind_range(t, d, c.first, c.first + c.count);
+    }
+    widget.changed(t, d.body, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// Where position i is once count rows at first are gone: those after them
+// move up, one among them goes to the row now there — or the last.
+fn _past_cut(i as i64, first as i64, count as i64, n as i64) as i64 {
+    if (i < first) { return i; }
+    if (i >= first + count) { return i - count; }
+    if (n == 0) { return 0 - 1; }
+    if (first >= n) { return n - 1; }
+    return first;
+}
+
+fn count(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.n;
+}
+
+// The id of the row at index, 0 for none.
+fn id_at(t as *tree.Tree, w as i64, index as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || index < 0 || index >= d.n) { return 0; }
+    return model.row_id(d.m, 0, index);
+}
+
+// --- The selection: sorted ranges of positions ---
+
+fn _grow(d as *Data, need as i64) as i32 {
+    if (need <= d.capsel) { return 1; }
+    let is i64 as cap with mut = 16;
+    while (cap < need) { cap = cap * 2; }
+    let is *u8 as p = mem.core.mmap_anon(cap * sizeof(Range));
+    if (cast(i64, p) <= 0) { return 0; }
+    if (cast(i64, d.sel) != 0) {
+        mem.memcpy(p, cast(*u8, d.sel), d.nsel * sizeof(Range));
+        mem.core.munmap(cast(*u8, d.sel), d.capsel * sizeof(Range));
+    }
+    d.sel = cast(*Range, p);
+    d.capsel = cap;
+    return 1;
+}
+
+// Ranges i to j replaced by the k at r. 0 when there is no room for them.
+fn _splice(d as *Data, i as i64, j as i64, r as *Range, k as i64) as i32 {
+    let is i64 as n = d.nsel - (j - i) + k;
+    if (_grow(d, n) == 0) { return 0; }
+    let is i64 as tail = d.nsel - j;
+    if (tail > 0) {
+        mem.core.memmove(cast(*u8, cast(i64, d.sel) + (i + k) * sizeof(Range)),
+                         cast(*u8, cast(i64, d.sel) + j * sizeof(Range)), tail * sizeof(Range));
+    }
+    let is i64 as q with mut = 0;
+    while (q < k) {
+        d.sel[i + q] = r[q];
+        q = q + 1;
+    }
+    d.nsel = n;
+    return 1;
+}
+
+fn _sel_has(d as *Data, i as i64) as i32 {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = d.nsel;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        if (d.sel[mid].b <= i) {
+            lo = mid + 1;
+        } else if (d.sel[mid].a > i) {
+            hi = mid;
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn _sel_count(d as *Data) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < d.nsel) {
+        k = k + d.sel[i].b - d.sel[i].a;
+        i = i + 1;
+    }
+    return k;
+}
+
+// Rows a to b chosen, joined with those they touch.
+fn _sel_add(d as *Data, a as i64, b as i64) as void {
+    if (a >= b) { return; }
+    let is i64 as i with mut = 0;
+    while (i < d.nsel && d.sel[i].b < a) { i = i + 1; }
+    let is Range as r;
+    r.a = a;
+    r.b = b;
+    let is i64 as j with mut = i;
+    while (j < d.nsel && d.sel[j].a <= b) {
+        if (d.sel[j].a < r.a) { r.a = d.sel[j].a; }
+        if (d.sel[j].b > r.b) { r.b = d.sel[j].b; }
+        j = j + 1;
+    }
+    _splice(d, i, j, &r, 1);
+}
+
+// Rows a to b not chosen.
+fn _sel_remove(d as *Data, a as i64, b as i64) as void {
+    if (a >= b) { return; }
+    let is i64 as i with mut = 0;
+    while (i < d.nsel && d.sel[i].b <= a) { i = i + 1; }
+    let is i64 as j with mut = i;
+    while (j < d.nsel && d.sel[j].a < b) { j = j + 1; }
+    if (i == j) { return; }
+    let is [2]Range as keep;
+    let is i64 as k with mut = 0;
+    if (d.sel[i].a < a) {
+        keep[k].a = d.sel[i].a;
+        keep[k].b = a;
+        k = k + 1;
+    }
+    if (d.sel[j - 1].b > b) {
+        keep[k].a = b;
+        keep[k].b = d.sel[j - 1].b;
+        k = k + 1;
+    }
+    _splice(d, i, j, cast(*Range, &keep), k);
+}
+
+// count rows inserted at first: those at it or after move down, a range
+// across it split, the new rows not chosen.
+fn _sel_open(d as *Data, first as i64, count as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < d.nsel) {
+        if (d.sel[i].a >= first) {
+            d.sel[i].a = d.sel[i].a + count;
+            d.sel[i].b = d.sel[i].b + count;
+        } else if (d.sel[i].b > first) {
+            let is [2]Range as two;
+            two[0].a = d.sel[i].a;
+            two[0].b = first;
+            two[1].a = first + count;
+            two[1].b = d.sel[i].b + count;
+            _splice(d, i, i + 1, cast(*Range, &two), 2);
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// count rows at first gone: unchosen, those after move up, joined where
+// they now touch.
+fn _sel_close(d as *Data, first as i64, count as i64) as void {
+    _sel_remove(d, first, first + count);
+    let is i64 as i with mut = 0;
+    while (i < d.nsel) {
+        if (d.sel[i].a >= first + count) {
+            d.sel[i].a = d.sel[i].a - count;
+            d.sel[i].b = d.sel[i].b - count;
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while (i < d.nsel) {
+        if (d.sel[i - 1].b == d.sel[i].a) {
+            let is Range as r;
+            r.a = d.sel[i - 1].a;
+            r.b = d.sel[i].b;
+            _splice(d, i - 1, i + 1, &r, 1);
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+// --- Choosing, for the program ---
+
+fn set_selection_mode(t as *tree.Tree, w as i64, mode as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.mode = mode;
+    if (mode == NONE && d.nsel > 0) {
+        d.nsel = 0;
+        _chosen(t, d);
+    }
+    if (mode == SINGLE && _sel_count(d) > 1) {
+        let is i64 as keep = d.sel[0].a;
+        d.nsel = 0;
+        _sel_add(d, keep, keep + 1);
+        _chosen(t, d);
+    }
+}
+
+fn selection_mode(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return NONE; }
+    return d.mode;
+}
+
+// The selection changed: drawn, and said.
+fn _chosen(t as *tree.Tree, d as *Data) as void {
+    tree.invalidate_paint(t, d.body);
+    signal.emit(t, d.self, signal.SELECTION_CHANGED, cast(*u8, 0));
+}
+
+fn is_selected(t as *tree.Tree, w as i64, index as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return _sel_has(d, index);
+}
+
+fn selected_count(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return _sel_count(d);
+}
+
+// The first row chosen at or after from, -1 for none: from 0, then from one
+// past each, every row chosen in order.
+fn next_selected(t as *tree.Tree, w as i64, from as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < d.nsel) {
+        if (d.sel[i].b > from) {
+            if (d.sel[i].a > from) { return d.sel[i].a; }
+            return from;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Rows a to b, b not among them, chosen — in SINGLE only a, the rest not.
+// Nothing in NONE.
+fn select_range(t as *tree.Tree, w as i64, a as i64, b as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.mode == NONE) { return; }
+    let is i64 as lo with mut = a;
+    let is i64 as hi with mut = b;
+    if (lo < 0) { lo = 0; }
+    if (hi > d.n) { hi = d.n; }
+    if (lo >= hi) { return; }
+    if (d.mode == SINGLE) {
+        d.nsel = 0;
+        hi = lo + 1;
+    }
+    _sel_add(d, lo, hi);
+    _chosen(t, d);
+}
+
+fn select(t as *tree.Tree, w as i64, index as i64) as void { select_range(t, w, index, index + 1); }
+
+fn unselect_range(t as *tree.Tree, w as i64, a as i64, b as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    let is i64 as had = _sel_count(d);
+    _sel_remove(d, a, b);
+    if (_sel_count(d) != had) { _chosen(t, d); }
+}
+
+fn unselect(t as *tree.Tree, w as i64, index as i64) as void { unselect_range(t, w, index, index + 1); }
+
+fn select_all(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.mode != MULTIPLE) { return; }
+    select_range(t, w, 0, d.n);
+}
+
+fn unselect_all(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.nsel == 0) { return; }
+    d.nsel = 0;
+    _chosen(t, d);
+}
+
+// Only the row at index chosen.
+fn _only(t as *tree.Tree, d as *Data, index as i64) as void {
+    if (d.mode == NONE) { return; }
+    if (d.nsel == 1 && d.sel[0].a == index && d.sel[0].b == index + 1) { return; }
+    d.nsel = 0;
+    _sel_add(d, index, index + 1);
+    _chosen(t, d);
+}
+
+// --- The cursor ---
+
+fn cursor(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    return d.cursor;
+}
+
+// The keyboard on row index, brought into view; the anchor there too.
+fn set_cursor(t as *tree.Tree, w as i64, index as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || index < 0 || index >= d.n) { return; }
+    _move_cursor(t, d, index);
+    d.anchor = index;
+}
+
+fn _move_cursor(t as *tree.Tree, d as *Data, index as i64) as void {
+    d.cursor = index;
+    tree.invalidate_paint(t, d.body);
+    _show_row(t, d, index);
+}
+
+// Scrolled just far enough for row index to be seen whole — once there is
+// a view to see it in.
+fn _show_row(t as *tree.Tree, d as *Data, index as i64) as void {
+    _settle(t, d);
+    let is f64 as vh = scroll.view_rect(t, d.area).h;
+    if (vh <= 0.0 || d.row_h <= 0.0) {
+        d.reveal = index;
+        return;
+    }
+    let is f64 as top = cast(f64, index) * d.row_h;
+    let is f64 as oy = scroll.offset_y(t, d.area);
+    if (top < oy) {
+        scroll.set_offset(t, d.area, 0.0, top);
+    } else if (top + d.row_h > oy + vh) {
+        scroll.set_offset(t, d.area, 0.0, top + d.row_h - vh);
+    }
+}
+
+// Row index at the top of the view, or as near as it goes.
+fn scroll_to_row(t as *tree.Tree, w as i64, index as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    _settle(t, d);
+    scroll.set_offset(t, d.area, 0.0, cast(f64, index) * d.row_h);
+}
+
+// Laid out first, when something waits — what changes inside marks the list
+// too: the rows' height and the area's view are known only then. Not before
+// the window has a size.
+fn _settle(t as *tree.Tree, d as *Data) as void {
+    if (tree.needs_layout(t, d.self) == 0 && d.row_h > 0.0) { return; }
+    let is math.rect.Rect as r = layout.rect(t, tree.root(t));
+    if (r.w <= 0.0 || r.h <= 0.0) { return; }
+    layout.run(t, r.w, r.h);
+}
+
+fn row_height(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return d.row_h;
+}
+
+// The row at window x, y, -1 for none.
+fn row_at(t as *tree.Tree, w as i64, x as f64, y as f64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.row_h <= 0.0) { return 0 - 1; }
+    let is math.rect.Rect as v = layout.window_rect(t, d.area);
+    if (x < v.x || x >= v.x + v.w || y < v.y || y >= v.y + v.h) { return 0 - 1; }
+    let is math.rect.Rect as b = layout.window_rect(t, d.body);
+    let is i64 as i = cast(i64, fm.floor((y - b.y) / d.row_h));
+    if (i < 0 || i >= d.n) { return 0 - 1; }
+    return i;
+}
+
+// The widget showing row index, 0 when it is not in view.
+fn row_widget(t as *tree.Tree, w as i64, index as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.nrows == 0 || index < 0) { return 0; }
+    let is i64 as rw = d.rows[index % d.nrows];
+    let is *Row as rd = _row(t, rw);
+    if (cast(i64, rd) == 0 || rd.index != index || tree.is_hidden_here(t, rw) == 1) { return 0; }
+    return rw;
+}
+
+// The row widget rw's row: its index, -1 for none.
+fn index_of_row(t as *tree.Tree, rw as i64) as i64 {
+    let is *Row as rd = _row(t, rw);
+    if (cast(i64, rd) == 0) { return 0 - 1; }
+    return rd.index;
+}
+
+// --- Rows of the program's making ---
+
+// setup(user, t, row) fills each new row widget, bind(user, t, row, id,
+// index) shows a row in one; the rows made so far made again.
+fn set_factory(t as *tree.Tree, w as i64, setup as SetupFn, bind as BindFn, user as *u8) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.setup = setup;
+    d.bind = bind;
+    d.fuser = user;
+    let is i64 as k with mut = 0;
+    while (k < d.nrows) {
+        tree.destroy(t, d.rows[k]);
+        k = k + 1;
+    }
+    d.nrows = 0;
+    d.row_h = 0.0;
+    widget.changed(t, d.body, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// The scroll area its rows are in.
+fn area(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.area;
+}
+
+// Rows wider than the view scrolled across (1), or cut to it (0, at first).
+fn set_horizontal(t as *tree.Tree, w as i64, on as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    if (on == 1) { scroll.set_policy(t, d.area, scroll.AUTO, scroll.AUTO); } else { scroll.set_policy(t, d.area, scroll.NEVER, scroll.AUTO); }
+}
+
+// Told as role, its rows as row_role — a tree, its tree items — instead of a
+// list of list items; 0 for those.
+fn set_roles(t as *tree.Tree, w as i64, role as i64, row_role as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.role = role;
+    d.row_role = row_role;
+}
+
+fn set_row_access(t as *tree.Tree, w as i64, cb as RowAccessFn, user as *u8) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.racc = cb;
+    d.racc_user = user;
+}
+
+// The keyboard to row index as an arrow key would move it there: alone
+// chosen, the anchor there, brought into view.
+fn go_to(t as *tree.Tree, w as i64, index as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || index < 0 || index >= d.n) { return; }
+    _go(t, d, index, 0);
+}
+
+// Label l showing row id's text in column of m — a number in its digits —
+// or nothing.
+fn show_text(t as *tree.Tree, l as i64, m as *model.Model, id as i64, column as i64) as void {
+    let is model.Value as v;
+    model.cell(m, id, column, model.TEXT, &v);
+    if (v.kind == model.V_TEXT) {
+        label.set_text(t, l, v.p, v.len);
+    } else if (v.kind == model.V_INT) {
+        let is [24]u8 as num;
+        let is i64 as k = _digits(v.i, cast(*u8, &num));
+        label.set_text(t, l, cast(*u8, &num), k);
+    } else {
+        label.set_text(t, l, "", 0);
+    }
+}
+
+// --- Rows made and bound ---
+
+fn _make_row(t as *tree.Tree, d as *Data) as i64 {
+    let is i64 as rw = tree.create(t, &_row_kind, d.body);
+    if (rw == 0) { return 0; }
+    let is *Row as rd = cast(*Row, tree.data(t, rw));
+    rd.owner = d.self;
+    rd.index = 0 - 1;
+    if (cast(i64, d.bind) != 0) {
+        if (cast(i64, d.setup) != 0) { call(d.setup, d.fuser, t, rw); }
+    } else {
+        rd.cell = label.create(t, rw, "", 0);
+        label.set_lines(t, rd.cell, 1, 1);
+        tree.set_labelled_by(t, rw, rd.cell);
+    }
+    return rw;
+}
+
+// At least k row widgets.
+fn _rows_for(t as *tree.Tree, d as *Data, k as i64) as void {
+    if (k <= d.nrows) { return; }
+    if (k > d.caprows) {
+        let is i64 as cap with mut = 16;
+        while (cap < k) { cap = cap * 2; }
+        let is *u8 as p = mem.core.mmap_anon(cap * 8);
+        if (cast(i64, p) <= 0) { return; }
+        if (cast(i64, d.rows) != 0) {
+            mem.memcpy(p, cast(*u8, d.rows), d.nrows * 8);
+            mem.core.munmap(cast(*u8, d.rows), d.caprows * 8);
+        }
+        d.rows = cast(*i64, p);
+        d.caprows = cap;
+    }
+    // A new count moves every row to another widget.
+    _unbind_all(t, d);
+    while (d.nrows < k) {
+        let is i64 as rw = _make_row(t, d);
+        if (rw == 0) { return; }
+        d.rows[d.nrows] = rw;
+        d.nrows = d.nrows + 1;
+    }
+}
+
+fn _unbind_all(t as *tree.Tree, d as *Data) as void {
+    let is i64 as k with mut = 0;
+    while (k < d.nrows) {
+        cast(*Row, tree.data(t, d.rows[k])).index = 0 - 1;
+        k = k + 1;
+    }
+}
+
+fn _unbind_from(t as *tree.Tree, d as *Data, first as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < d.nrows) {
+        let is *Row as rd = cast(*Row, tree.data(t, d.rows[k]));
+        if (rd.index >= first) { rd.index = 0 - 1; }
+        k = k + 1;
+    }
+}
+
+fn _unbind_range(t as *tree.Tree, d as *Data, a as i64, b as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < d.nrows) {
+        let is *Row as rd = cast(*Row, tree.data(t, d.rows[k]));
+        if (rd.index >= a && rd.index < b) { rd.index = 0 - 1; }
+        k = k + 1;
+    }
+}
+
+// The decimal digits of v into out, 24 bytes; how many.
+fn _digits(v as i64, out as *u8) as i64 {
+    let is [24]u8 as tmp;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    let is i32 as neg = cast(i32, v < 0);
+    if (x == 0) {
+        out[0] = cast(u8, 48);
+        return 1;
+    }
+    while (x != 0) {
+        let is i64 as q = x / 10;
+        let is i64 as digit with mut = x - q * 10;
+        if (digit < 0) { digit = 0 - digit; }
+        tmp[n] = cast(u8, 48 + digit);
+        n = n + 1;
+        x = q;
+    }
+    let is i64 as k with mut = 0;
+    if (neg == 1) {
+        out[0] = cast(u8, 45);
+        k = 1;
+    }
+    while (n > 0) {
+        n = n - 1;
+        out[k] = tmp[n];
+        k = k + 1;
+    }
+    return k;
+}
+
+// Row widget rw showing row index.
+fn _bind(t as *tree.Tree, d as *Data, rw as i64, index as i64) as void {
+    let is *Row as rd = cast(*Row, tree.data(t, rw));
+    rd.index = index;
+    rd.id = model.row_id(d.m, 0, index);
+    if (cast(i64, d.bind) != 0) {
+        call(d.bind, d.fuser, t, rw, rd.id, index);
+        return;
+    }
+    show_text(t, rd.cell, d.m, rd.id, 0);
+}
+
+// The rows in view bound and placed — from layout, and as it scrolls.
+fn _sync(t as *tree.Tree, d as *Data) as void {
+    if (d.row_h <= 0.0) { return; }
+    let is f64 as oy = scroll.offset_y(t, d.area);
+    let is f64 as vh = scroll.view_rect(t, d.area).h;
+    let is f64 as bw = layout.rect(t, d.body).w;
+    let is i64 as first with mut = cast(i64, fm.floor(oy / d.row_h));
+    if (first < 0) { first = 0; }
+    let is i64 as last with mut = cast(i64, fm.ceil((oy + vh) / d.row_h)) + SPARE;
+    if (last > d.n) { last = d.n; }
+    _rows_for(t, d, cast(i64, fm.ceil(vh / d.row_h)) + 1 + SPARE);
+    if (d.nrows == 0) { return; }
+    let is i64 as k with mut = 0;
+    while (k < d.nrows) {
+        // The row this widget is for now: the one in view at its slot.
+        let is i64 as rw = d.rows[k];
+        let is i64 as index with mut = first - first % d.nrows + k;
+        if (index < first) { index = index + d.nrows; }
+        if (index < last) {
+            let is *Row as rd = cast(*Row, tree.data(t, rw));
+            if (rd.index != index) { _bind(t, d, rw, index); }
+            if (tree.is_hidden_here(t, rw) == 1) { tree.set_visible(t, rw, 1); }
+            let is math.rect.Rect as at = math.rect.rect(0.0, cast(f64, index) * d.row_h, bw, d.row_h);
+            layout.place(t, rw, &at);
+        } else if (tree.is_hidden_here(t, rw) == 0) {
+            tree.set_visible(t, rw, 0);
+        }
+        k = k + 1;
+    }
+}
+
+fn _scrolled(t as *tree.Tree, a as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    _sync(t, d);
+}
+
+// --- Measuring and arranging ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    layout.measure(t, d.area, c, out);
+}
+
+// The area over all of it; then the rows for the view it now has — which
+// can change with the rows' extent staying the same — and the row waiting
+// to be shown, if one is.
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, r.w, r.h);
+    layout.place(t, d.area, &all);
+    _sync(t, d);
+    if (d.reveal >= 0) {
+        let is i64 as i = d.reveal;
+        d.reveal = 0 - 1;
+        _show_row(t, d, i);
+    }
+}
+
+// What a row would like: the first row's, bound to the first row when there
+// is one.
+fn _row_size(t as *tree.Tree, d as *Data) as geom.Size {
+    let is geom.Size as s;
+    geom.size_zero(&s);
+    _rows_for(t, d, 1);
+    if (d.nrows == 0) { return s; }
+    let is i64 as rw = d.rows[0];
+    let is *Row as rd = cast(*Row, tree.data(t, rw));
+    if (d.n > 0 && rd.index < 0) { _bind(t, d, rw, 0); }
+    // Measured whether or not it is in view now.
+    let is geom.Constraint as free = geom.unbounded();
+    layout.measure_hidden(t, rw, &free, &s);
+    return s;
+}
+
+// As tall as all the rows, as wide as a row would like.
+fn _body_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, tree.data(t, cast(*Body, data).owner));
+    let is geom.Size as rs = _row_size(t, d);
+    d.row_h = rs.pref_h;
+    geom.size_zero(out);
+    out.pref_w = rs.pref_w;
+    out.pref_h = cast(f64, d.n) * d.row_h;
+    out.min_h = out.pref_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = out.pref_h;
+}
+
+fn _body_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, tree.data(t, cast(*Body, data).owner));
+    _sync(t, d);
+}
+
+fn _row_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as px = th.metrics.control_pad_x;
+    let is f64 as py = th.metrics.space_xs;
+    geom.size_zero(out);
+    let is geom.Constraint as free = geom.unbounded();
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is geom.Size as s;
+        layout.measure(t, ch, &free, &s);
+        out.pref_w = _max(out.pref_w, s.pref_w);
+        out.pref_h = _max(out.pref_h, s.pref_h);
+        ch = tree.next_sibling(t, ch);
+    }
+    out.pref_w = out.pref_w + 2.0 * px;
+    out.pref_h = out.pref_h + 2.0 * py;
+    out.min_h = out.pref_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+// What is in it across its padding, each at its own height in the middle.
+fn _row_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as px = th.metrics.control_pad_x;
+    let is geom.Constraint as free = geom.unbounded();
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is geom.Size as s;
+        layout.measure(t, ch, &free, &s);
+        let is math.rect.Rect as at = math.rect.rect(px, (r.h - s.pref_h) / 2.0, _max(0.0, r.w - 2.0 * px), s.pref_h);
+        layout.place(t, ch, &at);
+        ch = tree.next_sibling(t, ch);
+    }
+}
+
+// --- Keys, the pointer, typing ---
+
+fn _router(t as *tree.Tree) as *router.Router { return cast(*router.Router, tree.router(t)); }
+
+fn _activate(t as *tree.Tree, d as *Data, index as i64) as void {
+    if (index < 0 || index >= d.n) { return; }
+    let is i64 as id = model.row_id(d.m, 0, index);
+    signal.emit(t, d.self, signal.ACTIVATED, cast(*u8, &id));
+}
+
+// The cursor to index — clamped to the rows — as the keys move it: alone
+// chosen, or from the anchor with Shift, or nothing chosen with Control.
+fn _go(t as *tree.Tree, d as *Data, index as i64, mods as i32) as void {
+    if (d.n == 0) { return; }
+    let is i64 as to with mut = index;
+    if (to < 0) { to = 0; }
+    if (to >= d.n) { to = d.n - 1; }
+    _move_cursor(t, d, to);
+    let is i32 as shift = cast(i32, (mods & keys.MOD_SHIFT) != 0);
+    let is i32 as ctrl = cast(i32, (mods & keys.MOD_CONTROL) != 0);
+    if (ctrl == 1 && d.mode == MULTIPLE) { return; }
+    if (shift == 1 && d.mode == MULTIPLE && d.anchor >= 0) {
+        let is i64 as a with mut = d.anchor;
+        let is i64 as b with mut = to;
+        if (b < a) {
+            a = to;
+            b = d.anchor;
+        }
+        d.nsel = 0;
+        _sel_add(d, a, b + 1);
+        _chosen(t, d);
+        return;
+    }
+    d.anchor = to;
+    _only(t, d, to);
+}
+
+// Rows in a view's height.
+fn _page(t as *tree.Tree, d as *Data) as i64 {
+    if (d.row_h <= 0.0) { return 1; }
+    let is i64 as k = cast(i64, fm.floor(scroll.view_rect(t, d.area).h / d.row_h));
+    if (k < 1) { return 1; }
+    return k;
+}
+
+fn _key(t as *tree.Tree, d as *Data, e as *event.Event) as i64 {
+    let is i32 as mods = e.mods & (keys.MOD_SHIFT | keys.MOD_CONTROL | keys.MOD_ALT | keys.MOD_SUPER);
+    let is i32 as plain = mods & (keys.MOD_SHIFT | keys.MOD_CONTROL);
+    if (mods != plain) { return 0; }
+    let is i64 as at with mut = d.cursor;
+    let is i32 as k = e.key;
+    if (k == keys.DOWN) {
+        if (at < 0) { at = 0 - 1; }
+        _go(t, d, at + 1, mods);
+        return 1;
+    }
+    if (k == keys.UP) {
+        if (at < 0) { at = d.n; }
+        _go(t, d, at - 1, mods);
+        return 1;
+    }
+    if (k == keys.HOME) {
+        _go(t, d, 0, mods);
+        return 1;
+    }
+    if (k == keys.END) {
+        _go(t, d, d.n - 1, mods);
+        return 1;
+    }
+    if (k == keys.PAGE_DOWN) {
+        _go(t, d, at + _page(t, d), mods);
+        return 1;
+    }
+    if (k == keys.PAGE_UP) {
+        _go(t, d, at - _page(t, d), mods);
+        return 1;
+    }
+    if (k == keys.SPACE && at >= 0) {
+        if (mods == keys.MOD_CONTROL && d.mode == MULTIPLE) {
+            if (_sel_has(d, at) == 1) { _sel_remove(d, at, at + 1); } else { _sel_add(d, at, at + 1); }
+            d.anchor = at;
+            _chosen(t, d);
+            return 1;
+        }
+        if (mods == 0) {
+            if (_sel_has(d, at) == 0) {
+                if (d.mode == SINGLE) { d.nsel = 0; }
+                if (d.mode != NONE) {
+                    _sel_add(d, at, at + 1);
+                    _chosen(t, d);
+                }
+            }
+            d.anchor = at;
+            return 1;
+        }
+    }
+    if (k == keys.RETURN && mods == 0 && at >= 0) {
+        _activate(t, d, at);
+        return 1;
+    }
+    if (k == keys.A && d.mode == MULTIPLE) {
+        if (mods == keys.MOD_CONTROL) {
+            select_all(t, d.self);
+            return 1;
+        }
+        if (mods == (keys.MOD_CONTROL | keys.MOD_SHIFT)) {
+            unselect_all(t, d.self);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// The pointer pressed on row index.
+fn _press(t as *tree.Tree, d as *Data, index as i64, e as *event.Event) as void {
+    let is i32 as shift = cast(i32, (e.mods & keys.MOD_SHIFT) != 0);
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    if (e.button == 3) {
+        // The menu is for what is chosen: a row not among it chosen alone.
+        if (_sel_has(d, index) == 0) { _go(t, d, index, 0); }
+        return;
+    }
+    if (ctrl == 1 && d.mode == MULTIPLE) {
+        _move_cursor(t, d, index);
+        if (_sel_has(d, index) == 1) { _sel_remove(d, index, index + 1); } else { _sel_add(d, index, index + 1); }
+        d.anchor = index;
+        _chosen(t, d);
+        return;
+    }
+    if (shift == 1) {
+        _go(t, d, index, keys.MOD_SHIFT);
+    } else {
+        _go(t, d, index, 0);
+    }
+    if (e.clicks == 2 && e.button == 1) { _activate(t, d, index); }
+}
+
+fn _lower(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// Whether row index's text starts with the n bytes at s, ASCII letters
+// either case.
+fn _starts(d as *Data, index as i64, s as *u8, n as i64) as i32 {
+    let is model.Value as v;
+    model.cell(d.m, model.row_id(d.m, 0, index), 0, model.TEXT, &v);
+    if (v.kind != model.V_TEXT || v.len < n) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (_lower(cast(i64, v.p[i])) != _lower(cast(i64, s[i]))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Text typed: the next row it starts — from the cursor, or past it when the
+// same letter is typed again.
+fn _typed(t as *tree.Tree, d as *Data, e as *event.Event) as i64 {
+    if (d.n == 0 || e.text_len <= 0) { return 0; }
+    if (cast(i64, d.search) == 0) {
+        let is *u8 as p = mem.core.mmap_anon(sizeof(Search));
+        if (cast(i64, p) <= 0) { return 0; }
+        d.search = cast(*Search, p);
+    }
+    let is *Search as s = d.search;
+    if (e.time - s.time > SEARCH_MS) { s.len = 0; }
+    s.time = e.time;
+    let is i64 as n with mut = e.text_len;
+    if (s.len + n > MAX_SEARCH) { n = MAX_SEARCH - s.len; }
+    mem.memcpy(cast(*u8, cast(i64, &s.text) + s.len), e.text, n);
+    s.len = s.len + n;
+    // The same letter again and again: on to the next row it starts.
+    let is i32 as again with mut = cast(i32, s.len > 1);
+    let is i64 as q with mut = 1;
+    while (q < s.len) {
+        if (s.text[q] != s.text[0]) { again = 0; }
+        q = q + 1;
+    }
+    let is *u8 as want = cast(*u8, &s.text);
+    let is i64 as wn with mut = s.len;
+    if (again == 1) { wn = 1; }
+    let is i64 as from with mut = d.cursor;
+    if (from < 0) { from = 0; }
+    if (again == 1 || (s.len == 1 && d.cursor >= 0 && _starts(d, d.cursor, want, wn) == 1)) { from = from + 1; }
+    let is i64 as k with mut = 0;
+    while (k < d.n) {
+        let is i64 as i = (from + k) % d.n;
+        if (_starts(d, i, want, wn) == 1) {
+            _go(t, d, i, 0);
+            return 1;
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (e.kind == event.KEY_DOWN) { return _key(t, d, e); }
+    if (e.kind == event.TEXT) { return _typed(t, d, e); }
+    if (e.kind == event.POINTER_DOWN && (e.button == 1 || e.button == 3)) {
+        let is i64 as i = row_at(t, w, e.x, e.y);
+        if (i < 0) { return 0; }
+        _press(t, d, i, e);
+        // The right button goes on, for whoever shows a menu.
+        return cast(i64, e.button == 1);
+    }
+    return 0;
+}
+
+// --- Drawn ---
+
+// With a row the keyboard is on, the ring is that row's, not the list's.
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    if (d.cursor >= 0 && d.cursor < d.n) { p.focus_drawn = 1; }
+}
+
+// In the theme's row look — chosen or not, under the pointer, held — and
+// ringed when the keyboard is on it and the list has the focus by keyboard.
+fn _row_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Row as rd = cast(*Row, data);
+    let is *Data as d = cast(*Data, tree.data(t, rd.owner));
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as r = p.rect;
+    let is style.Look as look = style.pick(&th.row, p.state, _sel_has(d, rd.index));
+    if (look.bg.a > 0.0) { shapes.fill_rect(p.canvas, r.x, r.y, r.w, r.h, look.bg); }
+    p.fg = look.fg;
+    let is *router.Router as rt = _router(t);
+    if (rd.index == d.cursor && cast(i64, rt) != 0 && router.focused(t, rt) == rd.owner && router.focus_visible(rt) == 1) {
+        shapes.stroke_rounded(p.canvas, r.x, r.y, r.w, r.h, 0.0, 0.0, 0.0, 0.0, th.metrics.focus_width, th.palette.focus);
+    }
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        if (d.role != 0) { q.role = d.role; }
+        q.states = q.states | access.VERTICAL;
+        if (d.mode == MULTIPLE) { q.states = q.states | access.MULTISELECTABLE; }
+    }
+    return 1;
+}
+
+fn _row_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Row as rd = cast(*Row, data);
+    let is *Data as d = cast(*Data, tree.data(t, rd.owner));
+    if (q.action == access.ASK) {
+        if (d.row_role != 0) { q.role = d.row_role; }
+        q.actions = access.PRESS;
+        if (d.mode != NONE) {
+            q.states = q.states | access.SELECTABLE;
+            q.actions = q.actions | access.SELECT;
+        }
+        if (_sel_has(d, rd.index) == 1) { q.states = q.states | access.SELECTED; }
+        if (cast(i64, d.racc) != 0) { call(d.racc, d.racc_user, t, w, rd.index, q); }
+        return 1;
+    }
+    if (q.action != access.PRESS && q.action != access.SELECT && cast(i64, d.racc) != 0) {
+        return call(d.racc, d.racc_user, t, w, rd.index, q);
+    }
+    if (q.action == access.PRESS) { _activate(t, d, rd.index); }
+    if (q.action == access.SELECT) {
+        if (d.mode == MULTIPLE) {
+            select(t, rd.owner, rd.index);
+        } else {
+            _only(t, d, rd.index);
+        }
+        d.anchor = rd.index;
+        d.cursor = rd.index;
+    }
+    return 1;
+}
