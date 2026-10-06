@@ -1,0 +1,206 @@
+// window/x11/dialog_test.cst — a dialog window: transient for the window it
+// belongs to, of the dialog type, modal when asked, against a real server,
+// the test playing the window manager on a second connection.
+//
+// What a window manager sees of a dialog is what is on it when it asks to be
+// mapped: WM_TRANSIENT_FOR, _NET_WM_WINDOW_TYPE and _NET_WM_STATE. So the
+// test holds the map — SubstructureRedirect on the root turns it into a
+// MapRequest — reads them there, and maps the window itself, as a window
+// manager would. Being modal later is asked by a client message, read there
+// too.
+//
+// Run by tools/run_headless.sh. Exit code is the number of failures.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "bind/x.cst" as x;
+use "bind/xlib.cst" as xlib;
+use "bind/xevent.cst" as xev;
+use "x11.cst" as x11;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        fails = fails + 1;
+        io.printf("  FAIL %s\n", name);
+    }
+}
+
+fn settle(w as *x11.window.Window, ms as i64) as void {
+    let is i64 as deadline = time.now_ns() + ms * 1000000;
+    while (time.now_ns() < deadline) {
+        if (x11.next_frame(w) == 0) { return; }
+    }
+}
+
+let is *u8 as wm with mut;
+let is i64 as root with mut = 0;
+let is xev.XEvent as got;
+
+fn atom(name as *u8) as i64 { return xlib.XInternAtom(wm, name, 0); }
+
+// The next event of kind k on the window manager's connection, within a
+// second; 0 for none.
+fn next(k as i32) as i32 {
+    let is i64 as deadline = time.now_ns() + 1000000000;
+    while (time.now_ns() < deadline) {
+        while (xlib.XPending(wm) > 0) {
+            xlib.XNextEvent(wm, cast(*u8, &got));
+            if (xev.kind(&got) == k) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+let is i64 as _type with mut = 0;
+let is i32 as _format with mut = 0;
+let is i64 as _n with mut = 0;
+let is i64 as _after with mut = 0;
+let is *u8 as _data with mut;
+
+fn longs(xid as i64, p as i64) as i64 {
+    _data = cast(*u8, 0);
+    if (xlib.XGetWindowProperty(wm, xid, p, 0, 64, 0, 0, cast(*u8, &_type), cast(*u8, &_format), cast(*u8, &_n),
+                                cast(*u8, &_after), cast(*u8, &_data)) != 0) { return 0; }
+    if (cast(i64, _data) == 0) { return 0; }
+    return _n;
+}
+
+fn long_at(i as i64) as i64 { return *cast(*i64, cast(i64, _data) + i * 8); }
+
+fn done() as void {
+    if (cast(i64, _data) != 0) { xlib.XFree(_data); }
+    _data = cast(*u8, 0);
+}
+
+fn has(xid as i64, p as i64, want as i64) as i32 {
+    let is i64 as n = longs(xid, p);
+    let is i32 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (long_at(i) == want) { found = 1; }
+        i = i + 1;
+    }
+    done();
+    return found;
+}
+
+// Mapped as a window manager maps one: WM_STATE says NormalState, which is
+// what tells a client its window is no longer withdrawn (ICCCM 4.1.3.1).
+let is [2]i64 as _wm_state;
+
+fn manage(xid as i64) as void {
+    xlib.XMapWindow(wm, xid);
+    _wm_state[0] = 1;
+    _wm_state[1] = 0;
+    let is i64 as a = atom("WM_STATE");
+    xlib.XChangeProperty(wm, xid, a, a, 32, x.PropModeReplace, cast(*u8, &_wm_state), 2);
+    xlib.XSync(wm, 0);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    let is x11.window.Window as main_w = x11.open("caustic-dialog-owner", 320, 240);
+    if (x11.is_open(&main_w) == 0) {
+        io.printf("  FAIL open: %s\n", x11.error_name(x11.last_error(&main_w)));
+        return 1;
+    }
+    settle(&main_w, 200);
+    wm = xlib.XOpenDisplay(cast(*u8, 0));
+    root = xlib.XDefaultRootWindow(wm);
+    xlib.XSelectInput(wm, root, x.SubstructureRedirectMask | x.SubstructureNotifyMask);
+    xlib.XSync(wm, 0);
+    let is i64 as owner = x11.xid(&main_w);
+    let is i64 as wtype = atom("_NET_WM_WINDOW_TYPE");
+    let is i64 as net_state = atom("_NET_WM_STATE");
+    let is i64 as modal = atom("_NET_WM_STATE_MODAL");
+
+    // --- A plain window: none of it ---
+    chk("a plain window: transient for nothing", x11.transient_for(&main_w) == 0 && longs(owner, wtype) == 0);
+    done();
+
+    // --- A modal dialog: all of it, before it is mapped ---
+    let is x11.window.Config as c with mut = x11.config("caustic-dialog", 200, 120);
+    c.transient_for = owner;
+    c.dialog = 1;
+    c.modal = 1;
+    let is x11.window.Window as dlg = x11.open_with(&c);
+    chk("opened", x11.is_open(&dlg) == 1);
+    let is i64 as dx = x11.xid(&dlg);
+    chk("its map held: the window manager asked", next(x.MapRequest) == 1 && xev.map_request(&got).window == dx);
+    chk("transient for its owner", x11.transient_for(&dlg) == owner);
+    chk("a dialog by its type", has(dx, wtype, atom("_NET_WM_WINDOW_TYPE_DIALOG")) == 1);
+    chk("modal from the start", has(dx, net_state, modal) == 1);
+    chk("read back: modal, the owner not", x11.modal(&dlg) == 1 && x11.modal(&main_w) == 0);
+    manage(dx);
+    settle(&dlg, 100);
+
+    // --- Modal no longer, once mapped: asked of the window manager ---
+    chk("asked", x11.set_modal(&dlg, 0) == 1);
+    chk("_NET_WM_STATE: remove modal", next(x.ClientMessage) == 1 && xev.client(&got).message_type == net_state &&
+        xev.client(&got).window == dx && xev.client(&got).data[0] == 0 && xev.client(&got).data[1] == modal);
+    x11.set_modal(&dlg, 1);
+    chk("and add it again", next(x.ClientMessage) == 1 && xev.client(&got).data[0] == 1 && xev.client(&got).data[1] == modal);
+
+    // --- A dialog not modal, owned: transient, a dialog, not modal ---
+    let is x11.window.Config as c2 with mut = x11.config("caustic-dialog-2", 200, 120);
+    c2.transient_for = owner;
+    c2.dialog = 1;
+    let is x11.window.Window as d2 = x11.open_with(&c2);
+    let is i64 as d2x = x11.xid(&d2);
+    chk("not modal: held, transient, a dialog, not modal", next(x.MapRequest) == 1 && x11.transient_for(&d2) == owner &&
+        has(d2x, wtype, atom("_NET_WM_WINDOW_TYPE_DIALOG")) == 1 && has(d2x, net_state, modal) == 0);
+
+    // --- Withdrawn, it is the client's to change: the property itself ---
+    let is i64 as above = atom("_NET_WM_STATE_ABOVE");
+    let is i64 as sticky = atom("_NET_WM_STATE_STICKY");
+    _wm_state[0] = above;
+    _wm_state[1] = sticky;
+    xlib.XChangeProperty(wm, d2x, net_state, atom("ATOM"), 32, x.PropModeReplace, cast(*u8, &_wm_state), 2);
+    xlib.XSync(wm, 0);
+    chk("modal while withdrawn: said on the window", x11.set_modal(&d2, 1) == 1 && has(d2x, net_state, modal) == 1 &&
+        has(d2x, net_state, above) == 1 && has(d2x, net_state, sticky) == 1);
+    x11.set_modal(&d2, 1);
+    chk("said once", longs(d2x, net_state) == 3);
+    done();
+    x11.set_modal(&d2, 0);
+    chk("and taken off again, the rest left", has(d2x, net_state, modal) == 0 && has(d2x, net_state, above) == 1 &&
+        has(d2x, net_state, sticky) == 1);
+    manage(d2x);
+
+
+    // --- Each of the three alone is enough to be asked for ---
+    let is x11.window.Config as c3 with mut = x11.config("caustic-owned", 100, 80);
+    c3.transient_for = owner;
+    let is x11.window.Window as w3 = x11.open_with(&c3);
+    chk("only owned: transient, not a dialog, not modal", next(x.MapRequest) == 1 && x11.transient_for(&w3) == owner &&
+        longs(x11.xid(&w3), wtype) == 0 && has(x11.xid(&w3), net_state, modal) == 0);
+    done();
+    let is x11.window.Config as c4 with mut = x11.config("caustic-lone-dialog", 100, 80);
+    c4.dialog = 1;
+    let is x11.window.Window as w4 = x11.open_with(&c4);
+    chk("only a dialog: of the type, owned by nothing", next(x.MapRequest) == 1 && x11.transient_for(&w4) == 0 &&
+        has(x11.xid(&w4), wtype, atom("_NET_WM_WINDOW_TYPE_DIALOG")) == 1);
+    let is x11.window.Config as c5 with mut = x11.config("caustic-lone-modal", 100, 80);
+    c5.modal = 1;
+    let is x11.window.Window as w5 = x11.open_with(&c5);
+    chk("only modal: modal, of no type", next(x.MapRequest) == 1 && has(x11.xid(&w5), net_state, modal) == 1 &&
+        longs(x11.xid(&w5), wtype) == 0);
+    done();
+    x11.close(&w5);
+    x11.close(&w4);
+    x11.close(&w3);
+
+    xlib.XCloseDisplay(wm);
+    x11.close(&d2);
+    chk("closed: owned by nothing, nothing asked, not modal",
+        x11.transient_for(&d2) == 0 && x11.set_modal(&d2, 1) == 0 && x11.modal(&d2) == 0);
+    x11.close(&dlg);
+    x11.close(&main_w);
+    if (fails == 0) {
+        io.printf("x11 dialog: all checks passed\n");
+        return 0;
+    }
+    io.printf("x11 dialog: %d failures\n", fails);
+    return fails;
+}
