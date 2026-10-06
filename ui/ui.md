@@ -1082,7 +1082,9 @@ window's height. Open, it is the router's modal scope: Tab goes round what it
 holds, a press outside or Escape closes it, and the focus goes to the first
 of what it holds, to the popup, or stays where it is (`KEEP_FOCUS`, what has
 it let through the scope), coming back when it closes. CLOSED says it
-closed. What combo boxes drop down, and popovers later.
+closed. With an arrow (`set_arrow`) it is a popover: an `ARROW`-long point on
+the side facing what it was opened against, at that rectangle's middle as
+near as its corners let it, moving to the other side when flipped.
 
 **Combo boxes** (`widgets/combo.cst`, tested by `combo_test`): the chosen row
 of a flat model in a control with an arrow; pressed, or Space, Enter,
@@ -1095,6 +1097,13 @@ end: the button, Alt+Down or F4 show all the rows; typing shows the rows its
 text starts, the focus staying in the entry, Up and Down moving through them
 and Enter or a click taking one's text. VALUE_CHANGED says another row is
 chosen. Told as a combo box, editable when typed in, expanded while open.
+
+**Menu buttons** (`widgets/menubutton.cst`, tested by `menubutton_test`): a
+control titled with a mnemonic, an arrow at its end, opening a menu under it
+flush with its start, or a popover under it, centred, the focus on the first
+of what it holds — on a press, Space, Enter, Down or its mnemonic, a menu
+opened by the keys with its first item chosen. Drawn pressed while open;
+told as a button that expands, expanded while open.
 
 ## For scale
 
@@ -1126,8 +1135,8 @@ widget set applications actually use, done properly, not parity.
    composed text. *Done, with the text view.*
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
    *Scroll areas, tabs, splitters, stacks and assistants, expanders, toolbars,
-   status bars, header bars, menus and menu bars, lists, trees, tables and
-   combo boxes done; popovers and dialogs next.*
+   status bars, header bars, menus and menu bars, lists, trees, tables, combo
+   boxes, popovers and menu buttons done; dialogs next.*
 7. **The accessibility bridges**, AT-SPI first.
 
 ## Not now, and deliberately
