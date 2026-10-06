@@ -1,0 +1,383 @@
+// ui/sortmodel.cst — a flat model's rows in the order of one of its columns.
+//
+// A sort model shows the rows of another flat model (rows under parent 0) as
+// a flat model of its own, ordered by a column: by each row's SORT value in
+// it when the model gives one, else by its TEXT — numbers as numbers, text
+// with ASCII letters' case aside — up or down, rows that compare equal in the
+// order the model has them, whichever way. Unsorted, it is the model's order.
+// A table's header sorts it through hook().
+//
+// The model's changes are passed on where the rows stand now: rows inserted
+// go where they sort, each said there; rows removed are said gone from where
+// they stood; a row changed is said changed where it stands, or gone and
+// inserted when it now sorts elsewhere; a reset sorts everything again.
+// Sorting again is said as a reset.
+use "std/mem.cst" as mem;
+use "model.cst" as model;
+
+let is i32 as NONE       with imut = 0;
+let is i32 as ASCENDING  with imut = 1;
+let is i32 as DESCENDING with imut = 2;
+
+let is i64 as KEY_BYTES with imut = 256;   // of a text compared, the first kept
+
+// A row: its id, and where the model has it.
+struct Ent {
+    id  as i64;
+    src as i64;
+}
+
+struct Sort {
+    src    as *model.Model;
+    obs    as i64;
+    out    as model.Model;   // what views read
+    n      as i64;
+    cap    as i64;
+    rows   as *Ent;          // in the order shown
+    tmp    as *Ent;          // room to merge in
+    column as i64;           // -1 unsorted
+    order  as i32;
+    _pad0  as i32;
+}
+
+// src's rows, unsorted, as a flat model (model_of). src stays where it is
+// while this has it. Null when memory is refused.
+fn open(src as *model.Model) as *Sort {
+    let is *u8 as p = mem.core.mmap_anon(sizeof(Sort));
+    if (cast(i64, p) <= 0) { return cast(*Sort, 0); }
+    let is *Sort as s = cast(*Sort, p);
+    s.src = src;
+    s.column = 0 - 1;
+    s.order = NONE;
+    s.out = model.make(p, fn_ptr(_count), fn_ptr(_row_id), fn_ptr(_cell));
+    s.out.columns = fn_ptr(_columns);
+    s.out.index_of = fn_ptr(_index_of);
+    s.out.set_cell = fn_ptr(_set_cell);
+    s.obs = model.observe(src, fn_ptr(_changed), p);
+    _read(s);
+    return s;
+}
+
+fn close(s as *Sort) as void {
+    if (cast(i64, s) == 0) { return; }
+    model.unobserve(s.src, s.obs);
+    if (cast(i64, s.rows) != 0) {
+        mem.core.munmap(cast(*u8, s.rows), s.cap * sizeof(Ent));
+        mem.core.munmap(cast(*u8, s.tmp), s.cap * sizeof(Ent));
+    }
+    mem.core.munmap(cast(*u8, s), sizeof(Sort));
+}
+
+fn model_of(s as *Sort) as *model.Model { return &s.out; }
+
+fn column(s as *Sort) as i64 { return s.column; }
+
+fn order(s as *Sort) as i32 { return s.order; }
+
+// Where the model has the row shown at i, -1 past the rows.
+fn source_index(s as *Sort, i as i64) as i64 {
+    if (i < 0 || i >= s.n) { return 0 - 1; }
+    return s.rows[i].src;
+}
+
+// --- Room ---
+
+fn _room(s as *Sort, need as i64) as i32 {
+    if (need <= s.cap) { return 1; }
+    let is i64 as cap with mut = 64;
+    while (cap < need) { cap = cap * 2; }
+    let is *u8 as a = mem.core.mmap_anon(cap * sizeof(Ent));
+    if (cast(i64, a) <= 0) { return 0; }
+    let is *u8 as b = mem.core.mmap_anon(cap * sizeof(Ent));
+    if (cast(i64, b) <= 0) {
+        mem.core.munmap(a, cap * sizeof(Ent));
+        return 0;
+    }
+    if (cast(i64, s.rows) != 0) {
+        mem.memcpy(a, cast(*u8, s.rows), s.n * sizeof(Ent));
+        mem.core.munmap(cast(*u8, s.rows), s.cap * sizeof(Ent));
+        mem.core.munmap(cast(*u8, s.tmp), s.cap * sizeof(Ent));
+    }
+    s.rows = cast(*Ent, a);
+    s.tmp = cast(*Ent, b);
+    s.cap = cap;
+    return 1;
+}
+
+// Every row read again from the model, then sorted.
+fn _read(s as *Sort) as void {
+    let is i64 as n = model.count(s.src, 0);
+    s.n = 0;
+    if (_room(s, n) == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        s.rows[i].id = model.row_id(s.src, 0, i);
+        s.rows[i].src = i;
+        i = i + 1;
+    }
+    s.n = n;
+    _sort_all(s);
+}
+
+// --- Comparing ---
+
+// The value row id is sorted by: its SORT in the column, else its TEXT.
+fn _key(s as *Sort, id as i64, out as *model.Value) as void {
+    if (model.cell(s.src, id, s.column, model.SORT, out) == 1) { return; }
+    model.cell(s.src, id, s.column, model.TEXT, out);
+}
+
+// Nothing, then numbers, then text.
+fn _rank(v as *model.Value) as i64 {
+    if (v.kind == model.V_INT || v.kind == model.V_FLOAT || v.kind == model.V_BOOL || v.kind == model.V_HANDLE) { return 1; }
+    if (v.kind == model.V_TEXT) { return 2; }
+    return 0;
+}
+
+fn _number(v as *model.Value) as f64 {
+    if (v.kind == model.V_FLOAT) { return v.f; }
+    return cast(f64, v.i);
+}
+
+fn _fold(c as i64) as i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// Below 0, 0 or above as row a sorts before, with or after row b in the
+// column, upwards.
+fn _by_column(s as *Sort, a as *Ent, b as *Ent) as i64 {
+    let is model.Value as va;
+    _key(s, a.id, &va);
+    // Kept: the model may hand both texts from one place.
+    let is [256]u8 as at;
+    let is i64 as an with mut = 0;
+    if (va.kind == model.V_TEXT) {
+        an = va.len;
+        if (an > KEY_BYTES) { an = KEY_BYTES; }
+        mem.memcpy(cast(*u8, &at), va.p, an);
+    }
+    let is model.Value as vb;
+    _key(s, b.id, &vb);
+    let is i64 as ra = _rank(&va);
+    let is i64 as rb = _rank(&vb);
+    if (ra != rb) { return ra - rb; }
+    if (ra == 1) {
+        let is f64 as x = _number(&va);
+        let is f64 as y = _number(&vb);
+        if (x < y) { return 0 - 1; }
+        if (x > y) { return 1; }
+        return 0;
+    }
+    if (ra == 2) {
+        let is i64 as bn with mut = vb.len;
+        if (bn > KEY_BYTES) { bn = KEY_BYTES; }
+        let is i64 as i with mut = 0;
+        while (i < an && i < bn) {
+            let is i64 as x = _fold(cast(i64, at[i]));
+            let is i64 as y = _fold(cast(i64, vb.p[i]));
+            if (x != y) { return x - y; }
+            i = i + 1;
+        }
+        return an - bn;
+    }
+    return 0;
+}
+
+// Below 0 when row a goes before row b: by the column, up or down; equal,
+// in the model's order.
+fn _cmp(s as *Sort, a as *Ent, b as *Ent) as i64 {
+    if (s.order != NONE && s.column >= 0) {
+        let is i64 as r with mut = _by_column(s, a, b);
+        if (s.order == DESCENDING) { r = 0 - r; }
+        if (r != 0) { return r; }
+    }
+    return a.src - b.src;
+}
+
+// --- Sorting ---
+
+// Rows lo to hi, hi not among them, sorted: merged from halves, so equal
+// rows keep their order.
+fn _merge_sort(s as *Sort, lo as i64, hi as i64) as void {
+    if (hi - lo < 2) { return; }
+    let is i64 as mid = (lo + hi) / 2;
+    _merge_sort(s, lo, mid);
+    _merge_sort(s, mid, hi);
+    let is i64 as i with mut = lo;
+    let is i64 as j with mut = mid;
+    let is i64 as k with mut = lo;
+    while (i < mid && j < hi) {
+        if (_cmp(s, &s.rows[j], &s.rows[i]) < 0) {
+            s.tmp[k] = s.rows[j];
+            j = j + 1;
+        } else {
+            s.tmp[k] = s.rows[i];
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    while (i < mid) {
+        s.tmp[k] = s.rows[i];
+        i = i + 1;
+        k = k + 1;
+    }
+    while (j < hi) {
+        s.tmp[k] = s.rows[j];
+        j = j + 1;
+        k = k + 1;
+    }
+    mem.memcpy(cast(*u8, cast(i64, s.rows) + lo * sizeof(Ent)), cast(*u8, cast(i64, s.tmp) + lo * sizeof(Ent)),
+               (hi - lo) * sizeof(Ent));
+}
+
+fn _sort_all(s as *Sort) as void { _merge_sort(s, 0, s.n); }
+
+// Sorted by column, up or down — or unsorted, NONE — and said as a reset.
+fn sort(s as *Sort, column as i64, order as i32) as void {
+    s.column = column;
+    s.order = order;
+    if (order == NONE) { s.column = 0 - 1; }
+    _sort_all(s);
+    model.reset(&s.out);
+}
+
+// sort() by the name a table's header calls: user is the Sort.
+fn hook(user as *u8, column as i64, order as i32) as void { sort(cast(*Sort, user), column, order); }
+
+// --- The model changing ---
+
+// Where row e goes among those shown.
+fn _place(s as *Sort, e as *Ent) as i64 {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = s.n;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        if (_cmp(s, &s.rows[mid], e) < 0) { lo = mid + 1; } else { hi = mid; }
+    }
+    return lo;
+}
+
+fn _insert_at(s as *Sort, at as i64, e as *Ent) as i32 {
+    if (_room(s, s.n + 1) == 0) { return 0; }
+    let is i64 as tail = s.n - at;
+    if (tail > 0) {
+        mem.core.memmove(cast(*u8, cast(i64, s.rows) + (at + 1) * sizeof(Ent)),
+                         cast(*u8, cast(i64, s.rows) + at * sizeof(Ent)), tail * sizeof(Ent));
+    }
+    s.rows[at] = *e;
+    s.n = s.n + 1;
+    return 1;
+}
+
+fn _remove_at(s as *Sort, at as i64) as void {
+    let is i64 as tail = s.n - at - 1;
+    if (tail > 0) {
+        mem.core.memmove(cast(*u8, cast(i64, s.rows) + at * sizeof(Ent)),
+                         cast(*u8, cast(i64, s.rows) + (at + 1) * sizeof(Ent)), tail * sizeof(Ent));
+    }
+    s.n = s.n - 1;
+}
+
+// Where the row the model has at src stands, -1 for none.
+fn _at_source(s as *Sort, src as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < s.n) {
+        if (s.rows[i].src == src) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The model's rows from at on moved by by.
+fn _shift(s as *Sort, at as i64, by as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < s.n) {
+        if (s.rows[i].src >= at) { s.rows[i].src = s.rows[i].src + by; }
+        i = i + 1;
+    }
+}
+
+fn _changed(user as *u8, c as *model.Change) as void {
+    let is *Sort as s = cast(*Sort, user);
+    if (c.kind == model.RESET) {
+        _read(s);
+        model.reset(&s.out);
+        return;
+    }
+    if (c.parent != 0) { return; }
+    if (c.kind == model.INSERTED) {
+        _shift(s, c.first, c.count);
+        let is i64 as k with mut = 0;
+        while (k < c.count) {
+            let is Ent as e;
+            e.id = model.row_id(s.src, 0, c.first + k);
+            e.src = c.first + k;
+            let is i64 as at = _place(s, &e);
+            if (_insert_at(s, at, &e) == 1) { model.inserted(&s.out, 0, at, 1); }
+            k = k + 1;
+        }
+    } else if (c.kind == model.REMOVED) {
+        let is i64 as k with mut = 0;
+        while (k < c.count) {
+            let is i64 as at = _at_source(s, c.first + k);
+            if (at >= 0) {
+                _remove_at(s, at);
+                model.removed(&s.out, 0, at, 1);
+            }
+            k = k + 1;
+        }
+        _shift(s, c.first + c.count, 0 - c.count);
+    } else if (c.kind == model.CHANGED) {
+        let is i64 as k with mut = 0;
+        while (k < c.count) {
+            let is i64 as at = _at_source(s, c.first + k);
+            if (at >= 0) {
+                let is Ent as e = s.rows[at];
+                _remove_at(s, at);
+                let is i64 as to = _place(s, &e);
+                _insert_at(s, to, &e);
+                if (to == at) {
+                    model.changed(&s.out, 0, at, 1);
+                } else {
+                    model.removed(&s.out, 0, at, 1);
+                    model.inserted(&s.out, 0, to, 1);
+                }
+            }
+            k = k + 1;
+        }
+    }
+}
+
+// --- The sorted model's entries ---
+
+fn _count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Sort, self).n;
+}
+
+fn _row_id(self as *u8, parent as i64, index as i64) as i64 {
+    let is *Sort as s = cast(*Sort, self);
+    if (parent != 0 || index < 0 || index >= s.n) { return 0; }
+    return s.rows[index].id;
+}
+
+fn _cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    return cast(i64, model.cell(cast(*Sort, self).src, id, column, role, out));
+}
+
+fn _columns(self as *u8) as i64 { return model.columns(cast(*Sort, self).src); }
+
+fn _index_of(self as *u8, id as i64) as i64 {
+    let is *Sort as s = cast(*Sort, self);
+    let is i64 as i with mut = 0;
+    while (i < s.n) {
+        if (s.rows[i].id == id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _set_cell(self as *u8, id as i64, column as i64, role as i32, v as *model.Value) as i64 {
+    return cast(i64, model.set_cell(cast(*Sort, self).src, id, column, role, v));
+}

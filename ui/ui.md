@@ -1061,6 +1061,18 @@ right to left) open and close a branch, Right going on to an open row's first
 child and Left to a closed row's parent. Told as a tree of tree items,
 expandable, expanded while open.
 
+**Tables** (`sortmodel.cst`, `widgets/tableview.cst`, tested by
+`sortmodel_test` and `tableview_test`): a sort model shows another flat
+model's rows in the order of a column — its SORT value, else its TEXT;
+numbers as numbers, text with ASCII letters' case aside; equal rows as they
+came — passing the model's changes on where the rows now stand. A table view
+is a list view of one cell per column under a header of the columns' titles:
+columns side by side, the last reaching the view's end, wider ones scrolled
+across with the header following. A column's edge in its header is dragged
+to resize it, never below `MIN_WIDTH`; a sortable column's header clicked
+asks the sort hook for the rows sorted by it, up and then down, and shows the
+arrow. Told as a table of table rows under column headers.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
