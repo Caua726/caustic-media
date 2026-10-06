@@ -1,0 +1,1126 @@
+// ui/widgets/menu.cst — a popup menu: a column of items over the window.
+//
+// The program builds a menu once — items with an underscore marking each
+// mnemonic, an accelerator shown at their end, separators, check items,
+// radio items in groups, submenus — and pops it up against a rectangle
+// (popup_at) or at the pointer (popup_at_pointer), each time placed by the
+// positioner inside the window: flipped from an edge it would cross, slid
+// back inside, cut to the window's height and then scrolled by the wheel and
+// by the keys that move through it. Until the native popups of window/ can
+// carry it outside, it is drawn inside the window, on a layer above
+// everything, a child of the tree's root; a submenu is a child of its menu,
+// a layer above it, beside its item — the other side right to left — its
+// first item level with the item.
+//
+// While it is open the window's input is its own: it is the router's modal
+// scope, every key is claimed ahead of the window's shortcuts, and a press
+// outside closes it, spent on that. The arrows move through what can be
+// chosen, wrapping, Home and End to the ends; the arrow towards the end of
+// the line opens a submenu and the other closes one; Enter and Space choose;
+// a letter, with or without Alt, chooses the one item it marks, or goes on to
+// the next of several; Escape closes a submenu, or the menu. The pointer
+// chooses what it rests on, and what it clicks; a press that opened the menu,
+// dragged to an item and let go there, chooses it — let go at once where it
+// was pressed, the menu stays. Resting on a submenu's item opens it, and on
+// another item closes it, after a pause (DELAY_MS, GTK's) when the window's
+// timers are lent to its tree (tree.set_timers); passing over another item on
+// the way into an open submenu keeps it open. Without timers it is at once.
+//
+// Choosing an item closes the whole menu, the scope and focus given back as
+// they were; then the menu emits ACTIVATED, its argument the item's id, an
+// i64 — a check item turned over, a radio item checked and the rest of its
+// group not, first. Closing, by whatever, emits CLOSED.
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/draw2d.cst" as draw2d;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../timer.cst" as timer;
+use "../positioner.cst" as positioner;
+use "label.cst" as label;
+
+let is i64 as LAYER    with imut = 1000;   // a menu's; each submenu one above its menu's
+let is i64 as DELAY_MS with imut = 225;    // a submenu opens, or another closes, after the pointer rests this long
+
+// What an item is.
+let is i32 as PLAIN   with imut = 0;
+let is i32 as CHECK   with imut = 1;
+let is i32 as RADIO   with imut = 2;
+let is i32 as SUBMENU with imut = 3;
+
+struct Menu {
+    t          as *tree.Tree;
+    r          as *router.Router;   // while it is open
+    self       as i64;
+    opener     as i64;              // a submenu's item in its menu; 0 for a menu the program pops up
+    child      as i64;              // the submenu open from it; 0 for none
+    prev_scope as i64;              // as it was before the menu opened
+    prev_focus as i64;
+    open_time  as i64;
+    pending    as i64;              // the timer that opens or closes a submenu after a pause; 0 for none
+    pend_item  as i64;              // whose submenu it opens; 0: it closes the one open
+    at         as math.rect.Rect;   // where it is, in the window
+    open_x     as f64;              // the pointer as it opened
+    open_y     as f64;
+    scroll     as f64;              // how far its items are moved up, cut to the window
+    ind_w      as f64;              // its columns, as last measured
+    label_w    as f64;
+    accel_w    as f64;
+    arrow_w    as f64;
+    open       as i32;
+    by_press   as i32;              // opened with a button held
+    prev_ring  as i32;
+    _pad0      as i32;
+}
+
+struct Item {
+    id      as i64;
+    label   as i64;
+    accel   as i64;   // its accelerator's label; 0 for none
+    submenu as i64;   // SUBMENU: the menu it opens
+    group   as i64;   // RADIO: its group in its menu
+    kind    as i32;
+    checked as i32;
+    armed   as i32;   // pressed on: let go, it is chosen
+    _pad0   as i32;
+}
+
+let is tree.Kind as _menu_kind with mut;
+let is tree.Kind as _item_kind with mut;
+let is tree.Kind as _check_kind with mut;
+let is tree.Kind as _radio_kind with mut;
+let is tree.Kind as _sep_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _menu_kind = widget.kind("menu", sizeof(Menu));
+    _menu_kind.destroy = fn_ptr(_menu_destroy);
+    _menu_kind.measure = fn_ptr(_menu_measure);
+    _menu_kind.arrange = fn_ptr(_menu_arrange);
+    _menu_kind.paint = fn_ptr(_menu_paint);
+    _menu_kind.event = fn_ptr(_menu_event);
+    _menu_kind.role = access.ROLE_MENU;
+    _item_kind = widget.kind("menu-item", sizeof(Item));
+    _item_kind.measure = fn_ptr(_item_measure);
+    _item_kind.arrange = fn_ptr(_item_arrange);
+    _item_kind.paint = fn_ptr(_item_paint);
+    _item_kind.event = fn_ptr(_item_event);
+    _item_kind.access = fn_ptr(_item_access);
+    _item_kind.role = access.ROLE_MENU_ITEM;
+    _check_kind = _item_kind;
+    _check_kind.role = access.ROLE_CHECK_MENU_ITEM;
+    _radio_kind = _item_kind;
+    _radio_kind.role = access.ROLE_RADIO_MENU_ITEM;
+    _sep_kind = widget.kind("menu-separator", 0);
+    _sep_kind.measure = fn_ptr(_sep_measure);
+    _sep_kind.paint = fn_ptr(_sep_paint);
+    _sep_kind.role = access.ROLE_SEPARATOR;
+    _ready = 1;
+}
+
+fn _menu(t as *tree.Tree, w as i64) as *Menu {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_menu_kind)) { return cast(*Menu, 0); }
+    return cast(*Menu, tree.data(t, w));
+}
+
+fn _is_item(t as *tree.Tree, w as i64) as i32 {
+    if (tree.is_valid(t, w) == 0) { return 0; }
+    let is i64 as k = cast(i64, tree.kind(t, w));
+    return cast(i32, k == cast(i64, &_item_kind) || k == cast(i64, &_check_kind) || k == cast(i64, &_radio_kind));
+}
+
+fn _item(t as *tree.Tree, w as i64) as *Item {
+    if (_is_item(t, w) == 0) { return cast(*Item, 0); }
+    return cast(*Item, tree.data(t, w));
+}
+
+// --- Made ---
+
+fn _start(t as *tree.Tree, w as i64, opener as i64) as void {
+    let is *Menu as d = cast(*Menu, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.opener = opener;
+    tree.set_visible(t, w, 0);
+    tree.set_focusable(t, w, 1);
+    layout.set_align(t, w, layout.START, layout.START);
+}
+
+// A new menu, closed, as the last child of the tree's root. Its handle, or 0
+// with the tree's last_error set.
+fn create(t as *tree.Tree) as i64 {
+    _init();
+    let is i64 as m = tree.create(t, &_menu_kind, tree.root(t));
+    if (m == 0) { return 0; }
+    _start(t, m, 0);
+    tree.set_layer(t, m, LAYER);
+    return m;
+}
+
+// An item of kind k in menu m: its label, s with its mnemonic, n bytes.
+fn _add(t as *tree.Tree, m as i64, k as *tree.Kind, s as *u8, n as i64, id as i64, kind as i32) as i64 {
+    _init();
+    if (cast(i64, _menu(t, m)) == 0) { return 0; }
+    let is i64 as it = tree.create(t, k, m);
+    if (it == 0) { return 0; }
+    let is i64 as l = label.create(t, it, "", 0);
+    if (l == 0) {
+        tree.destroy(t, it);
+        return 0;
+    }
+    label.set_text_mnemonic(t, l, s, n);
+    let is *Item as d = cast(*Item, tree.data(t, it));
+    d.id = id;
+    d.label = l;
+    d.kind = kind;
+    tree.set_focusable(t, it, 1);
+    tree.set_labelled_by(t, it, l);
+    widget.changed(t, m, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return it;
+}
+
+// An item that is chosen, id its id; its handle, or 0 for no room or m no
+// menu. Disabled with tree.set_enabled.
+fn add_item(t as *tree.Tree, m as i64, s as *u8, n as i64, id as i64) as i64 {
+    return _add(t, m, &_item_kind, s, n, id, PLAIN);
+}
+
+// An item turned over as it is chosen, checked as on says.
+fn add_check(t as *tree.Tree, m as i64, s as *u8, n as i64, id as i64, on as i32) as i64 {
+    let is i64 as it = _add(t, m, &_check_kind, s, n, id, CHECK);
+    if (it != 0) { cast(*Item, tree.data(t, it)).checked = on; }
+    return it;
+}
+
+// One of the items of group in m of which one is checked: chosen, it is.
+fn add_radio(t as *tree.Tree, m as i64, s as *u8, n as i64, id as i64, group as i64, on as i32) as i64 {
+    let is i64 as it = _add(t, m, &_radio_kind, s, n, id, RADIO);
+    if (it == 0) { return 0; }
+    cast(*Item, tree.data(t, it)).group = group;
+    if (on == 1) { set_checked(t, it, 1); }
+    return it;
+}
+
+fn add_separator(t as *tree.Tree, m as i64) as i64 {
+    _init();
+    if (cast(i64, _menu(t, m)) == 0) { return 0; }
+    let is i64 as s = tree.create(t, &_sep_kind, m);
+    if (s != 0) { widget.changed(t, m, widget.CHANGED_LAYOUT); }
+    return s;
+}
+
+// An item opening a submenu; the submenu, to put items in — its item is
+// item_of — or 0.
+fn add_submenu(t as *tree.Tree, m as i64, s as *u8, n as i64) as i64 {
+    let is i64 as it = _add(t, m, &_item_kind, s, n, 0, SUBMENU);
+    if (it == 0) { return 0; }
+    let is i64 as sub = tree.create(t, &_menu_kind, m);
+    if (sub == 0) {
+        tree.destroy(t, it);
+        return 0;
+    }
+    _start(t, sub, it);
+    tree.set_layer(t, sub, tree.layer(t, m) + 1);
+    cast(*Item, tree.data(t, it)).submenu = sub;
+    return sub;
+}
+
+// --- Accelerators shown ---
+
+fn _put(out as *u8, o as i64, s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        out[o + i] = s[i];
+        i = i + 1;
+    }
+    return o + i;
+}
+
+// The name of key: a letter as its capital, a digit or a sign as itself.
+fn _key_name(k as i32) as *u8 {
+    if (k == keys.RETURN) { return "Enter"; }
+    if (k == keys.ESCAPE) { return "Esc"; }
+    if (k == keys.BACKSPACE) { return "Backspace"; }
+    if (k == keys.TAB) { return "Tab"; }
+    if (k == keys.SPACE) { return "Space"; }
+    if (k == keys.DELETE) { return "Delete"; }
+    if (k == keys.INSERT) { return "Insert"; }
+    if (k == keys.HOME) { return "Home"; }
+    if (k == keys.END) { return "End"; }
+    if (k == keys.PAGE_UP) { return "Page Up"; }
+    if (k == keys.PAGE_DOWN) { return "Page Down"; }
+    if (k == keys.LEFT) { return "Left"; }
+    if (k == keys.RIGHT) { return "Right"; }
+    if (k == keys.UP) { return "Up"; }
+    if (k == keys.DOWN) { return "Down"; }
+    if (k == keys.MENU) { return "Menu"; }
+    if (k == keys.PAUSE) { return "Pause"; }
+    return cast(*u8, 0);
+}
+
+// The accelerator as shown: its modifiers, Control first, then its key.
+fn _accel_text(k as i32, mods as i32, out as *u8) as i64 {
+    let is i64 as o with mut = 0;
+    if ((mods & keys.MOD_CONTROL) != 0) { o = _put(out, o, "Ctrl+"); }
+    if ((mods & keys.MOD_ALT) != 0) { o = _put(out, o, "Alt+"); }
+    if ((mods & keys.MOD_SHIFT) != 0) { o = _put(out, o, "Shift+"); }
+    if ((mods & keys.MOD_SUPER) != 0) { o = _put(out, o, "Super+"); }
+    let is *u8 as name = _key_name(k);
+    if (cast(i64, name) != 0) { return _put(out, o, name); }
+    if (k >= keys.F1 && k <= keys.F12) {
+        let is i32 as f = k - keys.F1 + 1;
+        out[o] = 70;
+        o = o + 1;
+        if (f >= 10) {
+            out[o] = cast(u8, 48 + f / 10);
+            o = o + 1;
+        }
+        out[o] = cast(u8, 48 + f % 10);
+        return o + 1;
+    }
+    let is i32 as c with mut = k;
+    if (c >= 97 && c <= 122) { c = c - 32; }
+    if (c >= 33 && c <= 126) {
+        out[o] = cast(u8, c);
+        o = o + 1;
+    }
+    return o;
+}
+
+// The accelerator item shows at its end — the program's shortcut for it,
+// which it does not bind itself; key 0 shows none. 1, or 0 for no item.
+fn set_accel(t as *tree.Tree, item as i64, k as i32, mods as i32) as i32 {
+    let is *Item as d = _item(t, item);
+    if (cast(i64, d) == 0) { return 0; }
+    if (k == 0) {
+        if (d.accel != 0) { tree.destroy(t, d.accel); }
+        d.accel = 0;
+        widget.changed(t, tree.parent(t, item), widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+        return 1;
+    }
+    let is [64]u8 as s;
+    let is i64 as n = _accel_text(k, mods, cast(*u8, &s));
+    if (d.accel == 0) {
+        d.accel = label.create(t, item, "", 0);
+        if (d.accel == 0) { return 0; }
+        label.set_tone(t, d.accel, label.DIM);
+    }
+    label.set_text(t, d.accel, cast(*u8, &s), n);
+    widget.changed(t, tree.parent(t, item), widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return 1;
+}
+
+// --- Asked of it ---
+
+fn accel_label(t as *tree.Tree, item as i64) as i64 {
+    let is *Item as d = _item(t, item);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.accel;
+}
+
+fn item_label(t as *tree.Tree, item as i64) as i64 {
+    let is *Item as d = _item(t, item);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.label;
+}
+
+fn id_of(t as *tree.Tree, item as i64) as i64 {
+    let is *Item as d = _item(t, item);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.id;
+}
+
+fn submenu_of(t as *tree.Tree, item as i64) as i64 {
+    let is *Item as d = _item(t, item);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.submenu;
+}
+
+// The item a submenu is opened from; 0 for a menu the program pops up.
+fn item_of(t as *tree.Tree, m as i64) as i64 {
+    let is *Menu as d = _menu(t, m);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.opener;
+}
+
+fn checked(t as *tree.Tree, item as i64) as i32 {
+    let is *Item as d = _item(t, item);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.checked;
+}
+
+// A check or radio item checked or not; a radio item checked unchecks the
+// rest of its group. 1, or 0 for no item.
+fn set_checked(t as *tree.Tree, item as i64, on as i32) as i32 {
+    let is *Item as d = _item(t, item);
+    if (cast(i64, d) == 0) { return 0; }
+    if (d.kind == RADIO && on == 1) {
+        let is i64 as ch with mut = tree.first_child(t, tree.parent(t, item));
+        while (ch != 0) {
+            let is *Item as o = _item(t, ch);
+            if (cast(i64, o) != 0 && o.kind == RADIO && o.group == d.group && ch != item) {
+                o.checked = 0;
+                tree.invalidate_paint(t, ch);
+            }
+            ch = tree.next_sibling(t, ch);
+        }
+    }
+    d.checked = on;
+    tree.invalidate_paint(t, item);
+    return 1;
+}
+
+fn is_open(t as *tree.Tree, m as i64) as i32 {
+    let is *Menu as d = _menu(t, m);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.open;
+}
+
+// The item chosen in m: the one with the focus, or the one whose submenu is
+// open; 0 for none.
+fn current(t as *tree.Tree, m as i64) as i64 {
+    let is *Menu as d = _menu(t, m);
+    if (cast(i64, d) == 0 || d.open == 0 || cast(i64, d.r) == 0) { return 0; }
+    let is i64 as f = router.focused(t, d.r);
+    if (f != 0 && tree.parent(t, f) == m && _is_item(t, f) == 1) { return f; }
+    if (d.child != 0) { return item_of(t, d.child); }
+    return 0;
+}
+
+// How far its items are moved up, when it is cut to the window.
+fn scroll(t as *tree.Tree, m as i64) as f64 {
+    let is *Menu as d = _menu(t, m);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return d.scroll;
+}
+
+// --- Opened and closed ---
+
+fn _timers(t as *tree.Tree) as *timer.Timers { return cast(*timer.Timers, tree.timers(t)); }
+
+fn _cancel(d as *Menu) as void {
+    if (d.pending == 0) { return; }
+    let is *timer.Timers as ts = _timers(d.t);
+    if (cast(i64, ts) != 0) { timer.cancel(ts, d.pending); }
+    d.pending = 0;
+}
+
+// The menu a menu is a submenu of, and up: the one the program pops up.
+fn _root_of(t as *tree.Tree, m as i64) as i64 {
+    let is i64 as w with mut = m;
+    while (cast(i64, _menu(t, tree.parent(t, w))) != 0) { w = tree.parent(t, w); }
+    return w;
+}
+
+// Where menu m goes against rect, growing as gravity says from anchor: kept
+// inside the window — flipped, slid, cut to its height.
+fn _place(t as *tree.Tree, m as i64, d as *Menu, rect as math.rect.Rect, anchor as i32, gravity as i32,
+          off_y as f64, adjust as i32) as void {
+    layout.set_max_size(t, m, layout.UNBOUNDED, layout.UNBOUNDED);
+    layout.set_margin(t, m, 0.0, 0.0, 0.0, 0.0);
+    let is geom.Constraint as c = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, m, &c, &s);
+    let is positioner.Positioner as p with mut = positioner.make(s.pref_w, s.pref_h, rect);
+    p.anchor = anchor;
+    p.gravity = gravity;
+    p.adjust = adjust;
+    p.off_y = off_y;
+    d.at = positioner.place(&p, layout.rect(t, tree.root(t)));
+    d.scroll = 0.0;
+    layout.set_max_size(t, m, d.at.w, d.at.h);
+    if (d.opener == 0) {
+        // At the window's coordinates whatever its direction: right to left,
+        // the end is the left.
+        layout.set_margin(t, m, d.at.x, d.at.y, 0.0, 0.0);
+        if (layout.direction(t, m) == layout.RTL) {
+            layout.set_align(t, m, layout.END, layout.START);
+        } else {
+            layout.set_align(t, m, layout.START, layout.START);
+        }
+    }
+    widget.changed(t, m, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    widget.changed(t, tree.parent(t, m), widget.CHANGED_LAYOUT);
+}
+
+// The items of m that can be chosen, in order, n at most, into out; how many.
+fn _choosable(t as *tree.Tree, m as i64, out as *i64, n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as ch with mut = tree.first_child(t, m);
+    while (ch != 0) {
+        if (_is_item(t, ch) == 1 && tree.is_enabled(t, ch) == 1 && tree.is_visible(t, ch) == 1) {
+            if (k < n) { out[k] = ch; }
+            k = k + 1;
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    return k;
+}
+
+fn _first(t as *tree.Tree, m as i64) as i64 {
+    let is [1]i64 as one;
+    if (_choosable(t, m, cast(*i64, &one), 1) == 0) { return 0; }
+    return one[0];
+}
+
+// Menu m popped up against rect — the window's coordinates — growing as
+// gravity says from its anchor point, flipped, slid and cut to stay inside
+// the window; its first item chosen when select_first is 1, as when the
+// keyboard opened it. Opened again, it moves. 1, or 0 for no menu, or a
+// submenu, which its item opens.
+fn popup_at(t as *tree.Tree, r as *router.Router, m as i64, rect as math.rect.Rect, anchor as i32, gravity as i32,
+            select_first as i32) as i32 {
+    let is *Menu as d = _menu(t, m);
+    if (cast(i64, d) == 0 || d.opener != 0) { return 0; }
+    if (d.open == 0) {
+        d.prev_scope = router.scope(r);
+        d.prev_focus = router.focused(t, r);
+        d.prev_ring = router.focus_visible(r);
+    } else if (d.child != 0) {
+        _close_sub(t, d.child);
+    }
+    d.r = r;
+    d.open = 1;
+    d.by_press = cast(i32, r.buttons != 0);
+    d.open_x = r.pointer_x;
+    d.open_y = r.pointer_y;
+    d.open_time = r.now;
+    tree.set_visible(t, m, 1);
+    _place(t, m, d, rect, anchor, gravity, 0.0, positioner.FLIP_X | positioner.FLIP_Y | positioner.SLIDE_X |
+           positioner.SLIDE_Y | positioner.RESIZE_Y);
+    layout.run(t, layout.rect(t, tree.root(t)).w, layout.rect(t, tree.root(t)).h);
+    router.set_scope(t, r, m);
+    // What the hover asked for as the scope moved is not what is chosen.
+    tree.take_focus_request(t);
+    let is i64 as first = _first(t, m);
+    if (select_first == 1 && first != 0) {
+        router.focus(t, r, first, 1);
+    } else {
+        router.focus(t, r, m, 0);
+    }
+    return 1;
+}
+
+// At the pointer: its corner there, to the right and below — to the left
+// right to left — flipped and slid as popup_at.
+fn popup_at_pointer(t as *tree.Tree, r as *router.Router, m as i64) as i32 {
+    if (cast(i64, _menu(t, m)) == 0) { return 0; }
+    let is i32 as g with mut = positioner.BOTTOM_RIGHT;
+    if (layout.direction(t, m) == layout.RTL) { g = positioner.BOTTOM_LEFT; }
+    return popup_at(t, r, m, math.rect.rect(r.pointer_x, r.pointer_y, 0.0, 0.0), positioner.TOP_LEFT, g, 0);
+}
+
+// Submenu sub opened beside its item; its first item chosen when by_keys.
+fn _open_sub(t as *tree.Tree, sub as i64, by_keys as i32) as void {
+    let is *Menu as sd = _menu(t, sub);
+    let is i64 as m = tree.parent(t, sub);
+    let is *Menu as d = _menu(t, m);
+    _cancel(d);
+    if (d.child != 0 && d.child != sub) { _close_sub(t, d.child); }
+    if (sd.open == 0) {
+        sd.open = 1;
+        sd.r = d.r;
+        tree.set_visible(t, sub, 1);
+        let is style.Theme as th;
+        widget.theme(t, sub, &th);
+        let is i32 as a with mut = positioner.TOP_RIGHT;
+        let is i32 as g with mut = positioner.BOTTOM_RIGHT;
+        if (layout.direction(t, sub) == layout.RTL) {
+            a = positioner.TOP_LEFT;
+            g = positioner.BOTTOM_LEFT;
+        }
+        _place(t, sub, sd, layout.window_rect(t, sd.opener), a, g, 0.0 - _pad_y(&th),
+               positioner.FLIP_X | positioner.SLIDE_Y | positioner.RESIZE_Y);
+        d.child = sub;
+        tree.invalidate_paint(t, sd.opener);
+        layout.run(t, layout.rect(t, tree.root(t)).w, layout.rect(t, tree.root(t)).h);
+    }
+    if (by_keys == 1) {
+        let is i64 as first = _first(t, sub);
+        if (first != 0) { _choose_focus(t, sd, first, 1); }
+    }
+}
+
+// Submenu sub closed, and any open from it; the focus, if it was inside,
+// back on its item.
+fn _close_sub(t as *tree.Tree, sub as i64) as void {
+    let is *Menu as sd = _menu(t, sub);
+    if (cast(i64, sd) == 0 || sd.open == 0) { return; }
+    if (sd.child != 0) { _close_sub(t, sd.child); }
+    _cancel(sd);
+    let is i64 as f = router.focused(t, sd.r);
+    let is i32 as inside = cast(i32, f != 0 && _holds(t, sub, f) == 1);
+    sd.open = 0;
+    tree.set_visible(t, sub, 0);
+    let is *Menu as d = _menu(t, tree.parent(t, sub));
+    d.child = 0;
+    tree.invalidate_paint(t, sd.opener);
+    if (inside == 1) { _choose_focus(t, d, sd.opener, router.focus_visible(sd.r)); }
+    sd.r = cast(*router.Router, 0);
+}
+
+fn _holds(t as *tree.Tree, a as i64, w as i64) as i32 {
+    let is i64 as cur with mut = w;
+    while (cur != 0) {
+        if (cur == a) { return 1; }
+        cur = tree.parent(t, cur);
+    }
+    return 0;
+}
+
+// The focus to item, now — the menu is the router's scope, so it can be had.
+fn _choose_focus(t as *tree.Tree, d as *Menu, item as i64, by_keys as i32) as void {
+    router.focus(t, d.r, item, by_keys);
+    _reveal(t, tree.parent(t, item), item);
+}
+
+// The whole menu m is in closed; scope and focus given back; CLOSED.
+fn close(t as *tree.Tree, m as i64) as void {
+    if (cast(i64, _menu(t, m)) == 0) { return; }
+    let is i64 as root = _root_of(t, m);
+    let is *Menu as d = _menu(t, root);
+    if (d.open == 0) { return; }
+    if (d.child != 0) { _close_sub(t, d.child); }
+    _cancel(d);
+    d.open = 0;
+    tree.set_visible(t, root, 0);
+    let is *router.Router as r = d.r;
+    d.r = cast(*router.Router, 0);
+    router.restore(t, r, d.prev_scope, d.prev_focus, d.prev_ring);
+    signal.emit(t, root, signal.CLOSED, cast(*u8, 0));
+}
+
+fn _menu_destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Menu as d = cast(*Menu, data);
+    _cancel(d);
+    // Destroyed open, its scope must not outlive it.
+    if (d.open == 1 && d.opener == 0 && cast(i64, d.r) != 0) { router.set_scope(t, d.r, d.prev_scope); }
+}
+
+// --- Choosing ---
+
+// Item chosen: a submenu's opened; otherwise turned over or checked, the
+// menu closed, ACTIVATED with its id.
+fn _choose(t as *tree.Tree, item as i64, by_keys as i32) as void {
+    let is *Item as it = _item(t, item);
+    if (cast(i64, it) == 0 || tree.is_enabled(t, item) == 0) { return; }
+    if (it.kind == SUBMENU) {
+        _open_sub(t, it.submenu, by_keys);
+        return;
+    }
+    if (it.kind == CHECK) { set_checked(t, item, 1 - it.checked); }
+    if (it.kind == RADIO) { set_checked(t, item, 1); }
+    let is i64 as id with mut = it.id;
+    let is i64 as root = _root_of(t, tree.parent(t, item));
+    close(t, root);
+    signal.emit(t, root, signal.ACTIVATED, cast(*u8, &id));
+}
+
+// --- Keys ---
+
+fn _lower(k as i32) as i32 {
+    if (k >= 65 && k <= 90) { return k + 32; }
+    return k;
+}
+
+// The next item that can be chosen after cur, dir 1 down or -1 up, wrapping;
+// the first or last when there is no cur.
+fn _step(t as *tree.Tree, m as i64, cur as i64, dir as i32) as i64 {
+    let is [256]i64 as list;
+    let is i64 as n with mut = _choosable(t, m, cast(*i64, &list), 256);
+    if (n > 256) { n = 256; }
+    if (n == 0) { return 0; }
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (list[i] == cur) { at = i; }
+        i = i + 1;
+    }
+    if (at < 0) {
+        if (dir > 0) { return list[0]; }
+        return list[n - 1];
+    }
+    return list[(at + cast(i64, dir) + n) % n];
+}
+
+// The items of m marked by letter k: how many, and the first after cur.
+fn _marked(t as *tree.Tree, m as i64, k as i32, cur as i64, next as *i64) as i64 {
+    let is [256]i64 as list;
+    let is i64 as n with mut = _choosable(t, m, cast(*i64, &list), 256);
+    if (n > 256) { n = 256; }
+    let is i64 as found with mut = 0;
+    let is i64 as first with mut = 0;
+    let is i32 as past with mut = cast(i32, cur == 0);
+    *next = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as it = list[i];
+        if (it == cur) { past = 1; }
+        let is i32 as letter = _lower(label.mnemonic(t, cast(*Item, tree.data(t, it)).label));
+        if (letter != 0 && letter == k) {
+            found = found + 1;
+            if (first == 0) { first = it; }
+            if (*next == 0 && past == 1 && it != cur) { *next = it; }
+        }
+        i = i + 1;
+    }
+    if (*next == 0) { *next = first; }
+    return found;
+}
+
+fn _key(t as *tree.Tree, m as i64, d as *Menu, e as *event.Event) as i64 {
+    let is i32 as k = _lower(e.key);
+    let is i64 as cur = current(t, m);
+    let is i32 as rtl = cast(i32, layout.direction(t, m) == layout.RTL);
+    let is i32 as inward with mut = keys.RIGHT;
+    let is i32 as outward with mut = keys.LEFT;
+    if (rtl == 1) {
+        inward = keys.LEFT;
+        outward = keys.RIGHT;
+    }
+    if (k == keys.DOWN || k == keys.UP || k == keys.HOME || k == keys.END) {
+        let is i64 as to with mut = 0;
+        if (k == keys.DOWN) { to = _step(t, m, cur, 1); }
+        else if (k == keys.UP) { to = _step(t, m, cur, 0 - 1); }
+        else if (k == keys.HOME) { to = _step(t, m, 0, 1); }
+        else { to = _step(t, m, 0, 0 - 1); }
+        if (to != 0) {
+            if (d.child != 0) { _close_sub(t, d.child); }
+            _choose_focus(t, d, to, 1);
+        }
+        return 1;
+    }
+    if (k == keys.RETURN || k == keys.SPACE) {
+        if (cur != 0) { _choose(t, cur, 1); }
+        return 1;
+    }
+    if (k == inward) {
+        let is *Item as it = _item(t, cur);
+        if (cast(i64, it) != 0 && it.kind == SUBMENU) { _open_sub(t, it.submenu, 1); }
+        return 1;
+    }
+    if (k == outward) {
+        if (d.opener != 0) { _close_sub(t, m); }
+        return 1;
+    }
+    if (k == keys.ESCAPE) {
+        if (d.opener != 0) { _close_sub(t, m); } else { close(t, m); }
+        return 1;
+    }
+    if ((k >= 97 && k <= 122) || (k >= 48 && k <= 57)) {
+        let is i64 as next with mut = 0;
+        let is i64 as n = _marked(t, m, k, cur, &next);
+        if (n == 1) {
+            if (d.child != 0 && d.child != submenu_of(t, next)) { _close_sub(t, d.child); }
+            _choose_focus(t, d, next, 1);
+            _choose(t, next, 1);
+        } else if (n > 1) {
+            if (d.child != 0) { _close_sub(t, d.child); }
+            _choose_focus(t, d, next, 1);
+        }
+    }
+    return 1;
+}
+
+// --- The pointer ---
+
+fn _on_pause(user as *u8) as void {
+    let is *Menu as d = cast(*Menu, user);
+    d.pending = 0;
+    if (d.open == 0) { return; }
+    if (d.pend_item != 0) {
+        let is i64 as sub = submenu_of(d.t, d.pend_item);
+        if (sub != 0) { _open_sub(d.t, sub, 0); }
+        return;
+    }
+    if (d.child != 0) { _close_sub(d.t, d.child); }
+}
+
+// After a pause — or now, without the window's timers — item's submenu
+// opened in menu d (item 0: the open one closed).
+fn _after_pause(t as *tree.Tree, d as *Menu, item as i64, now as i64) as void {
+    _cancel(d);
+    let is *timer.Timers as ts = _timers(t);
+    d.pend_item = item;
+    if (cast(i64, ts) == 0) {
+        _on_pause(cast(*u8, d));
+        return;
+    }
+    d.pending = timer.add(ts, now, DELAY_MS, 0, fn_ptr(_on_pause), cast(*u8, d));
+}
+
+// The pointer resting on item: chosen; its submenu opening, another closing.
+fn _hover(t as *tree.Tree, item as i64, it as *Item, e as *event.Event) as void {
+    let is i64 as m = tree.parent(t, item);
+    let is *Menu as d = _menu(t, m);
+    if (cast(i64, d.r) == 0) { return; }
+    if (router.focused(t, d.r) != item) { tree.request_focus(t, item); }
+    // Into a submenu: what would have closed it does not.
+    if (d.opener != 0) {
+        let is *Menu as pd = _menu(t, tree.parent(t, m));
+        if (pd.pend_item == 0) { _cancel(pd); }
+    }
+    if (it.kind == SUBMENU) {
+        if (d.child == it.submenu) {
+            _cancel(d);
+        } else if (d.pending == 0 || d.pend_item != item) {
+            _after_pause(t, d, item, e.time);
+        }
+        return;
+    }
+    if (d.child != 0) {
+        if (d.pending == 0 || d.pend_item != 0) { _after_pause(t, d, 0, e.time); }
+    } else {
+        _cancel(d);
+    }
+}
+
+// Whether a release over an item chooses it though nobody pressed on it: the
+// press that opened the menu, dragged there or held a while.
+fn _dragged_to(t as *tree.Tree, item as i64, e as *event.Event) as i32 {
+    let is *Menu as root = _menu(t, _root_of(t, tree.parent(t, item)));
+    if (root.by_press == 0 || cast(i64, root.r) == 0) { return 0; }
+    let is f64 as dx = e.x - root.open_x;
+    let is f64 as dy = e.y - root.open_y;
+    let is f64 as th = root.r.settings.drag_threshold;
+    return cast(i32, dx * dx + dy * dy > th * th || e.time - root.open_time > 500);
+}
+
+fn _item_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Item as it = cast(*Item, data);
+    let is i32 as k = e.kind;
+    if (k == event.POINTER_ENTER || k == event.POINTER_MOVE) {
+        if (e.phase != event.TARGET && k == event.POINTER_ENTER) { return 0; }
+        _hover(t, w, it, e);
+        return 1;
+    }
+    if (k == event.POINTER_DOWN) {
+        it.armed = 1;
+        return 1;
+    }
+    if (k == event.POINTER_CANCEL) {
+        it.armed = 0;
+        return 1;
+    }
+    if (k == event.POINTER_UP) {
+        let is i32 as armed = it.armed;
+        it.armed = 0;
+        // Pressed here and let go: here, or on another item dragged to.
+        let is i64 as at with mut = w;
+        let is math.rect.Rect as wr = layout.window_rect(t, w);
+        if (e.x < wr.x || e.y < wr.y || e.x >= wr.x + wr.w || e.y >= wr.y + wr.h) {
+            at = router.hit(t, e.x, e.y);
+            while (at != 0 && _is_item(t, at) == 0) { at = tree.parent(t, at); }
+        }
+        if (at == 0) { return 1; }
+        if ((armed == 1 && at == w) || (armed == 1 && at != w) || _dragged_to(t, at, e) == 1) { _choose(t, at, 0); }
+        return 1;
+    }
+    return 0;
+}
+
+// --- The menu's own ---
+
+fn _menu_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Menu as d = cast(*Menu, data);
+    let is i32 as k = e.kind;
+    if (d.open == 0) { return 0; }
+    if (k == event.PRESS_OUTSIDE) {
+        close(t, w);
+        return 1;
+    }
+    // While it is open, every key is its own.
+    if (k == event.SHORTCUT_OVERRIDE || k == event.TEXT) { return 1; }
+    if (k == event.KEY_DOWN) { return _key(t, w, d, e); }
+    if (k == event.SCROLL) {
+        let is f64 as by with mut = e.dy;
+        if (e.discrete == 1) { by = e.dy * _row_h(t, w) * 3.0; }
+        _scroll_to(t, w, d, d.scroll + by);
+        return 1;
+    }
+    if (k == event.POINTER_DOWN || k == event.POINTER_UP || k == event.POINTER_MOVE) { return 1; }
+    return 0;
+}
+
+// --- Laying out ---
+
+fn _pad_y(th as *style.Theme) as f64 { return th.metrics.space_xs + th.metrics.border_width; }
+fn _gap(th as *style.Theme) as f64 { return th.metrics.space_m; }
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _menu_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Menu as d = cast(*Menu, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as uc = geom.unbounded();
+    d.ind_w = 0.0;
+    d.label_w = 0.0;
+    d.accel_w = 0.0;
+    d.arrow_w = 0.0;
+    // Its columns first, which its items are measured by.
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is *Item as it = _item(t, ch);
+        if (cast(i64, it) != 0 && tree.is_visible(t, ch) == 1) {
+            let is geom.Size as ls;
+            layout.measure(t, it.label, &uc, &ls);
+            d.label_w = _max(d.label_w, ls.pref_w);
+            if (it.accel != 0) {
+                layout.measure(t, it.accel, &uc, &ls);
+                d.accel_w = _max(d.accel_w, ls.pref_w);
+            }
+            if (it.kind == CHECK || it.kind == RADIO) { d.ind_w = th.metrics.indicator + th.metrics.space_s; }
+            if (it.kind == SUBMENU) { d.arrow_w = th.fonts.body.size * 0.5; }
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    let is f64 as wd with mut = 0.0;
+    ch = tree.first_child(t, w);
+    while (ch != 0) {
+        if (cast(i64, _menu(t, ch)) == 0 && tree.is_visible(t, ch) == 1) {
+            let is geom.Size as s;
+            layout.measure(t, ch, &uc, &s);
+            wd = _max(wd, s.pref_w);
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    out.min_w = wd + 2.0 * th.metrics.border_width;
+    out.pref_w = out.min_w;
+    out.min_h = 0.0;
+    out.pref_h = _content_h(t, w);
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+// The height of one of its items, for the wheel.
+fn _row_h(t as *tree.Tree, m as i64) as f64 {
+    let is i64 as first = _first(t, m);
+    if (first == 0) { return 20.0; }
+    return layout.rect(t, first).h;
+}
+
+// The height of all of its items, its padding with them: what it would be,
+// not cut.
+fn _content_h(t as *tree.Tree, m as i64) as f64 {
+    let is style.Theme as th;
+    widget.theme(t, m, &th);
+    let is geom.Constraint as uc = geom.unbounded();
+    let is f64 as h with mut = 2.0 * _pad_y(&th);
+    let is i64 as ch with mut = tree.first_child(t, m);
+    while (ch != 0) {
+        if (cast(i64, _menu(t, ch)) == 0 && tree.is_visible(t, ch) == 1) {
+            let is geom.Size as s;
+            layout.measure(t, ch, &uc, &s);
+            h = h + s.pref_h;
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    return h;
+}
+
+fn _scroll_to(t as *tree.Tree, m as i64, d as *Menu, v as f64) as void {
+    let is f64 as most = _max(0.0, _content_h(t, m) - layout.rect(t, m).h);
+    let is f64 as s with mut = v;
+    if (s > most) { s = most; }
+    if (s < 0.0) { s = 0.0; }
+    if (s == d.scroll) { return; }
+    d.scroll = s;
+    widget.changed(t, m, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    layout.run(t, layout.rect(t, tree.root(t)).w, layout.rect(t, tree.root(t)).h);
+}
+
+// Scrolled so item shows whole.
+fn _reveal(t as *tree.Tree, m as i64, item as i64) as void {
+    let is *Menu as d = _menu(t, m);
+    if (cast(i64, d) == 0) { return; }
+    let is style.Theme as th;
+    widget.theme(t, m, &th);
+    let is f64 as view = layout.rect(t, m).h - _pad_y(&th);
+    let is math.rect.Rect as ir = layout.rect(t, item);
+    // Its place with no scroll.
+    let is f64 as top = ir.y + d.scroll;
+    if (top - _pad_y(&th) < d.scroll) {
+        _scroll_to(t, m, d, top - _pad_y(&th));
+    } else if (top + ir.h > d.scroll + view) {
+        _scroll_to(t, m, d, top + ir.h - view);
+    }
+}
+
+fn _menu_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Menu as d = cast(*Menu, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as uc = geom.unbounded();
+    let is math.rect.Rect as me = layout.window_rect(t, w);
+    let is f64 as y with mut = _pad_y(&th) - d.scroll;
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        let is *Menu as sd = _menu(t, ch);
+        if (cast(i64, sd) != 0) {
+            // A submenu, where it was put, in the menu's coordinates.
+            if (sd.open == 1) {
+                let is math.rect.Rect as at = math.rect.rect(sd.at.x - me.x, sd.at.y - me.y, sd.at.w, sd.at.h);
+                layout.place(t, ch, &at);
+            }
+        } else if (tree.is_visible(t, ch) == 1) {
+            let is geom.Size as s;
+            layout.measure(t, ch, &uc, &s);
+            let is f64 as bw = th.metrics.border_width;
+            let is math.rect.Rect as row = math.rect.rect(bw, y, r.w - 2.0 * bw, s.pref_h);
+            layout.place(t, ch, &row);
+            y = y + s.pref_h;
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+}
+
+fn _item_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Item as it = cast(*Item, data);
+    let is *Menu as d = _menu(t, tree.parent(t, w));
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as uc = geom.unbounded();
+    let is geom.Size as ls;
+    layout.measure(t, it.label, &uc, &ls);
+    let is f64 as px = th.metrics.control_pad_x;
+    let is f64 as wd with mut = 2.0 * px + d.ind_w + d.label_w;
+    if (d.accel_w > 0.0) { wd = wd + _gap(&th) + d.accel_w; }
+    if (d.arrow_w > 0.0) { wd = wd + _gap(&th) + d.arrow_w; }
+    out.min_w = wd;
+    out.pref_w = wd;
+    out.min_h = ls.pref_h + 2.0 * th.metrics.space_s;
+    out.pref_h = out.min_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _item_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Item as it = cast(*Item, data);
+    let is *Menu as d = _menu(t, tree.parent(t, w));
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is geom.Constraint as uc = geom.unbounded();
+    let is f64 as px = th.metrics.control_pad_x;
+    let is i32 as rtl = cast(i32, layout.direction(t, w) == layout.RTL);
+    let is geom.Size as ls;
+    layout.measure(t, it.label, &uc, &ls);
+    let is f64 as lx with mut = px + d.ind_w;
+    if (rtl == 1) { lx = r.w - px - d.ind_w - ls.pref_w; }
+    let is math.rect.Rect as la = math.rect.rect(lx, (r.h - ls.pref_h) / 2.0, ls.pref_w, ls.pref_h);
+    layout.place(t, it.label, &la);
+    if (it.accel != 0) {
+        layout.measure(t, it.accel, &uc, &ls);
+        let is f64 as end with mut = px;
+        if (d.arrow_w > 0.0) { end = end + d.arrow_w + _gap(&th); }
+        let is f64 as ax with mut = r.w - end - ls.pref_w;
+        if (rtl == 1) { ax = end; }
+        let is math.rect.Rect as aa = math.rect.rect(ax, (r.h - ls.pref_h) / 2.0, ls.pref_w, ls.pref_h);
+        layout.place(t, it.accel, &aa);
+    }
+}
+
+fn _sep_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    out.min_w = 0.0;
+    out.pref_w = 0.0;
+    out.min_h = 2.0 * th.metrics.space_xs + 1.0;
+    out.pref_h = out.min_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = out.min_h;
+}
+
+// --- Drawing ---
+
+fn _menu_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as rc = p.rect;
+    let is f64 as rad = th.metrics.radius_m;
+    shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.palette.popover_bg);
+    if (th.metrics.border_width > 0.0) {
+        shapes.stroke_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.metrics.border_width,
+                              th.palette.border);
+    }
+    p.fg = th.palette.fg;
+}
+
+fn _sep_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is math.rect.Rect as rc = p.rect;
+    let is f64 as y = fm.floor(rc.y + rc.h / 2.0);
+    let is f64 as px = p.theme.metrics.space_s;
+    shapes.fill_rect(p.canvas, rc.x + px, y, rc.w - 2.0 * px, 1.0, p.theme.palette.separator);
+}
+
+fn _item_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Item as it = cast(*Item, data);
+    let is *Menu as d = _menu(t, tree.parent(t, w));
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as rc = p.rect;
+    // Chosen — with the focus, or its submenu open — in a row's chosen look.
+    let is i32 as lit = cast(i32, painter.has(p, painter.S_FOCUSED) == 1 ||
+                                  (it.kind == SUBMENU && d.child == it.submenu && it.submenu != 0));
+    let is style.Look as look = style.pick(&th.row, 0, lit);
+    if (lit == 1) { shapes.fill_rect(p.canvas, rc.x, rc.y, rc.w, rc.h, look.bg); }
+    let is math.color.Color as fg with mut = th.palette.fg;
+    if (lit == 1) { fg = look.fg; }
+    if (painter.has(p, painter.S_DISABLED) == 1) { fg = style.with_alpha(fg, fg.a * th.control.disabled_alpha); }
+    p.fg = fg;
+    let is i32 as rtl = cast(i32, p.rtl == 1);
+    let is f64 as px = th.metrics.control_pad_x;
+    let is f64 as ind = th.metrics.indicator;
+    let is f64 as cy = rc.y + rc.h / 2.0;
+    let is f64 as ix with mut = rc.x + px;
+    if (rtl == 1) { ix = rc.x + rc.w - px - ind; }
+    if (it.kind == CHECK && it.checked == 1) {
+        let is f64 as lw = _max(1.5, ind * 0.12);
+        let is f64 as iy = cy - ind / 2.0;
+        shapes.line(p.canvas, ix + ind * 0.22, iy + ind * 0.52, ix + ind * 0.42, iy + ind * 0.72, lw, fg);
+        shapes.line(p.canvas, ix + ind * 0.42, iy + ind * 0.72, ix + ind * 0.78, iy + ind * 0.30, lw, fg);
+    }
+    if (it.kind == RADIO && it.checked == 1) { shapes.fill_circle(p.canvas, ix + ind / 2.0, cy, ind / 5.0, fg); }
+    if (it.kind == SUBMENU) {
+        // A chevron towards where the submenu opens.
+        let is f64 as a = d.arrow_w;
+        let is f64 as lw = _max(1.5, a * 0.15);
+        let is f64 as ax with mut = rc.x + rc.w - px - a * 0.7;
+        let is f64 as dir with mut = 1.0;
+        if (rtl == 1) {
+            ax = rc.x + px + a * 0.7;
+            dir = 0.0 - 1.0;
+        }
+        shapes.line(p.canvas, ax - dir * a * 0.3, cy - a * 0.45, ax + dir * a * 0.2, cy, lw, fg);
+        shapes.line(p.canvas, ax + dir * a * 0.2, cy, ax - dir * a * 0.3, cy + a * 0.45, lw, fg);
+    }
+}
+
+// --- Told ---
+
+fn _item_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Item as it = cast(*Item, data);
+    if (q.action == access.ASK) {
+        q.actions = access.PRESS;
+        if (it.kind == CHECK || it.kind == RADIO) {
+            q.states = q.states | access.CHECKABLE;
+            if (it.checked == 1) { q.states = q.states | access.CHECKED; }
+        }
+        if (it.kind == SUBMENU) {
+            q.states = q.states | access.EXPANDABLE;
+            if (is_open(t, it.submenu) == 1) { q.states = q.states | access.EXPANDED; }
+        }
+        return 1;
+    }
+    if (q.action == access.PRESS) { _choose(t, w, 1); }
+    return 1;
+}
