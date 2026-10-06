@@ -731,6 +731,21 @@ technology, named by its text. Leaving the widget, a press or a key (the
 router counts them) hides it, and it does not show again until the pointer
 leaves and comes back.
 
+**Spin boxes** (`widgets/spin.cst`, tested by `spin_test`): a number in a
+field held to its range and step, with as many decimals as the step has
+(six at most) or as set, as wide as the widest value the range holds; two
+flat buttons at its end — mirrored right to left — each disabled at its end
+of the range. The arrows step it as they go down, Page Up and Down move ten
+steps, Ctrl+Home and Ctrl+End go to the ends, the wheel a step a notch.
+Typed into, it has a small editing of its own until the entry can take its
+place: what is typed takes the place of the value at first, then goes on
+after it, up to thirty-two characters of what a number can hold (a comma
+for the point too); Backspace takes the last away; Enter, leaving it or a
+step commits it held to range and step, or puts the value back when it is
+no number; Escape puts it back. While something is typed, Enter and Escape
+are its own, ahead of the window's default and cancel buttons. A caret after
+its text while it has the focus.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a

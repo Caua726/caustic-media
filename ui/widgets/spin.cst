@@ -1,0 +1,548 @@
+// ui/widgets/spin.cst — a number in a field, with buttons to step it.
+//
+// A value in a range held to its step, shown in a field with as many
+// decimals as the step has (or as set), and two flat buttons at its end, −
+// and +, each unable to do anything at its end of the range; the field is as
+// wide as the widest value the range holds, so it does not move as the value
+// changes. The arrows step it, Page Up and Down move ten steps, Ctrl+Home
+// and Ctrl+End go to the ends, and the wheel steps it a notch at a time.
+//
+// Typed into: what is typed takes the place of the value at first, then goes
+// on after it; Backspace takes the last character away; only what can be in
+// a number is taken, a comma for the point as well. Enter, leaving it or a
+// step commits what was typed — held to range and step, or as it was when it
+// is no number — and Escape puts the value back. This is the spin box's own
+// small editing until the entry (6.9) can take its place: no selection, the
+// caret at the end. While something is typed, Enter and Escape are its own,
+// ahead of the window's default and cancel buttons. VALUE_CHANGED carries
+// the new value, an f64.
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../../text/layout/model.cst" as model;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../signal.cst" as signal;
+use "../text.cst" as txt;
+use "label.cst" as label;
+use "button.cst" as button;
+
+let is i64 as MAX_TYPED with imut = 32;
+
+struct Data {
+    value      as f64;
+    min        as f64;
+    max        as f64;
+    step       as f64;
+    t          as *tree.Tree;
+    self       as i64;
+    text       as i64;   // the label showing the value, or what is typed
+    minus      as i64;
+    plus       as i64;
+    buf        as [32]u8;
+    nbuf       as i64;
+    digits     as i32;
+    own_digits as i32;   // set, not from the step
+    editing    as i32;   // what is typed shows
+    focused    as i32;   // as of its last painting
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+// For measuring the widest value.
+let is txt.Run as _scratch with mut;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("spin", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.role = access.ROLE_SPIN_BUTTON;
+    _kind.access = fn_ptr(_access);
+    _scratch = txt.run();
+    _ready = 1;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// --- Numbers as text ---
+
+// How many decimals a step has, up to six.
+fn _decimals(step as f64) as i32 {
+    let is i32 as n with mut = 0;
+    let is f64 as x with mut = step;
+    if (x < 0.0) { x = 0.0 - x; }
+    while (n < 6 && fm.abs_f64(x - fm.floor(x + 0.5)) > 0.000000001) {
+        x = x * 10.0;
+        n = n + 1;
+    }
+    return n;
+}
+
+// v with digits decimals into out — at least 40 bytes — and its length.
+fn _format(v as f64, digits as i32, out as *u8) as i64 {
+    let is i64 as p with mut = 1;
+    let is i32 as k with mut = 0;
+    while (k < digits) {
+        p = p * 10;
+        k = k + 1;
+    }
+    let is f64 as a with mut = v;
+    let is i32 as neg with mut = 0;
+    if (a < 0.0) {
+        a = 0.0 - a;
+        neg = 1;
+    }
+    let is i64 as scaled = cast(i64, fm.floor(a * cast(f64, p) + 0.5));
+    if (scaled == 0) { neg = 0; }
+    let is i64 as whole with mut = scaled / p;
+    let is i64 as frac = scaled % p;
+    let is [24]u8 as rev;
+    let is i64 as nr with mut = 0;
+    let is i32 as first with mut = 1;
+    while (first == 1 || whole > 0) {
+        first = 0;
+        rev[nr] = cast(u8, 48 + whole % 10);
+        whole = whole / 10;
+        nr = nr + 1;
+    }
+    let is i64 as n with mut = 0;
+    if (neg == 1) {
+        out[n] = 45;
+        n = n + 1;
+    }
+    while (nr > 0) {
+        nr = nr - 1;
+        out[n] = rev[nr];
+        n = n + 1;
+    }
+    if (digits > 0) {
+        out[n] = 46;
+        n = n + 1;
+        let is i64 as q with mut = p / 10;
+        while (q > 0) {
+            out[n] = cast(u8, 48 + (frac / q) % 10);
+            n = n + 1;
+            q = q / 10;
+        }
+    }
+    return n;
+}
+
+// The number s holds — a sign, digits, a point or a comma and digits —
+// into *out: 1, or 0 for what is no number.
+fn _parse(s as *u8, n as i64, out as *f64) as i32 {
+    let is i64 as i with mut = 0;
+    let is f64 as sign with mut = 1.0;
+    if (n > 0 && (s[0] == 45 || s[0] == 43)) {
+        if (s[0] == 45) { sign = 0.0 - 1.0; }
+        i = 1;
+    }
+    let is f64 as v with mut = 0.0;
+    let is f64 as scale with mut = 0.0;
+    let is i32 as digits with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        if (c >= 48 && c <= 57) {
+            if (scale == 0.0) {
+                v = v * 10.0 + cast(f64, c - 48);
+            } else {
+                v = v + cast(f64, c - 48) * scale;
+                scale = scale / 10.0;
+            }
+            digits = digits + 1;
+        } else if ((c == 46 || c == 44) && scale == 0.0) {
+            scale = 0.1;
+        } else {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if (digits == 0) { return 0; }
+    *out = sign * v;
+    return 1;
+}
+
+// What may be typed into a number.
+fn _numeric(c as i64) as i32 { return cast(i32, (c >= 48 && c <= 57) || c == 46 || c == 44 || c == 45 || c == 43); }
+
+// --- Its value ---
+
+fn _held(d as *Data, v as f64) as f64 {
+    let is f64 as x with mut = v;
+    if (d.step > 0.0) { x = d.min + fm.floor((x - d.min) / d.step + 0.5) * d.step; }
+    if (x > d.max) { x = d.max; }
+    if (x < d.min) { x = d.min; }
+    return x;
+}
+
+// Its label showing the value, or what is typed; its buttons able to do
+// what they can.
+fn _show(t as *tree.Tree, d as *Data) as void {
+    if (d.editing == 1) {
+        label.set_text(t, d.text, cast(*u8, &d.buf), d.nbuf);
+    } else {
+        let is [40]u8 as s;
+        let is i64 as n = _format(d.value, d.digits, cast(*u8, &s));
+        label.set_text(t, d.text, cast(*u8, &s), n);
+    }
+    tree.set_enabled(t, d.minus, cast(i32, d.value > d.min));
+    tree.set_enabled(t, d.plus, cast(i32, d.value < d.max));
+}
+
+fn _set(t as *tree.Tree, w as i64, d as *Data, v as f64) as void {
+    let is f64 as x = _held(d, v);
+    d.editing = 0;
+    if (x == d.value) {
+        _show(t, d);
+        return;
+    }
+    d.value = x;
+    _show(t, d);
+    signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, &d.value));
+}
+
+// What was typed made the value — or, no number, put back.
+fn _commit(t as *tree.Tree, w as i64, d as *Data) as void {
+    if (d.editing == 0) { return; }
+    let is f64 as v with mut = d.value;
+    _parse(cast(*u8, &d.buf), d.nbuf, &v);
+    _set(t, w, d, v);
+}
+
+fn _on_minus(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    _commit(d.t, d.self, d);
+    _set(d.t, d.self, d, d.value - d.step);
+}
+
+fn _on_plus(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    _commit(d.t, d.self, d);
+    _set(d.t, d.self, d, d.value + d.step);
+}
+
+// A new spin box from min to max by step, at min, as the last child of
+// parent. Its handle, or 0 with the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64, min as f64, max as f64, step as f64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is i64 as l = label.create(t, w, "", 0);
+    let is i64 as mi = button.create(t, w, "-", 1);
+    let is i64 as pl = button.create(t, w, "+", 1);
+    if (l == 0 || mi == 0 || pl == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.text = l;
+    d.minus = mi;
+    d.plus = pl;
+    d.min = min;
+    d.max = max;
+    d.step = step;
+    d.value = min;
+    d.digits = _decimals(step);
+    tree.set_focusable(t, w, 1);
+    tree.set_focusable(t, mi, 0);
+    tree.set_focusable(t, pl, 0);
+    button.set_variant(t, mi, button.FLAT);
+    button.set_variant(t, pl, button.FLAT);
+    signal.connect(t, mi, signal.CLICKED, fn_ptr(_on_minus), cast(*u8, d));
+    signal.connect(t, pl, signal.CLICKED, fn_ptr(_on_plus), cast(*u8, d));
+    _show(t, d);
+    return w;
+}
+
+// Its value from now on, held to range and step, saying VALUE_CHANGED when
+// that changes it; what was typed is dropped. Each setter returns 1, or 0
+// for a widget that is no spin box.
+fn set_value(t as *tree.Tree, w as i64, v as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    _set(t, w, d, v);
+    return 1;
+}
+
+fn value(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return d.value;
+}
+
+// Another range and step, the value held to them, its decimals the step's
+// unless set; 0 for a range the wrong way round.
+fn set_range(t as *tree.Tree, w as i64, min as f64, max as f64, step as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || max < min) { return 0; }
+    d.min = min;
+    d.max = max;
+    d.step = step;
+    if (d.own_digits == 0) { d.digits = _decimals(step); }
+    widget.changed(t, w, widget.CHANGED_LAYOUT);
+    _set(t, w, d, d.value);
+    return 1;
+}
+
+// How many decimals it shows; below 0, as many as its step has.
+fn set_digits(t as *tree.Tree, w as i64, digits as i32) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.digits = digits;
+    d.own_digits = 1;
+    if (digits < 0) {
+        d.digits = _decimals(d.step);
+        d.own_digits = 0;
+    }
+    widget.changed(t, w, widget.CHANGED_LAYOUT);
+    _show(t, d);
+    return 1;
+}
+
+// Its parts: the label showing its text, and its buttons; 0 for a widget
+// that is no spin box.
+fn text_label(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.text;
+}
+
+fn minus(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.minus;
+}
+
+fn plus(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.plus;
+}
+
+// Whether what is typed shows, not yet its value.
+fn editing(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.editing;
+}
+
+// Where its caret was last drawn, in the window: after its text while it has
+// the focus; nothing otherwise.
+fn caret(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.focused == 0) { return math.rect.rect_zero(); }
+    let is math.rect.Rect as lr = layout.window_rect(t, d.text);
+    let is *txt.Run as r = label.run(t, d.text);
+    let is f64 as h with mut = r.height;
+    if (h <= 0.0) { h = tree.theme(t).fonts.body.size; }
+    return math.rect.rect(lr.x + label.text_left(t, d.text) + r.width, lr.y + label.text_top(t, d.text), 1.0, h);
+}
+
+// --- Laying out ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+// The width of the widest value the range holds, in the label's style.
+fn _widest(t as *tree.Tree, d as *Data, th as *style.Theme) as f64 {
+    let is *txt.Service as svc = cast(*txt.Service, tree.text_service(t));
+    if (cast(i64, svc) == 0) { return 0.0; }
+    let is txt.Style as st = txt.style_of(th.fonts.body);
+    st.family = th.fonts.family;
+    let is model.Params as pp = model.params();
+    let is [40]u8 as s;
+    let is i64 as n with mut = _format(d.min, d.digits, cast(*u8, &s));
+    txt.lay_plain(svc, &_scratch, cast(*u8, &s), n, &st, &pp);
+    let is f64 as w with mut = _scratch.width;
+    n = _format(d.max, d.digits, cast(*u8, &s));
+    txt.lay_plain(svc, &_scratch, cast(*u8, &s), n, &st, &pp);
+    w = _max(w, _scratch.width);
+    let is f64 as sc with mut = layout.scale(t);
+    if (sc <= 0.0) { sc = 1.0; }
+    return fm.ceil(w * sc - 0.000000001) / sc;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as bh = th.metrics.control_height;
+    let is geom.Constraint as uc = geom.unbounded();
+    let is geom.Size as ls;
+    layout.measure(t, d.text, &uc, &ls);
+    let is f64 as tw = _max(_widest(t, d, &th), ls.pref_w);
+    out.min_w = tw + 2.0 * th.metrics.control_pad_x + 2.0 * bh;
+    out.pref_w = out.min_w;
+    out.min_h = _max(bh, ls.pref_h + 2.0 * th.metrics.control_pad_y);
+    out.pref_h = out.min_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as bh = th.metrics.control_height;
+    let is f64 as px = th.metrics.control_pad_x;
+    let is f64 as tw = _max(0.0, r.w - 2.0 * px - 2.0 * bh);
+    // Its buttons at its end: mirrored right to left.
+    let is math.rect.Rect as ta with mut = math.rect.rect(px, 0.0, tw, r.h);
+    let is math.rect.Rect as ma with mut = math.rect.rect(r.w - 2.0 * bh, 0.0, bh, r.h);
+    let is math.rect.Rect as pa with mut = math.rect.rect(r.w - bh, 0.0, bh, r.h);
+    if (layout.direction(t, w) == layout.RTL) {
+        pa = math.rect.rect(0.0, 0.0, bh, r.h);
+        ma = math.rect.rect(bh, 0.0, bh, r.h);
+        ta = math.rect.rect(2.0 * bh + px, 0.0, tw, r.h);
+    }
+    layout.place(t, d.text, &ta);
+    layout.place(t, d.minus, &ma);
+    layout.place(t, d.plus, &pa);
+}
+
+// --- Drawing ---
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *style.Theme as th = p.theme;
+    d.focused = painter.has(p, painter.S_FOCUSED);
+    let is style.Look as look = style.pick(&th.field, p.state, d.focused);
+    let is f64 as rad = th.metrics.radius_m;
+    let is math.rect.Rect as rc = p.rect;
+    shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, look.bg);
+    if (th.metrics.border_width > 0.0 && look.border.a > 0.0) {
+        shapes.stroke_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.metrics.border_width,
+                              look.border);
+    }
+    p.fg = look.fg;
+    if (d.focused == 1) {
+        let is math.rect.Rect as cr = caret(t, w);
+        shapes.fill_rect(p.canvas, fm.floor(cr.x), cr.y, cr.w, cr.h, look.fg);
+    }
+}
+
+// --- Events ---
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as k = e.kind;
+    if (k == event.TEXT) {
+        let is i32 as took with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < e.text_len) {
+            let is i64 as c = cast(i64, e.text[i]);
+            if (_numeric(c) == 1) {
+                if (d.editing == 0) {
+                    d.editing = 1;
+                    d.nbuf = 0;
+                }
+                if (d.nbuf < MAX_TYPED) {
+                    d.buf[d.nbuf] = cast(u8, c);
+                    d.nbuf = d.nbuf + 1;
+                }
+                took = 1;
+            }
+            i = i + 1;
+        }
+        if (took == 1) { _show(t, d); }
+        return 1;
+    }
+    if (k == event.SCROLL) {
+        if (e.dy == 0.0) { return 0; }
+        _commit(t, w, d);
+        let is f64 as by with mut = 1.0;
+        if (e.dy > 0.0) { by = 0.0 - 1.0; }
+        if (e.discrete == 1) { by = 0.0 - e.dy; }
+        _set(t, w, d, d.value + by * d.step);
+        return 1;
+    }
+    if (k == event.FOCUS_OUT) {
+        _commit(t, w, d);
+        return 0;
+    }
+    if (k == event.FOCUS_IN) {
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 0;
+    }
+    if (k == event.SHORTCUT_OVERRIDE) {
+        // Enter and Escape are its own while something is typed, ahead of
+        // the window's default and cancel buttons; not otherwise.
+        return cast(i64, d.editing == 1 && (e.key == keys.RETURN || e.key == keys.ESCAPE));
+    }
+    if (k != event.KEY_DOWN) { return 0; }
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    if (e.key == keys.RETURN) {
+        if (d.editing == 0) { return 0; }
+        _commit(t, w, d);
+        return 1;
+    }
+    if (e.key == keys.ESCAPE) {
+        if (d.editing == 0) { return 0; }
+        d.editing = 0;
+        _show(t, d);
+        return 1;
+    }
+    if (e.key == keys.BACKSPACE) {
+        if (d.editing == 0) {
+            // The value less its last character.
+            let is i64 as n = _format(d.value, d.digits, cast(*u8, &d.buf));
+            d.nbuf = n;
+            d.editing = 1;
+        }
+        if (d.nbuf > 0) { d.nbuf = d.nbuf - 1; }
+        _show(t, d);
+        return 1;
+    }
+    let is f64 as to with mut = 0.0;
+    let is i32 as moved with mut = 1;
+    if (e.key == keys.UP) { to = 1.0; }
+    else if (e.key == keys.DOWN) { to = 0.0 - 1.0; }
+    else if (e.key == keys.PAGE_UP) { to = 10.0; }
+    else if (e.key == keys.PAGE_DOWN) { to = 0.0 - 10.0; }
+    else { moved = 0; }
+    if (moved == 1) {
+        _commit(t, w, d);
+        _set(t, w, d, d.value + to * d.step);
+        return 1;
+    }
+    if (ctrl == 1 && e.key == keys.HOME) {
+        _set(t, w, d, d.min);
+        return 1;
+    }
+    if (ctrl == 1 && e.key == keys.END) {
+        _set(t, w, d, d.max);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        access.set_range(q, d.value, d.min, d.max, d.step);
+        q.actions = access.INCREMENT | access.DECREMENT | access.SET_VALUE;
+        q.states = q.states | access.EDITABLE;
+        return 1;
+    }
+    if (q.action == access.SET_VALUE) { _set(t, w, d, q.arg); }
+    if (q.action == access.INCREMENT) { _set(t, w, d, d.value + d.step); }
+    if (q.action == access.DECREMENT) { _set(t, w, d, d.value - d.step); }
+    return 1;
+}
