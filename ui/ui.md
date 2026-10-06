@@ -837,7 +837,10 @@ deletes forward (`erase_ahead` when it is known to be Delete, never joined to
 a backspace), a paste, a replacement or text moved by a drag (`move`) alone,
 each putting the caret back where it belongs; the program's own edits forget
 what could be undone, whose places they move. Two megabytes in twenty
-thousand paragraphs stay quick.
+thousand paragraphs stay quick. It says what changed since it was last asked
+(`take_change`) — one span from the first byte touched to the last, as the
+text is now, and how much longer it got — undo and redo included, so a view
+of it lays out again only those paragraphs.
 
 **Entries** (`widgets/entry.cst`, tested by `entry_test`): one line of text
 in a field, kept in a text buffer and undone in its steps; a line feed typed
