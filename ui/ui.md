@@ -1157,6 +1157,12 @@ font chosen. Another family keeps the style nearest the one chosen.
 `dialog()` and `button()` as for colours, the button saying "Family Style
 Size".
 
+**About dialogs** (`widgets/about.cst`, tested by `about_test`): the
+program's image, name, version, what it does, its website and copyright down
+the middle, each only once given; Credits and License, toggles at the
+foot's start (a dialog's secondary buttons, `dialog.set_secondary`), show
+who made it and the licence in their place.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
