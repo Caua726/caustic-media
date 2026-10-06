@@ -1,0 +1,1548 @@
+// ui/widgets/textview.cst — text of many lines.
+//
+// Its text is a text buffer's, its paragraphs broken at line feeds; typing,
+// Enter, Tab (unless set not to take it), pasting with line ends kept,
+// undoing in steps, the clipboard and the primary selection, an input
+// method's composition, its context menu — as the entry has them, through
+// textedit.cst. Wrapped at its width by word, or not at all; it is meant
+// to be the content of a scroll area, which it asks (REVEAL) to keep the
+// caret in view.
+//
+// A large document is laid out only where it is seen. Each paragraph has a
+// height — estimated from its length until it is laid out at the view's
+// width, then known — and a Fenwick tree over the heights finds where a
+// paragraph starts, and which one a point is in, without walking them all.
+// The paragraphs laid out, a few dozen, are kept with what text/layout found
+// for them, the least recently used given up first; a text short enough is
+// laid out whole, its heights all known. An edit tells it (textbuf's
+// take_change) which paragraphs changed: only those are estimated again,
+// and the rest keep what they had, moved along.
+//
+// The caret moves by grapheme and word as the entry's does, across
+// paragraph ends; up and down by lines, into the paragraphs above and
+// below, keeping where across it was; Home and End to its line's ends,
+// Control to the text's; Page Up and Down by the height in view. The
+// pointer places it, drags a selection, a word with a double click and the
+// paragraph with a triple.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/draw2d.cst" as draw2d;
+use "../../render/shapes2d.cst" as shapes;
+use "../../text/layout/model.cst" as model;
+use "../../text/layout/layout.cst" as tlayout;
+use "../../text/layout/cursor.cst" as cursor;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../scroll.cst" as scroll;
+use "../signal.cst" as signal;
+use "../text.cst" as txt;
+use "../textbuf.cst" as textbuf;
+use "menu.cst" as menu;
+use "textedit.cst" as textedit;
+
+let is i32 as WRAP_NONE with imut = 0;
+let is i32 as WRAP_WORD with imut = 1;
+
+let is i64 as MAX_LAID    with imut = 48;      // paragraphs kept laid out
+let is i64 as MAX_PREEDIT with imut = 256;
+let is i64 as EXACT_BYTES with imut = 16384;   // a text this long or shorter is laid out whole
+
+// One paragraph laid out at the view's width.
+struct Para {
+    idx     as i64;     // which; -1 for a free place
+    used    as i64;     // when last asked for
+    width   as f64;     // laid out at; below 0 not wrapped
+    pre_at  as i64;     // where a composition is in it, its own offsets; -1 for none
+    lay     as tlayout.Layout;
+    lstyles as [16]model.Style;
+    run     as txt.Run;
+    opened  as i32;
+    _pad0   as i32;
+}
+
+struct Doc {
+    buf         as textbuf.Buf;
+    hs          as *f64;    // each paragraph's height: known, or estimated
+    ws          as *f64;    // and width, for text not wrapped
+    fen         as *f64;    // a Fenwick tree over the heights
+    cap         as i64;
+    n           as i64;     // paragraphs, as these arrays have them
+    laid        as *Para;   // MAX_LAID of them
+    stamp       as i64;
+    lays        as i64;     // paragraphs laid out so far
+    width       as f64;     // what the text wraps at; below 0 not wrapped
+    line_h      as f64;
+    char_w      as f64;     // a character's width, about, for estimates
+    key_size    as f64;
+    key_weight  as i64;
+    key_family  as *u8;
+    tmp         as *u8;
+    tmp_cap     as i64;
+    pre         as [256]u8;
+    npre        as i64;
+    pre_cur     as i64;
+    anchor      as i64;
+    caret       as i64;
+    want_x      as f64;     // where across moving up and down keeps to; below 0 none
+    by          as i64;
+    unit_a      as i64;
+    unit_b      as i64;
+    press_at    as i64;
+    drop        as i64;
+    self        as i64;
+    menu        as i64;
+    items       as [8]i64;
+    upstream    as i32;
+    pressing    as i32;
+    maybe_drag  as i32;
+    dragging    as i32;
+    focused     as i32;
+    editable    as i32;
+    wrap        as i32;
+    tabs        as i32;     // Tab is typed
+    styled      as i32;     // the style is known
+    _pad0       as i32;
+}
+
+struct Data {
+    d as *Doc;
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+let is txt.Run as _scratch with mut;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("textview", sizeof(Data));
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.role = access.ROLE_TEXT;
+    _kind.access = fn_ptr(_access);
+    _kind.shape = fn_ptr(_shape);
+    _scratch = txt.run();
+    _ready = 1;
+}
+
+// A new, empty text view as the last child of parent — a scroll area, as a
+// rule. Its handle, or 0 with the tree's last_error set — or, when memory is
+// refused, 0 alone.
+fn create(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Doc as d = cast(*Doc, mem.core.mmap_anon(sizeof(Doc)));
+    let is *Para as laid = cast(*Para, mem.core.mmap_anon(MAX_LAID * sizeof(Para)));
+    if (cast(i64, d) <= 0 || cast(i64, laid) <= 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    d.buf = textbuf.open();
+    d.laid = laid;
+    let is i64 as i with mut = 0;
+    while (i < MAX_LAID) {
+        laid[i].idx = 0 - 1;
+        laid[i].pre_at = 0 - 1;
+        i = i + 1;
+    }
+    d.width = 0.0 - 1.0;
+    d.want_x = 0.0 - 1.0;
+    d.by = 1;
+    d.editable = 1;
+    d.wrap = WRAP_WORD;
+    d.tabs = 1;
+    d.self = w;
+    cast(*Data, tree.data(t, w)).d = d;
+    tree.set_focusable(t, w, 1);
+    _sync_all(t, w, d);
+    return w;
+}
+
+fn _doc(t as *tree.Tree, w as i64) as *Doc {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Doc, 0); }
+    return cast(*Data, tree.data(t, w)).d;
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Doc as d = cast(*Data, data).d;
+    if (cast(i64, d) == 0) { return; }
+    if (d.menu != 0 && tree.is_valid(t, d.menu) == 1) { tree.destroy(t, d.menu); }
+    if (cast(i64, d.laid) > 0) {
+        let is i64 as i with mut = 0;
+        while (i < MAX_LAID) {
+            if (d.laid[i].opened == 1) { tlayout.close(&d.laid[i].lay); }
+            txt.run_close(&d.laid[i].run);
+            i = i + 1;
+        }
+        mem.core.munmap(cast(*u8, d.laid), MAX_LAID * sizeof(Para));
+    }
+    textbuf.close(&d.buf);
+    if (d.cap > 0) {
+        mem.core.munmap(cast(*u8, d.hs), d.cap * 8);
+        mem.core.munmap(cast(*u8, d.ws), d.cap * 8);
+        mem.core.munmap(cast(*u8, d.fen), (d.cap + 1) * 8);
+    }
+    if (d.tmp_cap > 0) { mem.core.munmap(d.tmp, d.tmp_cap); }
+    mem.core.munmap(cast(*u8, d), sizeof(Doc));
+}
+
+// --- Paragraphs' heights ---
+
+fn _grow(d as *Doc, want as i64) as i32 {
+    if (want <= d.cap) { return 1; }
+    let is i64 as c with mut = d.cap * 2;
+    if (c < 64) { c = 64; }
+    while (c < want) { c = c * 2; }
+    let is *f64 as hs = cast(*f64, mem.core.mmap_anon(c * 8));
+    let is *f64 as ws = cast(*f64, mem.core.mmap_anon(c * 8));
+    let is *f64 as fen = cast(*f64, mem.core.mmap_anon((c + 1) * 8));
+    if (cast(i64, hs) <= 0 || cast(i64, ws) <= 0 || cast(i64, fen) <= 0) { return 0; }
+    if (d.cap > 0) {
+        mem.memcpy(cast(*u8, hs), cast(*u8, d.hs), d.n * 8);
+        mem.memcpy(cast(*u8, ws), cast(*u8, d.ws), d.n * 8);
+        mem.core.munmap(cast(*u8, d.hs), d.cap * 8);
+        mem.core.munmap(cast(*u8, d.ws), d.cap * 8);
+        mem.core.munmap(cast(*u8, d.fen), (d.cap + 1) * 8);
+    }
+    d.hs = hs;
+    d.ws = ws;
+    d.fen = fen;
+    d.cap = c;
+    return 1;
+}
+
+fn _fen_build(d as *Doc) as void {
+    let is i64 as i with mut = 1;
+    while (i <= d.n) {
+        d.fen[i] = d.hs[i - 1];
+        i = i + 1;
+    }
+    i = 1;
+    while (i <= d.n) {
+        let is i64 as j = i + (i & (0 - i));
+        if (j <= d.n) { d.fen[j] = d.fen[j] + d.fen[i]; }
+        i = i + 1;
+    }
+}
+
+fn _fen_add(d as *Doc, at as i64, by as f64) as void {
+    let is i64 as i with mut = at + 1;
+    while (i <= d.n) {
+        d.fen[i] = d.fen[i] + by;
+        i = i + (i & (0 - i));
+    }
+}
+
+// The heights of the paragraphs before paragraph at.
+fn _before(d as *Doc, at as i64) as f64 {
+    let is f64 as s with mut = 0.0;
+    let is i64 as i with mut = at;
+    while (i > 0) {
+        s = s + d.fen[i];
+        i = i - (i & (0 - i));
+    }
+    return s;
+}
+
+// The paragraph content height y falls in: the last when it is past them all.
+fn _at_height(d as *Doc, y as f64) as i64 {
+    if (y <= 0.0 || d.n <= 1) { return 0; }
+    let is i64 as pos with mut = 0;
+    let is f64 as rest with mut = y;
+    let is i64 as step with mut = 1;
+    while (step * 2 <= d.n) { step = step * 2; }
+    while (step > 0) {
+        if (pos + step <= d.n && d.fen[pos + step] <= rest) {
+            pos = pos + step;
+            rest = rest - d.fen[pos];
+        }
+        step = step / 2;
+    }
+    if (pos >= d.n) { return d.n - 1; }
+    return pos;
+}
+
+fn _total(d as *Doc) as f64 { return _before(d, d.n); }
+
+fn _set_h(d as *Doc, i as i64, h as f64) as void {
+    if (h == d.hs[i]) { return; }
+    _fen_add(d, i, h - d.hs[i]);
+    d.hs[i] = h;
+}
+
+fn _pstart(d as *Doc, i as i64) as i64 { return textbuf.para_start(&d.buf, i); }
+fn _pend(d as *Doc, i as i64) as i64 { return textbuf.para_end(&d.buf, i); }
+
+// How tall paragraph i would be wrapped at width, as its length says.
+fn _guess_h(d as *Doc, i as i64, width as f64) as f64 {
+    let is f64 as across = cast(f64, _pend(d, i) - _pstart(d, i)) * d.char_w;
+    let is f64 as lines with mut = 1.0;
+    if (width > 0.0 && across > width) { lines = fm.ceil(across / width); }
+    return lines * d.line_h;
+}
+
+// A paragraph's height and width, as its length says until it is laid out.
+fn _estimate(d as *Doc, i as i64) as void {
+    d.hs[i] = _guess_h(d, i, d.width);
+    d.ws[i] = cast(f64, _pend(d, i) - _pstart(d, i)) * d.char_w;
+}
+
+// Every paragraph estimated again; none kept laid out.
+fn _sync_all(t as *tree.Tree, w as i64, d as *Doc) as void {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = 0;
+    let is i64 as dl with mut = 0;
+    textbuf.take_change(&d.buf, &lo, &hi, &dl);
+    let is i64 as n = textbuf.paragraphs(&d.buf);
+    if (_grow(d, n) == 0) { return; }
+    d.n = n;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        _estimate(d, i);
+        i = i + 1;
+    }
+    _fen_build(d);
+    i = 0;
+    while (i < MAX_LAID) {
+        d.laid[i].idx = 0 - 1;
+        i = i + 1;
+    }
+}
+
+// n bytes from src to dst, the two maybe overlapping.
+fn _move_bytes(dst as *u8, src as *u8, n as i64) as void {
+    if (cast(i64, dst) < cast(i64, src)) {
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            dst[i] = src[i];
+            i = i + 1;
+        }
+        return;
+    }
+    let is i64 as j with mut = n - 1;
+    while (j >= 0) {
+        dst[j] = src[j];
+        j = j - 1;
+    }
+}
+
+// What the buffer says changed: those paragraphs estimated again, the rest
+// moved along with what they had.
+fn _resync(t as *tree.Tree, w as i64, d as *Doc) as void {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = 0;
+    let is i64 as dl with mut = 0;
+    if (textbuf.take_change(&d.buf, &lo, &hi, &dl) == 0) { return; }
+    let is i64 as n = textbuf.paragraphs(&d.buf);
+    let is i64 as p0 = textbuf.para_of(&d.buf, lo);
+    let is i64 as p1 = textbuf.para_of(&d.buf, hi);
+    let is i64 as old1 = p1 + d.n - n;
+    if (_grow(d, n) == 0) { return; }
+    let is i64 as by = n - d.n;
+    // The paragraphs after the change, moved.
+    if (by != 0 && old1 + 1 < d.n) {
+        let is i64 as count = d.n - old1 - 1;
+        _move_bytes(cast(*u8, cast(i64, d.hs) + (p1 + 1) * 8), cast(*u8, cast(i64, d.hs) + (old1 + 1) * 8), count * 8);
+        _move_bytes(cast(*u8, cast(i64, d.ws) + (p1 + 1) * 8), cast(*u8, cast(i64, d.ws) + (old1 + 1) * 8), count * 8);
+    }
+    d.n = n;
+    let is i64 as i with mut = p0;
+    while (i <= p1) {
+        _estimate(d, i);
+        i = i + 1;
+    }
+    _fen_build(d);
+    i = 0;
+    while (i < MAX_LAID) {
+        let is *Para as p = &d.laid[i];
+        if (p.idx >= p0 && p.idx <= old1) {
+            p.idx = 0 - 1;
+        } else if (p.idx > old1) {
+            p.idx = p.idx + by;
+        }
+        i = i + 1;
+    }
+    // A short text is laid out whole, the paragraphs just changed too.
+    if (d.width >= 0.0 - 1.5 && textbuf.length(&d.buf) <= EXACT_BYTES) {
+        i = p0;
+        while (i <= p1) {
+            _para(t, w, d, i);
+            i = i + 1;
+        }
+    }
+}
+
+// --- Laying out ---
+
+fn _service(t as *tree.Tree) as *txt.Service { return cast(*txt.Service, tree.text_service(t)); }
+
+fn _styles(th as *style.Theme, sts as *txt.Style) as void {
+    sts[0] = txt.style_of(th.fonts.body);
+    sts[0].family = th.fonts.family;
+    sts[1] = sts[0];
+    sts[1].underline = 1;
+}
+
+// The theme's text as it was laid out in: if not, all laid out again.
+fn _fresh(t as *tree.Tree, w as i64, d as *Doc) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is txt.Style as st = txt.style_of(th.fonts.body);
+    if (d.styled == 1 && st.size == d.key_size && st.weight == d.key_weight &&
+        cast(i64, th.fonts.family) == cast(i64, d.key_family)) {
+        return;
+    }
+    let is *txt.Service as svc = _service(t);
+    if (cast(i64, svc) == 0) { return; }
+    let is [2]txt.Style as sts;
+    _styles(&th, cast(*txt.Style, &sts));
+    let is model.Params as pp = model.params();
+    txt.lay_plain(svc, &_scratch, "Ag", 2, cast(*txt.Style, &sts), &pp);
+    d.line_h = _scratch.height;
+    txt.lay_plain(svc, &_scratch, "abcdefghijklmnopqrstuvwxyz", 26, cast(*txt.Style, &sts), &pp);
+    d.char_w = _scratch.width / 26.0;
+    d.key_size = st.size;
+    d.key_weight = st.weight;
+    d.key_family = th.fonts.family;
+    d.styled = 1;
+    _sync_all(t, w, d);
+    // At no width yet: the next pass lays out again — a short text whole.
+    d.width = 0.0 - 2.0;
+}
+
+fn _pad(th as *style.Theme) as f64 { return th.metrics.space_s; }
+
+fn _tmp_room(d as *Doc, want as i64) as i32 {
+    if (want <= d.tmp_cap) { return 1; }
+    let is i64 as c with mut = d.tmp_cap * 2;
+    if (c < 256) { c = 256; }
+    while (c < want) { c = c * 2; }
+    let is *u8 as q = mem.core.mmap_anon(c);
+    if (cast(i64, q) <= 0) { return 0; }
+    if (d.tmp_cap > 0) { mem.core.munmap(d.tmp, d.tmp_cap); }
+    d.tmp = q;
+    d.tmp_cap = c;
+    return 1;
+}
+
+// Paragraph i laid out at the view's width — found among those laid out,
+// or laid out now in the place least recently used — its height and width
+// known from then on. Null when it cannot be.
+fn _para(t as *tree.Tree, w as i64, d as *Doc, i as i64) as *Para {
+    d.stamp = d.stamp + 1;
+    let is i64 as k with mut = 0;
+    let is i64 as free with mut = 0;
+    while (k < MAX_LAID) {
+        let is *Para as p = &d.laid[k];
+        if (p.idx == i && p.width == d.width) {
+            p.used = d.stamp;
+            // Kept from before, the height may since have been estimated
+            // again — at another width, and back.
+            _known(d, i, p);
+            return p;
+        }
+        if (d.laid[free].idx >= 0 && (p.idx < 0 || p.used < d.laid[free].used)) { free = k; }
+        k = k + 1;
+    }
+    let is *txt.Service as svc = _service(t);
+    if (cast(i64, svc) == 0) { return cast(*Para, 0); }
+    let is *Para as p = &d.laid[free];
+    p.idx = 0 - 1;
+    let is i64 as ps = _pstart(d, i);
+    let is i64 as len = _pend(d, i) - ps;
+    // The caret's paragraph shows the composition at the caret.
+    let is i64 as cp = textbuf.para_of(&d.buf, d.caret);
+    p.pre_at = 0 - 1;
+    let is *u8 as s with mut = textbuf.span(&d.buf, ps, len);
+    let is i64 as n with mut = len;
+    if (d.npre > 0 && cp == i) {
+        if (_tmp_room(d, len + d.npre) == 0) { return cast(*Para, 0); }
+        let is i64 as at = d.caret - ps;
+        mem.memcpy(d.tmp, s, at);
+        mem.memcpy(cast(*u8, cast(i64, d.tmp) + at), cast(*u8, &d.pre), d.npre);
+        mem.memcpy(cast(*u8, cast(i64, d.tmp) + at + d.npre), cast(*u8, cast(i64, s) + at), len - at);
+        s = d.tmp;
+        n = len + d.npre;
+        p.pre_at = at;
+    }
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is [2]txt.Style as sts;
+    _styles(&th, cast(*txt.Style, &sts));
+    let is model.Params as pp = model.params();
+    pp.width = d.width;
+    let is model.Span as sp;
+    sp.start = p.pre_at;
+    sp.end = p.pre_at + d.npre;
+    sp.style = 1;
+    let is i64 as nsp with mut = 0;
+    if (p.pre_at >= 0) { nsp = 1; }
+    if (txt.lay(svc, &p.run, s, n, cast(*txt.Style, &sts), 2, &sp, nsp, &pp) == 0) { return cast(*Para, 0); }
+    if (p.opened == 0) {
+        tlayout.open(&p.lay);
+        p.opened = 1;
+    }
+    if (txt.lay_layout(svc, &p.lay, cast(*model.Style, &p.lstyles), txt.text_of(&p.run), txt.text_length(&p.run),
+                       cast(*txt.Style, &sts), 2, &sp, nsp, &pp) == 0) {
+        return cast(*Para, 0);
+    }
+    p.idx = i;
+    p.width = d.width;
+    p.used = d.stamp;
+    d.lays = d.lays + 1;
+    _known(d, i, p);
+    return p;
+}
+
+// Paragraph i's height and width as it is laid out.
+fn _known(d as *Doc, i as i64, p as *Para) as void {
+    let is f64 as h with mut = p.run.height;
+    if (h < d.line_h) { h = d.line_h; }
+    _set_h(d, i, h);
+    d.ws[i] = p.run.width;
+}
+
+// The paragraph laid out again, its text or composition having changed.
+fn _forget(d as *Doc, i as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < MAX_LAID) {
+        if (d.laid[k].idx == i) { d.laid[k].idx = 0 - 1; }
+        k = k + 1;
+    }
+}
+
+// The width the text wraps at in a widget ww wide; below 0, none.
+fn _wraps_at(t as *tree.Tree, w as i64, d as *Doc, ww as f64) as f64 {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as tw with mut = ww - 2.0 * _pad(&th);
+    if (tw < 1.0) { tw = 1.0; }
+    if (d.wrap == WRAP_NONE) { tw = 0.0 - 1.0; }
+    return tw;
+}
+
+// The width the text wraps at, from the widget's; on a change, every
+// paragraph estimated again — or, for a short text, laid out.
+fn _set_width(t as *tree.Tree, w as i64, d as *Doc, ww as f64) as void {
+    _fresh(t, w, d);
+    let is f64 as tw = _wraps_at(t, w, d, ww);
+    if (tw == d.width) { return; }
+    d.width = tw;
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        _estimate(d, i);
+        i = i + 1;
+    }
+    _fen_build(d);
+    if (textbuf.length(&d.buf) <= EXACT_BYTES) {
+        i = 0;
+        while (i < d.n) {
+            _para(t, w, d, i);
+            i = i + 1;
+        }
+    }
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _widest(d as *Doc) as f64 {
+    let is f64 as m with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < d.n) {
+        m = _max(m, d.ws[i]);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Doc as d = cast(*Data, data).d;
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as pad = _pad(&th);
+    let is f64 as natural = 2.0 * pad + 30.0 * th.fonts.body.size;
+    // Measured at a width, laid out at it; measured with none — a scroll
+    // area asking what it would like — as it is, laid out at its natural
+    // width only when it has none yet: going there and back on every pass
+    // would make a large text forget every height it found. So would a large
+    // text asked about a width it is not at, as a row asks before it hands
+    // out room: its height there guessed, nothing it found forgotten.
+    let is i32 as guessed with mut = 0;
+    let is f64 as h with mut = 0.0;
+    if (c.w < layout.UNBOUNDED) {
+        _fresh(t, w, d);
+        let is f64 as tw = _wraps_at(t, w, d, c.w);
+        if (d.styled == 1 && d.width >= 0.0 - 1.5 && tw != d.width && textbuf.length(&d.buf) > EXACT_BYTES) {
+            guessed = 1;
+            let is i64 as i with mut = 0;
+            while (i < d.n) {
+                h = h + _guess_h(d, i, tw);
+                i = i + 1;
+            }
+        } else {
+            _set_width(t, w, d, c.w);
+        }
+    } else if (d.width < 0.0 - 1.5 || d.styled == 0) {
+        _set_width(t, w, d, natural);
+    }
+    if (guessed == 0) { h = _total(d); }
+    out.min_w = 2.0 * pad + 2.0 * th.fonts.body.size;
+    out.pref_w = natural;
+    if (d.wrap == WRAP_NONE) {
+        out.pref_w = 2.0 * pad + _widest(d) + 1.0;
+        out.min_w = out.pref_w;
+    }
+    out.min_h = 2.0 * pad + h;
+    out.pref_h = out.min_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Doc as d = cast(*Data, data).d;
+    _set_width(t, w, d, r.w);
+    _area(t, w, d);
+}
+
+// --- Where things are ---
+
+// Paragraph i's top, from the widget's.
+fn _top(t as *tree.Tree, w as i64, d as *Doc, i as i64) as f64 {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    return _pad(&th) + _before(d, i);
+}
+
+// Offset at of the text, in its paragraph's text as laid out.
+fn _local(d as *Doc, p as *Para, at as i64) as i64 {
+    let is i64 as l = at - _pstart(d, p.idx);
+    if (p.pre_at >= 0 && l > p.pre_at) { return l + d.npre; }
+    return l;
+}
+
+// Offset l of a paragraph's text as laid out, in the text.
+fn _global(d as *Doc, p as *Para, l as i64) as i64 {
+    let is i64 as v with mut = l;
+    if (p.pre_at >= 0 && v > p.pre_at) {
+        v = v - d.npre;
+        if (v < p.pre_at) { v = p.pre_at; }
+    }
+    return _pstart(d, p.idx) + v;
+}
+
+// The caret at offset at — upstream up, shown s bytes on into a
+// composition — in the window.
+fn _rect_at(t as *tree.Tree, w as i64, d as *Doc, at as i64, up as i32, into as i64) as math.rect.Rect {
+    let is i64 as i = textbuf.para_of(&d.buf, at);
+    let is *Para as p = _para(t, w, d, i);
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    if (cast(i64, p) == 0) { return math.rect.rect(r.x + _pad(&th), r.y + _top(t, w, d, i), 1.0, d.line_h); }
+    let is cursor.Caret as c = cursor.caret(&p.lay, cursor.position(_local(d, p, at) + into, up));
+    return math.rect.rect(r.x + _pad(&th) + c.x, r.y + _top(t, w, d, i) + c.top, 1.0, c.height);
+}
+
+fn _caret_into(d as *Doc) as i64 {
+    if (d.npre > 0) { return d.pre_cur; }
+    return 0;
+}
+
+fn _area(t as *tree.Tree, w as i64, d as *Doc) as void {
+    if (d.focused == 0) { return; }
+    tree.set_text_area(t, w, _rect_at(t, w, d, d.caret, d.upstream, _caret_into(d)));
+}
+
+// The caret kept in view by what holds it, the input method told.
+fn _moved(t as *tree.Tree, w as i64, d as *Doc) as void {
+    let is math.rect.Rect as cr = _rect_at(t, w, d, d.caret, d.upstream, _caret_into(d));
+    router.reveal_rect(t, w, &cr);
+    _area(t, w, d);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// The text changed: its paragraphs told, laid out again, CHANGED. The
+// caret's paragraph — the one typed into — laid out before what holds the
+// view is told its height, which would otherwise come from its length.
+fn _edited(t as *tree.Tree, w as i64, d as *Doc) as void {
+    _resync(t, w, d);
+    if (d.width >= 0.0 - 1.5) { _para(t, w, d, textbuf.para_of(&d.buf, d.caret)); }
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    layout.run(t, layout.rect(t, tree.root(t)).w, layout.rect(t, tree.root(t)).h);
+    _moved(t, w, d);
+    signal.emit(t, w, signal.CHANGED, cast(*u8, 0));
+}
+
+// The height of what of it is in view: inside every ancestor's rectangle.
+fn _seen_h(t as *tree.Tree, w as i64) as f64 {
+    let is math.rect.Rect as r with mut = layout.window_rect(t, w);
+    let is i64 as a with mut = tree.parent(t, w);
+    while (a != 0) {
+        let is math.rect.Rect as ar = layout.window_rect(t, a);
+        let is f64 as y0 = _max(r.y, ar.y);
+        let is f64 as y1 = fm.min_f64(r.y + r.h, ar.y + ar.h);
+        r.y = y0;
+        r.h = _max(0.0, y1 - y0);
+        a = tree.parent(t, a);
+    }
+    return r.h;
+}
+
+// --- Asked of it ---
+
+fn text(t as *tree.Tree, w as i64) as *u8 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return cast(*u8, 0); }
+    return textbuf.span(&d.buf, 0, textbuf.length(&d.buf));
+}
+
+fn length(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return textbuf.length(&d.buf);
+}
+
+fn paragraphs(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return textbuf.paragraphs(&d.buf);
+}
+
+// The paragraph offset at is in.
+fn paragraph_of(t as *tree.Tree, w as i64, at as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return textbuf.para_of(&d.buf, at);
+}
+
+fn caret(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.caret;
+}
+
+fn selection(t as *tree.Tree, w as i64, a as *i64, b as *i64) as i32 {
+    let is *Doc as d = _doc(t, w);
+    *a = 0;
+    *b = 0;
+    if (cast(i64, d) == 0) { return 0; }
+    *a = d.anchor;
+    *b = d.caret;
+    return cast(i32, *a != *b);
+}
+
+// How many paragraphs are kept laid out now.
+fn laid(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    let is i64 as n with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < MAX_LAID) {
+        if (d.laid[k].idx >= 0) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+// How many times a paragraph has been laid out — what a kept one saves.
+fn layouts(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.lays;
+}
+
+// The caret at offset at, as it would be drawn, in the window.
+fn rect_of(t as *tree.Tree, w as i64, at as i64) as math.rect.Rect {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    return _rect_at(t, w, d, _clamp(d, at), 0, 0);
+}
+
+// The offset nearest the window's point x, y: above the text, in its first
+// line; below it, its end.
+fn offset_at(t as *tree.Tree, w as i64, x as f64, y as f64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    return _hit(t, w, d, x - r.x, y - r.y).offset;
+}
+
+// Its caret, in the window: inside a composition, the composition's.
+fn caret_rect(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    return _rect_at(t, w, d, d.caret, d.upstream, _caret_into(d));
+}
+
+// Where text being dragged would be dropped; -1 when nothing is dragged.
+fn drop_at(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0 || d.dragging == 0) { return 0 - 1; }
+    return d.drop;
+}
+
+fn context_menu(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.menu;
+}
+
+fn _clamp(d as *Doc, v as i64) as i64 {
+    if (v <= 0) { return 0; }
+    let is i64 as n = textbuf.length(&d.buf);
+    if (v >= n) { return n; }
+    let is i64 as i with mut = v;
+    while (i > 0 && (textbuf.byte_at(&d.buf, i) & 192) == 128) { i = i - 1; }
+    return i;
+}
+
+fn select(t as *tree.Tree, w as i64, a as i64, b as i64) as void {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return; }
+    _end_composition(t, w, d);
+    d.anchor = _clamp(d, a);
+    d.caret = _clamp(d, b);
+    d.upstream = 0;
+    d.want_x = 0.0 - 1.0;
+    textbuf.break_group(&d.buf);
+    _moved(t, w, d);
+}
+
+// --- Set by the program ---
+
+// Its text from now on — not filtered, nothing to undo — the caret at its
+// start; CR LF and a lone CR made line feeds. 1, or 0.
+fn set_text(t as *tree.Tree, w as i64, s as *u8, n as i64) as i32 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    _end_composition(t, w, d);
+    if (_tmp_room(d, n + 1) == 0) { return 0; }
+    let is i64 as k = textedit.accept(s, n, 0 - 1, cast(textedit.FilterFn, 0), cast(*u8, 0), 1, d.tmp);
+    if (textbuf.replace(&d.buf, 0, textbuf.length(&d.buf), d.tmp, k) == 0) { return 0; }
+    textbuf.forget(&d.buf);
+    d.anchor = 0;
+    d.caret = 0;
+    d.upstream = 0;
+    d.want_x = 0.0 - 1.0;
+    _sync_all(t, w, d);
+    d.width = 0.0 - 2.0;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    signal.emit(t, w, signal.CHANGED, cast(*u8, 0));
+    return 1;
+}
+
+fn set_editable(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    if (on == 0) { _end_composition(t, w, d); }
+    d.editable = on;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    return 1;
+}
+
+// Wrapped at its width by word (WRAP_WORD, as it starts), or not
+// (WRAP_NONE): one line a paragraph, as wide as the widest.
+fn set_wrap(t as *tree.Tree, w as i64, mode as i32) as i32 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.wrap = mode;
+    d.width = 0.0 - 2.0;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return 1;
+}
+
+// Tab typed (1, as it starts), or left to move the focus (0).
+fn set_accepts_tab(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.tabs = on;
+    return 1;
+}
+
+// --- Editing ---
+
+fn _lo(d as *Doc) as i64 { if (d.anchor < d.caret) { return d.anchor; } return d.caret; }
+fn _hi(d as *Doc) as i64 { if (d.anchor > d.caret) { return d.anchor; } return d.caret; }
+
+// The composition given up, and the input method told.
+fn _end_composition(t as *tree.Tree, w as i64, d as *Doc) as void {
+    if (d.npre == 0) { return; }
+    _forget(d, textbuf.para_of(&d.buf, d.caret));
+    d.npre = 0;
+    d.pre_cur = 0;
+    tree.reset_ime(t, w);
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// s, n bytes, in for the selection: typed or pasted.
+fn _put(t as *tree.Tree, w as i64, d as *Doc, s as *u8, n as i64, typed as i32) as void {
+    if (n <= 0 || _tmp_room(d, n) == 0) { return; }
+    let is i64 as k = textedit.accept(s, n, 0 - 1, cast(textedit.FilterFn, 0), cast(*u8, 0), 1, d.tmp);
+    if (k <= 0) { return; }
+    let is i64 as a = _lo(d);
+    let is i64 as b = _hi(d);
+    let is i32 as ok with mut = 0;
+    if (a != b) {
+        ok = textbuf.change(&d.buf, a, b - a, d.tmp, k);
+    } else if (typed == 1) {
+        ok = textbuf.type_in(&d.buf, a, d.tmp, k);
+    } else {
+        ok = textbuf.paste_in(&d.buf, a, d.tmp, k);
+    }
+    if (ok == 0) { return; }
+    d.anchor = a + k;
+    d.caret = a + k;
+    d.upstream = 0;
+    d.want_x = 0.0 - 1.0;
+    _edited(t, w, d);
+}
+
+fn _copy(t as *tree.Tree, d as *Doc, which as i32) as void {
+    let is i64 as a = _lo(d);
+    let is i64 as b = _hi(d);
+    if (a == b) { return; }
+    tree.copy(t, which, textbuf.span(&d.buf, a, b - a), b - a);
+}
+
+fn _erase_selection(t as *tree.Tree, w as i64, d as *Doc) as i32 {
+    let is i64 as a = _lo(d);
+    let is i64 as b = _hi(d);
+    if (a == b) { return 0; }
+    if (textbuf.change(&d.buf, a, b - a, "", 0) == 0) { return 0; }
+    d.anchor = a;
+    d.caret = a;
+    _edited(t, w, d);
+    return 1;
+}
+
+// Backspace — with Control, the word before; at a paragraph's start, the
+// line end before it.
+fn _back(t as *tree.Tree, w as i64, d as *Doc, words as i32) as void {
+    if (_erase_selection(t, w, d) == 1 || d.caret == 0) { return; }
+    let is i64 as i = textbuf.para_of(&d.buf, d.caret);
+    let is i64 as ps = _pstart(d, i);
+    let is i64 as from with mut = d.caret - 1;
+    if (d.caret > ps) {
+        let is *Para as p = _para(t, w, d, i);
+        if (cast(i64, p) == 0) { return; }
+        let is i64 as l = d.caret - ps;
+        let is i64 as to with mut = cursor.prev_grapheme(&p.lay, l);
+        if (words == 1) { to = cursor.prev_word(&p.lay, l); }
+        from = ps + to;
+    }
+    textbuf.erase(&d.buf, from, d.caret - from);
+    d.anchor = from;
+    d.caret = from;
+    d.upstream = 0;
+    d.want_x = 0.0 - 1.0;
+    _edited(t, w, d);
+}
+
+// Delete — with Control, to the word's end; at a paragraph's end, its line
+// end.
+fn _ahead(t as *tree.Tree, w as i64, d as *Doc, words as i32) as void {
+    if (_erase_selection(t, w, d) == 1 || d.caret >= textbuf.length(&d.buf)) { return; }
+    let is i64 as i = textbuf.para_of(&d.buf, d.caret);
+    let is i64 as ps = _pstart(d, i);
+    let is i64 as end with mut = d.caret + 1;
+    if (d.caret < _pend(d, i)) {
+        let is *Para as p = _para(t, w, d, i);
+        if (cast(i64, p) == 0) { return; }
+        let is i64 as l = d.caret - ps;
+        let is i64 as to with mut = cursor.next_grapheme(&p.lay, l);
+        if (words == 1) { to = cursor.next_word(&p.lay, l); }
+        end = ps + to;
+    }
+    textbuf.erase_ahead(&d.buf, d.caret, end - d.caret);
+    d.anchor = d.caret;
+    d.upstream = 0;
+    d.want_x = 0.0 - 1.0;
+    _edited(t, w, d);
+}
+
+fn _undo(t as *tree.Tree, w as i64, d as *Doc, redo as i32) as void {
+    let is i32 as did with mut = 0;
+    if (redo == 1) { did = textbuf.redo(&d.buf); } else { did = textbuf.undo(&d.buf); }
+    if (did == 0) { return; }
+    d.caret = _clamp(d, textbuf.caret(&d.buf));
+    d.anchor = d.caret;
+    d.upstream = 0;
+    d.want_x = 0.0 - 1.0;
+    _edited(t, w, d);
+}
+
+// The caret to at, the selection with it unless extending.
+fn _go(t as *tree.Tree, w as i64, d as *Doc, at as i64, up as i32, extend as i32) as void {
+    d.caret = at;
+    d.upstream = up;
+    if (extend == 0) { d.anchor = at; }
+    textbuf.break_group(&d.buf);
+    if (extend == 1) { _copy(t, d, tree.PRIMARY); }
+    _moved(t, w, d);
+}
+
+// --- Moving by lines ---
+
+// Where across the caret is, in the text's own coordinates.
+fn _x_now(t as *tree.Tree, w as i64, d as *Doc) as f64 {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    return _rect_at(t, w, d, d.caret, d.upstream, 0).x - layout.window_rect(t, w).x - _pad(&th);
+}
+
+// Down (dir 1) or up (-1) a line from the caret, keeping to want_x: into
+// the next or the last paragraph at its edge; past the text's ends, to them.
+fn _line_step(t as *tree.Tree, w as i64, d as *Doc, dir as i32) as cursor.Position {
+    let is i64 as i = textbuf.para_of(&d.buf, d.caret);
+    let is *Para as p = _para(t, w, d, i);
+    if (cast(i64, p) == 0) { return cursor.position(d.caret, 0); }
+    let is cursor.Position as at = cursor.position(_local(d, p, d.caret), d.upstream);
+    let is i64 as li = cursor.line_of(&p.lay, at);
+    let is i64 as lines = tlayout.line_count(&p.lay);
+    if (dir > 0 && li + 1 < lines) {
+        let is cursor.Position as to = cursor.down(&p.lay, at, d.want_x);
+        return cursor.position(_global(d, p, to.offset), to.upstream);
+    }
+    if (dir < 0 && li > 0) {
+        let is cursor.Position as to = cursor.up(&p.lay, at, d.want_x);
+        return cursor.position(_global(d, p, to.offset), to.upstream);
+    }
+    if (dir > 0 && i + 1 >= d.n) { return cursor.position(textbuf.length(&d.buf), 0); }
+    if (dir < 0 && i == 0) { return cursor.position(0, 0); }
+    let is i64 as j = i + cast(i64, dir);
+    let is *Para as q = _para(t, w, d, j);
+    if (cast(i64, q) == 0) { return cursor.position(d.caret, 0); }
+    let is f64 as y with mut = 1.0;
+    if (dir < 0) { y = d.hs[j] - 1.0; }
+    let is cursor.Position as to = cursor.hit(&q.lay, d.want_x, y);
+    return cursor.position(_global(d, q, to.offset), to.upstream);
+}
+
+// A page down (dir 1) or up: the height in view, keeping to want_x.
+fn _page(t as *tree.Tree, w as i64, d as *Doc, dir as i32) as cursor.Position {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is math.rect.Rect as cr = _rect_at(t, w, d, d.caret, d.upstream, 0);
+    let is f64 as y with mut = cr.y - layout.window_rect(t, w).y - _pad(&th) + cr.h / 2.0 +
+                               cast(f64, dir) * _max(d.line_h, _seen_h(t, w) - d.line_h);
+    if (y < 0.0) { return cursor.position(0, 0); }
+    if (y >= _total(d)) { return cursor.position(textbuf.length(&d.buf), 0); }
+    let is i64 as i = _at_height(d, y);
+    let is *Para as p = _para(t, w, d, i);
+    if (cast(i64, p) == 0) { return cursor.position(d.caret, 0); }
+    let is cursor.Position as to = cursor.hit(&p.lay, d.want_x, y - _before(d, i));
+    return cursor.position(_global(d, p, to.offset), to.upstream);
+}
+
+// --- Keys ---
+
+fn _lower(k as i32) as i32 {
+    if (k >= 65 && k <= 90) { return k + 32; }
+    return k;
+}
+
+fn _moving_key(k as i32) as i32 {
+    return cast(i32, k == keys.LEFT || k == keys.RIGHT || k == keys.UP || k == keys.DOWN || k == keys.HOME ||
+                     k == keys.END || k == keys.PAGE_UP || k == keys.PAGE_DOWN || k == keys.BACKSPACE ||
+                     k == keys.DELETE);
+}
+
+fn _claims(d as *Doc, e as *event.Event) as i64 {
+    let is i32 as k = _lower(e.key);
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    let is i32 as shift = cast(i32, (e.mods & keys.MOD_SHIFT) != 0);
+    if ((e.mods & (keys.MOD_ALT | keys.MOD_SUPER)) != 0) { return 0; }
+    if (k == keys.RETURN) { return cast(i64, ctrl == 0); }
+    if (k == keys.TAB) { return cast(i64, d.tabs == 1 && ctrl == 0 && shift == 0); }
+    if (_moving_key(k) == 1) { return 1; }
+    if (ctrl == 1) {
+        return cast(i64, k == keys.A || k == keys.C || k == keys.X || k == keys.V || k == keys.Z || k == keys.Y ||
+                         k == keys.INSERT);
+    }
+    return cast(i64, shift == 1 && k == keys.INSERT);
+}
+
+fn _key(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
+    let is i32 as k = _lower(e.key);
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    let is i32 as shift = cast(i32, (e.mods & keys.MOD_SHIFT) != 0);
+    if ((e.mods & (keys.MOD_ALT | keys.MOD_SUPER)) != 0) { return 0; }
+    if (_claims(d, e) == 1) { _end_composition(t, w, d); }
+    if (k == keys.RETURN && ctrl == 0) {
+        if (d.editable == 1) { _put(t, w, d, "\n", 1, 1); }
+        return 1;
+    }
+    if (k == keys.TAB && ctrl == 0 && shift == 0) {
+        if (d.tabs == 0) { return 0; }
+        if (d.editable == 1) { _put(t, w, d, "\t", 1, 1); }
+        return 1;
+    }
+    if (ctrl == 1 && k == keys.A) {
+        d.anchor = 0;
+        d.caret = textbuf.length(&d.buf);
+        textbuf.break_group(&d.buf);
+        _copy(t, d, tree.PRIMARY);
+        _moved(t, w, d);
+        return 1;
+    }
+    if (ctrl == 1 && (k == keys.C || k == keys.INSERT)) {
+        _copy(t, d, tree.CLIPBOARD);
+        return 1;
+    }
+    if ((ctrl == 1 && k == keys.X) || (shift == 1 && ctrl == 0 && k == keys.DELETE)) {
+        if (d.editable == 1) {
+            _copy(t, d, tree.CLIPBOARD);
+            _erase_selection(t, w, d);
+        }
+        return 1;
+    }
+    if ((ctrl == 1 && k == keys.V) || (shift == 1 && ctrl == 0 && k == keys.INSERT)) {
+        if (d.editable == 1) { tree.request_paste(t, tree.CLIPBOARD, w); }
+        return 1;
+    }
+    if (ctrl == 1 && (k == keys.Z || k == keys.Y)) {
+        if (d.editable == 1) { _undo(t, w, d, cast(i32, k == keys.Y || shift == 1)); }
+        return 1;
+    }
+    if (k == keys.BACKSPACE) {
+        if (d.editable == 1) { _back(t, w, d, ctrl); }
+        return 1;
+    }
+    if (k == keys.DELETE) {
+        if (d.editable == 1) { _ahead(t, w, d, ctrl); }
+        return 1;
+    }
+    if (_moving_key(k) == 0) { return 0; }
+    let is i64 as i = textbuf.para_of(&d.buf, d.caret);
+    let is *Para as p = _para(t, w, d, i);
+    if (cast(i64, p) == 0) { return 1; }
+    let is cursor.Position as at = cursor.position(_local(d, p, d.caret), d.upstream);
+    if (k == keys.UP || k == keys.DOWN || k == keys.PAGE_UP || k == keys.PAGE_DOWN) {
+        if (d.want_x < 0.0) { d.want_x = _x_now(t, w, d); }
+        let is i32 as dir with mut = 1;
+        if (k == keys.UP || k == keys.PAGE_UP) { dir = 0 - 1; }
+        let is cursor.Position as to with mut = cursor.position(d.caret, 0);
+        if (k == keys.UP || k == keys.DOWN) { to = _line_step(t, w, d, dir); } else { to = _page(t, w, d, dir); }
+        let is f64 as keep = d.want_x;
+        _go(t, w, d, to.offset, to.upstream, shift);
+        d.want_x = keep;
+        return 1;
+    }
+    d.want_x = 0.0 - 1.0;
+    if ((k == keys.LEFT || k == keys.RIGHT) && ctrl == 0 && shift == 0 && d.anchor != d.caret) {
+        let is i64 as side with mut = _hi(d);
+        if (k == keys.LEFT) { side = _lo(d); }
+        _go(t, w, d, side, 0, 0);
+        return 1;
+    }
+    let is i64 as ps = _pstart(d, i);
+    let is i64 as to with mut = d.caret;
+    let is i32 as up with mut = 0;
+    if (k == keys.LEFT || k == keys.RIGHT) {
+        let is cursor.Position as nx with mut = at;
+        if (ctrl == 1 && k == keys.LEFT) { nx = cursor.position(cursor.prev_word(&p.lay, at.offset), 0); }
+        else if (ctrl == 1) { nx = cursor.position(cursor.next_word(&p.lay, at.offset), 0); }
+        else if (k == keys.LEFT) { nx = cursor.left(&p.lay, at); }
+        else { nx = cursor.right(&p.lay, at); }
+        if (nx.offset == at.offset && nx.upstream == at.upstream) {
+            // At its paragraph's edge: on into the next or the last.
+            if (k == keys.RIGHT && i + 1 < d.n) { to = _pstart(d, i + 1); }
+            if (k == keys.LEFT && i > 0) { to = _pend(d, i - 1); }
+        } else {
+            to = _global(d, p, nx.offset);
+            up = nx.upstream;
+        }
+    } else if (k == keys.HOME) {
+        to = ps + tlayout.line(&p.lay, cursor.line_of(&p.lay, at)).start;
+        if (ctrl == 1) { to = 0; }
+    } else {
+        to = ps + tlayout.line(&p.lay, cursor.line_of(&p.lay, at)).end;
+        if (to > _pend(d, i)) { to = _pend(d, i); }
+        up = 1;
+        if (ctrl == 1) {
+            to = textbuf.length(&d.buf);
+            up = 0;
+        }
+    }
+    _go(t, w, d, to, up, shift);
+    return 1;
+}
+
+// --- The pointer ---
+
+fn _hit(t as *tree.Tree, w as i64, d as *Doc, x as f64, y as f64) as cursor.Position {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as cy = y - _pad(&th);
+    let is i64 as i = _at_height(d, cy);
+    let is *Para as p = _para(t, w, d, i);
+    if (cast(i64, p) == 0) { return cursor.position(d.caret, 0); }
+    let is cursor.Position as at = cursor.hit(&p.lay, x - _pad(&th), cy - _before(d, i));
+    return cursor.position(_global(d, p, at.offset), at.upstream);
+}
+
+// The word, or the paragraph, at offset at.
+fn _unit(t as *tree.Tree, w as i64, d as *Doc, by as i64, at as i64, a as *i64, b as *i64) as void {
+    let is i64 as i = textbuf.para_of(&d.buf, at);
+    let is i64 as ps = _pstart(d, i);
+    if (by == 3) {
+        *a = ps;
+        *b = _pend(d, i);
+        return;
+    }
+    let is *Para as p = _para(t, w, d, i);
+    if (cast(i64, p) == 0) {
+        *a = at;
+        *b = at;
+        return;
+    }
+    let is i64 as l = at - ps;
+    let is i64 as end = cursor.next_word(&p.lay, l);
+    let is i64 as start with mut = cursor.prev_word(&p.lay, end);
+    if (start > l) { start = l; }
+    *a = ps + start;
+    *b = ps + end;
+}
+
+fn _extend(t as *tree.Tree, w as i64, d as *Doc, at as cursor.Position) as void {
+    if (d.by == 1) {
+        d.caret = at.offset;
+        d.upstream = at.upstream;
+        return;
+    }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    _unit(t, w, d, d.by, at.offset, &a, &b);
+    d.upstream = 0;
+    if (a < d.unit_a) {
+        d.anchor = d.unit_b;
+        d.caret = a;
+    } else {
+        d.anchor = d.unit_a;
+        if (b < d.unit_b) { b = d.unit_b; }
+        d.caret = b;
+    }
+}
+
+fn _drop(t as *tree.Tree, w as i64, d as *Doc, copy as i32) as void {
+    let is i64 as a = _lo(d);
+    let is i64 as b = _hi(d);
+    let is i64 as to = d.drop;
+    let is i64 as n = b - a;
+    if (n == 0 || d.editable == 0) { return; }
+    if (copy == 1) {
+        if (_tmp_room(d, n) == 0) { return; }
+        textbuf.read(&d.buf, a, n, d.tmp);
+        if (textbuf.paste_in(&d.buf, to, d.tmp, n) == 0) { return; }
+        d.anchor = to;
+        d.caret = to + n;
+    } else {
+        if (textbuf.move(&d.buf, a, n, to) == 0) { return; }
+        let is i64 as at with mut = to;
+        if (to > a) { at = to - n; }
+        d.anchor = at;
+        d.caret = at + n;
+    }
+    d.upstream = 0;
+    _edited(t, w, d);
+}
+
+fn _pointer(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
+    let is i32 as k = e.kind;
+    if (k == event.POINTER_DOWN) {
+        if (e.button != 1 && e.button != 2) { return 0; }
+        _end_composition(t, w, d);
+        let is cursor.Position as p = _hit(t, w, d, e.local_x, e.local_y);
+        textbuf.break_group(&d.buf);
+        d.want_x = 0.0 - 1.0;
+        if (e.button == 2) {
+            if (d.editable == 0) { return 1; }
+            d.anchor = p.offset;
+            d.caret = p.offset;
+            d.upstream = p.upstream;
+            _moved(t, w, d);
+            tree.request_paste(t, tree.PRIMARY, w);
+            return 1;
+        }
+        d.by = 1;
+        d.maybe_drag = 0;
+        if (e.clicks >= 2) {
+            d.by = 3;
+            if (e.clicks == 2) { d.by = 2; }
+            _unit(t, w, d, d.by, p.offset, &d.unit_a, &d.unit_b);
+            d.anchor = d.unit_a;
+            d.caret = d.unit_b;
+            d.upstream = 0;
+        } else if ((e.mods & keys.MOD_SHIFT) != 0) {
+            d.caret = p.offset;
+            d.upstream = p.upstream;
+        } else if (d.anchor != d.caret && p.offset >= _lo(d) && p.offset <= _hi(d)) {
+            d.maybe_drag = 1;
+            d.press_at = p.offset;
+        } else {
+            d.anchor = p.offset;
+            d.caret = p.offset;
+            d.upstream = p.upstream;
+        }
+        d.pressing = 1;
+        _moved(t, w, d);
+        return 1;
+    }
+    if (k == event.DRAG_START) {
+        if (d.maybe_drag == 0) { return 0; }
+        d.dragging = 1;
+        d.drop = d.press_at;
+        return 1;
+    }
+    if (k == event.POINTER_MOVE) {
+        if (d.dragging == 1) {
+            d.drop = _hit(t, w, d, e.local_x, e.local_y).offset;
+            widget.changed(t, w, widget.CHANGED_PAINT);
+            scroll.follow(t, w, e.x, e.y, e.time);
+            return 1;
+        }
+        if (d.pressing == 0 || d.maybe_drag == 1) { return 0; }
+        _extend(t, w, d, _hit(t, w, d, e.local_x, e.local_y));
+        _moved(t, w, d);
+        // Past the view's edge: the area holding it follows.
+        scroll.follow(t, w, e.x, e.y, e.time);
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (d.pressing == 0) { return 0; }
+        let is i32 as up = cast(i32, k == event.POINTER_UP);
+        if (d.dragging == 1) {
+            if (up == 1) { _drop(t, w, d, cast(i32, (e.mods & keys.MOD_CONTROL) != 0)); }
+        } else if (d.maybe_drag == 1) {
+            if (up == 1) {
+                d.anchor = d.press_at;
+                d.caret = d.press_at;
+                d.upstream = 0;
+            }
+        } else if (up == 1) {
+            _copy(t, d, tree.PRIMARY);
+        }
+        d.pressing = 0;
+        d.maybe_drag = 0;
+        d.dragging = 0;
+        _moved(t, w, d);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Its context menu ---
+
+fn _on_menu(t as *tree.Tree, m as i64, arg as *u8, user as *u8) as void {
+    let is *Doc as d = cast(*Doc, user);
+    let is i64 as w = d.self;
+    let is i64 as id = *cast(*i64, arg);
+    if (id == textedit.UNDO || id == textedit.REDO) {
+        _undo(t, w, d, cast(i32, id == textedit.REDO));
+    } else if (id == textedit.CUT) {
+        _copy(t, d, tree.CLIPBOARD);
+        _erase_selection(t, w, d);
+    } else if (id == textedit.COPY) {
+        _copy(t, d, tree.CLIPBOARD);
+    } else if (id == textedit.PASTE) {
+        tree.request_paste(t, tree.CLIPBOARD, w);
+    } else if (id == textedit.DELETE) {
+        _erase_selection(t, w, d);
+    } else if (id == textedit.SELECT_ALL) {
+        d.anchor = 0;
+        d.caret = textbuf.length(&d.buf);
+        textbuf.break_group(&d.buf);
+        _copy(t, d, tree.PRIMARY);
+        _moved(t, w, d);
+    }
+}
+
+fn _context(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) == 0) { return 0; }
+    if (d.menu == 0 || tree.is_valid(t, d.menu) == 0) {
+        d.menu = textedit.context_menu(t, cast(*i64, &d.items));
+        if (d.menu == 0) { return 0; }
+        signal.connect(t, d.menu, signal.ACTIVATED, fn_ptr(_on_menu), cast(*u8, d));
+    }
+    _end_composition(t, w, d);
+    if (e.button != 0) {
+        let is cursor.Position as p = _hit(t, w, d, e.local_x, e.local_y);
+        if (d.anchor == d.caret || p.offset < _lo(d) || p.offset > _hi(d)) {
+            d.anchor = p.offset;
+            d.caret = p.offset;
+            d.upstream = p.upstream;
+            textbuf.break_group(&d.buf);
+            _moved(t, w, d);
+        }
+    }
+    textedit.offer(t, cast(*i64, &d.items), d.editable, 1, cast(i32, d.anchor != d.caret), textbuf.can_undo(&d.buf),
+                   textbuf.can_redo(&d.buf), cast(i32, textbuf.length(&d.buf) > 0));
+    if (e.button != 0) { return cast(i64, menu.popup_at_pointer(t, r, d.menu)); }
+    return cast(i64, menu.popup_at(t, r, d.menu, _rect_at(t, w, d, d.caret, d.upstream, 0), 6, 8, 1));
+}
+
+// --- Events ---
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Doc as d = cast(*Data, data).d;
+    let is i32 as k = e.kind;
+    if (k == event.TEXT || k == event.PASTE) {
+        if (d.editable == 0) { return 1; }
+        let is i32 as had = cast(i32, k == event.TEXT && d.npre > 0);
+        if (had == 1) {
+            _forget(d, textbuf.para_of(&d.buf, d.caret));
+            d.npre = 0;
+            d.pre_cur = 0;
+        }
+        if (k == event.PASTE) { _end_composition(t, w, d); }
+        _put(t, w, d, e.text, e.text_len, cast(i32, k == event.TEXT));
+        if (had == 1) { widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT); }
+        return 1;
+    }
+    if (k == event.PREEDIT) {
+        if (d.editable == 0) { return 1; }
+        if (e.text_len > 0) { _erase_selection(t, w, d); }
+        let is i64 as n with mut = e.text_len;
+        if (n > MAX_PREEDIT) {
+            n = MAX_PREEDIT;
+            while (n > 0 && (cast(i64, e.text[n]) & 192) == 128) { n = n - 1; }
+        }
+        mem.memcpy(cast(*u8, &d.pre), e.text, n);
+        d.npre = n;
+        d.pre_cur = e.cursor;
+        if (d.pre_cur < 0) { d.pre_cur = 0; }
+        if (d.pre_cur > n) { d.pre_cur = n; }
+        _forget(d, textbuf.para_of(&d.buf, d.caret));
+        widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+        _area(t, w, d);
+        return 1;
+    }
+    if (k == event.FOCUS_IN) {
+        d.focused = 1;
+        _moved(t, w, d);
+        return 0;
+    }
+    if (k == event.FOCUS_OUT) {
+        d.focused = 0;
+        if (tree.text_area(t) == w) { tree.set_text_area(t, 0, math.rect.rect_zero()); }
+        d.pressing = 0;
+        d.maybe_drag = 0;
+        d.dragging = 0;
+        textbuf.break_group(&d.buf);
+        _end_composition(t, w, d);
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 0;
+    }
+    if (k == event.SHORTCUT_OVERRIDE) { return _claims(d, e); }
+    if (k == event.KEY_DOWN) { return _key(t, w, d, e); }
+    if (k == event.CONTEXT_MENU) { return _context(t, w, d, e); }
+    return _pointer(t, w, d, e);
+}
+
+// --- Drawing ---
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Doc as d = cast(*Data, data).d;
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as rc = p.rect;
+    let is f64 as cy0 = _max(rc.y, p.clip.y);
+    let is f64 as cy1 = fm.min_f64(rc.y + rc.h, p.clip.y + p.clip.h);
+    shapes.fill_rect(p.canvas, rc.x, cy0, rc.w, _max(0.0, cy1 - cy0), th.palette.view_bg);
+    let is *txt.Service as svc = _service(t);
+    if (cast(i64, svc) == 0 || d.n == 0) { return; }
+    let is i32 as focused = painter.has(p, painter.S_FOCUSED);
+    let is math.color.Color as fg with mut = th.palette.fg;
+    if (painter.has(p, painter.S_DISABLED) == 1) { fg = style.with_alpha(fg, fg.a * th.control.disabled_alpha); }
+    let is f64 as pad = _pad(th);
+    let is f64 as before = d.hs[0];
+    let is i64 as i with mut = _at_height(d, cy0 - rc.y - pad);
+    let is f64 as top with mut = rc.y + pad + _before(d, i);
+    let is i32 as moved with mut = 0;
+    let is i64 as a = _lo(d);
+    let is i64 as b = _hi(d);
+    draw2d.push_clip(p.canvas, rc.x, cy0, rc.w, _max(0.0, cy1 - cy0));
+    while (i < d.n && top < cy1) {
+        let is f64 as was = d.hs[i];
+        let is *Para as pa = _para(t, w, d, i);
+        if (d.hs[i] != was) { moved = 1; }
+        if (cast(i64, pa) != 0) {
+            let is f64 as x = rc.x + pad;
+            let is i64 as ps = _pstart(d, i);
+            let is i64 as pe = _pend(d, i);
+            let is [32]cursor.Rect as rs;
+            let is i64 as nr with mut = 0;
+            if (focused == 1 && a != b && a <= pe && b >= ps) {
+                let is i64 as la with mut = a - ps;
+                let is i64 as lb with mut = b - ps;
+                if (la < 0) { la = 0; }
+                if (lb > pe - ps) { lb = pe - ps; }
+                nr = cursor.selection(&pa.lay, _local(d, pa, ps + la), _local(d, pa, ps + lb), cast(*cursor.Rect, &rs), 32);
+                if (nr > 32) { nr = 32; }
+            }
+            let is i64 as k with mut = 0;
+            while (k < nr) {
+                shapes.fill_rect(p.canvas, x + rs[k].x, top + rs[k].y, rs[k].w, rs[k].h, th.palette.selection_bg);
+                k = k + 1;
+            }
+            txt.draw(svc, p.canvas, &pa.run, x, top, fg);
+            k = 0;
+            while (k < nr) {
+                draw2d.push_clip(p.canvas, x + rs[k].x, top + rs[k].y, rs[k].w, rs[k].h);
+                txt.draw(svc, p.canvas, &pa.run, x, top, th.palette.selection_fg);
+                draw2d.pop_clip(p.canvas);
+                k = k + 1;
+            }
+        }
+        top = top + d.hs[i];
+        i = i + 1;
+    }
+    // The caret, or where dragged text would go.
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as into with mut = 0;
+    if (d.dragging == 1) {
+        at = d.drop;
+    } else if (focused == 1 && a == b && painter.has(p, painter.S_CARET_OFF) == 0 &&
+               painter.has(p, painter.S_BACKDROP) == 0) {
+        at = d.caret;
+        into = _caret_into(d);
+    }
+    if (at >= 0) {
+        let is math.rect.Rect as cr = _rect_at(t, w, d, at, d.upstream, into);
+        let is f64 as s with mut = layout.scale(t);
+        if (s <= 0.0) { s = 1.0; }
+        shapes.fill_rect(p.canvas, fm.floor((cr.x - 0.5) * s + 0.5) / s, cr.y, 1.0, cr.h, fg);
+    }
+    draw2d.pop_clip(p.canvas);
+    // Heights found as paragraphs came into view: measured again.
+    if (moved == 1 || d.hs[0] != before) { tree.invalidate_layout(t, w); }
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Doc as d = cast(*Data, data).d;
+    if (q.action != access.ASK) { return 0; }
+    q.states = q.states | access.MULTI_LINE;
+    if (d.editable == 1) { q.states = q.states | access.EDITABLE; }
+    else { q.states = q.states | access.READ_ONLY; }
+    return 1;
+}
+
+fn _shape(t as *tree.Tree, w as i64, data as *u8, p as *math.vec.Vec2) as i32 {
+    let is *Doc as d = cast(*Data, data).d;
+    if (d.dragging == 1) { return tree.SHAPE_DEFAULT; }
+    return tree.SHAPE_TEXT;
+}

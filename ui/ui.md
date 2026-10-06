@@ -33,7 +33,7 @@ ui/
   text.cst        one text service: runs laid out and drawn
   textbuf.cst     the text an entry or a text view edits; undo in steps
   access.cst      role, name, states, value and actions per widget
-  widgets/        label, button, check, radio, entry, menu, slider, progress,
+  widgets/        label, button, check, radio, entry, textview, menu, slider, progress,
                   list, tree, table, menu, tabs, dialog
 
   immediate/      the other model, for HUDs and tools   immediate/immediate.md
@@ -879,6 +879,31 @@ their keys shown, each only when it can be done: at the pointer, a click
 outside the selection moving the caret there first, or below the caret from
 the keyboard with its first item chosen; made the first time, gone with the
 entry.
+
+**Text views** (`widgets/textview.cst`, tested by `textview_test`): text of
+many lines, its paragraphs broken at line feeds, meant to be a scroll area's
+content, which it asks to keep the caret in view. Typing, Enter, Tab (unless
+set not to take it, when Tab moves the focus as ever), pasting with line ends
+kept as line feeds, undo in steps, the clipboard and the primary selection, a
+composition, its context menu, a selection dragged — as the entry has them,
+through `widgets/textedit.cst`, which both share. Wrapped by word at its width,
+or not at all, one line a paragraph as wide as the widest. The caret moves by
+grapheme and word across paragraph ends, up and down by lines into the
+paragraphs above and below keeping where across it was, Home and End to the
+line as drawn, Control to the text's ends, Page Up and Down by the height in
+view; the pointer as the entry's, a triple click the paragraph. A large
+document is laid out only where it is seen: each paragraph's height estimated
+from its length until it is laid out, a Fenwick tree over the heights finding
+a paragraph's top and the paragraph at a height without walking them all, a few
+dozen paragraphs kept laid out, the least recently used given up first; a text
+of sixteen kilobytes or less laid out whole. An edit lays out again only the
+paragraphs the buffer says changed, the rest moved along with what they had —
+checked against a view made with the same text after every kind of edit. Twenty
+thousand paragraphs open, scroll to their end and are typed into with a few
+dozen laid out. Asked how tall it would be at a width it is not at — as a row
+asks before it shares out its room — a large text guesses from the paragraphs'
+lengths and keeps the heights it found at its own. Told as text of many lines,
+editable or read-only.
 
 **Menus** (`widgets/menu.cst`, tested by `menu_test`): a popup menu the
 program builds once and pops up against a rectangle or at the pointer —
