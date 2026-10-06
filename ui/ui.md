@@ -1139,6 +1139,16 @@ opens, Backspace goes up, Control+H shows the hidden ones. Open, Save or
 Select does nothing until the answer is right; then `chosen()` is the whole
 path.
 
+**Colour choosers** (`widgets/colorpicker.cst`, tested by `colorpicker_test`):
+GNOME's palette — a column a hue, five shades down it, then the greys — over
+a plane of saturation across and value up beside a strip of hue, a strip of
+alpha when asked for, and the colour over a checkerboard beside its hex
+code to type ("#rrggbb", "#rrggbbaa", "#rgb", "#rgba"). Colours are the
+toolkit's, sRGB-encoded, and hue, saturation and value are of those values;
+a grey keeps its hue. The palette is one Tab stop, the arrows going round
+it; the plane and the strips move by keys as sliders do. `dialog()` holds one
+with Cancel and Select; `button()` shows a colour and opens that dialog.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a

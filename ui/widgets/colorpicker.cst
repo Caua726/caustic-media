@@ -1,0 +1,1192 @@
+// ui/widgets/colorpicker.cst — a colour chosen: from a palette, on a plane,
+// or typed as its hex code; in a dialog, or behind a button.
+//
+// A chooser (create) holds, from the top: a palette of swatches — a column a
+// hue, blue, green, yellow, orange, red, purple and brown, five shades down
+// it, then the greys from white to black, as GNOME's palette has them; a
+// plane of saturation across and value up, for the hue chosen on a strip
+// beside it; a strip of alpha under it when asked for (set_alpha_shown); and
+// at the foot the colour over a checkerboard beside its hex code to type.
+// Colours are the toolkit's, sRGB-encoded; hue, saturation and value are of
+// those encoded values, as every picker has them, and a grey keeps the hue it
+// had. Without alpha a colour is opaque.
+//
+// A swatch clicked, or Enter or Space on it, chooses its colour; the palette
+// is one stop for Tab, the arrows going round it — right a column on (left,
+// right to left), down a darker shade. On the plane a press puts the point
+// there and it follows the pointer, held to the edges, until let go; the
+// arrows move it a hundredth, Page Up and Down a tenth of value, Home and End
+// to no saturation and all of it. The strips are sliders: a press and a drag,
+// the arrows a degree or a hundredth, Page Up and Down ten of them, Home and
+// End their ends; the hue's least at the bottom, alpha's at the start. A code
+// typed — "#rrggbb", "#rrggbbaa" when alpha is shown, "#rgb", "#rgba", the
+// '#' and letters' case as they come — is taken at once with six or eight
+// digits, the shorter ones on Enter; Enter on anything else puts the colour's
+// code back. VALUE_CHANGED says the colour changed, its argument a
+// math.color.Color, set_color's too when it changes it.
+//
+// dialog() makes a dialog holding a chooser, with Cancel and Select;
+// button() a button showing a colour, pressed opening such a dialog with its
+// colour and taking the one selected — VALUE_CHANGED then, with it.
+//
+// Told as a colour chooser; the plane as a slider of saturation and value,
+// the strips as sliders of degrees and of percent, the swatches as radio
+// buttons named by their colour, the colour's own checked.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/draw2d.cst" as draw2d;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "entry.cst" as entry;
+use "button.cst" as button_w;
+use "dialog.cst" as dialog_w;
+
+let is f64 as SWATCH    with imut = 24.0;
+let is i64 as COLUMNS   with imut = 9;
+let is i64 as SHADES    with imut = 5;
+let is f64 as PLANE     with imut = 160.0;   // the plane's height, asked for
+let is f64 as PLANE_MIN with imut = 64.0;
+
+let is i32 as _HUE   with imut = 0;
+let is i32 as _ALPHA with imut = 1;
+
+// GNOME's palette, a column a hue from light to dark, then the greys.
+let is [45]i64 as _palette with mut;
+let is [9]*u8 as _hue_names with mut;
+
+fn _fill_palette() as void {
+    let is *i64 as p = cast(*i64, &_palette);
+    p[0] = 0x99C1F1; p[1] = 0x62A0EA; p[2] = 0x3584E4; p[3] = 0x1C71D8; p[4] = 0x1A5FB4;
+    p[5] = 0x8FF0A4; p[6] = 0x57E389; p[7] = 0x33D17A; p[8] = 0x2EC27E; p[9] = 0x26A269;
+    p[10] = 0xF9F06B; p[11] = 0xF8E45C; p[12] = 0xF6D32D; p[13] = 0xF5C211; p[14] = 0xE5A50A;
+    p[15] = 0xFFBE6F; p[16] = 0xFFA348; p[17] = 0xFF7800; p[18] = 0xE66100; p[19] = 0xC64600;
+    p[20] = 0xF66151; p[21] = 0xED333B; p[22] = 0xE01B24; p[23] = 0xC01C28; p[24] = 0xA51D2D;
+    p[25] = 0xDC8ADD; p[26] = 0xC061CB; p[27] = 0x9141AC; p[28] = 0x813D9C; p[29] = 0x613583;
+    p[30] = 0xCDAB8F; p[31] = 0xB5835A; p[32] = 0x986A44; p[33] = 0x865E3C; p[34] = 0x63452C;
+    p[35] = 0xFFFFFF; p[36] = 0xF6F5F4; p[37] = 0xDEDDDA; p[38] = 0xC0BFBC; p[39] = 0x9A9996;
+    p[40] = 0x77767B; p[41] = 0x5E5C64; p[42] = 0x3D3846; p[43] = 0x241F31; p[44] = 0x000000;
+    _hue_names[0] = "Blue";
+    _hue_names[1] = "Green";
+    _hue_names[2] = "Yellow";
+    _hue_names[3] = "Orange";
+    _hue_names[4] = "Red";
+    _hue_names[5] = "Purple";
+    _hue_names[6] = "Brown";
+}
+
+fn swatch_count() as i64 { return COLUMNS * SHADES; }
+
+// Swatch i's colour; transparent past the last.
+fn swatch_color(i as i64) as math.color.Color {
+    _init();
+    if (i < 0 || i >= swatch_count()) { return math.color.transparent(); }
+    return math.color.hex(_palette[i]);
+}
+
+struct Data {
+    t           as *tree.Tree;
+    self        as i64;
+    h           as f64;
+    s           as f64;
+    v           as f64;
+    a           as f64;
+    color       as math.color.Color;   // what VALUE_CHANGED carries
+    plane       as i64;
+    hue         as i64;
+    alpha       as i64;
+    entry       as i64;
+    first       as i64;   // the first swatch
+    stop        as i64;   // the swatch Tab stops at
+    selected    as i64;   // the colour's swatch, -1 for none
+    alpha_shown as i32;
+    quiet       as i32;   // the entry's text being set
+    palette     as i32;   // the palette shown
+    _pad0       as i32;
+    pv          as math.rect.Rect;   // the preview, in its own coordinates
+}
+
+struct Plane {
+    owner    as i64;
+    dragging as i32;
+    _pad0    as i32;
+    desc     as [48]u8;
+}
+
+struct Strip {
+    owner    as i64;
+    which    as i32;
+    dragging as i32;
+}
+
+struct Swatch {
+    owner    as i64;
+    index    as i64;
+    pressing as i32;
+    _pad0    as i32;
+    name     as [32]u8;
+}
+
+// The inside of a colour button.
+struct Shown {
+    t     as *tree.Tree;
+    owner as i64;     // the button
+    color as math.color.Color;
+    dlg   as i64;     // its dialog, made the first time it is pressed
+    hex   as [12]u8;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _plane_kind with mut;
+let is tree.Kind as _strip_kind with mut;
+let is tree.Kind as _swatch_kind with mut;
+let is tree.Kind as _shown_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _fill_palette();
+    _kind = widget.kind("color chooser", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.role = access.ROLE_COLOR_CHOOSER;
+    _plane_kind = widget.kind("color plane", sizeof(Plane));
+    _plane_kind.paint = fn_ptr(_plane_paint);
+    _plane_kind.event = fn_ptr(_plane_event);
+    _plane_kind.role = access.ROLE_SLIDER;
+    _plane_kind.access = fn_ptr(_plane_access);
+    _strip_kind = widget.kind("color strip", sizeof(Strip));
+    _strip_kind.paint = fn_ptr(_strip_paint);
+    _strip_kind.event = fn_ptr(_strip_event);
+    _strip_kind.role = access.ROLE_SLIDER;
+    _strip_kind.access = fn_ptr(_strip_access);
+    _swatch_kind = widget.kind("color swatch", sizeof(Swatch));
+    _swatch_kind.paint = fn_ptr(_swatch_paint);
+    _swatch_kind.event = fn_ptr(_swatch_event);
+    _swatch_kind.role = access.ROLE_RADIO_BUTTON;
+    _swatch_kind.access = fn_ptr(_swatch_access);
+    _shown_kind = widget.kind("color shown", sizeof(Shown));
+    _shown_kind.measure = fn_ptr(_shown_measure);
+    _shown_kind.paint = fn_ptr(_shown_paint);
+    _shown_kind.access = fn_ptr(_shown_access);
+    _shown_kind.destroy = fn_ptr(_shown_destroy);
+    _ready = 1;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// --- Colour arithmetic, on encoded values ---
+
+fn _clamp01(x as f64) as f64 {
+    if (x < 0.0) { return 0.0; }
+    if (x > 1.0) { return 1.0; }
+    return x;
+}
+
+fn _abs(x as f64) as f64 { if (x < 0.0) { return 0.0 - x; } return x; }
+
+fn _from_hsv(h as f64, s as f64, v as f64, a as f64) as math.color.Color {
+    let is f64 as hh with mut = h / 60.0;
+    if (hh >= 6.0) { hh = hh - 6.0; }
+    let is f64 as c = v * s;
+    let is f64 as x = c * (1.0 - _abs(hh - 2.0 * fm.floor(hh / 2.0) - 1.0));
+    let is f64 as m = v - c;
+    let is f64 as r with mut = c;
+    let is f64 as g with mut = x;
+    let is f64 as b with mut = 0.0;
+    if (hh >= 1.0 && hh < 2.0) { r = x; g = c; }
+    else if (hh >= 2.0 && hh < 3.0) { r = 0.0; g = c; b = x; }
+    else if (hh >= 3.0 && hh < 4.0) { r = 0.0; g = x; b = c; }
+    else if (hh >= 4.0 && hh < 5.0) { r = x; g = 0.0; b = c; }
+    else if (hh >= 5.0) { r = c; g = 0.0; b = x; }
+    return math.color.rgba(r + m, g + m, b + m, a);
+}
+
+// Hue, saturation and value of c; the hue left as it was for a grey.
+fn _to_hsv(c as math.color.Color, h as *f64, s as *f64, v as *f64) as void {
+    let is f64 as mx with mut = c.r;
+    if (c.g > mx) { mx = c.g; }
+    if (c.b > mx) { mx = c.b; }
+    let is f64 as mn with mut = c.r;
+    if (c.g < mn) { mn = c.g; }
+    if (c.b < mn) { mn = c.b; }
+    let is f64 as d = mx - mn;
+    *v = mx;
+    *s = 0.0;
+    if (mx > 0.0) { *s = d / mx; }
+    if (d <= 0.0) { return; }
+    let is f64 as hh with mut = 0.0;
+    if (mx == c.r) {
+        hh = (c.g - c.b) / d;
+        if (hh < 0.0) { hh = hh + 6.0; }
+    } else if (mx == c.g) {
+        hh = (c.b - c.r) / d + 2.0;
+    } else {
+        hh = (c.r - c.g) / d + 4.0;
+    }
+    *h = hh * 60.0;
+}
+
+fn _byte(x as f64) as i64 { return cast(i64, fm.floor(_clamp01(x) * 255.0 + 0.5)); }
+
+fn _hex_digit(v as i64) as u8 {
+    if (v < 10) { return cast(u8, 48 + v); }
+    return cast(u8, 87 + v);
+}
+
+fn _put_byte(out as *u8, at as i64, v as i64) as void {
+    out[at] = _hex_digit(v / 16);
+    out[at + 1] = _hex_digit(v % 16);
+}
+
+// c as "#rrggbb", or "#rrggbbaa" when alpha counts and it is not opaque;
+// how many bytes.
+fn _hex_text(c as math.color.Color, with_alpha as i32, out as *u8) as i64 {
+    out[0] = cast(u8, 35);
+    _put_byte(out, 1, _byte(c.r));
+    _put_byte(out, 3, _byte(c.g));
+    _put_byte(out, 5, _byte(c.b));
+    if (with_alpha == 1 && _byte(c.a) < 255) {
+        _put_byte(out, 7, _byte(c.a));
+        return 9;
+    }
+    return 7;
+}
+
+fn _digit(c as u8) as i64 {
+    let is i64 as v = cast(i64, c);
+    if (v >= 48 && v <= 57) { return v - 48; }
+    if (v >= 65 && v <= 70) { return v - 55; }
+    if (v >= 97 && v <= 102) { return v - 87; }
+    return 0 - 1;
+}
+
+// The code in s, n bytes, into *out: how many digits it had — 3, 4, 6 or 8 —
+// or 0 for none.
+fn _parse(s as *u8, n as i64, out as *math.color.Color) as i64 {
+    let is i64 as at with mut = 0;
+    if (n > 0 && s[0] == cast(u8, 35)) { at = 1; }
+    let is i64 as k = n - at;
+    if (k != 3 && k != 4 && k != 6 && k != 8) { return 0; }
+    let is [8]i64 as d;
+    mem.memset(cast(*u8, &d), 0, 64);
+    let is i64 as i with mut = 0;
+    while (i < k) {
+        d[i] = _digit(s[at + i]);
+        if (d[i] < 0) { return 0; }
+        i = i + 1;
+    }
+    let is [4]i64 as ch;
+    ch[3] = 255;
+    i = 0;
+    while (i < 4) {
+        if (k == 3 || k == 4) {
+            if (i < k) { ch[i] = d[i] * 17; }
+        } else if (i < k / 2) {
+            ch[i] = d[2 * i] * 16 + d[2 * i + 1];
+        }
+        i = i + 1;
+    }
+    *out = math.color.rgba(cast(f64, ch[0]) / 255.0, cast(f64, ch[1]) / 255.0, cast(f64, ch[2]) / 255.0,
+                           cast(f64, ch[3]) / 255.0);
+    return k;
+}
+
+// The swatch whose colour c is, opaque; -1 for none.
+fn _swatch_of(c as math.color.Color) as i64 {
+    if (_byte(c.a) < 255) { return 0 - 1; }
+    let is i64 as v = _byte(c.r) * 65536 + _byte(c.g) * 256 + _byte(c.b);
+    let is i64 as i with mut = 0;
+    while (i < swatch_count()) {
+        if (_palette[i] == v) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// --- Made ---
+
+// A new chooser, white, its palette shown and its alpha not, as the last
+// child of parent. Its handle, or 0 with the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.v = 1.0;
+    d.a = 1.0;
+    d.palette = 1;
+    d.selected = 0 - 1;
+    // Swatches first, so the focus comes to the palette first.
+    let is i64 as i with mut = 0;
+    while (i < swatch_count()) {
+        let is i64 as sw = tree.create(t, &_swatch_kind, w);
+        if (sw == 0) {
+            tree.destroy(t, w);
+            return 0;
+        }
+        let is *Swatch as sd = cast(*Swatch, tree.data(t, sw));
+        sd.owner = w;
+        sd.index = i;
+        if (i == 0) { d.first = sw; }
+        i = i + 1;
+    }
+    d.plane = tree.create(t, &_plane_kind, w);
+    d.hue = tree.create(t, &_strip_kind, w);
+    d.alpha = tree.create(t, &_strip_kind, w);
+    d.entry = entry.create(t, w);
+    if (d.plane == 0 || d.hue == 0 || d.alpha == 0 || d.entry == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    cast(*Plane, tree.data(t, d.plane)).owner = w;
+    let is *Strip as hs = cast(*Strip, tree.data(t, d.hue));
+    hs.owner = w;
+    hs.which = _HUE;
+    let is *Strip as als = cast(*Strip, tree.data(t, d.alpha));
+    als.owner = w;
+    als.which = _ALPHA;
+    tree.set_focusable(t, d.plane, 1);
+    tree.set_focusable(t, d.hue, 1);
+    tree.set_focusable(t, d.alpha, 1);
+    tree.set_visible(t, d.alpha, 0);
+    signal.connect(t, d.entry, signal.CHANGED, fn_ptr(_typed), cast(*u8, d));
+    signal.connect(t, d.entry, signal.ACTIVATED, fn_ptr(_entered), cast(*u8, d));
+    d.color = _from_hsv(0.0, 0.0, 1.0, 1.0);
+    _select(t, d, _swatch_of(d.color));
+    _write(t, d);
+    return w;
+}
+
+fn swatch(t as *tree.Tree, w as i64, i as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || i < 0 || i >= swatch_count()) { return 0; }
+    let is i64 as sw with mut = d.first;
+    let is i64 as k with mut = 0;
+    while (k < i) {
+        sw = tree.next_sibling(t, sw);
+        k = k + 1;
+    }
+    return sw;
+}
+
+fn plane_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.plane;
+}
+
+fn hue_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.hue;
+}
+
+fn alpha_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.alpha;
+}
+
+fn entry_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.entry;
+}
+
+// Where the colour is shown, in the window.
+fn preview(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    let is math.rect.Rect as o = layout.window_rect(t, w);
+    return math.rect.rect(o.x + d.pv.x, o.y + d.pv.y, d.pv.w, d.pv.h);
+}
+
+// The swatch of the colour, -1 for none.
+fn selected(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    return d.selected;
+}
+
+// --- The colour ---
+
+fn color(t as *tree.Tree, w as i64) as math.color.Color {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return math.color.transparent(); }
+    return d.color;
+}
+
+fn hsv(t as *tree.Tree, w as i64, h as *f64, s as *f64, v as *f64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    *h = d.h;
+    *s = d.s;
+    *v = d.v;
+}
+
+// Its hex code into out (12 bytes); how many bytes.
+fn hex(t as *tree.Tree, w as i64, out as *u8) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return _hex_text(d.color, d.alpha_shown, out);
+}
+
+// The entry's text: the colour's code, without saying it changed.
+fn _write(t as *tree.Tree, d as *Data) as void {
+    let is [12]u8 as b;
+    let is i64 as n = _hex_text(d.color, d.alpha_shown, cast(*u8, &b));
+    d.quiet = 1;
+    entry.set_text(t, d.entry, cast(*u8, &b), n);
+    d.quiet = 0;
+}
+
+fn _select(t as *tree.Tree, d as *Data, i as i64) as void {
+    if (d.selected >= 0) { widget.changed(t, swatch(t, d.self, d.selected), widget.CHANGED_PAINT); }
+    d.selected = i;
+    let is i64 as at with mut = i;
+    if (at < 0) { at = 0; }
+    // The Tab stop moves to the colour's swatch, or stays.
+    if (i >= 0 || d.stop == 0) { _stop_at(t, d, at); }
+    if (i >= 0) { widget.changed(t, swatch(t, d.self, i), widget.CHANGED_PAINT); }
+}
+
+fn _stop_at(t as *tree.Tree, d as *Data, i as i64) as void {
+    let is i64 as sw = swatch(t, d.self, i);
+    if (d.stop != 0 && d.stop != sw) { tree.set_focusable(t, d.stop, 0); }
+    d.stop = sw;
+    tree.set_focusable(t, sw, 1);
+}
+
+// The colour from these: 1 when it changed, said; the entry rewritten unless
+// it is where the colour came from.
+fn _apply(t as *tree.Tree, d as *Data, h as f64, s as f64, v as f64, a as f64, keep_text as i32) as i32 {
+    let is f64 as hh with mut = h;
+    if (hh < 0.0) { hh = 0.0; }
+    if (hh > 360.0) { hh = 360.0; }
+    let is f64 as aa with mut = _clamp01(a);
+    if (d.alpha_shown == 0) { aa = 1.0; }
+    let is f64 as ss = _clamp01(s);
+    let is f64 as vv = _clamp01(v);
+    if (hh == d.h && ss == d.s && vv == d.v && aa == d.a) { return 0; }
+    d.h = hh;
+    d.s = ss;
+    d.v = vv;
+    d.a = aa;
+    d.color = _from_hsv(hh, ss, vv, aa);
+    if (keep_text == 0) { _write(t, d); }
+    _select(t, d, _swatch_of(d.color));
+    widget.changed(t, d.self, widget.CHANGED_PAINT);
+    widget.changed(t, d.plane, widget.CHANGED_PAINT);
+    widget.changed(t, d.hue, widget.CHANGED_PAINT);
+    widget.changed(t, d.alpha, widget.CHANGED_PAINT);
+    signal.emit(t, d.self, signal.VALUE_CHANGED, cast(*u8, &d.color));
+    return 1;
+}
+
+fn _apply_color(t as *tree.Tree, d as *Data, c as math.color.Color, keep_text as i32) as i32 {
+    let is f64 as h with mut = d.h;
+    let is f64 as s with mut = 0.0;
+    let is f64 as v with mut = 0.0;
+    _to_hsv(c, &h, &s, &v);
+    return _apply(t, d, h, s, v, c.a, keep_text);
+}
+
+// The colour from now on — opaque without alpha shown — said when it
+// changes it. 1, or 0 for a widget that is no chooser.
+fn set_color(t as *tree.Tree, w as i64, c as math.color.Color) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    _apply_color(t, d, c, 0);
+    return 1;
+}
+
+fn set_hsv(t as *tree.Tree, w as i64, h as f64, s as f64, v as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    _apply(t, d, h, s, v, d.a, 0);
+    return 1;
+}
+
+// The strip of alpha shown, or not: opaque again then.
+fn set_alpha_shown(t as *tree.Tree, w as i64, on as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.alpha_shown = on;
+    tree.set_visible(t, d.alpha, on);
+    if (on == 0) { _apply(t, d, d.h, d.s, d.v, 1.0, 0); }
+    _write(t, d);
+    widget.changed(t, w, widget.CHANGED_LAYOUT);
+}
+
+fn set_palette_shown(t as *tree.Tree, w as i64, on as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.palette = on;
+    let is i64 as sw with mut = d.first;
+    let is i64 as i with mut = 0;
+    while (i < swatch_count()) {
+        tree.set_visible(t, sw, on);
+        sw = tree.next_sibling(t, sw);
+        i = i + 1;
+    }
+    widget.changed(t, w, widget.CHANGED_LAYOUT);
+}
+
+// --- Typed ---
+
+fn _typed(t as *tree.Tree, e as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (d.quiet == 1) { return; }
+    let is math.color.Color as c;
+    let is i64 as k = _parse(entry.text(t, e), entry.length(t, e), &c);
+    if (k == 6 || k == 8) { _apply_color(t, d, c, 1); }
+}
+
+fn _entered(t as *tree.Tree, e as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is math.color.Color as c;
+    if (_parse(entry.text(t, e), entry.length(t, e), &c) > 0) { _apply_color(t, d, c, 1); }
+    _write(t, d);
+}
+
+// --- Laid out ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _pref(t as *tree.Tree, w as i64) as geom.Size {
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, w, &free, &s);
+    return s;
+}
+
+fn _palette_w(g as f64) as f64 { return cast(f64, COLUMNS) * SWATCH + cast(f64, COLUMNS - 1) * g; }
+fn _palette_h(g as f64) as f64 { return cast(f64, SHADES) * SWATCH + cast(f64, SHADES - 1) * g; }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as g = th.metrics.space_s;
+    let is f64 as k = th.metrics.indicator;
+    let is f64 as eh = _pref(t, d.entry).pref_h;
+    let is f64 as top with mut = 0.0;
+    let is f64 as wide with mut = PLANE + g + k;
+    if (d.palette == 1) {
+        top = _palette_h(g) + 2.0 * g;
+        wide = _max(wide, _palette_w(g));
+    }
+    let is f64 as foot with mut = g + eh;
+    if (d.alpha_shown == 1) { foot = foot + g + k; }
+    geom.size_zero(out);
+    out.pref_w = wide;
+    out.pref_h = top + PLANE + foot;
+    out.min_w = PLANE_MIN + g + k;
+    out.min_h = top + PLANE_MIN + foot;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _put(t as *tree.Tree, ch as i64, x as f64, y as f64, w as f64, h as f64, across as f64, rtl as i32) as math.rect.Rect {
+    let is math.rect.Rect as at with mut = math.rect.rect(x, y, w, h);
+    if (rtl == 1) { at.x = across - x - w; }
+    if (ch != 0) { layout.place(t, ch, &at); }
+    return at;
+}
+
+// From the top: the palette, the plane with the hue beside it, alpha under
+// it, and at the foot the preview and the entry.
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as g = th.metrics.space_s;
+    let is f64 as k = th.metrics.indicator;
+    let is i32 as rtl = cast(i32, layout.direction(t, w) == layout.RTL);
+    let is f64 as y with mut = 0.0;
+    if (d.palette == 1) {
+        let is i64 as sw with mut = d.first;
+        let is i64 as i with mut = 0;
+        while (i < swatch_count()) {
+            let is f64 as col = cast(f64, i / SHADES);
+            let is f64 as row = cast(f64, i % SHADES);
+            _put(t, sw, col * (SWATCH + g), row * (SWATCH + g), SWATCH, SWATCH, r.w, rtl);
+            sw = tree.next_sibling(t, sw);
+            i = i + 1;
+        }
+        y = _palette_h(g) + 2.0 * g;
+    }
+    let is f64 as eh = _pref(t, d.entry).pref_h;
+    let is f64 as foot = r.h - eh;
+    let is f64 as bottom with mut = foot - g;
+    if (d.alpha_shown == 1) { bottom = bottom - k - g; }
+    let is f64 as pw = _max(0.0, r.w - g - k);
+    let is f64 as ph = _max(0.0, bottom - y);
+    _put(t, d.plane, 0.0, y, pw, ph, r.w, rtl);
+    _put(t, d.hue, pw + g, y, k, ph, r.w, rtl);
+    if (d.alpha_shown == 1) { _put(t, d.alpha, 0.0, bottom + g, pw, k, r.w, rtl); }
+    d.pv = _put(t, 0, 0.0, foot, eh, eh, r.w, rtl);
+    _put(t, d.entry, eh + g, foot, _max(0.0, r.w - eh - g), eh, r.w, rtl);
+}
+
+// --- Drawn ---
+
+let is f64 as _CHECK with imut = 8.0;
+
+// A checkerboard of light and darker grey, for what shows through.
+fn _checker(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64) as void {
+    let is math.color.Color as light = math.color.gray(0.8);
+    let is math.color.Color as dark = math.color.gray(0.6);
+    shapes.fill_rect(c, x, y, w, h, light);
+    let is f64 as cy with mut = 0.0;
+    let is i64 as row with mut = 0;
+    while (cy < h) {
+        let is f64 as cx with mut = 0.0;
+        let is i64 as col with mut = 0;
+        while (cx < w) {
+            if ((row + col) % 2 == 1) {
+                let is f64 as cw with mut = _CHECK;
+                if (cx + cw > w) { cw = w - cx; }
+                let is f64 as chh with mut = _CHECK;
+                if (cy + chh > h) { chh = h - cy; }
+                shapes.fill_rect(c, x + cx, y + cy, cw, chh, dark);
+            }
+            cx = cx + _CHECK;
+            col = col + 1;
+        }
+        cy = cy + _CHECK;
+        row = row + 1;
+    }
+}
+
+// A rectangle shaded from c0 at its start to c1 at its end — across, or up
+// from the bottom.
+fn _shade(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64, c0 as math.color.Color, c1 as math.color.Color,
+          up as i32) as void {
+    if (up == 1) {
+        draw2d.triangle(c, x, y + h, c0, x + w, y + h, c0, x + w, y, c1);
+        draw2d.triangle(c, x, y + h, c0, x + w, y, c1, x, y, c1);
+        return;
+    }
+    draw2d.triangle(c, x, y, c0, x + w, y, c1, x + w, y + h, c1);
+    draw2d.triangle(c, x, y, c0, x + w, y + h, c1, x, y + h, c0);
+}
+
+// A ring at a point: white inside a darker one, seen on any colour.
+fn _ring(c as *draw2d.Canvas, cx as f64, cy as f64, r as f64) as void {
+    let is f64 as o = r + 1.0;
+    shapes.stroke_rounded(c, cx - o, cy - o, 2.0 * o, 2.0 * o, o, o, o, o, 1.0, math.color.rgba(0.0, 0.0, 0.0, 0.6));
+    shapes.stroke_rounded(c, cx - r, cy - r, 2.0 * r, 2.0 * r, r, r, r, r, 2.0, math.color.white());
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is math.rect.Rect as pv = math.rect.rect(p.rect.x + d.pv.x, p.rect.y + d.pv.y, d.pv.w, d.pv.h);
+    _checker(p.canvas, pv.x, pv.y, pv.w, pv.h);
+    shapes.fill_rect(p.canvas, pv.x, pv.y, pv.w, pv.h, d.color);
+    shapes.stroke_rounded(p.canvas, pv.x, pv.y, pv.w, pv.h, 0.0, 0.0, 0.0, 0.0, 1.0, p.theme.palette.border);
+}
+
+fn _owner(t as *tree.Tree, w as i64) as *Data {
+    return _data(t, *cast(*i64, tree.data(t, w)));
+}
+
+fn _plane_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = _owner(t, w);
+    if (cast(i64, d) == 0) { return; }
+    let is math.rect.Rect as r = p.rect;
+    // White to the pure hue across; then black, clear at the top, over it.
+    _shade(p.canvas, r.x, r.y, r.w, r.h, math.color.white(), _from_hsv(d.h, 1.0, 1.0, 1.0), 0);
+    _shade(p.canvas, r.x, r.y, r.w, r.h, math.color.black(), math.color.rgba(0.0, 0.0, 0.0, 0.0), 1);
+    _ring(p.canvas, r.x + d.s * r.w, r.y + (1.0 - d.v) * r.h, p.theme.metrics.indicator / 3.0);
+}
+
+// --- The plane ---
+
+fn _plane_to(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as void {
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    let is f64 as s with mut = 0.0;
+    let is f64 as v with mut = 0.0;
+    if (r.w > 0.0) { s = (e.x - r.x) / r.w; }
+    if (r.h > 0.0) { v = 1.0 - (e.y - r.y) / r.h; }
+    _apply(t, d, d.h, s, v, d.a, 0);
+}
+
+fn _plain(e as *event.Event) as i32 {
+    return cast(i32, (e.mods & (keys.MOD_CONTROL | keys.MOD_ALT)) == 0);
+}
+
+fn _plane_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Plane as pd = cast(*Plane, data);
+    let is *Data as d = _data(t, pd.owner);
+    if (cast(i64, d) == 0) { return 0; }
+    let is i32 as k = e.kind;
+    if (k == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        pd.dragging = 1;
+        _plane_to(t, w, d, e);
+        return 1;
+    }
+    if (k == event.POINTER_MOVE) {
+        if (pd.dragging == 0) { return 0; }
+        _plane_to(t, w, d, e);
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (pd.dragging == 0) { return 0; }
+        pd.dragging = 0;
+        return 1;
+    }
+    if (k == event.KEY_DOWN && _plain(e) == 1) {
+        if (e.key == keys.RIGHT) { _apply(t, d, d.h, d.s + 0.01, d.v, d.a, 0); return 1; }
+        if (e.key == keys.LEFT) { _apply(t, d, d.h, d.s - 0.01, d.v, d.a, 0); return 1; }
+        if (e.key == keys.UP) { _apply(t, d, d.h, d.s, d.v + 0.01, d.a, 0); return 1; }
+        if (e.key == keys.DOWN) { _apply(t, d, d.h, d.s, d.v - 0.01, d.a, 0); return 1; }
+        if (e.key == keys.PAGE_UP) { _apply(t, d, d.h, d.s, d.v + 0.1, d.a, 0); return 1; }
+        if (e.key == keys.PAGE_DOWN) { _apply(t, d, d.h, d.s, d.v - 0.1, d.a, 0); return 1; }
+        if (e.key == keys.HOME) { _apply(t, d, d.h, 0.0, d.v, d.a, 0); return 1; }
+        if (e.key == keys.END) { _apply(t, d, d.h, 1.0, d.v, d.a, 0); return 1; }
+    }
+    return 0;
+}
+
+fn _percent(out as *u8, at as i64, x as f64) as i64 {
+    let is i64 as v = cast(i64, fm.floor(x * 100.0 + 0.5));
+    let is i64 as k with mut = at;
+    if (v >= 100) {
+        out[k] = cast(u8, 49);
+        k = k + 1;
+    }
+    if (v >= 10) {
+        out[k] = cast(u8, 48 + (v / 10) % 10);
+        k = k + 1;
+    }
+    out[k] = cast(u8, 48 + v % 10);
+    out[k + 1] = cast(u8, 37);
+    return k + 2;
+}
+
+fn _append(out as *u8, at as i64, s as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (s[k] != 0) {
+        out[at + k] = s[k];
+        k = k + 1;
+    }
+    return at + k;
+}
+
+fn _plane_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Plane as pd = cast(*Plane, data);
+    let is *Data as d = _data(t, pd.owner);
+    if (cast(i64, d) == 0 || q.action != access.ASK) { return 0; }
+    access.set_name(q, "Saturation and value", 20);
+    let is *u8 as b = cast(*u8, &pd.desc);
+    let is i64 as n with mut = _append(b, 0, "Saturation ");
+    n = _percent(b, n, d.s);
+    n = _append(b, n, ", value ");
+    n = _percent(b, n, d.v);
+    access.set_description(q, b, n);
+    return 1;
+}
+
+// --- The strips ---
+
+fn _strip_value(d as *Data, which as i32) as f64 {
+    if (which == _HUE) { return d.h; }
+    return d.a;
+}
+
+fn _strip_set(t as *tree.Tree, d as *Data, which as i32, x as f64) as void {
+    if (which == _HUE) {
+        _apply(t, d, x, d.s, d.v, d.a, 0);
+    } else {
+        _apply(t, d, d.h, d.s, d.v, x, 0);
+    }
+}
+
+fn _strip_step(which as i32) as f64 {
+    if (which == _HUE) { return 1.0; }
+    return 0.01;
+}
+
+fn _strip_max(which as i32) as f64 {
+    if (which == _HUE) { return 360.0; }
+    return 1.0;
+}
+
+// Alpha runs across, from the right when right to left; the hue up.
+fn _strip_rtl(t as *tree.Tree, w as i64, which as i32) as i32 {
+    return cast(i32, which == _ALPHA && layout.direction(t, w) == layout.RTL);
+}
+
+// How far along a strip a point is, 0 to 1.
+fn _strip_frac(t as *tree.Tree, w as i64, which as i32, r as math.rect.Rect, x as f64, y as f64) as f64 {
+    if (which == _HUE) {
+        if (r.h <= 0.0) { return 0.0; }
+        return _clamp01(1.0 - (y - r.y) / r.h);
+    }
+    if (r.w <= 0.0) { return 0.0; }
+    let is f64 as f = _clamp01((x - r.x) / r.w);
+    if (_strip_rtl(t, w, which) == 1) { return 1.0 - f; }
+    return f;
+}
+
+fn _strip_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Strip as sd = cast(*Strip, data);
+    let is *Data as d = _data(t, sd.owner);
+    if (cast(i64, d) == 0) { return; }
+    let is math.rect.Rect as r = p.rect;
+    let is f64 as f with mut = _strip_value(d, sd.which) / _strip_max(sd.which);
+    if (sd.which == _HUE) {
+        // Six runs up, each turning one channel: red, yellow, green, cyan,
+        // blue, magenta, red.
+        let is f64 as seg = r.h / 6.0;
+        let is i64 as i with mut = 0;
+        while (i < 6) {
+            let is f64 as y0 = r.y + r.h - cast(f64, i + 1) * seg;
+            _shade(p.canvas, r.x, y0, r.w, seg, _from_hsv(cast(f64, i) * 60.0, 1.0, 1.0, 1.0),
+                   _from_hsv(cast(f64, i + 1) * 60.0, 1.0, 1.0, 1.0), 1);
+            i = i + 1;
+        }
+        _ring(p.canvas, r.x + r.w / 2.0, r.y + (1.0 - f) * r.h, r.w / 3.0);
+        return;
+    }
+    _checker(p.canvas, r.x, r.y, r.w, r.h);
+    let is math.color.Color as clear = math.color.rgba(d.color.r, d.color.g, d.color.b, 0.0);
+    let is math.color.Color as full = math.color.rgba(d.color.r, d.color.g, d.color.b, 1.0);
+    if (_strip_rtl(t, w, sd.which) == 1) {
+        _shade(p.canvas, r.x, r.y, r.w, r.h, full, clear, 0);
+        f = 1.0 - f;
+    } else {
+        _shade(p.canvas, r.x, r.y, r.w, r.h, clear, full, 0);
+    }
+    _ring(p.canvas, r.x + f * r.w, r.y + r.h / 2.0, r.h / 3.0);
+}
+
+fn _strip_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Strip as sd = cast(*Strip, data);
+    let is *Data as d = _data(t, sd.owner);
+    if (cast(i64, d) == 0) { return 0; }
+    let is i32 as k = e.kind;
+    let is f64 as mx = _strip_max(sd.which);
+    if (k == event.POINTER_DOWN || (k == event.POINTER_MOVE && sd.dragging == 1)) {
+        if (k == event.POINTER_DOWN && e.button != 1) { return 0; }
+        sd.dragging = 1;
+        _strip_set(t, d, sd.which, _strip_frac(t, w, sd.which, layout.window_rect(t, w), e.x, e.y) * mx);
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (sd.dragging == 0) { return 0; }
+        sd.dragging = 0;
+        return 1;
+    }
+    if (k == event.KEY_DOWN && _plain(e) == 1) {
+        let is f64 as v = _strip_value(d, sd.which);
+        let is f64 as st = _strip_step(sd.which);
+        let is f64 as across with mut = 1.0;
+        if (_strip_rtl(t, w, sd.which) == 1) { across = 0.0 - 1.0; }
+        if (e.key == keys.RIGHT) { _strip_set(t, d, sd.which, v + st * across); return 1; }
+        if (e.key == keys.LEFT) { _strip_set(t, d, sd.which, v - st * across); return 1; }
+        if (e.key == keys.UP) { _strip_set(t, d, sd.which, v + st); return 1; }
+        if (e.key == keys.DOWN) { _strip_set(t, d, sd.which, v - st); return 1; }
+        if (e.key == keys.PAGE_UP) { _strip_set(t, d, sd.which, v + 10.0 * st); return 1; }
+        if (e.key == keys.PAGE_DOWN) { _strip_set(t, d, sd.which, v - 10.0 * st); return 1; }
+        if (e.key == keys.HOME) { _strip_set(t, d, sd.which, 0.0); return 1; }
+        if (e.key == keys.END) { _strip_set(t, d, sd.which, mx); return 1; }
+    }
+    return 0;
+}
+
+fn _strip_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Strip as sd = cast(*Strip, data);
+    let is *Data as d = _data(t, sd.owner);
+    if (cast(i64, d) == 0) { return 0; }
+    // Told in degrees and in percent.
+    let is f64 as unit with mut = 1.0;
+    if (sd.which == _ALPHA) { unit = 100.0; }
+    if (q.action == access.ASK) {
+        if (sd.which == _HUE) {
+            access.set_name(q, "Hue", 3);
+            q.states = q.states | access.VERTICAL;
+        } else {
+            access.set_name(q, "Alpha", 5);
+            q.states = q.states | access.HORIZONTAL;
+        }
+        access.set_range(q, _strip_value(d, sd.which) * unit, 0.0, _strip_max(sd.which) * unit, 1.0);
+        q.actions = access.INCREMENT | access.DECREMENT | access.SET_VALUE;
+        return 1;
+    }
+    let is f64 as v = _strip_value(d, sd.which);
+    let is f64 as st = _strip_step(sd.which);
+    if (q.action == access.SET_VALUE) { _strip_set(t, d, sd.which, q.arg / unit); }
+    if (q.action == access.INCREMENT) { _strip_set(t, d, sd.which, v + st); }
+    if (q.action == access.DECREMENT) { _strip_set(t, d, sd.which, v - st); }
+    return 1;
+}
+
+// --- The palette's swatches ---
+
+fn _choose(t as *tree.Tree, d as *Data, i as i64) as void {
+    _apply_color(t, d, swatch_color(i), 0);
+}
+
+fn _swatch_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Swatch as sd = cast(*Swatch, data);
+    let is *Data as d = _data(t, sd.owner);
+    if (cast(i64, d) == 0) { return; }
+    let is math.rect.Rect as r = p.rect;
+    let is math.color.Color as c = swatch_color(sd.index);
+    let is f64 as rad = p.theme.metrics.radius_s;
+    shapes.fill_rounded(p.canvas, r.x, r.y, r.w, r.h, rad, rad, rad, rad, c);
+    shapes.stroke_rounded(p.canvas, r.x, r.y, r.w, r.h, rad, rad, rad, rad, 1.0, style.with_alpha(p.theme.palette.fg, 0.15));
+    if (d.selected == sd.index) {
+        // Ringed in black on light colours, white on dark ones.
+        let is math.color.Color as ring with mut = math.color.white();
+        if (c.r * 0.299 + c.g * 0.587 + c.b * 0.114 > 0.6) { ring = math.color.black(); }
+        shapes.stroke_rounded(p.canvas, r.x + 3.0, r.y + 3.0, r.w - 6.0, r.h - 6.0, rad / 2.0, rad / 2.0, rad / 2.0, rad / 2.0,
+                              2.0, ring);
+    }
+}
+
+// The swatch the keys go to: right a column on (left, right to left), down a
+// shade darker, held at the edges.
+fn _swatch_key(t as *tree.Tree, w as i64, sd as *Swatch, d as *Data, e as *event.Event) as i64 {
+    let is i64 as i = sd.index;
+    let is i64 as col = i / SHADES;
+    let is i64 as row = i % SHADES;
+    let is i64 as on with mut = 1;
+    if (layout.direction(t, w) == layout.RTL) { on = 0 - 1; }
+    let is i64 as to with mut = 0 - 1;
+    if (e.key == keys.RIGHT) { to = (col + on) * SHADES + row; if (col + on < 0 || col + on >= COLUMNS) { to = i; } }
+    if (e.key == keys.LEFT) { to = (col - on) * SHADES + row; if (col - on < 0 || col - on >= COLUMNS) { to = i; } }
+    if (e.key == keys.DOWN) { to = i + 1; if (row + 1 >= SHADES) { to = i; } }
+    if (e.key == keys.UP) { to = i - 1; if (row == 0) { to = i; } }
+    if (e.key == keys.HOME) { to = 0; }
+    if (e.key == keys.END) { to = swatch_count() - 1; }
+    if (to < 0) { return 0; }
+    _stop_at(t, d, to);
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) != 0) { router.focus(t, r, d.stop, 1); }
+    return 1;
+}
+
+fn _swatch_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Swatch as sd = cast(*Swatch, data);
+    let is *Data as d = _data(t, sd.owner);
+    if (cast(i64, d) == 0) { return 0; }
+    let is i32 as k = e.kind;
+    if (k == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        sd.pressing = 1;
+        // Pressed, it is the Tab stop and has the focus.
+        _stop_at(t, d, sd.index);
+        let is *router.Router as r = cast(*router.Router, tree.router(t));
+        if (cast(i64, r) != 0) { router.focus(t, r, w, 0); }
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (sd.pressing == 0) { return 0; }
+        sd.pressing = 0;
+        let is math.rect.Rect as r = layout.rect(t, w);
+        if (k == event.POINTER_UP && e.local_x >= 0.0 && e.local_y >= 0.0 && e.local_x < r.w && e.local_y < r.h) {
+            _choose(t, d, sd.index);
+        }
+        return 1;
+    }
+    if (k == event.SHORTCUT_OVERRIDE) {
+        return cast(i64, _plain(e) == 1 && (e.key == keys.SPACE || e.key == keys.RETURN));
+    }
+    if (k == event.KEY_DOWN && _plain(e) == 1) {
+        if (e.key == keys.SPACE || e.key == keys.RETURN) {
+            _choose(t, d, sd.index);
+            return 1;
+        }
+        return _swatch_key(t, w, sd, d, e);
+    }
+    return 0;
+}
+
+fn _swatch_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Swatch as sd = cast(*Swatch, data);
+    let is *Data as d = _data(t, sd.owner);
+    if (cast(i64, d) == 0) { return 0; }
+    if (q.action == access.PRESS) {
+        _choose(t, d, sd.index);
+        return 1;
+    }
+    if (q.action != access.ASK) { return 0; }
+    // Shades from very light to very dark; the greys by number.
+    let is i64 as col = sd.index / SHADES;
+    let is i64 as row = sd.index % SHADES;
+    let is *u8 as b = cast(*u8, &sd.name);
+    let is i64 as n with mut = 0;
+    if (col < 7) {
+        if (row == 0) { n = _append(b, n, "Very Light "); }
+        if (row == 1) { n = _append(b, n, "Light "); }
+        if (row == 3) { n = _append(b, n, "Dark "); }
+        if (row == 4) { n = _append(b, n, "Very Dark "); }
+        n = _append(b, n, _hue_names[col]);
+    } else if (col == 7 && row == 0) {
+        n = _append(b, n, "White");
+    } else if (col == 8 && row == 4) {
+        n = _append(b, n, "Black");
+    } else {
+        if (col == 7) { n = _append(b, n, "Light Gray "); } else { n = _append(b, n, "Dark Gray "); }
+        let is i64 as k with mut = row;
+        if (col == 8) { k = row + 1; }
+        b[n] = cast(u8, 48 + k);
+        n = n + 1;
+    }
+    access.set_name(q, b, n);
+    q.states = q.states | access.CHECKABLE;
+    if (d.selected == sd.index) { q.states = q.states | access.CHECKED; }
+    q.actions = access.PRESS;
+    return 1;
+}
+
+// --- In a dialog ---
+
+// A new dialog titled s, n bytes, holding a chooser, with Cancel and Select;
+// hidden. Its handle, or 0.
+fn dialog(t as *tree.Tree, s as *u8, n as i64) as i64 {
+    _init();
+    let is i64 as dlg = dialog_w.create(t, s, n);
+    if (dlg == 0) { return 0; }
+    if (create(t, dialog_w.content(t, dlg)) == 0) {
+        tree.destroy(t, dlg);
+        return 0;
+    }
+    dialog_w.add_button(t, dlg, "_Cancel", 7, dialog_w.CANCEL);
+    dialog_w.add_button(t, dlg, "_Select", 7, dialog_w.OK);
+    dialog_w.set_default_response(t, dlg, dialog_w.OK);
+    return dlg;
+}
+
+// The chooser in dialog dlg; 0 for none.
+fn chooser_of(t as *tree.Tree, dlg as i64) as i64 {
+    let is i64 as c = dialog_w.content(t, dlg);
+    if (c == 0) { return 0; }
+    let is i64 as w = tree.first_child(t, c);
+    if (cast(i64, _data(t, w)) == 0) { return 0; }
+    return w;
+}
+
+// --- Behind a button ---
+
+fn _shown(t as *tree.Tree, b as i64) as *Shown {
+    if (tree.is_valid(t, b) == 0) { return cast(*Shown, 0); }
+    let is i64 as w = button_w.content(t, b);
+    if (w == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_shown_kind)) { return cast(*Shown, 0); }
+    return cast(*Shown, tree.data(t, w));
+}
+
+// A new button showing colour c, as the last child of parent. Its handle, or
+// 0 with the tree's last_error set.
+fn button(t as *tree.Tree, parent as i64, c as math.color.Color) as i64 {
+    _init();
+    let is i64 as b = button_w.create_holding(t, parent);
+    if (b == 0) { return 0; }
+    let is i64 as w = tree.create(t, &_shown_kind, b);
+    if (w == 0) {
+        tree.destroy(t, b);
+        return 0;
+    }
+    button_w.set_content(t, b, w);
+    let is *Shown as sd = cast(*Shown, tree.data(t, w));
+    sd.t = t;
+    sd.owner = b;
+    sd.color = c;
+    signal.connect(t, b, signal.CLICKED, fn_ptr(_pressed), cast(*u8, sd));
+    return b;
+}
+
+fn button_color(t as *tree.Tree, b as i64) as math.color.Color {
+    let is *Shown as sd = _shown(t, b);
+    if (cast(i64, sd) == 0) { return math.color.transparent(); }
+    return sd.color;
+}
+
+// Its colour from now on, not said.
+fn set_button_color(t as *tree.Tree, b as i64, c as math.color.Color) as void {
+    let is *Shown as sd = _shown(t, b);
+    if (cast(i64, sd) == 0) { return; }
+    sd.color = c;
+    widget.changed(t, button_w.content(t, b), widget.CHANGED_PAINT);
+}
+
+// Its dialog, made the first time it is pressed; 0 before.
+fn button_dialog(t as *tree.Tree, b as i64) as i64 {
+    let is *Shown as sd = _shown(t, b);
+    if (cast(i64, sd) == 0) { return 0; }
+    return sd.dlg;
+}
+
+fn _pressed(t as *tree.Tree, b as i64, arg as *u8, user as *u8) as void {
+    let is *Shown as sd = cast(*Shown, user);
+    if (sd.dlg == 0 || tree.is_valid(t, sd.dlg) == 0) {
+        sd.dlg = dialog(t, "Choose a Colour", 15);
+        if (sd.dlg == 0) { return; }
+        signal.connect(t, sd.dlg, signal.ACTIVATED, fn_ptr(_answered), user);
+    }
+    set_color(t, chooser_of(t, sd.dlg), sd.color);
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) != 0) { dialog_w.show(t, r, sd.dlg, 1); }
+}
+
+fn _answered(t as *tree.Tree, dlg as i64, arg as *u8, user as *u8) as void {
+    let is *Shown as sd = cast(*Shown, user);
+    if (*cast(*i64, arg) != dialog_w.OK) { return; }
+    sd.color = color(t, chooser_of(t, dlg));
+    widget.changed(t, button_w.content(t, sd.owner), widget.CHANGED_PAINT);
+    signal.emit(t, sd.owner, signal.VALUE_CHANGED, cast(*u8, &sd.color));
+}
+
+fn _shown_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    geom.size_zero(out);
+    out.pref_w = 2.0 * th.metrics.indicator;
+    out.pref_h = th.metrics.indicator;
+    out.min_w = out.pref_w;
+    out.min_h = out.pref_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _shown_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Shown as sd = cast(*Shown, data);
+    let is math.rect.Rect as r = p.rect;
+    _checker(p.canvas, r.x, r.y, r.w, r.h);
+    shapes.fill_rect(p.canvas, r.x, r.y, r.w, r.h, sd.color);
+    shapes.stroke_rounded(p.canvas, r.x, r.y, r.w, r.h, 0.0, 0.0, 0.0, 0.0, 1.0, p.theme.palette.border);
+}
+
+// Named by its code, which its button is named by.
+fn _shown_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Shown as sd = cast(*Shown, data);
+    if (q.action != access.ASK) { return 0; }
+    access.set_name(q, cast(*u8, &sd.hex), _hex_text(sd.color, 1, cast(*u8, &sd.hex)));
+    return 1;
+}
+
+fn _shown_destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Shown as sd = cast(*Shown, data);
+    if (sd.dlg != 0 && tree.is_valid(t, sd.dlg) == 1) { tree.destroy(t, sd.dlg); }
+}
