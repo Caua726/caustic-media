@@ -1,0 +1,1268 @@
+// ui/widgets/entry.cst — one line of text to type in.
+//
+// Its text is a text buffer's (textbuf.cst): typing goes in at the caret, a
+// selection is typed over, and undoing and redoing go by the steps a person
+// would — a run of typing, of backspaces, of deletes; a paste, a cut, a
+// drop. It is one line: a line feed typed or pasted is a space.
+//
+// The caret moves by grapheme and, with Control, by word, left and right as
+// the text is drawn (text/layout/cursor.cst does the right thing where
+// directions meet); Home and End go to the ends; Shift selects as it goes.
+// The pointer places the caret, drags a selection, selects a word with a
+// double click and all of it with a triple; Shift and a click extend. Pressed
+// inside the selection and dragged, the selection goes where it is dropped,
+// a copy of it with Control. What is selected by pointer or keys goes to the
+// primary selection; the middle button pastes it where it is pressed.
+// Control and C, X and V — and Insert's old companions — copy, cut and paste
+// through the program's clipboard (tree.set_clipboard, tree.set_paste).
+//
+// An input method's composition is shown at the caret, underlined, its own
+// caret inside it, until it is committed as text or given up; where the caret
+// is goes to the input method (tree.set_text_area) for its candidates. The
+// text is kept in view: past the field's width it moves along with the
+// caret.
+//
+// A password shows a bullet for each character, is never copied, and takes
+// no composition. A placeholder shows in the secondary colour while the field
+// is empty. A limit — in characters — cuts what goes in to what fits; a
+// filter lets in only the characters it says yes to. Read-only, it can still
+// be selected and copied. Focused by the keyboard, all of it is selected.
+//
+// Enter is its own — ACTIVATED — ahead of the window's default button,
+// unless it activates the default (set_activates_default). CHANGED follows
+// every change to the text, the program's too.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/draw2d.cst" as draw2d;
+use "../../render/shapes2d.cst" as shapes;
+use "../../text/layout/model.cst" as model;
+use "../../text/layout/layout.cst" as tlayout;
+use "../../text/layout/cursor.cst" as cursor;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../signal.cst" as signal;
+use "../text.cst" as txt;
+use "../textbuf.cst" as textbuf;
+
+// Says whether codepoint c may go in: 1 yes, 0 no.
+type FilterFn = fn(*u8, i64) as i32;
+
+let is i64 as MAX_PREEDIT with imut = 256;
+
+// How text goes in.
+let is i32 as _TYPED  with imut = 1;
+let is i32 as _PASTED with imut = 2;
+
+// What an entry keeps besides the tree's slot: a mapping of its own.
+struct Ent {
+    buf         as textbuf.Buf;
+    lay         as tlayout.Layout;   // the text as shown, for the cursor's questions
+    lstyles     as [16]model.Style;
+    run         as txt.Run;          // and to draw
+    hint        as txt.Run;          // the placeholder
+    shown       as *u8;              // the text as shown: bullets for a password, the composition at the caret
+    nshown      as i64;
+    shown_cap   as i64;
+    tmp         as *u8;              // what goes in, once let in
+    tmp_cap     as i64;
+    pre         as [256]u8;          // the input method's composition
+    npre        as i64;
+    pre_cur     as i64;              // its caret, bytes into it
+    anchor      as i64;              // where the selection began, in the text
+    caret       as i64;              // its other end, where the caret is
+    by          as i64;              // a press selects by: 1 graphemes, 2 words, 3 all
+    unit_a      as i64;              // the word, or all, the press chose
+    unit_b      as i64;
+    press_at    as i64;              // where a press inside the selection was
+    drop        as i64;              // where dragged text would go, while it is dragged
+    max         as i64;              // characters; 0 for no limit
+    scroll      as f64;              // how far its text is moved left to keep the caret in view
+    line_h      as f64;              // a line's height in its style
+    key_size    as f64;              // the style it was laid out in
+    key_weight  as i64;
+    key_family  as *u8;
+    filter      as FilterFn;
+    filter_user as *u8;
+    upstream    as i32;              // the caret goes with the text before it
+    password    as i32;
+    editable    as i32;
+    activates   as i32;              // Enter is the window's default button's
+    pressing    as i32;              // a press is selecting, or may drag
+    maybe_drag  as i32;              // pressed inside the selection: a drag or a click, not yet known
+    dragging    as i32;
+    focused     as i32;
+    laid        as i32;              // lay and run hold the text as shown
+    _pad0       as i32;
+}
+
+struct Data {
+    e as *Ent;
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+// For the height of a line in its style.
+let is txt.Run as _scratch with mut;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("entry", sizeof(Data));
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.role = access.ROLE_ENTRY;
+    _kind.access = fn_ptr(_access);
+    _scratch = txt.run();
+    _ready = 1;
+}
+
+// A new, empty entry as the last child of parent. Its handle, or 0 with the
+// tree's last_error set — or, when memory is refused, 0 alone.
+fn create(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Ent as en = cast(*Ent, mem.core.mmap_anon(sizeof(Ent)));
+    if (cast(i64, en) <= 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    en.buf = textbuf.open();
+    tlayout.open(&en.lay);
+    en.run = txt.run();
+    en.hint = txt.run();
+    en.by = 1;
+    en.editable = 1;
+    cast(*Data, tree.data(t, w)).e = en;
+    tree.set_focusable(t, w, 1);
+    _relay(t, w, en);
+    return w;
+}
+
+fn _ent(t as *tree.Tree, w as i64) as *Ent {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Ent, 0); }
+    return cast(*Data, tree.data(t, w)).e;
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Ent as en = cast(*Data, data).e;
+    if (cast(i64, en) == 0) { return; }
+    textbuf.close(&en.buf);
+    tlayout.close(&en.lay);
+    txt.run_close(&en.run);
+    txt.run_close(&en.hint);
+    if (en.shown_cap > 0) { mem.core.munmap(en.shown, en.shown_cap); }
+    if (en.tmp_cap > 0) { mem.core.munmap(en.tmp, en.tmp_cap); }
+    mem.core.munmap(cast(*u8, en), sizeof(Ent));
+}
+
+// --- Memory ---
+
+fn _cap_for(cap as i64, want as i64) as i64 {
+    let is i64 as c with mut = cap * 2;
+    if (c < 256) { c = 256; }
+    while (c < want) { c = c * 2; }
+    return c;
+}
+
+// Room for want bytes of the text as shown: 1, or 0 when memory is refused.
+fn _shown_room(en as *Ent, want as i64) as i32 {
+    if (want <= en.shown_cap) { return 1; }
+    let is i64 as c = _cap_for(en.shown_cap, want);
+    let is *u8 as q = mem.core.mmap_anon(c);
+    if (cast(i64, q) <= 0) { return 0; }
+    if (en.shown_cap > 0) { mem.core.munmap(en.shown, en.shown_cap); }
+    en.shown = q;
+    en.shown_cap = c;
+    return 1;
+}
+
+fn _tmp_room(en as *Ent, want as i64) as i32 {
+    if (want <= en.tmp_cap) { return 1; }
+    let is i64 as c = _cap_for(en.tmp_cap, want);
+    let is *u8 as q = mem.core.mmap_anon(c);
+    if (cast(i64, q) <= 0) { return 0; }
+    if (en.tmp_cap > 0) { mem.core.munmap(en.tmp, en.tmp_cap); }
+    en.tmp = q;
+    en.tmp_cap = c;
+    return 1;
+}
+
+// --- Characters ---
+
+fn _seq(b as i64) as i64 {
+    if (b < 128) { return 1; }
+    if (b >= 240) { return 4; }
+    if (b >= 224) { return 3; }
+    if (b >= 192) { return 2; }
+    return 1;
+}
+
+// The codepoint of the whole sequence at at.
+fn _decode(p as *u8, at as i64, n as i64) as i64 {
+    let is i64 as b = cast(i64, p[at]);
+    let is i64 as k = _seq(b);
+    if (k == 1) { return b; }
+    if (k == 2) { return ((b & 31) << 6) | (cast(i64, p[at + 1]) & 63); }
+    if (k == 3) { return ((b & 15) << 12) | ((cast(i64, p[at + 1]) & 63) << 6) | (cast(i64, p[at + 2]) & 63); }
+    return ((b & 7) << 18) | ((cast(i64, p[at + 1]) & 63) << 12) | ((cast(i64, p[at + 2]) & 63) << 6) |
+           (cast(i64, p[at + 3]) & 63);
+}
+
+// Whether the k bytes from i of s, n long, are one well-formed sequence, as
+// Unicode's table 3-7 has them: no overlong forms, no surrogates, nothing
+// past U+10FFFF.
+fn _whole(s as *u8, i as i64, n as i64, k as i64) as i32 {
+    let is i64 as b = cast(i64, s[i]);
+    if (b < 128) { return 1; }
+    if (b < 194 || b > 244 || i + k > n) { return 0; }
+    let is i64 as lo with mut = 128;
+    let is i64 as hi with mut = 191;
+    if (b == 224) { lo = 160; }
+    if (b == 237) { hi = 159; }
+    if (b == 240) { lo = 144; }
+    if (b == 244) { hi = 143; }
+    let is i64 as c = cast(i64, s[i + 1]);
+    if (c < lo || c > hi) { return 0; }
+    let is i64 as j with mut = 2;
+    while (j < k) {
+        if ((cast(i64, s[i + j]) & 192) != 128) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
+fn _len(en as *Ent) as i64 { return textbuf.length(&en.buf); }
+
+// The characters in bytes a .. b of the text.
+fn _chars_in(en as *Ent, a as i64, b as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = a;
+    while (i < b) {
+        if ((textbuf.byte_at(&en.buf, i) & 192) != 128) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Where character k of the text starts; the text's end past the last.
+fn _byte_of_char(en as *Ent, k as i64) as i64 {
+    let is i64 as n = _len(en);
+    let is i64 as seen with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if ((textbuf.byte_at(&en.buf, i) & 192) != 128) {
+            if (seen == k) { return i; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Offset b of the text, in the text as shown.
+fn _shown_of(en as *Ent, b as i64) as i64 {
+    let is i64 as s with mut = b;
+    if (en.password == 1) { s = 3 * _chars_in(en, 0, b); }
+    if (en.npre > 0 && b > en.caret) { s = s + en.npre; }
+    return s;
+}
+
+// Offset s of the text as shown, in the text — shown with no composition:
+// the caret moving gives a composition up first.
+fn _text_of(en as *Ent, s as i64) as i64 {
+    if (en.password == 1) { return _byte_of_char(en, s / 3); }
+    return s;
+}
+
+// The text as shown made from the text.
+fn _build(en as *Ent) as i32 {
+    let is i64 as n = _len(en);
+    let is *u8 as p = textbuf.span(&en.buf, 0, n);
+    let is i64 as want with mut = n + en.npre;
+    if (en.password == 1) { want = 3 * n + en.npre; }
+    if (_shown_room(en, want + 1) == 0) { return 0; }
+    let is *u8 as out = en.shown;
+    let is i64 as o with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i <= n) {
+        if (i == en.caret) {
+            let is i64 as k with mut = 0;
+            while (k < en.npre) {
+                out[o] = en.pre[k];
+                o = o + 1;
+                k = k + 1;
+            }
+        }
+        if (i < n) {
+            if (en.password == 0) {
+                out[o] = p[i];
+                o = o + 1;
+            } else if ((cast(i64, p[i]) & 192) != 128) {
+                // U+2022 BULLET.
+                out[o] = cast(u8, 226);
+                out[o + 1] = cast(u8, 128);
+                out[o + 2] = cast(u8, 162);
+                o = o + 3;
+            }
+        }
+        i = i + 1;
+    }
+    en.nshown = o;
+    return 1;
+}
+
+// --- Laying out ---
+
+fn _service(t as *tree.Tree) as *txt.Service { return cast(*txt.Service, tree.text_service(t)); }
+
+// Its text's style in theme th; style 1 is the composition's, underlined.
+fn _styles(th as *style.Theme, sts as *txt.Style) as void {
+    sts[0] = txt.style_of(th.fonts.body);
+    sts[0].family = th.fonts.family;
+    sts[1] = sts[0];
+    sts[1].underline = 1;
+}
+
+// The text as shown laid out again — after it, or the style, changed — and
+// kept in view.
+fn _relay(t as *tree.Tree, w as i64, en as *Ent) as void {
+    en.laid = 0;
+    let is *txt.Service as svc = _service(t);
+    if (cast(i64, svc) == 0) { return; }
+    if (_build(en) == 0) { return; }
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is [2]txt.Style as sts;
+    _styles(&th, cast(*txt.Style, &sts));
+    en.key_size = sts[0].size;
+    en.key_weight = sts[0].weight;
+    en.key_family = sts[0].family;
+    let is model.Params as pp = model.params();
+    let is model.Span as sp;
+    sp.start = _shown_of(en, en.caret);
+    sp.end = sp.start + en.npre;
+    sp.style = 1;
+    let is i64 as nsp with mut = 0;
+    if (en.npre > 0) { nsp = 1; }
+    if (txt.lay(svc, &en.run, en.shown, en.nshown, cast(*txt.Style, &sts), 2, &sp, nsp, &pp) == 0) { return; }
+    en.laid = txt.lay_layout(svc, &en.lay, cast(*model.Style, &en.lstyles), txt.text_of(&en.run),
+                             txt.text_length(&en.run), cast(*txt.Style, &sts), 2, &sp, nsp, &pp);
+    if (txt.text_length(&en.hint) > 0) {
+        txt.lay_text(svc, &en.hint, cast(*txt.Style, &sts), 1, cast(*model.Span, 0), 0, &pp);
+    }
+    txt.lay_plain(svc, &_scratch, "Ag", 2, cast(*txt.Style, &sts), &pp);
+    en.line_h = _scratch.height;
+    _reveal(t, w, en, layout.rect(t, w).w, &th);
+}
+
+// Laid out again when the theme's text is no longer what it was laid out in.
+fn _fresh(t as *tree.Tree, w as i64, en as *Ent, th as *style.Theme) as void {
+    let is txt.Style as st = txt.style_of(th.fonts.body);
+    if (en.laid == 1 && st.size == en.key_size && st.weight == en.key_weight &&
+        cast(i64, th.fonts.family) == cast(i64, en.key_family)) {
+        return;
+    }
+    _relay(t, w, en);
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Ent as en = cast(*Data, data).e;
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    _fresh(t, w, en, &th);
+    let is f64 as em = th.fonts.body.size;
+    let is f64 as px = th.metrics.control_pad_x;
+    let is f64 as lh with mut = en.line_h;
+    if (lh <= 0.0) { lh = em; }
+    out.min_w = 2.0 * px + 2.0 * em;
+    out.pref_w = 2.0 * px + 8.0 * em;
+    out.min_h = _max(th.metrics.control_height, lh + 2.0 * th.metrics.control_pad_y);
+    out.pref_h = out.min_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Ent as en = cast(*Data, data).e;
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    _fresh(t, w, en, &th);
+    _reveal(t, w, en, r.w, &th);
+    _area(t, w, en);
+}
+
+// --- Where things are ---
+
+fn _snap(t as *tree.Tree, v as f64) as f64 {
+    let is f64 as s with mut = layout.scale(t);
+    if (s <= 0.0) { s = 1.0; }
+    return fm.floor(v * s + 0.5) / s;
+}
+
+// The room its text has across, at width ww.
+fn _room(ww as f64, th as *style.Theme) as f64 { return _max(0.0, ww - 2.0 * th.metrics.control_pad_x); }
+
+// Where the text as shown starts across, from the widget's left at width ww:
+// in from its padding, moved along by the scroll; at the far side, right to
+// left, while it fits.
+fn _text_x(t as *tree.Tree, w as i64, en as *Ent, ww as f64, th as *style.Theme) as f64 {
+    let is f64 as px = th.metrics.control_pad_x;
+    let is f64 as room = _room(ww, th);
+    if (layout.direction(t, w) == layout.RTL && en.run.width + 1.0 <= room) {
+        return px + room - en.run.width - 1.0;
+    }
+    return px - en.scroll;
+}
+
+// Where its line's top is, from the widget's top at height wh: in the middle.
+fn _text_y(t as *tree.Tree, en as *Ent, wh as f64) as f64 { return _snap(t, (wh - en.line_h) / 2.0); }
+
+// The caret's place across for offset s of the text as shown, in the text's
+// own coordinates.
+fn _x_in(en as *Ent, s as i64, up as i32) as f64 {
+    if (en.laid == 0) { return 0.0; }
+    return cursor.caret(&en.lay, cursor.position(s, up)).x;
+}
+
+// Where the caret is in the text as shown: inside a composition, at its
+// caret.
+fn _caret_shown(en as *Ent) as i64 {
+    let is i64 as s = _shown_of(en, en.caret);
+    if (en.npre > 0) { return s + en.pre_cur; }
+    return s;
+}
+
+// The scroll that keeps the caret in view at width ww: none while the text
+// fits; otherwise only as far as it must, the text never ending short of
+// the field's end.
+fn _reveal(t as *tree.Tree, w as i64, en as *Ent, ww as f64, th as *style.Theme) as void {
+    let is f64 as room = _room(ww, th);
+    let is f64 as full = en.run.width + 1.0;
+    if (en.laid == 0 || room <= 0.0 || full <= room) {
+        en.scroll = 0.0;
+        return;
+    }
+    let is f64 as s with mut = layout.scale(t);
+    if (s <= 0.0) { s = 1.0; }
+    let is f64 as cx = _x_in(en, _caret_shown(en), en.upstream);
+    if (cx - en.scroll < 0.0) { en.scroll = fm.floor(cx * s) / s; }
+    if (cx + 1.0 - en.scroll > room) { en.scroll = fm.ceil((cx + 1.0 - room) * s) / s; }
+    if (en.scroll > full - room) { en.scroll = full - room; }
+    if (en.scroll < 0.0) { en.scroll = 0.0; }
+}
+
+// The caret, in the window, for offset s of the text as shown.
+fn _caret_rect(t as *tree.Tree, w as i64, en as *Ent, s as i64, up as i32) as math.rect.Rect {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    let is f64 as x = r.x + _text_x(t, w, en, r.w, &th) + _x_in(en, s, up);
+    return math.rect.rect(x, r.y + _text_y(t, en, r.h), 1.0, en.line_h);
+}
+
+// The input method told where the caret is, while it has the focus.
+fn _area(t as *tree.Tree, w as i64, en as *Ent) as void {
+    if (en.focused == 0) { return; }
+    tree.set_text_area(t, w, _caret_rect(t, w, en, _caret_shown(en), en.upstream));
+}
+
+// The caret moved, or the selection: kept in view, the input method told,
+// drawn again.
+fn _moved(t as *tree.Tree, w as i64, en as *Ent) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    _reveal(t, w, en, layout.rect(t, w).w, &th);
+    _area(t, w, en);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// The composition given up — the caret moved away from it, the text was
+// set — and the input method told to give it up too.
+fn _end_composition(t as *tree.Tree, w as i64, en as *Ent) as void {
+    if (en.npre == 0) { return; }
+    en.npre = 0;
+    en.pre_cur = 0;
+    tree.reset_ime(t, w);
+    _relay(t, w, en);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+}
+
+// The text changed: laid out again, the caret kept in view, CHANGED.
+fn _edited(t as *tree.Tree, w as i64, en as *Ent) as void {
+    _relay(t, w, en);
+    _area(t, w, en);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    signal.emit(t, w, signal.CHANGED, cast(*u8, 0));
+}
+
+// --- Asked of it ---
+
+// Its text, UTF-8, length(t, w) bytes, until it next changes; null for a
+// widget that is no entry.
+fn text(t as *tree.Tree, w as i64) as *u8 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return cast(*u8, 0); }
+    return textbuf.span(&en.buf, 0, _len(en));
+}
+
+fn length(t as *tree.Tree, w as i64) as i64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    return _len(en);
+}
+
+// Its text as shown — a password's bullets, a composition — and its length.
+fn shown(t as *tree.Tree, w as i64) as *u8 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return cast(*u8, 0); }
+    return en.shown;
+}
+
+fn shown_length(t as *tree.Tree, w as i64) as i64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    return en.nshown;
+}
+
+// The run it draws its text from.
+fn run(t as *tree.Tree, w as i64) as *txt.Run {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return cast(*txt.Run, 0); }
+    return &en.run;
+}
+
+// The selection: where it began and where the caret is, either way round,
+// byte offsets in its text; 1 when it is not empty.
+fn selection(t as *tree.Tree, w as i64, a as *i64, b as *i64) as i32 {
+    let is *Ent as en = _ent(t, w);
+    *a = 0;
+    *b = 0;
+    if (cast(i64, en) == 0) { return 0; }
+    *a = en.anchor;
+    *b = en.caret;
+    return cast(i32, *a != *b);
+}
+
+// Where the caret is, a byte offset in its text.
+fn caret(t as *tree.Tree, w as i64) as i64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    return en.caret;
+}
+
+// Held to the text, on a character's start.
+fn _clamp(en as *Ent, v as i64) as i64 {
+    if (v <= 0) { return 0; }
+    let is i64 as n = _len(en);
+    if (v >= n) { return n; }
+    let is i64 as i with mut = v;
+    while (i > 0 && (textbuf.byte_at(&en.buf, i) & 192) == 128) { i = i - 1; }
+    return i;
+}
+
+// Selects a .. b, the caret at b, held to the text.
+fn select(t as *tree.Tree, w as i64, a as i64, b as i64) as void {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return; }
+    en.anchor = _clamp(en, a);
+    en.caret = _clamp(en, b);
+    en.upstream = 0;
+    textbuf.break_group(&en.buf);
+    _moved(t, w, en);
+}
+
+// The window x of the caret before byte at of its text.
+fn x_of(t as *tree.Tree, w as i64, at as i64) as f64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0.0; }
+    return _caret_rect(t, w, en, _shown_of(en, _clamp(en, at)), 0).x;
+}
+
+// The same for byte at of its text as shown.
+fn x_of_shown(t as *tree.Tree, w as i64, at as i64) as f64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0.0; }
+    return _caret_rect(t, w, en, at, 0).x;
+}
+
+// The window x of its caret — inside a composition, of the composition's.
+fn caret_x(t as *tree.Tree, w as i64) as f64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0.0; }
+    return _caret_rect(t, w, en, _caret_shown(en), en.upstream).x;
+}
+
+// The window y of the top of its line of text.
+fn text_top(t as *tree.Tree, w as i64) as f64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0.0; }
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    return r.y + _text_y(t, en, r.h);
+}
+
+// How far its text is moved left to keep the caret in view.
+fn scroll(t as *tree.Tree, w as i64) as f64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0.0; }
+    return en.scroll;
+}
+
+// Where text being dragged would be dropped, a byte offset; -1 when nothing
+// is dragged.
+fn drop_at(t as *tree.Tree, w as i64) as i64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0 || en.dragging == 0) { return 0 - 1; }
+    return en.drop;
+}
+
+// --- Set by the program ---
+
+// What goes in of s, n bytes, into tmp: each line end a space, what is no
+// UTF-8 left out, each character the filter says no to left out when
+// filtered is 1, at most room characters — below 0 for any number. Its
+// length.
+fn _accept(en as *Ent, s as *u8, n as i64, room as i64, filtered as i32) as i64 {
+    if (n <= 0 || _tmp_room(en, n) == 0) { return 0; }
+    let is i64 as o with mut = 0;
+    let is i64 as chars with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as k with mut = _seq(cast(i64, s[i]));
+        let is i64 as step with mut = k;
+        if (_whole(s, i, n, k) == 0) {
+            // A byte that begins no sequence, or one cut short: left out.
+            step = 1;
+        } else {
+            let is i64 as c with mut = _decode(s, i, n);
+            if (c == 13 && i + 1 < n && cast(i64, s[i + 1]) == 10) { step = 2; }
+            if (c == 10 || c == 13) {
+                c = 32;
+                k = 0;
+            }
+            if (room >= 0 && chars >= room) {
+                step = n - i;
+            } else if (filtered == 0 || cast(i64, en.filter) == 0 || call(en.filter, en.filter_user, c) == 1) {
+                if (k == 0) {
+                    en.tmp[o] = cast(u8, 32);
+                    o = o + 1;
+                } else {
+                    let is i64 as j with mut = 0;
+                    while (j < k) {
+                        en.tmp[o] = s[i + j];
+                        o = o + 1;
+                        j = j + 1;
+                    }
+                }
+                chars = chars + 1;
+            }
+        }
+        i = i + step;
+    }
+    return o;
+}
+
+// Its text from now on — a program's, so not filtered and nothing to undo
+// — cut to its limit, the caret at its end. 1, or 0 when memory is refused
+// or w is no entry.
+fn set_text(t as *tree.Tree, w as i64, s as *u8, n as i64) as i32 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    let is i64 as room with mut = 0 - 1;
+    if (en.max > 0) { room = en.max; }
+    _end_composition(t, w, en);
+    let is i64 as k = _accept(en, s, n, room, 0);
+    if (textbuf.replace(&en.buf, 0, _len(en), en.tmp, k) == 0) { return 0; }
+    textbuf.forget(&en.buf);
+    en.anchor = k;
+    en.caret = k;
+    en.upstream = 0;
+    _edited(t, w, en);
+    return 1;
+}
+
+// What it shows while empty, in the secondary colour.
+fn set_placeholder(t as *tree.Tree, w as i64, s as *u8, n as i64) as i32 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    if (txt.set_text(&en.hint, s, n) == 0) { return 0; }
+    _relay(t, w, en);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    return 1;
+}
+
+// A password or not: shown as bullets, never copied.
+fn set_password(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    _end_composition(t, w, en);
+    en.password = on;
+    _relay(t, w, en);
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    return 1;
+}
+
+// At most n characters; 0 for no limit. A longer text is cut to it.
+fn set_max_length(t as *tree.Tree, w as i64, n as i64) as i32 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    en.max = n;
+    if (n < 0) { en.max = 0; }
+    if (en.max > 0 && _chars_in(en, 0, _len(en)) > en.max) {
+        let is i64 as cut = _byte_of_char(en, en.max);
+        textbuf.delete(&en.buf, cut, _len(en) - cut);
+        if (en.anchor > cut) { en.anchor = cut; }
+        if (en.caret > cut) { en.caret = cut; }
+        _edited(t, w, en);
+    }
+    return 1;
+}
+
+// Only the characters f says yes to go in from now on — typed, pasted or
+// dropped; a null f lets everything in.
+fn set_filter(t as *tree.Tree, w as i64, f as FilterFn, user as *u8) as i32 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    en.filter = f;
+    en.filter_user = user;
+    return 1;
+}
+
+// Editable or read-only.
+fn set_editable(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    if (on == 0) { _end_composition(t, w, en); }
+    en.editable = on;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    return 1;
+}
+
+// Enter the window's default button's (1) or its own (0, as it starts).
+fn set_activates_default(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    en.activates = on;
+    return 1;
+}
+
+// --- Editing ---
+
+fn _lo(en as *Ent) as i64 { if (en.anchor < en.caret) { return en.anchor; } return en.caret; }
+fn _hi(en as *Ent) as i64 { if (en.anchor > en.caret) { return en.anchor; } return en.caret; }
+
+// s, n bytes, in for the selection — typed or pasted — as much of it as the
+// filter and the limit let in; nothing when nothing is.
+fn _put(t as *tree.Tree, w as i64, en as *Ent, s as *u8, n as i64, how as i32) as void {
+    let is i64 as a = _lo(en);
+    let is i64 as b = _hi(en);
+    let is i64 as room with mut = 0 - 1;
+    if (en.max > 0) {
+        room = en.max - (_chars_in(en, 0, _len(en)) - _chars_in(en, a, b));
+        if (room < 0) { room = 0; }
+    }
+    let is i64 as k = _accept(en, s, n, room, 1);
+    if (k <= 0) { return; }
+    let is i32 as ok with mut = 0;
+    if (a != b) {
+        ok = textbuf.change(&en.buf, a, b - a, en.tmp, k);
+    } else if (how == _TYPED) {
+        ok = textbuf.type_in(&en.buf, a, en.tmp, k);
+    } else {
+        ok = textbuf.paste_in(&en.buf, a, en.tmp, k);
+    }
+    if (ok == 0) { return; }
+    en.anchor = a + k;
+    en.caret = a + k;
+    en.upstream = 0;
+    _edited(t, w, en);
+}
+
+// What is selected, to which of the program's places — never a password's.
+fn _copy(t as *tree.Tree, en as *Ent, which as i32) as void {
+    let is i64 as a = _lo(en);
+    let is i64 as b = _hi(en);
+    if (a == b || en.password == 1) { return; }
+    tree.copy(t, which, textbuf.span(&en.buf, a, b - a), b - a);
+}
+
+// The selection erased, a step of its own: 1, or 0 when there was none.
+fn _erase_selection(t as *tree.Tree, w as i64, en as *Ent) as i32 {
+    let is i64 as a = _lo(en);
+    let is i64 as b = _hi(en);
+    if (a == b) { return 0; }
+    if (textbuf.change(&en.buf, a, b - a, "", 0) == 0) { return 0; }
+    en.anchor = a;
+    en.caret = a;
+    _edited(t, w, en);
+    return 1;
+}
+
+// Backspace — with Control, the word before.
+fn _back(t as *tree.Tree, w as i64, en as *Ent, words as i32) as void {
+    if (_erase_selection(t, w, en) == 1 || en.caret == 0 || en.laid == 0) { return; }
+    let is i64 as s = _shown_of(en, en.caret);
+    let is i64 as to with mut = cursor.prev_grapheme(&en.lay, s);
+    if (words == 1) { to = cursor.prev_word(&en.lay, s); }
+    let is i64 as from = _text_of(en, to);
+    if (from >= en.caret) { return; }
+    textbuf.erase(&en.buf, from, en.caret - from);
+    en.anchor = from;
+    en.caret = from;
+    en.upstream = 0;
+    _edited(t, w, en);
+}
+
+// Delete — with Control, to the end of the word.
+fn _ahead(t as *tree.Tree, w as i64, en as *Ent, words as i32) as void {
+    if (_erase_selection(t, w, en) == 1 || en.laid == 0) { return; }
+    let is i64 as s = _shown_of(en, en.caret);
+    let is i64 as to with mut = cursor.next_grapheme(&en.lay, s);
+    if (words == 1) { to = cursor.next_word(&en.lay, s); }
+    let is i64 as end = _text_of(en, to);
+    if (end <= en.caret) { return; }
+    textbuf.erase_ahead(&en.buf, en.caret, end - en.caret);
+    en.anchor = en.caret;
+    en.upstream = 0;
+    _edited(t, w, en);
+}
+
+// Undone (redo 0) or redone, the caret where the step puts it.
+fn _undo(t as *tree.Tree, w as i64, en as *Ent, redo as i32) as void {
+    let is i32 as did with mut = 0;
+    if (redo == 1) { did = textbuf.redo(&en.buf); } else { did = textbuf.undo(&en.buf); }
+    if (did == 0) { return; }
+    en.caret = _clamp(en, textbuf.caret(&en.buf));
+    en.anchor = en.caret;
+    en.upstream = 0;
+    _edited(t, w, en);
+}
+
+// The caret to at — upstream up — the selection with it unless extending.
+fn _go(t as *tree.Tree, w as i64, en as *Ent, at as i64, up as i32, extend as i32) as void {
+    en.caret = at;
+    en.upstream = up;
+    if (extend == 0) { en.anchor = at; }
+    textbuf.break_group(&en.buf);
+    if (extend == 1) { _copy(t, en, tree.PRIMARY); }
+    _moved(t, w, en);
+}
+
+// --- The pointer ---
+
+// Where an event at local x, y of w is over the text as shown.
+fn _hit(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as cursor.Position {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is math.rect.Rect as r = layout.rect(t, w);
+    return cursor.hit(&en.lay, e.local_x - _text_x(t, w, en, r.w, &th), e.local_y - _text_y(t, en, r.h));
+}
+
+// The word, or all of it, at offset s of the text as shown, in the text.
+fn _unit(en as *Ent, by as i64, s as i64, a as *i64, b as *i64) as void {
+    if (by == 3) {
+        *a = 0;
+        *b = _len(en);
+        return;
+    }
+    let is i64 as end = cursor.next_word(&en.lay, s);
+    let is i64 as start with mut = cursor.prev_word(&en.lay, end);
+    if (start > s) { start = s; }
+    *a = _text_of(en, start);
+    *b = _text_of(en, end);
+}
+
+// The selection carried on to p by the press's unit: from the unit's far
+// side, round the unit at p.
+fn _extend(en as *Ent, p as cursor.Position) as void {
+    if (en.by == 1) {
+        en.caret = _text_of(en, p.offset);
+        en.upstream = p.upstream;
+        return;
+    }
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    _unit(en, en.by, p.offset, &a, &b);
+    en.upstream = 0;
+    if (a < en.unit_a) {
+        en.anchor = en.unit_b;
+        en.caret = a;
+    } else {
+        en.anchor = en.unit_a;
+        if (b < en.unit_b) { b = en.unit_b; }
+        en.caret = b;
+    }
+}
+
+// The selection dropped at en.drop: moved there, or with Control a copy of
+// it, still selected.
+fn _drop(t as *tree.Tree, w as i64, en as *Ent, copy as i32) as void {
+    let is i64 as a = _lo(en);
+    let is i64 as b = _hi(en);
+    let is i64 as to = en.drop;
+    let is i64 as n = b - a;
+    if (to < 0 || n == 0 || en.editable == 0) { return; }
+    if (copy == 1) {
+        if (en.max > 0 && _chars_in(en, 0, _len(en)) + _chars_in(en, a, b) > en.max) { return; }
+        if (_tmp_room(en, n) == 0) { return; }
+        textbuf.read(&en.buf, a, n, en.tmp);
+        if (textbuf.paste_in(&en.buf, to, en.tmp, n) == 0) { return; }
+        en.anchor = to;
+        en.caret = to + n;
+    } else {
+        if (textbuf.move(&en.buf, a, n, to) == 0) { return; }
+        let is i64 as at with mut = to;
+        if (to > a) { at = to - n; }
+        en.anchor = at;
+        en.caret = at + n;
+    }
+    en.upstream = 0;
+    _edited(t, w, en);
+}
+
+fn _pointer(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
+    let is i32 as k = e.kind;
+    if (k == event.POINTER_DOWN) {
+        if (en.laid == 0 || (e.button != 1 && e.button != 2)) { return 0; }
+        _end_composition(t, w, en);
+        let is cursor.Position as p = _hit(t, w, en, e);
+        let is i64 as at = _text_of(en, p.offset);
+        textbuf.break_group(&en.buf);
+        if (e.button == 2) {
+            // The primary selection pasted where it is pressed.
+            if (en.editable == 0) { return 1; }
+            en.anchor = at;
+            en.caret = at;
+            en.upstream = p.upstream;
+            _moved(t, w, en);
+            tree.request_paste(t, tree.PRIMARY, w);
+            return 1;
+        }
+        en.by = 1;
+        en.maybe_drag = 0;
+        if (e.clicks >= 2) {
+            en.by = 3;
+            if (e.clicks == 2) { en.by = 2; }
+            _unit(en, en.by, p.offset, &en.unit_a, &en.unit_b);
+            en.anchor = en.unit_a;
+            en.caret = en.unit_b;
+            en.upstream = 0;
+        } else if ((e.mods & keys.MOD_SHIFT) != 0) {
+            en.caret = at;
+            en.upstream = p.upstream;
+        } else if (en.anchor != en.caret && at >= _lo(en) && at <= _hi(en) && en.password == 0) {
+            // A drag of the selection, or a click in it: the move says.
+            en.maybe_drag = 1;
+            en.press_at = at;
+        } else {
+            en.anchor = at;
+            en.caret = at;
+            en.upstream = p.upstream;
+        }
+        en.pressing = 1;
+        _moved(t, w, en);
+        return 1;
+    }
+    if (k == event.DRAG_START) {
+        if (en.maybe_drag == 0) { return 0; }
+        en.dragging = 1;
+        en.drop = en.press_at;
+        return 1;
+    }
+    if (k == event.POINTER_MOVE) {
+        if (en.dragging == 1) {
+            en.drop = _text_of(en, _hit(t, w, en, e).offset);
+            widget.changed(t, w, widget.CHANGED_PAINT);
+            return 1;
+        }
+        if (en.pressing == 0 || en.maybe_drag == 1) { return 0; }
+        _end_composition(t, w, en);
+        _extend(en, _hit(t, w, en, e));
+        _moved(t, w, en);
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (en.pressing == 0) { return 0; }
+        let is i32 as up = cast(i32, k == event.POINTER_UP);
+        if (en.dragging == 1) {
+            if (up == 1) { _drop(t, w, en, cast(i32, (e.mods & keys.MOD_CONTROL) != 0)); }
+        } else if (en.maybe_drag == 1) {
+            if (up == 1) {
+                en.anchor = en.press_at;
+                en.caret = en.press_at;
+                en.upstream = 0;
+            }
+        } else if (up == 1) {
+            _copy(t, en, tree.PRIMARY);
+        }
+        en.pressing = 0;
+        en.maybe_drag = 0;
+        en.dragging = 0;
+        _moved(t, w, en);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Keys ---
+
+fn _lower(k as i32) as i32 {
+    if (k >= 65 && k <= 90) { return k + 32; }
+    return k;
+}
+
+fn _moving_key(k as i32) as i32 {
+    return cast(i32, k == keys.LEFT || k == keys.RIGHT || k == keys.HOME || k == keys.END ||
+                     k == keys.BACKSPACE || k == keys.DELETE);
+}
+
+// Whether it wants key e ahead of the window's shortcuts: its editing keys,
+// and Enter while it is its own.
+fn _claims(en as *Ent, e as *event.Event) as i64 {
+    let is i32 as k = _lower(e.key);
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    let is i32 as shift = cast(i32, (e.mods & keys.MOD_SHIFT) != 0);
+    if ((e.mods & (keys.MOD_ALT | keys.MOD_SUPER)) != 0) { return 0; }
+    if (k == keys.RETURN) { return cast(i64, en.activates == 0 && ctrl == 0); }
+    if (_moving_key(k) == 1) { return 1; }
+    if (ctrl == 1) {
+        return cast(i64, k == keys.A || k == keys.C || k == keys.X || k == keys.V || k == keys.Z || k == keys.Y ||
+                         k == keys.INSERT);
+    }
+    return cast(i64, shift == 1 && k == keys.INSERT);
+}
+
+fn _key(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
+    let is i32 as k = _lower(e.key);
+    let is i32 as ctrl = cast(i32, (e.mods & keys.MOD_CONTROL) != 0);
+    let is i32 as shift = cast(i32, (e.mods & keys.MOD_SHIFT) != 0);
+    if ((e.mods & (keys.MOD_ALT | keys.MOD_SUPER)) != 0) { return 0; }
+    if (_claims(en, e) == 1 || k == keys.RETURN) { _end_composition(t, w, en); }
+    if (k == keys.RETURN) {
+        signal.emit(t, w, signal.ACTIVATED, cast(*u8, 0));
+        return 1;
+    }
+    if (ctrl == 1 && k == keys.A) {
+        en.anchor = 0;
+        en.caret = _len(en);
+        en.upstream = 0;
+        textbuf.break_group(&en.buf);
+        _copy(t, en, tree.PRIMARY);
+        _moved(t, w, en);
+        return 1;
+    }
+    if (ctrl == 1 && (k == keys.C || k == keys.INSERT)) {
+        _copy(t, en, tree.CLIPBOARD);
+        return 1;
+    }
+    if ((ctrl == 1 && k == keys.X) || (shift == 1 && ctrl == 0 && k == keys.DELETE)) {
+        if (en.editable == 1 && en.password == 0) {
+            _copy(t, en, tree.CLIPBOARD);
+            _erase_selection(t, w, en);
+        }
+        return 1;
+    }
+    if ((ctrl == 1 && k == keys.V) || (shift == 1 && ctrl == 0 && k == keys.INSERT)) {
+        if (en.editable == 1) { tree.request_paste(t, tree.CLIPBOARD, w); }
+        return 1;
+    }
+    if (ctrl == 1 && (k == keys.Z || k == keys.Y)) {
+        if (en.editable == 1) { _undo(t, w, en, cast(i32, k == keys.Y || shift == 1)); }
+        return 1;
+    }
+    if (k == keys.BACKSPACE) {
+        if (en.editable == 1) { _back(t, w, en, ctrl); }
+        return 1;
+    }
+    if (k == keys.DELETE) {
+        if (en.editable == 1) { _ahead(t, w, en, ctrl); }
+        return 1;
+    }
+    if (en.laid == 0 || _moving_key(k) == 0) { return 0; }
+    let is cursor.Position as at = cursor.position(_shown_of(en, en.caret), en.upstream);
+    if ((k == keys.LEFT || k == keys.RIGHT) && ctrl == 0 && shift == 0 && en.anchor != en.caret) {
+        // A selection given up for its side.
+        let is i64 as side with mut = _hi(en);
+        if (k == keys.LEFT) { side = _lo(en); }
+        _go(t, w, en, side, 0, 0);
+        return 1;
+    }
+    let is cursor.Position as to with mut = at;
+    if (k == keys.LEFT) {
+        if (ctrl == 1) { to = cursor.position(cursor.prev_word(&en.lay, at.offset), 0); }
+        else { to = cursor.left(&en.lay, at); }
+    } else if (k == keys.RIGHT) {
+        if (ctrl == 1) { to = cursor.position(cursor.next_word(&en.lay, at.offset), 0); }
+        else { to = cursor.right(&en.lay, at); }
+    } else if (k == keys.HOME) {
+        to = cursor.position(0, 0);
+    } else {
+        to = cursor.position(en.nshown, 0);
+    }
+    _go(t, w, en, _text_of(en, to.offset), to.upstream, shift);
+    return 1;
+}
+
+// --- Events ---
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Ent as en = cast(*Data, data).e;
+    let is i32 as k = e.kind;
+    if (k == event.TEXT || k == event.PASTE) {
+        if (en.editable == 0) { return 1; }
+        // What the input method commits takes its composition's place.
+        let is i32 as had = cast(i32, k == event.TEXT && en.npre > 0);
+        if (had == 1) {
+            en.npre = 0;
+            en.pre_cur = 0;
+        }
+        let is i32 as how with mut = _TYPED;
+        if (k == event.PASTE) {
+            how = _PASTED;
+            _end_composition(t, w, en);
+        }
+        _put(t, w, en, e.text, e.text_len, how);
+        if (had == 1) {
+            _relay(t, w, en);
+            widget.changed(t, w, widget.CHANGED_PAINT);
+        }
+        return 1;
+    }
+    if (k == event.PREEDIT) {
+        if (en.editable == 0 || en.password == 1) { return 1; }
+        // Composing over a selection, as typing over it, takes its place.
+        if (e.text_len > 0) { _erase_selection(t, w, en); }
+        let is i64 as n with mut = e.text_len;
+        if (n > MAX_PREEDIT) {
+            // Cut on a character's start.
+            n = MAX_PREEDIT;
+            while (n > 0 && (cast(i64, e.text[n]) & 192) == 128) { n = n - 1; }
+        }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            en.pre[i] = e.text[i];
+            i = i + 1;
+        }
+        en.npre = n;
+        en.pre_cur = e.cursor;
+        if (en.pre_cur < 0) { en.pre_cur = 0; }
+        if (en.pre_cur > n) { en.pre_cur = n; }
+        _relay(t, w, en);
+        _area(t, w, en);
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (k == event.FOCUS_IN) {
+        en.focused = 1;
+        if (e.which == 1) {
+            en.anchor = 0;
+            en.caret = _len(en);
+            en.upstream = 0;
+        }
+        _moved(t, w, en);
+        return 0;
+    }
+    if (k == event.FOCUS_OUT) {
+        en.focused = 0;
+        if (tree.text_area(t) == w) { tree.set_text_area(t, 0, math.rect.rect_zero()); }
+        en.pressing = 0;
+        en.maybe_drag = 0;
+        en.dragging = 0;
+        textbuf.break_group(&en.buf);
+        _end_composition(t, w, en);
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 0;
+    }
+    if (k == event.SHORTCUT_OVERRIDE) { return _claims(en, e); }
+    if (k == event.KEY_DOWN) { return _key(t, w, en, e); }
+    return _pointer(t, w, en, e);
+}
+
+// --- Drawing ---
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Ent as en = cast(*Data, data).e;
+    let is *style.Theme as th = p.theme;
+    let is i32 as focused = painter.has(p, painter.S_FOCUSED);
+    let is style.Look as look = style.pick(&th.field, p.state, focused);
+    let is f64 as rad = th.metrics.radius_m;
+    let is math.rect.Rect as rc = p.rect;
+    shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, look.bg);
+    if (th.metrics.border_width > 0.0 && look.border.a > 0.0) {
+        shapes.stroke_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.metrics.border_width,
+                              look.border);
+    }
+    p.fg = look.fg;
+    let is *txt.Service as svc = _service(t);
+    _fresh(t, w, en, th);
+    if (en.laid == 0 || cast(i64, svc) == 0) { return; }
+    let is f64 as px = th.metrics.control_pad_x;
+    draw2d.push_clip(p.canvas, rc.x + px, rc.y, _room(rc.w, th), rc.h);
+    let is f64 as x = rc.x + _text_x(t, w, en, rc.w, th);
+    let is f64 as y = rc.y + _text_y(t, en, rc.h);
+    if (en.nshown == 0 && txt.text_length(&en.hint) > 0) {
+        let is f64 as hx with mut = rc.x + px;
+        if (layout.direction(t, w) == layout.RTL) { hx = rc.x + px + _room(rc.w, th) - en.hint.width; }
+        txt.draw(svc, p.canvas, &en.hint, hx, y, th.palette.fg_dim);
+    }
+    // The selection's background behind the text, its text in the
+    // selection's colour over it.
+    let is [32]cursor.Rect as rs;
+    let is i64 as nr with mut = 0;
+    if (focused == 1 && en.anchor != en.caret) {
+        nr = cursor.selection(&en.lay, _shown_of(en, en.anchor), _shown_of(en, en.caret), cast(*cursor.Rect, &rs), 32);
+        if (nr > 32) { nr = 32; }
+    }
+    let is i64 as i with mut = 0;
+    while (i < nr) {
+        shapes.fill_rect(p.canvas, x + rs[i].x, y + rs[i].y, rs[i].w, rs[i].h, th.palette.selection_bg);
+        i = i + 1;
+    }
+    txt.draw(svc, p.canvas, &en.run, x, y, look.fg);
+    i = 0;
+    while (i < nr) {
+        draw2d.push_clip(p.canvas, x + rs[i].x, y + rs[i].y, rs[i].w, rs[i].h);
+        txt.draw(svc, p.canvas, &en.run, x, y, th.palette.selection_fg);
+        draw2d.pop_clip(p.canvas);
+        i = i + 1;
+    }
+    // Where dragged text would go; else the caret, while nothing is
+    // selected.
+    let is i64 as at with mut = 0 - 1;
+    let is i32 as up with mut = 0;
+    if (en.dragging == 1) {
+        at = _shown_of(en, en.drop);
+    } else if (focused == 1 && en.anchor == en.caret) {
+        at = _caret_shown(en);
+        up = en.upstream;
+    }
+    if (at >= 0) {
+        let is f64 as cx = _snap(t, x + _x_in(en, at, up) - 0.5);
+        shapes.fill_rect(p.canvas, cx, y, 1.0, en.line_h, look.fg);
+    }
+    draw2d.pop_clip(p.canvas);
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Ent as en = cast(*Data, data).e;
+    if (q.action != access.ASK) { return 0; }
+    if (en.password == 1) { q.role = access.ROLE_PASSWORD; }
+    if (en.editable == 1) { q.states = q.states | access.EDITABLE; }
+    else { q.states = q.states | access.READ_ONLY; }
+    return 1;
+}

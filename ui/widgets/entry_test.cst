@@ -1,0 +1,1257 @@
+// ui/widgets/entry_test.cst — the entry: one line of text typed, moved
+// through and selected by keys and pointer, cut, copied and pasted through the
+// program's clipboard and the primary selection, undone and redone in steps,
+// composed by an input method at the caret; a password, a placeholder, a
+// limit, a filter, read-only; scrolled to keep the caret in view; drawn as a
+// field; told.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "std/os/linux.cst" as linux;
+use "../../math/math.cst" as math;
+use "../../gpu/gpu.cst" as gpu;
+use "../../render/draw2d.cst" as draw2d;
+use "../../window/keys.cst" as keys;
+use "../../text/sfnt/sfnt.cst" as sfnt;
+use "../../text/sfnt/table.cst" as table;
+use "../../text/layout/font.cst" as font;
+use "../../text/layout/model.cst" as model;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../box.cst" as box;
+use "../damage.cst" as damage;
+use "../paint.cst" as paint;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../event.cst" as event;
+use "../text.cst" as text;
+use "label.cst" as label;
+use "button.cst" as button;
+use "entry.cst" as entry;
+
+let is i64 as W with imut = 240;
+let is i64 as H with imut = 200;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (b[i] == 0 || a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, b[n] == 0);
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is *text.Service as svc with mut;
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as cmd with mut = 0;
+let is [48000]i32 as px with mut;
+let is *router.Router as frame_router with mut;
+
+fn frame(t as *tree.Tree, c as *draw2d.Canvas) as void {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    damage.collect(t);
+    text.next_frame(svc);
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    let is paint.Options as o = paint.options(&theme);
+    o.router = frame_router;
+    let is paint.Stats as st;
+    paint.frame(t, c, &o, &st);
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass_load(target, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    tree.damage_clear(t);
+}
+
+fn ch(x as i64, y as i64, c as i64) as i64 { return cast(i64, cast(*u8, &px)[(y * W + x) * 4 + c]); }
+
+fn is8(x as i64, y as i64, col as math.color.Color, tol as i64) as i32 {
+    let is i64 as r = cast(i64, col.r * 255.0 + 0.5);
+    let is i64 as g = cast(i64, col.g * 255.0 + 0.5);
+    let is i64 as b = cast(i64, col.b * 255.0 + 0.5);
+    let is i64 as dr with mut = ch(x, y, 0) - r;
+    let is i64 as dg with mut = ch(x, y, 1) - g;
+    let is i64 as db with mut = ch(x, y, 2) - b;
+    if (dr < 0) { dr = 0 - dr; }
+    if (dg < 0) { dg = 0 - dg; }
+    if (db < 0) { db = 0 - db; }
+    return cast(i32, dr <= tol && dg <= tol && db <= tol);
+}
+
+// What a look's background is over the window's.
+fn bg_of(l as style.Look) as math.color.Color { return style.over(l.bg, theme.palette.window_bg); }
+
+
+fn mid_x(t as *tree.Tree, b as i64) as f64 { return layout.window_rect(t, b).x + layout.window_rect(t, b).w / 2.0; }
+fn mid_y(t as *tree.Tree, b as i64) as f64 { return layout.window_rect(t, b).y + layout.window_rect(t, b).h / 2.0; }
+
+// --- Signals ---
+
+let is i64 as changes with mut = 0;
+let is i64 as activations with mut = 0;
+
+fn on_change(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { changes = changes + 1; }
+fn on_activate(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { activations = activations + 1; }
+
+// The program's clipboard and primary selection.
+let is [256]u8 as clip with mut;
+let is i64 as nclip with mut = 0;
+let is [256]u8 as prim with mut;
+let is i64 as nprim with mut = 0;
+let is i64 as asked with mut = 0;
+let is i32 as asked_which with mut = 0 - 1;
+let is i64 as asked_w with mut = 0;
+
+fn on_copy(user as *u8, which as i32, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n && i < 256) {
+        if (which == tree.CLIPBOARD) { clip[i] = s[i]; } else { prim[i] = s[i]; }
+        i = i + 1;
+    }
+    if (which == tree.CLIPBOARD) { nclip = n; } else { nprim = n; }
+}
+
+fn on_paste(user as *u8, which as i32, w as i64) as void {
+    asked = asked + 1;
+    asked_which = which;
+    asked_w = w;
+}
+
+fn holds(t as *tree.Tree, w as i64, s as *u8) as i32 {
+    return same(entry.text(t, w), entry.length(t, w), s);
+}
+
+fn sel_is(t as *tree.Tree, w as i64, a as i64, b as i64) as i32 {
+    let is i64 as sa with mut = 0 - 1;
+    let is i64 as sb with mut = 0 - 1;
+    entry.selection(t, w, &sa, &sb);
+    return cast(i32, sa == a && sb == b);
+}
+
+fn typed(t as *tree.Tree, r as *router.Router, s as *u8, n as i64, time as i64) as void {
+    router.text(t, r, s, n, time);
+}
+
+// Window x of the caret before byte at of w's text as shown.
+fn x_at(t as *tree.Tree, w as i64, at as i64) as f64 { return entry.x_of(t, w, at); }
+
+
+fn click(t as *tree.Tree, r as *router.Router, x as f64, y as f64, time as i64) as void {
+    router.pointer_move(t, r, x, y, time);
+    router.pointer_button(t, r, 1, 1, x, y, time);
+    router.pointer_button(t, r, 1, 0, x, y, time + 1);
+}
+
+fn key(t as *tree.Tree, r as *router.Router, k as i32, mods as i32, time as i64) as void {
+    router.key(t, r, k, mods, 1, 0, time);
+    router.key(t, r, k, mods, 0, 0, time + 1);
+}
+
+fn measure(t as *tree.Tree, w as i64) as geom.Size {
+    let is geom.Constraint as c = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, w, &c, &s);
+    return s;
+}
+
+fn tree_for() as tree.Tree {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_text_service(&t, cast(*u8, svc));
+    return t;
+}
+
+fn setup(t as *tree.Tree) as void {
+    tree.set_clipboard(t, fn_ptr(on_copy), cast(*u8, 0));
+    tree.set_paste(t, fn_ptr(on_paste), cast(*u8, 0));
+}
+
+// --- Typed, moved through, edited ---
+
+fn typing() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as root = tree.root(&t);
+    let is i64 as col = box.create(&t, root, box.COLUMN);
+    layout.set_align(&t, col, layout.START, layout.START);
+    let is i64 as e = entry.create(&t, col);
+    let is i64 as other = button.create(&t, col, "Other", 5);
+    signal.connect(&t, e, signal.CHANGED, fn_ptr(on_change), cast(*u8, 0));
+    signal.connect(&t, e, signal.ACTIVATED, fn_ptr(on_activate), cast(*u8, 0));
+    check("an entry, empty, focusable", e != 0 && tree.kind(&t, e).role == access.ROLE_ENTRY && entry.length(&t, e) == 0 &&
+          tree.is_focusable(&t, e) == 1);
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    changes = 0;
+    typed(&t, &r, "hello world", 11, 10);
+    check("typed", holds(&t, e, "hello world") == 1 && entry.caret(&t, e) == 11 && changes == 1);
+    key(&t, &r, keys.LEFT, 0, 20);
+    key(&t, &r, keys.LEFT, 0, 21);
+    key(&t, &r, keys.LEFT, 0, 22);
+    key(&t, &r, keys.LEFT, 0, 23);
+    key(&t, &r, keys.LEFT, 0, 24);
+    check("left five times", entry.caret(&t, e) == 6 && sel_is(&t, e, 6, 6) == 1);
+    typed(&t, &r, "big ", 4, 30);
+    check("typed in the middle", holds(&t, e, "hello big world") == 1 && entry.caret(&t, e) == 10);
+    key(&t, &r, keys.HOME, 0, 40);
+    check("home", entry.caret(&t, e) == 0);
+    key(&t, &r, keys.END, 0, 41);
+    check("end", entry.caret(&t, e) == 15);
+    key(&t, &r, keys.LEFT, keys.MOD_CONTROL, 42);
+    check("control and left: the word's start", entry.caret(&t, e) == 10);
+    key(&t, &r, keys.LEFT, keys.MOD_CONTROL, 43);
+    key(&t, &r, keys.RIGHT, keys.MOD_CONTROL, 44);
+    check("control and right: the word's end", entry.caret(&t, e) == 9);
+    key(&t, &r, keys.BACKSPACE, 0, 50);
+    check("backspace", holds(&t, e, "hello bi world") == 1 && entry.caret(&t, e) == 8);
+    key(&t, &r, keys.DELETE, 0, 51);
+    check("delete", holds(&t, e, "hello biworld") == 1 && entry.caret(&t, e) == 8);
+    key(&t, &r, keys.BACKSPACE, keys.MOD_CONTROL, 52);
+    check("control and backspace: the word before", holds(&t, e, "hello world") == 1 && entry.caret(&t, e) == 6);
+    key(&t, &r, keys.RIGHT, keys.MOD_SHIFT, 60);
+    key(&t, &r, keys.RIGHT, keys.MOD_SHIFT, 61);
+    key(&t, &r, keys.END, keys.MOD_SHIFT, 62);
+    check("shift: selected", sel_is(&t, e, 6, 11) == 1);
+    typed(&t, &r, "there", 5, 63);
+    check("typed over the selection", holds(&t, e, "hello there") == 1 && sel_is(&t, e, 11, 11) == 1);
+    key(&t, &r, keys.LEFT, keys.MOD_SHIFT, 64);
+    key(&t, &r, keys.LEFT, 0, 65);
+    check("left with a selection: to its start", entry.caret(&t, e) == 10 && sel_is(&t, e, 10, 10) == 1);
+    key(&t, &r, keys.A, keys.MOD_CONTROL, 70);
+    check("control and a: all", sel_is(&t, e, 0, 11) == 1);
+    typed(&t, &r, "x", 1, 71);
+    check("all typed over", holds(&t, e, "x") == 1);
+    // Undone and redone in steps.
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 80);
+    check("undone: all back", holds(&t, e, "hello there") == 1 && entry.caret(&t, e) == 11);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 81);
+    check("undone: what was typed over", holds(&t, e, "hello world") == 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 82);
+    check("undone: the word deleted", holds(&t, e, "hello biworld") == 1 && entry.caret(&t, e) == 8);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 83);
+    check("undone: the delete, alone, the caret where it was", holds(&t, e, "hello bi world") == 1 &&
+          entry.caret(&t, e) == 8);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL | keys.MOD_SHIFT, 84);
+    check("redone", holds(&t, e, "hello biworld") == 1);
+    key(&t, &r, keys.Y, keys.MOD_CONTROL, 85);
+    check("redone again", holds(&t, e, "hello world") == 1);
+    // Enter: its own, or the window's default.
+    activations = 0;
+    key(&t, &r, keys.RETURN, 0, 90);
+    check("enter: activated", activations == 1);
+    let is i64 as defaults with mut = 0;
+    router.add_shortcut(&r, keys.RETURN, 0, fn_ptr(bump), cast(*u8, &defaults));
+    key(&t, &r, keys.RETURN, 0, 91);
+    check("enter its own, ahead of the window's", activations == 2 && defaults == 0);
+    entry.set_activates_default(&t, e, 1);
+    key(&t, &r, keys.RETURN, 0, 92);
+    check("activating the default: the window's", activations == 2 && defaults == 1);
+    // Tab: on. Back by keyboard: all selected.
+    key(&t, &r, keys.TAB, 0, 100);
+    check("tab: on", router.focused(&t, &r) == other);
+    key(&t, &r, keys.TAB, keys.MOD_SHIFT, 101);
+    check("back by keyboard: all selected", router.focused(&t, &r) == e && sel_is(&t, e, 0, 11) == 1);
+    router.focus(&t, &r, other, 0);
+    entry.select(&t, e, 2, 2);
+    router.focus(&t, &r, e, 0);
+    check("by the pointer: as it was", sel_is(&t, e, 2, 2) == 1);
+    check("where text is typed: here", tree.text_area(&t) == e);
+    router.focus(&t, &r, other, 0);
+    check("gone: nowhere", tree.text_area(&t) == 0);
+    // Set by the program: changed, nothing to undo.
+    changes = 0;
+    check("set", entry.set_text(&t, e, "set", 3) == 1 && holds(&t, e, "set") == 1 && changes == 1 &&
+          entry.caret(&t, e) == 3);
+    router.focus(&t, &r, e, 0);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 110);
+    check("nothing to undo after it", holds(&t, e, "set") == 1);
+    typed(&t, &r, "a\nb", 3, 111);
+    check("one line: a line feed typed is a space", holds(&t, e, "seta b") == 1);
+    tree.close(&t);
+}
+
+fn bump(user as *u8) as void {
+    let is *i64 as n = cast(*i64, user);
+    *n = *n + 1;
+}
+
+// --- The clipboard and the primary selection ---
+
+fn clipboard() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as root = tree.root(&t);
+    let is i64 as e = entry.create(&t, root);
+    layout.set_align(&t, e, layout.FILL, layout.START);
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    entry.set_text(&t, e, "copy me", 7);
+    entry.select(&t, e, 0, 4);
+    nclip = 0;
+    key(&t, &r, keys.C, keys.MOD_CONTROL, 10);
+    check("copied", same(cast(*u8, &clip), nclip, "copy") == 1 && holds(&t, e, "copy me") == 1);
+    nclip = 0;
+    key(&t, &r, keys.X, keys.MOD_CONTROL, 20);
+    check("cut", same(cast(*u8, &clip), nclip, "copy") == 1 && holds(&t, e, " me") == 1 && entry.caret(&t, e) == 0);
+    asked = 0;
+    key(&t, &r, keys.V, keys.MOD_CONTROL, 30);
+    check("paste: asked of the program", asked == 1 && asked_which == tree.CLIPBOARD && asked_w == e &&
+          holds(&t, e, " me") == 1);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "pasted", 6, 40);
+    check("given: in at the caret", holds(&t, e, "pasted me") == 1 && entry.caret(&t, e) == 6);
+    entry.select(&t, e, 0, 6);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "two\nlines", 9, 45);
+    check("over the selection, one line", holds(&t, e, "two lines me") == 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 50);
+    check("a paste undone as one", holds(&t, e, "pasted me") == 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 51);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 52);
+    check("the cut undone", holds(&t, e, "copy me") == 1);
+    // What is selected goes to the primary selection; the middle button
+    // pastes it where it is pressed.
+    nprim = 0;
+    key(&t, &r, keys.HOME, 0, 60);
+    key(&t, &r, keys.RIGHT, keys.MOD_SHIFT | keys.MOD_CONTROL, 61);
+    check("selected by keyboard: primary", same(cast(*u8, &prim), nprim, "copy") == 1);
+    asked = 0;
+    let is f64 as y = layout.window_rect(&t, e).y + layout.window_rect(&t, e).h / 2.0;
+    router.pointer_move(&t, &r, x_at(&t, e, 7), y, 70);
+    router.pointer_button(&t, &r, 2, 1, x_at(&t, e, 7), y, 70);
+    router.pointer_button(&t, &r, 2, 0, x_at(&t, e, 7), y, 71);
+    check("the middle button: the primary asked for, the caret there", asked == 1 && asked_which == tree.PRIMARY &&
+          entry.caret(&t, e) == 7);
+    router.paste(&t, &r, e, tree.PRIMARY, "!", 1, 72);
+    check("given there", holds(&t, e, "copy me!") == 1);
+    // Shift and Insert, Control and Insert, Shift and Delete.
+    entry.select(&t, e, 5, 7);
+    nclip = 0;
+    key(&t, &r, keys.INSERT, keys.MOD_CONTROL, 80);
+    check("control and insert: copied", same(cast(*u8, &clip), nclip, "me") == 1);
+    key(&t, &r, keys.DELETE, keys.MOD_SHIFT, 81);
+    check("shift and delete: cut", holds(&t, e, "copy !") == 1);
+    asked = 0;
+    key(&t, &r, keys.INSERT, keys.MOD_SHIFT, 82);
+    check("shift and insert: pasted", asked == 1 && asked_which == tree.CLIPBOARD);
+    tree.close(&t);
+}
+
+// --- The pointer ---
+
+fn pointer() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as root = tree.root(&t);
+    let is i64 as e = entry.create(&t, root);
+    layout.set_align(&t, e, layout.FILL, layout.START);
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    entry.set_text(&t, e, "one two three", 13);
+    let is f64 as y = layout.window_rect(&t, e).y + layout.window_rect(&t, e).h / 2.0;
+    click(&t, &r, x_at(&t, e, 4) + 0.3, y, 10);
+    check("clicked: focused, the caret there", router.focused(&t, &r) == e && entry.caret(&t, e) == 4 &&
+          sel_is(&t, e, 4, 4) == 1);
+    router.pointer_move(&t, &r, x_at(&t, e, 0) + 0.3, y, 1000);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 0) + 0.3, y, 1000);
+    router.pointer_move(&t, &r, x_at(&t, e, 7) + 0.3, y, 1010);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 7) + 0.3, y, 1020);
+    check("dragged: selected", sel_is(&t, e, 0, 7) == 1 && same(cast(*u8, &prim), nprim, "one two") == 1);
+    click(&t, &r, x_at(&t, e, 5), y, 3000);
+    click(&t, &r, x_at(&t, e, 5), y, 3100);
+    check("a double click: the word", sel_is(&t, e, 4, 7) == 1);
+    click(&t, &r, x_at(&t, e, 5), y, 3200);
+    check("a triple: all", sel_is(&t, e, 0, 13) == 1);
+    click(&t, &r, x_at(&t, e, 2) + 0.3, y, 5000);
+    router.key(&t, &r, keys.SHIFT_L, keys.MOD_SHIFT, 1, 0, 5010);
+    click(&t, &r, x_at(&t, e, 9) + 0.3, y, 5020);
+    router.key(&t, &r, keys.SHIFT_L, 0, 0, 0, 5030);
+    check("shift and a click: extended", sel_is(&t, e, 2, 9) == 1);
+    // The selection dragged: moved where it is dropped; with Control,
+    // copied.
+    entry.select(&t, e, 4, 7);
+    router.pointer_move(&t, &r, x_at(&t, e, 5), y, 7000);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 5), y, 7000);
+    router.pointer_move(&t, &r, x_at(&t, e, 13), y, 7010);
+    router.pointer_move(&t, &r, x_at(&t, e, 13) + 1.0, y, 7020);
+    check("dragged: where it would go shown", entry.drop_at(&t, e) == 13);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 13) + 1.0, y, 7030);
+    check("dropped: moved, still selected", holds(&t, e, "one  threetwo") == 1 && sel_is(&t, e, 10, 13) == 1 &&
+          entry.drop_at(&t, e) == 0 - 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 7040);
+    check("undone as one", holds(&t, e, "one two three") == 1);
+    entry.select(&t, e, 4, 7);
+    router.key(&t, &r, keys.CONTROL_L, keys.MOD_CONTROL, 1, 0, 8000);
+    router.pointer_move(&t, &r, x_at(&t, e, 5), y, 8000);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 5), y, 8000);
+    router.pointer_move(&t, &r, x_at(&t, e, 0), y, 8010);
+    router.pointer_move(&t, &r, x_at(&t, e, 0) - 1.0, y, 8020);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 0) - 1.0, y, 8030);
+    router.key(&t, &r, keys.CONTROL_L, 0, 0, 0, 8040);
+    check("with control: copied", holds(&t, e, "twoone two three") == 1);
+    entry.select(&t, e, 3, 6);
+    router.pointer_move(&t, &r, x_at(&t, e, 3), y, 8500);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 3), y, 8500);
+    router.pointer_move(&t, &r, x_at(&t, e, 16), y, 8510);
+    router.pointer_move(&t, &r, x_at(&t, e, 16) + 1.0, y, 8520);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 16) + 1.0, y, 8530);
+    check("dragged from its very edge: the selection moved", holds(&t, e, "two two threeone") == 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 8540);
+    router.key(&t, &r, keys.CONTROL_L, 0, 0, 0, 8545);
+    entry.select(&t, e, 3, 6);
+    router.pointer_move(&t, &r, x_at(&t, e, 6), y, 8600);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 6), y, 8600);
+    router.pointer_move(&t, &r, x_at(&t, e, 0), y, 8610);
+    router.pointer_move(&t, &r, x_at(&t, e, 0) - 1.0, y, 8620);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 0) - 1.0, y, 8630);
+    check("from its other edge", holds(&t, e, "onetwo two three") == 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 8640);
+    entry.select(&t, e, 3, 6);
+    router.pointer_move(&t, &r, x_at(&t, e, 4), y, 9000);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 4), y, 9000);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 4), y, 9010);
+    check("pressed in the selection and let go: the caret there", sel_is(&t, e, 4, 4) == 1);
+    tree.close(&t);
+}
+
+// --- What it takes ---
+
+let is i64 as rejected with mut = 0;
+
+fn digits_only(user as *u8, c as i64) as i32 {
+    if (c >= 48 && c <= 57) { return 1; }
+    rejected = rejected + 1;
+    return 0;
+}
+
+fn limits() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as e = entry.create(&t, tree.root(&t));
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    check("at most five", entry.set_max_length(&t, e, 5) == 1);
+    typed(&t, &r, "abcdefg", 7, 10);
+    check("typed past it: cut to it", holds(&t, e, "abcde") == 1);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "xyz", 3, 20);
+    check("full: nothing pasted", holds(&t, e, "abcde") == 1);
+    entry.select(&t, e, 1, 3);
+    typed(&t, &r, "\xc3\xa9\xc3\xa9\xc3\xa9", 6, 30);
+    check("over a selection: as much as fits, in characters", holds(&t, e, "a\xc3\xa9\xc3\xa9de") == 1);
+    entry.set_max_length(&t, e, 0);
+    entry.set_text(&t, e, "", 0);
+    check("a filter", entry.set_filter(&t, e, fn_ptr(digits_only), cast(*u8, 0)) == 1);
+    rejected = 0;
+    typed(&t, &r, "a1b2", 4, 40);
+    check("only what it lets through", holds(&t, e, "12") == 1 && rejected == 2);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "3x4", 3, 50);
+    check("pasted too", holds(&t, e, "1234") == 1);
+    // Read-only: selected and copied, not changed.
+    check("read-only", entry.set_editable(&t, e, 0) == 1);
+    typed(&t, &r, "5", 1, 60);
+    key(&t, &r, keys.BACKSPACE, 0, 61);
+    key(&t, &r, keys.A, keys.MOD_CONTROL, 62);
+    key(&t, &r, keys.X, keys.MOD_CONTROL, 63);
+    asked = 0;
+    key(&t, &r, keys.V, keys.MOD_CONTROL, 64);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "9", 1, 65);
+    check("nothing typed, erased, cut or pasted", holds(&t, e, "1234") == 1 && asked == 0);
+    nclip = 0;
+    key(&t, &r, keys.C, keys.MOD_CONTROL, 66);
+    check("but copied", same(cast(*u8, &clip), nclip, "1234") == 1);
+    let is tree.Access as q;
+    access.describe(&t, cast(*router.Router, 0), e, &q);
+    check("told: read-only", (q.states & access.READ_ONLY) != 0 && (q.states & access.EDITABLE) == 0);
+    entry.set_editable(&t, e, 1);
+    access.describe(&t, cast(*router.Router, 0), e, &q);
+    check("told: editable", (q.states & access.EDITABLE) != 0);
+    // A password: bullets shown, never copied.
+    entry.set_filter(&t, e, cast(entry.FilterFn, 0), cast(*u8, 0));
+    check("a password", entry.set_password(&t, e, 1) == 1 && tree.kind(&t, e).role == access.ROLE_ENTRY);
+    entry.set_text(&t, e, "abc", 3);
+    check("shown as bullets", same(entry.shown(&t, e), entry.shown_length(&t, e), "\xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2") == 1 &&
+          holds(&t, e, "abc") == 1);
+    access.describe(&t, cast(*router.Router, 0), e, &q);
+    check("told: a password", q.role == access.ROLE_PASSWORD);
+    nclip = 0;
+    key(&t, &r, keys.A, keys.MOD_CONTROL, 70);
+    key(&t, &r, keys.C, keys.MOD_CONTROL, 71);
+    key(&t, &r, keys.X, keys.MOD_CONTROL, 72);
+    check("never copied nor cut", nclip == 0 && holds(&t, e, "abc") == 1);
+    key(&t, &r, keys.END, 0, 73);
+    key(&t, &r, keys.LEFT, 0, 74);
+    check("the caret by characters", entry.caret(&t, e) == 2);
+    tree.close(&t);
+}
+
+// --- An input method's composition ---
+
+let is i64 as resets with mut = 0;
+let is i64 as reset_w with mut = 0;
+
+fn on_reset(user as *u8, w as i64) as void {
+    resets = resets + 1;
+    reset_w = w;
+}
+
+fn composed() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    tree.set_ime_reset(&t, fn_ptr(on_reset), cast(*u8, 0));
+    let is i64 as e = entry.create(&t, tree.root(&t));
+    layout.set_align(&t, e, layout.FILL, layout.START);
+    signal.connect(&t, e, signal.CHANGED, fn_ptr(on_change), cast(*u8, 0));
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    typed(&t, &r, "abcd", 4, 10);
+    key(&t, &r, keys.LEFT, 0, 11);
+    key(&t, &r, keys.LEFT, 0, 12);
+    changes = 0;
+    router.preedit(&t, &r, "xyz", 3, 1, 20);
+    check("composing: shown at the caret, not yet the text", shows(&t, e, "abxyzcd") == 1 &&
+          holds(&t, e, "abcd") == 1 && changes == 0);
+    let is *text.Run as run = entry.run(&t, e);
+    let is f64 as o = entry.x_of_shown(&t, e, 0);
+    check("what is composed underlined", text.deco_count(run) == 1 &&
+          near(text.deco(run, 0).x, entry.x_of_shown(&t, e, 2) - o) == 1 &&
+          near(text.deco(run, 0).w, entry.x_of_shown(&t, e, 5) - entry.x_of_shown(&t, e, 2)) == 1);
+    check("its caret inside it", near(entry.caret_x(&t, e), entry.x_of_shown(&t, e, 3)) == 1);
+    check("the text after it after it", near(entry.x_of(&t, e, 3), entry.x_of_shown(&t, e, 6)) == 1 &&
+          near(entry.x_of(&t, e, 2), entry.x_of_shown(&t, e, 2)) == 1);
+    let is math.rect.Rect as area = tree.text_area_rect(&t);
+    check("the input method told where", tree.text_area(&t) == e && near(area.x, entry.caret_x(&t, e)) == 1 &&
+          near(area.y, entry.text_top(&t, e)) == 1 && area.h > 0.0);
+    router.preedit(&t, &r, "xyz", 3, 0 - 4, 21);
+    check("its caret before it: at its start", near(entry.caret_x(&t, e), entry.x_of_shown(&t, e, 2)) == 1);
+    router.preedit(&t, &r, "xyz", 3, 9, 22);
+    check("past it: at its end", near(entry.caret_x(&t, e), entry.x_of_shown(&t, e, 5)) == 1);
+    resets = 0;
+    typed(&t, &r, "XYZ", 3, 30);
+    check("committed: the text in its place", holds(&t, e, "abXYZcd") == 1 && shows(&t, e, "abXYZcd") == 1 &&
+          changes == 1 && entry.caret(&t, e) == 5);
+    check("committed: nothing to give up", resets == 0);
+    entry.select(&t, e, 0, 2);
+    router.preedit(&t, &r, "", 0, 0, 31);
+    check("an empty composition: the selection kept", sel_is(&t, e, 0, 2) == 1 && holds(&t, e, "abXYZcd") == 1);
+    key(&t, &r, keys.END, 0, 40);
+    router.preedit(&t, &r, "zz", 2, 2, 41);
+    check("composed at the end", shows(&t, e, "abXYZcdzz") == 1);
+    // A key or a click gives it up, and tells the input method; a modifier
+    // alone does not.
+    resets = 0;
+    router.key(&t, &r, keys.SHIFT_L, keys.MOD_SHIFT, 1, 0, 50);
+    router.key(&t, &r, keys.SHIFT_L, 0, 0, 0, 51);
+    check("a modifier alone: kept", entry.shown_length(&t, e) == 9 && resets == 0);
+    key(&t, &r, keys.LEFT, 0, 52);
+    check("a key: given up", entry.shown_length(&t, e) == 7 && resets == 1 && reset_w == e && entry.caret(&t, e) == 6);
+    router.preedit(&t, &r, "q", 1, 1, 60);
+    let is f64 as y = entry.text_top(&t, e) + 5.0;
+    click(&t, &r, x_at(&t, e, 1) + 0.3, y, 61);
+    check("a click: given up, the caret where it was", entry.shown_length(&t, e) == 7 && resets == 2 &&
+          entry.caret(&t, e) == 1);
+    // Over a selection: in its place.
+    entry.select(&t, e, 2, 5);
+    router.preedit(&t, &r, "w", 1, 1, 70);
+    check("composing over a selection: the selection gone", holds(&t, e, "abcd") == 1 && shows(&t, e, "abwcd") == 1 &&
+          sel_is(&t, e, 2, 2) == 1);
+    check("its text set: given up", entry.set_text(&t, e, "set", 3) == 1 && shows(&t, e, "set") == 1 && resets == 3);
+    router.preedit(&t, &r, "q", 1, 1, 80);
+    entry.set_editable(&t, e, 0);
+    check("read-only: given up", entry.shown_length(&t, e) == 3 && resets == 4);
+    check("read-only: none taken", router.preedit(&t, &r, "q", 1, 1, 81) == 1 && entry.shown_length(&t, e) == 3);
+    entry.set_editable(&t, e, 1);
+    router.preedit(&t, &r, "q", 1, 1, 82);
+    router.focus(&t, &r, 0, 0);
+    check("the focus gone: given up", entry.shown_length(&t, e) == 3 && resets == 5);
+    router.focus(&t, &r, e, 0);
+    // Committed, but nothing let in: gone all the same.
+    entry.set_filter(&t, e, fn_ptr(digits_only), cast(*u8, 0));
+    router.preedit(&t, &r, "q", 1, 1, 90);
+    typed(&t, &r, "q", 1, 91);
+    check("committed, refused: gone", shows(&t, e, "set") == 1);
+    entry.set_filter(&t, e, cast(entry.FilterFn, 0), cast(*u8, 0));
+    // A password takes none.
+    entry.set_password(&t, e, 1);
+    check("a password: none taken", router.preedit(&t, &r, "q", 1, 1, 100) == 1 && entry.shown_length(&t, e) == 9);
+    entry.set_password(&t, e, 0);
+    // A long one cut on a character's start.
+    let is [300]u8 as euros;
+    let is i64 as i with mut = 0;
+    while (i < 300) {
+        euros[i] = cast(u8, 226);
+        euros[i + 1] = cast(u8, 130);
+        euros[i + 2] = cast(u8, 172);
+        i = i + 3;
+    }
+    router.preedit(&t, &r, cast(*u8, &euros), 300, 0, 110);
+    check("a long composition: cut on a character", entry.shown_length(&t, e) == 3 + 255);
+    tree.close(&t);
+}
+
+fn shows(t as *tree.Tree, e as i64, s as *u8) as i32 { return same(entry.shown(t, e), entry.shown_length(t, e), s); }
+
+fn near(a as f64, b as f64) as i32 {
+    let is f64 as d = a - b;
+    return cast(i32, d < 0.01 && d > 0.0 - 0.01);
+}
+
+// The placeholder's width: "Name" in the body style.
+fn hint_width(t as *tree.Tree, h as i64) as f64 {
+    let is text.Style as st = text.style_of(theme.fonts.body);
+    st.family = theme.fonts.family;
+    let is model.Params as pp = model.params();
+    let is text.Run as run = text.run();
+    text.lay_plain(svc, &run, "Name", 4, &st, &pp);
+    let is f64 as w = run.width;
+    text.run_close(&run);
+    return w;
+}
+
+// Pixels in x0 .. x1, y0 .. y1 that are col.
+fn matching(x0 as i64, x1 as i64, y0 as i64, y1 as i64, col as math.color.Color) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as y with mut = y0;
+    while (y < y1) {
+        let is i64 as x with mut = x0;
+        while (x < x1) {
+            if (is8(x, y, col, 24) == 1) { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+// Pixels in x0 .. x1, y0 .. y1 that are not col.
+fn inked(x0 as i64, x1 as i64, y0 as i64, y1 as i64, col as math.color.Color) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as y with mut = y0;
+    while (y < y1) {
+        let is i64 as x with mut = x0;
+        while (x < x1) {
+            if (is8(x, y, col, 8) == 0) { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+// --- Scrolled ---
+
+fn scrolled(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as root = tree.root(&t);
+    let is i64 as e = entry.create(&t, root);
+    layout.set_align(&t, e, layout.START, layout.START);
+    layout.set_min_size(&t, e, 80.0, 0.0);
+    layout.set_max_size(&t, e, 80.0, layout.UNBOUNDED);
+    let is router.Router as r = router.init(router.settings_default());
+    frame_router = &r;
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    typed(&t, &r, "abcdefghijklmnopqrstuvwxyz", 26, 10);
+    let is math.rect.Rect as rc = layout.window_rect(&t, e);
+    let is f64 as px = theme.metrics.control_pad_x;
+    let is f64 as room = rc.w - 2.0 * px;
+    let is *text.Run as run = entry.run(&t, e);
+    check("past its width: its end in view, at the field's", near(entry.scroll(&t, e), run.width + 1.0 - room) == 1 &&
+          near(entry.caret_x(&t, e), rc.x + px + room - 1.0) == 1);
+    frame(&t, c);
+    let is i64 as top = cast(i64, entry.text_top(&t, e));
+    check("nothing drawn in its padding", inked(cast(i64, rc.x) + 2, cast(i64, rc.x + px) - 1, top, top + 20,
+          theme.field.checked.bg) == 0);
+    key(&t, &r, keys.HOME, 0, 20);
+    check("home: back", entry.scroll(&t, e) == 0.0 && near(entry.caret_x(&t, e), rc.x + px) == 1);
+    entry.select(&t, e, 10, 10);
+    let is f64 as g10 = text.glyph(run, 10).x;
+    check("on: moved along only as far as the caret needs", near(entry.scroll(&t, e), fm.ceil(g10 + 1.0 - room)) == 1);
+    entry.select(&t, e, 3, 3);
+    let is f64 as back = fm.floor(text.glyph(run, 3).x);
+    check("back before it: moved back to it", near(entry.scroll(&t, e), back) == 1);
+    entry.select(&t, e, 5, 5);
+    check("in view: not moved", near(entry.scroll(&t, e), back) == 1);
+    // A click goes where it is shown.
+    click(&t, &r, x_at(&t, e, 6) + 0.3, cast(f64, top) + 5.0, 30);
+    check("clicked, scrolled", entry.caret(&t, e) == 6);
+    key(&t, &r, keys.END, 0, 40);
+    key(&t, &r, keys.BACKSPACE, 0, 41);
+    key(&t, &r, keys.BACKSPACE, 0, 42);
+    key(&t, &r, keys.BACKSPACE, 0, 43);
+    check("shortened at the end: its end kept at the field's", near(entry.scroll(&t, e), run.width + 1.0 - room) == 1);
+    frame_router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+// --- Measured ---
+
+fn measured() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as e = entry.create(&t, tree.root(&t));
+    entry.set_text(&t, e, "Ag", 2);
+    let is geom.Size as s0 = measure(&t, e);
+    let is f64 as w0 = entry.run(&t, e).width;
+    let is style.Theme as big with mut = theme;
+    big.fonts.body.size = 40.0;
+    tree.set_theme(&t, &big);
+    let is geom.Size as s = measure(&t, e);
+    let is text.Style as st = text.style_of(big.fonts.body);
+    st.family = big.fonts.family;
+    let is model.Params as pp = model.params();
+    let is text.Run as ag = text.run();
+    text.lay_plain(svc, &ag, "Ag", 2, &st, &pp);
+    let is f64 as px = big.metrics.control_pad_x;
+    check("eight of its size wide, at least two", near(s.pref_w, 2.0 * px + 320.0) == 1 && near(s.min_w, 2.0 * px + 80.0) == 1);
+    check("a line tall and padded", ag.height + 2.0 * big.metrics.control_pad_y > big.metrics.control_height &&
+          near(s.min_h, ag.height + 2.0 * big.metrics.control_pad_y) == 1 && near(s.pref_h, s.min_h) == 1);
+    check("its text grown with the theme's", s.min_h > s0.min_h && entry.run(&t, e).width > 1.9 * w0);
+    tree.set_theme(&t, &theme);
+    check("and back", near(measure(&t, e).min_h, s0.min_h) == 1);
+    text.run_close(&ag);
+    tree.close(&t);
+}
+
+// --- Right to left ---
+
+fn mirrored(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as root = tree.root(&t);
+    let is i64 as col = box.create(&t, root, box.COLUMN);
+    layout.set_align(&t, col, layout.FILL, layout.START);
+    let is i64 as e = entry.create(&t, col);
+    let is i64 as h = entry.create(&t, col);
+    layout.set_direction(&t, root, layout.RTL);
+    entry.set_text(&t, e, "abc", 3);
+    entry.set_placeholder(&t, h, "Name", 4);
+    let is router.Router as r = router.init(router.settings_default());
+    frame_router = &r;
+    frame(&t, c);
+    let is math.rect.Rect as rc = layout.window_rect(&t, e);
+    let is f64 as px = theme.metrics.control_pad_x;
+    check("right to left: at the far side", near(x_at(&t, e, 3), rc.x + rc.w - px - 1.0) == 1 &&
+          near(x_at(&t, e, 0), x_at(&t, e, 3) - entry.run(&t, e).width) == 1);
+    let is math.rect.Rect as rh = layout.window_rect(&t, h);
+    let is i64 as top = cast(i64, entry.text_top(&t, h));
+    let is i64 as mid = cast(i64, rh.x + rh.w / 2.0);
+    let is f64 as hstart = rh.x + rh.w - px - hint_width(&t, h);
+    check("its placeholder too", inked(cast(i64, rh.x + 2.0), cast(i64, hstart) - 2, top, top + 20, theme.field.normal.bg) == 0 &&
+          inked(cast(i64, hstart) + 3, cast(i64, rh.x + rh.w - px), top, top + 20, theme.field.normal.bg) > 0);
+    frame_router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+// --- Not an entry; what is set ---
+
+fn others() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as root = tree.root(&t);
+    let is i64 as b = button.create(&t, root, "B", 1);
+    let is i64 as e = entry.create(&t, root);
+    let is i64 as sa with mut = 5;
+    let is i64 as sb with mut = 5;
+    check("no entry: nothing", cast(i64, entry.text(&t, b)) == 0 && entry.length(&t, b) == 0 &&
+          cast(i64, entry.shown(&t, b)) == 0 && entry.shown_length(&t, b) == 0 && cast(i64, entry.run(&t, b)) == 0 &&
+          entry.selection(&t, b, &sa, &sb) == 0 && sa == 0 && sb == 0 && entry.caret(&t, b) == 0);
+    check("no entry: nowhere", entry.x_of(&t, b, 0) == 0.0 && entry.x_of_shown(&t, b, 0) == 0.0 &&
+          entry.caret_x(&t, b) == 0.0 && entry.text_top(&t, b) == 0.0 && entry.scroll(&t, b) == 0.0 &&
+          entry.drop_at(&t, b) == 0 - 1);
+    check("no entry: nothing set", entry.set_text(&t, b, "x", 1) == 0 && entry.set_placeholder(&t, b, "x", 1) == 0 &&
+          entry.set_password(&t, b, 1) == 0 && entry.set_max_length(&t, b, 3) == 0 &&
+          entry.set_filter(&t, b, fn_ptr(digits_only), cast(*u8, 0)) == 0 && entry.set_editable(&t, b, 0) == 0 &&
+          entry.set_activates_default(&t, b, 1) == 0);
+    entry.select(&t, b, 0, 1);
+    check("an entry: set", entry.set_placeholder(&t, e, "p", 1) == 1 && entry.set_activates_default(&t, e, 1) == 1 &&
+          entry.set_editable(&t, e, 1) == 1);
+    entry.set_text(&t, e, "ab", 2);
+    check("nothing selected: 0", entry.selection(&t, e, &sa, &sb) == 0 && sa == 2 && sb == 2);
+    entry.select(&t, e, 0 - 5, 100);
+    check("something selected: 1; held to the text", entry.selection(&t, e, &sa, &sb) == 1 && sa == 0 && sb == 2);
+    entry.set_text(&t, e, "a\xc3\xa9b", 4);
+    entry.select(&t, e, 2, 3);
+    check("held to a character's start", sel_is(&t, e, 1, 3) == 1);
+    let is [400]u8 as long;
+    let is i64 as i with mut = 0;
+    while (i < 400) {
+        long[i] = cast(u8, 97 + i % 26);
+        i = i + 1;
+    }
+    check("a long text", entry.set_text(&t, e, cast(*u8, &long), 400) == 1 && entry.length(&t, e) == 400 &&
+          entry.shown_length(&t, e) == 400 && same(entry.shown(&t, e), 26, "abcdefghijklmnopqrstuvwxyz") == 1);
+    entry.set_password(&t, e, 1);
+    check("a long password", entry.shown_length(&t, e) == 1200);
+    tree.close(&t);
+    let is tree.Limits as tiny = tree.limits_default();
+    tiny.widgets = 1;
+    let is tree.Tree as full = tree.open(&tiny);
+    check("no room: no entry", entry.create(&full, tree.root(&full)) == 0);
+    tree.close(&full);
+}
+
+// --- UTF-8, line ends ---
+
+let is [8]i64 as seen with mut;
+let is i64 as nseen with mut = 0;
+
+fn wide_or_digit(user as *u8, c as i64) as i32 {
+    if (nseen < 8) { seen[nseen] = c; }
+    nseen = nseen + 1;
+    return cast(i32, c >= 128 || (c >= 48 && c <= 57));
+}
+
+fn utf8() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as e = entry.create(&t, tree.root(&t));
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    entry.set_filter(&t, e, fn_ptr(wide_or_digit), cast(*u8, 0));
+    nseen = 0;
+    typed(&t, &r, "a\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80b1\xe0\xa4\x85", 15, 10);
+    check("each character to the filter whole", nseen == 7 && seen[0] == 97 && seen[1] == 233 && seen[2] == 8364 &&
+          seen[3] == 128512 && seen[4] == 98 && seen[5] == 49 && seen[6] == 2309);
+    check("what it let in", holds(&t, e, "\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\x31\xe0\xa4\x85") == 1);
+    entry.set_filter(&t, e, cast(entry.FilterFn, 0), cast(*u8, 0));
+    entry.set_text(&t, e, "", 0);
+    typed(&t, &r, "x\x80y\xffz\xc3w\xe2\x82", 9, 20);
+    check("bytes that are no UTF-8 left out", holds(&t, e, "xyzw") == 1);
+    entry.set_text(&t, e, "", 0);
+    typed(&t, &r, "\xc0\x80\xc1\xbf\xe0\x80\xaf\xed\xa0\x80\xf0\x8f\xbf\xbf\xf4\x90\x80\x80\xf5\x80\x80\x80\xf8\x88\x80\x80\x80", 27, 21);
+    check("too long, a surrogate, past the last codepoint: left out", entry.length(&t, e) == 0);
+    typed(&t, &r, "\xe2\x82z\xf0\x9f\x98q", 7, 22);
+    check("a sequence broken off: left out, what follows kept", holds(&t, e, "zq") == 1);
+    typed(&t, &r, "\xed\x9f\xbf\xee\x80\x80\xf4\x8f\xbf\xbf\xef\xbf\xbd\xc2\x80", 15, 23);
+    check("the edges that are UTF-8 kept", holds(&t, e, "zq\xed\x9f\xbf\xee\x80\x80\xf4\x8f\xbf\xbf\xef\xbf\xbd\xc2\x80") == 1);
+    entry.set_text(&t, e, "", 0);
+    typed(&t, &r, "q\xe2\x82\xac", 3, 24);
+    check("cut short by its length: left out", holds(&t, e, "q") == 1);
+    entry.set_text(&t, e, "xyzw", 4);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "a\r\nb\rc\nd", 8, 30);
+    check("line ends: one space each", holds(&t, e, "xyzwa b c d") == 1);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "!\r\n", 3, 31);
+    check("at the end too", holds(&t, e, "xyzwa b c d! ") == 1);
+    check("typed: taken", router.text(&t, &r, "?", 1, 32) == 1);
+    tree.close(&t);
+}
+
+// --- More editing ---
+
+fn editing() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as e = entry.create(&t, tree.root(&t));
+    signal.connect(&t, e, signal.CHANGED, fn_ptr(on_change), cast(*u8, 0));
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    entry.set_text(&t, e, "one two three", 13);
+    entry.select(&t, e, 4, 7);
+    key(&t, &r, keys.BACKSPACE, 0, 10);
+    check("backspace: the selection alone", holds(&t, e, "one  three") == 1 && entry.caret(&t, e) == 4);
+    entry.select(&t, e, 5, 4);
+    key(&t, &r, keys.DELETE, 0, 11);
+    check("delete: the selection alone", holds(&t, e, "one three") == 1 && entry.caret(&t, e) == 4);
+    nclip = 0;
+    entry.select(&t, e, 0, 4);
+    key(&t, &r, keys.DELETE, keys.MOD_CONTROL | keys.MOD_SHIFT, 12);
+    check("control, shift and delete: erased, not cut", holds(&t, e, "three") == 1 && nclip == 0);
+    changes = 0;
+    key(&t, &r, keys.END, 0, 20);
+    key(&t, &r, keys.DELETE, 0, 21);
+    key(&t, &r, keys.HOME, 0, 22);
+    key(&t, &r, keys.BACKSPACE, 0, 23);
+    check("nothing to erase: nothing changed", changes == 0 && holds(&t, e, "three") == 1);
+    key(&t, &r, 90, keys.MOD_CONTROL | keys.MOD_SHIFT, 24);
+    check("shift's capital: redone all the same", holds(&t, e, "three") == 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 25);
+    key(&t, &r, 90, keys.MOD_CONTROL | keys.MOD_SHIFT, 26);
+    check("undone, and redone by the capital", holds(&t, e, "three") == 1 && changes == 2);
+    entry.set_text(&t, e, "", 0);
+    typed(&t, &r, "a", 1, 27);
+    typed(&t, &r, "b", 1, 28);
+    router.paste(&t, &r, e, tree.CLIPBOARD, "cd", 2, 29);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 29);
+    check("a paste after typing: its own step", holds(&t, e, "ab") == 1);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 29);
+    check("typing in two goes: one", entry.length(&t, e) == 0);
+    entry.set_text(&t, e, "one two three", 13);
+    key(&t, &r, 65, keys.MOD_CONTROL, 29);
+    check("a capital, with control: all the same", sel_is(&t, e, 0, 13) == 1);
+    entry.select(&t, e, 0, 7);
+    key(&t, &r, keys.LEFT, keys.MOD_CONTROL, 30);
+    check("control and left with a selection: by word from the caret", sel_is(&t, e, 4, 4) == 1);
+    entry.select(&t, e, 0, 7);
+    key(&t, &r, keys.RIGHT, keys.MOD_CONTROL, 31);
+    check("control and right: the same", sel_is(&t, e, 13, 13) == 1);
+    entry.select(&t, e, 7, 0);
+    key(&t, &r, keys.RIGHT, 0, 32);
+    check("right with a selection: to its end", sel_is(&t, e, 7, 7) == 1);
+    entry.select(&t, e, 0, 3);
+    entry.set_filter(&t, e, fn_ptr(digits_only), cast(*u8, 0));
+    typed(&t, &r, "x", 1, 40);
+    check("nothing let in over a selection: kept", holds(&t, e, "one two three") == 1 && sel_is(&t, e, 0, 3) == 1);
+    entry.set_filter(&t, e, cast(entry.FilterFn, 0), cast(*u8, 0));
+    // A limit set on a longer text cuts it; one it fits changes nothing.
+    entry.set_text(&t, e, "abcdef", 6);
+    entry.select(&t, e, 4, 6);
+    changes = 0;
+    entry.set_max_length(&t, e, 3);
+    check("a limit: the text cut, the selection with it", holds(&t, e, "abc") == 1 && sel_is(&t, e, 3, 3) == 1 &&
+          changes == 1);
+    entry.set_max_length(&t, e, 3);
+    check("one it fits: nothing", changes == 1);
+    entry.set_max_length(&t, e, 0);
+    check("no limit: nothing cut", holds(&t, e, "abc") == 1 && changes == 1);
+    // A long password.
+    let is [2000]u8 as long;
+    let is i64 as i with mut = 0;
+    while (i < 2000) {
+        long[i] = cast(u8, 97 + i % 26);
+        i = i + 1;
+    }
+    entry.set_password(&t, e, 1);
+    check("a long password shown", entry.set_text(&t, e, cast(*u8, &long), 2000) == 1 && entry.shown_length(&t, e) == 6000);
+    tree.close(&t);
+}
+
+// --- Keys taken ahead of the window's ---
+
+let is i64 as ran with mut = 0;
+
+fn ran_one(user as *u8) as void { ran = ran + 1; }
+
+fn shortcut(r as *router.Router, k as i32, mods as i32) as void {
+    router.add_shortcut(r, k, mods, fn_ptr(ran_one), cast(*u8, 0));
+}
+
+// What bubbles out of the entry: whatever it did not take.
+let is tree.Kind as catcher with mut;
+let is i64 as caught with mut = 0;        // keys, text and presses
+let is i64 as caught_moves with mut = 0;
+
+fn catch(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    if (e.phase != event.BUBBLE) { return 0; }
+    if (e.kind == event.KEY_DOWN || e.kind == event.TEXT || e.kind == event.POINTER_DOWN) { caught = caught + 1; }
+    if (e.kind == event.POINTER_MOVE) { caught_moves = caught_moves + 1; }
+    return 1;
+}
+
+fn claimed() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as root = tree.root(&t);
+    let is i64 as model_box = box.create(&t, root, box.COLUMN);
+    catcher = *tree.kind(&t, model_box);
+    catcher.event = fn_ptr(catch);
+    let is i64 as holder = tree.create(&t, &catcher, root);
+    layout.set_align(&t, holder, layout.FILL, layout.START);
+    let is i64 as e = entry.create(&t, holder);
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    entry.set_text(&t, e, "abc", 3);
+    shortcut(&r, keys.A, keys.MOD_CONTROL);
+    shortcut(&r, keys.C, keys.MOD_CONTROL);
+    shortcut(&r, keys.X, keys.MOD_CONTROL);
+    shortcut(&r, keys.V, keys.MOD_CONTROL);
+    shortcut(&r, keys.Z, keys.MOD_CONTROL);
+    shortcut(&r, keys.Y, keys.MOD_CONTROL);
+    shortcut(&r, keys.INSERT, keys.MOD_CONTROL);
+    shortcut(&r, keys.INSERT, keys.MOD_SHIFT);
+    shortcut(&r, keys.LEFT, 0);
+    shortcut(&r, keys.RIGHT, keys.MOD_CONTROL);
+    shortcut(&r, keys.HOME, 0);
+    shortcut(&r, keys.END, keys.MOD_SHIFT);
+    shortcut(&r, keys.BACKSPACE, 0);
+    shortcut(&r, keys.DELETE, 0);
+    shortcut(&r, keys.RETURN, 0);
+    ran = 0;
+    caught = 0;
+    key(&t, &r, keys.A, keys.MOD_CONTROL, 10);
+    key(&t, &r, keys.C, keys.MOD_CONTROL, 11);
+    key(&t, &r, keys.X, keys.MOD_CONTROL, 12);
+    key(&t, &r, keys.V, keys.MOD_CONTROL, 13);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 14);
+    key(&t, &r, keys.Y, keys.MOD_CONTROL, 15);
+    key(&t, &r, keys.INSERT, keys.MOD_CONTROL, 16);
+    key(&t, &r, keys.INSERT, keys.MOD_SHIFT, 17);
+    key(&t, &r, keys.LEFT, 0, 18);
+    key(&t, &r, keys.RIGHT, keys.MOD_CONTROL, 19);
+    key(&t, &r, keys.HOME, 0, 20);
+    key(&t, &r, keys.END, keys.MOD_SHIFT, 21);
+    key(&t, &r, keys.BACKSPACE, 0, 22);
+    key(&t, &r, keys.DELETE, 0, 23);
+    key(&t, &r, keys.RETURN, 0, 24);
+    check("its editing keys its own, ahead of the window's", ran == 0);
+    check("and taken: none passed on", caught == 0);
+    entry.set_editable(&t, e, 0);
+    key(&t, &r, keys.BACKSPACE, 0, 30);
+    key(&t, &r, keys.DELETE, 0, 31);
+    key(&t, &r, keys.X, keys.MOD_CONTROL, 32);
+    key(&t, &r, keys.V, keys.MOD_CONTROL, 33);
+    key(&t, &r, keys.Z, keys.MOD_CONTROL, 34);
+    check("read-only: still taken", ran == 0 && caught == 0);
+    check("typed, read-only: taken", router.text(&t, &r, "q", 1, 35) == 1 && caught == 0);
+    check("pasted, read-only: taken", router.paste(&t, &r, e, tree.CLIPBOARD, "q", 1, 36) == 1);
+    entry.set_editable(&t, e, 1);
+    shortcut(&r, keys.S, keys.MOD_CONTROL);
+    shortcut(&r, keys.ESCAPE, 0);
+    shortcut(&r, keys.INSERT, 0);
+    shortcut(&r, keys.LEFT, keys.MOD_ALT);
+    shortcut(&r, keys.A, keys.MOD_SUPER);
+    shortcut(&r, keys.RETURN, keys.MOD_CONTROL);
+    key(&t, &r, keys.S, keys.MOD_CONTROL, 40);
+    key(&t, &r, keys.ESCAPE, 0, 41);
+    key(&t, &r, keys.INSERT, 0, 42);
+    key(&t, &r, keys.LEFT, keys.MOD_ALT, 43);
+    key(&t, &r, keys.A, keys.MOD_SUPER, 44);
+    key(&t, &r, keys.RETURN, keys.MOD_CONTROL, 45);
+    check("the rest the window's", ran == 6);
+    caught = 0;
+    key(&t, &r, keys.F5, 0, 50);
+    key(&t, &r, keys.UP, 0, 51);
+    key(&t, &r, keys.RIGHT, keys.MOD_ALT, 52);
+    check("keys it has no use for passed on", caught == 3);
+    // The pointer: its presses taken, the third button's and a hover not.
+    let is f64 as y = entry.text_top(&t, e) + 5.0;
+    caught = 0;
+    caught_moves = 0;
+    router.pointer_move(&t, &r, x_at(&t, e, 1), y, 60);
+    check("a hover passed on", caught_moves == 1);
+    click(&t, &r, x_at(&t, e, 1), y, 61);
+    router.pointer_button(&t, &r, 2, 1, x_at(&t, e, 1), y, 1000);
+    router.pointer_button(&t, &r, 2, 0, x_at(&t, e, 1), y, 1001);
+    check("presses taken", caught == 0);
+    router.pointer_button(&t, &r, 3, 1, x_at(&t, e, 1), y, 2000);
+    router.pointer_button(&t, &r, 3, 0, x_at(&t, e, 1), y, 2001);
+    check("the third button's passed on", caught == 1);
+    entry.set_editable(&t, e, 0);
+    caught = 0;
+    router.pointer_button(&t, &r, 2, 1, x_at(&t, e, 1), y, 3000);
+    router.pointer_button(&t, &r, 2, 0, x_at(&t, e, 1), y, 3001);
+    check("the middle one, read-only: taken", caught == 0);
+    tree.close(&t);
+}
+
+// --- A press given up ---
+
+fn cancelled() as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as e = entry.create(&t, tree.root(&t));
+    layout.set_align(&t, e, layout.FILL, layout.START);
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    entry.set_text(&t, e, "one two three", 13);
+    router.set_source(&r, router.TOUCH);
+    let is f64 as y = entry.text_top(&t, e) + 5.0;
+    router.pointer_move(&t, &r, x_at(&t, e, 2) + 0.3, y, 10);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 2) + 0.3, y, 10);
+    router.tick(&t, &r, 600);
+    router.pointer_move(&t, &r, x_at(&t, e, 9) + 0.3, y, 610);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 9) + 0.3, y, 620);
+    check("held: the press given up, nothing selected by moving after", sel_is(&t, e, 2, 2) == 1);
+    tree.close(&t);
+}
+
+// --- Dragged text and its limits ---
+
+fn dragged(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as e = entry.create(&t, tree.root(&t));
+    layout.set_align(&t, e, layout.FILL, layout.START);
+    let is router.Router as r = router.init(router.settings_default());
+    frame_router = &r;
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.focus(&t, &r, e, 0);
+    entry.set_text(&t, e, "ab cd", 5);
+    entry.set_max_length(&t, e, 6);
+    let is f64 as y = entry.text_top(&t, e) + 5.0;
+    // Two more would not fit: nothing copied.
+    entry.select(&t, e, 3, 5);
+    router.key(&t, &r, keys.CONTROL_L, keys.MOD_CONTROL, 1, 0, 10);
+    router.pointer_move(&t, &r, x_at(&t, e, 4), y, 10);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 4), y, 10);
+    router.pointer_move(&t, &r, x_at(&t, e, 0) + 0.2, y, 20);
+    router.pointer_move(&t, &r, x_at(&t, e, 0) - 1.0, y, 30);
+    frame(&t, c);
+    check("where it would go shown, at the very start", is8(cast(i64, x_at(&t, e, 0)), cast(i64, y),
+          theme.field.checked.fg, 2) == 1);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 0) - 1.0, y, 40);
+    check("past the limit: nothing copied", holds(&t, e, "ab cd") == 1);
+    // One more fits.
+    entry.select(&t, e, 3, 4);
+    router.pointer_move(&t, &r, x_at(&t, e, 3) + 0.5, y, 1000);
+    router.pointer_button(&t, &r, 1, 1, x_at(&t, e, 3) + 0.5, y, 1000);
+    router.pointer_move(&t, &r, x_at(&t, e, 0), y, 1010);
+    router.pointer_move(&t, &r, x_at(&t, e, 0) - 1.0, y, 1020);
+    router.pointer_button(&t, &r, 1, 0, x_at(&t, e, 0) - 1.0, y, 1030);
+    router.key(&t, &r, keys.CONTROL_L, 0, 0, 0, 1040);
+    check("up to it: copied, selected", holds(&t, e, "cab cd") == 1 && sel_is(&t, e, 0, 1) == 1);
+    frame_router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+// --- Drawn ---
+
+fn drawn(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    setup(&t);
+    let is i64 as root = tree.root(&t);
+    let is i64 as col = box.create(&t, root, box.COLUMN);
+    layout.set_align(&t, col, layout.FILL, layout.START);
+    let is i64 as e = entry.create(&t, col);
+    let is i64 as h = entry.create(&t, col);
+    let is i64 as z = entry.create(&t, col);
+    entry.set_placeholder(&t, h, "Name", 4);
+    let is router.Router as r = router.init(router.settings_default());
+    frame_router = &r;
+    entry.set_text(&t, e, "Hello", 5);
+    router.pointer_move(&t, &r, 230.0, 195.0, 1);
+    frame(&t, c);
+    let is math.rect.Rect as re = layout.window_rect(&t, e);
+    let is i64 as ty = cast(i64, re.y + re.h / 2.0);
+    let is i64 as top = cast(i64, entry.text_top(&t, e));
+    check("a field", is8(cast(i64, re.x + 3.0), cast(i64, re.y + re.h / 2.0),
+          style.over(theme.field.normal.bg, theme.palette.window_bg), 2) == 1);
+    check("its text in the field's colour", is8(cast(i64, x_at(&t, e, 0) + 4.0), ty + 2, theme.field.normal.fg, 2) == 1);
+    let is math.rect.Rect as rh = layout.window_rect(&t, h);
+    check("a placeholder in the secondary colour", is8(cast(i64, x_at(&t, h, 0) + 4.0), cast(i64, rh.y + rh.h / 2.0) + 2,
+          style.over(theme.palette.fg_dim, theme.field.normal.bg), 3) == 1);
+    let is i64 as htop = cast(i64, entry.text_top(&t, h));
+    let is f64 as hend = rh.x + theme.metrics.control_pad_x + hint_width(&t, h);
+    check("from its start", inked(cast(i64, rh.x + 1.0), cast(i64, hend) - 3, htop, htop + 20, theme.field.normal.bg) > 0 &&
+          inked(cast(i64, hend) - 5, cast(i64, hend) + 1, htop, htop + 20, theme.field.normal.bg) > 0 &&
+          inked(cast(i64, hend) + 2, cast(i64, rh.x + rh.w - 2.0), htop, htop + 20, theme.field.normal.bg) == 0);
+    entry.set_text(&t, h, "x", 1);
+    frame(&t, c);
+    check("text: no placeholder", is8(cast(i64, x_at(&t, h, 1) + 8.0), cast(i64, rh.y + rh.h / 2.0) + 2,
+          theme.field.normal.bg, 2) == 1);
+    router.focus(&t, &r, e, 0);
+    entry.select(&t, e, 0, 2);
+    frame(&t, c);
+    check("selected: the selection's colours", is8(cast(i64, x_at(&t, e, 0) + 4.0), ty + 2, theme.palette.selection_fg, 2) == 1 &&
+          is8(cast(i64, x_at(&t, e, 1) - 0.5), top + 1, theme.palette.selection_bg, 2) == 1);
+    entry.select(&t, e, 2, 4);
+    frame(&t, c);
+    check("selected from the middle: there", is8(cast(i64, x_at(&t, e, 3)), top + 1, theme.palette.selection_bg, 2) == 1 &&
+          is8(cast(i64, x_at(&t, e, 2)) - 2, top + 1, theme.field.checked.bg, 2) == 1 &&
+          is8(cast(i64, x_at(&t, e, 4)) + 2, top + 1, theme.field.checked.bg, 2) == 1);
+    check("its text in the selection's colour, all of it", matching(cast(i64, x_at(&t, e, 2)) + 1, cast(i64, x_at(&t, e, 4)) - 1,
+          top, top + 20, theme.field.checked.fg) == 0 &&
+          matching(cast(i64, x_at(&t, e, 2)) + 1, cast(i64, x_at(&t, e, 4)) - 1, top, top + 20, theme.palette.selection_fg) > 0);
+    check("a selection: no caret", is8(cast(i64, entry.caret_x(&t, e)), top + 1, theme.field.checked.fg, 2) == 0);
+    entry.select(&t, e, 5, 5);
+    frame(&t, c);
+    check("focused: a caret", is8(cast(i64, entry.caret_x(&t, e)), ty, theme.field.checked.fg, 2) == 1);
+    router.focus(&t, &r, z, 0);
+    frame(&t, c);
+    check("empty, focused: a caret at the start", is8(cast(i64, entry.caret_x(&t, z)), cast(i64, entry.text_top(&t, z)) + 2,
+          theme.field.checked.fg, 2) == 1);
+    frame_router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+fn main() as i32 {
+    let is *u8 as d = load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 1;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    frame_router = cast(*router.Router, 0);
+    theme = style.light();
+    theme.fonts.body.size = 20.0;
+
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as limits = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &limits);
+    let is text.Limits as lim = text.limits_default();
+    svc = text.open(&dv, &lim, fn_ptr(resolve), cast(*u8, 0), theme.fonts.family);
+
+    typing();
+    clipboard();
+    pointer();
+    limits();
+    composed();
+    scrolled(&c);
+    measured();
+    mirrored(&c);
+    others();
+    utf8();
+    editing();
+    claimed();
+    cancelled();
+    dragged(&c);
+    drawn(&c);
+
+    if (fails == 0) {
+        io.printf("entry: %d checks passed\n", checks);
+        return 0;
+    }
+    io.printf("entry: %d of %d checks failed\n", fails, checks);
+    return 1;
+}

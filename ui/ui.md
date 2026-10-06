@@ -287,8 +287,9 @@ drawn there, so a subtree painted into a texture of its own, which is flushed
 before the frame is, finds its glyphs there.
 
 The entry is the hardest widget in any toolkit — selection, undo, IME,
-clipboard, caret movement through bidi text — and it waits for `text/` to reach
-caret and hit-testing rather than being faked with a monospace bitmap font.
+clipboard, caret movement through bidi text — and it asks all of it of `text/`
+— the caret, hit-testing, graphemes and words, selection rectangles — rather
+than faking it with a monospace bitmap font.
 
 ---
 
@@ -484,8 +485,10 @@ which is what `input/` will call; and `paste`, giving a widget the text it asked
 the clipboard for (`tree.request_paste`, answered by the program), and
 `preedit`, the input method's composition with its caret, to the focus. The
 widget text is typed into says where its caret is (`tree.set_text_area`), for
-the input method's candidates. FOCUS_IN says whether the focus came by
-keyboard.
+the input method's candidates, and when it gives a composition up — the caret
+moved away from it — says so (`tree.reset_ime`, passed on by the program), so
+that what the input method commits next is not what was given up. FOCUS_IN
+says whether the focus came by keyboard.
 
 **Signals and models** (`signal.cst`, `model.cst`, tested by `signal_test` and
 `model_test`): callbacks connected per widget and signal, called in connection
@@ -758,9 +761,41 @@ a text view edits — a gap buffer, any range had in one piece for laying out
 the paragraph of an offset is a search away; line ends made line feeds on the
 way in. Undo and redo go by the steps a person would undo by: a run of typing
 broken at a word's start or by the caret moving, a run of backspaces or of
-deletes forward, a paste or a replacement alone, each putting the caret back
-where it belongs; the program's own edits forget what could be undone, whose
-places they move. Two megabytes in twenty thousand paragraphs stay quick.
+deletes forward (`erase_ahead` when it is known to be Delete, never joined to
+a backspace), a paste, a replacement or text moved by a drag (`move`) alone,
+each putting the caret back where it belongs; the program's own edits forget
+what could be undone, whose places they move. Two megabytes in twenty
+thousand paragraphs stay quick.
+
+**Entries** (`widgets/entry.cst`, tested by `entry_test`): one line of text
+in a field, kept in a text buffer and undone in its steps; a line feed typed
+or pasted is a space, and what is no UTF-8 is left out. The caret moves by
+grapheme and by word (Control), left and right as the text is drawn, Home and
+End to the ends, Shift selecting; the pointer places it, drags a selection,
+selects a word with a double click and all with a triple, and Shift and a
+click extend. Pressed inside the selection and dragged, the selection goes
+where it is dropped — where it would go drawn as a caret — a copy with
+Control; each drop a step to undo. What is selected goes to the primary
+selection, the middle button pastes it where it is pressed; Control and C, X
+and V, Control and Insert, Shift and Insert and Shift and Delete copy, cut
+and paste through the program's clipboard. Its editing keys are its own
+ahead of the window's shortcuts, and Enter too unless it activates the
+window's default (`set_activates_default`); Enter emits ACTIVATED, every change
+to the text CHANGED. An input method's composition shows at the caret,
+underlined, with its own caret, until committed as text; composing over a
+selection takes its place, and a key, a click, the text set, read-only or the
+focus leaving give it up and tell the input method. Past its width the text
+moves along only as far as the caret needs, never ending short of the
+field's end; right to left, a text that fits is at the far side, its
+placeholder too. A password shows a bullet per character, is never copied or
+cut, and takes no composition; a placeholder shows in the secondary colour
+while it is empty; a limit in characters cuts what goes in to what fits, and
+a shorter limit cuts the text; a filter lets in only the characters it says
+yes to, typed, pasted or dropped. Read-only it is still selected and copied.
+Focused by the keyboard, all of it is selected. It is laid out again when the
+theme's text changes; eight of the body's ems wide by preference, a line
+tall and padded. Told as an entry, or as password text, editable or
+read-only.
 
 ## For scale
 
