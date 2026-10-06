@@ -628,7 +628,8 @@ as tall as its text at the width offered; wrapping, no narrower than its
 widest word; at most a number of lines with an ellipsis, and then, not
 wrapping, cut to its width and no narrower than the ellipsis. Drawn in the
 theme's colour for its tone — text, secondary, accent, error, warning,
-success, link — faded when disabled, quieter in the backdrop, aligned across
+success, link — faded when disabled, quieter in the backdrop (in its normal
+tone, in the colour what holds it gives instead), aligned across
 by its alignment in the widget's direction and centred down. Its text is its
 name to assistive technology, and the name of the widget it labels. A
 mnemonic (`_Save`; `__` for an underscore) underlines its letter while Alt is
@@ -648,6 +649,20 @@ nearest texel taken, straight or premultiplied. A symbolic image is drawn in
 the colour what holds it gives, else the theme's text colour; disabled, an
 image fades as controls do unless it was given a colour. Its description is
 its name to assistive technology.
+
+**Buttons** (`widgets/button.cst`, tested by `button_test`): a label (with
+its mnemonic) or an image inside the theme's padding, at least a control
+tall, drawn from the control's variants — the suggested action's, the
+destructive one's, or flat with only the overlays — its content in the
+variant's text colour for its state. Clicked on a release inside it after a
+press, the pointer free to leave and come back (looking at rest while it is
+away); on Space, pressed looking while held, clicked on release; on Enter; on
+its mnemonic; by assistive technology. A toggle button stays down and says
+`TOGGLED`. The window's default button answers Enter wherever the focus is,
+unless a focused button takes Enter, and is drawn in the accent; its cancel
+button answers Escape; both give their keys back when destroyed. A link is
+underlined text in the link colour, no padding, saying `ACTIVATED` with its
+address and told visited once followed.
 
 ## For scale
 

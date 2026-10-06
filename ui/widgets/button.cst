@@ -1,0 +1,471 @@
+// ui/widgets/button.cst — something to press.
+//
+// A button holds one widget — a label, an image, or what the program puts
+// there — inside the theme's padding, at least a control tall, and draws
+// itself from the theme's variants: the control's, the suggested action's in
+// the accent, the destructive one's, or flat with only the hover and press
+// overlays. What it holds draws in the variant's text colour for the
+// button's state (painter.fg), so a label inside a default button is in the
+// accent's text colour and fades with it when disabled.
+//
+// It is clicked on a release inside it after a press — the pointer may
+// leave and come back — on Space (pressed looking while held, clicked on
+// release), on Enter, on its mnemonic, and by assistive technology. A toggle
+// button stays down until clicked again and says TOGGLED. A window's default
+// button answers Enter wherever the focus is — unless a focused button takes
+// Enter itself — and is drawn in the accent; its cancel button answers
+// Escape. A link is a button drawn as underlined text in the link colour,
+// with no padding, saying ACTIVATED with its address.
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../../text/layout/model.cst" as model;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../text.cst" as txt;
+use "label.cst" as label;
+use "image.cst" as image;
+
+// What it is drawn as.
+let is i32 as NORMAL      with imut = 0;
+let is i32 as SUGGESTED   with imut = 1;   // the action a window suggests: in the accent
+let is i32 as DESTRUCTIVE with imut = 2;
+let is i32 as FLAT        with imut = 3;   // no background until hovered or pressed
+let is i32 as LINK        with imut = 4;
+
+struct Data {
+    content    as i64;            // what it holds; 0 for nothing
+    r          as *router.Router; // where its key is registered
+    t          as *tree.Tree;
+    self       as i64;
+    key_id     as i64;            // its window shortcut — Enter, Escape — or 0
+    uri        as *u8;            // a link's address, the program's
+    link       as txt.Style;      // a link's text: underlined
+    variant    as i32;
+    toggle     as i32;
+    active     as i32;            // a toggle that is down
+    held       as i32;            // Space held on it
+    out        as i32;            // pressed, and the pointer has left it
+    pressing   as i32;
+    visited    as i32;            // a link followed
+    is_default as i32;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _link_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("button", sizeof(Data));
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.role = access.ROLE_BUTTON;
+    _kind.access = fn_ptr(_access);
+    _link_kind = _kind;
+    _link_kind.name = "link";
+    _link_kind.role = access.ROLE_LINK;
+    _ready = 1;
+}
+
+fn kind() as *tree.Kind {
+    _init();
+    return &_kind;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0) { return cast(*Data, 0); }
+    let is i64 as k = cast(i64, tree.kind(t, w));
+    if (k != cast(i64, &_kind) && k != cast(i64, &_link_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn _make(t as *tree.Tree, parent as i64, k as *tree.Kind) as i64 {
+    _init();
+    let is i64 as b = tree.create(t, k, parent);
+    if (b == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, b));
+    d.t = t;
+    d.self = b;
+    tree.set_focusable(t, b, 1);
+    return b;
+}
+
+// A new button around a label of text — n bytes of UTF-8, an underscore
+// marking its mnemonic's letter — as the last child of parent. Its handle, or
+// 0 with the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64, s as *u8, n as i64) as i64 {
+    let is i64 as b = _make(t, parent, &_kind);
+    if (b == 0) { return 0; }
+    let is i64 as l = label.create(t, b, "", 0);
+    if (l == 0) {
+        tree.destroy(t, b);
+        return 0;
+    }
+    label.set_text_mnemonic(t, l, s, n);
+    label.set_align(t, l, model.ALIGN_CENTER);
+    label.set_target(t, l, b);
+    cast(*Data, tree.data(t, b)).content = l;
+    return b;
+}
+
+// A new button around an image of texture tex, w by h; its image's
+// description names it.
+fn create_icon(t as *tree.Tree, parent as i64, tex as i64, w as f64, h as f64) as i64 {
+    let is i64 as b = _make(t, parent, &_kind);
+    if (b == 0) { return 0; }
+    let is i64 as im = image.create(t, b, tex, w, h);
+    if (im == 0) {
+        tree.destroy(t, b);
+        return 0;
+    }
+    tree.set_labelled_by(t, b, im);
+    cast(*Data, tree.data(t, b)).content = im;
+    return b;
+}
+
+// A new link: text, underlined in the link colour, that says ACTIVATED with
+// uri — the program's, kept alive — when clicked.
+fn link(t as *tree.Tree, parent as i64, s as *u8, n as i64, uri as *u8) as i64 {
+    let is i64 as b = _make(t, parent, &_link_kind);
+    if (b == 0) { return 0; }
+    let is i64 as l = label.create(t, b, "", 0);
+    if (l == 0) {
+        tree.destroy(t, b);
+        return 0;
+    }
+    let is *Data as d = cast(*Data, tree.data(t, b));
+    label.set_text_mnemonic(t, l, s, n);
+    label.set_target(t, l, b);
+    d.content = l;
+    d.variant = LINK;
+    d.uri = uri;
+    // Every field of the label's own but the underline.
+    d.link.family = cast(*u8, 0);
+    d.link.size = 0.0;
+    d.link.weight = 0;
+    d.link.underline = 1;
+    d.link.color = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+    label.set_spans(t, l, &d.link, 1, cast(*model.Span, 0), 0);
+    return b;
+}
+
+// What it holds; 0 for a widget that is no button.
+fn content(t as *tree.Tree, b as i64) as i64 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.content;
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    if (d.key_id != 0) { router.remove_shortcut(d.r, d.key_id); }
+    d.key_id = 0;
+}
+
+fn _repaint(t as *tree.Tree, w as i64) as void { widget.changed(t, w, widget.CHANGED_PAINT); }
+
+// NORMAL, SUGGESTED, DESTRUCTIVE or FLAT. Each setter returns 1, or 0 for a
+// widget that is no button.
+fn set_variant(t as *tree.Tree, b as i64, v as i32) as i32 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0) { return 0; }
+    d.variant = v;
+    _repaint(t, b);
+    return 1;
+}
+
+// A toggle button, which stays down until clicked again; not one, it is up.
+fn set_toggle(t as *tree.Tree, b as i64, on as i32) as i32 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0) { return 0; }
+    d.toggle = on;
+    if (on == 0) { d.active = 0; }
+    _repaint(t, b);
+    return 1;
+}
+
+// A toggle down or up, saying TOGGLED when that changes it.
+fn set_active(t as *tree.Tree, b as i64, on as i32) as i32 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0 || d.toggle == 0) { return 0; }
+    if (d.active == on) { return 1; }
+    d.active = on;
+    _repaint(t, b);
+    signal.emit(t, b, signal.TOGGLED, cast(*u8, 0));
+    return 1;
+}
+
+fn is_active(t as *tree.Tree, b as i64) as i32 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.active;
+}
+
+// Whether it is held down now: by a press the pointer is still over, or by
+// Space.
+fn is_down(t as *tree.Tree, b as i64) as i32 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0) { return 0; }
+    return cast(i32, d.held == 1 || (d.pressing == 1 && d.out == 0));
+}
+
+fn _on_key(user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is *tree.Tree as t = d.t;
+    let is i64 as w = d.self;
+    if (tree.is_valid(t, w) == 0 || tree.is_enabled(t, w) == 0 || tree.is_visible(t, w) == 0) { return; }
+    _click(t, w, d);
+}
+
+fn _bind_key(t as *tree.Tree, r as *router.Router, b as i64, k as i32) as i32 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0) { return 0; }
+    if (d.key_id != 0) { router.remove_shortcut(d.r, d.key_id); }
+    d.r = r;
+    d.key_id = router.add_shortcut(r, k, 0, fn_ptr(_on_key), cast(*u8, d));
+    return cast(i32, d.key_id != 0);
+}
+
+// The window's default button: it answers Enter wherever the focus is,
+// unless a focused button takes Enter itself, and is drawn in the accent.
+// The tree and the router must outlive it. 1, or 0 when the router's table
+// is full.
+fn set_default(t as *tree.Tree, r as *router.Router, b as i64) as i32 {
+    if (_bind_key(t, r, b, keys.RETURN) == 0) { return 0; }
+    let is *Data as d = _data(t, b);
+    d.is_default = 1;
+    d.variant = SUGGESTED;
+    _repaint(t, b);
+    return 1;
+}
+
+// The window's cancel button: it answers Escape wherever the focus is.
+fn set_cancel(t as *tree.Tree, r as *router.Router, b as i64) as i32 {
+    return _bind_key(t, r, b, keys.ESCAPE);
+}
+
+// Alt and its label's mnemonic letter, from now on, focus and click it. 1, or
+// 0 when it holds no label with a mnemonic.
+fn bind_mnemonic(t as *tree.Tree, r as *router.Router, b as i64) as i32 {
+    let is *Data as d = _data(t, b);
+    if (cast(i64, d) == 0) { return 0; }
+    return label.bind_mnemonic(t, r, d.content);
+}
+
+// --- Clicking ---
+
+fn _click(t as *tree.Tree, w as i64, d as *Data) as void {
+    if (d.toggle == 1) {
+        d.active = 1 - d.active;
+        _repaint(t, w);
+        signal.emit(t, w, signal.TOGGLED, cast(*u8, 0));
+        if (tree.is_valid(t, w) == 0) { return; }
+    }
+    if (d.variant == LINK) {
+        d.visited = 1;
+        signal.emit(t, w, signal.ACTIVATED, d.uri);
+        if (tree.is_valid(t, w) == 0) { return; }
+    }
+    signal.emit(t, w, signal.CLICKED, cast(*u8, 0));
+}
+
+fn _inside(t as *tree.Tree, w as i64, e as *event.Event) as i32 {
+    let is math.rect.Rect as r = layout.rect(t, w);
+    return cast(i32, e.local_x >= 0.0 && e.local_y >= 0.0 && e.local_x < r.w && e.local_y < r.h);
+}
+
+// Whether a key is Space or Enter with no modifier that makes it another.
+fn _plain(e as *event.Event) as i32 {
+    return cast(i32, (e.mods & (keys.MOD_CONTROL | keys.MOD_ALT)) == 0);
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as k = e.kind;
+    if (k == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        d.pressing = 1;
+        d.out = 0;
+        _repaint(t, w);
+        return 1;
+    }
+    if (k == event.POINTER_MOVE) {
+        if (d.pressing == 0) { return 0; }
+        let is i32 as out = 1 - _inside(t, w, e);
+        if (out != d.out) {
+            d.out = out;
+            _repaint(t, w);
+        }
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (d.pressing == 0) { return 0; }
+        d.pressing = 0;
+        _repaint(t, w);
+        if (k == event.POINTER_UP && _inside(t, w, e) == 1) { _click(t, w, d); }
+        return 1;
+    }
+    if (k == event.SHORTCUT_OVERRIDE) {
+        // Space and Enter are its own while it has the focus, ahead of the
+        // window's default button.
+        return cast(i64, _plain(e) == 1 && (e.key == keys.SPACE || e.key == keys.RETURN));
+    }
+    if (k == event.KEY_DOWN) {
+        if (_plain(e) == 0) { return 0; }
+        if (e.key == keys.SPACE) {
+            if (d.held == 0) {
+                d.held = 1;
+                _repaint(t, w);
+            }
+            return 1;
+        }
+        if (e.key == keys.RETURN) {
+            if (e.repeat == 0) { _click(t, w, d); }
+            return 1;
+        }
+        return 0;
+    }
+    if (k == event.KEY_UP) {
+        if (e.key != keys.SPACE || d.held == 0) { return 0; }
+        d.held = 0;
+        _repaint(t, w);
+        _click(t, w, d);
+        return 1;
+    }
+    if (k == event.FOCUS_OUT) {
+        if (d.held == 1) {
+            d.held = 0;
+            _repaint(t, w);
+        }
+        return 0;
+    }
+    if (k == event.ACTIVATE) {
+        _click(t, w, d);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Laying out ---
+
+fn _pad_x(t as *tree.Tree, d as *Data, th as *style.Theme) as f64 {
+    if (d.variant == LINK) { return 0.0; }
+    return th.metrics.control_pad_x;
+}
+
+fn _pad_y(t as *tree.Tree, d as *Data, th as *style.Theme) as f64 {
+    if (d.variant == LINK) { return 0.0; }
+    return th.metrics.control_pad_y;
+}
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as px = _pad_x(t, d, &th);
+    let is f64 as py = _pad_y(t, d, &th);
+    let is geom.Size as cs;
+    geom.size_zero(&cs);
+    let is i64 as ch = tree.first_child(t, w);
+    if (ch != 0) {
+        let is geom.Constraint as ic with mut = *c;
+        if (ic.w < layout.UNBOUNDED) { ic.w = _max(0.0, ic.w - 2.0 * px); }
+        if (ic.h < layout.UNBOUNDED) { ic.h = _max(0.0, ic.h - 2.0 * py); }
+        layout.measure(t, ch, &ic, &cs);
+    }
+    out.min_w = cs.min_w + 2.0 * px;
+    out.pref_w = cs.pref_w + 2.0 * px;
+    out.min_h = cs.min_h + 2.0 * py;
+    out.pref_h = cs.pref_h + 2.0 * py;
+    if (d.variant != LINK) {
+        out.min_h = _max(out.min_h, th.metrics.control_height);
+        out.pref_h = _max(out.pref_h, th.metrics.control_height);
+    }
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is i64 as ch = tree.first_child(t, w);
+    if (ch == 0) { return; }
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as px = _pad_x(t, d, &th);
+    let is f64 as py = _pad_y(t, d, &th);
+    let is math.rect.Rect as area = math.rect.rect(px, py, _max(0.0, r.w - 2.0 * px), _max(0.0, r.h - 2.0 * py));
+    layout.place(t, ch, &area);
+}
+
+// --- Drawing ---
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *style.Theme as th = p.theme;
+    if (d.variant == LINK) {
+        let is math.color.Color as col with mut = th.palette.link;
+        if (painter.has(p, painter.S_DISABLED) == 1) {
+            col = style.with_alpha(col, col.a * th.control.disabled_alpha);
+        }
+        p.fg = col;
+        return;
+    }
+    let is style.Variants as v with mut = th.control;
+    if (d.variant == SUGGESTED) { v = th.suggested; }
+    if (d.variant == DESTRUCTIVE) { v = th.destructive; }
+    if (d.variant == FLAT) {
+        v.normal.bg = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+        v.normal.border = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+    }
+    // Pressed while the pointer is still on it, or Space is held; pressed
+    // and left, at rest — the router keeps the hover on what it captured.
+    let is i64 as state with mut = p.state | painter.S_PRESSED;
+    if (is_down(t, w) == 0) { state = state - painter.S_PRESSED; }
+    if (d.pressing == 1 && d.out == 1 && (state & painter.S_HOVER) != 0) { state = state - painter.S_HOVER; }
+    let is style.Look as look = style.pick(&v, state, cast(i32, d.toggle == 1 && d.active == 1));
+    let is f64 as rad = th.metrics.radius_m;
+    let is math.rect.Rect as rc = p.rect;
+    if (look.bg.a > 0.0) { shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, look.bg); }
+    if (look.border.a > 0.0 && th.metrics.border_width > 0.0) {
+        shapes.stroke_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.metrics.border_width,
+                              look.border);
+    }
+    p.fg = look.fg;
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        q.actions = access.PRESS;
+        if (d.toggle == 1) {
+            q.role = access.ROLE_TOGGLE_BUTTON;
+            q.actions = q.actions | access.TOGGLE;
+            q.states = q.states | access.CHECKABLE;
+            if (d.active == 1) { q.states = q.states | access.PRESSED; }
+        }
+        if (d.is_default == 1) { q.states = q.states | access.DEFAULT; }
+        if (d.visited == 1) { q.states = q.states | access.VISITED; }
+        return 1;
+    }
+    if (q.action == access.PRESS || q.action == access.TOGGLE) {
+        _click(t, w, d);
+        return 1;
+    }
+    return 0;
+}
