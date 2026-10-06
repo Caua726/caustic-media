@@ -1,0 +1,385 @@
+// ui/widgets/decoration_test.cst — a window's frame drawn by the toolkit:
+// its shadow outside the window's geometry, a header bar across its top,
+// edges and corners to resize it by; maximized, full screen, tiled; what the
+// platform is told of it; drawn.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../math/math.cst" as math;
+use "../../gpu/gpu.cst" as gpu;
+use "../../render/draw2d.cst" as draw2d;
+use "../../text/sfnt/sfnt.cst" as sfnt;
+use "../../text/sfnt/table.cst" as table;
+use "../../text/layout/font.cst" as font;
+use "../tree.cst" as tree;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../damage.cst" as damage;
+use "../paint.cst" as paint;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../text.cst" as text;
+use "headerbar.cst" as headerbar;
+use "button.cst" as button;
+use "../box.cst" as box;
+use "../scroll.cst" as scroll;
+use "decoration.cst" as decoration;
+
+let is i64 as W with imut = 400;
+let is i64 as H with imut = 300;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is *text.Service as svc with mut;
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as cmd with mut = 0;
+let is [120000]i32 as px with mut;
+
+let is i32 as window_active with mut = 1;
+
+fn frame(t as *tree.Tree, c as *draw2d.Canvas) as void {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    damage.collect(t);
+    text.next_frame(svc);
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    let is paint.Options as o with mut = paint.options(&theme);
+    o.active = window_active;
+    o.see_through = 1;
+    let is paint.Stats as st;
+    paint.frame(t, c, &o, &st);
+    gpu.command.begin(&dv, cmd);
+    // Cleared to nothing: what is outside the window shows through.
+    let is gpu.command.Pass as ps = gpu.command.pass(target, 0, math.color.rgba(0.0, 0.0, 0.0, 0.0));
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    tree.damage_clear(t);
+}
+
+fn ch(x as i64, y as i64, c as i64) as i64 { return cast(i64, cast(*u8, &px)[(y * W + x) * 4 + c]); }
+
+fn widget_repaint(t as *tree.Tree, w as i64) as void { tree.invalidate_paint_subtree(t, w); }
+
+fn tree_for() as tree.Tree {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_text_service(&t, cast(*u8, svc));
+    return t;
+}
+
+fn near(a as f64, b as f64) as i32 {
+    let is f64 as d = a - b;
+    return cast(i32, d < 0.01 && d > 0.0 - 0.01);
+}
+
+fn rect_is(r as math.rect.Rect, x as f64, y as f64, w as f64, h as f64) as i32 {
+    if (near(r.x, x) == 1 && near(r.y, y) == 1 && near(r.w, w) == 1 && near(r.h, h) == 1) { return 1; }
+    io.printf("  rect %d,%d %dx%d\n", cast(i64, r.x), cast(i64, r.y), cast(i64, r.w), cast(i64, r.h));
+    return 0;
+}
+
+let is [16]i64 as ops with mut;
+let is [16]f64 as op_x with mut;
+let is [16]f64 as op_y with mut;
+let is i64 as nops with mut = 0;
+
+fn on_op(user as *u8, op as i32, x as f64, y as f64) as void {
+    if (nops < 16) {
+        ops[nops] = cast(i64, op);
+        op_x[nops] = x;
+        op_y[nops] = y;
+    }
+    nops = nops + 1;
+}
+
+fn press(t as *tree.Tree, r as *router.Router, x as f64, y as f64, time as i64) as void {
+    router.pointer_move(t, r, x, y, time);
+    router.pointer_button(t, r, 1, 1, x, y, time);
+    router.pointer_button(t, r, 1, 0, x, y, time + 1);
+}
+
+fn shape_at(t as *tree.Tree, r as *router.Router, x as f64, y as f64, time as i64) as i32 {
+    router.pointer_move(t, r, x, y, time);
+    return router.pointer_shape(t, r);
+}
+
+// --- Laid out ---
+
+fn laid() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as w = decoration.create(&t, tree.root(&t));
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is i64 as hb = decoration.header_of(&t, w);
+    let is i64 as ct = decoration.content_of(&t, w);
+    let is f64 as hh = layout.window_rect(&t, hb).h;
+    check("made: a header bar, a place for what it holds", w != 0 && hb != 0 && ct != 0 && headerbar.title(&t, hb) != 0 && hh > 20.0);
+    let is math.rect.Rect as g = decoration.geometry(&t, w);
+    check("the window inside its shadow", rect_is(g, 24.0, 24.0, 352.0, 252.0) == 1);
+    let is decoration.Extents as e = decoration.extents(&t, w);
+    check("the shadow's reach each way", e.left == 24.0 && e.right == 24.0 && e.top == 24.0 && e.bottom == 24.0);
+    check("the header across its top", rect_is(layout.window_rect(&t, hb), 24.0, 24.0, 352.0, hh) == 1);
+    check("what it holds under it", rect_is(layout.window_rect(&t, ct), 24.0, 24.0 + hh, 352.0, 252.0 - hh) == 1);
+    check("input: the window and the edges' reach outside it", rect_is(decoration.input(&t, w), 16.0, 16.0, 368.0, 268.0) == 1);
+    // The edges: the sides between the corners, a corner's handle each way
+    // from it, reaching 8 outside and 4 inside.
+    check("top", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.N)), 40.0, 16.0, 320.0, 12.0) == 1);
+    check("bottom", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.S)), 40.0, 272.0, 320.0, 12.0) == 1);
+    check("left", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.W)), 16.0, 40.0, 12.0, 220.0) == 1);
+    check("right", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.E)), 372.0, 40.0, 12.0, 220.0) == 1);
+    check("top left", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.NW)), 16.0, 16.0, 24.0, 24.0) == 1);
+    check("top right", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.NE)), 360.0, 16.0, 24.0, 24.0) == 1);
+    check("bottom right", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.SE)), 360.0, 260.0, 24.0, 24.0) == 1);
+    check("bottom left", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.SW)), 16.0, 260.0, 24.0, 24.0) == 1);
+    check("eight of them", decoration.grip(&t, w, 8) == 0 && decoration.grip(&t, w, 0 - 1) == 0);
+    // Something in it with a least and a size of its own.
+    let is i64 as kept = box.create(&t, ct, box.COLUMN);
+    let is i64 as fixed = button.create(&t, kept, "Fixed", 5);
+    let is i64 as sc = scroll.create(&t, kept);
+    button.create(&t, sc, "Scrolled", 8);
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(&t, w, &free, &s);
+    let is geom.Size as hs;
+    layout.measure(&t, hb, &free, &hs);
+    let is geom.Size as cs;
+    layout.measure(&t, ct, &free, &cs);
+    let is f64 as wide with mut = hs.pref_w;
+    if (cs.pref_w > wide) { wide = cs.pref_w; }
+    check("what it holds has a least and more", cs.min_h > 0.0 && cs.pref_h > cs.min_h && fixed != 0);
+    check("its size: the header's and what it holds, the shadow round them", near(s.pref_w, 48.0 + wide) == 1 &&
+          near(s.pref_h, 48.0 + hs.pref_h + cs.pref_h) == 1 && near(s.min_h, 48.0 + hs.pref_h + cs.min_h) == 1 &&
+          s.min_h >= hh + 48.0 && s.min_w >= 48.0);
+    tree.close(&t);
+}
+
+// --- Its edges: the pointer's shape over them, a press resizing ---
+
+fn edged() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    tree.set_window_ops(&t, fn_ptr(on_op), cast(*u8, 0));
+    let is i64 as w = decoration.create(&t, tree.root(&t));
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("over the top edge, even on the header", shape_at(&t, &r, 200.0, 26.0, 10) == tree.SHAPE_N_RESIZE);
+    check("just outside it", shape_at(&t, &r, 200.0, 18.0, 20) == tree.SHAPE_N_RESIZE);
+    check("bottom", shape_at(&t, &r, 200.0, 280.0, 30) == tree.SHAPE_S_RESIZE);
+    check("left and right", shape_at(&t, &r, 20.0, 150.0, 40) == tree.SHAPE_W_RESIZE &&
+          shape_at(&t, &r, 378.0, 150.0, 50) == tree.SHAPE_E_RESIZE);
+    check("the corners", shape_at(&t, &r, 20.0, 20.0, 60) == tree.SHAPE_NW_RESIZE && shape_at(&t, &r, 380.0, 20.0, 70) == tree.SHAPE_NE_RESIZE &&
+          shape_at(&t, &r, 380.0, 280.0, 80) == tree.SHAPE_SE_RESIZE && shape_at(&t, &r, 20.0, 280.0, 90) == tree.SHAPE_SW_RESIZE);
+    check("a corner's handle along its sides", shape_at(&t, &r, 35.0, 18.0, 100) == tree.SHAPE_NW_RESIZE &&
+          shape_at(&t, &r, 18.0, 35.0, 110) == tree.SHAPE_NW_RESIZE);
+    check("past the edges' reach, in the shadow: nothing of theirs", shape_at(&t, &r, 5.0, 150.0, 120) != tree.SHAPE_W_RESIZE);
+    nops = 0;
+    press(&t, &r, 200.0, 18.0, 200);
+    press(&t, &r, 380.0, 280.0, 300);
+    press(&t, &r, 20.0, 150.0, 400);
+    check("pressed: resized from there, where it was pressed", nops == 3 && ops[0] == tree.WIN_RESIZE_N && op_x[0] == 200.0 &&
+          op_y[0] == 18.0 && ops[1] == tree.WIN_RESIZE_SE && ops[2] == tree.WIN_RESIZE_W);
+    nops = 0;
+    press(&t, &r, 380.0, 20.0, 500);
+    press(&t, &r, 20.0, 20.0, 600);
+    press(&t, &r, 20.0, 280.0, 700);
+    press(&t, &r, 378.0, 150.0, 800);
+    press(&t, &r, 200.0, 280.0, 900);
+    check("each edge its own", nops == 5 && ops[0] == tree.WIN_RESIZE_NE && ops[1] == tree.WIN_RESIZE_NW &&
+          ops[2] == tree.WIN_RESIZE_SW && ops[3] == tree.WIN_RESIZE_E && ops[4] == tree.WIN_RESIZE_S);
+    nops = 0;
+    router.pointer_move(&t, &r, 200.0, 280.0, 950);
+    router.pointer_button(&t, &r, 1, 1, 200.0, 280.0, 950);
+    let is i64 as on_press = nops;
+    router.pointer_move(&t, &r, 210.0, 290.0, 955);
+    router.pointer_button(&t, &r, 1, 0, 210.0, 290.0, 960);
+    check("asked once, on the press", on_press == 1 && nops == 1);
+    nops = 0;
+    router.pointer_move(&t, &r, 200.0, 18.0, 1000);
+    router.pointer_button(&t, &r, 3, 1, 200.0, 18.0, 1000);
+    router.pointer_button(&t, &r, 3, 0, 200.0, 18.0, 1001);
+    check("another button: nothing", nops == 0);
+    // The header still moves it.
+    let is math.rect.Rect as hr = layout.window_rect(&t, decoration.header_of(&t, w));
+    router.pointer_move(&t, &r, hr.x + 60.0, hr.y + hr.h / 2.0, 1100);
+    router.pointer_button(&t, &r, 1, 1, hr.x + 60.0, hr.y + hr.h / 2.0, 1100);
+    router.pointer_move(&t, &r, hr.x + 90.0, hr.y + hr.h / 2.0, 1110);
+    router.pointer_button(&t, &r, 1, 0, hr.x + 90.0, hr.y + hr.h / 2.0, 1120);
+    check("the header dragged: moved", nops == 1 && ops[0] == tree.WIN_MOVE);
+    tree.close(&t);
+}
+
+// --- Its states ---
+
+fn stated() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    tree.set_window_ops(&t, fn_ptr(on_op), cast(*u8, 0));
+    let is i64 as w = decoration.create(&t, tree.root(&t));
+    let is i64 as hb = decoration.header_of(&t, w);
+    let is i64 as ct = decoration.content_of(&t, w);
+    // Maximized: the whole window, no shadow, no edges.
+    decoration.set_maximized(&t, w, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is decoration.Extents as e with mut = decoration.extents(&t, w);
+    check("maximized: no shadow", e.left == 0.0 && e.top == 0.0 && e.right == 0.0 && e.bottom == 0.0 &&
+          rect_is(decoration.geometry(&t, w), 0.0, 0.0, 400.0, 300.0) == 1 && rect_is(decoration.input(&t, w), 0.0, 0.0, 400.0, 300.0) == 1);
+    check("nor edges", tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.N)) == 1 &&
+          tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.SE)) == 1 && decoration.is_maximized(&t, w) == 1);
+    check("the header across the whole top, its button restoring", rect_is(layout.window_rect(&t, hb), 0.0, 0.0, 400.0, layout.window_rect(&t, hb).h) == 1 &&
+          headerbar.is_maximized(&t, hb) == 1);
+    nops = 0;
+    press(&t, &r, 200.0, 2.0, 10);
+    check("pressed at its top: not resized", nops == 0 || ops[0] != tree.WIN_RESIZE_N);
+    decoration.set_maximized(&t, w, 0);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("back: its shadow, its edges", decoration.extents(&t, w).top == 24.0 && tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.N)) == 0 &&
+          headerbar.is_maximized(&t, hb) == 0);
+    // Full screen: only what it holds.
+    decoration.set_fullscreen(&t, w, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("full screen: no header, what it holds the whole window", tree.is_hidden_here(&t, hb) == 1 &&
+          rect_is(layout.window_rect(&t, ct), 0.0, 0.0, 400.0, 300.0) == 1 && decoration.extents(&t, w).left == 0.0 &&
+          tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.W)) == 1 && decoration.is_fullscreen(&t, w) == 1);
+    decoration.set_fullscreen(&t, w, 0);
+    // Tiled to the left: no shadow at all, no resizing from that side.
+    decoration.set_tiled(&t, w, decoration.TILED_LEFT);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    e = decoration.extents(&t, w);
+    check("tiled: no shadow", e.left == 0.0 && e.right == 0.0 && e.top == 0.0 && e.bottom == 0.0 &&
+          rect_is(decoration.geometry(&t, w), 0.0, 0.0, 400.0, 300.0) == 1 && decoration.tiled(&t, w) == decoration.TILED_LEFT);
+    check("not resized from the tiled side, from the others", tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.W)) == 1 &&
+          tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.NW)) == 1 && tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.SW)) == 1 &&
+          tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.E)) == 0 && tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.N)) == 0 &&
+          tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.S)) == 0 && tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.SE)) == 0);
+    check("its edges inside the window now", rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.E)), 396.0, 16.0, 12.0, 268.0) == 1 &&
+          rect_is(layout.window_rect(&t, decoration.grip(&t, w, decoration.NE)), 384.0, -8.0, 24.0, 24.0) == 1);
+    check("input: the window", rect_is(decoration.input(&t, w), 0.0, 0.0, 400.0, 300.0) == 1);
+    decoration.set_tiled(&t, w, decoration.TILED_TOP | decoration.TILED_RIGHT | decoration.TILED_BOTTOM | decoration.TILED_LEFT);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("tiled every side: no edges at all", tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.N)) == 1 &&
+          tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.E)) == 1 && tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.S)) == 1 &&
+          tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.SE)) == 1);
+    decoration.set_tiled(&t, w, 0);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("untiled: as it was", decoration.extents(&t, w).right == 24.0 && tree.is_hidden_here(&t, decoration.grip(&t, w, decoration.W)) == 0);
+    check("not a decoration: nothing", decoration.header_of(&t, tree.root(&t)) == 0 && decoration.content_of(&t, tree.root(&t)) == 0 &&
+          decoration.is_maximized(&t, tree.root(&t)) == 0 && decoration.extents(&t, tree.root(&t)).top == 0.0 &&
+          decoration.geometry(&t, tree.root(&t)).w == 0.0 && headerbar.is_maximized(&t, tree.root(&t)) == 0 &&
+          decoration.is_fullscreen(&t, tree.root(&t)) == 0 && decoration.tiled(&t, tree.root(&t)) == 0);
+    tree.close(&t);
+}
+
+// --- Drawn ---
+
+fn drawn() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as w = decoration.create(&t, tree.root(&t));
+    let is draw2d.Limits as limits = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &limits);
+    frame(&t, &c);
+    let is i64 as hb = decoration.header_of(&t, w);
+    let is math.rect.Rect as hr = layout.window_rect(&t, hb);
+    check("its shadow outside the window: dark, part seen through", ch(200, 290, 3) > 0 && ch(200, 290, 3) < 255 &&
+          ch(200, 290, 0) < 60);
+    check("further out, less of it", ch(200, 298, 3) < ch(200, 290, 3));
+    check("more below than above: a light from above", ch(200, 282, 3) > ch(200, 18, 3));
+    check("beside it: the shadow, not the window", ch(390, 150, 3) < 255);
+    check("a line round it", ch(24, 150, 0) < ch(30, 150, 0));
+    check("nothing far from it: a corner of the buffer", ch(1, 1, 3) < 20);
+    check("the window inside: opaque, the window's colour", ch(200, 200, 3) == 255 && ch(200, 200, 0) > 200);
+    check("its top corner rounded: the header not there", ch(25, 25, 1) < ch(40, 30, 1) || ch(25, 25, 3) < 255);
+    check("the header's colour by it", ch(60, cast(i64, hr.y + 4.0), 3) == 255);
+    // Inactive: a lighter shadow.
+    let is i32 as active = cast(i32, ch(200, 290, 3));
+    window_active = 0;
+    widget_repaint(&t, w);
+    frame(&t, &c);
+    check("not the active window: a lighter shadow", cast(i32, ch(200, 290, 3)) < active);
+    window_active = 1;
+    decoration.set_maximized(&t, w, 1);
+    frame(&t, &c);
+    check("maximized: to its very corner", ch(1, 1, 3) == 255 && ch(200, 298, 3) == 255);
+    check("no line round it then", ch(0, 150, 0) == ch(30, 150, 0));
+    draw2d.close(&c);
+    let is tree.Access as q;
+    access.describe(&t, cast(*router.Router, 0), decoration.grip(&t, w, decoration.N), &q);
+    check("its edges: nothing to tell, nothing to focus", q.role == access.ROLE_NONE && tree.is_focusable(&t, decoration.grip(&t, w, decoration.N)) == 0);
+    tree.close(&t);
+}
+
+fn main() as i32 {
+    let is *u8 as d = load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 1;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    theme = style.light();
+    theme.fonts.body.size = 16.0;
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is text.Limits as lim = text.limits_default();
+    svc = text.open(&dv, &lim, fn_ptr(resolve), cast(*u8, 0), theme.fonts.family);
+
+    laid();
+    edged();
+    stated();
+    drawn();
+
+    if (fails == 0) {
+        io.printf("decoration: %d checks passed\n", checks);
+        return 0;
+    }
+    io.printf("decoration: %d of %d checks failed\n", fails, checks);
+    return 1;
+}

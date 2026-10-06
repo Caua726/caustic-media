@@ -1,0 +1,372 @@
+// ui/widgets/decoration.cst — a window's frame, drawn by the toolkit.
+//
+// Where the desktop does not decorate the window — GNOME's Wayland
+// compositor never does, and a program may ask it not to on X11 — the window
+// draws its own (client-side decoration): a shadow around it, its corners
+// rounded, a header bar across its top (headerbar.cst), and edges and corners
+// to resize it by. The window's buffer is larger than the window as the
+// desktop counts it: the shadow lies outside its geometry (geometry(),
+// extents() — what the platform is told, _GTK_FRAME_EXTENTS,
+// xdg_surface.set_window_geometry) and outside where it takes the pointer
+// (input()), but for the reach of its edges just beyond it.
+//
+// Over an edge or a corner the pointer is the resize cursor for it, a corner
+// taking CORNER of each side by it; pressed there, the window is asked to
+// resize from it (tree.window_op, WIN_RESIZE_*), the platform following the
+// pointer from then on. The edges lie over the header's top and what the
+// window holds, so they reach a few pixels inside it too.
+//
+// As the platform says: maximized — no shadow, no rounding, no edges, the
+// header's maximize button a restoring one; full screen — only what it holds;
+// tiled to an edge (TILED_*) — no shadow or rounding at all, and no resizing
+// from the tiled sides. Not the active window, its shadow is lighter.
+use "../../math/math.cst" as math;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../box.cst" as box;
+use "headerbar.cst" as headerbar;
+
+// Its edges and corners, north and round clockwise.
+let is i32 as N  with imut = 0;
+let is i32 as NE with imut = 1;
+let is i32 as E  with imut = 2;
+let is i32 as SE with imut = 3;
+let is i32 as S  with imut = 4;
+let is i32 as SW with imut = 5;
+let is i32 as W  with imut = 6;
+let is i32 as NW with imut = 7;
+
+// The sides it is tiled to, a bit each.
+let is i32 as TILED_TOP    with imut = 1;
+let is i32 as TILED_RIGHT  with imut = 2;
+let is i32 as TILED_BOTTOM with imut = 4;
+let is i32 as TILED_LEFT   with imut = 8;
+
+let is f64 as SHADOW   with imut = 24.0;   // its reach beyond the window
+let is f64 as GRIP_OUT with imut = 8.0;    // an edge's reach into it
+let is f64 as GRIP_IN  with imut = 4.0;    // and inside the window
+let is f64 as CORNER   with imut = 16.0;   // a corner's along each side
+
+// How far the buffer reaches past the window each way.
+struct Extents {
+    left   as f64;
+    right  as f64;
+    top    as f64;
+    bottom as f64;
+}
+
+struct Data {
+    header     as i64;
+    content    as i64;
+    grips      as [8]i64;
+    maximized  as i32;
+    fullscreen as i32;
+    tiled      as i32;
+    _pad0      as i32;
+}
+
+struct Grip {
+    owner as i64;
+    edge  as i32;
+    _pad0 as i32;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _grip_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("decoration", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _grip_kind = widget.kind("resize edge", sizeof(Grip));
+    _grip_kind.event = fn_ptr(_grip_event);
+    _grip_kind.shape = fn_ptr(_grip_shape);
+    _ready = 1;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// A new frame filling parent — the tree's root, usually — a header bar
+// across its top and a column under it for what the window holds. Its
+// handle, or 0.
+fn create(t as *tree.Tree, parent as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.header = headerbar.create(t, w);
+    d.content = box.create(t, w, box.COLUMN);
+    if (d.header == 0 || d.content == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    // The sides first, then the corners: the last made are found first.
+    let is i64 as k with mut = 0;
+    while (k < 8) {
+        let is i32 as edge with mut = cast(i32, k * 2);
+        if (k >= 4) { edge = cast(i32, (k - 4) * 2 + 1); }
+        let is i64 as g = tree.create(t, &_grip_kind, w);
+        if (g == 0) {
+            tree.destroy(t, w);
+            return 0;
+        }
+        let is *Grip as gd = cast(*Grip, tree.data(t, g));
+        gd.owner = w;
+        gd.edge = edge;
+        d.grips[edge] = g;
+        k = k + 1;
+    }
+    return w;
+}
+
+fn header_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.header;
+}
+
+fn content_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.content;
+}
+
+// Edge or corner which's handle; 0 for none.
+fn grip(t as *tree.Tree, w as i64, which as i32) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || which < 0 || which > 7) { return 0; }
+    return d.grips[which];
+}
+
+// --- Its states ---
+
+fn _shadowed(d as *Data) as i32 { return cast(i32, d.maximized == 0 && d.fullscreen == 0 && d.tiled == 0); }
+
+// Which handles there are: none maximized or full screen, none on a tiled
+// side, a corner only where neither side by it is tiled.
+fn _grips(t as *tree.Tree, w as i64, d as *Data) as void {
+    let is i32 as any = cast(i32, d.maximized == 0 && d.fullscreen == 0);
+    let is [4]i32 as side;
+    side[0] = cast(i32, any == 1 && (d.tiled & TILED_TOP) == 0);
+    side[1] = cast(i32, any == 1 && (d.tiled & TILED_RIGHT) == 0);
+    side[2] = cast(i32, any == 1 && (d.tiled & TILED_BOTTOM) == 0);
+    side[3] = cast(i32, any == 1 && (d.tiled & TILED_LEFT) == 0);
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        tree.set_visible(t, d.grips[k * 2], side[k]);
+        tree.set_visible(t, d.grips[k * 2 + 1], cast(i32, side[k] == 1 && side[(k + 1) % 4] == 1));
+        k = k + 1;
+    }
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+fn set_maximized(t as *tree.Tree, w as i64, on as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.maximized = on;
+    headerbar.set_maximized(t, d.header, on);
+    _grips(t, w, d);
+}
+
+fn is_maximized(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.maximized;
+}
+
+// Full screen: only what it holds, no header.
+fn set_fullscreen(t as *tree.Tree, w as i64, on as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.fullscreen = on;
+    tree.set_visible(t, d.header, 1 - on);
+    _grips(t, w, d);
+}
+
+fn is_fullscreen(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.fullscreen;
+}
+
+// The sides it is tiled to (TILED_*), 0 for none.
+fn set_tiled(t as *tree.Tree, w as i64, sides as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.tiled = sides;
+    _grips(t, w, d);
+}
+
+fn tiled(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.tiled;
+}
+
+// --- What the platform is told ---
+
+fn _extents_of(d as *Data) as Extents {
+    let is Extents as e;
+    let is f64 as s with mut = 0.0;
+    if (_shadowed(d) == 1) { s = SHADOW; }
+    e.left = s;
+    e.right = s;
+    e.top = s;
+    e.bottom = s;
+    return e;
+}
+
+fn extents(t as *tree.Tree, w as i64) as Extents {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) {
+        let is Extents as z;
+        z.left = 0.0;
+        z.right = 0.0;
+        z.top = 0.0;
+        z.bottom = 0.0;
+        return z;
+    }
+    return _extents_of(d);
+}
+
+// The window as the desktop counts it, in the window's coordinates.
+fn geometry(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    let is Extents as e = _extents_of(d);
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    return math.rect.rect(r.x + e.left, r.y + e.top, r.w - e.left - e.right, r.h - e.top - e.bottom);
+}
+
+// Where it takes the pointer: the window, and its edges' reach beyond.
+fn input(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    let is math.rect.Rect as g = geometry(t, w);
+    if (_shadowed(d) == 0) { return g; }
+    return math.rect.rect(g.x - GRIP_OUT, g.y - GRIP_OUT, g.w + 2.0 * GRIP_OUT, g.h + 2.0 * GRIP_OUT);
+}
+
+// --- Laid out ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _pref(t as *tree.Tree, w as i64) as geom.Size {
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, w, &free, &s);
+    return s;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is Extents as e = _extents_of(d);
+    let is geom.Size as hs = _pref(t, d.header);
+    let is geom.Size as cs = _pref(t, d.content);
+    let is f64 as across = e.left + e.right;
+    let is f64 as down = e.top + e.bottom;
+    geom.size_zero(out);
+    out.pref_w = across + _max(hs.pref_w, cs.pref_w);
+    out.pref_h = down + hs.pref_h + cs.pref_h;
+    out.min_w = across + _max(hs.min_w, cs.min_w);
+    out.min_h = down + hs.pref_h + cs.min_h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _place(t as *tree.Tree, ch as i64, x as f64, y as f64, w as f64, h as f64) as void {
+    let is math.rect.Rect as at = math.rect.rect(x, y, w, h);
+    layout.place(t, ch, &at);
+}
+
+// The header across the window's top, what it holds under it, the handles
+// over both at the window's edges.
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is Extents as e = _extents_of(d);
+    let is f64 as vx = e.left;
+    let is f64 as vy = e.top;
+    let is f64 as vw = _max(0.0, r.w - e.left - e.right);
+    let is f64 as vh = _max(0.0, r.h - e.top - e.bottom);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as round with mut = 0.0;
+    if (_shadowed(d) == 1) { round = th.metrics.radius_l; }
+    headerbar.set_rounding(t, d.header, round);
+    let is f64 as hh with mut = 0.0;
+    if (d.fullscreen == 0) {
+        hh = _pref(t, d.header).pref_h;
+        _place(t, d.header, vx, vy, vw, hh);
+    }
+    _place(t, d.content, vx, vy + hh, vw, _max(0.0, vh - hh));
+    let is f64 as o = GRIP_OUT;
+    let is f64 as i = GRIP_IN;
+    let is f64 as c = CORNER;
+    _place(t, d.grips[N], vx + c, vy - o, _max(0.0, vw - 2.0 * c), o + i);
+    _place(t, d.grips[S], vx + c, vy + vh - i, _max(0.0, vw - 2.0 * c), o + i);
+    _place(t, d.grips[W], vx - o, vy + c, o + i, _max(0.0, vh - 2.0 * c));
+    _place(t, d.grips[E], vx + vw - i, vy + c, o + i, _max(0.0, vh - 2.0 * c));
+    _place(t, d.grips[NW], vx - o, vy - o, o + c, o + c);
+    _place(t, d.grips[NE], vx + vw - c, vy - o, o + c, o + c);
+    _place(t, d.grips[SE], vx + vw - c, vy + vh - c, o + c, o + c);
+    _place(t, d.grips[SW], vx - o, vy + vh - c, o + c, o + c);
+}
+
+// --- Drawn ---
+
+// Its shadow, lighter when the window is not the active one, then the
+// window's colour inside its rounded corners, and a line round it.
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *style.Theme as th = p.theme;
+    let is Extents as e = _extents_of(d);
+    let is f64 as x = p.rect.x + e.left;
+    let is f64 as y = p.rect.y + e.top;
+    let is f64 as vw = p.rect.w - e.left - e.right;
+    let is f64 as vh = p.rect.h - e.top - e.bottom;
+    let is f64 as rr with mut = 0.0;
+    if (_shadowed(d) == 1) {
+        rr = th.metrics.radius_l;
+        let is style.Shadow as sh = th.metrics.shadow_l;
+        let is math.color.Color as col with mut = sh.color;
+        if (painter.has(p, painter.S_BACKDROP) == 1) { col = style.with_alpha(col, col.a * 0.5); }
+        shapes.shadow(p.canvas, x + sh.x, y + sh.y, vw, vh, rr, sh.blur, col);
+    }
+    shapes.fill_rounded(p.canvas, x, y, vw, vh, rr, rr, rr, rr, th.palette.window_bg);
+    if (_shadowed(d) == 1 && th.metrics.border_width > 0.0) {
+        shapes.stroke_rounded(p.canvas, x, y, vw, vh, rr, rr, rr, rr, th.metrics.border_width,
+                              style.with_alpha(th.palette.fg, 0.12));
+    }
+}
+
+// --- Its edges ---
+
+fn _grip_shape(t as *tree.Tree, w as i64, data as *u8, p as *math.vec.Vec2) as i32 {
+    let is i32 as edge = cast(*Grip, data).edge;
+    if (edge == N) { return tree.SHAPE_N_RESIZE; }
+    if (edge == NE) { return tree.SHAPE_NE_RESIZE; }
+    if (edge == E) { return tree.SHAPE_E_RESIZE; }
+    if (edge == SE) { return tree.SHAPE_SE_RESIZE; }
+    if (edge == S) { return tree.SHAPE_S_RESIZE; }
+    if (edge == SW) { return tree.SHAPE_SW_RESIZE; }
+    if (edge == W) { return tree.SHAPE_W_RESIZE; }
+    return tree.SHAPE_NW_RESIZE;
+}
+
+fn _grip_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    if (e.kind != event.POINTER_DOWN || e.button != 1) { return 0; }
+    tree.window_op(t, tree.WIN_RESIZE_N + cast(*Grip, data).edge, e.x, e.y);
+    return 1;
+}

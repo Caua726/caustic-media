@@ -1031,6 +1031,25 @@ own menu where it was pressed. Drawn in the header's colour over a line, all
 mirrored in right to left; told as a title bar named by its title, its buttons
 named for what they do.
 
+**Window frames** (`widgets/decoration.cst`, tested by `decoration_test`):
+the client-side decoration itself, for where the desktop draws none — GNOME's
+Wayland compositor, or a program that asks not to have one on X11. A header
+bar across the window's top, rounded with it, a column under it for what the
+window holds, and the window's colour inside rounded corners within a shadow;
+the buffer is larger than the window as the desktop counts it, and
+`geometry()`, `extents()` and `input()` say by how much and where the pointer
+is taken — the window and the edges' reach just beyond it, never the rest of
+the shadow. Eight handles lie over the edges and corners, a corner taking 16
+pixels of each side by it: the pointer is the resize cursor there, and a press
+asks the window, through `tree.window_op`, to resize from that edge
+(WIN_RESIZE_N … WIN_RESIZE_NW). Maximized it has no shadow, rounding or
+edges, and its header's button restores; full screen it is only what it
+holds; tiled to a side (TILED_*) it has no shadow or rounding at all and no
+edge on that side; in an inactive window its shadow is lighter. Painted with
+`paint.Options.see_through`, where every damaged region starts from nothing
+instead of the window's colour (`draw2d.replace_rect`, written, not blended),
+so the shadow lies over whatever is behind the window.
+
 **List views** (`widgets/listview.cst`, tested by `listview_test`): the rows
 of a flat model in a scroll area of their own, each as tall as the first,
 with widgets only for the rows in view and one past them; scrolled, each is
