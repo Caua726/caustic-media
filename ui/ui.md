@@ -490,6 +490,15 @@ moved away from it — says so (`tree.reset_ime`, passed on by the program), so
 that what the input method commits next is not what was given up. FOCUS_IN
 says whether the focus came by keyboard.
 
+The router keeps a text caret's blink (`blink_test`): on for two thirds of the
+desktop's cycle and off for the rest, as GTK draws it, started again by each
+key, text, composition, paste, press and change of focus, and steady again a
+while after the last (`caret_blink_timeout_ms`, ten seconds), since a caret
+blinking in a window nobody types into would keep the machine awake. It says
+when the caret next changes (`next_due`), asks then for the widget typed into
+to be drawn again, and painting asks it whether the caret is off at the
+frame's time (`caret_off`), which widgets hear as `S_CARET_OFF`.
+
 **Signals and models** (`signal.cst`, `model.cst`, tested by `signal_test` and
 `model_test`): callbacks connected per widget and signal, called in connection
 order, with what happens mid-emission decided — connected then is not called,
@@ -794,7 +803,8 @@ a shorter limit cuts the text; a filter lets in only the characters it says
 yes to, typed, pasted or dropped. Read-only it is still selected and copied.
 Focused by the keyboard, all of it is selected. It is laid out again when the
 theme's text changes; eight of the body's ems wide by preference, a line
-tall and padded. Told as an entry, or as password text, editable or
+tall and padded. Its caret blinks, and is not drawn while its window is not
+the active one. Told as an entry, or as password text, editable or
 read-only.
 
 ## For scale

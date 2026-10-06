@@ -72,6 +72,9 @@ struct Settings {
     // One whole on-and-off cycle of a text caret's blink; 0 for a caret that
     // does not blink. Kept here with the other timings the desktop sets.
     caret_blink_ms        as i64;
+    // How long after the last input it goes on blinking before it stays on,
+    // as GTK's does; 0 for ever.
+    caret_blink_timeout_ms as i64;
     tooltip_ms            as i64;   // the pointer held over a widget this long shows its tip
 }
 
@@ -84,6 +87,7 @@ fn settings_default() as Settings {
     s.long_press_mouse = 0;
     s.long_press_ms = 500;
     s.caret_blink_ms = 1200;
+    s.caret_blink_timeout_ms = 10000;
     s.tooltip_ms = 500;
     return s;
 }
@@ -118,6 +122,10 @@ struct Router {
     swallow         as i32;        // the next release follows a long press: no click
     _pad2           as i32;
     inputs          as i64;        // presses and key presses so far
+    now             as i64;        // the time of the last event or tick
+    blink_from      as i64;        // the caret's blink started again then
+    blinking        as i32;        // something takes typing: tree.text_area
+    _pad3           as i32;
     shortcuts       as [64]Shortcut;
     mnemonic_w      as [128]i64;   // widget, 0 for a free slot
     mnemonic_key    as [128]i32;
@@ -153,6 +161,10 @@ fn init(s as Settings) as Router {
     r.swallow = 0;
     r._pad2 = 0;
     r.inputs = 0;
+    r.now = 0;
+    r.blink_from = 0;
+    r.blinking = 0;
+    r._pad3 = 0;
     let is i64 as i with mut = 0;
     while (i < MAX_SHORTCUTS) {
         r.shortcuts[i].key = 0;
@@ -408,6 +420,7 @@ fn _requested(t as *tree.Tree, r as *Router, by_keyboard as i32) as void {
 }
 
 fn pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as void {
+    r.now = time;
     _pointer_move(t, r, x, y, time);
     _requested(t, r, 0);
 }
@@ -473,8 +486,10 @@ fn _context(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as v
 // button is 1 left, 2 middle, 3 right; pressed is 1 down, 0 up.
 fn pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
                   x as f64, y as f64, time as i64) as void {
+    r.now = time;
     _pointer_button(t, r, button, pressed, x, y, time);
     _requested(t, r, 0);
+    if (pressed == 1) { _awake(t, r, time); }
 }
 
 fn _pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
@@ -579,6 +594,7 @@ fn _pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
 // already at its end can leave the rest to an outer one.
 fn scroll(t as *tree.Tree, r as *Router, x as f64, y as f64, dx as f64, dy as f64,
           discrete as i32, time as i64) as void {
+    r.now = time;
     r.pointer_x = x;
     r.pointer_y = y;
     r.pointer_in = 1;
@@ -601,8 +617,11 @@ fn set_source(r as *Router, source as i32) as void { r.source = source; }
 // When a pending long press is due, or -1 — for the loop to wake by, since
 // nothing arrives while a finger is held still.
 fn next_due(r as *Router) as i64 {
-    if (r.lp_armed == 0) { return 0 - 1; }
-    return r.lp_due;
+    let is i64 as best with mut = 0 - 1;
+    if (r.lp_armed == 1) { best = r.lp_due; }
+    let is i64 as b = _blink_due(r);
+    if (b >= 0 && (best < 0 || b < best)) { best = b; }
+    return best;
 }
 
 // Fires a long press due by now: the widget that captured the press hears
@@ -610,6 +629,18 @@ fn next_due(r as *Router) as i64 {
 // happening, and CONTEXT_MENU goes where the press was, bubbling, with button
 // 1. The release that follows is eaten. Returns 1 if it fired.
 fn tick(t as *tree.Tree, r as *Router, now as i64) as i32 {
+    let is i32 as ran with mut = 0;
+    let is i64 as due = _blink_due(r);
+    r.now = now;
+    if (due >= 0 && now >= due) {
+        tree.invalidate_paint(t, tree.text_area(t));
+        ran = 1;
+    }
+    r.blinking = cast(i32, tree.text_area(t) != 0);
+    return ran | _long_press(t, r, now);
+}
+
+fn _long_press(t as *tree.Tree, r as *Router, now as i64) as i32 {
     if (r.lp_armed == 0 || now < r.lp_due) { return 0; }
     r.lp_armed = 0;
     r.swallow = 1;
@@ -629,6 +660,52 @@ fn tick(t as *tree.Tree, r as *Router, now as i64) as i32 {
     e.mods = r.mods;
     _dispatch(t, &e, _hit_scoped(t, r, r.lp_x, r.lp_y));
     return 1;
+}
+
+// --- The caret's blink ---
+//
+// A text caret is on for two thirds of the desktop's cycle and off for the
+// rest, as GTK draws it, counted from the last input — each key, text,
+// composition, paste and press, and each change of focus, starts it again
+// on. A while after the last (caret_blink_timeout_ms) it stays on: a caret
+// blinking in a window nobody types into would keep the machine awake. The
+// router says when it next changes (next_due) and, ticked then, asks for
+// the widget typed into (tree.text_area) to be drawn again; painting asks
+// caret_off for the frame's time, and widgets hear it as S_CARET_OFF.
+
+fn _awake(t as *tree.Tree, r as *Router, time as i64) as void {
+    r.blink_from = time;
+    r.blinking = cast(i32, tree.text_area(t) != 0);
+}
+
+// Whether a caret is off at time now.
+fn caret_off(r as *Router, now as i64) as i32 {
+    let is i64 as p = r.settings.caret_blink_ms;
+    if (p <= 0 || r.blinking == 0) { return 0; }
+    let is i64 as el = now - r.blink_from;
+    let is i64 as limit = r.settings.caret_blink_timeout_ms;
+    if (el < 0 || (limit > 0 && el >= limit)) { return 0; }
+    return cast(i32, el % p >= p * 2 / 3);
+}
+
+// When the caret next goes off or on after the time last known; -1 for
+// never.
+fn _blink_due(r as *Router) as i64 {
+    let is i64 as p = r.settings.caret_blink_ms;
+    if (p <= 0 || r.blinking == 0) { return 0 - 1; }
+    let is i64 as el = r.now - r.blink_from;
+    let is i64 as limit = r.settings.caret_blink_timeout_ms;
+    if (el < 0 || (limit > 0 && el >= limit)) { return 0 - 1; }
+    let is i64 as on = p * 2 / 3;
+    let is i64 as c = el % p;
+    let is i64 as next with mut = el - c + on;
+    if (c >= on) { next = el - c + p; }
+    if (limit > 0 && next >= limit) {
+        // Off at the end: on then, for good.
+        if (c >= on) { return r.blink_from + limit; }
+        return 0 - 1;
+    }
+    return r.blink_from + next;
 }
 
 // --- Modal scope ---
@@ -729,6 +806,7 @@ fn focus(t as *tree.Tree, r as *Router, w as i64, by_keyboard as i32) as i32 {
     // Whoever is on the keyboard has to see where focus went; a click was
     // aimed at something already in view.
     if (w != 0 && by_keyboard == 1) { reveal(t, w); }
+    _awake(t, r, r.now);
     return 1;
 }
 
@@ -844,8 +922,10 @@ fn _plain(mods as i32) as i32 { return (mods | keys.MOD_LOCK) - keys.MOD_LOCK; }
 //   5. if nobody took it, Tab and Shift+Tab move focus.
 fn key(t as *tree.Tree, r as *Router, k as i32, mods as i32, pressed as i32,
        repeat as i32, time as i64) as i32 {
+    r.now = time;
     let is i32 as done = _key(t, r, k, mods, pressed, repeat, time);
     _requested(t, r, 1);
+    if (pressed == 1) { _awake(t, r, time); }
     return done;
 }
 
@@ -906,6 +986,8 @@ fn _key(t as *tree.Tree, r as *Router, k as i32, mods as i32, pressed as i32,
 // Text the user typed, UTF-8 and already composed — dead keys and input
 // methods have done their work below. To the focused widget, bubbling.
 fn text(t as *tree.Tree, r as *Router, s as *u8, len as i64, time as i64) as i32 {
+    r.now = time;
+    _awake(t, r, time);
     let is i64 as f = focused(t, r);
     if (f == 0) { return 0; }
     let is event.Event as e = event.make(event.TEXT, time);
@@ -919,6 +1001,8 @@ fn text(t as *tree.Tree, r as *Router, s as *u8, len as i64, time as i64) as i32
 // Text asked of the clipboard (tree.request_paste) for widget w, given to
 // it as PASTE when it is still there. which is tree.CLIPBOARD or PRIMARY.
 fn paste(t as *tree.Tree, r as *Router, w as i64, which as i32, s as *u8, len as i64, time as i64) as i32 {
+    r.now = time;
+    _awake(t, r, time);
     if (tree.is_valid(t, w) == 0) { return 0; }
     let is event.Event as e = event.make(event.PASTE, time);
     e.text = s;
@@ -933,6 +1017,8 @@ fn paste(t as *tree.Tree, r as *Router, w as i64, which as i32, s as *u8, len as
 // empty when it is over — to the focused widget as PREEDIT. What it
 // commits comes as text().
 fn preedit(t as *tree.Tree, r as *Router, s as *u8, len as i64, cursor as i64, time as i64) as i32 {
+    r.now = time;
+    _awake(t, r, time);
     let is i64 as f = focused(t, r);
     if (f == 0) { return 0; }
     let is event.Event as e = event.make(event.PREEDIT, time);
