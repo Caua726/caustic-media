@@ -764,12 +764,14 @@ widget set applications actually use, done properly, not parity.
 ## Order of work
 
 1. **The tree, the widget table, handles and layout** — testable with geometry
-   alone, before anything is drawn.
+   alone, before anything is drawn. *Done.*
 2. **Event routing**: capture, bubbling, the focus chain — testable with
-   synthetic events.
-3. **Painting and damage**, once `render/draw2d` exists.
+   synthetic events. *Done.*
+3. **Painting and damage**, once `render/draw2d` exists. *Done.*
 4. **The first widgets** — label, button, check, radio, slider, progress — with
-   box, grid and stack, and the light and dark themes.
+   box, grid and stack, and the light and dark themes. *Done, with the text
+   service, the switch, the spin box, the image, links, separators, group
+   boxes and tooltips, each told to assistive technology.*
 5. **The entry**, once `text/` has caret and hit-testing and `input/` delivers
    composed text.
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
