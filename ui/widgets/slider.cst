@@ -1,0 +1,380 @@
+// ui/widgets/slider.cst — a value chosen along a track.
+//
+// A value in a range, held to its step (any value when the step is 0). Its
+// track runs across — or up and down, the least at the bottom — filled from
+// its start to the knob; right to left, a track across runs from the right.
+// A click on the track jumps the value there and the knob follows the
+// pointer until release; a press on the knob drags it from where it was
+// held; Shift and a click move a page towards the click. The arrows move a
+// step (right and up more, mirrored right to left), Page Up and Down a page
+// (ten steps unless set), Home and End to the ends, and the wheel a step a
+// notch, up more. Marks the program gives are drawn below a track across,
+// beside one up and down. VALUE_CHANGED carries the new value, an f64.
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../signal.cst" as signal;
+
+struct Data {
+    value    as f64;
+    min      as f64;
+    max      as f64;
+    step     as f64;
+    page     as f64;   // 0 for ten steps
+    grab     as f64;   // where along it the knob was pressed, from its centre
+    marks    as *f64;  // the program's
+    nmarks   as i64;
+    vertical as i32;
+    dragging as i32;
+}
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("slider", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.role = access.ROLE_SLIDER;
+    _kind.access = fn_ptr(_access);
+    _ready = 1;
+}
+
+// A new slider across, from min to max by step, at min, as the last child of
+// parent. Its handle, or 0 with the tree's last_error set.
+fn create(t as *tree.Tree, parent as i64, min as f64, max as f64, step as f64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.min = min;
+    d.max = max;
+    d.step = step;
+    d.value = min;
+    tree.set_focusable(t, w, 1);
+    return w;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// v held to d's range and step.
+fn _held(d as *Data, v as f64) as f64 {
+    let is f64 as x with mut = v;
+    if (d.step > 0.0) { x = d.min + fm.floor((x - d.min) / d.step + 0.5) * d.step; }
+    if (x > d.max) { x = d.max; }
+    if (x < d.min) { x = d.min; }
+    return x;
+}
+
+// The value set and said; 1 when it changed.
+fn _set(t as *tree.Tree, w as i64, d as *Data, v as f64) as i32 {
+    let is f64 as x = _held(d, v);
+    if (x == d.value) { return 0; }
+    d.value = x;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, &d.value));
+    return 1;
+}
+
+// Its value from now on, held to its range and step, saying VALUE_CHANGED
+// when that changes it. Each setter returns 1, or 0 for a widget that is no
+// slider.
+fn set_value(t as *tree.Tree, w as i64, v as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    _set(t, w, d, v);
+    return 1;
+}
+
+fn value(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return d.value;
+}
+
+// Another range and step, the value held to them; 0 for a range the wrong
+// way round.
+fn set_range(t as *tree.Tree, w as i64, min as f64, max as f64, step as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || max < min) { return 0; }
+    d.min = min;
+    d.max = max;
+    d.step = step;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    _set(t, w, d, d.value);
+    return 1;
+}
+
+// How far Page Up and Down move it; 0 for ten steps.
+fn set_page(t as *tree.Tree, w as i64, page as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.page = page;
+    return 1;
+}
+
+// Up and down rather than across.
+fn set_vertical(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.vertical = on;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return 1;
+}
+
+// Marks at n values the program keeps alive; null and 0 for none.
+fn set_marks(t as *tree.Tree, w as i64, values as *f64, n as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.marks = values;
+    d.nmarks = n;
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return 1;
+}
+
+// --- Where things are ---
+
+fn _range(d as *Data) as f64 { return d.max - d.min; }
+
+// How far along the track the value is, 0 to 1.
+fn _frac(d as *Data, v as f64) as f64 {
+    if (_range(d) <= 0.0) { return 0.0; }
+    return (v - d.min) / _range(d);
+}
+
+fn _rtl(t as *tree.Tree, w as i64, d as *Data) as i32 {
+    return cast(i32, d.vertical == 0 && layout.direction(t, w) == layout.RTL);
+}
+
+// The track in rc, its rectangle: the knob's width in from each end, in
+// the middle of the knob's row or column.
+fn _track_in(d as *Data, rc as math.rect.Rect, k as f64) as math.rect.Rect {
+    let is f64 as th = k / 4.0;
+    if (d.vertical == 1) { return math.rect.rect(rc.x + (k - th) / 2.0, rc.y + k / 2.0, th, rc.h - k); }
+    return math.rect.rect(rc.x + k / 2.0, rc.y + (k - th) / 2.0, rc.w - k, th);
+}
+
+// Where along the track — x across, y up and down — a fraction is.
+fn _at(t as *tree.Tree, w as i64, d as *Data, tr as math.rect.Rect, f as f64) as f64 {
+    if (d.vertical == 1) { return tr.y + tr.h * (1.0 - f); }
+    if (_rtl(t, w, d) == 1) { return tr.x + tr.w * (1.0 - f); }
+    return tr.x + tr.w * f;
+}
+
+// The fraction along the track a point at pos is.
+fn _frac_at(t as *tree.Tree, w as i64, d as *Data, tr as math.rect.Rect, pos as f64) as f64 {
+    let is f64 as f with mut = 0.0;
+    if (d.vertical == 1) {
+        if (tr.h > 0.0) { f = 1.0 - (pos - tr.y) / tr.h; }
+    } else if (tr.w > 0.0) {
+        f = (pos - tr.x) / tr.w;
+        if (_rtl(t, w, d) == 1) { f = 1.0 - f; }
+    }
+    return f;
+}
+
+fn _knob_in(t as *tree.Tree, w as i64, d as *Data, tr as math.rect.Rect, k as f64) as math.rect.Rect {
+    let is f64 as at = _at(t, w, d, tr, _frac(d, d.value));
+    if (d.vertical == 1) { return math.rect.rect(tr.x + tr.w / 2.0 - k / 2.0, at - k / 2.0, k, k); }
+    return math.rect.rect(at - k / 2.0, tr.y + tr.h / 2.0 - k / 2.0, k, k);
+}
+
+fn _k(t as *tree.Tree, w as i64) as f64 {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    return th.metrics.indicator;
+}
+
+// Its track and its knob, in the window; nothing for a widget that is no
+// slider.
+fn track(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    return _track_in(d, layout.window_rect(t, w), _k(t, w));
+}
+
+fn knob(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return math.rect.rect_zero(); }
+    let is f64 as k = _k(t, w);
+    return _knob_in(t, w, d, _track_in(d, layout.window_rect(t, w), k), k);
+}
+
+// --- Laying out ---
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is f64 as k = _k(t, w);
+    let is f64 as across with mut = k;
+    if (d.nmarks > 0) { across = k * 1.5; }
+    if (d.vertical == 1) {
+        out.min_w = across;
+        out.pref_w = across;
+        out.min_h = 3.0 * k;
+        out.pref_h = 10.0 * k;
+    } else {
+        out.min_w = 3.0 * k;
+        out.pref_w = 10.0 * k;
+        out.min_h = across;
+        out.pref_h = across;
+    }
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+// --- Drawing ---
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *style.Theme as th = p.theme;
+    let is f64 as k = th.metrics.indicator;
+    let is math.rect.Rect as tr = _track_in(d, p.rect, k);
+    let is i64 as st with mut = p.state | painter.S_PRESSED;
+    if (d.dragging == 0) { st = st - painter.S_PRESSED; }
+    let is style.Look as empty = style.pick(&th.track, st, 0);
+    let is style.Look as full = style.pick(&th.track, st, 1);
+    let is f64 as rad = k / 8.0;
+    shapes.fill_rounded(p.canvas, tr.x, tr.y, tr.w, tr.h, rad, rad, rad, rad, empty.bg);
+    let is f64 as at = _at(t, w, d, tr, _frac(d, d.value));
+    if (d.vertical == 1) {
+        shapes.fill_rounded(p.canvas, tr.x, at, tr.w, tr.y + tr.h - at, rad, rad, rad, rad, full.bg);
+    } else if (_rtl(t, w, d) == 1) {
+        shapes.fill_rounded(p.canvas, at, tr.y, tr.x + tr.w - at, tr.h, rad, rad, rad, rad, full.bg);
+    } else {
+        shapes.fill_rounded(p.canvas, tr.x, tr.y, at - tr.x, tr.h, rad, rad, rad, rad, full.bg);
+    }
+    // Marks: below a track across, beside one up and down, on whole pixels.
+    let is math.color.Color as mc with mut = th.palette.fg_dim;
+    if (painter.has(p, painter.S_DISABLED) == 1) { mc = style.with_alpha(mc, mc.a * th.track.disabled_alpha); }
+    let is i64 as i with mut = 0;
+    while (i < d.nmarks) {
+        let is f64 as m = _at(t, w, d, tr, _frac(d, _held(d, d.marks[i])));
+        if (d.vertical == 1) {
+            shapes.fill_rect(p.canvas, p.rect.x + k + 1.0, fm.floor(m), k / 2.0 - 1.0, 1.0, mc);
+        } else {
+            shapes.fill_rect(p.canvas, fm.floor(m), p.rect.y + k + 1.0, 1.0, k / 2.0 - 1.0, mc);
+        }
+        i = i + 1;
+    }
+    let is math.rect.Rect as kr = _knob_in(t, w, d, tr, k);
+    let is style.Look as kl = style.pick(&th.control, st, 0);
+    shapes.fill_circle(p.canvas, kr.x + k / 2.0, kr.y + k / 2.0, k / 2.0, kl.bg);
+    if (th.metrics.border_width > 0.0 && kl.border.a > 0.0) {
+        let is f64 as r2 = k / 2.0;
+        shapes.stroke_rounded(p.canvas, kr.x, kr.y, k, k, r2, r2, r2, r2, th.metrics.border_width, kl.border);
+    }
+}
+
+// --- Events ---
+
+fn _step_of(d as *Data) as f64 {
+    if (d.step > 0.0) { return d.step; }
+    return _range(d) / 100.0;
+}
+
+fn _page_of(d as *Data) as f64 {
+    if (d.page > 0.0) { return d.page; }
+    return _step_of(d) * 10.0;
+}
+
+fn _along(d as *Data, e as *event.Event) as f64 {
+    if (d.vertical == 1) { return e.y; }
+    return e.x;
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as k = e.kind;
+    let is f64 as kn = _k(t, w);
+    let is math.rect.Rect as tr = _track_in(d, layout.window_rect(t, w), kn);
+    if (k == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        let is math.rect.Rect as kr = _knob_in(t, w, d, tr, kn);
+        let is f64 as centre with mut = kr.x + kn / 2.0;
+        if (d.vertical == 1) { centre = kr.y + kn / 2.0; }
+        let is f64 as pos = _along(d, e);
+        if ((e.mods & keys.MOD_SHIFT) != 0) {
+            // A page towards the click.
+            let is f64 as toward = _frac_at(t, w, d, tr, pos) - _frac(d, d.value);
+            if (toward > 0.0) { _set(t, w, d, d.value + _page_of(d)); }
+            if (toward < 0.0) { _set(t, w, d, d.value - _page_of(d)); }
+            return 1;
+        }
+        d.grab = 0.0;
+        if (math.rect.rect_contains(kr, math.vec.v2(e.x, e.y)) == 1) {
+            d.grab = pos - centre;
+        } else {
+            _set(t, w, d, d.min + _frac_at(t, w, d, tr, pos) * _range(d));
+        }
+        d.dragging = 1;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (k == event.POINTER_MOVE) {
+        if (d.dragging == 0) { return 0; }
+        _set(t, w, d, d.min + _frac_at(t, w, d, tr, _along(d, e) - d.grab) * _range(d));
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (d.dragging == 0) { return 0; }
+        d.dragging = 0;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (k == event.SCROLL) {
+        let is f64 as by with mut = e.dy;
+        if (by == 0.0) { by = 0.0 - e.dx; }
+        if (by == 0.0) { return 0; }
+        let is f64 as unit with mut = _step_of(d);
+        if (e.discrete == 0) { unit = unit / 10.0; }
+        _set(t, w, d, d.value - by * unit);
+        return 1;
+    }
+    if (k == event.KEY_DOWN) {
+        if ((e.mods & (keys.MOD_CONTROL | keys.MOD_ALT)) != 0) { return 0; }
+        let is f64 as s = _step_of(d);
+        let is f64 as across with mut = 1.0;
+        if (_rtl(t, w, d) == 1) { across = 0.0 - 1.0; }
+        if (e.key == keys.RIGHT) { _set(t, w, d, d.value + s * across); return 1; }
+        if (e.key == keys.LEFT) { _set(t, w, d, d.value - s * across); return 1; }
+        if (e.key == keys.UP) { _set(t, w, d, d.value + s); return 1; }
+        if (e.key == keys.DOWN) { _set(t, w, d, d.value - s); return 1; }
+        if (e.key == keys.PAGE_UP) { _set(t, w, d, d.value + _page_of(d)); return 1; }
+        if (e.key == keys.PAGE_DOWN) { _set(t, w, d, d.value - _page_of(d)); return 1; }
+        if (e.key == keys.HOME) { _set(t, w, d, d.min); return 1; }
+        if (e.key == keys.END) { _set(t, w, d, d.max); return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        access.set_range(q, d.value, d.min, d.max, d.step);
+        q.actions = access.INCREMENT | access.DECREMENT | access.SET_VALUE;
+        if (d.vertical == 1) { q.states = q.states | access.VERTICAL; }
+        else { q.states = q.states | access.HORIZONTAL; }
+        return 1;
+    }
+    if (q.action == access.SET_VALUE) { _set(t, w, d, q.arg); }
+    if (q.action == access.INCREMENT) { _set(t, w, d, d.value + _step_of(d)); }
+    if (q.action == access.DECREMENT) { _set(t, w, d, d.value - _step_of(d)); }
+    return 1;
+}

@@ -689,6 +689,17 @@ once with reduced motion or no animator — mirrored right to left. Clicked,
 toggled by Space released or Enter as GTK's is, and by assistive technology;
 named by the label beside it.
 
+**Sliders** (`widgets/slider.cst`, tested by `slider_test`): a value in a
+range held to its step (any value with none), on a track across — filled from
+its start, from the right when right to left — or up and down with the least
+at the bottom. A click on the track jumps there and the knob follows until
+release; a press on the knob drags it as held; Shift and a click move a page
+towards the click. The arrows move a step, mirrored right to left, Page Up
+and Down a page (ten steps unless set), Home and End to the ends, the wheel a
+step a notch or a tenth of one every pixel. Marks at the program's values,
+below or beside the track. `VALUE_CHANGED` carries the value; assistive
+technology reads the value, range and step and sets, raises and lowers it.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
