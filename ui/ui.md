@@ -968,6 +968,19 @@ assistive technology, saying TOGGLED each time; the triangle points along the
 line when closed and down when open, and the focus ring goes round the title's
 row only. Told as a button that expands, named by its title.
 
+**Toolbars** (`widgets/toolbar.cst`, tested by `toolbar_test`): flat buttons,
+toggles, separators — or any widget made with the toolbar as its parent — in
+a row from the start edge, as tall as a control. Its buttons are one stop for
+Tab, the one last focused, and the arrows along the row move between them past
+separators and what is disabled, Home and End to the ends. Those that do not
+fit leave the row, and a button at its end offers them from a menu — a toggle
+as a check item as it stands, a disabled tool disabled — where choosing one
+presses it as a click would; that button is the last stop for the arrows, and
+Space, Enter or Down there opens the menu with its first item chosen. The stop
+stays in the row: one that leaves it, or is destroyed, hands it to the last
+button still there, or to the menu button when none fits. Told as a tool bar,
+across.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
