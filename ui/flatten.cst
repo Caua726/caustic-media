@@ -1,0 +1,268 @@
+// ui/flatten.cst — a tree's rows as a list: those shown, one under another.
+//
+// A tree view shows the rows of a tree model that can be seen — the top
+// level, and under each row opened its children — and that is a flat model
+// of its own (rows under parent 0 only), which a list view reads as it
+// reads any other, GTK 4's tree list model. Each row shown keeps its depth
+// and whether it is open. A branch's children are read only when it is
+// opened, so a model that loads lazily loads a branch then; opened again
+// after closing, its children come back closed.
+//
+// The tree's changes are passed on as the rows shown change: rows inserted
+// under an open row, or at the top, are inserted where they now show; rows
+// removed go with every row shown under them; rows changed are said changed
+// one by one where they show; a change under a closed row says that row
+// changed (it may have children to open now, or none); a reset closes all.
+use "std/mem.cst" as mem;
+use "model.cst" as model;
+
+struct Rec {
+    id    as i64;
+    depth as i32;
+    open  as i32;
+}
+
+struct Flat {
+    src  as *model.Model;
+    obs  as i64;
+    out  as model.Model;   // what views read
+    n    as i64;
+    cap  as i64;
+    recs as *Rec;
+}
+
+// The rows of src that show — its top level, all closed — as a flat model
+// (model_of). src stays where it is while this has it. Null when memory is
+// refused.
+fn open(src as *model.Model) as *Flat {
+    let is *u8 as p = mem.core.mmap_anon(sizeof(Flat));
+    if (cast(i64, p) <= 0) { return cast(*Flat, 0); }
+    let is *Flat as f = cast(*Flat, p);
+    f.src = src;
+    f.out = model.make(p, fn_ptr(_count), fn_ptr(_row_id), fn_ptr(_cell));
+    f.out.columns = fn_ptr(_columns);
+    f.out.index_of = fn_ptr(_index_of);
+    f.out.set_cell = fn_ptr(_set_cell);
+    f.obs = model.observe(src, fn_ptr(_changed), p);
+    _top(f);
+    return f;
+}
+
+fn close(f as *Flat) as void {
+    if (cast(i64, f) == 0) { return; }
+    model.unobserve(f.src, f.obs);
+    if (cast(i64, f.recs) != 0) { mem.core.munmap(cast(*u8, f.recs), f.cap * sizeof(Rec)); }
+    mem.core.munmap(cast(*u8, f), sizeof(Flat));
+}
+
+// What a list view reads: the rows shown, under parent 0.
+fn model_of(f as *Flat) as *model.Model { return &f.out; }
+
+fn source(f as *Flat) as *model.Model { return f.src; }
+
+fn count(f as *Flat) as i64 { return f.n; }
+
+// --- Room for rows ---
+
+fn _room(f as *Flat, need as i64) as i32 {
+    if (need <= f.cap) { return 1; }
+    let is i64 as cap with mut = 64;
+    while (cap < need) { cap = cap * 2; }
+    let is *u8 as p = mem.core.mmap_anon(cap * sizeof(Rec));
+    if (cast(i64, p) <= 0) { return 0; }
+    if (cast(i64, f.recs) != 0) {
+        mem.memcpy(p, cast(*u8, f.recs), f.n * sizeof(Rec));
+        mem.core.munmap(cast(*u8, f.recs), f.cap * sizeof(Rec));
+    }
+    f.recs = cast(*Rec, p);
+    f.cap = cap;
+    return 1;
+}
+
+// count rows at at, the children of parent from first on, depth deep. 0 when
+// memory is refused.
+fn _insert(f as *Flat, at as i64, parent as i64, first as i64, count as i64, depth as i32) as i32 {
+    if (_room(f, f.n + count) == 0) { return 0; }
+    let is i64 as tail = f.n - at;
+    if (tail > 0) {
+        mem.core.memmove(cast(*u8, cast(i64, f.recs) + (at + count) * sizeof(Rec)),
+                         cast(*u8, cast(i64, f.recs) + at * sizeof(Rec)), tail * sizeof(Rec));
+    }
+    let is i64 as k with mut = 0;
+    while (k < count) {
+        f.recs[at + k].id = model.row_id(f.src, parent, first + k);
+        f.recs[at + k].depth = depth;
+        f.recs[at + k].open = 0;
+        k = k + 1;
+    }
+    f.n = f.n + count;
+    return 1;
+}
+
+fn _cut(f as *Flat, at as i64, count as i64) as void {
+    let is i64 as tail = f.n - at - count;
+    if (tail > 0) {
+        mem.core.memmove(cast(*u8, cast(i64, f.recs) + at * sizeof(Rec)),
+                         cast(*u8, cast(i64, f.recs) + (at + count) * sizeof(Rec)), tail * sizeof(Rec));
+    }
+    f.n = f.n - count;
+}
+
+// The top level, all closed.
+fn _top(f as *Flat) as void {
+    f.n = 0;
+    _insert(f, 0, 0, 0, model.count(f.src, 0), 0);
+}
+
+// One past the last row shown under row i.
+fn _end(f as *Flat, i as i64) as i64 {
+    let is i64 as j with mut = i + 1;
+    while (j < f.n && f.recs[j].depth > f.recs[i].depth) { j = j + 1; }
+    return j;
+}
+
+// --- Asking ---
+
+// Row i's depth, 0 at the top; -1 past the rows.
+fn depth(f as *Flat, i as i64) as i32 {
+    if (i < 0 || i >= f.n) { return cast(i32, 0 - 1); }
+    return f.recs[i].depth;
+}
+
+fn is_expanded(f as *Flat, i as i64) as i32 {
+    if (i < 0 || i >= f.n) { return 0; }
+    return f.recs[i].open;
+}
+
+// Whether row i has children to show, asked of the tree.
+fn expandable(f as *Flat, i as i64) as i32 {
+    if (i < 0 || i >= f.n) { return 0; }
+    return model.has_children(f.src, f.recs[i].id);
+}
+
+// The row row i is under, -1 at the top.
+fn parent_index(f as *Flat, i as i64) as i64 {
+    if (i < 0 || i >= f.n || f.recs[i].depth == 0) { return 0 - 1; }
+    let is i64 as j with mut = i - 1;
+    while (j >= 0 && f.recs[j].depth >= f.recs[i].depth) { j = j - 1; }
+    return j;
+}
+
+// Where row id shows, -1 when it does not.
+fn index_of(f as *Flat, id as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < f.n) {
+        if (f.recs[i].id == id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// --- Opening and closing ---
+
+// Row i opened: its children read and shown under it, closed. 1 if it was
+// closed and has children.
+fn expand(f as *Flat, i as i64) as i32 {
+    if (i < 0 || i >= f.n || f.recs[i].open == 1 || expandable(f, i) == 0) { return 0; }
+    let is i64 as id = f.recs[i].id;
+    let is i64 as k = model.count(f.src, id);
+    if (_insert(f, i + 1, id, 0, k, f.recs[i].depth + 1) == 0) { return 0; }
+    f.recs[i].open = 1;
+    if (k > 0) { model.inserted(&f.out, 0, i + 1, k); }
+    return 1;
+}
+
+// Row i closed: every row under it gone. 1 if it was open.
+fn collapse(f as *Flat, i as i64) as i32 {
+    if (i < 0 || i >= f.n || f.recs[i].open == 0) { return 0; }
+    let is i64 as e = _end(f, i);
+    _cut(f, i + 1, e - i - 1);
+    f.recs[i].open = 0;
+    if (e - i - 1 > 0) { model.removed(&f.out, 0, i + 1, e - i - 1); }
+    return 1;
+}
+
+fn toggle(f as *Flat, i as i64) as i32 {
+    if (is_expanded(f, i) == 1) { return collapse(f, i); }
+    return expand(f, i);
+}
+
+// --- The tree changing ---
+
+// Where the child first of the row at pi — depth pd; -1 and -1 for the top —
+// shows, or would.
+fn _child_at(f as *Flat, pi as i64, pd as i32, first as i64) as i64 {
+    let is i64 as j with mut = pi + 1;
+    let is i64 as k with mut = 0;
+    while (k < first && j < f.n && f.recs[j].depth > pd) {
+        j = _end(f, j);
+        k = k + 1;
+    }
+    return j;
+}
+
+fn _changed(user as *u8, c as *model.Change) as void {
+    let is *Flat as f = cast(*Flat, user);
+    if (c.kind == model.RESET) {
+        _top(f);
+        model.reset(&f.out);
+        return;
+    }
+    let is i64 as pi with mut = 0 - 1;
+    let is i32 as pd with mut = cast(i32, 0 - 1);
+    if (c.parent != 0) {
+        pi = index_of(f, c.parent);
+        if (pi < 0) { return; }
+        if (f.recs[pi].open == 0) {
+            model.changed(&f.out, 0, pi, 1);
+            return;
+        }
+        pd = f.recs[pi].depth;
+    }
+    let is i64 as at = _child_at(f, pi, pd, c.first);
+    if (c.kind == model.INSERTED) {
+        if (_insert(f, at, c.parent, c.first, c.count, pd + 1) == 1) { model.inserted(&f.out, 0, at, c.count); }
+    } else if (c.kind == model.REMOVED) {
+        let is i64 as e with mut = at;
+        let is i64 as k with mut = 0;
+        while (k < c.count && e < f.n && f.recs[e].depth > pd) {
+            e = _end(f, e);
+            k = k + 1;
+        }
+        _cut(f, at, e - at);
+        model.removed(&f.out, 0, at, e - at);
+    } else if (c.kind == model.CHANGED) {
+        let is i64 as j with mut = at;
+        let is i64 as k with mut = 0;
+        while (k < c.count && j < f.n && f.recs[j].depth > pd) {
+            model.changed(&f.out, 0, j, 1);
+            j = _end(f, j);
+            k = k + 1;
+        }
+    }
+}
+
+// --- The flat model's entries ---
+
+fn _count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Flat, self).n;
+}
+
+fn _row_id(self as *u8, parent as i64, index as i64) as i64 {
+    let is *Flat as f = cast(*Flat, self);
+    if (parent != 0 || index < 0 || index >= f.n) { return 0; }
+    return f.recs[index].id;
+}
+
+fn _cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    return cast(i64, model.cell(cast(*Flat, self).src, id, column, role, out));
+}
+
+fn _columns(self as *u8) as i64 { return model.columns(cast(*Flat, self).src); }
+
+fn _index_of(self as *u8, id as i64) as i64 { return index_of(cast(*Flat, self), id); }
+
+fn _set_cell(self as *u8, id as i64, column as i64, role as i32, v as *model.Value) as i64 {
+    return cast(i64, model.set_cell(cast(*Flat, self).src, id, column, role, v));
+}

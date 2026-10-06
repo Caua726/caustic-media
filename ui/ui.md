@@ -1050,6 +1050,17 @@ list. Told as a list, many selectable when so, of list items; those built on
 it say other roles and add to what a row says (`set_roles`,
 `set_row_access`).
 
+**Trees** (`flatten.cst`, `widgets/treeview.cst`, tested by `flatten_test`
+and `treeview_test`): a tree model's rows that show — the top level and,
+under each open row, its children — are a flat model of their own, each row
+with its depth, GTK 4's tree list model; a branch's children are read only
+when it opens, and the tree's changes become the changes of the rows shown.
+A tree view is a list view over it: each row an expander and a name, one
+indent further in per level; the expander, Right and Left (the other way
+right to left) open and close a branch, Right going on to an open row's first
+child and Left to a closed row's parent. Told as a tree of tree items,
+expandable, expanded while open.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
