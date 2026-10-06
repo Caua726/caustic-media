@@ -682,6 +682,13 @@ released, on the mnemonic and by assistive technology; `TOGGLED` from every
 radio a choice changes. Drawn from the theme's indicator variants: a rounded
 square with a tick, or a bar when mixed; a circle with a dot.
 
+**Switches** (`widgets/switch.cst`, tested by `switch_test`): a track the
+theme's size, rounded at its ends and filled when on, with a knob that slides
+to its end over the theme's fast duration through the window's animator — at
+once with reduced motion or no animator — mirrored right to left. Clicked,
+toggled by Space released or Enter as GTK's is, and by assistive technology;
+named by the label beside it.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
