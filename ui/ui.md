@@ -700,6 +700,15 @@ step a notch or a tenth of one every pixel. Marks at the program's values,
 below or beside the track. `VALUE_CHANGED` carries the value; assistive
 technology reads the value, range and step and sets, raises and lowers it.
 
+**Progress bars and separators** (`widgets/progress.cst`, `widgets/separator.cst`,
+tested by `progress_test`): a bar filled from its start — from the right, right
+to left — to a fraction held to 0 .. 1, or, when there is none, a pulse: a
+quarter of the bar going back and forth for ever, one way in four of the
+theme's slow durations through the window's animator, until a fraction is
+set; told its fraction, or busy. A separator is a line the theme's border
+thick in its separator colour, across or up and down, in the middle of what
+it is given on whole physical pixels.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
