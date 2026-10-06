@@ -18,6 +18,13 @@
 // Windows are named by handles with an era, as widgets are: a closed window's
 // handle fails every check, even once its slot holds another. The table is
 // sized when the application opens and running out is FULL, never growth.
+//
+// A window can belong to another — a dialog's (dialog_open) — and be modal:
+// shown so, the windows under it wait (blocked), and it closes with its
+// owner. What a widget asks of its window — a dialog window of its own, shown,
+// titled — reaches the application through its tree (tree.ask_host), so the
+// App stays where it is while windows are open: their trees point at it, as
+// they point at its timers.
 use "std/mem.cst" as mem;
 use "../math/math.cst" as math;
 use "tree.cst" as tree;
@@ -41,6 +48,9 @@ let is i32 as INVALID_HANDLE with imut = 2;
 let is i32 as BAD_ARGUMENT   with imut = 3;
 let is i32 as OUT_OF_MEMORY  with imut = 5;
 let is i32 as TREE_FAILED    with imut = 7;   // the window's tree could not open
+
+// A window's title, in bytes: longer is cut at a character's start.
+let is i64 as MAX_TITLE with imut = 255;
 
 struct Limits {
     windows as i64;          // open at once
@@ -68,6 +78,13 @@ struct Window {
     maximized  as i32;   // as the platform says
     fullscreen as i32;
     _pad0      as i32;
+    owner      as i64;   // the window it belongs to; 0 for one of its own
+    title_len  as i64;
+    title      as [256]u8;   // MAX_TITLE bytes and a zero
+    dialog     as i32;   // a dialog's window (dialog_open)
+    modal      as i32;   // its owners wait while it is shown
+    shown      as i32;
+    _pad1      as i32;
 }
 
 struct App {
@@ -194,8 +211,15 @@ fn window_open(a as *App, width as f64, height as f64) as i64 {
     w.active = 0;
     w.maximized = 0;
     w.fullscreen = 0;
+    w.owner = 0;
+    w.title_len = 0;
+    w.title[0] = 0;
+    w.dialog = 0;
+    w.modal = 0;
+    w.shown = 1;
     w.used = 1;
     a.live = a.live + 1;
+    tree.set_host(&w.tree, fn_ptr(_host), cast(*u8, a), _handle(a, i));
     return _handle(a, i);
 }
 
@@ -208,11 +232,16 @@ fn _close_slot(a as *App, i as i64) as void {
     a.live = a.live - 1;
 }
 
-// Closes the window: every widget in it is destroyed. A stale handle is
-// ignored.
+// Closes the window: every widget in it is destroyed, and every window that
+// belongs to it closed first. A stale handle is ignored.
 fn window_close(a as *App, h as i64) as void {
     let is i64 as i = _index(a, h);
     if (i < 0) { return; }
+    let is i64 as j with mut = 0;
+    while (j < a.cap) {
+        if (_win(a, j).used == 1 && _win(a, j).owner == h) { window_close(a, _handle(a, j)); }
+        j = j + 1;
+    }
     _close_slot(a, i);
 }
 
@@ -277,6 +306,169 @@ fn user(a as *App, h as i64) as *u8 {
     let is i64 as i = _index(a, h);
     if (i < 0) { return cast(*u8, 0); }
     return _win(a, i).user;
+}
+
+// --- Windows belonging to others ---
+
+// A window belonging to owner, for a dialog: hidden until shown, kept above
+// its owner and closed with it, a dialog to the platform. Its handle, or 0
+// with last_error() set.
+fn dialog_open(a as *App, owner as i64, width as f64, height as f64) as i64 {
+    if (a.ok == 0) { return 0; }
+    if (_index(a, owner) < 0) { a.err = INVALID_HANDLE; return 0; }
+    let is i64 as h = window_open(a, width, height);
+    if (h == 0) { return 0; }
+    let is *Window as w = _win(a, _index(a, h));
+    w.owner = owner;
+    w.dialog = 1;
+    w.shown = 0;
+    return h;
+}
+
+// The window h belongs to, 0 for none.
+fn owner(a as *App, h as i64) as i64 {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return 0; }
+    return _win(a, i).owner;
+}
+
+fn is_dialog(a as *App, h as i64) as i32 {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return 0; }
+    return _win(a, i).dialog;
+}
+
+// Modal: while it is shown, the windows it belongs to — its owner, and theirs
+// — wait.
+fn set_modal(a as *App, h as i64, on as i32) as void {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return; }
+    _win(a, i).modal = on;
+}
+
+fn is_modal(a as *App, h as i64) as i32 {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return 0; }
+    return _win(a, i).modal;
+}
+
+// Shown or hidden: what the platform's loop opens or puts away. A window
+// opened by window_open starts shown, a dialog's hidden.
+fn show(a as *App, h as i64) as void {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return; }
+    _win(a, i).shown = 1;
+}
+
+fn hide(a as *App, h as i64) as void {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return; }
+    _win(a, i).shown = 0;
+}
+
+fn is_shown(a as *App, h as i64) as i32 {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return 0; }
+    return _win(a, i).shown;
+}
+
+// Whether h waits on a modal window shown above it — one belonging to it, or
+// to one that does. Its input is not to be given to it meanwhile.
+fn blocked(a as *App, h as i64) as i32 {
+    if (_index(a, h) < 0) { return 0; }
+    let is i64 as j with mut = 0;
+    while (j < a.cap) {
+        let is *Window as w = _win(a, j);
+        if (w.used == 1 && w.shown == 1 && w.modal == 1) {
+            // No loop to fear: an owner is always open before what belongs to
+            // it, and what belongs to it closes with it.
+            let is i64 as o with mut = w.owner;
+            while (o != 0) {
+                if (o == h) { return 1; }
+                o = owner(a, o);
+            }
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+// The window's title, s n bytes, copied: what the platform shows for it.
+fn set_title(a as *App, h as i64, s as *u8, n as i64) as void {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return; }
+    let is *Window as w = _win(a, i);
+    let is i64 as m with mut = n;
+    if (m > MAX_TITLE) {
+        m = MAX_TITLE;
+        // Not in the middle of a character: back to the start of the one the
+        // limit falls in.
+        while (m > 0 && (cast(i64, s[m]) & 192) == 128) { m = m - 1; }
+    }
+    if (m < 0) { m = 0; }
+    let is i64 as k with mut = 0;
+    while (k < m) {
+        w.title[k] = s[k];
+        k = k + 1;
+    }
+    w.title[m] = 0;
+    w.title_len = m;
+}
+
+// Its title, zero-terminated; title_length bytes.
+fn title(a as *App, h as i64) as *u8 {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return cast(*u8, 0); }
+    return cast(*u8, &_win(a, i).title);
+}
+
+fn title_length(a as *App, h as i64) as i64 {
+    let is i64 as i = _index(a, h);
+    if (i < 0) { return 0; }
+    return _win(a, i).title_len;
+}
+
+// The window whose tree t is, 0 for none.
+fn window_of(a as *App, t as *tree.Tree) as i64 {
+    if (a.ok == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a.cap) {
+        if (_win(a, i).used == 1 && cast(i64, &_win(a, i).tree) == cast(i64, t)) { return _handle(a, i); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// What a widget asks through its tree (tree.ask_host).
+fn _host(user as *u8, window as i64, op as i32, arg as i64) as i64 {
+    let is *App as a = cast(*App, user);
+    if (op == tree.HOST_DIALOG) {
+        // Sized when it is shown, by what it holds.
+        let is i64 as h = dialog_open(a, window, 1.0, 1.0);
+        if (h == 0) { return 0; }
+        return cast(i64, &_win(a, _index(a, h)).tree);
+    }
+    if (op == tree.HOST_IS_DIALOG) { return cast(i64, is_dialog(a, window)); }
+    if (op == tree.HOST_SHOW) {
+        set_modal(a, window, cast(i32, arg));
+        show(a, window);
+        return 1;
+    }
+    if (op == tree.HOST_HIDE) {
+        hide(a, window);
+        return 1;
+    }
+    if (op == tree.HOST_TITLE) {
+        let is *tree.HostText as ht = cast(*tree.HostText, arg);
+        set_title(a, window, ht.s, ht.n);
+        return 1;
+    }
+    if (op == tree.HOST_SIZE) {
+        let is *math.vec.Vec2 as v = cast(*math.vec.Vec2, arg);
+        resize(a, window, v.x, v.y);
+        return 1;
+    }
+    return 0;
 }
 
 // --- What the platform says about a window ---
