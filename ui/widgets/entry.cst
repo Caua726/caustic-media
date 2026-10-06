@@ -31,6 +31,13 @@
 // Enter is its own — ACTIVATED — ahead of the window's default button,
 // unless it activates the default (set_activates_default). CHANGED follows
 // every change to the text, the program's too.
+//
+// Its context menu — a right click, a long press, the Menu key or Shift+F10
+// — offers Undo, Redo, Cut, Copy, Paste, Delete and Select All, each with
+// its key shown and offered only when it can be done; at the pointer, a
+// click outside the selection moving the caret there first, or below the
+// caret from the keyboard, its first item chosen. It is made the first time,
+// and needs the window's router lent to the tree (tree.set_router).
 use "std/mem.cst" as mem;
 use "std/math.cst" as fm;
 use "../../math/math.cst" as math;
@@ -51,11 +58,24 @@ use "../access.cst" as access;
 use "../signal.cst" as signal;
 use "../text.cst" as txt;
 use "../textbuf.cst" as textbuf;
+use "../router.cst" as router;
+use "../positioner.cst" as positioner;
+use "menu.cst" as menu;
+use "textedit.cst" as textedit;
 
 // Says whether codepoint c may go in: 1 yes, 0 no.
 type FilterFn = fn(*u8, i64) as i32;
 
 let is i64 as MAX_PREEDIT with imut = 256;
+
+// Its context menu's items: their ids, textedit's.
+let is i64 as UNDO       with imut = 1;
+let is i64 as REDO       with imut = 2;
+let is i64 as CUT        with imut = 3;
+let is i64 as COPY       with imut = 4;
+let is i64 as PASTE      with imut = 5;
+let is i64 as DELETE     with imut = 6;
+let is i64 as SELECT_ALL with imut = 7;
 
 // How text goes in.
 let is i32 as _TYPED  with imut = 1;
@@ -93,6 +113,9 @@ struct Ent {
     key_family  as *u8;
     filter      as FilterFn;
     filter_user as *u8;
+    self        as i64;
+    menu        as i64;              // its context menu, made the first time; 0 before
+    items       as [8]i64;           // its items, by id
     upstream    as i32;              // the caret goes with the text before it
     password    as i32;
     editable    as i32;
@@ -148,6 +171,7 @@ fn create(t as *tree.Tree, parent as i64) as i64 {
     en.by = 1;
     en.editable = 1;
     en.chars = 0 - 1;
+    en.self = w;
     cast(*Data, tree.data(t, w)).e = en;
     tree.set_focusable(t, w, 1);
     _relay(t, w, en);
@@ -162,6 +186,7 @@ fn _ent(t as *tree.Tree, w as i64) as *Ent {
 fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
     let is *Ent as en = cast(*Data, data).e;
     if (cast(i64, en) == 0) { return; }
+    if (en.menu != 0 && tree.is_valid(t, en.menu) == 1) { tree.destroy(t, en.menu); }
     textbuf.close(&en.buf);
     tlayout.close(&en.lay);
     txt.run_close(&en.run);
@@ -204,48 +229,6 @@ fn _tmp_room(en as *Ent, want as i64) as i32 {
 }
 
 // --- Characters ---
-
-fn _seq(b as i64) as i64 {
-    if (b < 128) { return 1; }
-    if (b >= 240) { return 4; }
-    if (b >= 224) { return 3; }
-    if (b >= 192) { return 2; }
-    return 1;
-}
-
-// The codepoint of the whole sequence at at.
-fn _decode(p as *u8, at as i64, n as i64) as i64 {
-    let is i64 as b = cast(i64, p[at]);
-    let is i64 as k = _seq(b);
-    if (k == 1) { return b; }
-    if (k == 2) { return ((b & 31) << 6) | (cast(i64, p[at + 1]) & 63); }
-    if (k == 3) { return ((b & 15) << 12) | ((cast(i64, p[at + 1]) & 63) << 6) | (cast(i64, p[at + 2]) & 63); }
-    return ((b & 7) << 18) | ((cast(i64, p[at + 1]) & 63) << 12) | ((cast(i64, p[at + 2]) & 63) << 6) |
-           (cast(i64, p[at + 3]) & 63);
-}
-
-// Whether the k bytes from i of s, n long, are one well-formed sequence, as
-// Unicode's table 3-7 has them: no overlong forms, no surrogates, nothing
-// past U+10FFFF.
-fn _whole(s as *u8, i as i64, n as i64, k as i64) as i32 {
-    let is i64 as b = cast(i64, s[i]);
-    if (b < 128) { return 1; }
-    if (b < 194 || b > 244 || i + k > n) { return 0; }
-    let is i64 as lo with mut = 128;
-    let is i64 as hi with mut = 191;
-    if (b == 224) { lo = 160; }
-    if (b == 237) { hi = 159; }
-    if (b == 240) { lo = 144; }
-    if (b == 244) { hi = 143; }
-    let is i64 as c = cast(i64, s[i + 1]);
-    if (c < lo || c > hi) { return 0; }
-    let is i64 as j with mut = 2;
-    while (j < k) {
-        if ((cast(i64, s[i + j]) & 192) != 128) { return 0; }
-        j = j + 1;
-    }
-    return 1;
-}
 
 fn _len(en as *Ent) as i64 { return textbuf.length(&en.buf); }
 
@@ -641,48 +624,13 @@ fn drop_at(t as *tree.Tree, w as i64) as i64 {
 
 // --- Set by the program ---
 
-// What goes in of s, n bytes, into tmp: each line end a space, what is no
-// UTF-8 left out, each character the filter says no to left out when
-// filtered is 1, at most room characters — below 0 for any number. Its
-// length.
+// What goes in of s, n bytes, into tmp: as textedit.accept lets it, each
+// line end a space, the filter asked when filtered is 1. Its length.
 fn _accept(en as *Ent, s as *u8, n as i64, room as i64, filtered as i32) as i64 {
     if (n <= 0 || _tmp_room(en, n) == 0) { return 0; }
-    let is i64 as o with mut = 0;
-    let is i64 as chars with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < n) {
-        let is i64 as k with mut = _seq(cast(i64, s[i]));
-        let is i64 as step with mut = k;
-        if (_whole(s, i, n, k) == 0) {
-            // A byte that begins no sequence, or one cut short: left out.
-            step = 1;
-        } else {
-            let is i64 as c with mut = _decode(s, i, n);
-            if (c == 13 && i + 1 < n && cast(i64, s[i + 1]) == 10) { step = 2; }
-            if (c == 10 || c == 13) {
-                c = 32;
-                k = 0;
-            }
-            if (room >= 0 && chars >= room) {
-                step = n - i;
-            } else if (filtered == 0 || cast(i64, en.filter) == 0 || call(en.filter, en.filter_user, c) == 1) {
-                if (k == 0) {
-                    en.tmp[o] = cast(u8, 32);
-                    o = o + 1;
-                } else {
-                    let is i64 as j with mut = 0;
-                    while (j < k) {
-                        en.tmp[o] = s[i + j];
-                        o = o + 1;
-                        j = j + 1;
-                    }
-                }
-                chars = chars + 1;
-            }
-        }
-        i = i + step;
-    }
-    return o;
+    let is textedit.FilterFn as f with mut = cast(textedit.FilterFn, 0);
+    if (filtered == 1) { f = en.filter; }
+    return textedit.accept(s, n, room, f, en.filter_user, 0, en.tmp);
 }
 
 // Its text from now on — a program's, so not filtered and nothing to undo
@@ -1220,6 +1168,7 @@ fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
     }
     if (k == event.SHORTCUT_OVERRIDE) { return _claims(en, e); }
     if (k == event.KEY_DOWN) { return _key(t, w, en, e); }
+    if (k == event.CONTEXT_MENU) { return _context(t, w, en, e); }
     return _pointer(t, w, en, e);
 }
 
@@ -1291,6 +1240,78 @@ fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void
         shapes.fill_rect(p.canvas, cx, y, 1.0, en.line_h, look.fg);
     }
     draw2d.pop_clip(p.canvas);
+}
+
+// --- Its context menu ---
+
+// Its context menu: 0 until one was asked for, or for no entry.
+fn context_menu(t as *tree.Tree, w as i64) as i64 {
+    let is *Ent as en = _ent(t, w);
+    if (cast(i64, en) == 0) { return 0; }
+    return en.menu;
+}
+
+fn _make_menu(t as *tree.Tree, en as *Ent) as i32 {
+    en.menu = textedit.context_menu(t, cast(*i64, &en.items));
+    if (en.menu == 0) { return 0; }
+    signal.connect(t, en.menu, signal.ACTIVATED, fn_ptr(_on_menu), cast(*u8, en));
+    return 1;
+}
+
+fn _on_menu(t as *tree.Tree, m as i64, arg as *u8, user as *u8) as void {
+    let is *Ent as en = cast(*Ent, user);
+    let is i64 as w = en.self;
+    let is i64 as id = *cast(*i64, arg);
+    if (id == UNDO || id == REDO) {
+        _undo(t, w, en, cast(i32, id == REDO));
+    } else if (id == CUT) {
+        _copy(t, en, tree.CLIPBOARD);
+        _erase_selection(t, w, en);
+    } else if (id == COPY) {
+        _copy(t, en, tree.CLIPBOARD);
+    } else if (id == PASTE) {
+        tree.request_paste(t, tree.CLIPBOARD, w);
+    } else if (id == DELETE) {
+        _erase_selection(t, w, en);
+    } else if (id == SELECT_ALL) {
+        en.anchor = 0;
+        en.caret = _len(en);
+        en.upstream = 0;
+        textbuf.break_group(&en.buf);
+        _copy(t, en, tree.PRIMARY);
+        _moved(t, w, en);
+    }
+}
+
+// Its context menu asked for: what can be done offered, the menu opened.
+fn _context(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) == 0) { return 0; }
+    if ((en.menu == 0 || tree.is_valid(t, en.menu) == 0) && _make_menu(t, en) == 0) { return 0; }
+    _end_composition(t, w, en);
+    if (e.button != 0 && en.laid == 1) {
+        // A click outside the selection moves the caret there first.
+        let is cursor.Position as p = _hit(t, w, en, e);
+        let is i64 as at = _text_of(en, p.offset);
+        if (en.anchor == en.caret || at < _lo(en) || at > _hi(en)) {
+            en.anchor = at;
+            en.caret = at;
+            en.upstream = p.upstream;
+            textbuf.break_group(&en.buf);
+            _moved(t, w, en);
+        }
+    }
+    textedit.offer(t, cast(*i64, &en.items), en.editable, cast(i32, en.password == 0), cast(i32, en.anchor != en.caret),
+                   textbuf.can_undo(&en.buf), textbuf.can_redo(&en.buf), cast(i32, _len(en) > 0));
+    if (e.button != 0) { return cast(i64, menu.popup_at_pointer(t, r, en.menu)); }
+    // From the keyboard: below the caret.
+    let is i32 as a with mut = positioner.BOTTOM_LEFT;
+    let is i32 as g with mut = positioner.BOTTOM_RIGHT;
+    if (layout.direction(t, w) == layout.RTL) {
+        a = positioner.BOTTOM_RIGHT;
+        g = positioner.BOTTOM_LEFT;
+    }
+    return cast(i64, menu.popup_at(t, r, en.menu, _caret_rect(t, w, en, _caret_shown(en), en.upstream), a, g, 1));
 }
 
 // The text beam over it; the arrow while its selection is dragged.

@@ -33,7 +33,7 @@ ui/
   text.cst        one text service: runs laid out and drawn
   textbuf.cst     the text an entry or a text view edits; undo in steps
   access.cst      role, name, states, value and actions per widget
-  widgets/        label, button, check, radio, entry, slider, progress,
+  widgets/        label, button, check, radio, entry, menu, slider, progress,
                   list, tree, table, menu, tabs, dialog
 
   immediate/      the other model, for HUDs and tools   immediate/immediate.md
@@ -412,7 +412,8 @@ tree does not bring the text stack into programs that show none), the
 program's function for text copied to the clipboard or the primary selection
 (`set_clipboard`, `copy`), which widget names which (`set_labelled_by`,
 forgotten when the label goes), the window's animator (`set_animator`) and the
-application's timers (`set_timers`), for a widget that acts after a pause.
+application's timers (`set_timers`), for a widget that acts after a pause, and
+the window's router (`set_router`), for a widget that opens a popup of its own.
 A widget's event entry may ask for the focus for another
 (`tree.request_focus`): the router gives it once the event is delivered,
 by keyboard or pointer as the event was.
@@ -509,7 +510,11 @@ moved away from it — says so (`tree.reset_ime`, passed on by the program), so
 that what the input method commits next is not what was given up. FOCUS_IN
 says whether the focus came by keyboard. A press outside a modal scope goes
 nowhere, but the scope hears of it (`PRESS_OUTSIDE`), so a popup closes; the
-press is spent on that, and opens no context menu where it landed.
+press is spent on that, and opens no context menu where it landed. When the
+popup ends, `restore` puts the scope back and gives the focus back in one
+step (`give_back`: the ring as it was, but no move by keyboard, so an entry
+does not select all of itself), nothing else focused on the way; a scope
+destroyed while set is none, so the window is never left shut.
 
 The router keeps a text caret's blink (`blink_test`): on for two thirds of the
 desktop's cycle and off for the rest, as GTK draws it, started again by each
@@ -839,7 +844,39 @@ tall and padded — or room for so many characters (`set_width_chars`), none
 leaving its width to what holds it — and drawn without its frame inside a
 field of its holder's (`set_frame`). Its caret blinks, and is not drawn while its window is not
 the active one. Told as an entry, or as password text, editable or
-read-only.
+read-only. Its context menu — a right click, a long press, the Menu key
+or Shift+F10 — offers Undo, Redo, Cut, Copy, Paste, Delete and Select All,
+their keys shown, each only when it can be done: at the pointer, a click
+outside the selection moving the caret there first, or below the caret from
+the keyboard with its first item chosen; made the first time, gone with the
+entry.
+
+**Menus** (`widgets/menu.cst`, tested by `menu_test`): a popup menu the
+program builds once and pops up against a rectangle or at the pointer —
+items with mnemonics and the accelerators they show (Ctrl, Alt, Shift and
+Super before the key, a letter as its capital, named keys by name),
+separators, check items, radio items in groups, submenus. Inside the window
+until window/'s native popups can carry it out, on a layer above everything,
+a child of the root; placed by the positioner — flipped from an edge, slid
+inside, cut to the window's height and then scrolled by the wheel and by the
+keys moving through it; a submenu beside its item, the other side right to
+left, its first item level with it. While it is open the window's input is
+its own: the router's scope, every key claimed ahead of the window's
+shortcuts, a press outside closing it. The arrows move through what can be
+chosen, wrapping, Home and End to the ends, the arrow towards the line's end
+opens a submenu and the other closes one; Enter and Space choose; a letter,
+with or without Alt, chooses the one item it marks or goes on to the next of
+several; Escape closes a submenu, or the menu. The pointer chooses what it
+rests on and what it clicks; a press that opened the menu, dragged to an
+item and let go there, chooses it, while one let go at once leaves it open.
+Resting on a submenu's item opens it, and on another item closes it, after a
+pause when the window's timers are lent, at once when not; passing over
+another item on the way into the open submenu keeps it open. Choosing closes
+the whole menu, the scope and the focus given back as they were, then emits
+ACTIVATED with the item's id — a check item turned over, a radio item
+checked, its group's others not, first; closing emits CLOSED. Told as a
+menu of items, check items and radio items, checkable, checked, expandable
+and expanded as they are, chosen by assistive technology's press.
 
 ## For scale
 
