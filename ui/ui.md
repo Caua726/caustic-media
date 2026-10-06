@@ -1012,6 +1012,23 @@ Moving says VALUE_CHANGED, Finish ACTIVATED and Cancel CLOSED — closing is the
 program's to do. Bound to a window's router, Enter is Next or Finish and
 Escape Cancel. Told as a panel named by its step's title.
 
+**Header bars** (`widgets/headerbar.cst`, tested by `headerbar_test`): a
+window's title bar drawn by the toolkit, for the client-side decorations of
+6.13b. The title, and a subtitle under it, in the middle of the whole bar where
+there is room, else of what is left; the program's widgets at its start and
+end; the window's buttons where the desktop's layout puts them — GNOME's
+`button-layout`, `close:minimize,maximize`, names before the colon at the
+start and after it at the end, unknown ones left out. What the window does is
+asked of it through the tree: the program lends `tree.set_window_ops` a
+callback, and widgets call `tree.window_op` with WIN_MOVE, WIN_MINIMIZE,
+WIN_MAXIMIZE, WIN_CLOSE or WIN_MENU at a window point, for the program to pass
+on to the platform. The buttons minimize, maximize — restore once
+`set_maximized` says so — and close; a drag on the bar's empty places moves the
+window, a double click maximizes it, and the right button opens the window's
+own menu where it was pressed. Drawn in the header's colour over a line, all
+mirrored in right to left; told as a title bar named by its title, its buttons
+named for what they do.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
@@ -1039,8 +1056,11 @@ widget set applications actually use, done properly, not parity.
    service, the switch, the spin box, the image, links, separators, group
    boxes and tooltips, each told to assistive technology.*
 5. **The entry**, once `text/` has caret and hit-testing and `input/` delivers
-   composed text.
+   composed text. *Done, with the text view.*
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
+   *Scroll areas, tabs, splitters, stacks and assistants, expanders, toolbars,
+   status bars, header bars, menus and menu bars done; lists, trees and tables
+   next.*
 7. **The accessibility bridges**, AT-SPI first.
 
 ## Not now, and deliberately
