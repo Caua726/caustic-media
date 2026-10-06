@@ -628,7 +628,9 @@ service in the theme's text style for its role — caption, body, heading,
 monospace and the rest — of its part of the window, so a theme change or an
 override's text scale sets it again; spans of the program's styles over it,
 their empty fields the label's. Measured as wide as its text would like and
-as tall as its text at the width offered; wrapping, no narrower than its
+as tall as its text at the width offered — rounded up to whole physical pixels,
+as GTK rounds Pango's sizes, so a label given its own width on snapped edges
+does not wrap its last word; wrapping, no narrower than its
 widest word; at most a number of lines with an ellipsis, and then, not
 wrapping, cut to its width and no narrower than the ellipsis. Drawn in the
 theme's colour for its tone — text, secondary, accent, error, warning,
