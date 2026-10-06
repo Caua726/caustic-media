@@ -1163,6 +1163,14 @@ the middle, each only once given; Credits and License, toggles at the
 foot's start (a dialog's secondary buttons, `dialog.set_secondary`), show
 who made it and the licence in their place.
 
+**A window's state** (`winstate.cst`, tested by `winstate_test`): its size
+and whether it was maximized or full screen, kept between runs in a file of
+its own under `$XDG_STATE_HOME` (else `~/.local/state`), written whole under
+another name and moved over the old, refused when it is not what was
+written; never where it was, which Wayland does not say. The application
+keeps what the platform says of each window (`app.set_maximized`,
+`set_fullscreen`) for `app.window_state`.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
@@ -1194,8 +1202,9 @@ widget set applications actually use, done properly, not parity.
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
    *Scroll areas, tabs, splitters, stacks and assistants, expanders, toolbars,
    status bars, header bars, menus and menu bars, lists, trees, tables, combo
-   boxes, popovers and menu buttons done; dialogs, message boxes and our
-   own file chooser done.*
+   boxes, popovers and menu buttons done; dialogs, message boxes, our own
+   file chooser and the desktop's through the portal, colour and font
+   choosers, about dialogs and windows' state kept done.*
 7. **The accessibility bridges**, AT-SPI first.
 
 ## Not now, and deliberately

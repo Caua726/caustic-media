@@ -1,0 +1,256 @@
+// ui/winstate.cst — a window's size and state kept between runs.
+//
+// What a window was when it closed — its size in logical pixels, maximized
+// or full screen — kept in a file of its own under the user's state
+// directory, as XDG has it: $XDG_STATE_HOME when it is a whole path, else
+// ~/.local/state; a folder for the program, the window's name with
+// ".window". Lines of key=value — width, height to a tenth; maximized,
+// fullscreen as 0 or 1 — written whole under another name and moved over the
+// old, so a reader never sees half of one; read back when the window is
+// made again, refused when it is not what was written. Where the window was
+// is not kept: Wayland never says, and a place on one screen layout can be
+// off every screen of another. Windows keeps it under %LOCALAPPDATA% when
+// its backend comes.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+
+let is f64 as MAX_SIDE with imut = 32768.0;
+
+struct State {
+    width      as f64;
+    height     as f64;
+    maximized  as i32;
+    fullscreen as i32;
+}
+
+fn state(width as f64, height as f64) as State {
+    let is State as s;
+    s.width = width;
+    s.height = height;
+    s.maximized = 0;
+    s.fullscreen = 0;
+    return s;
+}
+
+fn _len(s as *u8) as i64 {
+    if (cast(i64, s) == 0) { return 0; }
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// A name a folder or file can have: not empty, no slash, not "." or "..".
+fn _plain_name(s as *u8, n as i64) as i32 {
+    if (n <= 0) { return 0; }
+    if (s[0] == cast(u8, 46) && (n == 1 || (n == 2 && s[1] == cast(u8, 46)))) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (s[i] == cast(u8, 47) || s[i] == cast(u8, 0)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _put(out as *u8, at as i64, s as *u8, n as i64, cap as i64) as i64 {
+    if (at < 0 || at + n > cap) { return 0 - 1; }
+    mem.memcpy(cast(*u8, cast(i64, out) + at), s, n);
+    return at + n;
+}
+
+// Where window name — nn bytes — of program app — an bytes — is kept, given
+// HOME and XDG_STATE_HOME as home and xdg: into out, cap bytes; how many, 0
+// when nowhere, a name is not one a file can have, or it does not fit.
+fn path_in(home as *u8, xdg as *u8, app as *u8, an as i64, name as *u8, nn as i64, out as *u8, cap as i64) as i64 {
+    if (_plain_name(app, an) == 0 || _plain_name(name, nn) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    let is i64 as xn = _len(xdg);
+    if (xn > 0 && xdg[0] == cast(u8, 47)) {
+        k = _put(out, k, xdg, xn, cap);
+    } else {
+        let is i64 as hn = _len(home);
+        if (hn == 0) { return 0; }
+        k = _put(out, k, home, hn, cap);
+        k = _put(out, k, "/.local/state", 13, cap);
+    }
+    k = _put(out, k, "/", 1, cap);
+    k = _put(out, k, app, an, cap);
+    k = _put(out, k, "/", 1, cap);
+    k = _put(out, k, name, nn, cap);
+    k = _put(out, k, ".window", 7, cap);
+    if (k < 0) { return 0; }
+    return k;
+}
+
+// --- Written ---
+
+fn _number(v as f64, out as *u8, at as i64) as i64 {
+    let is i64 as tenths = cast(i64, fm.floor(v * 10.0 + 0.5));
+    let is [24]u8 as tmp;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = tenths / 10;
+    if (x == 0) {
+        tmp[0] = cast(u8, 48);
+        n = 1;
+    }
+    while (x > 0) {
+        tmp[n] = cast(u8, 48 + x % 10);
+        n = n + 1;
+        x = x / 10;
+    }
+    let is i64 as k with mut = at;
+    while (n > 0) {
+        n = n - 1;
+        out[k] = tmp[n];
+        k = k + 1;
+    }
+    if (tenths % 10 != 0) {
+        out[k] = cast(u8, 46);
+        out[k + 1] = cast(u8, 48 + tenths % 10);
+        k = k + 2;
+    }
+    return k;
+}
+
+fn _line(out as *u8, at as i64, key as *u8, v as f64) as i64 {
+    let is i64 as k with mut = at;
+    let is i64 as kn = _len(key);
+    mem.memcpy(cast(*u8, cast(i64, out) + k), key, kn);
+    k = k + kn;
+    out[k] = cast(u8, 61);
+    k = _number(v, out, k + 1);
+    out[k] = cast(u8, 10);
+    return k + 1;
+}
+
+// The folders above the file at p, n bytes, made where they are not.
+fn _folders(p as *u8, n as i64) as void {
+    let is [4096]u8 as b;
+    if (n >= 4096) { return; }
+    mem.memcpy(cast(*u8, &b), p, n);
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        if (b[i] == cast(u8, 47)) {
+            b[i] = cast(u8, 0);
+            linux.mkdir(cast(*u8, &b), 448);
+            b[i] = cast(u8, 47);
+        }
+        i = i + 1;
+    }
+}
+
+// st written to the file at p, n bytes, its folders made: 1, or 0 when it
+// could not be.
+fn write(p as *u8, n as i64, st as *State) as i32 {
+    if (n <= 0 || n >= 4090) { return 0; }
+    let is [256]u8 as text;
+    let is i64 as k with mut = _line(cast(*u8, &text), 0, "width", st.width);
+    k = _line(cast(*u8, &text), k, "height", st.height);
+    k = _line(cast(*u8, &text), k, "maximized", cast(f64, st.maximized));
+    k = _line(cast(*u8, &text), k, "fullscreen", cast(f64, st.fullscreen));
+    let is [4096]u8 as to;
+    mem.memcpy(cast(*u8, &to), p, n);
+    to[n] = cast(u8, 0);
+    let is [4096]u8 as tmp;
+    mem.memcpy(cast(*u8, &tmp), p, n);
+    mem.memcpy(cast(*u8, cast(i64, &tmp) + n), ".new", 5);
+    _folders(p, n);
+    let is i64 as fd = linux.open(cast(*u8, &tmp), 577, 384);   // O_WRONLY|O_CREAT|O_TRUNC, 0600
+    if (fd < 0) { return 0; }
+    let is i64 as wrote = linux.write(fd, cast(*u8, &text), k);
+    linux.close(fd);
+    if (wrote != k || linux.rename(cast(*u8, &tmp), cast(*u8, &to)) != 0) {
+        linux.unlink(cast(*u8, &tmp));
+        return 0;
+    }
+    return 1;
+}
+
+// --- Read ---
+
+// A number at s, n bytes: digits, and one tenth after a point; -1 when it is
+// not one.
+fn _value(s as *u8, n as i64) as f64 {
+    if (n <= 0) { return 0.0 - 1.0; }
+    let is f64 as v with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n && s[i] >= cast(u8, 48) && s[i] <= cast(u8, 57)) {
+        v = v * 10.0 + cast(f64, cast(i64, s[i]) - 48);
+        i = i + 1;
+    }
+    if (i == 0) { return 0.0 - 1.0; }
+    if (i == n) { return v; }
+    if (i + 2 != n || s[i] != cast(u8, 46) || s[i + 1] < cast(u8, 48) || s[i + 1] > cast(u8, 57)) { return 0.0 - 1.0; }
+    return (v * 10.0 + cast(f64, cast(i64, s[i + 1]) - 48)) / 10.0;
+}
+
+fn _is(s as *u8, n as i64, key as *u8) as i32 {
+    let is i64 as kn = _len(key);
+    return cast(i32, n == kn && mem.core.memcmp(s, key, n) == 0);
+}
+
+// The file at p, n bytes, read into st: 1; 0 when there is none or it is not
+// as written — st then as it was.
+fn read(p as *u8, n as i64, st as *State) as i32 {
+    if (n <= 0 || n >= 4096) { return 0; }
+    let is [4096]u8 as at;
+    mem.memcpy(cast(*u8, &at), p, n);
+    at[n] = cast(u8, 0);
+    let is i64 as fd = linux.open(cast(*u8, &at), 0, 0);
+    if (fd < 0) { return 0; }
+    let is [1024]u8 as text;
+    let is i64 as got = linux.read(fd, cast(*u8, &text), 1024);
+    linux.close(fd);
+    if (got <= 0 || got >= 1024) { return 0; }
+    let is State as s = state(0.0 - 1.0, 0.0 - 1.0);
+    let is i64 as i with mut = 0;
+    while (i < got) {
+        let is i64 as e with mut = i;
+        while (e < got && text[e] != cast(u8, 10)) { e = e + 1; }
+        let is i64 as eq with mut = i;
+        while (eq < e && text[eq] != cast(u8, 61)) { eq = eq + 1; }
+        if (eq < e) {
+            let is *u8 as key = cast(*u8, cast(i64, &text) + i);
+            let is f64 as v = _value(cast(*u8, cast(i64, &text) + eq + 1), e - eq - 1);
+            if (_is(key, eq - i, "width") == 1) { s.width = v; }
+            if (_is(key, eq - i, "height") == 1) { s.height = v; }
+            if (_is(key, eq - i, "maximized") == 1) {
+                if (v != 0.0 && v != 1.0) { return 0; }
+                s.maximized = cast(i32, v);
+            }
+            if (_is(key, eq - i, "fullscreen") == 1) {
+                if (v != 0.0 && v != 1.0) { return 0; }
+                s.fullscreen = cast(i32, v);
+            }
+        }
+        i = e + 1;
+    }
+    if (s.width < 1.0 || s.height < 1.0 || s.width > MAX_SIDE || s.height > MAX_SIDE) { return 0; }
+    *st = s;
+    return 1;
+}
+
+// --- Through the environment ---
+
+fn _path(app as *u8, an as i64, name as *u8, nn as i64, out as *u8) as i64 {
+    return path_in(env.getenv("HOME"), env.getenv("XDG_STATE_HOME"), app, an, name, nn, out, 4095);
+}
+
+// Window name of program app kept: 1, or 0 when it could not be. The program
+// has called env.init.
+fn save(app as *u8, an as i64, name as *u8, nn as i64, st as *State) as i32 {
+    let is [4096]u8 as p;
+    let is i64 as n = _path(app, an, name, nn, cast(*u8, &p));
+    if (n == 0) { return 0; }
+    return write(cast(*u8, &p), n, st);
+}
+
+// Window name of program app as it was kept, into st: 1, or 0 with st as it
+// was.
+fn load(app as *u8, an as i64, name as *u8, nn as i64, st as *State) as i32 {
+    let is [4096]u8 as p;
+    let is i64 as n = _path(app, an, name, nn, cast(*u8, &p));
+    if (n == 0) { return 0; }
+    return read(cast(*u8, &p), n, st);
+}
