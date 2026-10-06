@@ -423,8 +423,10 @@ and its own router, its logical size, its scale and whether the platform says
 it is active (a change repaints all of it); `app.frame` lays it out at its size
 and collects what to repaint. `app.set_text_service` lends every window, open
 and to come, the application's text service; each window's tree has its
-animator. It is fed by calls, as the router is: the
-platform loop that opens real windows and presents frames sits above it.
+animator; `app.pointer_shape` says what the pointer looks like in a window,
+for the loop to hand the platform when it changes. It is fed by calls, as the
+router is: the platform loop that opens real windows and presents frames sits
+above it.
 
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
 with its test): margins, alignment, minimum and maximum, right to left,
@@ -503,6 +505,16 @@ blinking in a window nobody types into would keep the machine awake. It says
 when the caret next changes (`next_due`), asks then for the widget typed into
 to be drawn again, and painting asks it whether the caret is off at the
 frame's time (`caret_off`), which widgets hear as `S_CARET_OFF`.
+
+The pointer's shape (`pointer_shape_test`) is CSS's cursors, numbered as
+Wayland's cursor-shape-v1 has them (`tree.SHAPE_*`), so the window layer maps
+each to an X cursor, a Wayland shape or a Windows IDC_. A kind may say, for a
+point of a widget, which one the pointer takes there or that its parent
+decides (`Kind.shape`); `router.pointer_shape` asks the widget holding a
+press, wherever the pointer went, or else the deepest one under it, and up —
+skipping what is disabled, since a shape says what can be done there. The
+text beam over an entry and a selectable label, a hand over a link, the
+resizing arrows over a splitter's handle.
 
 **Signals and models** (`signal.cst`, `model.cst`, tested by `signal_test` and
 `model_test`): callbacks connected per widget and signal, called in connection
