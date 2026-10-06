@@ -185,7 +185,10 @@ the theme.
 **Height for width.** Wrapped text is taller the narrower it is, so a widget's
 height is measured again at the width it is actually given, and a row or grid
 that knows its width shares it out before asking its children how tall they
-need to be. Without that, a paragraph in a row is measured on one line.
+need to be. Without that, a paragraph in a row is measured on one line. Nor
+is a widget asked about more room than its maximum size lets it take: what
+holds a paragraph capped narrower than the space would otherwise count too few
+of its lines.
 
 Rectangles are **relative to the parent**: moving a container — scrolling it,
 moving the window — moves everything in it without laying anything out again.
