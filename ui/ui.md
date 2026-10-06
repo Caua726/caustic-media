@@ -405,8 +405,11 @@ invalidation that climbs to the root. It carries what the application lends
 its widgets: the text service (`set_text_service`, a bare pointer so that the
 tree does not bring the text stack into programs that show none), the
 program's function for text copied to the clipboard or the primary selection
-(`set_clipboard`, `copy`), and which widget names which (`set_labelled_by`,
-forgotten when the label goes).
+(`set_clipboard`, `copy`), which widget names which (`set_labelled_by`,
+forgotten when the label goes), and the window's animator (`set_animator`).
+A widget's event entry may ask for the focus for another
+(`tree.request_focus`): the router gives it once the event is delivered,
+by keyboard or pointer as the event was.
 
 **The application** (`app.cst`, tested by `app_test`): one per program,
 holding what no single window owns — the system's settings, which every
@@ -415,7 +418,8 @@ table of windows named by handles with an era. Each window has its own tree
 and its own router, its logical size, its scale and whether the platform says
 it is active (a change repaints all of it); `app.frame` lays it out at its size
 and collects what to repaint. `app.set_text_service` lends every window, open
-and to come, the application's text service. It is fed by calls, as the router is: the
+and to come, the application's text service; each window's tree has its
+animator. It is fed by calls, as the router is: the
 platform loop that opens real windows and presents frames sits above it.
 
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
