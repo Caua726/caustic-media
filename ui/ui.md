@@ -17,6 +17,7 @@ ui/
   grid.cst        rows and columns at once
   stack.cst       one page at a time; children layered on each other
   scroll.cst      a viewport onto content larger than it
+  positioner.cst  where a popup goes: xdg_positioner as geometry
   splitter.cst    panes divided by handles the user drags
   event.cst       what a widget receives
   router.cst      where events go: hit-testing, capture, bubbling, hover,
@@ -410,7 +411,8 @@ its widgets: the text service (`set_text_service`, a bare pointer so that the
 tree does not bring the text stack into programs that show none), the
 program's function for text copied to the clipboard or the primary selection
 (`set_clipboard`, `copy`), which widget names which (`set_labelled_by`,
-forgotten when the label goes), and the window's animator (`set_animator`).
+forgotten when the label goes), the window's animator (`set_animator`) and the
+application's timers (`set_timers`), for a widget that acts after a pause.
 A widget's event entry may ask for the focus for another
 (`tree.request_focus`): the router gives it once the event is delivered,
 by keyboard or pointer as the event was.
@@ -431,7 +433,8 @@ above it.
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
 with its test): margins, alignment, minimum and maximum, right to left,
 height for width, a pass that skips what did not change, and box, grid, stack
-and overlay. No container has a fixed ceiling on children: they work in a
+and overlay — whose size leaves out what is on a layer, so an open popup does
+not make the window fit it. No container has a fixed ceiling on children: they work in a
 scratch area that is part of the tree's mapping, sized from its capacity, and a
 grid too sparse to fit says so with `LAYOUT_TOO_LARGE` instead of dropping
 cells. Edges land on physical pixels: `layout.set_scale` gives the window's
@@ -439,6 +442,15 @@ scale, and every rectangle's edges — not its size — are rounded to that grid
 relative to a parent already on it, so 100 split three ways at scale 1 is 33,
 34 and 33 edge to edge, and at 1.5 is 50 physical pixels each (`snap_test`). The tests were checked against deliberate breakages — each rule
 removed in turn — and catch every one.
+
+**Popups' places** (`positioner.cst`, tested by `positioner_test`): Wayland's
+xdg_positioner, the most constrained of the three platforms' models and so
+the one the toolkit speaks everywhere — a popup is put against an anchor
+rectangle, never at a point of the screen: a point of the rectangle, the way
+the popup grows from it, an offset, and on an axis where that leaves the
+bounds the adjustments allowed, in the spec's order — flipped when the other
+side fits, slid back inside, cut to fit unless that leaves nothing. A popup
+just touching an edge fits.
 
 **Scroll areas** (`scroll.cst`, tested by `scroll_test`): content measured
 without a limit along an axis that scrolls and given the view's size along one
@@ -495,7 +507,9 @@ widget text is typed into says where its caret is (`tree.set_text_area`), for
 the input method's candidates, and when it gives a composition up — the caret
 moved away from it — says so (`tree.reset_ime`, passed on by the program), so
 that what the input method commits next is not what was given up. FOCUS_IN
-says whether the focus came by keyboard.
+says whether the focus came by keyboard. A press outside a modal scope goes
+nowhere, but the scope hears of it (`PRESS_OUTSIDE`), so a popup closes; the
+press is spent on that, and opens no context menu where it landed.
 
 The router keeps a text caret's blink (`blink_test`): on for two thirds of the
 desktop's cycle and off for the rest, as GTK draws it, started again by each
