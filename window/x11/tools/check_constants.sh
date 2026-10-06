@@ -30,9 +30,10 @@ LAYOUT=tools/layout.txt
 # Two files, because the constants come from two headers. X.h is the protocol
 # and bind/x.cst carries it; Xutil.h is the conventions layered on top, and the
 # XSizeHints flags live in bind/xutil.cst beside the struct they are the flags
-# word of. Both are checked as one set, so a constant declared in neither is
-# still a gap and one declared in either is still checked against the header.
-SRCS="bind/x.cst bind/xutil.cst"
+# word of. shape.h's few are in bind/xshape.cst beside the calls that take
+# them. All are checked as one set, so a constant declared in none is still a
+# gap and one declared in any is still checked against the header.
+SRCS="bind/x.cst bind/xutil.cst bind/xshape.cst"
 TMP="${TMPDIR:-/tmp}/x11_const_$$"
 mkdir -p "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -75,6 +76,6 @@ fi
 
 n=$(wc -l < "$TMP/declared")
 if [ "$fails" -eq 0 ]; then
-    echo "check_constants: $n/$n conferidos contra X.h e Xutil.h, ok"
+    echo "check_constants: $n/$n conferidos contra X.h, Xutil.h e shape.h, ok"
 fi
 exit "$fails"

@@ -26,6 +26,7 @@
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/scrnsaver.h>
+#include <X11/extensions/shape.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -756,6 +757,21 @@ static void structs(void)
     F(XSizeHints, base_width);
     F(XSizeHints, base_height);
     F(XSizeHints, win_gravity);
+
+    /* XVisualInfo is what XMatchVisualInfo fills in: a window with alpha
+     * needs a 32-bit TrueColor visual, which the default one never is, and
+     * its colormap made for it. */
+    S(XVisualInfo);
+    F(XVisualInfo, visual);
+    F(XVisualInfo, visualid);
+    F(XVisualInfo, screen);
+    F(XVisualInfo, depth);
+    F(XVisualInfo, class);
+    F(XVisualInfo, red_mask);
+    F(XVisualInfo, green_mask);
+    F(XVisualInfo, blue_mask);
+    F(XVisualInfo, colormap_size);
+    F(XVisualInfo, bits_per_rgb);
 }
 
 static void im_structs(void)
@@ -1168,6 +1184,19 @@ static void constants(void)
     C(PAspect);
     C(PBaseSize);
     C(PWinGravity);
+
+    /* shape.h: which of a window's two regions, and how a new one combines
+     * with the old. A window drawing its own frame sets its input region to
+     * leave its shadow out of the pointer's reach; ShapeBounding there would
+     * cut the shadow off instead. */
+    C(ShapeSet);
+    C(ShapeUnion);
+    C(ShapeIntersect);
+    C(ShapeSubtract);
+    C(ShapeInvert);
+    C(ShapeBounding);
+    C(ShapeClip);
+    C(ShapeInput);
 }
 
 int main(void)
