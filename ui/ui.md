@@ -30,6 +30,7 @@ ui/
   style.cst       the theme: colours, metrics, fonts, per-state variants
   system.cst      the desktop's settings, as the theme and the timings
   text.cst        one text service: runs laid out and drawn
+  textbuf.cst     the text an entry or a text view edits; undo in steps
   access.cst      role, name, states, value and actions per widget
   widgets/        label, button, check, radio, entry, slider, progress,
                   list, tree, table, menu, tabs, dialog
@@ -745,6 +746,16 @@ step commits it held to range and step, or puts the value back when it is
 no number; Escape puts it back. While something is typed, Enter and Escape
 are its own, ahead of the window's default and cancel buttons. A caret after
 its text while it has the focus.
+
+**The text buffer** (`textbuf.cst`, tested by `textbuf_test`): what an entry or
+a text view edits — a gap buffer, any range had in one piece for laying out
+(the gap moved only when inside it); paragraphs indexed through every edit, so
+the paragraph of an offset is a search away; line ends made line feeds on the
+way in. Undo and redo go by the steps a person would undo by: a run of typing
+broken at a word's start or by the caret moving, a run of backspaces or of
+deletes forward, a paste or a replacement alone, each putting the caret back
+where it belongs; the program's own edits forget what could be undone, whose
+places they move. Two megabytes in twenty thousand paragraphs stay quick.
 
 ## For scale
 

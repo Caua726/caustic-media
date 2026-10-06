@@ -1,0 +1,548 @@
+// ui/textbuf.cst — the text an entry or a text view edits.
+//
+// A gap buffer: the text in one block with a gap where the last edit was, so
+// typing in one place costs nothing and moving the gap costs only the bytes
+// between. Any range can be had in one piece (span) for laying out — the gap
+// moves out of it only when it is inside — and read out anywhere.
+//
+// Paragraphs are indexed: the offset each one starts at, kept through every
+// edit, so a text view finds the paragraph of an offset by a search and lays
+// out only those it shows. Line ends come in as line feeds: CR LF and a lone
+// CR are made one LF on the way in (added says how many bytes went in).
+//
+// Undo and redo go by the steps a person would undo by: a run of typing is
+// one — a word's start breaks it, so is the caret moving (break_group) — a
+// run of backspaces or of deletes forward is one, a paste and a replacement
+// each one. Each step puts the caret back where it belongs (caret). The
+// plain edits, insert and delete, are a program setting text: they are not
+// remembered, and they forget what was, whose places they move.
+use "std/mem.cst" as mem;
+
+// What a step is, to know what joins it.
+let is i64 as _TYPING   with imut = 1;
+let is i64 as _BACK     with imut = 2;   // backspaces: each before the last
+let is i64 as _FORWARD  with imut = 3;   // deletes forward: each where the last was
+let is i64 as _OTHER    with imut = 4;   // a paste, a replacement: alone
+
+// One edit: at at, del bytes taken out and ins put in, both kept in the
+// store at their offsets.
+struct Rec {
+    at      as i64;
+    del_off as i64;
+    del_n   as i64;
+    ins_off as i64;
+    ins_n   as i64;
+    group   as i64;
+}
+
+// A step: its edits, its kind, and where the caret goes undoing and redoing
+// it.
+struct Group {
+    first     as i64;   // records
+    last      as i64;
+    kind      as i64;
+    caret_un  as i64;
+    caret_re  as i64;
+}
+
+struct Buf {
+    block    as *u8;
+    cap      as i64;
+    gap_at   as i64;
+    gap_len  as i64;
+    len      as i64;
+    added    as i64;   // what the last insertion put in, line ends made LF
+    paras    as *i64;  // each paragraph's start
+    npara    as i64;
+    para_cap as i64;
+    recs     as *Rec;
+    nrec     as i64;
+    rec_cap  as i64;
+    groups   as *Group;
+    ngroup   as i64;   // undone ones stay past done, for redoing
+    done     as i64;   // groups done; below ngroup, some can be redone
+    group_cap as i64;
+    store    as *u8;   // the bytes edits took out and put in
+    nstore   as i64;
+    store_cap as i64;
+    open_grp as i32;   // the last group may be joined
+    _pad0    as i32;
+    caret_at as i64;   // where the caret goes after an undo or redo
+}
+
+fn _grow(p as *u8, used as i64, cap as i64, want as i64, out_cap as *i64) as *u8 {
+    if (want <= cap) {
+        *out_cap = cap;
+        return p;
+    }
+    let is i64 as c with mut = cap * 2;
+    if (c < 4096) { c = 4096; }
+    while (c < want) { c = c * 2; }
+    let is *u8 as q = mem.core.mmap_anon(c);
+    if (cast(i64, q) <= 0) {
+        *out_cap = cap;
+        return cast(*u8, 0);
+    }
+    if (used > 0) { mem.memcpy(q, p, used); }
+    if (cap > 0) { mem.core.munmap(p, cap); }
+    *out_cap = c;
+    return q;
+}
+
+fn open() as Buf {
+    let is Buf as b;
+    mem.memset(cast(*u8, &b), 0, sizeof(Buf));
+    let is i64 as c with mut = 0;
+    b.paras = cast(*i64, _grow(cast(*u8, 0), 0, 0, 8 * 64, &c));
+    b.para_cap = c / 8;
+    b.paras[0] = 0;
+    b.npara = 1;
+    return b;
+}
+
+fn close(b as *Buf) as void {
+    if (b.cap > 0) { mem.core.munmap(b.block, b.cap); }
+    if (b.para_cap > 0) { mem.core.munmap(cast(*u8, b.paras), b.para_cap * 8); }
+    if (b.rec_cap > 0) { mem.core.munmap(cast(*u8, b.recs), b.rec_cap * sizeof(Rec)); }
+    if (b.group_cap > 0) { mem.core.munmap(cast(*u8, b.groups), b.group_cap * sizeof(Group)); }
+    if (b.store_cap > 0) { mem.core.munmap(b.store, b.store_cap); }
+    mem.memset(cast(*u8, b), 0, sizeof(Buf));
+}
+
+fn length(b as *Buf) as i64 { return b.len; }
+fn added(b as *Buf) as i64 { return b.added; }
+
+// --- The gap ---
+
+// The gap moved to at.
+fn _move_gap(b as *Buf, at as i64) as void {
+    if (at == b.gap_at) { return; }
+    if (at < b.gap_at) {
+        // The bytes at .. gap_at go to the gap's far end.
+        let is i64 as n = b.gap_at - at;
+        let is i64 as i with mut = n - 1;
+        while (i >= 0) {
+            b.block[at + b.gap_len + i] = b.block[at + i];
+            i = i - 1;
+        }
+    } else {
+        let is i64 as n = at - b.gap_at;
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            b.block[b.gap_at + i] = b.block[b.gap_at + b.gap_len + i];
+            i = i + 1;
+        }
+    }
+    b.gap_at = at;
+}
+
+// Room in the gap for n more bytes: 1, or 0 when memory is refused.
+fn _room(b as *Buf, n as i64) as i32 {
+    if (b.gap_len >= n) { return 1; }
+    let is i64 as want = b.len + n + 64;
+    let is i64 as c with mut = b.cap * 2;
+    if (c < 256) { c = 256; }
+    while (c < want) { c = c * 2; }
+    let is *u8 as q = mem.core.mmap_anon(c);
+    if (cast(i64, q) <= 0) { return 0; }
+    // Before the gap, then after it, at the new block's end.
+    if (b.gap_at > 0) { mem.memcpy(q, b.block, b.gap_at); }
+    let is i64 as tail = b.len - b.gap_at;
+    if (tail > 0) { mem.memcpy(cast(*u8, cast(i64, q) + c - tail), cast(*u8, cast(i64, b.block) + b.gap_at + b.gap_len), tail); }
+    if (b.cap > 0) { mem.core.munmap(b.block, b.cap); }
+    b.block = q;
+    b.gap_len = c - b.len;
+    b.cap = c;
+    return 1;
+}
+
+// The byte at offset i, -1 past the text.
+fn byte_at(b as *Buf, i as i64) as i64 {
+    if (i < 0 || i >= b.len) { return 0 - 1; }
+    if (i < b.gap_at) { return cast(i64, b.block[i]); }
+    return cast(i64, b.block[i + b.gap_len]);
+}
+
+// n bytes from at into out.
+fn read(b as *Buf, at as i64, n as i64, out as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        out[i] = cast(u8, byte_at(b, at + i));
+        i = i + 1;
+    }
+}
+
+// n bytes from at, in one piece, until the next edit; the gap moved away
+// only when it is inside them.
+fn span(b as *Buf, at as i64, n as i64) as *u8 {
+    if (at < b.gap_at && at + n > b.gap_at) { _move_gap(b, at + n); }
+    if (at < b.gap_at) { return cast(*u8, cast(i64, b.block) + at); }
+    return cast(*u8, cast(i64, b.block) + at + b.gap_len);
+}
+
+// --- Paragraphs ---
+
+fn paragraphs(b as *Buf) as i64 { return b.npara; }
+
+fn para_start(b as *Buf, i as i64) as i64 { return b.paras[i]; }
+
+// Where paragraph i ends, its line feed left out.
+fn para_end(b as *Buf, i as i64) as i64 {
+    if (i + 1 < b.npara) { return b.paras[i + 1] - 1; }
+    return b.len;
+}
+
+// The paragraph offset at is in; a line feed is its paragraph's.
+fn para_of(b as *Buf, at as i64) as i64 {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = b.npara - 1;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi + 1) / 2;
+        if (b.paras[mid] <= at) { lo = mid; } else { hi = mid - 1; }
+    }
+    return lo;
+}
+
+// Paragraph starts after offset at moved by by.
+fn _shift(b as *Buf, from as i64, by as i64) as void {
+    let is i64 as i with mut = from;
+    while (i < b.npara) {
+        b.paras[i] = b.paras[i] + by;
+        i = i + 1;
+    }
+}
+
+fn _add_para(b as *Buf, i as i64, start as i64) as i32 {
+    if (b.npara >= b.para_cap) {
+        let is i64 as c with mut = 0;
+        let is *u8 as q = _grow(cast(*u8, b.paras), b.npara * 8, b.para_cap * 8, (b.npara + 1) * 8, &c);
+        if (cast(i64, q) == 0) { return 0; }
+        b.paras = cast(*i64, q);
+        b.para_cap = c / 8;
+    }
+    let is i64 as k with mut = b.npara;
+    while (k > i) {
+        b.paras[k] = b.paras[k - 1];
+        k = k - 1;
+    }
+    b.paras[i] = start;
+    b.npara = b.npara + 1;
+    return 1;
+}
+
+// --- Plain edits ---
+
+// s, n bytes, in at at — line ends made LF — the index kept: 1, or 0 for a
+// place past the text or memory refused.
+fn _insert(b as *Buf, at as i64, s as *u8, n as i64) as i32 {
+    b.added = 0;
+    if (at < 0 || at > b.len || n < 0) { return 0; }
+    if (_room(b, n) == 0) { return 0; }
+    _move_gap(b, at);
+    let is i64 as p = para_of(b, at);
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    let is i64 as made with mut = 0;
+    while (i < n) {
+        let is u8 as c with mut = s[i];
+        if (c == 13) {
+            c = 10;
+            if (i + 1 < n && s[i + 1] == 10) { i = i + 1; }
+        }
+        b.block[at + k] = c;
+        k = k + 1;
+        i = i + 1;
+    }
+    b.gap_at = at + k;
+    b.gap_len = b.gap_len - k;
+    b.len = b.len + k;
+    b.added = k;
+    // The paragraphs after it move, and each line feed starts one.
+    _shift(b, p + 1, k);
+    i = 0;
+    while (i < k) {
+        if (b.block[at + i] == 10) {
+            if (_add_para(b, p + 1 + made, at + i + 1) == 0) { return 0; }
+            made = made + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// n bytes from at out, the index kept: 1, or 0 for a range past the text.
+fn _delete(b as *Buf, at as i64, n as i64) as i32 {
+    if (at < 0 || n < 0 || at + n > b.len) { return 0; }
+    _move_gap(b, at);
+    b.gap_len = b.gap_len + n;
+    b.len = b.len - n;
+    // Paragraphs starting inside the range go; those after it move back.
+    let is i64 as i with mut = 1;
+    let is i64 as o with mut = 1;
+    while (i < b.npara) {
+        let is i64 as st = b.paras[i];
+        if (st > at && st <= at + n) {
+            i = i + 1;
+        } else {
+            if (st > at + n) { b.paras[o] = st - n; } else { b.paras[o] = st; }
+            o = o + 1;
+            i = i + 1;
+        }
+    }
+    b.npara = o;
+    return 1;
+}
+
+// The program's edits: not remembered, and forgetting what was.
+fn insert(b as *Buf, at as i64, s as *u8, n as i64) as i32 {
+    let is i32 as ok = _insert(b, at, s, n);
+    if (ok == 1) { forget(b); }
+    return ok;
+}
+
+fn delete(b as *Buf, at as i64, n as i64) as i32 {
+    let is i32 as ok = _delete(b, at, n);
+    if (ok == 1) { forget(b); }
+    return ok;
+}
+
+// n bytes at at made s, m bytes.
+fn replace(b as *Buf, at as i64, n as i64, s as *u8, m as i64) as i32 {
+    if (_delete(b, at, n) == 0) { return 0; }
+    let is i32 as ok = _insert(b, at, s, m);
+    forget(b);
+    return ok;
+}
+
+// --- What can be undone ---
+
+// Nothing to undo or redo.
+fn forget(b as *Buf) as void {
+    b.nrec = 0;
+    b.ngroup = 0;
+    b.done = 0;
+    b.nstore = 0;
+    b.open_grp = 0;
+}
+
+fn can_undo(b as *Buf) as i32 { return cast(i32, b.done > 0); }
+fn can_redo(b as *Buf) as i32 { return cast(i32, b.done < b.ngroup); }
+
+// Where the caret goes, after the last undo or redo.
+fn caret(b as *Buf) as i64 { return b.caret_at; }
+
+// The next edit a step of its own: the caret moved, the selection changed.
+fn break_group(b as *Buf) as void { b.open_grp = 0; }
+
+// What could be redone, dropped: a new edit goes on from here.
+fn _drop_redo(b as *Buf) as void {
+    if (b.done >= b.ngroup) { return; }
+    let is i64 as first = b.groups[b.done].first;
+    b.nrec = first;
+    if (first > 0) {
+        let is *Rec as last = &b.recs[first - 1];
+        b.nstore = last.ins_off + last.ins_n;
+    } else {
+        b.nstore = 0;
+    }
+    b.ngroup = b.done;
+    b.open_grp = 0;
+}
+
+// The text at at, n bytes, kept in the store.
+fn _keep_text(b as *Buf, at as i64, n as i64) as i64 {
+    let is i64 as c with mut = 0;
+    let is *u8 as q = _grow(b.store, b.nstore, b.store_cap, b.nstore + n, &c);
+    if (cast(i64, q) == 0) { return 0 - 1; }
+    b.store = q;
+    b.store_cap = c;
+    let is i64 as off = b.nstore;
+    read(b, at, n, cast(*u8, cast(i64, b.store) + off));
+    b.nstore = b.nstore + n;
+    return off;
+}
+
+fn _rec(b as *Buf) as *Rec {
+    if (b.nrec >= b.rec_cap) {
+        let is i64 as c with mut = 0;
+        let is *u8 as q = _grow(cast(*u8, b.recs), b.nrec * sizeof(Rec), b.rec_cap * sizeof(Rec),
+                               (b.nrec + 1) * sizeof(Rec), &c);
+        if (cast(i64, q) == 0) { return cast(*Rec, 0); }
+        b.recs = cast(*Rec, q);
+        b.rec_cap = c / sizeof(Rec);
+    }
+    let is *Rec as r = &b.recs[b.nrec];
+    b.nrec = b.nrec + 1;
+    return r;
+}
+
+fn _group(b as *Buf, kind as i64) as *Group {
+    if (b.ngroup >= b.group_cap) {
+        let is i64 as c with mut = 0;
+        let is *u8 as q = _grow(cast(*u8, b.groups), b.ngroup * sizeof(Group), b.group_cap * sizeof(Group),
+                               (b.ngroup + 1) * sizeof(Group), &c);
+        if (cast(i64, q) == 0) { return cast(*Group, 0); }
+        b.groups = cast(*Group, q);
+        b.group_cap = c / sizeof(Group);
+    }
+    let is *Group as g = &b.groups[b.ngroup];
+    g.first = b.nrec;
+    g.last = b.nrec;
+    g.kind = kind;
+    b.ngroup = b.ngroup + 1;
+    b.done = b.ngroup;
+    b.open_grp = 1;
+    return g;
+}
+
+// The open group, when an edit of kind may join it.
+fn _joinable(b as *Buf, kind as i64) as *Group {
+    if (b.open_grp == 0 || b.done == 0 || b.done != b.ngroup) { return cast(*Group, 0); }
+    let is *Group as g = &b.groups[b.done - 1];
+    if (g.kind != kind) { return cast(*Group, 0); }
+    return g;
+}
+
+fn _is_space(c as i64) as i32 { return cast(i32, c == 32 || c == 9 || c == 10); }
+
+// Typed: s, n bytes, in at at — joining the typing before it when it goes on
+// from where that ended and does not start a word.
+fn type_in(b as *Buf, at as i64, s as *u8, n as i64) as i32 {
+    _drop_redo(b);
+    let is *Group as g with mut = _joinable(b, _TYPING);
+    if (cast(i64, g) != 0) {
+        let is *Rec as last = &b.recs[g.last];
+        let is i64 as end = last.at + last.ins_n;
+        let is i64 as before = byte_at(b, at - 1);
+        if (at != end || n == 0 || (_is_space(before) == 1 && _is_space(cast(i64, s[0])) == 0)) {
+            g = cast(*Group, 0);
+        }
+    }
+    if (_insert(b, at, s, n) == 0) { return 0; }
+    let is i64 as k = b.added;
+    if (cast(i64, g) != 0) {
+        let is *Rec as last = &b.recs[g.last];
+        // Its bytes go on after the last's, at the store's end.
+        if (_keep_text(b, at, k) < 0) { return 0; }
+        last.ins_n = last.ins_n + k;
+        g.caret_re = at + k;
+        return 1;
+    }
+    g = _group(b, _TYPING);
+    let is *Rec as r = _rec(b);
+    if (cast(i64, g) == 0 || cast(i64, r) == 0) { return 0; }
+    r.at = at;
+    r.del_off = b.nstore;
+    r.del_n = 0;
+    r.ins_off = _keep_text(b, at, k);
+    r.ins_n = k;
+    r.group = b.ngroup - 1;
+    g.first = b.nrec - 1;
+    g.last = b.nrec - 1;
+    g.caret_un = at;
+    g.caret_re = at + k;
+    return 1;
+}
+
+// Erased: n bytes from at — by Backspace when the caret was after them, by
+// Delete when it was at at — joining a run of the same: backspaces each just
+// before the last, deletes each where the last was. A run starts as
+// backspaces, and a second erase at its first's place makes it deletes.
+fn erase(b as *Buf, at as i64, n as i64) as i32 {
+    if (at < 0 || n <= 0 || at + n > b.len) { return 0; }
+    _drop_redo(b);
+    let is *Group as g with mut = _joinable(b, _BACK);
+    if (cast(i64, g) == 0) { g = _joinable(b, _FORWARD); }
+    if (cast(i64, g) != 0) {
+        let is *Rec as last = &b.recs[g.last];
+        if (g.kind == _BACK && at + n == last.at) {
+            // Backspacing on.
+        } else if ((g.kind == _FORWARD || g.first == g.last) && at == last.at) {
+            g.kind = _FORWARD;
+            g.caret_un = at;
+        } else {
+            g = cast(*Group, 0);
+        }
+    }
+    let is i64 as off = _keep_text(b, at, n);
+    if (off < 0 || _delete(b, at, n) == 0) { return 0; }
+    if (cast(i64, g) == 0) {
+        g = _group(b, _BACK);
+        if (cast(i64, g) == 0) { return 0; }
+        g.caret_un = at + n;
+    }
+    let is *Rec as r = _rec(b);
+    if (cast(i64, r) == 0) { return 0; }
+    r.at = at;
+    r.del_off = off;
+    r.del_n = n;
+    r.ins_off = b.nstore;
+    r.ins_n = 0;
+    r.group = b.ngroup - 1;
+    g.last = b.nrec - 1;
+    g.caret_re = at;
+    return 1;
+}
+
+// A change of its own: n bytes at at made s, m bytes — a paste, a
+// replacement, what is typed over a selection.
+fn change(b as *Buf, at as i64, n as i64, s as *u8, m as i64) as i32 {
+    if (at < 0 || n < 0 || at + n > b.len) { return 0; }
+    _drop_redo(b);
+    let is i64 as off = _keep_text(b, at, n);
+    if (off < 0 || _delete(b, at, n) == 0) { return 0; }
+    if (_insert(b, at, s, m) == 0) { return 0; }
+    let is i64 as k = b.added;
+    let is *Group as g = _group(b, _OTHER);
+    let is *Rec as r = _rec(b);
+    if (cast(i64, g) == 0 || cast(i64, r) == 0) { return 0; }
+    r.at = at;
+    r.del_off = off;
+    r.del_n = n;
+    r.ins_off = _keep_text(b, at, k);
+    r.ins_n = k;
+    r.group = b.ngroup - 1;
+    g.first = b.nrec - 1;
+    g.last = b.nrec - 1;
+    g.caret_un = at + n;
+    g.caret_re = at + k;
+    b.open_grp = 0;
+    return 1;
+}
+
+// A paste: s, n bytes, in at at, a step of its own.
+fn paste_in(b as *Buf, at as i64, s as *u8, n as i64) as i32 { return change(b, at, 0, s, n); }
+
+// The last step undone: 1, or 0 for none.
+fn undo(b as *Buf) as i32 {
+    if (b.done == 0) { return 0; }
+    let is *Group as g = &b.groups[b.done - 1];
+    let is i64 as i with mut = g.last;
+    while (i >= g.first) {
+        let is *Rec as r = &b.recs[i];
+        _delete(b, r.at, r.ins_n);
+        _insert(b, r.at, cast(*u8, cast(i64, b.store) + r.del_off), r.del_n);
+        i = i - 1;
+    }
+    b.done = b.done - 1;
+    b.caret_at = g.caret_un;
+    b.open_grp = 0;
+    return 1;
+}
+
+// The last step undone, done again: 1, or 0 for none.
+fn redo(b as *Buf) as i32 {
+    if (b.done >= b.ngroup) { return 0; }
+    let is *Group as g = &b.groups[b.done];
+    let is i64 as i with mut = g.first;
+    while (i <= g.last) {
+        let is *Rec as r = &b.recs[i];
+        _delete(b, r.at, r.del_n);
+        _insert(b, r.at, cast(*u8, cast(i64, b.store) + r.ins_off), r.ins_n);
+        i = i + 1;
+    }
+    b.done = b.done + 1;
+    b.caret_at = g.caret_re;
+    b.open_grp = 0;
+    return 1;
+}
