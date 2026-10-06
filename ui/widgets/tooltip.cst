@@ -1,0 +1,280 @@
+// ui/widgets/tooltip.cst — a short text shown over what the pointer rests on.
+//
+// One set of tooltips per window, held by the program beside its tree and
+// router: each widget's tip is text the program keeps alive. The program's
+// loop tells it the time (tick) and asks when it next wants to be told
+// (next_due), as with timers and the animator.
+//
+// The pointer resting on a widget with a tip — or inside one, the tip of the
+// nearest ancestor that has one — for the router's tooltip delay shows a
+// bubble: on a layer above everything, just below the pointer, kept inside
+// the window — to the left near its right edge, above the pointer near its
+// bottom — in the theme's tooltip colours, its text in the caption style and
+// wrapped to twenty-five of the body's ems. Leaving the widget, a press or a
+// key hides it, and it does not show again until the pointer leaves and comes
+// back; a press or a key before the delay keeps it from showing at all.
+// Assistive technology finds the bubble while it shows, a tooltip named by
+// its text.
+use "../../math/math.cst" as math;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "label.cst" as label;
+
+let is i64 as MAX_TIPS with imut = 64;
+let is i64 as LAYER    with imut = 1000;
+
+struct Tip {
+    w    as i64;     // 0 for a free slot
+    text as *u8;     // the program's
+    n    as i64;
+}
+
+struct Tooltips {
+    t       as *tree.Tree;
+    r       as *router.Router;
+    tips    as [64]Tip;
+    owner   as i64;   // the widget whose tip the pointer is on, 0 for none
+    since   as i64;   // when it was first seen there
+    inputs  as i64;   // the router's count of presses and keys then
+    shown   as i64;   // the bubble, 0 for none
+    label   as i64;   // its text
+    off     as i32;   // pressed or typed over: no tip until the pointer leaves
+    _pad0   as i32;
+}
+
+// --- The bubble ---
+
+let is tree.Kind as _kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("tooltip", 0);
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.role = access.ROLE_TOOLTIP;
+    _ready = 1;
+}
+
+fn _pad(th as *style.Theme) as f64 { return th.metrics.space_s; }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as pad = _pad(&th);
+    let is geom.Size as ls;
+    geom.size_zero(&ls);
+    let is i64 as ch = tree.first_child(t, w);
+    if (ch != 0) {
+        let is geom.Constraint as lc with mut = *c;
+        if (lc.w < layout.UNBOUNDED) { lc.w = lc.w - 2.0 * pad; }
+        if (lc.w < 0.0) { lc.w = 0.0; }
+        layout.measure(t, ch, &lc, &ls);
+    }
+    out.min_w = ls.min_w + 2.0 * pad;
+    out.pref_w = ls.pref_w + 2.0 * pad;
+    out.min_h = ls.min_h + 2.0 * pad;
+    out.pref_h = ls.pref_h + 2.0 * pad;
+    out.max_w = out.pref_w;
+    out.max_h = out.pref_h;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is i64 as ch = tree.first_child(t, w);
+    if (ch == 0) { return; }
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as pad = _pad(&th);
+    let is math.rect.Rect as area = math.rect.rect(pad, pad, r.w - 2.0 * pad, r.h - 2.0 * pad);
+    layout.place(t, ch, &area);
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is f64 as rad = p.theme.metrics.radius_s;
+    shapes.fill_rounded(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, rad, rad, rad, rad,
+                        p.theme.palette.tooltip_bg);
+    p.fg = p.theme.palette.tooltip_fg;
+}
+
+// --- The set of them ---
+
+// The tooltips of a window's tree t and router r, none yet.
+fn open(t as *tree.Tree, r as *router.Router) as Tooltips {
+    let is Tooltips as tt;
+    tt.t = t;
+    tt.r = r;
+    let is i64 as i with mut = 0;
+    while (i < MAX_TIPS) {
+        tt.tips[i].w = 0;
+        i = i + 1;
+    }
+    tt.owner = 0;
+    tt.since = 0;
+    tt.inputs = 0;
+    tt.shown = 0;
+    tt.label = 0;
+    tt.off = 0;
+    tt._pad0 = 0;
+    return tt;
+}
+
+// The bubble taken down; the tips forgotten.
+fn close(tt as *Tooltips) as void {
+    _hide(tt);
+    let is i64 as i with mut = 0;
+    while (i < MAX_TIPS) {
+        tt.tips[i].w = 0;
+        i = i + 1;
+    }
+}
+
+fn _find(tt as *Tooltips, w as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_TIPS) {
+        if (tt.tips[i].w == w) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// w's tip from now on: n bytes of UTF-8 the program keeps alive, or none for
+// null. 1, or 0 for no widget or a full table — a table whose dead widgets'
+// slots are taken back first.
+fn set(tt as *Tooltips, w as i64, s as *u8, n as i64) as i32 {
+    if (tree.is_valid(tt.t, w) == 0) { return 0; }
+    let is i64 as i with mut = _find(tt, w);
+    if (cast(i64, s) == 0) {
+        if (i >= 0) { tt.tips[i].w = 0; }
+        return 1;
+    }
+    if (i < 0) {
+        i = 0;
+        while (i < MAX_TIPS && tt.tips[i].w != 0 && tree.is_valid(tt.t, tt.tips[i].w) == 1) { i = i + 1; }
+        if (i >= MAX_TIPS) { return 0; }
+    }
+    tt.tips[i].w = w;
+    tt.tips[i].text = s;
+    tt.tips[i].n = n;
+    if (tt.shown != 0 && tt.owner == w) { label.set_text(tt.t, tt.label, s, n); }
+    return 1;
+}
+
+// The bubble showing now, 0 for none; the widget it is for; its label.
+fn shown(tt as *Tooltips) as i64 {
+    if (tree.is_valid(tt.t, tt.shown) == 0) { return 0; }
+    return tt.shown;
+}
+
+fn showing_for(tt as *Tooltips) as i64 {
+    if (shown(tt) == 0) { return 0; }
+    return tt.owner;
+}
+
+fn label_of(tt as *Tooltips) as i64 {
+    if (shown(tt) == 0) { return 0; }
+    return tt.label;
+}
+
+fn _hide(tt as *Tooltips) as void {
+    if (tree.is_valid(tt.t, tt.shown) == 1) { tree.destroy(tt.t, tt.shown); }
+    tt.shown = 0;
+    tt.label = 0;
+}
+
+// The widget whose tip the pointer is on: the one under it, or the nearest
+// ancestor with a tip.
+fn _owner(tt as *Tooltips) as i64 {
+    let is i64 as w with mut = router.hover(tt.r);
+    // What the router last saw under the pointer may since be gone.
+    while (w != 0 && tree.is_valid(tt.t, w) == 1) {
+        let is i64 as i = _find(tt, w);
+        if (i >= 0) { return w; }
+        w = tree.parent(tt.t, w);
+    }
+    return 0;
+}
+
+fn _show(tt as *Tooltips) as void {
+    _init();
+    let is *tree.Tree as t = tt.t;
+    let is i64 as i = _find(tt, tt.owner);
+    if (i < 0) { return; }
+    let is i64 as root = tree.root(t);
+    let is i64 as b = tree.create(t, &_kind, root);
+    if (b == 0) { return; }
+    let is i64 as l = label.create(t, b, tt.tips[i].text, tt.tips[i].n);
+    if (l == 0) {
+        tree.destroy(t, b);
+        return;
+    }
+    label.set_style(t, l, label.CAPTION);
+    label.set_wrap(t, l, 1);
+    tree.set_labelled_by(t, b, l);
+    tree.set_layer(t, b, LAYER);
+    // Where: just below the pointer, kept inside the window.
+    let is style.Theme as th;
+    widget.theme(t, b, &th);
+    let is math.rect.Rect as win = layout.rect(t, root);
+    let is f64 as most = th.fonts.body.size * 25.0;
+    let is geom.Constraint as c = geom.constraint(most, layout.UNBOUNDED);
+    let is geom.Size as s;
+    layout.measure(t, b, &c, &s);
+    let is f64 as bw with mut = s.pref_w;
+    if (bw > most) { bw = most; }
+    let is geom.Constraint as c2 = geom.constraint(bw, layout.UNBOUNDED);
+    layout.measure(t, b, &c2, &s);
+    let is f64 as px = tt.r.pointer_x;
+    let is f64 as py = tt.r.pointer_y;
+    let is f64 as below = th.metrics.indicator + th.metrics.space_s;
+    let is f64 as x with mut = px;
+    let is f64 as y with mut = py + below;
+    if (x + bw > win.w) { x = win.w - bw; }
+    if (x < 0.0) { x = 0.0; }
+    if (y + s.pref_h > win.h) { y = py - s.pref_h - th.metrics.space_s; }
+    if (y < 0.0) { y = 0.0; }
+    layout.set_align(t, b, layout.START, layout.START);
+    layout.set_margin(t, b, x, y, 0.0, 0.0);
+    layout.set_max_size(t, b, bw, layout.UNBOUNDED);
+    tt.shown = b;
+    tt.label = l;
+}
+
+// The time is now: show, keep or hide the bubble.
+fn tick(tt as *Tooltips, now as i64) as void {
+    let is i64 as owner = _owner(tt);
+    if (owner != tt.owner) {
+        _hide(tt);
+        tt.owner = owner;
+        tt.since = now;
+        tt.inputs = router.inputs(tt.r);
+        tt.off = 0;
+    }
+    // Pressed or typed over: away, until the pointer leaves.
+    if (router.inputs(tt.r) != tt.inputs) {
+        tt.inputs = router.inputs(tt.r);
+        tt.off = 1;
+        _hide(tt);
+    }
+    if (tt.shown != 0 && (tree.is_valid(tt.t, tt.shown) == 0 || tree.is_valid(tt.t, tt.owner) == 0 || owner == 0)) {
+        _hide(tt);
+    }
+    if (tt.shown == 0 && tt.owner != 0 && tt.off == 0 && tt.r.buttons == 0 &&
+        now - tt.since >= tt.r.settings.tooltip_ms) {
+        _show(tt);
+    }
+}
+
+// When it next wants to be told the time, -1 for no time of its own: the
+// delay's end while the pointer rests on a tip not yet shown.
+fn next_due(tt as *Tooltips) as i64 {
+    if (tt.shown != 0 || tt.owner == 0 || tt.off == 1 || _find(tt, tt.owner) < 0) { return 0 - 1; }
+    return tt.since + tt.r.settings.tooltip_ms;
+}

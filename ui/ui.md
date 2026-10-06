@@ -719,6 +719,18 @@ sizes both carried through. The title names the group to assistive
 technology, and its mnemonic gives the focus to the first thing inside that
 can take it.
 
+**Tooltips** (`widgets/tooltip.cst`, tested by `tooltip_test`): one set per
+window beside its tree and router, each widget's tip the program's text, told
+the time by the program's loop and saying when it next wants to be (as the
+animator does). The pointer resting on a widget with a tip — or inside one,
+the nearest ancestor's — for the router's `tooltip_ms` (500 by default)
+shows a bubble on a layer above everything, just below the pointer and kept
+inside the window, in the theme's tooltip colours, its text in the caption
+style wrapped to twenty-five of the body's ems; a tooltip to assistive
+technology, named by its text. Leaving the widget, a press or a key (the
+router counts them) hides it, and it does not show again until the pointer
+leaves and comes back.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
