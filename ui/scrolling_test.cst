@@ -1,0 +1,1125 @@
+// ui/scrolling_test.cst — a scroll area in pixels and in time: its bars
+// drawn, classic and overlay, the overlay ones there while something happens
+// and faded after; the wheel gliding; a touchpad's fling carried on after the
+// fingers lift; a drag held past its edge scrolling it; a widget scrolled to.
+use "std/io.cst" as io;
+use "std/math.cst" as fm;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
+use "../window/keys.cst" as keys;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "event.cst" as event;
+use "router.cst" as router;
+use "damage.cst" as damage;
+use "paint.cst" as paint;
+use "painter.cst" as painter;
+use "style.cst" as style;
+use "timer.cst" as timer;
+use "anim.cst" as anim;
+use "access.cst" as access;
+use "scroll.cst" as scroll;
+
+let is i64 as W with imut = 200;
+let is i64 as H with imut = 150;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn near(a as f64, b as f64, tol as f64) as i32 {
+    let is f64 as d = a - b;
+    return cast(i32, d <= tol && d >= 0.0 - tol);
+}
+
+// --- A sheet: one colour all over, which can hold a drag ---
+
+struct Sheet {
+    w       as f64;
+    h       as f64;
+    color   as i64;   // 0xRRGGBB
+    grab    as i64;   // takes presses, holding the pointer
+    held    as i64;
+    moves   as i64;   // moves heard while held
+    follows as i64;   // asks the areas holding it to follow the drag
+    wrap    as f64;   // above 0: that many square units of text, 10 a line, as wide as it is offered
+    caught  as i64;   // presses that bubbled up to it
+}
+
+fn sheet_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Sheet as d = cast(*Sheet, data);
+    geom.size_zero(out);
+    out.pref_w = d.w;
+    out.pref_h = d.h;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+    if (d.wrap > 0.0) {
+        let is f64 as width with mut = d.w;
+        if (c.w < width) { width = c.w; }
+        if (width < 1.0) { width = 1.0; }
+        out.pref_h = fm.ceil(d.wrap / width) * 10.0;
+        out.min_h = out.pref_h;
+    }
+}
+
+fn sheet_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    layout.overlay_arrange(t, w, r);
+}
+
+fn sheet_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Sheet as d = cast(*Sheet, data);
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, style.hex(d.color));
+}
+
+fn sheet_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Sheet as d = cast(*Sheet, data);
+    if (e.kind == event.POINTER_DOWN && e.phase == event.BUBBLE) { d.caught = d.caught + 1; }
+    if (e.kind == event.POINTER_DOWN && e.phase == event.TARGET && d.grab == 1) {
+        d.held = 1;
+        return 1;
+    }
+    if (e.kind == event.POINTER_UP && d.held == 1) {
+        d.held = 0;
+        return 1;
+    }
+    if (e.kind == event.POINTER_MOVE && d.held == 1) {
+        d.moves = d.moves + 1;
+        if (d.follows == 1) { scroll.follow(t, w, e.x, e.y, e.time); }
+        return 1;
+    }
+    return 0;
+}
+
+let is tree.Kind as sheet_kind with mut;
+
+fn sheet(t as *tree.Tree, parent as i64, w as f64, h as f64, color as i64) as i64 {
+    let is i64 as k = tree.create(t, &sheet_kind, parent);
+    let is *Sheet as d = cast(*Sheet, tree.data(t, k));
+    d.w = w;
+    d.h = h;
+    d.color = color;
+    return k;
+}
+
+fn sheet_of(t as *tree.Tree, w as i64) as *Sheet { return cast(*Sheet, tree.data(t, w)); }
+
+// A scroll area at x, y of the window, exactly w by h.
+fn area_at(t as *tree.Tree, x as f64, y as f64, w as f64, h as f64) as i64 {
+    let is i64 as s = scroll.create(t, tree.root(t));
+    layout.set_align(t, s, layout.START, layout.START);
+    layout.set_margin(t, s, x, y, 0.0, 0.0);
+    layout.set_min_size(t, s, w, h);
+    layout.set_max_size(t, s, w, h);
+    return s;
+}
+
+// --- Frames ---
+
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as cmd with mut = 0;
+let is [30000]i32 as px with mut;
+let is style.Theme as theme with mut;
+let is *router.Router as frame_router with mut;
+
+fn frame(t as *tree.Tree, c as *draw2d.Canvas, time as i64) as void {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, cast(f64, W), cast(f64, H));
+    tree.damage_add(t, &all);
+    damage.collect(t);
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    let is paint.Options as o = paint.options(&theme);
+    o.router = frame_router;
+    o.time = time;
+    let is paint.Stats as st;
+    paint.frame(t, c, &o, &st);
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass_load(target, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    tree.damage_clear(t);
+}
+
+// How light the pixel at x, y is: red, green and blue added up.
+fn lum(x as f64, y as f64) as i64 {
+    let is i64 as i = (cast(i64, y) * W + cast(i64, x)) * 4;
+    let is *u8 as b = cast(*u8, &px);
+    return cast(i64, b[i]) + cast(i64, b[i + 1]) + cast(i64, b[i + 2]);
+}
+
+let is i64 as WHITE with imut = 16777215;
+
+// A tree lent a router, timers and an animator, as a window's is.
+let is timer.Timers as ts with mut;
+
+fn tree_for() as tree.Tree {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    return t;
+}
+
+// --- Classic bars: always there while there is more to see ---
+
+fn classic(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    frame_router = &r;
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    scroll.set_bars(&t, a, scroll.CLASSIC);
+    sheet(&t, a, 300.0, 500.0, WHITE);
+    frame(&t, c, 0);
+    let is math.rect.Rect as wa = layout.window_rect(&t, a);
+    let is math.rect.Rect as th = scroll.thumb_rect(&t, a, scroll.Y);
+    let is f64 as tx = wa.x + th.x + th.w / 2.0;
+    let is f64 as ty = wa.y + th.y + th.h / 2.0;
+    let is f64 as gy = wa.y + th.y + th.h + 10.0;
+    check("classic: the track darker than the window", lum(tx, gy) < lum(150.0, 120.0));
+    check("its thumb darker still", lum(tx, ty) < lum(tx, gy));
+    check("the content as it is beside them", lum(wa.x + 20.0, wa.y + 20.0) == 765);
+    let is i64 as rest = lum(tx, ty);
+    router.pointer_move(&t, &r, tx, ty, 10);
+    frame(&t, c, 10);
+    let is i64 as over = lum(tx, ty);
+    check("the pointer over it: darker", over < rest);
+    router.pointer_button(&t, &r, 1, 1, tx, ty, 20);
+    frame(&t, c, 20);
+    check("held: darker still", lum(tx, ty) < over);
+    router.pointer_button(&t, &r, 1, 0, tx, ty, 30);
+    router.pointer_move(&t, &r, wa.x + 20.0, wa.y + 20.0, 40);
+    let is math.rect.Rect as hx = scroll.thumb_rect(&t, a, scroll.X);
+    frame(&t, c, 40);
+    check("the other way too", lum(wa.x + hx.x + hx.w / 2.0, wa.y + hx.y + hx.h / 2.0) < lum(150.0, 120.0));
+    // Right to left: the upright bar on the left, drawn there.
+    layout.set_direction(&t, a, layout.RTL);
+    frame(&t, c, 50);
+    let is math.rect.Rect as rt = scroll.thumb_rect(&t, a, scroll.Y);
+    let is math.rect.Rect as wr = layout.window_rect(&t, a);
+    check("right to left: its bar on the left", rt.x < 1.0 && lum(wr.x + rt.x + rt.w / 2.0, wr.y + rt.y + rt.h / 2.0) < 700);
+    frame_router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+// --- Overlay bars: over the content, while something happens ---
+
+fn overlay(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    ts = timer.init();
+    tree.set_timers(&t, cast(*u8, &ts));
+    let is anim.Animator as an = anim.init(&t);
+    tree.set_animator(&t, cast(*u8, &an));
+    frame_router = &r;
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    sheet(&t, a, 300.0, 500.0, WHITE);
+    frame(&t, c, 0);
+    let is math.rect.Rect as wa = layout.window_rect(&t, a);
+    let is math.rect.Rect as bar = scroll.bar_rect(&t, a, scroll.Y);
+    let is math.rect.Rect as bx_ = scroll.bar_rect(&t, a, scroll.X);
+    // The thin bar along the very edge; the wide one across the whole bar.
+    let is f64 as edge = wa.x + bar.x + bar.w - 3.5;
+    let is f64 as inner = wa.x + bar.x + 3.5;
+    let is math.rect.Rect as th with mut = scroll.thumb_rect(&t, a, scroll.Y);
+    check("at rest: no bars over the content", lum(edge, wa.y + th.y + th.h / 2.0) == 765 &&
+          lum(inner, wa.y + th.y + th.h / 2.0) == 765);
+    router.tick(&t, &r, 100);
+    scroll.set_offset(&t, a, 0.0, 30.0);
+    frame(&t, c, 100);
+    th = scroll.thumb_rect(&t, a, scroll.Y);
+    let is f64 as ty = wa.y + th.y + th.h / 2.0;
+    check("scrolled: a thin bar at its edge", lum(edge, ty) < 765 && lum(inner, ty) == 765);
+    check("not past its thumb", lum(edge, wa.y + th.y + th.h + 6.0) == 765);
+    let is i64 as thin = lum(edge, ty);
+    router.pointer_move(&t, &r, wa.x + bar.x + bar.w / 2.0, ty, 200);
+    frame(&t, c, 200);
+    check("the pointer over it: wide", lum(inner, ty) < 765);
+    router.pointer_move(&t, &r, wa.x + 40.0, wa.y + 40.0, 300);
+    frame(&t, c, 300);
+    check("off it: thin again", lum(inner, ty) == 765 && lum(edge, ty) == thin);
+    timer.fire(&ts, 300 + scroll.HIDE_MS - 1);
+    frame(&t, c, 300 + scroll.HIDE_MS - 1);
+    check("a moment before it is due: still there", lum(edge, ty) == thin);
+    timer.fire(&ts, 300 + scroll.HIDE_MS);
+    let is i64 as gone_at = 300 + scroll.HIDE_MS;
+    anim.tick(&an, gone_at);
+    anim.tick(&an, gone_at + theme.motion.normal / 2);
+    frame(&t, c, gone_at + theme.motion.normal / 2);
+    check("then fading", lum(edge, ty) > thin && lum(edge, ty) < 765);
+    anim.tick(&an, gone_at + theme.motion.normal);
+    frame(&t, c, gone_at + theme.motion.normal);
+    check("faded: gone", lum(edge, ty) == 765);
+    // Moving over the content brings it back; resting on the bar keeps it.
+    router.pointer_move(&t, &r, wa.x + 41.0, wa.y + 40.0, 3000);
+    frame(&t, c, 3000);
+    check("the pointer moving over the content: back", lum(edge, ty) < 765);
+    router.pointer_move(&t, &r, wa.x + bar.x + bar.w / 2.0, ty, 3100);
+    timer.fire(&ts, 3100 + scroll.HIDE_MS);
+    anim.tick(&an, 3100 + scroll.HIDE_MS);
+    anim.tick(&an, 3100 + scroll.HIDE_MS + theme.motion.normal);
+    frame(&t, c, 3100 + scroll.HIDE_MS + theme.motion.normal);
+    check("resting on the bar: kept", lum(inner, ty) < 765);
+    router.pointer_move(&t, &r, wa.x + 40.0, wa.y + 40.0, 5000);
+    timer.fire(&ts, 5000 + scroll.HIDE_MS);
+    anim.tick(&an, 5000 + scroll.HIDE_MS);
+    anim.tick(&an, 5000 + scroll.HIDE_MS + theme.motion.normal);
+    frame(&t, c, 5000 + scroll.HIDE_MS + theme.motion.normal);
+    check("left: gone after a while", lum(edge, ty) == 765);
+    // A thumb held: kept however long.
+    let is math.rect.Rect as hold = scroll.thumb_rect(&t, a, scroll.X);
+    let is f64 as hxm = wa.x + hold.x + hold.w / 2.0;
+    let is f64 as hym = wa.y + hold.y + hold.h / 2.0;
+    router.pointer_move(&t, &r, hxm, hym, 5500);
+    router.pointer_button(&t, &r, 1, 1, hxm, hym, 5500);
+    router.pointer_move(&t, &r, hxm, wa.y + 20.0, 5510);
+    timer.fire(&ts, 5510 + scroll.HIDE_MS);
+    anim.tick(&an, 5510 + scroll.HIDE_MS);
+    anim.tick(&an, 5510 + scroll.HIDE_MS + theme.motion.normal);
+    frame(&t, c, 5510 + scroll.HIDE_MS + theme.motion.normal);
+    let is math.rect.Rect as held = scroll.thumb_rect(&t, a, scroll.X);
+    check("its thumb held, the pointer gone off it: kept, wide", lum(wa.x + held.x + held.w / 2.0, wa.y + held.y + 3.5) < 765);
+    router.pointer_button(&t, &r, 1, 0, hxm, wa.y + 20.0, 5900);
+    // Only the bars repainted for the pointer coming onto one.
+    router.pointer_move(&t, &r, wa.x + 40.0, wa.y + 40.0, 5950);
+    tree.damage_clear(&t);
+    let is math.rect.Rect as by_ = scroll.bar_rect(&t, a, scroll.Y);
+    router.pointer_move(&t, &r, wa.x + by_.x + 5.0, wa.y + by_.y + 5.0, 5960);
+    let is i32 as both with mut = 0;
+    let is i64 as di with mut = 0;
+    while (di < tree.damage_count(&t)) {
+        let is math.rect.Rect as dr = tree.damage_at(&t, di);
+        if (dr.x == wa.x + by_.x && dr.y == wa.y + by_.y && dr.w == by_.w && dr.h == by_.h) { both = both + 1; }
+        if (dr.x == wa.x + bx_.x && dr.y == wa.y + bx_.y && dr.w == bx_.w && dr.h == bx_.h) { both = both + 2; }
+        di = di + 1;
+    }
+    check("onto a bar: both bars repainted", both == 3);
+    // The bar across: thin along the bottom; wide under the pointer, kept
+    // while it rests there; thin again once it leaves.
+    let is math.rect.Rect as bx = scroll.bar_rect(&t, a, scroll.X);
+    let is math.rect.Rect as hx = scroll.thumb_rect(&t, a, scroll.X);
+    let is f64 as hx_mid = wa.x + hx.x + hx.w / 2.0;
+    let is f64 as bottom = wa.y + bx.y + bx.h - 3.5;
+    let is f64 as upper = wa.y + bx.y + 3.5;
+    router.pointer_move(&t, &r, wa.x + 42.0, wa.y + 40.0, 6000);
+    frame(&t, c, 6000);
+    check("the bar across: thin along the bottom", lum(hx_mid, bottom) < 765 && lum(hx_mid, upper) == 765);
+    router.pointer_move(&t, &r, hx_mid, wa.y + bx.y + bx.h / 2.0, 6100);
+    timer.fire(&ts, 6100 + scroll.HIDE_MS);
+    anim.tick(&an, 6100 + scroll.HIDE_MS);
+    anim.tick(&an, 6100 + scroll.HIDE_MS + theme.motion.normal);
+    frame(&t, c, 6100 + scroll.HIDE_MS + theme.motion.normal);
+    check("resting on the bar across: wide, and kept", lum(hx_mid, upper) < 765);
+    router.pointer_leave(&t, &r, 7500);
+    frame(&t, c, 7500);
+    check("the pointer gone from the window: thin again", lum(hx_mid, upper) == 765 && lum(hx_mid, bottom) < 765);
+    // With no animator, gone at once when due.
+    tree.set_animator(&t, cast(*u8, 0));
+    router.pointer_move(&t, &r, wa.x + 41.0, wa.y + 41.0, 8000);
+    frame(&t, c, 8000);
+    check("no animator: shown", lum(edge, ty) < 765);
+    timer.fire(&ts, 8000 + scroll.HIDE_MS);
+    frame(&t, c, 8000 + scroll.HIDE_MS);
+    check("and gone at once", lum(edge, ty) == 765);
+    // Right to left: the thin bar along the left edge.
+    layout.set_direction(&t, a, layout.RTL);
+    router.pointer_move(&t, &r, 150.0, 40.0, 8500);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as wl = layout.window_rect(&t, a);
+    let is math.rect.Rect as tl = scroll.thumb_rect(&t, a, scroll.Y);
+    router.pointer_move(&t, &r, wl.x + 50.0, wl.y + 40.0, 8600);
+    frame(&t, c, 8600);
+    check("right to left: thin along the left", lum(wl.x + 3.5, wl.y + tl.y + tl.h / 2.0) < 765 &&
+          lum(wl.x + 8.5, wl.y + tl.y + tl.h / 2.0) == 765);
+    layout.set_direction(&t, a, layout.LTR);
+    // Destroyed while it waits: nothing left behind to run.
+    router.pointer_move(&t, &r, wa.x + 40.0, wa.y + 40.0, 9000);
+    tree.destroy(&t, a);
+    check("destroyed: its timer gone", timer.next_due(&ts) < 0);
+    frame_router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+// --- The wheel glides ---
+
+fn smooth() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    ts = timer.init();
+    tree.set_timers(&t, cast(*u8, &ts));
+    let is anim.Animator as an = anim.init(&t);
+    tree.set_animator(&t, cast(*u8, &an));
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    sheet(&t, a, 100.0, 5000.0, WHITE);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is f64 as x = 50.0;
+    let is f64 as y = 50.0;
+    let is i64 as ms = theme.motion.normal;
+    router.scroll(&t, &r, x, y, 0.0, 1.0, 1, 1000);
+    check("a notch: not there at once", scroll.offset_y(&t, a) == 0.0);
+    anim.tick(&an, 1000);
+    anim.tick(&an, 1000 + ms / 2);
+    let is f64 as mid = scroll.offset_y(&t, a);
+    check("on its way", mid > 0.0 && mid < 40.0);
+    anim.tick(&an, 1000 + ms);
+    check("there: a line", scroll.offset_y(&t, a) == 40.0);
+    router.scroll(&t, &r, x, y, 0.0, 1.0, 1, 2000);
+    anim.tick(&an, 2000);
+    anim.tick(&an, 2050);
+    router.scroll(&t, &r, x, y, 0.0, 1.0, 1, 2050);
+    anim.tick(&an, 2050);
+    anim.tick(&an, 2050 + ms);
+    check("notches one after another add up", scroll.offset_y(&t, a) == 120.0);
+    router.scroll(&t, &r, x, y, 0.0, 0.0 - 0.5, 1, 3000);
+    anim.tick(&an, 3000);
+    anim.tick(&an, 3000 + ms);
+    check("half a notch back: half a line", scroll.offset_y(&t, a) == 100.0);
+    // Across, with Shift.
+    let is tree.Tree as t3 = tree_for();
+    let is router.Router as r3 = router.init(router.settings_default());
+    tree.set_router(&t3, cast(*u8, &r3));
+    let is anim.Animator as an3 = anim.init(&t3);
+    tree.set_animator(&t3, cast(*u8, &an3));
+    let is i64 as a3 = area_at(&t3, 10.0, 10.0, 100.0, 80.0);
+    sheet(&t3, a3, 1000.0, 80.0, WHITE);
+    layout.run(&t3, cast(f64, W), cast(f64, H));
+    router.key(&t3, &r3, keys.SHIFT_L, keys.MOD_SHIFT, 1, 0, 0);
+    router.scroll(&t3, &r3, 50.0, 50.0, 0.0, 1.0, 1, 10);
+    anim.tick(&an3, 10);
+    anim.tick(&an3, 10 + ms / 2);
+    let is f64 as half = scroll.offset_x(&t3, a3);
+    anim.tick(&an3, 10 + ms);
+    check("shift and a notch: gliding across", half > 0.0 && half < 40.0 && scroll.offset_x(&t3, a3) == 40.0);
+    router.scroll(&t3, &r3, 50.0, 50.0, 0.0, 1.0, 1, 1000);
+    anim.tick(&an3, 1000);
+    anim.tick(&an3, 1000 + ms / 2);
+    let is f64 as half2 = scroll.offset_x(&t3, a3);
+    anim.tick(&an3, 1000 + ms);
+    check("and on from there", half2 > 40.0 && half2 < 80.0 && scroll.offset_x(&t3, a3) == 80.0);
+    router.scroll(&t3, &r3, 50.0, 50.0, 0.0, 30.0, 1, 2000);
+    anim.tick(&an3, 2000);
+    anim.tick(&an3, 2000 + ms);
+    check("past its end across: to its end", scroll.offset_x(&t3, a3) == 900.0);
+    tree.close(&t3);
+    // Set while gliding: it stops where it was set.
+    router.scroll(&t, &r, x, y, 0.0, 3.0, 1, 4000);
+    anim.tick(&an, 4000);
+    anim.tick(&an, 4000 + ms / 2);
+    scroll.set_offset(&t, a, 0.0, 500.0);
+    anim.tick(&an, 4000 + ms);
+    check("set while gliding: set", scroll.offset_y(&t, a) == 500.0);
+    // At its end, the rest for an area around it.
+    let is tree.Tree as t2 = tree_for();
+    let is router.Router as r2 = router.init(router.settings_default());
+    tree.set_router(&t2, cast(*u8, &r2));
+    let is anim.Animator as an2 = anim.init(&t2);
+    tree.set_animator(&t2, cast(*u8, &an2));
+    let is i64 as outer = area_at(&t2, 0.0, 0.0, 180.0, 140.0);
+    let is i64 as col = box.create(&t2, outer, box.COLUMN);
+    let is i64 as inner = scroll.create(&t2, col);
+    layout.set_min_size(&t2, inner, 100.0, 80.0);
+    layout.set_max_size(&t2, inner, 100.0, 80.0);
+    sheet(&t2, inner, 100.0, 200.0, WHITE);
+    sheet(&t2, col, 100.0, 1000.0, WHITE);
+    layout.run(&t2, cast(f64, W), cast(f64, H));
+    scroll.set_offset(&t2, inner, 0.0, 120.0);
+    router.scroll(&t2, &r2, 20.0, 20.0, 0.0, 1.0, 1, 100);
+    anim.tick(&an2, 100);
+    anim.tick(&an2, 100 + ms);
+    check("at its end: the area around it glides", scroll.offset_y(&t2, inner) == 120.0 &&
+          scroll.offset_y(&t2, outer) == 40.0);
+    router.scroll(&t2, &r2, 20.0, 20.0, 0.0, 0.0 - 1.0, 1, 1000);
+    anim.tick(&an2, 1000);
+    anim.tick(&an2, 1000 + ms);
+    check("not at its end: it glides, the one around it stays", scroll.offset_y(&t2, inner) == 80.0 &&
+          scroll.offset_y(&t2, outer) == 40.0);
+    tree.close(&t2);
+    // Less motion asked for: there at once.
+    let is style.Theme as still = theme;
+    still.motion.reduced = 1;
+    tree.set_theme(&t, &still);
+    let is f64 as was = scroll.offset_y(&t, a);
+    router.scroll(&t, &r, x, y, 0.0, 1.0, 1, 6000);
+    check("less motion: there at once", scroll.offset_y(&t, a) == was + 40.0);
+    tree.close(&t);
+}
+
+// --- A fling carries on ---
+
+fn kinetic() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    ts = timer.init();
+    tree.set_timers(&t, cast(*u8, &ts));
+    let is anim.Animator as an = anim.init(&t);
+    tree.set_animator(&t, cast(*u8, &an));
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    let is i64 as s = sheet(&t, a, 1000.0, 50000.0, WHITE);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    // A finger's scroll: by pixels, at once.
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 1000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 1010);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 1020);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 1030);
+    check("a finger's scroll: there at once", scroll.offset_y(&t, a) == 40.0);
+    router.scroll_end(&t, &r, 50.0, 50.0, 1032);
+    anim.tick(&an, 1032);
+    anim.tick(&an, 1132);
+    let is f64 as o1 = scroll.offset_y(&t, a);
+    anim.tick(&an, 1232);
+    let is f64 as o2 = scroll.offset_y(&t, a);
+    check("lifted: on it goes, slowing", o1 > 40.0 && o2 > o1 && o2 - o1 < o1 - 40.0);
+    let is i64 as k with mut = 1;
+    while (k < 400) {
+        anim.tick(&an, 1232 + k * 16);
+        k = k + 1;
+    }
+    let is f64 as far = scroll.KINETIC_TAU * (1.0 - scroll.KINETIC_STOP);
+    check("and stops as far as its speed carries it", near(scroll.offset_y(&t, a), 40.0 + far, 1.0) == 1 &&
+          anim.active(&an) == 0);
+    // Rested before lifting: no fling.
+    let is f64 as at = scroll.offset_y(&t, a);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 20000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 20010);
+    router.scroll_end(&t, &r, 50.0, 50.0, 20300);
+    anim.tick(&an, 20300);
+    anim.tick(&an, 20400);
+    check("rested before lifting: no fling", scroll.offset_y(&t, a) == at + 20.0);
+    // Touched again while it flies: stopped there.
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 30000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 30010);
+    router.scroll_end(&t, &r, 50.0, 50.0, 30012);
+    anim.tick(&an, 30012);
+    anim.tick(&an, 30062);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 0.0, 0, 30070);
+    let is f64 as caught = scroll.offset_y(&t, a);
+    anim.tick(&an, 30200);
+    check("touched again: stopped", scroll.offset_y(&t, a) == caught && caught > at + 40.0);
+    // Flung at its end: stopped there.
+    scroll.set_offset(&t, a, 0.0, 50000.0 - 80.0 - 30.0);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 40000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 40010);
+    router.scroll_end(&t, &r, 50.0, 50.0, 40012);
+    let is i64 as j with mut = 0;
+    while (j < 100) {
+        anim.tick(&an, 40012 + j * 16);
+        j = j + 1;
+    }
+    check("flung to its end: there, and done", scroll.offset_y(&t, a) == 50000.0 - 80.0 && anim.active(&an) == 0);
+    // More scrolls than it keeps: the speed of the last few.
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 50.0, 0, 41000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 50.0, 0, 41010);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 41020);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 41030);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 41040);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 41050);
+    let is f64 as b5 = scroll.offset_y(&t, a);
+    router.scroll_end(&t, &r, 50.0, 50.0, 41052);
+    let is i64 as q with mut = 0;
+    while (q < 400) {
+        anim.tick(&an, 41052 + q * 16);
+        q = q + 1;
+    }
+    check("more scrolls than it keeps: the speed of the last few", near(scroll.offset_y(&t, a), b5 + far, 1.0) == 1 &&
+          scroll.offset_x(&t, a) == 0.0);
+    // Spread out, none resting long: still a fling.
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 90.0, 0, 42000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 90.0, 0, 42090);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 90.0, 0, 42180);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 90.0, 0, 42270);
+    let is f64 as b6 = scroll.offset_y(&t, a);
+    router.scroll_end(&t, &r, 50.0, 50.0, 42300);
+    anim.tick(&an, 42300);
+    anim.tick(&an, 42400);
+    check("spread out, none resting long: a fling", scroll.offset_y(&t, a) > b6);
+    // Lifted over what is disabled: the area still flies.
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    tree.set_enabled(&t, s, 0);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 43000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 43010);
+    router.scroll_end(&t, &r, 50.0, 50.0, 43012);
+    anim.tick(&an, 43012);
+    anim.tick(&an, 43112);
+    check("lifted over what is disabled: flown on", scroll.offset_y(&t, a) > 20.0);
+    tree.set_enabled(&t, s, 1);
+    // Across: a fling across, nothing up or down.
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    router.scroll(&t, &r, 50.0, 50.0, 10.0, 0.0, 0, 44000);
+    router.scroll(&t, &r, 50.0, 50.0, 10.0, 0.0, 0, 44010);
+    router.scroll_end(&t, &r, 50.0, 50.0, 44012);
+    let is i64 as j2 with mut = 0;
+    while (j2 < 400) {
+        anim.tick(&an, 44012 + j2 * 16);
+        j2 = j2 + 1;
+    }
+    check("flung across: across only", scroll.offset_x(&t, a) > 100.0 && scroll.offset_y(&t, a) == 0.0 && anim.active(&an) == 0);
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 45000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 45010);
+    router.scroll_end(&t, &r, 50.0, 50.0, 45012);
+    anim.tick(&an, 45012);
+    anim.tick(&an, 45200);
+    check("flung down: not across", scroll.offset_x(&t, a) == 0.0 && scroll.offset_y(&t, a) > 20.0);
+    // Less motion: none.
+    let is style.Theme as still = theme;
+    still.motion.reduced = 1;
+    tree.set_theme(&t, &still);
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 50000);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 10.0, 0, 50010);
+    router.scroll_end(&t, &r, 50.0, 50.0, 50012);
+    anim.tick(&an, 50012);
+    anim.tick(&an, 50100);
+    check("less motion: no fling", scroll.offset_y(&t, a) == 20.0);
+    tree.close(&t);
+    // An area inside another: the inner one flies, the outer stays.
+    let is tree.Tree as t2 = tree_for();
+    let is router.Router as r2 = router.init(router.settings_default());
+    tree.set_router(&t2, cast(*u8, &r2));
+    let is anim.Animator as an2 = anim.init(&t2);
+    tree.set_animator(&t2, cast(*u8, &an2));
+    let is i64 as outer = area_at(&t2, 0.0, 0.0, 180.0, 140.0);
+    let is i64 as col = box.create(&t2, outer, box.COLUMN);
+    let is i64 as inner = scroll.create(&t2, col);
+    layout.set_min_size(&t2, inner, 100.0, 80.0);
+    layout.set_max_size(&t2, inner, 100.0, 80.0);
+    sheet(&t2, inner, 100.0, 5000.0, WHITE);
+    sheet(&t2, col, 100.0, 1000.0, WHITE);
+    layout.run(&t2, cast(f64, W), cast(f64, H));
+    router.scroll(&t2, &r2, 20.0, 20.0, 0.0, 10.0, 0, 100);
+    router.scroll(&t2, &r2, 20.0, 20.0, 0.0, 10.0, 0, 110);
+    router.scroll_end(&t2, &r2, 20.0, 20.0, 112);
+    anim.tick(&an2, 112);
+    anim.tick(&an2, 300);
+    check("inside another: the inner one flies, the outer stays", scroll.offset_y(&t2, inner) > 20.0 &&
+          scroll.offset_y(&t2, outer) == 0.0);
+    let is i64 as k2 with mut = 0;
+    while (k2 < 400) {
+        anim.tick(&an2, 300 + k2 * 16);
+        k2 = k2 + 1;
+    }
+    scroll.set_offset(&t2, inner, 0.0, 5000.0);
+    router.scroll(&t2, &r2, 20.0, 20.0, 0.0, 10.0, 0, 20000);
+    router.scroll(&t2, &r2, 20.0, 20.0, 0.0, 10.0, 0, 20010);
+    let is f64 as ob = scroll.offset_y(&t2, outer);
+    router.scroll_end(&t2, &r2, 20.0, 20.0, 20012);
+    anim.tick(&an2, 20012);
+    anim.tick(&an2, 20200);
+    check("the inner one at its end: the outer flies", ob == 20.0 && scroll.offset_y(&t2, outer) > ob);
+    tree.close(&t2);
+}
+
+// --- Held past its edge: scrolled along ---
+
+fn followed() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    ts = timer.init();
+    tree.set_timers(&t, cast(*u8, &ts));
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    // Classic bars: no timer of theirs to tell from the one that follows.
+    scroll.set_bars(&t, a, scroll.CLASSIC);
+    let is i64 as s = sheet(&t, a, 400.0, 500.0, WHITE);
+    sheet_of(&t, s).grab = 1;
+    sheet_of(&t, s).follows = 1;
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.pointer_move(&t, &r, 60.0, 50.0, 0);
+    router.pointer_button(&t, &r, 1, 1, 60.0, 50.0, 0);
+    router.pointer_move(&t, &r, 60.0, 110.0, 10);
+    check("held past its bottom: not at once", scroll.offset_y(&t, a) == 0.0 && sheet_of(&t, s).moves == 1);
+    timer.fire(&ts, 10 + scroll.FOLLOW_MS);
+    let is f64 as o1 = scroll.offset_y(&t, a);
+    check("then, in a moment, down: half as far as past it", o1 == 15.0 && sheet_of(&t, s).moves == 2);
+    timer.fire(&ts, 10 + 2 * scroll.FOLLOW_MS);
+    let is f64 as o2 = scroll.offset_y(&t, a);
+    check("and on", o2 > o1);
+    router.pointer_move(&t, &r, 60.0, 150.0, 100);
+    timer.fire(&ts, 10 + 3 * scroll.FOLLOW_MS);
+    let is f64 as o3 = scroll.offset_y(&t, a);
+    check("further past: faster", o3 - o2 > o2 - o1);
+    router.pointer_move(&t, &r, 60.0, 50.0, 200);
+    timer.fire(&ts, 10 + 4 * scroll.FOLLOW_MS);
+    timer.fire(&ts, 10 + 5 * scroll.FOLLOW_MS);
+    check("back inside: stopped", scroll.offset_y(&t, a) == o3 && timer.next_due(&ts) < 0);
+    router.pointer_move(&t, &r, 60.0, 0.0, 300);
+    timer.fire(&ts, 300 + scroll.FOLLOW_MS);
+    check("past its top: up, half as far as past it", scroll.offset_y(&t, a) == o3 - 5.0);
+    router.pointer_move(&t, &r, 150.0, 50.0, 400);
+    let is f64 as ox = scroll.offset_x(&t, a);
+    timer.fire(&ts, 300 + 2 * scroll.FOLLOW_MS);
+    check("past its side: across, half as far as past it", scroll.offset_x(&t, a) == ox + 25.0);
+    router.pointer_move(&t, &r, 0.0, 50.0, 410);
+    let is f64 as ox2 = scroll.offset_x(&t, a);
+    timer.fire(&ts, 300 + 3 * scroll.FOLLOW_MS);
+    check("past its other side: back", scroll.offset_x(&t, a) == ox2 - 5.0);
+    router.pointer_move(&t, &r, 60.0, 50.0, 420);
+    let is f64 as ox3 = scroll.offset_x(&t, a);
+    timer.fire(&ts, 300 + 4 * scroll.FOLLOW_MS);
+    check("back inside, scrolled across: still", scroll.offset_x(&t, a) == ox3);
+    router.pointer_move(&t, &r, 60.0, 130.0, 500);
+    router.pointer_button(&t, &r, 1, 0, 60.0, 130.0, 510);
+    let is f64 as o4 = scroll.offset_y(&t, a);
+    timer.fire(&ts, 500 + scroll.FOLLOW_MS);
+    timer.fire(&ts, 500 + 2 * scroll.FOLLOW_MS);
+    check("let go: stopped", scroll.offset_y(&t, a) == o4 && timer.next_due(&ts) < 0);
+    // A press it does not follow — a slider's, say — scrolls nothing.
+    sheet_of(&t, s).follows = 0;
+    router.pointer_button(&t, &r, 1, 1, 60.0, 50.0, 600);
+    router.pointer_move(&t, &r, 60.0, 140.0, 610);
+    timer.fire(&ts, 610 + scroll.FOLLOW_MS);
+    check("not asked to follow: still", scroll.offset_y(&t, a) == o4);
+    router.pointer_button(&t, &r, 1, 0, 60.0, 140.0, 620);
+    // Right to left, classic: the pointer over the bar on the left is past
+    // the view's start.
+    layout.set_direction(&t, a, layout.RTL);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as rw = layout.window_rect(&t, a);
+    sheet_of(&t, s).follows = 1;
+    router.pointer_button(&t, &r, 1, 1, rw.x + 50.0, 50.0, 650);
+    router.pointer_move(&t, &r, rw.x + 4.0, 50.0, 660);
+    let is f64 as rx0 = scroll.offset_x(&t, a);
+    timer.fire(&ts, 660 + scroll.FOLLOW_MS);
+    check("right to left, classic: over its bar is past its view", scroll.offset_x(&t, a) != rx0);
+    router.pointer_button(&t, &r, 1, 0, rw.x + 4.0, 50.0, 670);
+    timer.fire(&ts, 660 + 2 * scroll.FOLLOW_MS);
+    layout.set_direction(&t, a, layout.LTR);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    // Destroyed while it follows: nothing left behind to run.
+    sheet_of(&t, s).follows = 1;
+    router.pointer_button(&t, &r, 1, 1, 60.0, 50.0, 700);
+    router.pointer_move(&t, &r, 60.0, 140.0, 710);
+    check("following", timer.next_due(&ts) >= 0);
+    router.pointer_button(&t, &r, 1, 0, 60.0, 140.0, 720);
+    tree.destroy(&t, a);
+    check("destroyed while following: its timer gone", timer.next_due(&ts) < 0);
+    tree.close(&t);
+}
+
+// --- Scrolled to a widget ---
+
+fn scrolled_to() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    let is i64 as col = box.create(&t, a, box.COLUMN);
+    let is [20]i64 as rows;
+    let is i64 as i with mut = 0;
+    while (i < 20) {
+        rows[i] = sheet(&t, col, 100.0, 30.0, WHITE);
+        i = i + 1;
+    }
+    let is i64 as elsewhere = sheet(&t, tree.root(&t), 10.0, 10.0, WHITE);
+    layout.set_align(&t, elsewhere, layout.END, layout.END);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("to its start", scroll.scroll_to(&t, a, rows[10], scroll.NEAREST, layout.START) == 1 &&
+          scroll.offset_y(&t, a) == 300.0);
+    scroll.scroll_to(&t, a, rows[10], scroll.NEAREST, layout.CENTER);
+    check("its middle to the middle", scroll.offset_y(&t, a) == 275.0);
+    scroll.scroll_to(&t, a, rows[10], scroll.NEAREST, layout.END);
+    check("its end to the end", scroll.offset_y(&t, a) == 250.0);
+    check("in view already: nothing", scroll.scroll_to(&t, a, rows[9], scroll.NEAREST, scroll.NEAREST) == 0 &&
+          scroll.offset_y(&t, a) == 250.0);
+    scroll.scroll_to(&t, a, rows[15], scroll.NEAREST, scroll.NEAREST);
+    check("below: just into view", scroll.offset_y(&t, a) == 400.0);
+    scroll.scroll_to(&t, a, rows[2], scroll.NEAREST, scroll.NEAREST);
+    check("above: just into view", scroll.offset_y(&t, a) == 60.0);
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    scroll.scroll_to(&t, a, rows[2], scroll.NEAREST, scroll.NEAREST);
+    check("partly below the view: just into it", scroll.offset_y(&t, a) == 10.0);
+    scroll.set_offset(&t, a, 0.0, 60.0);
+    check("not in it: nothing", scroll.scroll_to(&t, a, elsewhere, layout.START, layout.START) == 0 &&
+          scroll.offset_y(&t, a) == 60.0);
+    // Sideways, right to left too.
+    let is tree.Tree as t2 = tree_for();
+    let is i64 as a2 = area_at(&t2, 0.0, 0.0, 100.0, 80.0);
+    let is i64 as row = box.create(&t2, a2, box.ROW);
+    let is [10]i64 as cells;
+    i = 0;
+    while (i < 10) {
+        cells[i] = sheet(&t2, row, 50.0, 80.0, WHITE);
+        i = i + 1;
+    }
+    layout.run(&t2, cast(f64, W), cast(f64, H));
+    scroll.scroll_to(&t2, a2, cells[4], layout.START, scroll.NEAREST);
+    check("across: to its start", scroll.offset_x(&t2, a2) == 200.0);
+    scroll.scroll_to(&t2, a2, cells[4], layout.END, scroll.NEAREST);
+    check("across: its end to the end", scroll.offset_x(&t2, a2) == 150.0);
+    layout.set_direction(&t2, a2, layout.RTL);
+    scroll.set_offset(&t2, a2, 0.0, 0.0);
+    layout.run(&t2, cast(f64, W), cast(f64, H));
+    scroll.scroll_to(&t2, a2, cells[4], layout.START, scroll.NEAREST);
+    check("right to left: its start, the right, to the view's", scroll.offset_x(&t2, a2) == 200.0);
+    scroll.scroll_to(&t2, a2, cells[4], layout.END, scroll.NEAREST);
+    check("right to left: its end, the left, to the view's", scroll.offset_x(&t2, a2) == 150.0);
+    scroll.set_bars(&t2, a2, scroll.CLASSIC);
+    scroll.set_policy(&t2, a2, scroll.AUTO, scroll.ALWAYS);
+    scroll.set_offset(&t2, a2, 0.0, 0.0);
+    layout.run(&t2, cast(f64, W), cast(f64, H));
+    scroll.scroll_to(&t2, a2, cells[4], layout.START, scroll.NEAREST);
+    let is math.rect.Rect as c4 = layout.window_rect(&t2, cells[4]);
+    let is math.rect.Rect as v2 = layout.window_rect(&t2, a2);
+    check("right to left, classic: its start at the view's, by the bar", near(c4.x + c4.w, v2.x + v2.w, 0.01) == 1);
+    tree.close(&t2);
+    tree.close(&t);
+}
+
+
+// --- Settings, and what is not a scroll area ---
+
+fn settings() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    let is i64 as s = sheet(&t, a, 300.0, 500.0, WHITE);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    scroll.set_bar_size(&t, a, 6.0);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("a bar's thickness set", scroll.bar_rect(&t, a, scroll.Y).w == 6.0);
+    scroll.set_min_thumb(&t, a, 50.0);
+    check("a thumb's least length set", scroll.min_thumb(&t, a) == 50.0 && scroll.thumb_rect(&t, a, scroll.Y).h == 50.0);
+    scroll.set_line(&t, a, 20.0);
+    scroll.set_line(&t, a, 0.0);
+    router.scroll(&t, &r, 50.0, 50.0, 0.0, 1.0, 1, 10);
+    check("a notch's step set; none of nothing", scroll.line(&t, a) == 20.0 && scroll.offset_y(&t, a) == 20.0);
+    check("a page: nine tenths of the view, each way", scroll.page(&t, a, scroll.Y) == 72.0 && scroll.page(&t, a, scroll.X) == 90.0);
+    scroll.set_offset(&t, a, 1000.0, 0.0);
+    check("held to the content across too", scroll.offset_x(&t, a) == 200.0);
+    check("not a scroll area: nothing", scroll.set_offset(&t, s, 1.0, 1.0) == 0 && scroll.scroll_by(&t, s, 1.0, 1.0) == 0 &&
+          scroll.bar_shown(&t, s, scroll.Y) == 0 && scroll.page(&t, s, scroll.Y) == 0.0 && scroll.line(&t, s) == 0.0 &&
+          scroll.scroll_to(&t, a, a, layout.START, layout.START) == 0);
+    tree.close(&t);
+}
+
+// --- Measured and laid out, more ---
+
+fn laid_more() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as a = scroll.create(&t, tree.root(&t));
+    scroll.set_bars(&t, a, scroll.CLASSIC);
+    scroll.set_policy(&t, a, scroll.NEVER, scroll.ALWAYS);
+    let is i64 as s = sheet(&t, a, 1000.0, 10.0, WHITE);
+    sheet_of(&t, s).wrap = 1000.0;
+    let is geom.Constraint as c = geom.constraint(110.0, layout.UNBOUNDED);
+    let is geom.Size as sz;
+    layout.measure(&t, a, &c, &sz);
+    check("a classic bar always there: the content measured beside it", sz.pref_h == 100.0);
+    tree.destroy(&t, a);
+    let is i64 as b = scroll.create(&t, tree.root(&t));
+    scroll.set_bars(&t, b, scroll.CLASSIC);
+    scroll.set_policy(&t, b, scroll.ALWAYS, scroll.ALWAYS);
+    sheet(&t, b, 50.0, 40.0, WHITE);
+    let is geom.Constraint as free = geom.unbounded();
+    layout.measure(&t, b, &free, &sz);
+    check("and its room asked for", sz.pref_w == 60.0 && sz.pref_h == 50.0);
+    tree.destroy(&t, b);
+    // Right to left, classic: the view beside the bar on the left.
+    let is i64 as c2 = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    scroll.set_bars(&t, c2, scroll.CLASSIC);
+    let is i64 as s2 = sheet(&t, c2, 300.0, 500.0, WHITE);
+    layout.set_direction(&t, c2, layout.RTL);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as wr = layout.window_rect(&t, c2);
+    let is math.rect.Rect as sr = layout.window_rect(&t, s2);
+    check("right to left, classic: the view after the bar", scroll.view_rect(&t, c2).x == 10.0 &&
+          sr.x + sr.w == wr.x + 100.0);
+    // The content smaller: the offset held to what is left.
+    scroll.set_offset(&t, c2, 0.0, 1000.0);
+    sheet_of(&t, s2).h = 200.0;
+    tree.invalidate_layout(&t, s2);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("the content smaller: the offset held to it", scroll.offset_y(&t, c2) == 200.0 - 70.0);
+    layout.set_direction(&t, c2, layout.LTR);
+    scroll.set_offset(&t, c2, 1000.0, 0.0);
+    sheet_of(&t, s2).w = 150.0;
+    tree.invalidate_layout(&t, s2);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("narrower: held across too", scroll.offset_x(&t, c2) == 150.0 - 90.0);
+    // A bar always there, nothing to scroll: its thumb the whole track.
+    let is i64 as d2 = area_at(&t, 10.0, 100.0, 100.0, 40.0);
+    scroll.set_policy(&t, d2, scroll.NEVER, scroll.ALWAYS);
+    sheet(&t, d2, 100.0, 20.0, WHITE);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as fb = scroll.bar_rect(&t, d2, scroll.Y);
+    let is math.rect.Rect as ft = scroll.thumb_rect(&t, d2, scroll.Y);
+    check("a bar always there, nothing to scroll: the thumb all of it", ft.y == fb.y && ft.h == fb.h);
+    tree.close(&t);
+}
+
+// --- Thumbs, presses and keys, across too ---
+
+fn thumbs() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as holder = sheet(&t, tree.root(&t), 200.0, 150.0, WHITE);
+    let is i64 as a = scroll.create(&t, holder);
+    layout.set_align(&t, a, layout.START, layout.START);
+    layout.set_margin(&t, a, 10.0, 10.0, 0.0, 0.0);
+    layout.set_min_size(&t, a, 100.0, 80.0);
+    layout.set_max_size(&t, a, 100.0, 80.0);
+    let is i64 as s = sheet(&t, a, 300.0, 500.0, WHITE);
+    tree.set_focusable(&t, s, 1);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    scroll.set_offset(&t, a, 200.0, 420.0);
+    let is math.rect.Rect as ty = scroll.thumb_rect(&t, a, scroll.Y);
+    let is math.rect.Rect as tx = scroll.thumb_rect(&t, a, scroll.X);
+    check("at the ends: the thumbs at their tracks' ends", ty.y + ty.h == 70.0 && tx.x + tx.w == 90.0);
+    check("the bar across is the area's", router.hit(&t, 50.0, 85.0) == a);
+    // A press on the track across, before its thumb: a page back.
+    router.pointer_button(&t, &r, 1, 1, 20.0, 85.0, 10);
+    router.pointer_button(&t, &r, 1, 0, 20.0, 85.0, 20);
+    check("pressed before the thumb across: a page back", scroll.offset_x(&t, a) == 200.0 - 90.0);
+    // Its thumb dragged.
+    let is math.rect.Rect as tx2 = scroll.thumb_rect(&t, a, scroll.X);
+    let is f64 as gx = 10.0 + tx2.x + tx2.w / 2.0;
+    router.pointer_move(&t, &r, gx, 85.0, 30);
+    router.pointer_button(&t, &r, 1, 1, gx, 85.0, 30);
+    router.pointer_move(&t, &r, gx - 10.0, 85.0, 40);
+    router.pointer_button(&t, &r, 1, 0, gx - 10.0, 85.0, 50);
+    let is f64 as travel = 90.0 - tx2.w;
+    check("its thumb dragged back: the content with it", near(scroll.offset_x(&t, a), 110.0 - 10.0 * 200.0 / travel, 1.0) == 1);
+    let is f64 as let_go = scroll.offset_x(&t, a);
+    router.pointer_move(&t, &r, gx - 30.0, 85.0, 55);
+    check("let go: the pointer moves on its own", scroll.offset_x(&t, a) == let_go);
+    // A press on what takes none: on up, past the area.
+    router.pointer_button(&t, &r, 1, 1, 50.0, 40.0, 60);
+    router.pointer_button(&t, &r, 1, 0, 50.0, 40.0, 70);
+    check("a press nothing in it takes: on up", sheet_of(&t, holder).caught == 1);
+    // Keys back up.
+    router.focus(&t, &r, s, 0);
+    let is f64 as y0 = scroll.offset_y(&t, a);
+    router.key(&t, &r, keys.PAGE_UP, 0, 1, 0, 80);
+    check("page up: a page back up", scroll.offset_y(&t, a) == y0 - 72.0);
+    router.key(&t, &r, keys.UP, 0, 1, 0, 90);
+    check("up: a line", scroll.offset_y(&t, a) == y0 - 72.0 - 40.0);
+    // Right to left: the thumb across starts at the right.
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    layout.set_direction(&t, a, layout.RTL);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as rx = scroll.thumb_rect(&t, a, scroll.X);
+    check("right to left: the thumb across at the right", rx.x + rx.w == 100.0);
+    scroll.set_offset(&t, a, 200.0, 0.0);
+    let is math.rect.Rect as rx2 = scroll.thumb_rect(&t, a, scroll.X);
+    check("and scrolled to its end, at the left", rx2.x == scroll.bar_rect(&t, a, scroll.X).x);
+    tree.close(&t);
+}
+
+// --- Brought into view ---
+
+fn revealed() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    let is i64 as col = box.create(&t, a, box.COLUMN);
+    let is [20]i64 as rows;
+    let is i64 as i with mut = 0;
+    while (i < 20) {
+        rows[i] = sheet(&t, col, 100.0, 30.0, WHITE);
+        i = i + 1;
+    }
+    let is i64 as tall = sheet(&t, col, 100.0, 200.0, WHITE);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    router.reveal(&t, rows[10]);
+    check("below: just into view", scroll.offset_y(&t, a) == 250.0);
+    router.reveal(&t, rows[2]);
+    check("above: just into view", scroll.offset_y(&t, a) == 60.0);
+    router.reveal(&t, tall);
+    check("taller than the view: its start", scroll.offset_y(&t, a) == 600.0);
+    scroll.set_offset(&t, a, 0.0, 0.0);
+    router.reveal(&t, rows[2]);
+    check("partly below: just into view", scroll.offset_y(&t, a) == 10.0);
+    router.reveal(&t, rows[1]);
+    check("in view already: left where it is", scroll.offset_y(&t, a) == 10.0);
+    tree.close(&t);
+    // Across, and areas inside areas.
+    let is tree.Tree as t2 = tree_for();
+    let is i64 as outer = area_at(&t2, 0.0, 0.0, 150.0, 100.0);
+    let is i64 as ocol = box.create(&t2, outer, box.COLUMN);
+    sheet(&t2, ocol, 100.0, 300.0, WHITE);
+    let is i64 as inner = scroll.create(&t2, ocol);
+    layout.set_margin(&t2, inner, 20.0, 0.0, 0.0, 0.0);
+    layout.set_align(&t2, inner, layout.START, layout.START);
+    layout.set_min_size(&t2, inner, 100.0, 50.0);
+    layout.set_max_size(&t2, inner, 100.0, 50.0);
+    let is i64 as row = box.create(&t2, inner, box.ROW);
+    let is [10]i64 as cells;
+    i = 0;
+    while (i < 10) {
+        cells[i] = sheet(&t2, row, 50.0, 50.0, WHITE);
+        i = i + 1;
+    }
+    layout.run(&t2, cast(f64, W), cast(f64, H));
+    router.reveal(&t2, cells[4]);
+    check("inside another, across: each brought along", scroll.offset_x(&t2, inner) == 150.0 &&
+          scroll.offset_y(&t2, outer) == 250.0);
+    router.reveal(&t2, cells[1]);
+    check("before it across: just into view", scroll.offset_x(&t2, inner) == 50.0);
+    router.reveal(&t2, cells[1]);
+    check("in view across already: left where it is", scroll.offset_x(&t2, inner) == 50.0);
+    tree.close(&t2);
+    // Wider than the view, past its end: its start brought in.
+    let is tree.Tree as t4 = tree_for();
+    let is i64 as a4 = area_at(&t4, 30.0, 10.0, 100.0, 50.0);
+    let is i64 as row4 = box.create(&t4, a4, box.ROW);
+    sheet(&t4, row4, 120.0, 50.0, WHITE);
+    let is i64 as wide = sheet(&t4, row4, 300.0, 50.0, WHITE);
+    layout.run(&t4, cast(f64, W), cast(f64, H));
+    router.reveal(&t4, wide);
+    check("wider than the view, past its end: its start", scroll.offset_x(&t4, a4) == 120.0);
+    tree.close(&t4);
+    // Right to left, classic: the view starts beside the bar on the left.
+    let is tree.Tree as t6 = tree_for();
+    let is i64 as a6 = area_at(&t6, 30.0, 10.0, 100.0, 60.0);
+    scroll.set_bars(&t6, a6, scroll.CLASSIC);
+    scroll.set_policy(&t6, a6, scroll.AUTO, scroll.ALWAYS);
+    let is i64 as row7 = box.create(&t6, a6, box.ROW);
+    let is [6]i64 as c6;
+    i = 0;
+    while (i < 6) {
+        c6[i] = sheet(&t6, row7, 50.0, 40.0, WHITE);
+        i = i + 1;
+    }
+    layout.set_direction(&t6, a6, layout.RTL);
+    layout.run(&t6, cast(f64, W), cast(f64, H));
+    scroll.set_offset(&t6, a6, 5.0, 0.0);
+    router.reveal(&t6, c6[1]);
+    let is math.rect.Rect as r61 = layout.window_rect(&t6, c6[1]);
+    let is math.rect.Rect as w6 = layout.window_rect(&t6, a6);
+    check("right to left, classic: brought out from under the bar", r61.x >= w6.x + 10.0 - 0.01);
+    tree.close(&t6);
+    // Across, an area inside another with room to spare: the outer brought
+    // to where the inner one put it.
+    let is tree.Tree as t5 = tree_for();
+    let is i64 as out5 = area_at(&t5, 0.0, 0.0, 150.0, 100.0);
+    let is i64 as row5 = box.create(&t5, out5, box.ROW);
+    sheet(&t5, row5, 200.0, 50.0, WHITE);
+    let is i64 as in5 = scroll.create(&t5, row5);
+    layout.set_min_size(&t5, in5, 100.0, 50.0);
+    layout.set_max_size(&t5, in5, 100.0, 50.0);
+    let is i64 as row6 = box.create(&t5, in5, box.ROW);
+    let is [10]i64 as c5;
+    i = 0;
+    while (i < 10) {
+        c5[i] = sheet(&t5, row6, 50.0, 50.0, WHITE);
+        i = i + 1;
+    }
+    sheet(&t5, row5, 600.0, 50.0, WHITE);
+    layout.run(&t5, cast(f64, W), cast(f64, H));
+    scroll.set_offset(&t5, in5, 50.0, 0.0);
+    router.reveal(&t5, c5[4]);
+    let is math.rect.Rect as cr5 = layout.window_rect(&t5, c5[4]);
+    check("across, inside another with room: in view of both, no further", scroll.offset_x(&t5, in5) == 150.0 &&
+          cr5.x >= 0.0 && cr5.x + cr5.w <= 150.0 && scroll.offset_x(&t5, out5) == 150.0);
+    tree.close(&t5);
+    // Up and down, an area inside another: each brought along, the inner one
+    // first, the outer to where the inner one put it.
+    let is tree.Tree as t3 = tree_for();
+    let is i64 as out3 = area_at(&t3, 0.0, 0.0, 150.0, 100.0);
+    let is i64 as col3 = box.create(&t3, out3, box.COLUMN);
+    sheet(&t3, col3, 100.0, 300.0, WHITE);
+    let is i64 as in3 = scroll.create(&t3, col3);
+    layout.set_min_size(&t3, in3, 100.0, 60.0);
+    layout.set_max_size(&t3, in3, 100.0, 60.0);
+    let is i64 as col4 = box.create(&t3, in3, box.COLUMN);
+    let is [10]i64 as items;
+    i = 0;
+    while (i < 10) {
+        items[i] = sheet(&t3, col4, 100.0, 30.0, WHITE);
+        i = i + 1;
+    }
+    sheet(&t3, col3, 100.0, 600.0, WHITE);
+    layout.run(&t3, cast(f64, W), cast(f64, H));
+    scroll.set_offset(&t3, in3, 0.0, 30.0);
+    router.reveal(&t3, items[5]);
+    let is math.rect.Rect as ir = layout.window_rect(&t3, items[5]);
+    check("inside another, up and down: in view of both", scroll.offset_y(&t3, in3) == 120.0 && ir.y >= 0.0 &&
+          ir.y + ir.h <= 100.0 && scroll.offset_y(&t3, out3) == 260.0);
+    tree.close(&t3);
+}
+
+// --- Told ---
+
+fn told() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as a = area_at(&t, 10.0, 10.0, 100.0, 80.0);
+    sheet(&t, a, 300.0, 500.0, WHITE);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    scroll.set_offset(&t, a, 0.0, 30.0);
+    let is tree.Access as q;
+    access.describe(&t, cast(*router.Router, 0), a, &q);
+    check("told: a scroll pane, how far down its value", q.role == access.ROLE_SCROLL_PANE && q.has_value == 1 &&
+          q.value == 30.0 && q.min == 0.0 && q.max == 420.0 && (q.states & access.VERTICAL) != 0 &&
+          (q.actions & access.SET_VALUE) != 0 && (q.actions & access.INCREMENT) != 0 && (q.actions & access.DECREMENT) != 0);
+    check("scrolled by assistive technology", access.act(&t, a, access.SET_VALUE, 100.0) == 1 && scroll.offset_y(&t, a) == 100.0);
+    access.act(&t, a, access.INCREMENT, 0.0);
+    check("a line on", scroll.offset_y(&t, a) == 140.0);
+    access.act(&t, a, access.DECREMENT, 0.0);
+    access.act(&t, a, access.DECREMENT, 0.0);
+    check("two back", scroll.offset_y(&t, a) == 60.0);
+    // Scrolling only across: that its value.
+    let is i64 as b = area_at(&t, 10.0, 100.0, 100.0, 40.0);
+    scroll.set_policy(&t, b, scroll.AUTO, scroll.NEVER);
+    sheet(&t, b, 300.0, 40.0, WHITE);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    scroll.set_offset(&t, b, 50.0, 0.0);
+    access.describe(&t, cast(*router.Router, 0), b, &q);
+    check("only across: how far across", q.value == 50.0 && q.max == 200.0 && (q.states & access.HORIZONTAL) != 0);
+    access.act(&t, b, access.SET_VALUE, 120.0);
+    check("and set so", scroll.offset_x(&t, b) == 120.0);
+    tree.close(&t);
+}
+
+fn main() as i32 {
+    theme = style.light();
+    frame_router = cast(*router.Router, 0);
+    sheet_kind = widget.kind("sheet", sizeof(Sheet));
+    sheet_kind.measure = fn_ptr(sheet_measure);
+    sheet_kind.arrange = fn_ptr(sheet_arrange);
+    sheet_kind.paint = fn_ptr(sheet_paint);
+    sheet_kind.event = fn_ptr(sheet_event);
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as limits = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &limits);
+
+    classic(&c);
+    overlay(&c);
+    smooth();
+    kinetic();
+    followed();
+    scrolled_to();
+    settings();
+    laid_more();
+    thumbs();
+    revealed();
+    told();
+
+    if (fails == 0) {
+        io.printf("scrolling: %d checks passed\n", checks);
+        return 0;
+    }
+    io.printf("scrolling: %d of %d checks failed\n", fails, checks);
+    return 1;
+}

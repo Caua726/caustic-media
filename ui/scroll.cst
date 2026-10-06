@@ -30,16 +30,43 @@
 // just far enough to show the rectangle it names.
 //
 // After the content moves under a pointer that did not, the window calls
-// router.refresh_hover; this has no router to call it with.
+// router.refresh_hover.
+//
+// Drawn over the content (paint_over). Classic bars always, a track and a
+// thumb, darker with the pointer over them and darker still held. Overlay
+// bars only while something happens — the content scrolled, the pointer
+// moving over the area — and gone HIDE_MS after, faded through the window's
+// animator; a thin line along the edge, the whole bar under the pointer.
+//
+// In time, with the window's animator: a notch of the wheel glides there,
+// notches in a row adding up; a touchpad's scroll moves at once, and when the
+// fingers lift (SCROLL_END) flies on with the speed it had, slowing as
+// exp(-t / KINETIC_TAU) until KINETIC_STOP pixels a millisecond — or until
+// it is touched again, or reaches the end. Less motion asked for: none of it.
+//
+// A widget holding the pointer — a text view selecting, a list being dragged
+// over — calls follow() as it moves: each area holding it, the pointer past
+// its view, scrolls towards it every FOLLOW_MS, faster the further past, and
+// the widget hears the move again where the pointer now is in its content.
+// scroll_to brings a widget inside into view: its start, middle or end to
+// the view's, or just into view (NEAREST).
 use "std/math.cst" as fm;
+use "std/mem.cst" as mem;
 use "../math/math.cst" as math;
 use "../window/keys.cst" as keys;
+use "../render/shapes2d.cst" as shapes;
 use "tree.cst" as tree;
 use "widget.cst" as widget;
 use "geom.cst" as geom;
 use "layout.cst" as layout;
 use "event.cst" as event;
 use "signal.cst" as signal;
+use "style.cst" as style;
+use "painter.cst" as painter;
+use "timer.cst" as timer;
+use "anim.cst" as anim;
+use "router.cst" as router;
+use "access.cst" as access;
 
 // Axes.
 let is i32 as X with imut = 0;
@@ -53,6 +80,20 @@ let is i32 as ALWAYS with imut = 2;   // scrolls, and the bar is always there
 // Bar styles.
 let is i32 as OVERLAY with imut = 0;
 let is i32 as CLASSIC with imut = 1;
+
+// scroll_to: just into view, along an axis — beside layout's START, CENTER
+// and END.
+let is i32 as NEAREST with imut = 0 - 1;
+
+let is i64 as HIDE_MS      with imut = 1000;    // overlay bars: gone this long after the last thing
+let is i64 as FOLLOW_MS    with imut = 30;      // a drag past the edge: a step this often
+let is f64 as KINETIC_TAU  with imut = 325.0;   // a fling's speed falls by e every this many ms
+let is f64 as KINETIC_STOP with imut = 0.02;    // and stops below this many pixels a millisecond
+let is f64 as FLING_MIN    with imut = 0.05;    // slower than this when lifted: no fling
+let is i64 as RECENT_MS    with imut = 100;     // a touchpad's scroll older than this says no speed
+
+let is f64 as THIN  with imut = 3.0;   // an overlay bar at rest, across
+let is f64 as INSET with imut = 2.0;   // a thumb inside its bar
 
 struct Data {
     policy_x  as i32;
@@ -73,6 +114,49 @@ struct Data {
     view_h    as f64;
     drag_from as f64;   // where the held thumb was pressed, along its axis
     drag_off  as f64;   // the offset then
+    t         as *tree.Tree;   // for what time calls back
+    self      as i64;
+    over      as i32;   // the axis whose bar the pointer is over, -1 for none
+    _pad0     as i32;
+    alpha     as f64;   // overlay bars: how much they show, 0 to 1
+    hide_id   as i64;   // the timer that fades them
+    fade_id   as i64;   // their fade
+    mo        as *Motion;   // made the first time it glides, flies or follows
+}
+
+// What moves it in time, apart: a widget's data is kept small, and most
+// areas never need this.
+struct Motion {
+    glide_id  as i64;   // the wheel's glide: from g_f to g_t, g_s of the way
+    g_s       as f64;
+    g_fx      as f64;
+    g_fy      as f64;
+    g_tx      as f64;
+    g_ty      as f64;
+    fling_id  as i64;   // a fling: f_s milliseconds in, from f_f at f_v
+    f_s       as f64;
+    f_fx      as f64;
+    f_fy      as f64;
+    f_vx      as f64;
+    f_vy      as f64;
+    n_s       as i64;   // a touchpad's last scrolls: when, and how far
+    s_t       as [4]i64;
+    s_x       as [4]f64;
+    s_y       as [4]f64;
+    follow_id as i64;   // following a drag: where the pointer is, in the window
+    fol_x     as f64;
+    fol_y     as f64;
+}
+
+// Its Motion, made now if it has none; null when memory is refused, and it
+// then moves at once and follows nothing.
+fn _mo(d as *Data) as *Motion {
+    if (cast(i64, d.mo) == 0) {
+        let is *u8 as m = mem.core.mmap_anon(sizeof(Motion));
+        if (cast(i64, m) <= 0) { return cast(*Motion, 0); }
+        d.mo = cast(*Motion, m);
+    }
+    return d.mo;
 }
 
 let is tree.Kind as _kind with mut;
@@ -85,6 +169,10 @@ fn _init() as void {
     _kind.arrange = fn_ptr(_arrange);
     _kind.event = fn_ptr(_event);
     _kind.hit = fn_ptr(_hit);
+    _kind.paint_over = fn_ptr(_paint_over);
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.role = access.ROLE_SCROLL_PANE;
+    _kind.access = fn_ptr(_access);
     _ready = 1;
 }
 
@@ -102,7 +190,41 @@ fn create(t as *tree.Tree, parent as i64) as i64 {
     d.bar = 10.0;
     d.min_thumb = 20.0;
     d.line = 40.0;
+    d.t = t;
+    d.self = w;
+    d.over = cast(i32, 0 - 1);
     return w;
+}
+
+// What time calls back about it, let go of.
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *timer.Timers as ts = _timers(t);
+    if (cast(i64, ts) != 0) { timer.cancel(ts, d.hide_id); }
+    let is *anim.Animator as an = _animator(t);
+    if (cast(i64, an) != 0) { anim.cancel(an, d.fade_id); }
+    if (cast(i64, d.mo) == 0) { return; }
+    _still(t, d);
+    _unfollow(t, d);
+    mem.core.munmap(cast(*u8, d.mo), sizeof(Motion));
+    d.mo = cast(*Motion, 0);
+}
+
+fn _timers(t as *tree.Tree) as *timer.Timers { return cast(*timer.Timers, tree.timers(t)); }
+fn _animator(t as *tree.Tree) as *anim.Animator { return cast(*anim.Animator, tree.animator(t)); }
+fn _router(t as *tree.Tree) as *router.Router { return cast(*router.Router, tree.router(t)); }
+
+// The time of the last thing the window heard, 0 with no router.
+fn _now(t as *tree.Tree) as i64 {
+    let is *router.Router as r = _router(t);
+    if (cast(i64, r) == 0) { return 0; }
+    return r.now;
+}
+
+fn _reduced(t as *tree.Tree, w as i64) as i32 {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    return th.motion.reduced;
 }
 
 fn _data(t as *tree.Tree, w as i64) as *Data {
@@ -324,11 +446,16 @@ fn _snap(t as *tree.Tree, v as f64) as f64 {
     return fm.floor(v * s + 0.5) / s;
 }
 
-// Scrolls to x, y — clamped to the content, on whole physical pixels. Returns
-// 1 if the offset changed.
+// Scrolls to x, y — clamped to the content, on whole physical pixels — ending
+// a glide or a fling where it is. Returns 1 if the offset changed.
 fn set_offset(t as *tree.Tree, w as i64, x as f64, y as f64) as i32 {
     let is *Data as d = _data(t, w);
     if (_null(d) == 1) { return 0; }
+    _still(t, d);
+    return _offset(t, w, d, x, y);
+}
+
+fn _offset(t as *tree.Tree, w as i64, d as *Data, x as f64, y as f64) as i32 {
     let is f64 as nx = _clamp_off(_snap(t, x), d.content_w - d.view_w);
     let is f64 as ny = _clamp_off(_snap(t, y), d.content_h - d.view_h);
     if (nx == d.ox && ny == d.oy) { return 0; }
@@ -337,7 +464,21 @@ fn set_offset(t as *tree.Tree, w as i64, x as f64, y as f64) as i32 {
     _place(t, w, d);
     tree.want_paint(t);
     signal.emit(t, w, signal.VALUE_CHANGED, cast(*u8, 0));
+    _show(t, w, d, _now(t));
     return 1;
+}
+
+// No glide, no fling.
+fn _still(t as *tree.Tree, d as *Data) as void {
+    let is *Motion as m = d.mo;
+    if (cast(i64, m) == 0) { return; }
+    let is *anim.Animator as an = _animator(t);
+    if (cast(i64, an) != 0) {
+        anim.cancel(an, m.glide_id);
+        anim.cancel(an, m.fling_id);
+    }
+    m.glide_id = 0;
+    m.fling_id = 0;
 }
 
 fn scroll_by(t as *tree.Tree, w as i64, dx as f64, dy as f64) as i32 {
@@ -457,13 +598,359 @@ fn _wheel(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
             dx = dy;
             dy = 0.0;
         }
+        let is *anim.Animator as an = _animator(t);
+        if (cast(i64, an) != 0 && _reduced(t, w) == 0 && cast(i64, _mo(d)) != 0) {
+            return _glide(t, w, d, an, _hdelta(t, w, dx), dy);
+        }
     }
     // An axis that does not scroll has nothing beyond the view, so the clamp
     // keeps it at 0 and the wheel passes on to an outer area.
-    return cast(i64, scroll_by(t, w, _hdelta(t, w, dx), dy));
+    let is i32 as moved = scroll_by(t, w, _hdelta(t, w, dx), dy);
+    if (e.discrete == 0 && moved == 1 && cast(i64, _mo(d)) != 0) { _sample(d.mo, e.time, _hdelta(t, w, dx), dy); }
+    return cast(i64, moved);
+}
+
+// --- In time ---
+
+// A notch glides: towards where the last one was going, if one still is.
+// Nothing further that way — at its end — and the wheel is an outer area's.
+fn _glide(t as *tree.Tree, w as i64, d as *Data, an as *anim.Animator, dx as f64, dy as f64) as i64 {
+    let is *Motion as m = d.mo;
+    let is f64 as bx with mut = d.ox;
+    let is f64 as by with mut = d.oy;
+    if (anim.running(an, m.glide_id) == 1) {
+        bx = m.g_tx;
+        by = m.g_ty;
+    }
+    let is f64 as tx = _clamp_off(_snap(t, bx + dx), d.content_w - d.view_w);
+    let is f64 as ty = _clamp_off(_snap(t, by + dy), d.content_h - d.view_h);
+    if (tx == bx && ty == by) { return 0; }
+    anim.cancel(an, m.fling_id);
+    m.fling_id = 0;
+    m.g_fx = d.ox;
+    m.g_fy = d.oy;
+    m.g_tx = tx;
+    m.g_ty = ty;
+    m.g_s = 0.0;
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    m.glide_id = anim.number(an, w, &m.g_s, 1.0, th.motion.normal, math.curve.EASE_OUT_CUBIC);
+    anim.on_step(an, m.glide_id, fn_ptr(_glided), cast(*u8, d));
+    return 1;
+}
+
+fn _glided(user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is *Motion as m = d.mo;
+    _offset(d.t, d.self, d, m.g_fx + (m.g_tx - m.g_fx) * m.g_s, m.g_fy + (m.g_ty - m.g_fy) * m.g_s);
+}
+
+// A touchpad's scroll, kept for its speed: the last few, none older than
+// RECENT_MS before the next.
+fn _sample(d as *Motion, time as i64, dx as f64, dy as f64) as void {
+    if (d.n_s > 0 && time - d.s_t[d.n_s - 1] > RECENT_MS) { d.n_s = 0; }
+    if (d.n_s == 4) {
+        let is i64 as i with mut = 0;
+        while (i < 3) {
+            d.s_t[i] = d.s_t[i + 1];
+            d.s_x[i] = d.s_x[i + 1];
+            d.s_y[i] = d.s_y[i + 1];
+            i = i + 1;
+        }
+        d.n_s = 3;
+    }
+    d.s_t[d.n_s] = time;
+    d.s_x[d.n_s] = dx;
+    d.s_y[d.n_s] = dy;
+    d.n_s = d.n_s + 1;
+}
+
+// The fingers lifted: flown on with the speed of the last scrolls — how far
+// they went after the first, over the time since it — unless they rested
+// first. 1 if it flies.
+fn _fling(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    let is *Motion as m = d.mo;
+    if (cast(i64, m) == 0) { return 0; }
+    let is i64 as n = m.n_s;
+    m.n_s = 0;
+    let is *anim.Animator as an = _animator(t);
+    if (cast(i64, an) == 0 || _reduced(t, w) == 1 || n < 2) { return 0; }
+    if (e.time - m.s_t[n - 1] > RECENT_MS) { return 0; }
+    let is f64 as span = cast(f64, m.s_t[n - 1] - m.s_t[0]);
+    if (span <= 0.0) { return 0; }
+    let is f64 as sx with mut = 0.0;
+    let is f64 as sy with mut = 0.0;
+    let is i64 as i with mut = 1;
+    while (i < n) {
+        sx = sx + m.s_x[i];
+        sy = sy + m.s_y[i];
+        i = i + 1;
+    }
+    let is f64 as vx = sx / span;
+    let is f64 as vy = sy / span;
+    let is f64 as speed = fm.sqrt(vx * vx + vy * vy);
+    if (speed < FLING_MIN) { return 0; }
+    _still(t, d);
+    m.f_fx = d.ox;
+    m.f_fy = d.oy;
+    m.f_vx = vx;
+    m.f_vy = vy;
+    m.f_s = 0.0;
+    let is f64 as ms = KINETIC_TAU * fm.log(speed / KINETIC_STOP);
+    m.fling_id = anim.number(an, w, &m.f_s, ms, cast(i64, ms), math.curve.EASE_LINEAR);
+    anim.on_step(an, m.fling_id, fn_ptr(_flung), cast(*u8, d));
+    return 1;
+}
+
+// f_s milliseconds in, it has gone v tau (1 - e^(-s / tau)). Pinned at an
+// end along every axis it moves on: over.
+fn _flung(user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is *Motion as m = d.mo;
+    let is f64 as k = KINETIC_TAU * (1.0 - fm.exp(0.0 - m.f_s / KINETIC_TAU));
+    let is f64 as wx = m.f_fx + m.f_vx * k;
+    let is f64 as wy = m.f_fy + m.f_vy * k;
+    _offset(d.t, d.self, d, wx, wy);
+    let is i32 as px = cast(i32, m.f_vx == 0.0 || wx <= 0.0 || wx >= d.content_w - d.view_w);
+    let is i32 as py = cast(i32, m.f_vy == 0.0 || wy <= 0.0 || wy >= d.content_h - d.view_h);
+    if (px == 1 && py == 1) {
+        let is *anim.Animator as an = _animator(d.t);
+        if (cast(i64, an) != 0) { anim.cancel(an, m.fling_id); }
+        m.fling_id = 0;
+    }
+}
+
+// --- Following a drag ---
+
+// How far past the view, along x, a window x is: below 0 before it, above 0
+// after it, 0 inside — or along an axis that does not scroll.
+fn _past_x(t as *tree.Tree, w as i64, d as *Data, x as f64) as f64 {
+    if (_scrolls(d.policy_x) == 0) { return 0.0; }
+    let is f64 as x0 = layout.window_rect(t, w).x + d.view_x;
+    if (x < x0) { return x - x0; }
+    if (x > x0 + d.view_w) { return x - x0 - d.view_w; }
+    return 0.0;
+}
+
+fn _past_y(t as *tree.Tree, w as i64, d as *Data, y as f64) as f64 {
+    if (_scrolls(d.policy_y) == 0) { return 0.0; }
+    let is f64 as y0 = layout.window_rect(t, w).y;
+    if (y < y0) { return y - y0; }
+    if (y > y0 + d.view_h) { return y - y0 - d.view_h; }
+    return 0.0;
+}
+
+// w, holding the pointer, has it at window x, y: each scroll area holding w
+// follows it past its edge, or stops.
+fn follow(t as *tree.Tree, w as i64, x as f64, y as f64, time as i64) as void {
+    let is i64 as a with mut = tree.parent(t, w);
+    while (a != 0) {
+        let is *Data as d = _data(t, a);
+        if (_null(d) == 0) { _follow(t, a, d, x, y, time); }
+        a = tree.parent(t, a);
+    }
+}
+
+fn _follow(t as *tree.Tree, w as i64, d as *Data, x as f64, y as f64, time as i64) as void {
+    if (_past_x(t, w, d, x) == 0.0 && _past_y(t, w, d, y) == 0.0) {
+        _unfollow(t, d);
+        return;
+    }
+    let is *Motion as m = _mo(d);
+    if (cast(i64, m) == 0) { return; }
+    m.fol_x = x;
+    m.fol_y = y;
+    if (m.follow_id != 0) { return; }
+    let is *timer.Timers as ts = _timers(t);
+    if (cast(i64, ts) == 0) { return; }
+    m.follow_id = timer.add(ts, time, FOLLOW_MS, FOLLOW_MS, fn_ptr(_followed), cast(*u8, d));
+}
+
+fn _unfollow(t as *tree.Tree, d as *Data) as void {
+    let is *Motion as m = d.mo;
+    if (cast(i64, m) == 0) { return; }
+    let is *timer.Timers as ts = _timers(t);
+    if (cast(i64, ts) != 0) { timer.cancel(ts, m.follow_id); }
+    m.follow_id = 0;
+}
+
+// A step towards a point past by b: half of it, from 2 to 40 pixels.
+fn _step(b as f64) as f64 {
+    if (b == 0.0) { return 0.0; }
+    let is f64 as m with mut = b;
+    if (m < 0.0) { m = 0.0 - m; }
+    m = m / 2.0;
+    if (m < 2.0) { m = 2.0; }
+    if (m > 40.0) { m = 40.0; }
+    if (b < 0.0) { return 0.0 - m; }
+    return m;
+}
+
+fn _followed(user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is *tree.Tree as t = d.t;
+    let is i64 as w = d.self;
+    let is *router.Router as r = _router(t);
+    if (cast(i64, r) == 0 || router.capture(r) == 0 || r.buttons == 0) {
+        _unfollow(t, d);
+        return;
+    }
+    let is f64 as bx = _past_x(t, w, d, d.mo.fol_x);
+    let is f64 as by = _past_y(t, w, d, d.mo.fol_y);
+    if (scroll_by(t, w, _hdelta(t, w, _step(bx)), _step(by)) == 0) {
+        _unfollow(t, d);
+        return;
+    }
+    router.repeat_move(t, r, r.now);
+}
+
+// --- Scrolled to ---
+
+// How far to move along an axis to put a stretch at `at`, len long, where
+// how says in a view that long.
+fn _align(how as i32, at as f64, len as f64, view as f64) as f64 {
+    if (how == layout.START) { return at; }
+    if (how == layout.END) { return at + len - view; }
+    if (how == layout.CENTER) { return at + len / 2.0 - view / 2.0; }
+    if (at < 0.0) { return at; }
+    if (at + len > view) { return _min(at + len - view, at); }
+    return 0.0;
+}
+
+// Scrolls w so the widget item inside it is where ax and ay say — START,
+// CENTER, END or NEAREST, START the right in right to left. 1 if it moved.
+fn scroll_to(t as *tree.Tree, w as i64, item as i64, ax as i32, ay as i32) as i32 {
+    let is *Data as d = _data(t, w);
+    if (_null(d) == 1 || item == w) { return 0; }
+    let is i64 as a with mut = item;
+    while (a != 0 && a != w) { a = tree.parent(t, a); }
+    if (a == 0) { return 0; }
+    let is math.rect.Rect as ir = layout.window_rect(t, item);
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    let is i32 as hx with mut = ax;
+    if (_rtl(t, w) == 1) {
+        if (ax == layout.START) { hx = layout.END; } else if (ax == layout.END) { hx = layout.START; }
+    }
+    let is f64 as dx = _align(hx, ir.x - wr.x - d.view_x, ir.w, d.view_w);
+    let is f64 as dy = _align(ay, ir.y - wr.y, ir.h, d.view_h);
+    return set_offset(t, w, d.ox + _hdelta(t, w, dx), d.oy + dy);
+}
+
+// --- Overlay bars in time ---
+
+// Their rectangles, to repaint.
+fn _damage_bars(t as *tree.Tree, w as i64, d as *Data) as void {
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    let is i32 as axis with mut = Y;
+    while (axis >= X) {
+        let is math.rect.Rect as b = bar_rect(t, w, axis);
+        if (math.rect.rect_is_empty(b) == 0) {
+            let is math.rect.Rect as at = math.rect.rect(wr.x + b.x, wr.y + b.y, b.w, b.h);
+            tree.damage_add(t, &at);
+        }
+        axis = axis - 1;
+    }
+}
+
+// Something happened: overlay bars shown, to go HIDE_MS from now.
+fn _show(t as *tree.Tree, w as i64, d as *Data, now as i64) as void {
+    if (d.bars == CLASSIC) { return; }
+    let is *anim.Animator as an = _animator(t);
+    if (cast(i64, an) != 0) { anim.cancel(an, d.fade_id); }
+    d.fade_id = 0;
+    if (d.alpha < 1.0) {
+        d.alpha = 1.0;
+        _damage_bars(t, w, d);
+    }
+    let is *timer.Timers as ts = _timers(t);
+    if (cast(i64, ts) == 0) { return; }
+    timer.cancel(ts, d.hide_id);
+    d.hide_id = timer.add(ts, now, HIDE_MS, 0, fn_ptr(_hide_due), cast(*u8, d));
+}
+
+// Nothing since: faded — unless the pointer rests on a bar or holds a thumb,
+// whose leaving brings this round again.
+fn _hide_due(user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    d.hide_id = 0;
+    if (d.over >= 0 || d.drag >= 0) { return; }
+    let is *anim.Animator as an = _animator(d.t);
+    if (cast(i64, an) == 0) {
+        d.alpha = 0.0;
+        _damage_bars(d.t, d.self, d);
+        return;
+    }
+    let is style.Theme as th;
+    widget.theme(d.t, d.self, &th);
+    d.fade_id = anim.number(an, d.self, &d.alpha, 0.0, th.motion.normal, anim.THEME_EASE);
+}
+
+// The pointer over the area: on a bar or not, and something happening.
+fn _hover(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as void {
+    let is i32 as o with mut = cast(i32, 0 - 1);
+    if (_in(bar_rect(t, w, Y), e.local_x, e.local_y) == 1) {
+        o = Y;
+    } else if (_in(bar_rect(t, w, X), e.local_x, e.local_y) == 1) {
+        o = X;
+    }
+    if (o != d.over) {
+        d.over = o;
+        _damage_bars(t, w, d);
+    }
+    _show(t, w, d, e.time);
+}
+
+// --- Drawn ---
+
+fn _paint_over(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    _paint_bar(t, w, d, p, Y);
+    _paint_bar(t, w, d, p, X);
+}
+
+// A classic bar: its track, its thumb inside it. An overlay one: the same
+// under the pointer or held, else a thin line along the far edge.
+fn _paint_bar(t as *tree.Tree, w as i64, d as *Data, p as *painter.Painter, axis as i32) as void {
+    let is math.rect.Rect as b = bar_rect(t, w, axis);
+    if (math.rect.rect_is_empty(b) == 1) { return; }
+    let is math.rect.Rect as tr = thumb_rect(t, w, axis);
+    let is math.color.Color as fg = p.theme.palette.fg;
+    let is f64 as ox = p.rect.x;
+    let is f64 as oy = p.rect.y;
+    let is f64 as a with mut = 1.0;
+    let is i32 as wide with mut = 1;
+    if (d.bars == OVERLAY) {
+        a = d.alpha;
+        if (a <= 0.0) { return; }
+        wide = cast(i32, d.over == axis || d.drag == axis);
+    }
+    let is f64 as tone with mut = 0.35;
+    if (d.over == axis) { tone = 0.5; }
+    if (d.drag == axis) { tone = 0.65; }
+    if (wide == 1) {
+        shapes.fill_rect(p.canvas, ox + b.x, oy + b.y, b.w, b.h, style.with_alpha(fg, 0.1 * a));
+        let is f64 as tw = _max(0.0, tr.w - 2.0 * INSET);
+        let is f64 as th = _max(0.0, tr.h - 2.0 * INSET);
+        let is f64 as rad = _min(tw, th) / 2.0;
+        shapes.fill_rounded(p.canvas, ox + tr.x + INSET, oy + tr.y + INSET, tw, th, rad, rad, rad, rad,
+                            style.with_alpha(fg, tone * a));
+        return;
+    }
+    let is f64 as half = THIN / 2.0;
+    if (axis == Y) {
+        let is f64 as x with mut = ox + b.x + b.w - INSET - THIN;
+        if (_rtl(t, w) == 1) { x = ox + b.x + INSET; }
+        shapes.fill_rounded(p.canvas, x, oy + tr.y + INSET, THIN, _max(0.0, tr.h - 2.0 * INSET), half, half, half, half,
+                            style.with_alpha(fg, tone * a));
+        return;
+    }
+    shapes.fill_rounded(p.canvas, ox + tr.x + INSET, oy + b.y + b.h - INSET - THIN, _max(0.0, tr.w - 2.0 * INSET), THIN,
+                        half, half, half, half, style.with_alpha(fg, tone * a));
 }
 
 fn _press(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
+    // A press stops what flies.
+    _still(t, d);
     if (e.button != 1) { return 0; }
     let is i32 as axis with mut = Y;
     while (axis >= X) {
@@ -472,6 +959,7 @@ fn _press(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
             let is math.rect.Rect as th = thumb_rect(t, w, axis);
             if (_in(th, e.local_x, e.local_y) == 1) {
                 d.drag = axis;
+                _damage_bars(t, w, d);
                 d.drag_from = e.y;
                 d.drag_off = d.oy;
                 if (axis == X) {
@@ -566,13 +1054,55 @@ fn _reveal(t as *tree.Tree, w as i64, d as *Data, e as *event.Event) as i64 {
 fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
     let is *Data as d = cast(*Data, data);
     if (e.kind == event.SCROLL) { return _wheel(t, w, d, e); }
+    if (e.kind == event.SCROLL_END) { return _fling(t, w, d, e); }
     if (e.kind == event.POINTER_DOWN) { return _press(t, w, d, e); }
     if (e.kind == event.POINTER_MOVE && d.drag >= 0) { return _drag(t, w, d, e); }
     if (e.kind == event.POINTER_UP && d.drag >= 0) {
         d.drag = cast(i32, 0 - 1);
+        _damage_bars(t, w, d);
+        _show(t, w, d, e.time);
         return 1;
+    }
+    if (e.kind == event.POINTER_MOVE || e.kind == event.POINTER_ENTER) {
+        _hover(t, w, d, e);
+        return 0;
+    }
+    if (e.kind == event.POINTER_LEAVE) {
+        if (d.over >= 0) {
+            d.over = cast(i32, 0 - 1);
+            _damage_bars(t, w, d);
+        }
+        _show(t, w, d, e.time);
+        return 0;
     }
     if (e.kind == event.KEY_DOWN) { return _key(t, w, d, e); }
     if (e.kind == event.REVEAL) { return _reveal(t, w, d, e); }
     return 0;
+}
+
+// --- Told ---
+
+// A scroll pane: how far down it is, of how far it can go — or across, when
+// that is the only way it scrolls — set or stepped a line at a time.
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as across = cast(i32, _scrolls(d.policy_y) == 0 && _scrolls(d.policy_x) == 1);
+    if (q.action == access.ASK) {
+        if (across == 1) {
+            access.set_range(q, d.ox, 0.0, _max(0.0, d.content_w - d.view_w), d.line);
+            q.states = q.states | access.HORIZONTAL;
+        } else {
+            access.set_range(q, d.oy, 0.0, _max(0.0, d.content_h - d.view_h), d.line);
+            q.states = q.states | access.VERTICAL;
+        }
+        q.actions = access.SET_VALUE | access.INCREMENT | access.DECREMENT;
+        return 1;
+    }
+    let is f64 as v with mut = d.oy;
+    if (across == 1) { v = d.ox; }
+    if (q.action == access.SET_VALUE) { v = q.arg; }
+    if (q.action == access.INCREMENT) { v = v + d.line; }
+    if (q.action == access.DECREMENT) { v = v - d.line; }
+    if (across == 1) { return cast(i64, set_offset(t, w, v, d.oy)); }
+    return cast(i64, set_offset(t, w, d.ox, v));
 }

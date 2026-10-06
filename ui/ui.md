@@ -472,6 +472,27 @@ to bring a rectangle into view — sent when focus moves by keyboard. Damage is
 clipped to the ancestors, so scrolling repaints the view, not the content's
 whole extent.
 
+Drawn and in time (tested by `scrolling_test`): its bars over the content,
+through a kind's `paint_over` entry — drawn after the children, in the same
+clip. Classic bars always, a track and a thumb, darker under the pointer and
+darker still held; overlay bars only while something happens — the content
+scrolled, the pointer moving over the area — a thin line along the far edge,
+the whole bar with its track under the pointer, faded `HIDE_MS` after the last
+thing unless the pointer rests on one. A notch of the wheel glides there along
+an ease-out, notches in a row heading on from where the last was going, and an
+area at its end still hands the rest on; a touchpad's scroll moves at once and,
+when the fingers lift (`router.scroll_end`, from Wayland's `axis_stop`), flies
+on with the speed of its last few scrolls, slowing as e^(-t/325 ms) until two
+hundredths of a pixel a millisecond, stopped by another scroll, a press or the
+end. Less motion asked for, it does neither. A widget holding a drag calls
+`follow` as the pointer moves: each area holding it, the pointer past its view,
+steps towards it every `FOLLOW_MS` — half the distance past, 2 to 40 pixels —
+and the widget hears the move again where the pointer now is
+(`router.repeat_move`), so a selection or a drop place goes on with it; the
+text view does. `scroll_to` puts a widget inside at the view's start, middle or
+end, or just into view. What it needs in time — the glide, the fling, the
+following — sits apart from its widget data, made the first time.
+
 **Splitters** (`splitter.cst`, tested by `splitter_test`): any number of panes
 in a row or a column with a handle between each two. Each pane's size is kept
 (in its layout record's `slot`), so a pane dragged wider stays wider; when the
@@ -574,8 +595,10 @@ ask, with `tree.F_FOCUS_WITHIN_LOOK`). A paint entry may set the painter's
 it is given that colour, as CSS's `color` is inherited: a button's label in the
 button's text colour for its state. A widget on a higher layer
 (`tree.set_layer`) escapes its ancestors' clips, draws above everything below
-it and is hit-tested first: a popup inside the window. The focus ring is drawn
-after the subtree, inside the edge, unless the widget drew its own. A clip a
+it and is hit-tested first: a popup inside the window. A kind's `paint_over`
+entry draws after its children, over them, in the same clip — a scroll area's
+bars. The focus ring is drawn after the subtree, inside the edge, unless the
+widget drew its own. A clip a
 paint entry forgets to pop is popped for it. `app.paint` paints a window with
 its own router and active state, in the application's theme.
 
