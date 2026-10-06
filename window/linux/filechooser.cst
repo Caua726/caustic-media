@@ -1,0 +1,462 @@
+// window/linux/filechooser.cst — the desktop's own file chooser, through the
+// XDG portal: org.freedesktop.portal.FileChooser, over D-Bus.
+//
+// The dialog a person then picks files in is the desktop's — GNOME's, KDE's,
+// whichever xdg-desktop-portal hands it to — under X11 and Wayland alike; for
+// a sandboxed program (Flatpak) it is the only way to files outside.
+//
+// A dialog takes as long as the person does, so it is answered later:
+// open_file or save_file asks and returns, and the answer comes as a Response
+// signal on the request's own object, heard while the program dispatches the
+// connection — the request's state leaves WAITING. That object's path is
+// known before asking, made from our unique name and a token we choose
+// (handle_token), so it is listened to first and an answer given at once is
+// not missed; a portal older than handle_token says another path, listened
+// to from then on.
+//
+// The request, the program's and kept where it is until closed, holds the
+// answer: the URIs chosen — path() turns a file:// one into a path — and the
+// filter left chosen. close() is called once the program is done with it,
+// answered or not: it stops listening, and tells the portal to close a
+// dialog still open. Filters are patterns as our own chooser has them
+// ("*.txt;*.md", "" for all). Windows' dialog comes with its window backend.
+use "std/mem.cst" as mem;
+use "../../dbus/dbus.cst" as dbus;
+use "portal.cst" as portal;
+
+let is *u8 as IFACE   with imut = "org.freedesktop.portal.FileChooser";
+let is *u8 as REQUEST with imut = "org.freedesktop.portal.Request";
+
+// What became of a request.
+let is i32 as WAITING   with imut = 0;
+let is i32 as CHOSEN    with imut = 1;
+let is i32 as CANCELLED with imut = 2;
+let is i32 as FAILED    with imut = 3;   // not asked, or it ended some other way
+
+let is i64 as MAX_FILTERS with imut = 8;
+let is i64 as MAX_URIS    with imut = 128;
+let is i64 as URI_BYTES   with imut = 16384;
+
+// What the dialog is asked to be. Texts are the program's, read when asked.
+struct Options {
+    accept     as *u8;   // the button's label, null for the portal's own
+    accept_len as i64;
+    modal      as i32;   // 1 at first
+    multiple   as i32;   // opening: more than one file
+    directory  as i32;   // opening: a folder, not files
+    _pad0      as i32;
+    folder     as *u8;   // where it starts, null for the portal's choice
+    folder_len as i64;
+    name       as *u8;   // saving: the name proposed
+    name_len   as i64;
+    nf         as i64;
+    fname      as [8]*u8;
+    fname_len  as [8]i64;
+    fpat       as [8]*u8;
+    fpat_len   as [8]i64;
+    current    as i64;   // the filter chosen at first, -1 for the portal's
+}
+
+struct Request {
+    c          as *dbus.conn.Conn;
+    dest       as *u8;
+    state      as i32;
+    response   as i32;   // the portal's: 0 chosen, 1 cancelled, 2 otherwise
+    matched    as i64;   // the Response match, 0 when not listening
+    path       as [256]u8;
+    n          as i64;
+    more       as i32;   // more URIs came than it keeps
+    _pad0      as i32;
+    filter     as [64]u8;   // the filter left chosen, by name
+    filter_len as i64;
+    at         as [128]i64;
+    len        as [128]i64;
+    bn         as i64;
+    blob       as [16384]u8;
+}
+
+let is i64 as _tokens with mut = 0;
+
+fn options() as Options {
+    let is Options as o;
+    o.accept = cast(*u8, 0);
+    o.accept_len = 0;
+    o.modal = 1;
+    o.multiple = 0;
+    o.directory = 0;
+    o._pad0 = 0;
+    o.folder = cast(*u8, 0);
+    o.folder_len = 0;
+    o.name = cast(*u8, 0);
+    o.name_len = 0;
+    o.nf = 0;
+    o.current = 0 - 1;
+    return o;
+}
+
+// A filter named s, n bytes, showing the files patterns match; its index, or
+// -1 past MAX_FILTERS.
+fn add_filter(o as *Options, s as *u8, n as i64, patterns as *u8, pn as i64) as i64 {
+    if (o.nf >= MAX_FILTERS) { return 0 - 1; }
+    let is i64 as k = o.nf;
+    o.fname[k] = s;
+    o.fname_len[k] = n;
+    o.fpat[k] = patterns;
+    o.fpat_len[k] = pn;
+    o.nf = k + 1;
+    return k;
+}
+
+// --- Asking ---
+
+fn _at(s as *u8, i as i64) as *u8 { return cast(*u8, cast(i64, s) + i); }
+
+fn _key(w as *dbus.wire.Writer, k as *u8, sig as *u8) as void {
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string(w, k);
+    dbus.wire.put_variant(w, sig);
+}
+
+fn _bool(w as *dbus.wire.Writer, k as *u8, v as i32) as void {
+    _key(w, k, "b");
+    dbus.wire.put_bool(w, cast(i32, v != 0));
+}
+
+// A filter, (sa(us)): its name and its patterns as globs (0); none at all
+// is every file.
+fn _filter(w as *dbus.wire.Writer, o as *Options, k as i64) as void {
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string_n(w, o.fname[k], o.fname_len[k]);
+    let is i64 as a = dbus.wire.put_array(w, 8);
+    let is *u8 as p = o.fpat[k];
+    let is i64 as pn = o.fpat_len[k];
+    let is i32 as any with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < pn) {
+        let is i64 as j with mut = i;
+        while (j < pn && p[j] != cast(u8, 59) && p[j] != cast(u8, 32)) { j = j + 1; }
+        if (j > i) {
+            dbus.wire.put_struct(w);
+            dbus.wire.put_u32(w, 0);
+            dbus.wire.put_string_n(w, _at(p, i), j - i);
+            any = 1;
+        }
+        i = j + 1;
+    }
+    if (any == 0) {
+        dbus.wire.put_struct(w);
+        dbus.wire.put_u32(w, 0);
+        dbus.wire.put_string(w, "*");
+    }
+    dbus.wire.put_array_end(w, a, 8);
+}
+
+fn _options(w as *dbus.wire.Writer, o as *Options, save as i32, token as *u8) as void {
+    let is i64 as all = dbus.wire.put_array(w, 8);
+    _key(w, "handle_token", "s");
+    dbus.wire.put_string(w, token);
+    if (cast(i64, o.accept) != 0 && o.accept_len > 0) {
+        _key(w, "accept_label", "s");
+        dbus.wire.put_string_n(w, o.accept, o.accept_len);
+    }
+    _bool(w, "modal", o.modal);
+    if (save == 0) {
+        _bool(w, "multiple", o.multiple);
+        _bool(w, "directory", o.directory);
+    }
+    if (o.nf > 0) {
+        _key(w, "filters", "a(sa(us))");
+        let is i64 as fa = dbus.wire.put_array(w, 8);
+        let is i64 as k with mut = 0;
+        while (k < o.nf) {
+            _filter(w, o, k);
+            k = k + 1;
+        }
+        dbus.wire.put_array_end(w, fa, 8);
+    }
+    if (o.current >= 0 && o.current < o.nf) {
+        _key(w, "current_filter", "(sa(us))");
+        _filter(w, o, o.current);
+    }
+    if (save == 1 && cast(i64, o.name) != 0 && o.name_len > 0) {
+        _key(w, "current_name", "s");
+        dbus.wire.put_string_n(w, o.name, o.name_len);
+    }
+    // A folder is bytes, as the file system has it, ending in a zero.
+    if (cast(i64, o.folder) != 0 && o.folder_len > 0) {
+        _key(w, "current_folder", "ay");
+        let is i64 as a = dbus.wire.put_array(w, 1);
+        let is i64 as i with mut = 0;
+        while (i < o.folder_len) {
+            dbus.wire.put_byte(w, cast(i64, o.folder[i]));
+            i = i + 1;
+        }
+        dbus.wire.put_byte(w, 0);
+        dbus.wire.put_array_end(w, a, 1);
+    }
+    dbus.wire.put_array_end(w, all, 8);
+}
+
+fn _digits(v as i64, out as *u8) as i64 {
+    let is [24]u8 as tmp;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    while (x > 0) {
+        tmp[n] = cast(u8, 48 + x % 10);
+        n = n + 1;
+        x = x / 10;
+    }
+    let is i64 as k with mut = 0;
+    while (n > 0) {
+        n = n - 1;
+        out[k] = tmp[n];
+        k = k + 1;
+    }
+    return k;
+}
+
+// The request's path, as the portal makes it: our unique name without its
+// ':' and with '_' for each '.', then the token. 0 when it does not fit.
+fn _request_path(q as *Request, token as *u8, tn as i64) as i32 {
+    let is *u8 as base = "/org/freedesktop/portal/desktop/request/";
+    let is i64 as k with mut = dbus.wire.cstr_len(base);
+    mem.memcpy(cast(*u8, &q.path), base, k);
+    let is *u8 as u = dbus.conn.unique_name(q.c);
+    let is i64 as un = dbus.wire.cstr_len(u);
+    if (un < 2 || k + un + tn + 1 >= 256) { return 0; }
+    let is i64 as i with mut = 1;
+    while (i < un) {
+        if (u[i] == cast(u8, 46)) { q.path[k] = cast(u8, 95); } else { q.path[k] = u[i]; }
+        k = k + 1;
+        i = i + 1;
+    }
+    q.path[k] = cast(u8, 47);
+    mem.memcpy(cast(*u8, cast(i64, &q.path) + k + 1), token, tn);
+    q.path[k + 1 + tn] = cast(u8, 0);
+    return 1;
+}
+
+fn _listen(q as *Request) as i32 {
+    q.matched = dbus.conn.add_match(q.c, q.dest, cast(*u8, &q.path), REQUEST, "Response", fn_ptr(_response), cast(*u8, q));
+    if (q.matched > 0) { return 1; }
+    q.matched = 0;
+    return 0;
+}
+
+fn _unlisten(q as *Request) as void {
+    if (q.matched > 0) { dbus.conn.remove_match(q.c, q.matched); }
+    q.matched = 0;
+}
+
+fn _ask(c as *dbus.conn.Conn, dest as *u8, method as *u8, save as i32, parent as *u8, pn as i64, title as *u8, tn as i64,
+        o as *Options, q as *Request) as i32 {
+    q.c = c;
+    q.dest = dest;
+    q.state = WAITING;
+    q.response = 0;
+    q.matched = 0;
+    q.n = 0;
+    q.more = 0;
+    q.filter_len = 0;
+    q.bn = 0;
+    let is [32]u8 as token;
+    mem.memcpy(cast(*u8, &token), "caustic", 7);
+    _tokens = _tokens + 1;
+    let is i64 as kn = 7 + _digits(_tokens, cast(*u8, cast(i64, &token) + 7));
+    token[kn] = cast(u8, 0);
+    if (_request_path(q, cast(*u8, &token), kn) == 0 || _listen(q) == 0) {
+        q.state = FAILED;
+        return 0;
+    }
+    let is dbus.message.Message as m with mut = dbus.message.method_call(dest, portal.PATH, IFACE, method);
+    m.signature = "ssa{sv}";
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    dbus.wire.put_string_n(w, parent, pn);
+    dbus.wire.put_string_n(w, title, tn);
+    _options(w, o, save, cast(*u8, &token));
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    if (dbus.conn.call_method(c, &m, 5000, &rep) != dbus.conn.OK || dbus.message.named(rep.signature, "o") == 0) {
+        _unlisten(q);
+        q.state = FAILED;
+        return 0;
+    }
+    // A portal before handle_token: its own path, listened to instead. (The
+    // reply lives in the connection's buffer, which the next call reuses.)
+    let is dbus.wire.Reader as r with mut = dbus.message.body(&rep);
+    let is i64 as n with mut = 0;
+    let is *u8 as handle = dbus.wire.get_path(&r, &n);
+    if (r.err == 0 && dbus.message.named(handle, cast(*u8, &q.path)) == 0 && n < 256 && q.state == WAITING) {
+        let is [256]u8 as own;
+        mem.memcpy(cast(*u8, &own), handle, n);
+        _unlisten(q);
+        mem.memcpy(cast(*u8, &q.path), cast(*u8, &own), n);
+        q.path[n] = cast(u8, 0);
+        if (_listen(q) == 0) {
+            q.state = FAILED;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Asks the portal at dest — portal.DESKTOP, or a test's — for files to open,
+// over the window parent names, pn bytes ("x11:<hex id>", "wayland:<handle>",
+// or empty), titled title, tn bytes. 1 when asked, the answer to come into q;
+// 0 when there is no portal or it said no, q FAILED.
+fn open_file(c as *dbus.conn.Conn, dest as *u8, parent as *u8, pn as i64, title as *u8, tn as i64, o as *Options,
+             q as *Request) as i32 {
+    return _ask(c, dest, "OpenFile", 0, parent, pn, title, tn, o, q);
+}
+
+// As open_file, for a file to save to.
+fn save_file(c as *dbus.conn.Conn, dest as *u8, parent as *u8, pn as i64, title as *u8, tn as i64, o as *Options,
+             q as *Request) as i32 {
+    return _ask(c, dest, "SaveFile", 1, parent, pn, title, tn, o, q);
+}
+
+// Done with q: no longer listened for, and its dialog closed when still open
+// (CANCELLED then).
+fn close(q as *Request) as void {
+    if (cast(i64, q.c) == 0) { return; }
+    if (q.state == WAITING && q.matched > 0) {
+        let is dbus.message.Message as m with mut = dbus.message.method_call(q.dest, cast(*u8, &q.path), REQUEST, "Close");
+        dbus.conn.body(q.c);
+        let is dbus.message.Message as rep with mut = dbus.message.empty();
+        dbus.conn.call_method(q.c, &m, 2000, &rep);
+        q.state = CANCELLED;
+    }
+    _unlisten(q);
+}
+
+// --- The answer ---
+
+fn _keep(q as *Request, s as *u8, n as i64) as void {
+    if (q.n >= MAX_URIS || q.bn + n > URI_BYTES) {
+        q.more = 1;
+        return;
+    }
+    mem.memcpy(cast(*u8, cast(i64, &q.blob) + q.bn), s, n);
+    q.at[q.n] = q.bn;
+    q.len[q.n] = n;
+    q.bn = q.bn + n;
+    q.n = q.n + 1;
+}
+
+// Response(u response, a{sv} results): the URIs and the filter left chosen,
+// taken only when chosen; values of other types skipped.
+fn _response(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *Request as q = cast(*Request, user);
+    if (q.state != WAITING) { return; }
+    if (dbus.message.named(m.signature, "ua{sv}") == 0) {
+        q.state = FAILED;
+        return;
+    }
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    q.response = cast(i32, dbus.wire.get_u32(&r));
+    if (q.response == 1) {
+        q.state = CANCELLED;
+        return;
+    }
+    if (q.response != 0) {
+        q.state = FAILED;
+        return;
+    }
+    let is i64 as n with mut = 0;
+    let is i64 as end = dbus.wire.get_array(&r, 8);
+    while (r.err == 0 && r.pos < end) {
+        dbus.wire.get_struct(&r);
+        let is *u8 as key = dbus.wire.get_string(&r, &n);
+        let is i64 as sn with mut = 0;
+        let is *u8 as sig = dbus.wire.get_variant(&r, &sn);
+        if (r.err != 0) {
+            q.state = FAILED;
+            return;
+        }
+        if (dbus.message.named(key, "uris") == 1 && dbus.message.named(sig, "as") == 1) {
+            let is i64 as e = dbus.wire.get_array(&r, 4);
+            while (r.err == 0 && r.pos < e) {
+                let is *u8 as s = dbus.wire.get_string(&r, &n);
+                if (r.err == 0) { _keep(q, s, n); }
+            }
+        } else if (dbus.message.named(key, "current_filter") == 1 && dbus.message.named(sig, "(sa(us))") == 1) {
+            dbus.wire.get_struct(&r);
+            let is *u8 as s = dbus.wire.get_string(&r, &n);
+            if (r.err == 0 && n <= 64) {
+                mem.memcpy(cast(*u8, &q.filter), s, n);
+                q.filter_len = n;
+            }
+            dbus.wire.skip(&r, "a(us)", 5);
+        } else {
+            dbus.wire.skip(&r, sig, sn);
+        }
+    }
+    if (r.err != 0) {
+        q.state = FAILED;
+        return;
+    }
+    q.state = CHOSEN;
+}
+
+fn count(q as *Request) as i64 { return q.n; }
+
+// URI i, its length into *n; null past the last.
+fn uri(q as *Request, i as i64, n as *i64) as *u8 {
+    if (i < 0 || i >= q.n) {
+        *n = 0;
+        return cast(*u8, 0);
+    }
+    *n = q.len[i];
+    return cast(*u8, cast(i64, &q.blob) + q.at[i]);
+}
+
+fn _hex(c as u8) as i64 {
+    let is i64 as v = cast(i64, c);
+    if (v >= 48 && v <= 57) { return v - 48; }
+    if (v >= 65 && v <= 70) { return v - 55; }
+    if (v >= 97 && v <= 102) { return v - 87; }
+    return 0 - 1;
+}
+
+// URI i as a path into out, cap bytes, its escapes undone; how many bytes —
+// 0 when it is no file:// URI of this machine, an escape is broken or a zero,
+// or it does not fit.
+fn path(q as *Request, i as i64, out as *u8, cap as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is *u8 as s = uri(q, i, &n);
+    if (n < 8 || mem.core.memcmp(s, "file://", 7) != 0) { return 0; }
+    // The host: none, or this machine's own name for itself.
+    let is i64 as h with mut = 7;
+    while (h < n && s[h] != cast(u8, 47)) { h = h + 1; }
+    if (h > 7 && (h != 16 || mem.core.memcmp(_at(s, 7), "localhost", 9) != 0)) { return 0; }
+    if (h >= n) { return 0; }
+    let is i64 as k with mut = 0;
+    let is i64 as j with mut = h;
+    while (j < n) {
+        let is u8 as ch with mut = s[j];
+        j = j + 1;
+        if (ch == cast(u8, 37)) {
+            if (j + 1 >= n) { return 0; }
+            let is i64 as hi = _hex(s[j]);
+            let is i64 as lo = _hex(s[j + 1]);
+            if (hi < 0 || lo < 0 || hi * 16 + lo == 0) { return 0; }
+            ch = cast(u8, hi * 16 + lo);
+            j = j + 2;
+        }
+        if (k >= cap) { return 0; }
+        out[k] = ch;
+        k = k + 1;
+    }
+    return k;
+}
+
+// The filter left chosen, as an index into o's; -1 when none was said, or it
+// is none of o's.
+fn filter_index(q as *Request, o as *Options) as i64 {
+    if (q.filter_len == 0) { return 0 - 1; }
+    let is i64 as k with mut = 0;
+    while (k < o.nf) {
+        if (o.fname_len[k] == q.filter_len && mem.core.memcmp(o.fname[k], cast(*u8, &q.filter), q.filter_len) == 0) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}

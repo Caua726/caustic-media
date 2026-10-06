@@ -32,7 +32,7 @@ window/
   native.cst      native handle accessors — the public contract
 
   x11/      done — 8 modules over bind/, see x11/x11.md
-  linux/    what every Linux backend shares: GTK's settings.ini, the portal
+  linux/    what every Linux backend shares: GTK's settings.ini, the portals
   wayland/  protocol.cst  + backend.cst      see wayland/wayland.md
   kms/      drm.cst       + backend.cst      see kms/kms.md
   win32/    user32.cst gdi32.cst + backend.cst   see win32/win32.md
@@ -394,6 +394,21 @@ the pump hands every event to the watcher first, since the daemon's window and
 the root belong to no window here. The portal needs a D-Bus connection, so it
 is read by whoever holds one (the toolkit). The Windows registry comes with
 the Win32 backend, whose WM_SETTINGCHANGE is a window message.
+
+**The desktop's file chooser** (`linux/filechooser.cst`): files to open or
+save to, or a folder, asked of org.freedesktop.portal.FileChooser over D-Bus,
+so the dialog is the desktop's own under X11 and Wayland alike, and the way
+out for a sandboxed program. Asking returns at once; the answer comes as a
+Response signal on the request's object while the program dispatches the
+connection. That object's path is made from our unique name and a token we
+choose, so it is listened to before asking and an answer given at once is
+heard; a portal older than handle_token names its own, listened to then.
+The answer keeps the URIs chosen — `path()` undoes a file:// one's escapes —
+and the filter left chosen; `close()` stops listening and closes a dialog
+still open. Tested against a fake portal on a private bus answering later,
+at once, on its own path, or never (`portal_files_test`); asked of this
+desktop's own by hand with `linux/filechooser_check.cst`. Our own chooser is
+`../ui/widgets/filechooser.cst`; Windows' comes with the Win32 backend.
 
 **Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
 the system's and the user's font directories, and where the font index is

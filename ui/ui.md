@@ -328,8 +328,8 @@ windows on one connection (`window/x11/multi_test.cst`), which is what this
 needs.
 
 Dialogs are windows with a modal flag and a result. The file dialog is our own
-first; the XDG desktop portal on Linux and the system dialog on Windows come
-later, because users expect their own.
+first; the XDG desktop portal on Linux (`window/linux/filechooser.cst`) and the
+system dialog on Windows give users their own.
 
 Clipboard and drag-and-drop come from `window/`, where the X11 side is already
 done.
