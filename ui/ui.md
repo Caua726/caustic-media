@@ -1105,6 +1105,22 @@ of what it holds — on a press, Space, Enter, Down or its mnemonic, a menu
 opened by the keys with its first item chosen. Drawn pressed while open;
 told as a button that expands, expanded while open.
 
+**Dialogs** (`widgets/dialog.cst`, tested by `dialog_test`): a titled frame
+holding what the program puts in it above a row of buttons, one per answer.
+Until `window/` opens dialog windows of their own it is drawn in the middle
+of the window, on a layer above it. Modal, the window behind is dimmed and
+the dialog is the router's modal scope — presses outside go nowhere, the
+window's shortcuts wait; not modal, the window goes on. The buttons stand in
+the platform's order (`set_order`): the affirmative answers last at the end,
+as GNOME and macOS have them, or first, as Windows does, Help at the start,
+all mirrored right to left. The default answer's button is in the accent,
+has the focus when nothing in the dialog takes it, and answers Enter; Escape
+answers CANCEL. A check (`set_check`) looks at an answer first and can keep
+the dialog shown — how a file chooser refuses Open with nothing chosen. An
+answer hides the dialog, then ACTIVATED says it. `message()` makes a message
+box: an icon for information, a warning, an error or a question beside its
+text, and a set of buttons. Told as a dialog, a message box as an alert.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
@@ -1136,7 +1152,8 @@ widget set applications actually use, done properly, not parity.
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
    *Scroll areas, tabs, splitters, stacks and assistants, expanders, toolbars,
    status bars, header bars, menus and menu bars, lists, trees, tables, combo
-   boxes, popovers and menu buttons done; dialogs next.*
+   boxes, popovers, menu buttons, dialogs and message boxes done; the file
+   chooser next.*
 7. **The accessibility bridges**, AT-SPI first.
 
 ## Not now, and deliberately

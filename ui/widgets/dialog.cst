@@ -1,0 +1,596 @@
+// ui/widgets/dialog.cst — a question put to the user, with buttons to answer.
+//
+// A dialog is a titled frame with what the program puts in it (content())
+// above a row of buttons, each standing for an answer — a response. Until
+// window/ can open dialogs as windows of their own, it is drawn inside the
+// window, in its middle, on a layer above it, as menus and popups are.
+// Shown modal, the window behind it is dimmed and its input is the dialog's
+// (the router's modal scope): presses outside go nowhere, the window's own
+// shortcuts wait. Shown not modal, the window goes on as before. Either way
+// the focus goes to the first of what it holds that takes it, and back where
+// it was when it hides.
+//
+// The buttons stand in the platform's order (set_order): the affirmative
+// answers — OK, Yes, Apply, the program's own past USER — last at the end, as
+// GNOME and macOS have them, or first, as Windows does; the negative ones —
+// Cancel, No, Close — before or after them; Help at the start. Everything
+// mirrors in right to left. The default answer's button is drawn in the
+// accent, has the focus when nothing the dialog holds takes it, and answers
+// Enter (an entry passes Enter on when it activates the
+// default, entry.set_activates_default); Escape answers CANCEL. An answer
+// hides the dialog, then ACTIVATED says it, its argument the response, an
+// i64.
+//
+// message() makes a message box: an icon for its kind — information, a
+// warning, an error, a question — beside its text, and a set of buttons.
+// Told as a dialog — modal when shown so — named by its title; a message box
+// as an alert, its text its description.
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../box.cst" as box;
+use "label.cst" as label;
+use "button.cst" as button;
+
+let is i64 as LAYER       with imut = 800;   // under popups and menus a dialog's controls open
+let is i64 as MAX_BUTTONS with imut = 8;
+
+// Responses.
+let is i64 as NONE   with imut = 0;
+let is i64 as OK     with imut = 1;
+let is i64 as CANCEL with imut = 2;
+let is i64 as YES    with imut = 3;
+let is i64 as NO     with imut = 4;
+let is i64 as CLOSE  with imut = 5;
+let is i64 as APPLY  with imut = 6;
+let is i64 as HELP   with imut = 7;
+let is i64 as USER   with imut = 100;   // the program's own, affirmative
+
+// The order of the buttons.
+let is i32 as AFFIRMATIVE_LAST  with imut = 0;   // GNOME, macOS
+let is i32 as AFFIRMATIVE_FIRST with imut = 1;   // Windows
+
+// A message box's kind.
+let is i32 as INFO     with imut = 1;
+let is i32 as WARNING  with imut = 2;
+let is i32 as ERROR    with imut = 3;
+let is i32 as QUESTION with imut = 4;
+
+// A message box's buttons.
+let is i32 as OK_ONLY       with imut = 1;
+let is i32 as OK_CANCEL     with imut = 10;
+let is i32 as YES_NO        with imut = 11;
+let is i32 as YES_NO_CANCEL with imut = 12;
+let is i32 as CLOSE_ONLY    with imut = 13;
+
+struct Data {
+    t          as *tree.Tree;
+    self       as i64;
+    r          as *router.Router;   // while it is shown
+    backdrop   as i64;
+    title      as i64;
+    content    as i64;
+    text       as i64;              // a message box's text; 0 for a dialog
+    icon       as i64;
+    kind       as i32;              // a message box's, 0 for a dialog
+    modal      as i32;
+    shown      as i32;
+    prev_ring  as i32;
+    prev_scope as i64;
+    prev_focus as i64;
+    dflt       as i64;              // the default response, NONE for none
+    nb         as i64;
+    btn        as [8]i64;
+    resp       as [8]i64;
+    check      as CheckFn;          // looks at an answer before it is given; null for none
+    check_user as *u8;
+}
+
+// An answer about to be given: check(user, response) — 1 lets it, 0 keeps
+// the dialog shown, as for a name that is not right yet.
+type CheckFn = fn(*u8, i64) as i32;
+
+struct Icon {
+    kind as i64;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _back_kind with mut;
+let is tree.Kind as _icon_kind with mut;
+let is i32 as _ready with mut = 0;
+let is i32 as _order with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("dialog", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.paint = fn_ptr(_paint);
+    _kind.event = fn_ptr(_event);
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.role = access.ROLE_DIALOG;
+    _kind.access = fn_ptr(_access);
+    _back_kind = widget.kind("dialog backdrop", 0);
+    _back_kind.measure = fn_ptr(_back_measure);
+    _back_kind.paint = fn_ptr(_back_paint);
+    _icon_kind = widget.kind("dialog icon", sizeof(Icon));
+    _icon_kind.measure = fn_ptr(_icon_measure);
+    _icon_kind.arrange = fn_ptr(_icon_arrange);
+    _icon_kind.paint = fn_ptr(_icon_paint);
+    _ready = 1;
+}
+
+// The buttons' order for every dialog from now on.
+fn set_order(order as i32) as void { _order = order; }
+
+// A new dialog titled s, n bytes, hidden, as the last child of the tree's
+// root. Its handle, or 0.
+fn create(t as *tree.Tree, s as *u8, n as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, tree.root(t));
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.title = label.create(t, w, s, n);
+    d.content = box.create(t, w, box.COLUMN);
+    if (d.title == 0 || d.content == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    label.set_style(t, d.title, label.HEADING);
+    tree.set_labelled_by(t, w, d.title);
+    box.set_spacing(t, d.content, 8.0);
+    tree.set_visible(t, w, 0);
+    tree.set_layer(t, w, LAYER);
+    layout.set_align(t, w, layout.CENTER, layout.CENTER);
+    return w;
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    // Destroyed shown, its scope must not outlive it.
+    if (d.shown == 1 && d.modal == 1 && cast(i64, d.r) != 0) { router.set_scope(t, d.r, d.prev_scope); }
+    if (d.backdrop != 0 && tree.is_valid(t, d.backdrop) == 1) { tree.destroy(t, d.backdrop); }
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+// Where the program puts what it asks: a column.
+fn content(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.content;
+}
+
+fn title_label(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.title;
+}
+
+// A message box's text.
+fn text_label(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.text;
+}
+
+fn is_shown(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.shown;
+}
+
+// --- Its buttons ---
+
+fn _clicked(t as *tree.Tree, b as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    let is i64 as k with mut = 0;
+    while (k < d.nb) {
+        if (d.btn[k] == b) {
+            respond(t, d.self, d.resp[k]);
+            return;
+        }
+        k = k + 1;
+    }
+}
+
+// A button titled s — n bytes, an underscore before its mnemonic — standing
+// for response. Its handle, or 0.
+fn add_button(t as *tree.Tree, w as i64, s as *u8, n as i64, response as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.nb >= MAX_BUTTONS) { return 0; }
+    let is i64 as b = button.create(t, w, s, n);
+    if (b == 0) { return 0; }
+    d.btn[d.nb] = b;
+    d.resp[d.nb] = response;
+    d.nb = d.nb + 1;
+    signal.connect(t, b, signal.CLICKED, fn_ptr(_clicked), cast(*u8, d));
+    if (response == d.dflt) { button.set_variant(t, b, button.SUGGESTED); }
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+    return b;
+}
+
+// The button standing for response, 0 for none.
+fn button_for(t as *tree.Tree, w as i64, response as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < d.nb) {
+        if (d.resp[k] == response) { return d.btn[k]; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// The answer Enter gives, its button drawn in the accent.
+fn set_default_response(t as *tree.Tree, w as i64, response as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.dflt = response;
+    let is i64 as b = button_for(t, w, response);
+    if (b != 0) { button.set_variant(t, b, button.SUGGESTED); }
+}
+
+fn _affirmative(response as i64) as i32 {
+    return cast(i32, response == OK || response == YES || response == APPLY || response >= USER);
+}
+
+// --- Shown and hidden ---
+
+// The first in w's subtree that takes the focus, 0 for none.
+fn _first_focusable(t as *tree.Tree, w as i64) as i64 {
+    let is i64 as ch with mut = tree.first_child(t, w);
+    while (ch != 0) {
+        if (tree.is_visible(t, ch) == 1) {
+            if (tree.is_focusable(t, ch) == 1 && tree.is_enabled(t, ch) == 1) { return ch; }
+            let is i64 as inner = _first_focusable(t, ch);
+            if (inner != 0) { return inner; }
+        }
+        ch = tree.next_sibling(t, ch);
+    }
+    return 0;
+}
+
+// Shown in the middle of the window — modal (1), over it dimmed, its input
+// the dialog's — the focus on the first of what it holds.
+fn show(t as *tree.Tree, r as *router.Router, w as i64, modal as i32) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.shown == 1) { return; }
+    d.r = r;
+    d.modal = modal;
+    d.shown = 1;
+    d.prev_scope = router.scope(r);
+    d.prev_focus = router.focused(t, r);
+    d.prev_ring = router.focus_visible(r);
+    tree.set_visible(t, w, 1);
+    if (modal == 1) {
+        if (d.backdrop == 0 || tree.is_valid(t, d.backdrop) == 0) {
+            d.backdrop = tree.create(t, &_back_kind, tree.root(t));
+            if (d.backdrop != 0) { tree.set_layer(t, d.backdrop, LAYER - 1); }
+        }
+        if (d.backdrop != 0) { tree.set_visible(t, d.backdrop, 1); }
+        router.set_scope(t, r, w);
+    }
+    let is i64 as b = button_for(t, w, d.dflt);
+    if (b != 0) { button.set_default(t, r, b); }
+    let is math.rect.Rect as rr = layout.rect(t, tree.root(t));
+    layout.run(t, rr.w, rr.h);
+    // What it holds first; with nothing there to take the focus, the
+    // default's button, so Enter answers with it.
+    let is i64 as first with mut = _first_focusable(t, d.content);
+    if (first == 0) { first = b; }
+    if (first == 0) { first = _first_focusable(t, w); }
+    if (first != 0) { router.focus(t, r, first, 1); }
+    widget.changed(t, tree.root(t), widget.CHANGED_PAINT);
+}
+
+// Hidden, the window's input and the focus given back as they were;
+// nothing said.
+fn hide(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.shown == 0) { return; }
+    d.shown = 0;
+    tree.set_visible(t, w, 0);
+    if (d.backdrop != 0 && tree.is_valid(t, d.backdrop) == 1) { tree.set_visible(t, d.backdrop, 0); }
+    let is *router.Router as r = d.r;
+    if (d.modal == 1) {
+        router.restore(t, r, d.prev_scope, d.prev_focus, d.prev_ring);
+    } else if (d.prev_focus != 0) {
+        router.give_back(t, r, d.prev_focus, d.prev_ring);
+    }
+    widget.changed(t, tree.root(t), widget.CHANGED_PAINT);
+}
+
+// What looks at each answer before it is given.
+fn set_check(t as *tree.Tree, w as i64, cb as CheckFn, user as *u8) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return; }
+    d.check = cb;
+    d.check_user = user;
+}
+
+// Answered with response: hidden, then said — unless its check holds the
+// answer back.
+fn respond(t as *tree.Tree, w as i64, response as i64) as void {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.shown == 0) { return; }
+    if (cast(i64, d.check) != 0 && call(d.check, d.check_user, response) == 0) { return; }
+    hide(t, w);
+    let is i64 as answer = response;
+    signal.emit(t, w, signal.ACTIVATED, cast(*u8, &answer));
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (d.shown == 0) { return 0; }
+    if (e.kind == event.KEY_DOWN && e.key == keys.ESCAPE && e.mods == 0) {
+        respond(t, w, CANCEL);
+        return 1;
+    }
+    // Pressed outside it, modal: nothing; the press is spent.
+    if (e.kind == event.PRESS_OUTSIDE) { return 1; }
+    return 0;
+}
+
+// --- Message boxes ---
+
+// A message box of kind (INFO, WARNING, ERROR, QUESTION) titled s, saying
+// text, with buttons (OK_ONLY, OK_CANCEL, YES_NO, YES_NO_CANCEL,
+// CLOSE_ONLY), the affirmative the default. Hidden; its handle, or 0.
+fn message(t as *tree.Tree, kind as i32, s as *u8, n as i64, text as *u8, tn as i64, buttons as i32) as i64 {
+    let is i64 as w = create(t, s, n);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.kind = kind;
+    let is i64 as row = box.create(t, d.content, box.ROW);
+    box.set_spacing(t, row, 12.0);
+    d.icon = tree.create(t, &_icon_kind, row);
+    if (d.icon != 0) {
+        cast(*Icon, tree.data(t, d.icon)).kind = cast(i64, kind);
+        let is *u8 as glyph with mut = "i";
+        if (kind == WARNING) { glyph = "!"; }
+        if (kind == ERROR) { glyph = "x"; }
+        if (kind == QUESTION) { glyph = "?"; }
+        let is i64 as g = label.create(t, d.icon, glyph, 1);
+        label.set_style(t, g, label.HEADING);
+        layout.set_align(t, d.icon, layout.START, layout.START);
+    }
+    d.text = label.create(t, row, text, tn);
+    label.set_wrap(t, d.text, 1);
+    if (buttons == OK_ONLY) {
+        add_button(t, w, "_OK", 3, OK);
+        set_default_response(t, w, OK);
+    } else if (buttons == OK_CANCEL) {
+        add_button(t, w, "_Cancel", 7, CANCEL);
+        add_button(t, w, "_OK", 3, OK);
+        set_default_response(t, w, OK);
+    } else if (buttons == YES_NO) {
+        add_button(t, w, "_No", 3, NO);
+        add_button(t, w, "_Yes", 4, YES);
+        set_default_response(t, w, YES);
+    } else if (buttons == YES_NO_CANCEL) {
+        add_button(t, w, "_No", 3, NO);
+        add_button(t, w, "_Cancel", 7, CANCEL);
+        add_button(t, w, "_Yes", 4, YES);
+        set_default_response(t, w, YES);
+    } else {
+        add_button(t, w, "_Close", 6, CLOSE);
+        set_default_response(t, w, CLOSE);
+    }
+    return w;
+}
+
+// A message box's icon widget, and the glyph's label on it; 0 for none.
+fn icon_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.icon;
+}
+
+// What dims the window while it is shown modal; 0 until it first is.
+fn backdrop_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.backdrop;
+}
+
+// A message box's icon, in the window; empty for none.
+fn icon_rect(t as *tree.Tree, w as i64) as math.rect.Rect {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || d.icon == 0) { return math.rect.rect_zero(); }
+    return layout.window_rect(t, d.icon);
+}
+
+// --- Measured and arranged ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _pref(t as *tree.Tree, w as i64) as geom.Size {
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, w, &free, &s);
+    return s;
+}
+
+// The buttons side by side, gap apart: how wide, how tall.
+fn _row(t as *tree.Tree, d as *Data, gap as f64, h as *f64) as f64 {
+    let is f64 as x with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < d.nb) {
+        let is geom.Size as s = _pref(t, d.btn[k]);
+        if (k > 0) { x = x + gap; }
+        x = x + s.pref_w;
+        if (s.pref_h > *h) { *h = s.pref_h; }
+        k = k + 1;
+    }
+    return x;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as pad = th.metrics.space_l;
+    let is f64 as gap = th.metrics.space_m;
+    let is geom.Size as ts = _pref(t, d.title);
+    let is geom.Size as cs = _pref(t, d.content);
+    let is f64 as bh with mut = 0.0;
+    let is f64 as bw = _row(t, d, th.metrics.space_s, &bh);
+    geom.size_zero(out);
+    out.pref_w = 2.0 * pad + _max(bw, _max(ts.pref_w, cs.pref_w));
+    out.pref_h = 2.0 * pad + ts.pref_h + gap + cs.pref_h + gap + bh;
+    out.min_w = out.pref_w;
+    out.min_h = out.pref_h;
+    out.max_w = out.pref_w;
+    out.max_h = out.pref_h;
+}
+
+// The title on top, what it holds under it, the buttons at the foot: help at
+// the start, the rest at the end in the platform's order.
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as pad = th.metrics.space_l;
+    let is f64 as gap = th.metrics.space_m;
+    let is f64 as bgap = th.metrics.space_s;
+    let is i32 as rtl = cast(i32, layout.direction(t, w) == layout.RTL);
+    let is f64 as inner = _max(0.0, r.w - 2.0 * pad);
+    let is geom.Size as ts = _pref(t, d.title);
+    let is math.rect.Rect as tr with mut = math.rect.rect(pad, pad, ts.pref_w, ts.pref_h);
+    if (rtl == 1) { tr.x = r.w - pad - ts.pref_w; }
+    layout.place(t, d.title, &tr);
+    let is f64 as bh with mut = 0.0;
+    _row(t, d, bgap, &bh);
+    let is f64 as cy = pad + ts.pref_h + gap;
+    let is math.rect.Rect as cr = math.rect.rect(pad, cy, inner, _max(0.0, r.h - pad - bh - gap - cy));
+    layout.place(t, d.content, &cr);
+    let is f64 as by = r.h - pad - bh;
+    // Help from the start.
+    let is f64 as x0 with mut = pad;
+    let is i64 as k with mut = 0;
+    while (k < d.nb) {
+        if (d.resp[k] == HELP) {
+            let is geom.Size as s = _pref(t, d.btn[k]);
+            _put(t, d.btn[k], x0, by, s.pref_w, bh, r.w, rtl);
+            x0 = x0 + s.pref_w + bgap;
+        }
+        k = k + 1;
+    }
+    // The rest back from the end: the group placed last first.
+    let is f64 as x1 with mut = r.w - pad;
+    let is i32 as pass with mut = 0;
+    while (pass < 2) {
+        // AFFIRMATIVE_LAST: affirmatives at the very end, negatives before.
+        let is i32 as want_aff with mut = 1 - pass;
+        if (_order == AFFIRMATIVE_FIRST) { want_aff = pass; }
+        let is i64 as j with mut = d.nb - 1;
+        while (j >= 0) {
+            if (d.resp[j] != HELP && _affirmative(d.resp[j]) == want_aff) {
+                let is geom.Size as s = _pref(t, d.btn[j]);
+                x1 = x1 - s.pref_w;
+                _put(t, d.btn[j], x1, by, s.pref_w, bh, r.w, rtl);
+                x1 = x1 - bgap;
+            }
+            j = j - 1;
+        }
+        pass = pass + 1;
+    }
+}
+
+// ch at x along the line from the start edge — from the right in right to
+// left — y down, w by h.
+fn _put(t as *tree.Tree, ch as i64, x as f64, y as f64, w as f64, h as f64, across as f64, rtl as i32) as void {
+    let is math.rect.Rect as at with mut = math.rect.rect(x, y, w, h);
+    if (rtl == 1) { at.x = across - x - w; }
+    layout.place(t, ch, &at);
+}
+
+fn _back_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _icon_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    geom.size_zero(out);
+    out.pref_w = 2.0 * th.metrics.indicator;
+    out.pref_h = out.pref_w;
+    out.min_w = out.pref_w;
+    out.min_h = out.pref_h;
+    out.max_w = out.pref_w;
+    out.max_h = out.pref_h;
+}
+
+// Its glyph in its middle.
+fn _icon_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is i64 as g = tree.first_child(t, w);
+    if (g == 0) { return; }
+    let is geom.Size as s = _pref(t, g);
+    let is math.rect.Rect as at = math.rect.rect((r.w - s.pref_w) / 2.0, (r.h - s.pref_h) / 2.0, s.pref_w, s.pref_h);
+    layout.place(t, g, &at);
+}
+
+// --- Drawn ---
+
+// What the window behind a modal dialog is dimmed by.
+fn backdrop_colour(th as *style.Theme) as math.color.Color { return style.with_alpha(th.palette.shadow, 0.35); }
+
+fn _back_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, backdrop_colour(p.theme));
+}
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *style.Theme as th = p.theme;
+    let is math.rect.Rect as rc = p.rect;
+    let is f64 as rad = th.metrics.radius_l;
+    shapes.fill_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.palette.popover_bg);
+    if (th.metrics.border_width > 0.0) {
+        shapes.stroke_rounded(p.canvas, rc.x, rc.y, rc.w, rc.h, rad, rad, rad, rad, th.metrics.border_width, th.palette.border);
+    }
+    p.fg = th.palette.fg;
+}
+
+// A disc in its kind's colour, its glyph over it.
+fn _icon_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Icon as ic = cast(*Icon, data);
+    let is *style.Theme as th = p.theme;
+    let is math.color.Color as col with mut = th.palette.accent;
+    if (ic.kind == cast(i64, WARNING)) { col = th.palette.warning; }
+    if (ic.kind == cast(i64, ERROR)) { col = th.palette.error; }
+    let is math.rect.Rect as rc = p.rect;
+    shapes.fill_circle(p.canvas, rc.x + rc.w / 2.0, rc.y + rc.h / 2.0, rc.w / 2.0, col);
+    p.fg = style.text_on(col);
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        if (d.kind != 0) {
+            q.role = access.ROLE_ALERT;
+            q.description = label.text(t, d.text);
+            q.description_len = label.text_length(t, d.text);
+        }
+        if (d.shown == 1 && d.modal == 1) { q.states = q.states | access.MODAL; }
+    }
+    return 1;
+}
