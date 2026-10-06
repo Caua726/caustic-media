@@ -439,7 +439,9 @@ above it.
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
 with its test): margins, alignment, minimum and maximum, right to left,
 height for width, a pass that skips what did not change, and box, grid, stack
-and overlay — whose size leaves out what is on a layer, so an open popup does
+— as large as its largest page, what is inside a page it does not show counted
+too: only a widget's own hidden flag makes it measure as nothing — and overlay
+— whose size leaves out what is on a layer, so an open popup does
 not make the window fit it. No container has a fixed ceiling on children: they work in a
 scratch area that is part of the tree's mapping, sized from its capacity, and a
 grid too sparse to fit says so with `LAYOUT_TOO_LARGE` instead of dropping
