@@ -1,0 +1,948 @@
+// ui/widgets/fontpicker.cst — a font chosen: its family, its style, its size.
+//
+// A chooser (create) over a font index the program keeps
+// (text/fonts/index.cst) holds: an entry to search the families by; the
+// families in a list, in the index's order, the nameless left out, those
+// with what is typed in their name when something is, letters' case aside;
+// beside it the chosen family's styles — upright by weight, then slanted,
+// then other widths, a variable face's weights at each hundred of its range
+// by their names, a static face's by its own; its size, in logical pixels as
+// the theme's are, in a spin box from 4 to 400; and under them a preview, a
+// line of text in the font chosen. Another family keeps the style nearest
+// the one chosen: the same width, slanted or not, then the nearest weight.
+// At first it is the theme's text, or the first family when the index has
+// not got that one. VALUE_CHANGED says the font changed; family, weight,
+// italic (oblique counted), width and size read it.
+//
+// dialog() makes a dialog holding a chooser, with Cancel and Select;
+// button() a button saying a font — "Family Style Size" — pressed opening
+// such a dialog with it and taking the one selected, VALUE_CHANGED then.
+//
+// Told as a font chooser; its lists named Family and Style by the headings
+// over them, its spin box Size.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../../math/math.cst" as math;
+use "../../text/fonts/index.cst" as index;
+use "../../text/fonts/face.cst" as face;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../model.cst" as model;
+use "../text.cst" as txt;
+use "../../text/layout/model.cst" as tmodel;
+use "label.cst" as label;
+use "entry.cst" as entry;
+use "listview.cst" as listview;
+use "spin.cst" as spin;
+use "button.cst" as button_w;
+use "dialog.cst" as dialog_w;
+
+let is i64 as MAX_STYLES with imut = 64;
+let is f64 as MIN_SIZE   with imut = 4.0;
+let is f64 as MAX_SIZE   with imut = 400.0;
+
+let is *u8 as SAMPLE with imut = "The quick brown fox jumps over the lazy dog";
+
+// A font, as chosen.
+struct Font {
+    family     as [128]u8;   // zero-terminated
+    family_len as i64;
+    weight     as i64;
+    italic     as i32;
+    _pad0      as i32;
+    width      as f64;       // CSS: 100 normal
+    size       as f64;
+}
+
+// One of a family's styles.
+struct Sty {
+    weight as i64;
+    slant  as i64;   // 0 upright, 1 italic, 2 oblique
+    width  as f64;
+    at     as i64;   // its name in the names
+    len    as i64;
+}
+
+// What does not fit a widget's data.
+struct Side {
+    ix       as *index.Index;
+    families as model.Model;
+    nf       as i64;
+    fam      as *i64;      // the families shown, by number in the index
+    fcap     as i64;
+    styles   as model.Model;
+    ns       as i64;
+    sty      as [64]Sty;
+    names    as [2048]u8;
+    nn       as i64;
+    font     as Font;
+    look     as txt.Style;   // the preview's
+}
+
+// The inside of a font button: a label saying the font.
+struct Shown {
+    t     as *tree.Tree;
+    owner as i64;
+    ix    as *index.Index;
+    dlg   as i64;
+    font  as Font;
+}
+
+struct Data {
+    t       as *tree.Tree;
+    self    as i64;
+    ix      as *index.Index;
+    side    as *Side;
+    search  as i64;
+    flist   as i64;
+    slist   as i64;
+    size    as i64;
+    preview as i64;
+    fhead   as i64;
+    shead   as i64;
+    zlabel  as i64;
+    family  as i64;   // the chosen family's number in the index, -1 for none
+    quiet   as i32;   // the lists being set
+    _pad0   as i32;
+}
+
+let is tree.Kind as _kind with mut;
+let is tree.Kind as _shown_kind with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _kind = widget.kind("font chooser", sizeof(Data));
+    _kind.measure = fn_ptr(_measure);
+    _kind.arrange = fn_ptr(_arrange);
+    _kind.destroy = fn_ptr(_destroy);
+    _kind.role = access.ROLE_FONT_CHOOSER;
+    _shown_kind = widget.kind("font shown", sizeof(Shown));
+    _shown_kind.measure = fn_ptr(_shown_measure);
+    _shown_kind.arrange = fn_ptr(_shown_arrange);
+    _shown_kind.destroy = fn_ptr(_shown_destroy);
+    _ready = 1;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_kind)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _fold(c as u8) as u8 {
+    if (c >= cast(u8, 65) && c <= cast(u8, 90)) { return cast(u8, cast(i64, c) + 32); }
+    return c;
+}
+
+// Whether s holds the n bytes at p, letters' case aside.
+fn _holds(s as *u8, p as *u8, n as i64) as i32 {
+    if (n == 0) { return 1; }
+    let is i64 as sn = _len(s);
+    let is i64 as i with mut = 0;
+    while (i + n <= sn) {
+        let is i64 as k with mut = 0;
+        while (k < n && _fold(s[i + k]) == _fold(p[k])) { k = k + 1; }
+        if (k == n) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- Made ---
+
+// A new chooser over ix — the program's, alive as long as it is — as the
+// last child of parent. Its handle, or 0.
+fn create(t as *tree.Tree, parent as i64, ix as *index.Index) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, &_kind, parent);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.t = t;
+    d.self = w;
+    d.ix = ix;
+    d.family = 0 - 1;
+    let is *u8 as p = mem.core.mmap_anon(sizeof(Side));
+    if (cast(i64, p) <= 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    d.side = cast(*Side, p);
+    let is *Side as g = d.side;
+    g.ix = ix;
+    g.fcap = index.family_count(ix);
+    if (g.fcap > 0) {
+        g.fam = cast(*i64, mem.core.mmap_anon(g.fcap * 8));
+        if (cast(i64, g.fam) <= 0) {
+            g.fam = cast(*i64, 0);
+            tree.destroy(t, w);
+            return 0;
+        }
+    }
+    g.families = model.make(p, fn_ptr(_fam_count), fn_ptr(_row_id), fn_ptr(_fam_cell));
+    g.families.index_of = fn_ptr(_index_of);
+    g.styles = model.make(p, fn_ptr(_sty_count), fn_ptr(_sty_row_id), fn_ptr(_sty_cell));
+    g.styles.index_of = fn_ptr(_sty_index_of);
+    // The search first, so the focus comes to it first.
+    d.search = entry.create(t, w);
+    d.fhead = label.create(t, w, "Family", 6);
+    d.shead = label.create(t, w, "Style", 5);
+    d.flist = listview.create(t, w, &g.families);
+    d.slist = listview.create(t, w, &g.styles);
+    d.zlabel = label.create(t, w, "Size", 4);
+    d.size = spin.create(t, w, MIN_SIZE, MAX_SIZE, 1.0);
+    d.preview = label.create(t, w, SAMPLE, _len(SAMPLE));
+    if (d.search == 0 || d.fhead == 0 || d.shead == 0 || d.flist == 0 || d.slist == 0 || d.zlabel == 0 || d.size == 0 ||
+        d.preview == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    entry.set_placeholder(t, d.search, "Search families", 15);
+    label.set_target(t, d.fhead, d.flist);
+    label.set_target(t, d.shead, d.slist);
+    label.set_target(t, d.zlabel, d.size);
+    label.set_lines(t, d.preview, 1, 1);
+    signal.connect(t, d.search, signal.CHANGED, fn_ptr(_searched), cast(*u8, d));
+    signal.connect(t, d.flist, signal.SELECTION_CHANGED, fn_ptr(_family_picked), cast(*u8, d));
+    signal.connect(t, d.slist, signal.SELECTION_CHANGED, fn_ptr(_style_picked), cast(*u8, d));
+    signal.connect(t, d.size, signal.VALUE_CHANGED, fn_ptr(_sized), cast(*u8, d));
+    _filter(t, d);
+    // The theme's text, or the first family there is.
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is i64 as k with mut = _family_named(ix, th.fonts.family, _len(th.fonts.family));
+    if (k < 0 && g.nf > 0) { k = g.fam[0]; }
+    g.font.weight = th.fonts.body.weight;
+    g.font.width = 100.0;
+    g.font.size = th.fonts.body.size;
+    d.quiet = 1;
+    spin.set_value(t, d.size, g.font.size);
+    d.quiet = 0;
+    g.font.size = spin.value(t, d.size);
+    if (k >= 0) { _pick_family(t, d, k, g.font.weight, 0, 100.0); }
+    _show(t, d);
+    return w;
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    if (cast(i64, d.side) == 0) { return; }
+    if (cast(i64, d.side.fam) != 0) { mem.core.munmap(cast(*u8, d.side.fam), d.side.fcap * 8); }
+    mem.core.munmap(cast(*u8, d.side), sizeof(Side));
+}
+
+// The family named s, n bytes, its number in the index; -1 for none.
+fn _family_named(ix as *index.Index, s as *u8, n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < index.family_count(ix)) {
+        let is *u8 as f = index.family_name(ix, k);
+        if (f[0] != 0 && _len(f) == n && mem.core.memcmp(f, s, n) == 0) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// --- The families' model ---
+
+fn _fam_count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Side, self).nf;
+}
+
+fn _row_id(self as *u8, parent as i64, i as i64) as i64 {
+    if (parent != 0 || i < 0 || i >= cast(*Side, self).nf) { return 0; }
+    return i + 1;
+}
+
+fn _index_of(self as *u8, id as i64) as i64 {
+    if (id < 1 || id > cast(*Side, self).nf) { return 0 - 1; }
+    return id - 1;
+}
+
+fn _fam_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    let is *Side as g = cast(*Side, self);
+    let is i64 as i = id - 1;
+    if (i < 0 || i >= g.nf || column != 0 || role != model.TEXT) { return 0; }
+    let is *u8 as s = index.family_name(g.ix, g.fam[i]);
+    *out = model.text(s, _len(s));
+    return 1;
+}
+
+// The families whose names hold what is typed, the chosen one chosen.
+fn _filter(t as *tree.Tree, d as *Data) as void {
+    let is *Side as g = d.side;
+    let is *u8 as q = entry.text(t, d.search);
+    let is i64 as qn = entry.length(t, d.search);
+    g.nf = 0;
+    let is i64 as k with mut = 0;
+    while (k < index.family_count(d.ix)) {
+        let is *u8 as f = index.family_name(d.ix, k);
+        if (f[0] != 0 && _holds(f, q, qn) == 1) {
+            g.fam[g.nf] = k;
+            g.nf = g.nf + 1;
+        }
+        k = k + 1;
+    }
+    d.quiet = 1;
+    model.reset(&g.families);
+    _mark_family(t, d);
+    d.quiet = 0;
+}
+
+fn _mark_family(t as *tree.Tree, d as *Data) as void {
+    let is *Side as g = d.side;
+    let is i64 as i with mut = 0;
+    while (i < g.nf) {
+        if (g.fam[i] == d.family) {
+            d.quiet = 1;
+            listview.go_to(t, d.flist, i);
+            d.quiet = 0;
+            return;
+        }
+        i = i + 1;
+    }
+    d.quiet = 1;
+    listview.unselect_all(t, d.flist);
+    d.quiet = 0;
+}
+
+fn _searched(t as *tree.Tree, e as i64, arg as *u8, user as *u8) as void { _filter(t, cast(*Data, user)); }
+
+// --- Styles ---
+
+fn _sty_count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return cast(*Side, self).ns;
+}
+
+fn _sty_row_id(self as *u8, parent as i64, i as i64) as i64 {
+    if (parent != 0 || i < 0 || i >= cast(*Side, self).ns) { return 0; }
+    return i + 1;
+}
+
+fn _sty_index_of(self as *u8, id as i64) as i64 {
+    if (id < 1 || id > cast(*Side, self).ns) { return 0 - 1; }
+    return id - 1;
+}
+
+fn _sty_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    let is *Side as g = cast(*Side, self);
+    let is i64 as i = id - 1;
+    if (i < 0 || i >= g.ns || column != 0 || role != model.TEXT) { return 0; }
+    *out = model.text(cast(*u8, cast(i64, &g.names) + g.sty[i].at), g.sty[i].len);
+    return 1;
+}
+
+fn _weight_name(w as i64) as *u8 {
+    if (w == 100) { return "Thin"; }
+    if (w == 200) { return "Extra Light"; }
+    if (w == 300) { return "Light"; }
+    if (w == 500) { return "Medium"; }
+    if (w == 600) { return "Semi Bold"; }
+    if (w == 700) { return "Bold"; }
+    if (w == 800) { return "Extra Bold"; }
+    if (w == 900) { return "Black"; }
+    return "Regular";
+}
+
+fn _put(g as *Side, s as *u8, n as i64) as void {
+    if (g.nn + n > 2048) { return; }
+    mem.memcpy(cast(*u8, cast(i64, &g.names) + g.nn), s, n);
+    g.nn = g.nn + n;
+}
+
+// A style added, named by the face (s, n bytes) or, when s is null, by its
+// weight and slant.
+fn _add(g as *Side, weight as i64, slant as i64, width as f64, s as *u8, n as i64) as void {
+    if (g.ns >= MAX_STYLES) { return; }
+    let is *Sty as y = &g.sty[g.ns];
+    y.weight = weight;
+    y.slant = slant;
+    y.width = width;
+    y.at = g.nn;
+    if (cast(i64, s) != 0) {
+        _put(g, s, n);
+    } else if (slant != 0 && weight == 400) {
+        if (slant == 1) { _put(g, "Italic", 6); } else { _put(g, "Oblique", 7); }
+    } else {
+        let is *u8 as wn = _weight_name(weight);
+        _put(g, wn, _len(wn));
+        if (slant == 1) { _put(g, " Italic", 7); }
+        if (slant == 2) { _put(g, " Oblique", 8); }
+    }
+    y.len = g.nn - y.at;
+    g.ns = g.ns + 1;
+}
+
+// Whether a comes before b: normal width first, then by width; upright,
+// then slanted; then by weight; italic before oblique.
+fn _before(a as *Sty, b as *Sty) as i32 {
+    let is i32 as an = cast(i32, a.width != 100.0);
+    let is i32 as bn = cast(i32, b.width != 100.0);
+    if (an != bn) { return cast(i32, an < bn); }
+    if (a.width != b.width) { return cast(i32, a.width < b.width); }
+    let is i32 as asl = cast(i32, a.slant != 0);
+    let is i32 as bsl = cast(i32, b.slant != 0);
+    if (asl != bsl) { return cast(i32, asl < bsl); }
+    if (a.weight != b.weight) { return cast(i32, a.weight < b.weight); }
+    return cast(i32, a.slant < b.slant);
+}
+
+// The family's styles, sorted, those that say the same — slanted or not at
+// one width and weight — once.
+fn _styles_of(g as *Side, k as i64) as void {
+    g.ns = 0;
+    g.nn = 0;
+    let is index.Run as run = index.family_run(g.ix, k);
+    let is i64 as i with mut = 0;
+    while (i < run.n) {
+        let is *face.Desc as f = index.desc(g.ix, run.faces[i]);
+        let is f64 as width with mut = f.width_lo;
+        if (f.width_lo <= 100.0 && f.width_hi >= 100.0) { width = 100.0; }
+        let is i64 as lo = cast(i64, f.weight_lo);
+        let is i64 as hi = cast(i64, f.weight_hi);
+        let is i32 as ranged = cast(i32, (f.flags & face.VARIABLE) != 0 && hi > lo);
+        let is i64 as slants with mut = 0;
+        if ((f.styles & face.CAN_NORMAL) != 0) { slants = slants + 1; }
+        if ((f.styles & (face.CAN_ITALIC | face.CAN_OBLIQUE)) != 0) { slants = slants + 1; }
+        let is i32 as named = cast(i32, ranged == 0 && slants == 1);
+        let is i64 as slant with mut = 0;
+        while (slant < 3) {
+            let is i32 as has with mut = 0;
+            if (slant == 0) { has = cast(i32, (f.styles & face.CAN_NORMAL) != 0); }
+            if (slant == 1) { has = cast(i32, (f.styles & face.CAN_ITALIC) != 0); }
+            // Oblique only where there is no italic.
+            if (slant == 2) { has = cast(i32, (f.styles & face.CAN_OBLIQUE) != 0 && (f.styles & face.CAN_ITALIC) == 0); }
+            if (has == 1) {
+                if (ranged == 1) {
+                    let is i64 as wgt with mut = ((lo + 99) / 100) * 100;
+                    if (wgt < 100) { wgt = 100; }
+                    while (wgt <= hi && wgt <= 900) {
+                        _add(g, wgt, slant, width, cast(*u8, 0), 0);
+                        wgt = wgt + 100;
+                    }
+                } else if (named == 1) {
+                    let is *u8 as sn = index.text(g.ix, f.style);
+                    _add(g, lo, slant, width, sn, _len(sn));
+                } else {
+                    _add(g, lo, slant, width, cast(*u8, 0), 0);
+                }
+            }
+            slant = slant + 1;
+        }
+        i = i + 1;
+    }
+    // Sorted by insertion: a few dozen at most.
+    let is i64 as a with mut = 1;
+    while (a < g.ns) {
+        let is Sty as y = g.sty[a];
+        let is i64 as b with mut = a;
+        while (b > 0 && _before(&y, &g.sty[b - 1]) == 1) {
+            g.sty[b] = g.sty[b - 1];
+            b = b - 1;
+        }
+        g.sty[b] = y;
+        a = a + 1;
+    }
+    // Those saying the same as the one before: left out.
+    let is i64 as n with mut = 0;
+    a = 0;
+    while (a < g.ns) {
+        let is *Sty as y = &g.sty[a];
+        let is i32 as dup with mut = 0;
+        if (n > 0) {
+            let is *Sty as p = &g.sty[n - 1];
+            dup = cast(i32, p.width == y.width && p.weight == y.weight && (p.slant != 0) == (y.slant != 0));
+        }
+        if (dup == 0) {
+            g.sty[n] = *y;
+            n = n + 1;
+        }
+        a = a + 1;
+    }
+    g.ns = n;
+}
+
+// The style nearest weight, slanted or not, at width: -1 for none.
+fn _nearest(g as *Side, weight as i64, italic as i32, width as f64) as i64 {
+    let is i64 as best with mut = 0 - 1;
+    let is f64 as cost with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < g.ns) {
+        let is *Sty as y = &g.sty[i];
+        let is f64 as c with mut = cast(f64, y.weight - weight);
+        if (c < 0.0) { c = 0.0 - c; }
+        if (cast(i32, y.slant != 0) != italic) { c = c + 1000.0; }
+        if (y.width != width) { c = c + 10000.0; }
+        if (best < 0 || c < cost) {
+            best = i;
+            cost = c;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// --- Choosing ---
+
+fn _take(g as *Side, i as i64) as void {
+    g.font.weight = g.sty[i].weight;
+    g.font.italic = cast(i32, g.sty[i].slant != 0);
+    g.font.width = g.sty[i].width;
+}
+
+// Family k chosen in g, with its style nearest these: which, -1 for none.
+fn _choose_in(g as *Side, k as i64, weight as i64, italic as i32, width as f64) as i64 {
+    let is *u8 as f = index.family_name(g.ix, k);
+    let is i64 as n with mut = _len(f);
+    if (n > 127) { n = 127; }
+    mem.memcpy(cast(*u8, &g.font.family), f, n);
+    g.font.family[n] = cast(u8, 0);
+    g.font.family_len = n;
+    _styles_of(g, k);
+    let is i64 as s = _nearest(g, weight, italic, width);
+    if (s >= 0) { _take(g, s); }
+    return s;
+}
+
+fn _pick_family(t as *tree.Tree, d as *Data, k as i64, weight as i64, italic as i32, width as f64) as void {
+    let is *Side as g = d.side;
+    d.family = k;
+    let is i64 as s = _choose_in(g, k, weight, italic, width);
+    d.quiet = 1;
+    model.reset(&g.styles);
+    if (s >= 0) { listview.go_to(t, d.slist, s); }
+    d.quiet = 0;
+    _mark_family(t, d);
+}
+
+// The preview in the font chosen.
+fn _show(t as *tree.Tree, d as *Data) as void {
+    let is *Side as g = d.side;
+    g.look.family = cast(*u8, &g.font.family);
+    g.look.size = g.font.size;
+    g.look.weight = g.font.weight;
+    g.look.italic = g.font.italic;
+    g.look.underline = 0;
+    g.look.strike = 0;
+    g.look.color = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+    label.set_spans(t, d.preview, &g.look, 1, cast(*tmodel.Span, 0), 0);
+}
+
+fn _said(t as *tree.Tree, d as *Data) as void {
+    _show(t, d);
+    widget.changed(t, d.self, widget.CHANGED_LAYOUT);
+    signal.emit(t, d.self, signal.VALUE_CHANGED, cast(*u8, &d.side.font));
+}
+
+fn _family_picked(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (d.quiet == 1) { return; }
+    let is i64 as i = listview.next_selected(t, l, 0);
+    if (i < 0 || i >= d.side.nf || d.side.fam[i] == d.family) { return; }
+    let is *Side as g = d.side;
+    _pick_family(t, d, g.fam[i], g.font.weight, g.font.italic, g.font.width);
+    _said(t, d);
+}
+
+fn _style_picked(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (d.quiet == 1) { return; }
+    let is i64 as i = listview.next_selected(t, l, 0);
+    if (i < 0 || i >= d.side.ns) { return; }
+    _take(d.side, i);
+    _said(t, d);
+}
+
+fn _sized(t as *tree.Tree, s as i64, arg as *u8, user as *u8) as void {
+    let is *Data as d = cast(*Data, user);
+    if (d.quiet == 1) { return; }
+    d.side.font.size = *cast(*f64, arg);
+    _said(t, d);
+}
+
+// The font from now on: the family named s, n bytes, its style nearest
+// weight and italic, size held to 4 to 400; said. 1, or 0 when there is no
+// such family or w is no chooser.
+fn set_font(t as *tree.Tree, w as i64, s as *u8, n as i64, weight as i64, italic as i32, size as f64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    let is i64 as k = _family_named(d.ix, s, n);
+    if (k < 0) { return 0; }
+    _pick_family(t, d, k, weight, italic, 100.0);
+    d.quiet = 1;
+    spin.set_value(t, d.size, size);
+    d.quiet = 0;
+    d.side.font.size = spin.value(t, d.size);
+    _said(t, d);
+    return 1;
+}
+
+fn family(t as *tree.Tree, w as i64) as *u8 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return cast(*u8, 0); }
+    return cast(*u8, &d.side.font.family);
+}
+
+fn family_length(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.side.font.family_len;
+}
+
+fn weight(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.side.font.weight;
+}
+
+fn italic(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.side.font.italic;
+}
+
+fn width(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return d.side.font.width;
+}
+
+fn size(t as *tree.Tree, w as i64) as f64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0.0; }
+    return d.side.font.size;
+}
+
+// The font as a whole into out: 1, or 0 for no chooser.
+fn font(t as *tree.Tree, w as i64, out as *Font) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    *out = d.side.font;
+    return 1;
+}
+
+// The chosen style's name, n bytes into *n; null for none.
+fn style_name(t as *tree.Tree, w as i64, n as *i64) as *u8 {
+    *n = 0;
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return cast(*u8, 0); }
+    return _style_name(d.side, n);
+}
+
+fn _style_name(g as *Side, n as *i64) as *u8 {
+    let is i64 as i = _nearest(g, g.font.weight, g.font.italic, g.font.width);
+    if (i < 0) { return cast(*u8, 0); }
+    *n = g.sty[i].len;
+    return cast(*u8, cast(i64, &g.names) + g.sty[i].at);
+}
+
+// --- Its parts ---
+
+fn search_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.search;
+}
+
+fn families_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.flist;
+}
+
+fn styles_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.slist;
+}
+
+fn size_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.size;
+}
+
+fn preview_of(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.preview;
+}
+
+// --- Laid out ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _pref(t as *tree.Tree, w as i64) as geom.Size {
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, w, &free, &s);
+    return s;
+}
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as g = th.metrics.space_s;
+    let is f64 as fixed = _pref(t, d.search).pref_h + g + _pref(t, d.fhead).pref_h + g + g +
+                          _max(_pref(t, d.size).pref_h, _pref(t, d.zlabel).pref_h) + g + _pref(t, d.preview).pref_h;
+    geom.size_zero(out);
+    out.pref_w = 480.0;
+    out.pref_h = fixed + 240.0;
+    out.min_w = 240.0;
+    out.min_h = fixed + 80.0;
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _place(t as *tree.Tree, ch as i64, x as f64, y as f64, w as f64, h as f64, across as f64, rtl as i32) as void {
+    let is math.rect.Rect as at with mut = math.rect.rect(x, y, w, h);
+    if (rtl == 1) { at.x = across - x - w; }
+    layout.place(t, ch, &at);
+}
+
+// The search across the top; the families and their headings, then the
+// styles beside them; the size; the preview at the foot.
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as g = th.metrics.space_s;
+    let is i32 as rtl = cast(i32, layout.direction(t, w) == layout.RTL);
+    let is f64 as eh = _pref(t, d.search).pref_h;
+    _place(t, d.search, 0.0, 0.0, r.w, eh, r.w, rtl);
+    let is f64 as fw = fm.floor((r.w - g) * 0.6);
+    let is f64 as sw = _max(0.0, r.w - g - fw);
+    let is f64 as hh = _pref(t, d.fhead).pref_h;
+    let is f64 as y = eh + g;
+    _place(t, d.fhead, 0.0, y, fw, hh, r.w, rtl);
+    _place(t, d.shead, fw + g, y, sw, hh, r.w, rtl);
+    let is f64 as ph = _pref(t, d.preview).pref_h;
+    let is geom.Size as zs = _pref(t, d.size);
+    let is geom.Size as ls = _pref(t, d.zlabel);
+    let is f64 as zh = _max(zs.pref_h, ls.pref_h);
+    let is f64 as py = r.h - ph;
+    let is f64 as zy = py - g - zh;
+    let is f64 as ly = y + hh + g;
+    let is f64 as lh = _max(0.0, zy - g - ly);
+    _place(t, d.flist, 0.0, ly, fw, lh, r.w, rtl);
+    _place(t, d.slist, fw + g, ly, sw, lh, r.w, rtl);
+    _place(t, d.zlabel, 0.0, zy + (zh - ls.pref_h) / 2.0, ls.pref_w, ls.pref_h, r.w, rtl);
+    _place(t, d.size, ls.pref_w + g, zy + (zh - zs.pref_h) / 2.0, zs.pref_w, zs.pref_h, r.w, rtl);
+    _place(t, d.preview, 0.0, py, r.w, ph, r.w, rtl);
+}
+
+// --- In a dialog ---
+
+// A new dialog titled s, n bytes, holding a chooser over ix, with Cancel and
+// Select; hidden. Its handle, or 0.
+fn dialog(t as *tree.Tree, s as *u8, n as i64, ix as *index.Index) as i64 {
+    _init();
+    let is i64 as dlg = dialog_w.create(t, s, n);
+    if (dlg == 0) { return 0; }
+    if (create(t, dialog_w.content(t, dlg), ix) == 0) {
+        tree.destroy(t, dlg);
+        return 0;
+    }
+    dialog_w.add_button(t, dlg, "_Cancel", 7, dialog_w.CANCEL);
+    dialog_w.add_button(t, dlg, "_Select", 7, dialog_w.OK);
+    dialog_w.set_default_response(t, dlg, dialog_w.OK);
+    return dlg;
+}
+
+fn chooser_of(t as *tree.Tree, dlg as i64) as i64 {
+    let is i64 as c = dialog_w.content(t, dlg);
+    if (c == 0) { return 0; }
+    let is i64 as w = tree.first_child(t, c);
+    if (cast(i64, _data(t, w)) == 0) { return 0; }
+    return w;
+}
+
+// --- Behind a button ---
+
+fn _shown(t as *tree.Tree, b as i64) as *Shown {
+    if (tree.is_valid(t, b) == 0) { return cast(*Shown, 0); }
+    let is i64 as w = button_w.content(t, b);
+    if (w == 0 || cast(i64, tree.kind(t, w)) != cast(i64, &_shown_kind)) { return cast(*Shown, 0); }
+    return cast(*Shown, tree.data(t, w));
+}
+
+// A new button saying a font over ix — the theme's text until set — as the
+// last child of parent. Its handle, or 0.
+fn button(t as *tree.Tree, parent as i64, ix as *index.Index) as i64 {
+    _init();
+    let is i64 as b = button_w.create_holding(t, parent);
+    if (b == 0) { return 0; }
+    let is i64 as w = tree.create(t, &_shown_kind, b);
+    if (w == 0 || label.create(t, w, "", 0) == 0) {
+        tree.destroy(t, b);
+        return 0;
+    }
+    button_w.set_content(t, b, w);
+    tree.set_labelled_by(t, b, tree.first_child(t, w));
+    let is *Shown as sd = cast(*Shown, tree.data(t, w));
+    sd.t = t;
+    sd.owner = b;
+    sd.ix = ix;
+    let is style.Theme as th;
+    widget.theme(t, b, &th);
+    let is i64 as n = _len(th.fonts.family);
+    if (n < 128) {
+        mem.memcpy(cast(*u8, &sd.font.family), th.fonts.family, n);
+        sd.font.family_len = n;
+    }
+    sd.font.weight = th.fonts.body.weight;
+    sd.font.width = 100.0;
+    sd.font.size = th.fonts.body.size;
+    signal.connect(t, b, signal.CLICKED, fn_ptr(_pressed), cast(*u8, sd));
+    _say(t, sd, "Regular", 7);
+    return b;
+}
+
+fn button_label(t as *tree.Tree, b as i64) as i64 {
+    let is *Shown as sd = _shown(t, b);
+    if (cast(i64, sd) == 0) { return 0; }
+    return tree.first_child(t, button_w.content(t, b));
+}
+
+fn button_dialog(t as *tree.Tree, b as i64) as i64 {
+    let is *Shown as sd = _shown(t, b);
+    if (cast(i64, sd) == 0) { return 0; }
+    return sd.dlg;
+}
+
+fn button_font(t as *tree.Tree, b as i64, out as *Font) as i32 {
+    let is *Shown as sd = _shown(t, b);
+    if (cast(i64, sd) == 0) { return 0; }
+    *out = sd.font;
+    return 1;
+}
+
+// The size as written: whole, or to a tenth.
+fn _size_text(v as f64, out as *u8) as i64 {
+    let is i64 as tenths = cast(i64, fm.floor(v * 10.0 + 0.5));
+    let is [24]u8 as tmp;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = tenths / 10;
+    if (x == 0) {
+        tmp[0] = cast(u8, 48);
+        n = 1;
+    }
+    while (x > 0) {
+        tmp[n] = cast(u8, 48 + x % 10);
+        n = n + 1;
+        x = x / 10;
+    }
+    let is i64 as k with mut = 0;
+    while (n > 0) {
+        n = n - 1;
+        out[k] = tmp[n];
+        k = k + 1;
+    }
+    if (tenths % 10 != 0) {
+        out[k] = cast(u8, 46);
+        out[k + 1] = cast(u8, 48 + tenths % 10);
+        k = k + 2;
+    }
+    return k;
+}
+
+// "Family Style Size" on the button.
+fn _say(t as *tree.Tree, sd as *Shown, st as *u8, sn as i64) as void {
+    let is [256]u8 as b;
+    let is i64 as k with mut = sd.font.family_len;
+    mem.memcpy(cast(*u8, &b), cast(*u8, &sd.font.family), k);
+    b[k] = cast(u8, 32);
+    k = k + 1;
+    if (sn > 0 && sn < 96) {
+        mem.memcpy(cast(*u8, cast(i64, &b) + k), st, sn);
+        k = k + sn;
+        b[k] = cast(u8, 32);
+        k = k + 1;
+    }
+    k = k + _size_text(sd.font.size, cast(*u8, cast(i64, &b) + k));
+    label.set_text(t, tree.first_child(t, button_w.content(t, sd.owner)), cast(*u8, &b), k);
+}
+
+// Its font from now on: the family named s, n bytes, the style nearest weight
+// and italic, at size; not said. 1, or 0 for no such family, or no font
+// button.
+fn set_button_font(t as *tree.Tree, b as i64, s as *u8, n as i64, weight as i64, italic as i32, size as f64) as i32 {
+    let is *Shown as sd = _shown(t, b);
+    if (cast(i64, sd) == 0) { return 0; }
+    let is i64 as k = _family_named(sd.ix, s, n);
+    if (k < 0) { return 0; }
+    // The family's styles, as a chooser would list them.
+    let is *Side as g = cast(*Side, mem.core.mmap_anon(sizeof(Side)));
+    if (cast(i64, g) <= 0) { return 0; }
+    g.ix = sd.ix;
+    _choose_in(g, k, weight, italic, 100.0);
+    g.font.size = size;
+    if (g.font.size < MIN_SIZE) { g.font.size = MIN_SIZE; }
+    if (g.font.size > MAX_SIZE) { g.font.size = MAX_SIZE; }
+    sd.font = g.font;
+    let is i64 as sn with mut = 0;
+    let is *u8 as st = _style_name(g, &sn);
+    _say(t, sd, st, sn);
+    mem.core.munmap(cast(*u8, g), sizeof(Side));
+    return 1;
+}
+
+fn _take_from(t as *tree.Tree, sd as *Shown, w as i64) as void {
+    font(t, w, &sd.font);
+    let is i64 as sn with mut = 0;
+    let is *u8 as st = style_name(t, w, &sn);
+    _say(t, sd, st, sn);
+}
+
+fn _dialog_for(t as *tree.Tree, sd as *Shown) as i64 {
+    if (sd.dlg == 0 || tree.is_valid(t, sd.dlg) == 0) {
+        sd.dlg = dialog(t, "Choose a Font", 13, sd.ix);
+        if (sd.dlg == 0) { return 0; }
+        signal.connect(t, sd.dlg, signal.ACTIVATED, fn_ptr(_answered), cast(*u8, sd));
+    }
+    return sd.dlg;
+}
+
+fn _pressed(t as *tree.Tree, b as i64, arg as *u8, user as *u8) as void {
+    let is *Shown as sd = cast(*Shown, user);
+    let is i64 as dlg = _dialog_for(t, sd);
+    if (dlg == 0) { return; }
+    let is i64 as w = chooser_of(t, dlg);
+    set_font(t, w, cast(*u8, &sd.font.family), sd.font.family_len, sd.font.weight, sd.font.italic, sd.font.size);
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) != 0) { dialog_w.show(t, r, dlg, 1); }
+}
+
+fn _answered(t as *tree.Tree, dlg as i64, arg as *u8, user as *u8) as void {
+    let is *Shown as sd = cast(*Shown, user);
+    if (*cast(*i64, arg) != dialog_w.OK) { return; }
+    _take_from(t, sd, chooser_of(t, dlg));
+    signal.emit(t, sd.owner, signal.VALUE_CHANGED, cast(*u8, &sd.font));
+}
+
+fn _shown_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    layout.measure(t, tree.first_child(t, w), c, out);
+}
+
+fn _shown_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is math.rect.Rect as all = math.rect.rect(0.0, 0.0, r.w, r.h);
+    layout.place(t, tree.first_child(t, w), &all);
+}
+
+fn _shown_destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Shown as sd = cast(*Shown, data);
+    if (sd.dlg != 0 && tree.is_valid(t, sd.dlg) == 1) { tree.destroy(t, sd.dlg); }
+}

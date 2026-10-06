@@ -1149,6 +1149,14 @@ a grey keeps its hue. The palette is one Tab stop, the arrows going round
 it; the plane and the strips move by keys as sliders do. `dialog()` holds one
 with Cancel and Select; `button()` shows a colour and opens that dialog.
 
+**Font choosers** (`widgets/fontpicker.cst`, tested by `fontpicker_test`):
+over the program's font index — the families searched by any part of their
+name, the chosen family's styles (a variable face's weights at each hundred
+of its range, by name), a size in logical pixels, and a line of text in the
+font chosen. Another family keeps the style nearest the one chosen.
+`dialog()` and `button()` as for colours, the button saying "Family Style
+Size".
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
