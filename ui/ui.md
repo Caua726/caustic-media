@@ -668,6 +668,20 @@ button answers Escape; both give their keys back when destroyed. A link is
 underlined text in the link colour, no padding, saying `ACTIVATED` with its
 address and told visited once followed.
 
+**Check boxes and radio buttons** (`widgets/check.cst`, tested by
+`check_test`): one widget for both, as GTK 4 makes it — an indicator beside a
+label with its mnemonic, the label past it in the widget's direction, the
+whole of it clicked. A check box is on, off, or mixed when the program says or
+as the third state a click goes through on request. Radios are joined in a
+group, a ring: one chosen, choosing another unchooses it, a chosen one stays
+chosen when clicked; only the chosen one takes Tab, so the group is one stop,
+and the arrows — mirrored right to left — choose the next or the one before,
+passing over what is disabled, and move the focus there; with none chosen
+every one takes Tab. Clicked on a release inside after a press, on Space
+released, on the mnemonic and by assistive technology; `TOGGLED` from every
+radio a choice changes. Drawn from the theme's indicator variants: a rounded
+square with a tick, or a bar when mixed; a circle with a dot.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a

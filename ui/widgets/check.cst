@@ -1,0 +1,457 @@
+// ui/widgets/check.cst — check boxes and radio buttons.
+//
+// Both are an indicator beside a label — the label past it in the widget's
+// direction — and the whole of either is clicked, as GTK 4 makes one widget
+// of the two. A check box is on or off, and mixed when the program says or,
+// on request, as the third state a click goes through. A radio button is in
+// a group, a ring of radios: one is chosen, choosing another unchooses it,
+// and a chosen one stays chosen when clicked. Only the chosen one takes Tab,
+// so the group is one stop, and the arrows choose the next or the one before
+// and move the focus there (tree.request_focus); with none chosen every one
+// takes Tab.
+//
+// Clicked on a release inside it after a press, on Space released, on its
+// label's mnemonic and by assistive technology; TOGGLED on every change,
+// from both radios of a choice. Drawn from the theme's indicator variants: a
+// rounded square with a mark, or a bar when mixed; a circle with a dot.
+use "../../math/math.cst" as math;
+use "../../window/keys.cst" as keys;
+use "../../render/shapes2d.cst" as shapes;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../event.cst" as event;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "label.cst" as label;
+
+let is i32 as OFF   with imut = 0;
+let is i32 as ON    with imut = 1;
+let is i32 as MIXED with imut = 2;
+
+struct Data {
+    content  as i64;   // its label
+    next     as i64;   // the next radio of its group, round; itself alone; 0 for a check box
+    state    as i32;
+    three    as i32;   // a click goes on to mixed
+    radio    as i32;
+    held     as i32;   // Space held on it
+    pressing as i32;
+    out      as i32;   // pressed, and the pointer has left it
+}
+
+let is tree.Kind as _check with mut;
+let is tree.Kind as _radio with mut;
+let is i32 as _ready with mut = 0;
+
+fn _init() as void {
+    if (_ready == 1) { return; }
+    _check = widget.kind("check", sizeof(Data));
+    _check.destroy = fn_ptr(_destroy);
+    _check.measure = fn_ptr(_measure);
+    _check.arrange = fn_ptr(_arrange);
+    _check.paint = fn_ptr(_paint);
+    _check.event = fn_ptr(_event);
+    _check.role = access.ROLE_CHECK_BOX;
+    _check.access = fn_ptr(_access);
+    _radio = _check;
+    _radio.name = "radio";
+    _radio.role = access.ROLE_RADIO_BUTTON;
+    _ready = 1;
+}
+
+fn _data(t as *tree.Tree, w as i64) as *Data {
+    if (tree.is_valid(t, w) == 0) { return cast(*Data, 0); }
+    let is i64 as k = cast(i64, tree.kind(t, w));
+    if (k != cast(i64, &_check) && k != cast(i64, &_radio)) { return cast(*Data, 0); }
+    return cast(*Data, tree.data(t, w));
+}
+
+fn _make(t as *tree.Tree, parent as i64, k as *tree.Kind, s as *u8, n as i64) as i64 {
+    _init();
+    let is i64 as w = tree.create(t, k, parent);
+    if (w == 0) { return 0; }
+    let is i64 as l = label.create(t, w, "", 0);
+    if (l == 0) {
+        tree.destroy(t, w);
+        return 0;
+    }
+    label.set_text_mnemonic(t, l, s, n);
+    label.set_target(t, l, w);
+    cast(*Data, tree.data(t, w)).content = l;
+    tree.set_focusable(t, w, 1);
+    return w;
+}
+
+// A new check box, off, with a label of text — an underscore marking its
+// mnemonic's letter — as the last child of parent. Its handle, or 0 with the
+// tree's last_error set.
+fn create(t as *tree.Tree, parent as i64, s as *u8, n as i64) as i64 {
+    return _make(t, parent, &_check, s, n);
+}
+
+// A new radio button in group's group — group is any radio of it — or, for
+// 0, in a group of its own, chosen.
+fn radio(t as *tree.Tree, parent as i64, s as *u8, n as i64, group as i64) as i64 {
+    let is i64 as w = _make(t, parent, &_radio, s, n);
+    if (w == 0) { return 0; }
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    d.radio = 1;
+    d.next = w;
+    d.state = ON;
+    if (group != 0) { join(t, w, group); }
+    return w;
+}
+
+// Its label; 0 for a widget that is neither.
+fn content(t as *tree.Tree, w as i64) as i64 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.content;
+}
+
+fn state(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return OFF; }
+    return d.state;
+}
+
+// Whether it is held down now: by a press the pointer is still over, or by
+// Space.
+fn is_down(t as *tree.Tree, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return cast(i32, d.held == 1 || (d.pressing == 1 && d.out == 0));
+}
+
+fn _repaint(t as *tree.Tree, w as i64) as void { widget.changed(t, w, widget.CHANGED_PAINT); }
+
+// --- Groups ---
+
+fn _prev(t as *tree.Tree, w as i64) as i64 {
+    let is i64 as p with mut = w;
+    while (cast(*Data, tree.data(t, p)).next != w) { p = cast(*Data, tree.data(t, p)).next; }
+    return p;
+}
+
+// w out of its ring, alone.
+fn _unlink(t as *tree.Tree, w as i64) as void {
+    let is *Data as d = cast(*Data, tree.data(t, w));
+    if (d.next == w) { return; }
+    let is i64 as p = _prev(t, w);
+    cast(*Data, tree.data(t, p)).next = d.next;
+    d.next = w;
+}
+
+// Who takes Tab in w's group: the chosen one; every one when none is.
+fn _tab_stops(t as *tree.Tree, w as i64) as void {
+    let is i32 as any with mut = 0;
+    let is i64 as m with mut = w;
+    let is i32 as first with mut = 1;
+    while (first == 1 || m != w) {
+        first = 0;
+        if (cast(*Data, tree.data(t, m)).state == ON) { any = 1; }
+        m = cast(*Data, tree.data(t, m)).next;
+    }
+    first = 1;
+    while (first == 1 || m != w) {
+        first = 0;
+        let is *Data as md = cast(*Data, tree.data(t, m));
+        tree.set_focusable(t, m, cast(i32, any == 0 || md.state == ON));
+        m = md.next;
+    }
+}
+
+// Radio w into group's group, off: 1, or 0 when either is no radio.
+fn join(t as *tree.Tree, w as i64, group as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    let is *Data as g = _data(t, group);
+    if (cast(i64, d) == 0 || cast(i64, g) == 0 || d.radio == 0 || g.radio == 0) { return 0; }
+    _unlink(t, w);
+    d.next = g.next;
+    g.next = w;
+    d.state = OFF;
+    _tab_stops(t, w);
+    _repaint(t, w);
+    return 1;
+}
+
+// Radio w chosen, the one that was not: each that changed says so.
+fn _choose(t as *tree.Tree, w as i64) as void {
+    let is i64 as was with mut = 0;
+    let is i64 as m with mut = cast(*Data, tree.data(t, w)).next;
+    while (m != w) {
+        let is *Data as md = cast(*Data, tree.data(t, m));
+        if (md.state == ON) {
+            md.state = OFF;
+            was = m;
+            _repaint(t, m);
+        }
+        m = md.next;
+    }
+    cast(*Data, tree.data(t, w)).state = ON;
+    _repaint(t, w);
+    _tab_stops(t, w);
+    if (was != 0) { signal.emit(t, was, signal.TOGGLED, cast(*u8, 0)); }
+    if (tree.is_valid(t, w) == 1) { signal.emit(t, w, signal.TOGGLED, cast(*u8, 0)); }
+}
+
+fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
+    let is *Data as d = cast(*Data, data);
+    if (d.radio == 0 || d.next == w) { return; }
+    let is i64 as rest = d.next;
+    _unlink(t, w);
+    _tab_stops(t, rest);
+}
+
+// --- Setting ---
+
+// OFF, ON, or MIXED for a check box; a radio set on is chosen, set off
+// leaves its group with none. Says TOGGLED when it changed. 1, or 0 for a
+// state that is none of those, a mixed radio, or a widget that is neither.
+fn set_state(t as *tree.Tree, w as i64, st as i32) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0 || st < OFF || st > MIXED || (d.radio == 1 && st == MIXED)) { return 0; }
+    if (d.state == st) { return 1; }
+    if (d.radio == 1 && st == ON) {
+        _choose(t, w);
+        return 1;
+    }
+    d.state = st;
+    _repaint(t, w);
+    if (d.radio == 1) { _tab_stops(t, w); }
+    signal.emit(t, w, signal.TOGGLED, cast(*u8, 0));
+    return 1;
+}
+
+// A check box whose clicks go off, on, mixed and round; not, mixed goes on.
+fn set_three_state(t as *tree.Tree, w as i64, on as i32) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.three = on;
+    return 1;
+}
+
+// Alt and its label's mnemonic letter, from now on, focus and click it.
+fn bind_mnemonic(t as *tree.Tree, r as *router.Router, w as i64) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return label.bind_mnemonic(t, r, d.content);
+}
+
+// What a click does.
+fn _activate(t as *tree.Tree, w as i64, d as *Data) as void {
+    if (d.radio == 1) {
+        if (d.state != ON) {
+            _choose(t, w);
+            tree.request_focus(t, w);
+        }
+        return;
+    }
+    let is i32 as to with mut = ON;
+    if (d.state == ON) {
+        to = OFF;
+        if (d.three == 1) { to = MIXED; }
+    }
+    if (d.state == MIXED && d.three == 1) { to = OFF; }
+    set_state(t, w, to);
+}
+
+// The next radio of w's group, or the one before for dir -1, that can be
+// chosen: shown and enabled. w itself when none.
+fn _step(t as *tree.Tree, w as i64, dir as i32) as i64 {
+    let is i64 as m with mut = w;
+    let is i32 as first with mut = 1;
+    while (first == 1 || m != w) {
+        first = 0;
+        if (dir > 0) { m = cast(*Data, tree.data(t, m)).next; }
+        else { m = _prev(t, m); }
+        if (m != w && tree.is_visible(t, m) == 1 && tree.is_enabled(t, m) == 1) { return m; }
+    }
+    return w;
+}
+
+// --- Events ---
+
+fn _inside(t as *tree.Tree, w as i64, e as *event.Event) as i32 {
+    let is math.rect.Rect as r = layout.rect(t, w);
+    return cast(i32, e.local_x >= 0.0 && e.local_y >= 0.0 && e.local_x < r.w && e.local_y < r.h);
+}
+
+fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Data as d = cast(*Data, data);
+    let is i32 as k = e.kind;
+    let is i32 as plain = cast(i32, (e.mods & (keys.MOD_CONTROL | keys.MOD_ALT)) == 0);
+    if (k == event.POINTER_DOWN) {
+        if (e.button != 1) { return 0; }
+        d.pressing = 1;
+        d.out = 0;
+        _repaint(t, w);
+        return 1;
+    }
+    if (k == event.POINTER_MOVE) {
+        if (d.pressing == 0) { return 0; }
+        let is i32 as out = 1 - _inside(t, w, e);
+        if (out != d.out) {
+            d.out = out;
+            _repaint(t, w);
+        }
+        return 1;
+    }
+    if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
+        if (d.pressing == 0) { return 0; }
+        d.pressing = 0;
+        _repaint(t, w);
+        if (k == event.POINTER_UP && _inside(t, w, e) == 1) { _activate(t, w, d); }
+        return 1;
+    }
+    if (k == event.SHORTCUT_OVERRIDE) { return cast(i64, plain == 1 && e.key == keys.SPACE); }
+    if (k == event.KEY_DOWN) {
+        if (plain == 0) { return 0; }
+        if (e.key == keys.SPACE) {
+            if (d.held == 0) {
+                d.held = 1;
+                _repaint(t, w);
+            }
+            return 1;
+        }
+        if (d.radio == 0) { return 0; }
+        let is i32 as dir with mut = 0;
+        if (e.key == keys.DOWN || e.key == keys.RIGHT) { dir = 1; }
+        if (e.key == keys.UP || e.key == keys.LEFT) { dir = 0 - 1; }
+        // Right to left, right goes back.
+        if ((e.key == keys.LEFT || e.key == keys.RIGHT) && layout.direction(t, w) == layout.RTL) { dir = 0 - dir; }
+        if (dir == 0) { return 0; }
+        let is i64 as to = _step(t, w, dir);
+        if (to != w) {
+            _choose(t, to);
+            tree.request_focus(t, to);
+        }
+        return 1;
+    }
+    if (k == event.KEY_UP) {
+        if (e.key != keys.SPACE || d.held == 0) { return 0; }
+        d.held = 0;
+        _repaint(t, w);
+        _activate(t, w, d);
+        return 1;
+    }
+    if (k == event.FOCUS_OUT) {
+        if (d.held == 1) {
+            d.held = 0;
+            _repaint(t, w);
+        }
+        return 0;
+    }
+    if (k == event.ACTIVATE) {
+        _activate(t, w, d);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Laying out ---
+
+fn _max(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as ind = th.metrics.indicator;
+    let is f64 as sp = th.metrics.space_s;
+    let is geom.Constraint as lc with mut = *c;
+    if (lc.w < layout.UNBOUNDED) { lc.w = _max(0.0, lc.w - ind - sp); }
+    let is geom.Size as ls;
+    layout.measure(t, d.content, &lc, &ls);
+    out.min_w = ind + sp + ls.min_w;
+    out.pref_w = ind + sp + ls.pref_w;
+    out.min_h = _max(ind, ls.min_h);
+    out.pref_h = _max(ind, ls.pref_h);
+    out.max_w = layout.UNBOUNDED;
+    out.max_h = layout.UNBOUNDED;
+}
+
+fn _arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    let is *Data as d = cast(*Data, data);
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    let is f64 as skip = th.metrics.indicator + th.metrics.space_s;
+    let is f64 as x with mut = skip;
+    if (layout.direction(t, w) == layout.RTL) { x = 0.0; }
+    let is math.rect.Rect as area = math.rect.rect(x, 0.0, _max(0.0, r.w - skip), r.h);
+    layout.place(t, d.content, &area);
+}
+
+// Where its indicator is in rc, its rectangle: at its start, centred down.
+fn _indicator_in(t as *tree.Tree, w as i64, rc as math.rect.Rect, ind as f64) as math.rect.Rect {
+    let is f64 as x with mut = rc.x;
+    if (layout.direction(t, w) == layout.RTL) { x = rc.x + rc.w - ind; }
+    return math.rect.rect(x, rc.y + (rc.h - ind) / 2.0, ind, ind);
+}
+
+// Its indicator, in the window; nothing for a widget that is neither.
+fn indicator(t as *tree.Tree, w as i64) as math.rect.Rect {
+    if (cast(i64, _data(t, w)) == 0) { return math.rect.rect_zero(); }
+    let is style.Theme as th;
+    widget.theme(t, w, &th);
+    return _indicator_in(t, w, layout.window_rect(t, w), th.metrics.indicator);
+}
+
+// --- Drawing ---
+
+fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Data as d = cast(*Data, data);
+    let is *style.Theme as th = p.theme;
+    let is f64 as ind = th.metrics.indicator;
+    let is math.rect.Rect as ir = _indicator_in(t, w, p.rect, ind);
+    let is i64 as st with mut = p.state | painter.S_PRESSED;
+    if (is_down(t, w) == 0) { st = st - painter.S_PRESSED; }
+    if (d.pressing == 1 && d.out == 1 && (st & painter.S_HOVER) != 0) { st = st - painter.S_HOVER; }
+    let is style.Look as look = style.pick(&th.indicator, st, cast(i32, d.state != OFF));
+    let is f64 as bw = th.metrics.border_width;
+    let is f64 as cx = ir.x + ind / 2.0;
+    let is f64 as cy = ir.y + ind / 2.0;
+    if (d.radio == 1) {
+        let is f64 as rad = ind / 2.0;
+        shapes.fill_circle(p.canvas, cx, cy, rad, look.bg);
+        if (bw > 0.0 && look.border.a > 0.0) {
+            shapes.stroke_rounded(p.canvas, ir.x, ir.y, ind, ind, rad, rad, rad, rad, bw, look.border);
+        }
+        if (d.state == ON) { shapes.fill_circle(p.canvas, cx, cy, ind / 4.0, look.fg); }
+        return;
+    }
+    let is f64 as rs = th.metrics.radius_s;
+    shapes.fill_rounded(p.canvas, ir.x, ir.y, ind, ind, rs, rs, rs, rs, look.bg);
+    if (bw > 0.0 && look.border.a > 0.0) {
+        shapes.stroke_rounded(p.canvas, ir.x, ir.y, ind, ind, rs, rs, rs, rs, bw, look.border);
+    }
+    let is f64 as lw = ind / 8.0;
+    if (d.state == ON) {
+        // A tick: down to the low point, then up to the right.
+        shapes.line(p.canvas, ir.x + ind * 0.22, ir.y + ind * 0.52, ir.x + ind * 0.42, ir.y + ind * 0.72, lw, look.fg);
+        shapes.line(p.canvas, ir.x + ind * 0.42, ir.y + ind * 0.72, ir.x + ind * 0.78, ir.y + ind * 0.30, lw, look.fg);
+    }
+    if (d.state == MIXED) {
+        shapes.line(p.canvas, ir.x + ind * 0.25, cy, ir.x + ind * 0.75, cy, lw, look.fg);
+    }
+}
+
+// --- Told ---
+
+fn _access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    let is *Data as d = cast(*Data, data);
+    if (q.action == access.ASK) {
+        q.actions = access.PRESS | access.TOGGLE;
+        q.states = q.states | access.CHECKABLE;
+        if (d.state == ON) { q.states = q.states | access.CHECKED; }
+        if (d.state == MIXED) { q.states = q.states | access.MIXED; }
+        return 1;
+    }
+    _activate(t, w, d);
+    return 1;
+}

@@ -1,0 +1,540 @@
+// ui/widgets/check_test.cst — check boxes and radio buttons: an indicator
+// beside a label, the whole of it clicked; on, off, and mixed on request;
+// radios in a group, one chosen, the only one Tab stops at, the arrows moving
+// the choice and the focus; drawn in the theme's indicator variants; told.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../math/math.cst" as math;
+use "../../gpu/gpu.cst" as gpu;
+use "../../render/draw2d.cst" as draw2d;
+use "../../window/keys.cst" as keys;
+use "../../text/sfnt/sfnt.cst" as sfnt;
+use "../../text/sfnt/table.cst" as table;
+use "../../text/layout/font.cst" as font;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../box.cst" as box;
+use "../damage.cst" as damage;
+use "../paint.cst" as paint;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../text.cst" as text;
+use "label.cst" as label;
+use "check.cst" as check;
+
+let is i64 as W with imut = 240;
+let is i64 as H with imut = 200;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (b[i] == 0 || a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, b[n] == 0);
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is *text.Service as svc with mut;
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as cmd with mut = 0;
+let is [48000]i32 as px with mut;
+let is *router.Router as frame_router with mut;
+
+fn frame(t as *tree.Tree, c as *draw2d.Canvas) as void {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    damage.collect(t);
+    text.next_frame(svc);
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    let is paint.Options as o = paint.options(&theme);
+    o.router = frame_router;
+    let is paint.Stats as st;
+    paint.frame(t, c, &o, &st);
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass_load(target, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    tree.damage_clear(t);
+}
+
+fn ch(x as i64, y as i64, c as i64) as i64 { return cast(i64, cast(*u8, &px)[(y * W + x) * 4 + c]); }
+
+fn is8(x as i64, y as i64, col as math.color.Color, tol as i64) as i32 {
+    let is i64 as r = cast(i64, col.r * 255.0 + 0.5);
+    let is i64 as g = cast(i64, col.g * 255.0 + 0.5);
+    let is i64 as b = cast(i64, col.b * 255.0 + 0.5);
+    let is i64 as dr with mut = ch(x, y, 0) - r;
+    let is i64 as dg with mut = ch(x, y, 1) - g;
+    let is i64 as db with mut = ch(x, y, 2) - b;
+    if (dr < 0) { dr = 0 - dr; }
+    if (dg < 0) { dg = 0 - dg; }
+    if (db < 0) { db = 0 - db; }
+    return cast(i32, dr <= tol && dg <= tol && db <= tol);
+}
+
+// What a look's background is over the window's.
+fn bg_of(l as style.Look) as math.color.Color { return style.over(l.bg, theme.palette.window_bg); }
+
+// The middle of the ink of the first glyph of a check's label.
+fn ink_x(t as *tree.Tree, b as i64) as i64 {
+    let is i64 as l = check.content(t, b);
+    let is *text.Glyph as g = text.glyph(label.run(t, l), 0);
+    return cast(i64, layout.window_rect(t, l).x + label.text_left(t, l) + g.x + g.adv / 2.0);
+}
+
+fn ink_y(t as *tree.Tree, b as i64) as i64 {
+    let is i64 as l = check.content(t, b);
+    let is *text.Glyph as g = text.glyph(label.run(t, l), 0);
+    return cast(i64, layout.window_rect(t, l).y + label.text_top(t, l) + g.y - 4.0);
+}
+
+fn mid_x(t as *tree.Tree, b as i64) as f64 { return layout.window_rect(t, b).x + layout.window_rect(t, b).w / 2.0; }
+fn mid_y(t as *tree.Tree, b as i64) as f64 { return layout.window_rect(t, b).y + layout.window_rect(t, b).h / 2.0; }
+
+// --- Signals ---
+
+let is i64 as toggles with mut = 0;
+
+fn on_toggle(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { toggles = toggles + 1; }
+
+fn click(t as *tree.Tree, r as *router.Router, x as f64, y as f64, time as i64) as void {
+    router.pointer_move(t, r, x, y, time);
+    router.pointer_button(t, r, 1, 1, x, y, time);
+    router.pointer_button(t, r, 1, 0, x, y, time + 1);
+}
+
+fn key(t as *tree.Tree, r as *router.Router, k as i32, mods as i32, time as i64) as void {
+    router.key(t, r, k, mods, 1, 0, time);
+    router.key(t, r, k, mods, 0, 0, time + 1);
+}
+
+fn measure(t as *tree.Tree, w as i64) as geom.Size {
+    let is geom.Constraint as c = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(t, w, &c, &s);
+    return s;
+}
+
+fn tree_for() as tree.Tree {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_text_service(&t, cast(*u8, svc));
+    return t;
+}
+
+// --- Made and measured ---
+
+fn made() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as root = tree.root(&t);
+    let is i64 as col = box.create(&t, root, box.COLUMN);
+    layout.set_align(&t, col, layout.START, layout.START);
+    let is i64 as c = check.create(&t, col, "_Bold", 5);
+    let is i64 as l = check.content(&t, c);
+    check("a check box beside its label", c != 0 && tree.kind(&t, c).role == access.ROLE_CHECK_BOX &&
+          cast(i64, tree.kind(&t, l)) == cast(i64, label.kind()) && tree.parent(&t, l) == c &&
+          tree.labelled_by(&t, c) == l && label.mnemonic(&t, l) == 66 && label.target(&t, l) == c);
+    check("focusable, off", tree.is_focusable(&t, c) == 1 && check.state(&t, c) == check.OFF);
+    let is geom.Size as s = measure(&t, c);
+    let is geom.Size as ls = measure(&t, l);
+    let is f64 as ind = theme.metrics.indicator;
+    let is f64 as sp = theme.metrics.space_s;
+    let is f64 as h with mut = ls.pref_h;
+    if (h < ind) { h = ind; }
+    check("its indicator, a space, its label", s.pref_w == ind + sp + ls.pref_w && s.pref_h == h &&
+          s.min_w == ind + sp + ls.min_w);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as rc = layout.rect(&t, c);
+    check("its label past the indicator", layout.rect(&t, l).x == ind + sp &&
+          layout.rect(&t, l).w == rc.w - ind - sp);
+    let is math.rect.Rect as ir with mut = check.indicator(&t, c);
+    let is math.rect.Rect as wr with mut = layout.window_rect(&t, c);
+    check("its indicator at the start, centred down", ir.x == wr.x && ir.w == ind && ir.h == ind &&
+          ir.y == wr.y + (wr.h - ind) / 2.0);
+    layout.set_direction(&t, c, layout.RTL);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    ir = check.indicator(&t, c);
+    wr = layout.window_rect(&t, c);
+    check("right to left: the indicator at the right", layout.rect(&t, l).x == 0.0 && ir.x == wr.x + wr.w - ind);
+    let is router.Router as rr = router.init(router.settings_default());
+    check("not a check: nothing", check.content(&t, col) == 0 && check.set_state(&t, col, check.ON) == 0 &&
+          check.state(&t, col) == check.OFF && check.set_three_state(&t, col, 1) == 0 &&
+          check.bind_mnemonic(&t, &rr, col) == 0 && check.is_down(&t, col) == 0 && check.join(&t, col, c) == 0);
+    tree.close(&t);
+    let is tree.Limits as tl = tree.limits_default();
+    tl.widgets = 2;
+    let is tree.Tree as tight = tree.open(&tl);
+    check("no room for its label: none", check.create(&tight, tree.root(&tight), "x", 1) == 0 &&
+          check.radio(&tight, tree.root(&tight), "x", 1, 0) == 0 && tree.live_count(&tight) == 1);
+    tree.close(&tight);
+}
+
+// --- Checked ---
+
+fn checked() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as root = tree.root(&t);
+    let is i64 as col = box.create(&t, root, box.COLUMN);
+    layout.set_align(&t, col, layout.START, layout.START);
+    let is i64 as c = check.create(&t, col, "_Bold", 5);
+    let is i64 as other = check.create(&t, col, "Other", 5);
+    signal.connect(&t, c, signal.TOGGLED, fn_ptr(on_toggle), cast(*u8, 0));
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    toggles = 0;
+    click(&t, &r, cast(f64, ink_x(&t, c)), cast(f64, ink_y(&t, c)), 10);
+    check("its label clicked: on, said", check.state(&t, c) == check.ON && toggles == 1 && router.focused(&t, &r) == c);
+    let is math.rect.Rect as ir = check.indicator(&t, c);
+    click(&t, &r, ir.x + ir.w / 2.0, ir.y + ir.h / 2.0, 1000);
+    check("its indicator: off", check.state(&t, c) == check.OFF && toggles == 2);
+    router.pointer_move(&t, &r, ir.x + 2.0, ir.y + 2.0, 2000);
+    router.pointer_button(&t, &r, 1, 1, ir.x + 2.0, ir.y + 2.0, 2000);
+    router.pointer_move(&t, &r, 230.0, 195.0, 2010);
+    router.pointer_button(&t, &r, 1, 0, 230.0, 195.0, 2020);
+    check("released elsewhere: nothing", check.state(&t, c) == check.OFF && toggles == 2);
+    router.pointer_move(&t, &r, ir.x + 2.0, ir.y + 2.0, 2030);
+    router.pointer_button(&t, &r, 1, 1, ir.x + 2.0, ir.y + 2.0, 2030);
+    router.pointer_move(&t, &r, ir.x + 4.0, ir.y + 3.0, 2040);
+    check("pressed and moved within: down", check.is_down(&t, c) == 1);
+    router.pointer_move(&t, &r, 230.0, 195.0, 2050);
+    check("moved off: up", check.is_down(&t, c) == 0);
+    router.pointer_button(&t, &r, 1, 0, 230.0, 195.0, 2060);
+    router.pointer_button(&t, &r, 3, 1, ir.x + 2.0, ir.y + 2.0, 2100);
+    check("another button: not taken", router.capture(&r) != c);
+    router.pointer_button(&t, &r, 3, 0, ir.x + 2.0, ir.y + 2.0, 2110);
+
+    // By keyboard: Space, on release; Enter is not its.
+    router.focus(&t, &r, c, 1);
+    router.key(&t, &r, keys.SPACE, 0, 1, 0, 3000);
+    check("space down: not yet", check.state(&t, c) == check.OFF && check.is_down(&t, c) == 1);
+    router.key(&t, &r, keys.SPACE, 0, 0, 0, 3010);
+    check("space up: on", check.state(&t, c) == check.ON && check.is_down(&t, c) == 0);
+    key(&t, &r, keys.RETURN, 0, 3020);
+    check("enter: nothing", check.state(&t, c) == check.ON);
+    key(&t, &r, keys.TAB, 0, 3030);
+    check("tab: on to the next", router.focused(&t, &r) == other);
+    router.focus(&t, &r, c, 1);
+    router.key(&t, &r, keys.SPACE, 0, 1, 0, 3040);
+    router.focus(&t, &r, other, 1);
+    router.key(&t, &r, keys.SPACE, 0, 0, 0, 3050);
+    check("space held, the focus gone: nothing", check.state(&t, c) == check.ON && check.is_down(&t, c) == 0);
+
+    // Mixed, set; clicked, on. Three states on request: off, on, mixed.
+    check("set mixed: said", check.set_state(&t, c, check.MIXED) == 1 && check.state(&t, c) == check.MIXED &&
+          toggles == 4);
+    check("set as it is: nothing said", check.set_state(&t, c, check.MIXED) == 1 && toggles == 4);
+    click(&t, &r, ir.x + 2.0, ir.y + 2.0, 4000);
+    check("mixed, clicked: on", check.state(&t, c) == check.ON);
+    check("three states", check.set_three_state(&t, c, 1) == 1);
+    click(&t, &r, ir.x + 2.0, ir.y + 2.0, 5000);
+    check("on, clicked: mixed", check.state(&t, c) == check.MIXED);
+    click(&t, &r, ir.x + 2.0, ir.y + 2.0, 6000);
+    check("mixed, clicked: off", check.state(&t, c) == check.OFF);
+    click(&t, &r, ir.x + 2.0, ir.y + 2.0, 7000);
+    check("off, clicked: on", check.state(&t, c) == check.ON);
+    check.set_three_state(&t, c, 0);
+    check("a state that is none: refused", check.set_state(&t, c, 7) == 0 && check.state(&t, c) == check.ON);
+
+    // Told, and toggled by assistive technology, and by its mnemonic.
+    let is tree.Access as q;
+    access.describe(&t, cast(*router.Router, 0), c, &q);
+    check("told: checked, its label its name", (q.states & access.CHECKED) != 0 &&
+          (q.states & access.CHECKABLE) != 0 && same(q.name, q.name_len, "Bold") == 1 &&
+          (q.actions & access.TOGGLE) != 0 && (q.actions & access.PRESS) != 0);
+    check("toggled by it", access.act(&t, c, access.TOGGLE, 0.0) == 1 && check.state(&t, c) == check.OFF);
+    check.set_state(&t, c, check.MIXED);
+    access.describe(&t, cast(*router.Router, 0), c, &q);
+    check("told: mixed", (q.states & access.MIXED) != 0 && (q.states & access.CHECKED) == 0);
+    check("its mnemonic bound", check.bind_mnemonic(&t, &r, c) == 1);
+    router.focus(&t, &r, other, 1);
+    key(&t, &r, keys.B, keys.MOD_ALT, 8000);
+    router.key(&t, &r, keys.ALT_L, 0, 0, 0, 8010);
+    check("alt and its letter: focused, on", router.focused(&t, &r) == c && check.state(&t, c) == check.ON);
+    tree.set_enabled(&t, c, 0);
+    click(&t, &r, ir.x + 2.0, ir.y + 2.0, 9000);
+    check("disabled: nothing", check.state(&t, c) == check.ON);
+    tree.close(&t);
+}
+
+// --- Radios ---
+
+fn radios() as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as root = tree.root(&t);
+    let is i64 as col = box.create(&t, root, box.COLUMN);
+    layout.set_align(&t, col, layout.START, layout.START);
+    let is i64 as before = check.create(&t, col, "Before", 6);
+    let is i64 as r1 = check.radio(&t, col, "One", 3, 0);
+    let is i64 as r2 = check.radio(&t, col, "Two", 3, r1);
+    let is i64 as r3 = check.radio(&t, col, "Three", 5, r2);
+    let is i64 as after = check.create(&t, col, "After", 5);
+    signal.connect(&t, r1, signal.TOGGLED, fn_ptr(on_toggle), cast(*u8, 0));
+    signal.connect(&t, r3, signal.TOGGLED, fn_ptr(on_toggle), cast(*u8, 0));
+    let is router.Router as r = router.init(router.settings_default());
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("radios", tree.kind(&t, r1).role == access.ROLE_RADIO_BUTTON);
+    check("the first chosen", check.state(&t, r1) == check.ON && check.state(&t, r2) == check.OFF &&
+          check.state(&t, r3) == check.OFF);
+    check("only the chosen one takes Tab", tree.is_focusable(&t, r1) == 1 && tree.is_focusable(&t, r2) == 0 &&
+          tree.is_focusable(&t, r3) == 0);
+    toggles = 0;
+    let is math.rect.Rect as i3 = check.indicator(&t, r3);
+    click(&t, &r, i3.x + 2.0, i3.y + 2.0, 10);
+    check("another clicked: it chosen, the first not, both said", check.state(&t, r3) == check.ON &&
+          check.state(&t, r1) == check.OFF && toggles == 2 && router.focused(&t, &r) == r3);
+    check("and it takes Tab now", tree.is_focusable(&t, r3) == 1 && tree.is_focusable(&t, r1) == 0);
+    click(&t, &r, i3.x + 2.0, i3.y + 2.0, 1000);
+    check("the chosen one clicked: still chosen, nothing said", check.state(&t, r3) == check.ON && toggles == 2);
+
+    // Tab into the group: at the chosen one.
+    router.focus(&t, &r, before, 1);
+    key(&t, &r, keys.TAB, 0, 2000);
+    check("tab: into the group at the chosen one", router.focused(&t, &r) == r3);
+    key(&t, &r, keys.TAB, 0, 2010);
+    check("tab: out of it", router.focused(&t, &r) == after);
+
+    // The arrows: the next or the one before, round, chosen and focused.
+    router.focus(&t, &r, r3, 1);
+    key(&t, &r, keys.DOWN, 0, 3000);
+    check("down from the last: the first", check.state(&t, r1) == check.ON && check.state(&t, r3) == check.OFF &&
+          router.focused(&t, &r) == r1 && router.focus_visible(&r) == 1);
+    key(&t, &r, keys.RIGHT, 0, 3010);
+    check("right: the next", check.state(&t, r2) == check.ON && router.focused(&t, &r) == r2);
+    key(&t, &r, keys.UP, 0, 3020);
+    check("up: the one before", check.state(&t, r1) == check.ON && router.focused(&t, &r) == r1);
+    key(&t, &r, keys.LEFT, 0, 3030);
+    check("left from the first: the last", check.state(&t, r3) == check.ON && router.focused(&t, &r) == r3);
+    tree.set_enabled(&t, r1, 0);
+    key(&t, &r, keys.DOWN, 0, 3040);
+    check("a disabled one passed over", check.state(&t, r2) == check.ON && router.focused(&t, &r) == r2);
+    tree.set_enabled(&t, r1, 1);
+    layout.set_direction(&t, r2, layout.RTL);
+    key(&t, &r, keys.RIGHT, 0, 3045);
+    check("right to left, right: the one before", check.state(&t, r1) == check.ON && router.focused(&t, &r) == r1);
+    check.set_state(&t, r2, check.ON);
+    router.focus(&t, &r, r2, 1);
+    key(&t, &r, keys.LEFT, 0, 3046);
+    check("right to left, left: the next", check.state(&t, r3) == check.ON && router.focused(&t, &r) == r3);
+    layout.set_direction(&t, r2, layout.INHERIT);
+    check.set_state(&t, r2, check.ON);
+    router.focus(&t, &r, r2, 1);
+    key(&t, &r, keys.SPACE, 0, 3050);
+    check("space on the chosen one: still chosen", check.state(&t, r2) == check.ON);
+
+    // Chosen by the program; none chosen.
+    check("set on: the rest off", check.set_state(&t, r1, check.ON) == 1 && check.state(&t, r2) == check.OFF &&
+          tree.is_focusable(&t, r1) == 1 && tree.is_focusable(&t, r2) == 0);
+    check("set off: none chosen, every one takes Tab", check.set_state(&t, r1, check.OFF) == 1 &&
+          check.state(&t, r1) == check.OFF && tree.is_focusable(&t, r1) == 1 && tree.is_focusable(&t, r2) == 1 &&
+          tree.is_focusable(&t, r3) == 1);
+    check("a radio is never mixed", check.set_state(&t, r2, check.MIXED) == 0 && check.state(&t, r2) == check.OFF);
+    let is tree.Access as q;
+    check.set_state(&t, r2, check.ON);
+    access.describe(&t, cast(*router.Router, 0), r2, &q);
+    check("told: chosen", (q.states & access.CHECKED) != 0 && same(q.name, q.name_len, "Two") == 1);
+
+    // One gone: the rest still a group.
+    tree.destroy(&t, r2);
+    check("the chosen one gone: none chosen, every one takes Tab", check.state(&t, r1) == check.OFF &&
+          check.state(&t, r3) == check.OFF && tree.is_focusable(&t, r1) == 1 && tree.is_focusable(&t, r3) == 1);
+    router.focus(&t, &r, r1, 1);
+    key(&t, &r, keys.DOWN, 0, 4000);
+    check("the arrows over the rest", check.state(&t, r3) == check.ON && router.focused(&t, &r) == r3);
+    key(&t, &r, keys.DOWN, 0, 4010);
+    check("round", check.state(&t, r1) == check.ON && router.focused(&t, &r) == r1);
+    // A radio alone, joined to a group later.
+    let is i64 as r4 = check.radio(&t, col, "Four", 4, 0);
+    check("alone: chosen", check.state(&t, r4) == check.ON);
+    check("joined: off, the group's choice kept", check.join(&t, r4, r3) == 1 && check.state(&t, r4) == check.OFF &&
+          check.state(&t, r1) == check.ON && tree.is_focusable(&t, r4) == 0);
+    check("not a radio: not joined", check.join(&t, after, r3) == 0);
+    tree.close(&t);
+}
+
+// --- Drawn ---
+
+fn drawn(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    let is i64 as root = tree.root(&t);
+    let is i64 as col = box.create(&t, root, box.COLUMN);
+    layout.set_align(&t, col, layout.START, layout.START);
+    let is i64 as k = check.create(&t, col, "Check", 5);
+    let is i64 as r1 = check.radio(&t, col, "One", 3, 0);
+    let is i64 as r2 = check.radio(&t, col, "Two", 3, r1);
+    let is router.Router as r = router.init(router.settings_default());
+    frame_router = &r;
+    frame(&t, c);
+    let is math.rect.Rect as ik = check.indicator(&t, k);
+    let is i64 as kx = cast(i64, ik.x + 3.0);
+    let is i64 as ky = cast(i64, ik.y + 3.0);
+    let is i64 as cx = cast(i64, ik.x + ik.w / 2.0);
+    let is i64 as cy = cast(i64, ik.y + ik.h / 2.0);
+    check("off: the indicator's background", is8(kx, ky, theme.indicator.normal.bg, 1) == 1 &&
+          is8(cx, cy, theme.indicator.normal.bg, 1) == 1);
+    check("its label in the text colour", is8(ink_x(&t, k), ink_y(&t, k), theme.palette.fg, 1) == 1);
+    check.set_state(&t, k, check.ON);
+    frame(&t, c);
+    check("on: the accent", is8(kx, ky, theme.indicator.checked.bg, 1) == 1);
+    let is f64 as ind = ik.w;
+    check("a tick: its short stroke down", near_at(ik.x + ind * 0.32, ik.y + ind * 0.62, theme.indicator.checked.fg) == 1 &&
+          near_at(ik.x + ind * 0.25, ik.y + ind * 0.55, theme.indicator.checked.fg) == 1);
+    check("and its long stroke up", near_at(ik.x + ind * 0.66, ik.y + ind * 0.44, theme.indicator.checked.fg) == 1);
+    check("nothing above the tick", is8(cast(i64, ik.x + ind * 0.3), cast(i64, ik.y + ind * 0.3),
+          theme.indicator.checked.bg, 1) == 1);
+    check.set_state(&t, k, check.MIXED);
+    frame(&t, c);
+    check("mixed: a bar across the middle", is8(cx, cy, theme.indicator.checked.fg, 2) == 1 &&
+          is8(cx, cast(i64, ik.y + 3.0), theme.indicator.checked.bg, 1) == 1);
+    check("from a quarter in to a quarter from the end",
+          is8(cast(i64, ik.x + ind * 0.3), cy, theme.indicator.checked.fg, 2) == 1 &&
+          is8(cast(i64, ik.x + ind * 0.65), cy, theme.indicator.checked.fg, 2) == 1 &&
+          is8(cast(i64, ik.x + ind * 0.15), cy, theme.indicator.checked.bg, 1) == 1 &&
+          is8(cast(i64, ik.x + ind * 0.85), cy, theme.indicator.checked.bg, 1) == 1);
+    check.set_state(&t, k, check.OFF);
+    router.pointer_move(&t, &r, ik.x + 2.0, ik.y + 2.0, 10);
+    frame(&t, c);
+    let is style.Look as hl = style.pick(&theme.indicator, painter.S_HOVER, 0);
+    check("hovered: the overlay", is8(kx, ky, hl.bg, 1) == 1);
+    router.pointer_button(&t, &r, 1, 1, ik.x + 2.0, ik.y + 2.0, 12);
+    frame(&t, c);
+    let is style.Look as pl = style.pick(&theme.indicator, painter.S_HOVER | painter.S_PRESSED, 0);
+    check("pressed: the press's overlay", is8(kx, ky, pl.bg, 1) == 1);
+    router.pointer_move(&t, &r, 230.0, 195.0, 14);
+    frame(&t, c);
+    check("pressed and left: at rest", is8(kx, ky, theme.indicator.normal.bg, 1) == 1);
+    router.pointer_button(&t, &r, 1, 0, 230.0, 195.0, 16);
+    check.set_state(&t, k, check.OFF);
+    router.pointer_move(&t, &r, 230.0, 195.0, 20);
+    tree.set_enabled(&t, k, 0);
+    frame(&t, c);
+    let is style.Look as dl = style.pick(&theme.indicator, painter.S_DISABLED, 0);
+    check("disabled: faded", is8(kx, ky, style.over(dl.bg, theme.palette.window_bg), 2) == 1);
+    tree.set_enabled(&t, k, 1);
+    // Radios: round, a dot when chosen.
+    let is math.rect.Rect as i1 = check.indicator(&t, r1);
+    let is math.rect.Rect as i2 = check.indicator(&t, r2);
+    check("chosen: the accent, a dot in its text colour",
+          is8(cast(i64, i1.x + i1.w / 2.0), cast(i64, i1.y + i1.h / 2.0), theme.indicator.checked.fg, 1) == 1 &&
+          is8(cast(i64, i1.x + i1.w / 2.0), cast(i64, i1.y + 2.5), theme.indicator.checked.bg, 2) == 1);
+    check("round: its corner the window's", is8(cast(i64, i1.x), cast(i64, i1.y), theme.palette.window_bg, 2) == 1);
+    check("not chosen: the background, no dot",
+          is8(cast(i64, i2.x + i2.w / 2.0), cast(i64, i2.y + i2.h / 2.0), theme.indicator.normal.bg, 1) == 1);
+    frame_router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+// Whether colour col is at x, y or a pixel from it.
+fn near_at(x as f64, y as f64, col as math.color.Color) as i32 {
+    let is i64 as dy with mut = 0 - 1;
+    while (dy <= 1) {
+        let is i64 as dx with mut = 0 - 1;
+        while (dx <= 1) {
+            if (is8(cast(i64, x) + dx, cast(i64, y) + dy, col, 2) == 1) { return 1; }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return 0;
+}
+
+// Whether colour col is within two pixels of x, y.
+fn has_near(x as i64, y as i64, col as math.color.Color) as i32 {
+    let is i64 as dy with mut = 0 - 2;
+    while (dy <= 2) {
+        let is i64 as dx with mut = 0 - 2;
+        while (dx <= 2) {
+            if (is8(x + dx, y + dy, col, 2) == 1) { return 1; }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return 0;
+}
+
+fn main() as i32 {
+    let is *u8 as d = load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 1;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    frame_router = cast(*router.Router, 0);
+    theme = style.light();
+    theme.fonts.body.size = 20.0;
+
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as dl = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &dl);
+    let is text.Limits as lim = text.limits_default();
+    svc = text.open(&dv, &lim, fn_ptr(resolve), cast(*u8, 0), theme.fonts.family);
+
+    made();
+    checked();
+    radios();
+    drawn(&c);
+
+    if (fails == 0) {
+        io.printf("check: %d checks passed\n", checks);
+        return 0;
+    }
+    io.printf("check: %d of %d checks failed\n", fails, checks);
+    return 1;
+}
