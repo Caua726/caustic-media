@@ -406,7 +406,9 @@ theme change restyles them all:
 
 **The tree** (`tree.cst`, `widget.cst`, tested by `tree_test.cst`): handles
 with an era, the tree sized at open and never grown, children kept in order,
-recursive destruction children-first with each kind's `destroy` entry, reparent
+recursive destruction children-first with each kind's `destroy` entry — which
+may destroy other widgets in turn, a text view its menu, even one the walk would
+have reached next — reparent
 refusing cycles, inserting before a given sibling and moving among siblings
 (`create_before`, `insert`, `move_before`, with `index_of` and `child_at`), hidden and disabled inherited from ancestors, and layout
 invalidation that climbs to the root. It carries what the application lends
