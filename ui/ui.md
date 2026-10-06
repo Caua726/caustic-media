@@ -542,11 +542,13 @@ moved away from it — says so (`tree.reset_ime`, passed on by the program), so
 that what the input method commits next is not what was given up. FOCUS_IN
 says whether the focus came by keyboard. A press outside a modal scope goes
 nowhere, but the scope hears of it (`PRESS_OUTSIDE`), so a popup closes; the
-press is spent on that, and opens no context menu where it landed. When the
-popup ends, `restore` puts the scope back and gives the focus back in one
-step (`give_back`: the ring as it was, but no move by keyboard, so an entry
-does not select all of itself), nothing else focused on the way; a scope
-destroyed while set is none, so the window is never left shut.
+press is spent on that, and opens no context menu where it landed; the pointer
+moving outside it, over nothing it may reach, is told to it too
+(`MOVE_OUTSIDE`), for a menu bar's open menu to find the pointer on another
+title. When the popup ends, `restore` puts the scope back and gives the focus
+back in one step (`give_back`: the ring as it was, but no move by keyboard, so
+an entry does not select all of itself), nothing else focused on the way; a
+scope destroyed while set is none, so the window is never left shut.
 
 The router keeps a text caret's blink (`blink_test`): on for two thirds of the
 desktop's cycle and off for the rest, as GTK draws it, started again by each
@@ -988,6 +990,17 @@ context the program picks for each part of itself that speaks, popped by it —
 its newest — or taken away by the id push gave; one flashed goes by itself
 after a while through the window's timers, and a newer flash takes its place.
 Told as a status bar named by its message.
+
+**Menu bars** (`widgets/menubar.cst`, tested by `menubar_test`): titles in a
+row, each with a menu the program built, opened under it flush with its start.
+A press on a title opens its menu and another on it closes it; while one is
+open, the pointer reaching another title opens that one instead (the menu
+hears the pointer outside it, `menu.set_outside`), and Left and Right with
+nothing to open or close in the menu go to the menu before or after, round
+from the ends (`menu.set_sideways`). F10 opens the first and Alt with a
+title's mnemonic its own, each with its first item chosen; Escape closes, the
+focus going back where it was. The title whose menu is open is lit. Told as a
+menu bar of items that open, expanded while open.
 
 ## For scale
 

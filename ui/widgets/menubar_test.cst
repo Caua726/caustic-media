@@ -1,0 +1,437 @@
+// ui/widgets/menubar_test.cst — a menu bar: titles in a row, each opening its
+// menu below it; the pointer and the arrows going from one to the next while
+// one is open; F10 and mnemonics; told.
+//
+// Run from the repository's root, where text/testdata is.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../math/math.cst" as math;
+use "../../gpu/gpu.cst" as gpu;
+use "../../render/draw2d.cst" as draw2d;
+use "../../window/keys.cst" as keys;
+use "../../text/sfnt/sfnt.cst" as sfnt;
+use "../../text/sfnt/table.cst" as table;
+use "../../text/layout/font.cst" as font;
+use "../tree.cst" as tree;
+use "../widget.cst" as widget;
+use "../geom.cst" as geom;
+use "../layout.cst" as layout;
+use "../box.cst" as box;
+use "../damage.cst" as damage;
+use "../paint.cst" as paint;
+use "../painter.cst" as painter;
+use "../style.cst" as style;
+use "../access.cst" as access;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../text.cst" as text;
+use "../event.cst" as event;
+use "label.cst" as label;
+use "button.cst" as button;
+use "menu.cst" as menu;
+use "menubar.cst" as menubar;
+
+let is i64 as W with imut = 400;
+let is i64 as H with imut = 300;
+
+let is i32 as fails with mut = 0;
+let is i32 as checks with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    checks = checks + 1;
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (b[i] == 0 || a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, b[n] == 0);
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is *text.Service as svc with mut;
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as cmd with mut = 0;
+let is [120000]i32 as px with mut;
+let is *router.Router as frame_router with mut;
+
+fn frame(t as *tree.Tree, c as *draw2d.Canvas) as void {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    damage.collect(t);
+    text.next_frame(svc);
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    let is paint.Options as o = paint.options(&theme);
+    o.router = frame_router;
+    let is paint.Stats as st;
+    paint.frame(t, c, &o, &st);
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass_load(target, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, &px), W * H * 4);
+    tree.damage_clear(t);
+}
+
+fn ch(x as i64, y as i64, c as i64) as i64 { return cast(i64, cast(*u8, &px)[(y * W + x) * 4 + c]); }
+
+fn is8(x as i64, y as i64, col as math.color.Color, tol as i64) as i32 {
+    let is i64 as r = cast(i64, col.r * 255.0 + 0.5);
+    let is i64 as g = cast(i64, col.g * 255.0 + 0.5);
+    let is i64 as b = cast(i64, col.b * 255.0 + 0.5);
+    let is i64 as dr with mut = ch(x, y, 0) - r;
+    let is i64 as dg with mut = ch(x, y, 1) - g;
+    let is i64 as db with mut = ch(x, y, 2) - b;
+    if (dr < 0) { dr = 0 - dr; }
+    if (dg < 0) { dg = 0 - dg; }
+    if (db < 0) { db = 0 - db; }
+    return cast(i32, dr <= tol && dg <= tol && db <= tol);
+}
+
+// What a look's background is over the window's.
+fn bg_of(l as style.Look) as math.color.Color { return style.over(l.bg, theme.palette.window_bg); }
+
+// The middle of the ink of the first glyph of a label.
+fn ink_x(t as *tree.Tree, l as i64) as i64 {
+    let is *text.Glyph as g = text.glyph(label.run(t, l), 0);
+    return cast(i64, layout.window_rect(t, l).x + label.text_left(t, l) + g.x + g.adv / 2.0);
+}
+
+fn ink_y(t as *tree.Tree, l as i64) as i64 {
+    let is *text.Glyph as g = text.glyph(label.run(t, l), 0);
+    return cast(i64, layout.window_rect(t, l).y + label.text_top(t, l) + g.y - 4.0);
+}
+
+fn mid_x(t as *tree.Tree, b as i64) as f64 { return layout.window_rect(t, b).x + layout.window_rect(t, b).w / 2.0; }
+fn mid_y(t as *tree.Tree, b as i64) as f64 { return layout.window_rect(t, b).y + layout.window_rect(t, b).h / 2.0; }
+
+
+fn click(t as *tree.Tree, r as *router.Router, x as f64, y as f64, time as i64) as void {
+    router.pointer_move(t, r, x, y, time);
+    router.pointer_button(t, r, 1, 1, x, y, time);
+    router.pointer_button(t, r, 1, 0, x, y, time + 1);
+}
+
+fn key(t as *tree.Tree, r as *router.Router, k as i32, mods as i32, time as i64) as void {
+    router.key(t, r, k, mods, 1, 0, time);
+    router.key(t, r, k, mods, 0, 0, time + 1);
+}
+
+fn tree_for() as tree.Tree {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_text_service(&t, cast(*u8, svc));
+    return t;
+}
+
+let is i64 as chosen with mut = 0;
+fn on_choose(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { chosen = *cast(*i64, arg); }
+
+let is i64 as file with mut = 0;
+let is i64 as edit with mut = 0;
+let is i64 as help with mut = 0;
+let is i64 as new_item with mut = 0;
+let is i64 as undo_item with mut = 0;
+
+fn made(t as *tree.Tree) as i64 { return made_in(t, tree.root(t)); }
+
+fn made_in(t as *tree.Tree, parent as i64) as i64 {
+    let is i64 as mb = menubar.create(t, parent);
+    layout.set_align(t, mb, layout.FILL, layout.START);
+    file = menu.create(t);
+    new_item = menu.add_item(t, file, "_New", 4, 1);
+    menu.add_item(t, file, "_Open", 5, 2);
+    edit = menu.create(t);
+    undo_item = menu.add_item(t, edit, "_Undo", 5, 3);
+    menu.add_item(t, edit, "_Redo", 5, 4);
+    help = menu.create(t);
+    menu.add_item(t, help, "_About", 6, 5);
+    menubar.add(t, mb, "_File", 5, file);
+    menubar.add(t, mb, "_Edit", 5, edit);
+    menubar.add(t, mb, "_Help", 5, help);
+    signal.connect(t, file, signal.ACTIVATED, fn_ptr(on_choose), cast(*u8, 0));
+    return mb;
+}
+
+fn mx(t as *tree.Tree, w as i64) as f64 { return layout.window_rect(t, w).x + layout.window_rect(t, w).w / 2.0; }
+fn my(t as *tree.Tree, w as i64) as f64 { return layout.window_rect(t, w).y + layout.window_rect(t, w).h / 2.0; }
+
+fn opened() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as mb = made(&t);
+    let is i64 as before = button.create(&t, tree.root(&t), "Before", 6);
+    layout.set_align(&t, before, layout.CENTER, layout.CENTER);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is i64 as tf = menubar.title(&t, mb, 0);
+    let is i64 as te = menubar.title(&t, mb, 1);
+    let is math.rect.Rect as rf = layout.window_rect(&t, tf);
+    let is math.rect.Rect as re = layout.window_rect(&t, te);
+    check("its titles in a row along the top", menubar.count(&t, mb) == 3 && rf.y == 0.0 && rf.x == 0.0 && re.x >= rf.x + rf.w &&
+          rf.h >= theme.metrics.control_height && menubar.open_index(&t, mb) == 0 - 1);
+    router.focus(&t, &r, before, 1);
+    click(&t, &r, mx(&t, tf), my(&t, tf), 10);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("a title clicked: its menu open under it", menu.is_open(&t, file) == 1 && menubar.open_index(&t, mb) == 0 &&
+          layout.window_rect(&t, file).y >= rf.y + rf.h - 0.01 && near(layout.window_rect(&t, file).x, rf.x) == 1);
+    click(&t, &r, mx(&t, tf), my(&t, tf), 20);
+    check("clicked again: closed", menu.is_open(&t, file) == 0 && menubar.open_index(&t, mb) == 0 - 1 &&
+          router.focused(&t, &r) == before);
+    click(&t, &r, mx(&t, tf), my(&t, tf), 30);
+    router.pointer_move(&t, &r, mx(&t, te), my(&t, te), 40);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    check("the pointer onto another title: its menu instead", menu.is_open(&t, file) == 0 && menu.is_open(&t, edit) == 1 &&
+          menubar.open_index(&t, mb) == 1);
+    key(&t, &r, keys.RIGHT, 0, 50);
+    check("right: the next menu", menu.is_open(&t, help) == 1 && menu.is_open(&t, edit) == 0);
+    key(&t, &r, keys.RIGHT, 0, 60);
+    check("right at the last: round to the first", menu.is_open(&t, file) == 1 && menubar.open_index(&t, mb) == 0);
+    key(&t, &r, keys.LEFT, 0, 70);
+    check("left: back round to the last", menu.is_open(&t, help) == 1);
+    key(&t, &r, keys.ESCAPE, 0, 80);
+    check("escape: closed, the focus back", menubar.open_index(&t, mb) == 0 - 1 && router.focused(&t, &r) == before);
+    // F10 and mnemonics.
+    menubar.bind(&t, &r, mb);
+    key(&t, &r, keys.F10, 0, 90);
+    check("f10: the first menu, its first item chosen", menu.is_open(&t, file) == 1 && menu.current(&t, file) == new_item);
+    key(&t, &r, keys.ESCAPE, 0, 100);
+    key(&t, &r, keys.E, keys.MOD_ALT, 110);
+    check("alt and a title's letter: its menu", menu.is_open(&t, edit) == 1 && menu.current(&t, edit) == undo_item);
+    key(&t, &r, keys.LEFT, 0, 120);
+    chosen = 0;
+    key(&t, &r, keys.RETURN, 0, 130);
+    check("an item chosen: the program told, all closed", chosen == 1 && menubar.open_index(&t, mb) == 0 - 1 &&
+          menu.is_open(&t, file) == 0);
+    tree.close(&t);
+}
+
+fn righted() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as mb = made(&t);
+    layout.set_direction(&t, mb, layout.RTL);
+    layout.set_direction(&t, file, layout.RTL);
+    layout.set_direction(&t, edit, layout.RTL);
+    layout.set_direction(&t, help, layout.RTL);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as rf = layout.window_rect(&t, menubar.title(&t, mb, 0));
+    let is math.rect.Rect as re = layout.window_rect(&t, menubar.title(&t, mb, 1));
+    check("right to left: from the right", near(rf.x + rf.w, cast(f64, W)) == 1 && re.x + re.w <= rf.x + 0.01);
+    click(&t, &r, mx(&t, menubar.title(&t, mb, 0)), my(&t, menubar.title(&t, mb, 0)), 10);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as fm_ = layout.window_rect(&t, file);
+    check("its menu under it, flush right", near(fm_.x + fm_.w, rf.x + rf.w) == 1);
+    key(&t, &r, keys.LEFT, 0, 20);
+    check("left is on", menu.is_open(&t, edit) == 1);
+    key(&t, &r, keys.ESCAPE, 0, 30);
+    // A bar not the window wide, at its left: its menus flush right still,
+    // room to the right or not.
+    layout.set_align(&t, mb, layout.END, layout.START);
+    layout.set_min_size(&t, mb, 200.0, 0.0);
+    layout.set_max_size(&t, mb, 200.0, 100.0);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as rf2 = layout.window_rect(&t, menubar.title(&t, mb, 0));
+    click(&t, &r, mx(&t, menubar.title(&t, mb, 0)), my(&t, menubar.title(&t, mb, 0)), 40);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as fm2 = layout.window_rect(&t, file);
+    check("room to its right too: flush right", near(rf2.x + rf2.w, 200.0) == 1 && near(fm2.x + fm2.w, 200.0) == 1);
+    key(&t, &r, keys.ESCAPE, 0, 50);
+    tree.close(&t);
+}
+
+// What gets past it: presses on a title are its own, the right button's not.
+let is i64 as caught with mut = 0;
+
+fn catch(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    if (e.phase == event.BUBBLE && (e.kind == event.KEY_DOWN || e.kind == event.POINTER_DOWN)) {
+        caught = caught + 1;
+        return 1;
+    }
+    return 0;
+}
+
+fn catch_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    layout.overlay_measure(t, w, c, out);
+}
+
+fn catch_arrange(t as *tree.Tree, w as i64, data as *u8, r as *math.rect.Rect) as void {
+    layout.overlay_arrange(t, w, r);
+}
+
+let is tree.Kind as catcher with mut;
+
+fn edges() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    catcher = widget.kind("catcher", 8);
+    catcher.measure = fn_ptr(catch_measure);
+    catcher.arrange = fn_ptr(catch_arrange);
+    catcher.event = fn_ptr(catch);
+    let is i64 as holder = tree.create(&t, &catcher, tree.root(&t));
+    let is i64 as mb = made_in(&t, holder);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is i64 as tf = menubar.title(&t, mb, 0);
+    let is i64 as te = menubar.title(&t, mb, 1);
+    let is i64 as th = menubar.title(&t, mb, 2);
+    let is math.rect.Rect as rf = layout.window_rect(&t, tf);
+    let is math.rect.Rect as re = layout.window_rect(&t, te);
+    let is math.rect.Rect as rh = layout.window_rect(&t, th);
+    caught = 0;
+    click(&t, &r, mx(&t, tf), my(&t, tf), 10);
+    check("a title pressed: its own", menu.is_open(&t, file) == 1 && caught == 0);
+    key(&t, &r, keys.ESCAPE, 0, 20);
+    caught = 0;
+    router.pointer_button(&t, &r, 3, 1, mx(&t, tf), my(&t, tf), 30);
+    router.pointer_button(&t, &r, 3, 0, mx(&t, tf), my(&t, tf), 31);
+    check("the right button on a title: on up, no menu", caught == 1 && menubar.open_index(&t, mb) == 0 - 1);
+    // The pointer onto a title's very edges.
+    click(&t, &r, mx(&t, tf), my(&t, tf), 40);
+    router.pointer_move(&t, &r, re.x, re.y, 50);
+    check("onto another title's first column, its top row: its menu", menubar.open_index(&t, mb) == 1);
+    click(&t, &r, mx(&t, th), my(&t, th), 60);
+    click(&t, &r, mx(&t, th), my(&t, th), 70);
+    check("the last open", menubar.open_index(&t, mb) == 2);
+    router.pointer_move(&t, &r, rf.x + 1.0, rf.y + rf.h, 80);
+    check("just under a title: not onto it", menubar.open_index(&t, mb) == 2);
+    key(&t, &r, keys.ESCAPE, 0, 90);
+    // Measured: its titles' widths together; a title's label across its middle.
+    let is geom.Constraint as free = geom.unbounded();
+    let is geom.Size as s;
+    layout.measure(&t, mb, &free, &s);
+    check("as wide as its titles", near(s.pref_w, rf.w + re.w + rh.w) == 1 && near(s.min_w, s.pref_w) == 1);
+    let is math.rect.Rect as lr = layout.window_rect(&t, tree.first_child(&t, tf));
+    check("a title's label across its middle", near(lr.y + lr.h / 2.0, rf.y + rf.h / 2.0) == 1 &&
+          near(lr.x, rf.x + theme.metrics.control_pad_x) == 1);
+    check("not a menu bar, or no such title: none", menubar.title(&t, tree.root(&t), 0) == 0 && menubar.title(&t, mb, 0 - 1) == 0);
+    // Bound twice, then gone: F10 no longer its.
+    menubar.bind(&t, &r, mb);
+    menubar.bind(&t, &r, mb);
+    tree.destroy(&t, mb);
+    check("bound twice, then gone: F10 nobody's", router.key(&t, &r, keys.F10, 0, 1, 0, 100) == 0);
+    router.key(&t, &r, keys.F10, 0, 0, 0, 101);
+    tree.close(&t);
+}
+
+// The title whose menu is open drawn lit.
+fn drawn(c as *draw2d.Canvas) as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as mb = made(&t);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is math.rect.Rect as rf = layout.window_rect(&t, menubar.title(&t, mb, 0));
+    let is math.rect.Rect as re = layout.window_rect(&t, menubar.title(&t, mb, 1));
+    click(&t, &r, mx(&t, menubar.title(&t, mb, 0)), my(&t, menubar.title(&t, mb, 0)), 10);
+    frame(&t, c);
+    let is math.color.Color as lit = style.over(style.with_alpha(theme.palette.fg, 0.12), theme.palette.window_bg);
+    check("the open one's title lit, no other", is8(cast(i64, rf.x + 2.0), cast(i64, rf.y + 2.0), lit, 3) == 1 &&
+          is8(cast(i64, re.x + 2.0), cast(i64, re.y + 2.0), theme.palette.window_bg, 2) == 1);
+    key(&t, &r, keys.ESCAPE, 0, 20);
+    tree.close(&t);
+}
+
+fn told() as void {
+    let is tree.Tree as t = tree_for();
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    let is i64 as mb = made(&t);
+    layout.run(&t, cast(f64, W), cast(f64, H));
+    let is tree.Access as q;
+    access.describe(&t, &r, mb, &q);
+    check("told: a menu bar", q.role == access.ROLE_MENU_BAR);
+    let is i64 as tf = menubar.title(&t, mb, 0);
+    access.describe(&t, &r, tf, &q);
+    check("its titles items that open, named", q.role == access.ROLE_MENU_ITEM && (q.states & access.EXPANDABLE) != 0 &&
+          (q.states & access.EXPANDED) == 0 && q.name_len == 4 && (q.actions & access.EXPAND) != 0);
+    check("opened by assistive technology", access.act(&t, tf, access.EXPAND, 0.0) == 1 && menu.is_open(&t, file) == 1);
+    access.describe(&t, &r, tf, &q);
+    check("then expanded", (q.states & access.EXPANDED) != 0 && (q.actions & access.COLLAPSE) != 0);
+    access.act(&t, tf, access.COLLAPSE, 0.0);
+    check("and closed", menu.is_open(&t, file) == 0);
+    check("not a menu bar: nothing", menubar.count(&t, tree.root(&t)) == 0 && menubar.add(&t, tree.root(&t), "x", 1, file) == 0 &&
+          menubar.title(&t, mb, 7) == 0 && menubar.open_index(&t, tree.root(&t)) == 0 - 1);
+    tree.close(&t);
+}
+
+fn near(a as f64, b as f64) as i32 {
+    let is f64 as d = a - b;
+    return cast(i32, d < 0.01 && d > 0.0 - 0.01);
+}
+
+fn main() as i32 {
+    let is *u8 as d = load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 1;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    frame_router = cast(*router.Router, 0);
+    theme = style.light();
+    theme.fonts.body.size = 16.0;
+
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as limits = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &limits);
+    let is text.Limits as lim = text.limits_default();
+    svc = text.open(&dv, &lim, fn_ptr(resolve), cast(*u8, 0), theme.fonts.family);
+
+    opened();
+    righted();
+    edges();
+    drawn(&c);
+    told();
+
+    if (fails == 0) {
+        io.printf("menubar: %d checks passed\n", checks);
+        return 0;
+    }
+    io.printf("menubar: %d of %d checks failed\n", fails, checks);
+    return 1;
+}
