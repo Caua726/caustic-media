@@ -480,7 +480,12 @@ since nothing arrives while a finger is still (`longpress_test`); the touch and
 pen events themselves come from `input/`, which says which the pointer is with
 `router.set_source`. The
 router is fed by plain calls — `pointer_move`, `pointer_button`, `key`, `text` —
-which is what `input/` will call.
+which is what `input/` will call; and `paste`, giving a widget the text it asked
+the clipboard for (`tree.request_paste`, answered by the program), and
+`preedit`, the input method's composition with its caret, to the focus. The
+widget text is typed into says where its caret is (`tree.set_text_area`), for
+the input method's candidates. FOCUS_IN says whether the focus came by
+keyboard.
 
 **Signals and models** (`signal.cst`, `model.cst`, tested by `signal_test` and
 `model_test`): callbacks connected per widget and signal, called in connection
