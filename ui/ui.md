@@ -1002,6 +1002,16 @@ title's mnemonic its own, each with its first item chosen; Escape closes, the
 focus going back where it was. The title whose menu is open is lit. Told as a
 menu bar of items that open, expanded while open.
 
+**Assistants** (`widgets/assistant.cst`, tested by `assistant_test`): a task
+in steps, one at a time — the step's title on top, the step under it, and at
+the foot Cancel at the start, Back and Next at the end, mirrored in right to
+left. Next reads Finish on the last step and is held back while the step is not
+complete (`set_complete`); Back is held back on the first. The steps are kept
+in a stack, as large as the largest, so nothing moves from one to the next.
+Moving says VALUE_CHANGED, Finish ACTIVATED and Cancel CLOSED — closing is the
+program's to do. Bound to a window's router, Enter is Next or Finish and
+Escape Cancel. Told as a panel named by its step's title.
+
 ## For scale
 
 Measured on this machine, as a sense of what the references weigh rather than a
