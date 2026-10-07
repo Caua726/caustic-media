@@ -375,7 +375,7 @@ fn open_with(c as *Config) as Window {
         w.err = NO_WINDOW; return w;
     }
 
-    if (cast(i64, c.title) != 0) { xlib.XStoreName(d, w.xid, c.title); }
+    // Titled once it is a window: set_title, in UTF-8.
     if (cast(i64, c.class_name) != 0) { _set_class(&w, d, c.class_name); }
     _set_size_hints(&w, d, c);
 
@@ -443,10 +443,11 @@ fn open_with(c as *Config) as Window {
     w.frame_ns = 0;
     w.last_frame = 0;
 
-    xlib.XMapWindow(d, w.xid);
-    xlib.XFlush(d);
     w.ok = 1;
     w.err = OK;
+    if (cast(i64, c.title) != 0) { set_title(&w, c.title); }
+    xlib.XMapWindow(d, w.xid);
+    xlib.XFlush(d);
     return w;
 }
 
@@ -894,6 +895,10 @@ fn poll_event(w as *Window, out as *events.Event) as i32 {
     let is xev.XEvent as raw;
     while (poll_xevent(w, &raw) == 1) {
         if (events.decode(&raw, &w.km, out) == 1) {
+            // What the key typed, looked up while the press is at hand.
+            if (out.kind == events.KEY_DOWN) { text.lookup(&w.txt, &raw); }
+            // The window manager asking it to close: the close button.
+            if (xev.kind(&raw) == x.ClientMessage && xev.client(&raw).data[0] == w.wm_delete) { out.kind = events.CLOSE; }
             // The window manager writing the window's state: a STATE event,
             // with what it is now.
             if (xev.kind(&raw) == x.PropertyNotify && frame.is_state(&w.frst, w.display, xev.property(&raw).atom) == 1) {
@@ -919,6 +924,8 @@ fn focused(w as *Window) as i32 { return w.st.focused; }
 fn visible(w as *Window) as i32 { return w.st.visible; }
 fn should_close(w as *Window) as i32 { return w.st.should_close; }
 fn request_close(w as *Window) as void { w.st.should_close = 1; }
+// Asked to close, and kept open: the program said no.
+fn keep_open(w as *Window) as void { w.st.should_close = 0; }
 
 fn key_down(w as *Window, key_id as i32) as i32 { return events.key_down(&w.st, &w.km, key_id); }
 fn keycode_down(w as *Window, keycode as i32) as i32 { return events.keycode_down(&w.st, keycode); }
@@ -934,8 +941,63 @@ fn button_down(w as *Window, button as i32) as i32 { return events.button_down(&
 
 fn set_title(w as *Window, title as *u8) as void {
     if (w.ok == 0) { return; }
-    xlib.XStoreName(w.display, w.xid, title);
+    let is i64 as n with mut = 0;
+    while (title[n] != 0) { n = n + 1; }
+    set_title_utf8(w, title, n);
+}
+
+// The title, n bytes of UTF-8: _NET_WM_NAME as it is, which every window
+// manager of this century reads, and WM_NAME in Latin-1 for one that does
+// not — what Latin-1 has not written '?'.
+fn set_title_utf8(w as *Window, s as *u8, n as i64) as void {
+    if (w.ok == 0 || n < 0) { return; }
+    let is i64 as name = xlib.XInternAtom(w.display, "_NET_WM_NAME", 0);
+    let is i64 as utf8 = xlib.XInternAtom(w.display, "UTF8_STRING", 0);
+    xlib.XChangeProperty(w.display, w.xid, name, utf8, 8, x.PropModeReplace, s, cast(i32, n));
+    let is *u8 as latin = mem.core.mmap_anon(n + 1);
+    if (cast(i64, latin) > 0) {
+        let is i64 as k = _to_latin1(s, n, latin);
+        xlib.XChangeProperty(w.display, w.xid, _XA_WM_NAME, _XA_STRING, 8, x.PropModeReplace, latin, cast(i32, k));
+        mem.core.munmap(latin, n + 1);
+    }
     xlib.XFlush(w.display);
+}
+
+// The protocol's predefined atoms (Xatom.h).
+let is i64 as _XA_STRING  with imut = 31;
+let is i64 as _XA_WM_NAME with imut = 39;
+
+// UTF-8 into Latin-1, out at least n bytes: its length. A sequence is read
+// whole — its lead says how long, each byte after it a continuation — and
+// written as its character where Latin-1 has it, '?' where not; a byte that
+// starts no sequence, or one cut short, is a '?' of its own.
+fn _to_latin1(s as *u8, n as i64, out as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as k with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        let is i64 as len with mut = 1;
+        if (c >= 194 && c < 224) { len = 2; }
+        if (c >= 224 && c < 240) { len = 3; }
+        if (c >= 240 && c < 245) { len = 4; }
+        let is i32 as whole with mut = cast(i32, i + len <= n);
+        let is i64 as j with mut = 1;
+        while (whole == 1 && j < len) {
+            if ((cast(i64, s[i + j]) & 192) != 128) { whole = 0; }
+            j = j + 1;
+        }
+        if (c < 128) {
+            out[k] = cast(u8, c);
+        } else if (whole == 1 && len == 2 && c < 196) {
+            out[k] = cast(u8, ((c & 31) << 6) | (cast(i64, s[i + 1]) & 63));
+        } else {
+            out[k] = cast(u8, 63);
+        }
+        if (c >= 128 && (whole == 0 || len == 1)) { len = 1; }
+        k = k + 1;
+        i = i + len;
+    }
+    return k;
 }
 
 // A request, not a command: the window manager decides, and the answer arrives
@@ -1092,6 +1154,20 @@ fn clipboard_request_text(w as *Window) as i32 {
 fn clipboard_text(w as *Window, buf as *u8, cap as i64) as i64 {
     return clipboard.text(&w.clip, buf, cap);
 }
+
+// Either selection — clipboard.CLIPBOARD, what Ctrl+C fills, or PRIMARY,
+// what selecting with the mouse fills — owned with text, or asked for; what
+// was asked arrives while the pump runs (selection_ready).
+fn selection_set_text(w as *Window, which as i32, s as *u8, n as i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    return clipboard.set_text(&w.clip, w.display, w.xid, which, s, n);
+}
+fn selection_request_text(w as *Window, which as i32) as i32 {
+    if (w.ok == 0) { return 0; }
+    return clipboard.request_text(&w.clip, w.display, w.xid, which);
+}
+fn selection_ready(w as *Window) as i32 { return clipboard.ready(&w.clip); }
+fn selection_pending(w as *Window) as i32 { return clipboard.pending(&w.clip); }
 
 // The blocking form. It PUMPS rather than sleeps: if the other client asks us
 // for something while we wait and we are asleep, both sides wait forever.
