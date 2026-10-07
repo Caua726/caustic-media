@@ -1,0 +1,422 @@
+// ui/open_uri_test.cst — a link opened in the desktop's application for
+// it: through the portal, and through xdg-open where there is none. On a
+// private bus that starts none of the desktop's services, with a stand-in
+// xdg-open first on the path that writes what it was asked to open:
+//   env PATH=ui/testdata/bin:/usr/bin:/bin CAUSTIC_XDG_OPEN_OUT=build/open_uri_xdg_open \
+//       sh dbus/tools/run_dbus_bare.sh ./build/open_uri_test
+// and with neither a bus nor an xdg-open:
+//   env PATH=/nonexistent DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent ./build/open_uri_test nobody
+// The portal is played here on a connection of its own, both dispatched in
+// turn.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+use "open_uri.cst" as open_uri;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (s[k] != 0) { k = k + 1; }
+    return k;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    if (n != _len(b)) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+let is dbus.conn.Conn as c with mut;      // the program's
+let is dbus.conn.Conn as w with mut;      // the portal's
+let is dbus.conn.Conn as none with mut;   // no bus at all
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        dbus.conn.dispatch(&c, 0);
+        dbus.conn.dispatch(&w, 5);
+    }
+}
+
+// --- The portal ---
+
+let is [256]u8 as said with mut;   // what it was asked, a line a field
+let is i64 as said_n with mut = 0;
+let is i64 as calls with mut = 0;
+
+fn note(s as *u8, n as i64) as void {
+    if (said_n + n + 1 > 256) { return; }
+    mem.memcpy(cast(*u8, cast(i64, &said) + said_n), s, n);
+    said[said_n + n] = cast(u8, 10);
+    said_n = said_n + n + 1;
+}
+
+fn _options(k as *dbus.conn.Call) as void {
+    let is i64 as end = dbus.wire.get_array(&k.args, 8);
+    if (k.args.err == 0 && end == k.args.pos) { note("{}", 2); }
+}
+
+fn m_open_uri(cn as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    said_n = 0;
+    note("OpenURI", 7);
+    let is i64 as n with mut = 0;
+    let is *u8 as parent = dbus.wire.get_string(&k.args, &n);
+    note(parent, n);
+    let is *u8 as uri = dbus.wire.get_string(&k.args, &n);
+    note(uri, n);
+    _options(k);
+    dbus.wire.put_path(k.reply, "/org/freedesktop/portal/desktop/request/1_1/t");
+    calls = calls + 1;
+}
+
+// A descriptor handed over: where it is, and whether it was opened only to
+// say where (O_PATH), as the portal asks.
+fn m_open_file(cn as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    said_n = 0;
+    note("OpenFile", 8);
+    let is i64 as n with mut = 0;
+    let is *u8 as parent = dbus.wire.get_string(&k.args, &n);
+    note(parent, n);
+    // The index among the message's descriptors: taken, to close it here.
+    let is i64 as fd = dbus.conn.take_fd(k.msg, dbus.wire.get_u32(&k.args));
+    let is [64]u8 as proc;
+    mem.memcpy(cast(*u8, &proc), "/proc/self/fd/", 14);
+    let is i64 as pn with mut = 14;
+    let is [24]u8 as r;
+    let is i64 as rn with mut = 0;
+    let is i64 as x with mut = fd;
+    while (x > 0 || rn == 0) {
+        r[rn] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        rn = rn + 1;
+    }
+    while (rn > 0) {
+        rn = rn - 1;
+        proc[pn] = r[rn];
+        pn = pn + 1;
+    }
+    proc[pn] = cast(u8, 0);
+    let is [256]u8 as where;
+    let is i64 as wn = linux.readlink(cast(*u8, &proc), cast(*u8, &where), 256);
+    if (wn > 0) { note(cast(*u8, &where), wn); }
+    let is i64 as flags = linux.fcntl(fd, 3, 0);
+    if (flags >= 0 && (flags & 2097152) != 0) { note("O_PATH", 6); }
+    linux.close(fd);
+    _options(k);
+    dbus.wire.put_path(k.reply, "/org/freedesktop/portal/desktop/request/1_1/u");
+    calls = calls + 1;
+}
+
+let is [2]dbus.conn.Method as portal_methods with mut;
+let is [1]dbus.conn.Interface as portal_iface with mut;
+
+fn method(t as *dbus.conn.Method, name as *u8, ins as *u8, h as dbus.conn.MethodFn) as void {
+    t.name = name;
+    t.in_sig = ins;
+    t.out_sig = "o";
+    t.handler = h;
+    t.in_names = cast(*u8, 0);
+    t.out_names = cast(*u8, 0);
+}
+
+fn portal_up() as i32 { return cast(i32, dbus.conn.request_name(&w, open_uri.PORTAL_NAME, 4) == 1); }
+
+// --- xdg-open's stand-in ---
+
+let is [512]u8 as out_buf with mut;
+
+// What the stand-in wrote, its length — -1 until it has.
+fn xdg_said() as i64 {
+    let is *u8 as path = env.getenv("CAUSTIC_XDG_OPEN_OUT");
+    if (cast(i64, path) == 0) { return 0 - 1; }
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as n = linux.read(fd, cast(*u8, &out_buf), 512);
+    linux.close(fd);
+    return n;
+}
+
+fn xdg_forget() as void {
+    let is *u8 as path = env.getenv("CAUSTIC_XDG_OPEN_OUT");
+    if (cast(i64, path) != 0) { linux.unlink(path); }
+}
+
+// Until the stand-in has written, for at most two seconds.
+fn xdg_wait() as i64 {
+    let is i64 as until = time.now_ms() + 2000;
+    let is i64 as n with mut = xdg_said();
+    while (n < 0 && time.now_ms() < until) {
+        pump(20);
+        n = xdg_said();
+    }
+    return n;
+}
+
+let is open_uri.Request as rq with mut;
+
+// "/tmp/caustic-PID-" and then tail (tn bytes) into out: its length.
+fn tmp_name(out as *u8, tail as *u8, tn as i64) as i64 {
+    mem.memcpy(out, "/tmp/caustic-", 13);
+    let is [24]u8 as r;
+    let is i64 as rn with mut = 0;
+    let is i64 as x with mut = linux.getpid();
+    while (x > 0) {
+        r[rn] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        rn = rn + 1;
+    }
+    let is i64 as k with mut = 13;
+    while (rn > 0) {
+        rn = rn - 1;
+        out[k] = r[rn];
+        k = k + 1;
+    }
+    out[k] = cast(u8, 45);
+    mem.memcpy(cast(*u8, cast(i64, out) + k + 1), tail, tn);
+    out[k + 1 + tn] = cast(u8, 0);
+    return k + 1 + tn;
+}
+
+fn touch(path as *u8) as void { linux.close(linux.open(path, 65 | 512, 420)); }
+
+// Uri (n bytes) opened: whether the portal was handed the file at path.
+fn handed(uri as *u8, n as i64, path as *u8) as i32 {
+    calls = 0;
+    if (open_uri.open(&rq, &c, uri, n, "", 0) != 1) { return 0; }
+    let is i64 as until = time.now_ms() + 2000;
+    while (open_uri.how(&rq) == open_uri.PENDING && time.now_ms() < until) { pump(20); }
+    let is [256]u8 as want;
+    let is i64 as pn = _len(path);
+    mem.memcpy(cast(*u8, &want), "OpenFile\n\n", 10);
+    mem.memcpy(cast(*u8, cast(i64, &want) + 10), path, pn);
+    mem.memcpy(cast(*u8, cast(i64, &want) + 10 + pn), "\nO_PATH\n{}\n", 11);
+    return cast(i32, open_uri.how(&rq) == open_uri.PORTAL && calls == 1 && said_n == 21 + pn &&
+                mem.memcmp(cast(*u8, &said), cast(*u8, &want), said_n) == 0);
+}
+
+// Uri (n bytes) opened: whether the portal was asked to open it as a link.
+fn linked(uri as *u8, n as i64) as i32 {
+    calls = 0;
+    if (open_uri.open(&rq, &c, uri, n, "", 0) != 1) { return 0; }
+    let is i64 as until = time.now_ms() + 2000;
+    while (open_uri.how(&rq) == open_uri.PENDING && time.now_ms() < until) { pump(20); }
+    return cast(i32, open_uri.how(&rq) == open_uri.PORTAL && calls == 1 && mem.memcmp(cast(*u8, &said), "OpenURI\n", 8) == 0);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() > 1) {
+        check("nobody to open it: not asked", open_uri.open(&rq, &none, "https://example.org/x", 21, "", 0) == 0 &&
+              open_uri.how(&rq) == open_uri.FAILED);
+        if (fails == 0) {
+            io.printf("open uri, nobody: all checks passed\n");
+            return 0;
+        }
+        io.printf("open uri, nobody: %d failures\n", fails);
+        return 1;
+    }
+    check("the stand-in's file named", cast(i64, env.getenv("CAUSTIC_XDG_OPEN_OUT")) != 0);
+    xdg_forget();
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    c = dbus.conn.open_session(&l);
+    w = dbus.conn.open_session(&l);
+    check("two connections", dbus.conn.is_open(&c) == 1 && dbus.conn.is_open(&w) == 1);
+    method(&portal_methods[0], "OpenURI", "ssa{sv}", fn_ptr(m_open_uri));
+    method(&portal_methods[1], "OpenFile", "sha{sv}", fn_ptr(m_open_file));
+    portal_iface[0].name = open_uri.PORTAL_IFACE;
+    portal_iface[0].methods = cast(*dbus.conn.Method, &portal_methods);
+    portal_iface[0].nmethods = 2;
+    portal_iface[0].props = cast(*dbus.conn.Property, 0);
+    portal_iface[0].nprops = 0;
+    portal_iface[0].signals = cast(*dbus.conn.SignalDecl, 0);
+    portal_iface[0].nsignals = 0;
+    dbus.conn.export(&w, open_uri.PORTAL_PATH, cast(*dbus.conn.Interface, &portal_iface), 1, cast(*u8, 0));
+    check("the portal up", portal_up() == 1);
+
+    // --- Where the window is, as the portal names it ---
+    let is [32]u8 as parent;
+    let is i64 as pn = open_uri.x11_parent(4207021, cast(*u8, &parent));
+    check("an X window: x11: and its id in hex", same(cast(*u8, &parent), pn, "x11:4031ad") == 1);
+    let is [32]u8 as nowhere;
+    check("none: nothing", open_uri.x11_parent(0, cast(*u8, &nowhere)) == 0 && nowhere[0] == 0);
+
+    // --- A link: the portal's OpenURI ---
+    check("a link: asked", open_uri.open(&rq, &c, "https://example.org/a%20b?x=1", 29, cast(*u8, &parent), pn) == 1);
+    check("asked, not yet answered", open_uri.how(&rq) == open_uri.PENDING);
+    let is i64 as until with mut = time.now_ms() + 2000;
+    while (open_uri.how(&rq) == open_uri.PENDING && time.now_ms() < until) { pump(20); }
+    check("opened by the portal", open_uri.how(&rq) == open_uri.PORTAL);
+    check("the portal told the link, the window, no options",
+          same(cast(*u8, &said), said_n, "OpenURI\nx11:4031ad\nhttps://example.org/a%20b?x=1\n{}\n") == 1);
+    check("xdg-open left alone", xdg_said() < 0);
+
+    // --- A file of this machine: the portal's OpenFile, with a descriptor ---
+    let is [24]u8 as pidd;
+    let is i64 as pdn with mut = 0;
+    let is [24]u8 as r;
+    let is i64 as rn with mut = 0;
+    let is i64 as x with mut = linux.getpid();
+    while (x > 0) {
+        r[rn] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        rn = rn + 1;
+    }
+    while (rn > 0) {
+        rn = rn - 1;
+        pidd[pdn] = r[rn];
+        pdn = pdn + 1;
+    }
+    let is [128]u8 as fname;
+    mem.memcpy(cast(*u8, &fname), "/tmp/caustic open ", 18);
+    mem.memcpy(cast(*u8, cast(i64, &fname) + 18), cast(*u8, &pidd), pdn);
+    let is i64 as fnn = 18 + pdn;
+    fname[fnn] = cast(u8, 0);
+    let is [128]u8 as furi;
+    mem.memcpy(cast(*u8, &furi), "file:///tmp/caustic%20open%20", 29);
+    mem.memcpy(cast(*u8, cast(i64, &furi) + 29), cast(*u8, &pidd), pdn);
+    let is i64 as un = 29 + pdn;
+    let is [128]u8 as luri;
+    mem.memcpy(cast(*u8, &luri), "file://localhost/tmp/caustic%20open%20", 38);
+    mem.memcpy(cast(*u8, cast(i64, &luri) + 38), cast(*u8, &pidd), pdn);
+    let is i64 as ln = 38 + pdn;
+    let is i64 as fd = linux.open(cast(*u8, &fname), 65 | 512, 420);
+    linux.close(fd);
+    calls = 0;
+    check("a file: asked", open_uri.open(&rq, &c, cast(*u8, &furi), un, "", 0) == 1);
+    until = time.now_ms() + 2000;
+    while (open_uri.how(&rq) == open_uri.PENDING && time.now_ms() < until) { pump(20); }
+    let is [256]u8 as want;
+    mem.memcpy(cast(*u8, &want), "OpenFile\n\n", 10);
+    mem.memcpy(cast(*u8, cast(i64, &want) + 10), cast(*u8, &fname), fnn);
+    mem.memcpy(cast(*u8, cast(i64, &want) + 10 + fnn), "\nO_PATH\n{}\n", 11);
+    check("opened by the portal, handed the file itself, opened only to say where",
+          open_uri.how(&rq) == open_uri.PORTAL && calls == 1 && said_n == 21 + fnn &&
+          mem.memcmp(cast(*u8, &said), cast(*u8, &want), said_n) == 0);
+    calls = 0;
+    check("a file on localhost: the same", open_uri.open(&rq, &c, cast(*u8, &luri), ln, "", 0) == 1);
+    until = time.now_ms() + 2000;
+    while (open_uri.how(&rq) == open_uri.PENDING && time.now_ms() < until) { pump(20); }
+    check("handed the same file", calls == 1 && said_n == 21 + fnn && mem.memcmp(cast(*u8, &said), cast(*u8, &want), said_n) == 0);
+    linux.unlink(cast(*u8, &fname));
+    calls = 0;
+    check("a file that is not there: not asked", open_uri.open(&rq, &c, cast(*u8, &furi), un, "", 0) == 0 &&
+          open_uri.how(&rq) == open_uri.FAILED);
+    // Its escapes, each hex digit's every form; the scheme and the host in
+    // either case.
+    let is [128]u8 as esc_path;
+    let is [9]u8 as esc_name;
+    mem.memcpy(cast(*u8, &esc_name), "0JJ9oo~~", 8);
+    esc_name[8] = cast(u8, 9);
+    tmp_name(cast(*u8, &esc_path), cast(*u8, &esc_name), 9);
+    touch(cast(*u8, &esc_path));
+    let is [160]u8 as esc_uri;
+    mem.memcpy(cast(*u8, &esc_uri), "file://", 7);
+    let is i64 as eun with mut = 7 + tmp_name(cast(*u8, cast(i64, &esc_uri) + 7), "%30%4a%4A%39%6F%6f%7e%7E%09", 27);
+    check("escapes: 0, 9, a, A, f, F, e, E, a tab", handed(cast(*u8, &esc_uri), eun, cast(*u8, &esc_path)) == 1);
+    linux.unlink(cast(*u8, &esc_path));
+    let is [128]u8 as case_path;
+    tmp_name(cast(*u8, &case_path), "plain", 5);
+    touch(cast(*u8, &case_path));
+    let is [160]u8 as case_uri;
+    mem.memcpy(cast(*u8, &case_uri), "FiLe://LocalHost", 16);
+    eun = 16 + tmp_name(cast(*u8, cast(i64, &case_uri) + 16), "plain", 5);
+    check("FILE and LOCALHOST: as file and localhost", handed(cast(*u8, &case_uri), eun, cast(*u8, &case_path)) == 1);
+    linux.unlink(cast(*u8, &case_path));
+    // An escape the length cuts short, though the bytes after would make one.
+    let is [128]u8 as cut_path;
+    tmp_name(cast(*u8, &cut_path), "A", 1);
+    touch(cast(*u8, &cut_path));
+    let is [160]u8 as cut_uri;
+    mem.memcpy(cast(*u8, &cut_uri), "file://", 7);
+    eun = 7 + tmp_name(cast(*u8, cast(i64, &cut_uri) + 7), "%41", 3);
+    check("an escape cut short: not asked", open_uri.open(&rq, &c, cast(*u8, &cut_uri), eun - 1, "", 0) == 0);
+    check("whole: asked", handed(cast(*u8, &cut_uri), eun, cast(*u8, &cut_path)) == 1);
+    linux.unlink(cast(*u8, &cut_path));
+    // Not a hex digit: no escape, though a byte of that name is there.
+    let is [128]u8 as odd_path;
+    let is [1]u8 as odd;
+    odd[0] = cast(u8, 17);
+    tmp_name(cast(*u8, &odd_path), cast(*u8, &odd), 1);
+    touch(cast(*u8, &odd_path));
+    let is [160]u8 as odd_uri;
+    mem.memcpy(cast(*u8, &odd_uri), "file://", 7);
+    eun = 7 + tmp_name(cast(*u8, cast(i64, &odd_uri) + 7), "%G1", 3);
+    check("%G1: no escape, not asked", open_uri.open(&rq, &c, cast(*u8, &odd_uri), eun, "", 0) == 0);
+    linux.unlink(cast(*u8, &odd_path));
+    check("file:/ alone: the root", handed("file://", 6, "/") == 1);
+    check("file:// and nothing: not asked", open_uri.open(&rq, &c, "file://", 7, "", 0) == 0);
+    check("cut before its colon: a link, file", linked("file:///tmp/x", 4) == 1);
+    check("ftp: a link, though it begins as file does", linked("ftp://example.org/x", 19) == 1);
+    let is [4100]u8 as longest;
+    mem.memcpy(cast(*u8, &longest), "https://e.org/", 14);
+    mem.memset(cast(*u8, cast(i64, &longest) + 14), 97, 4086);
+    check("a link of the longest: asked", linked(cast(*u8, &longest), open_uri.MAX_URI) == 1);
+    check("one byte longer: not", open_uri.open(&rq, &c, cast(*u8, &longest), open_uri.MAX_URI + 1, "", 0) == 0);
+    pump(50);
+    calls = 0;
+    check("on another machine: not asked", open_uri.open(&rq, &c, "file://elsewhere/etc/hostname", 29, "", 0) == 0);
+    check("a bad escape: not asked", open_uri.open(&rq, &c, "file:///tmp/a%2", 15, "", 0) == 0);
+    check("an empty link: not asked", open_uri.open(&rq, &c, "", 0, "", 0) == 0);
+    pump(50);
+    check("none of them told to the portal", calls == 0);
+
+    // --- No portal: xdg-open ---
+    dbus.conn.release_name(&w, open_uri.PORTAL_NAME);
+    check("with no portal: asked", open_uri.open(&rq, &c, "https://example.org/x", 21, "", 0) == 1);
+    let is i64 as n with mut = xdg_wait();
+    check("opened by xdg-open instead", open_uri.how(&rq) == open_uri.XDG_OPEN && same(cast(*u8, &out_buf), n, "https://example.org/x") == 1);
+    xdg_forget();
+    // A link with what a shell would read differently: one argument as it is.
+    check("its words not a shell's", open_uri.open(&rq, &c, "https://e.org/?a=$(x)&b='c' d", 29, "", 0) == 1);
+    n = xdg_wait();
+    check("handed as it is", same(cast(*u8, &out_buf), n, "https://e.org/?a=$(x)&b='c' d") == 1);
+    xdg_forget();
+
+    // --- No session bus at all: xdg-open at once ---
+    check("no bus: asked", open_uri.open(&rq, &none, "mailto:a@example.org", 20, "", 0) == 1);
+    check("no bus: xdg-open at once", open_uri.how(&rq) == open_uri.XDG_OPEN);
+    n = xdg_wait();
+    check("no bus: handed over", same(cast(*u8, &out_buf), n, "mailto:a@example.org") == 1);
+    xdg_forget();
+    let is [128]u8 as nb_path;
+    tmp_name(cast(*u8, &nb_path), "nobus", 5);
+    touch(cast(*u8, &nb_path));
+    let is [160]u8 as nb_uri;
+    mem.memcpy(cast(*u8, &nb_uri), "file://", 7);
+    eun = 7 + tmp_name(cast(*u8, cast(i64, &nb_uri) + 7), "nobus", 5);
+    check("no bus, a file: asked", open_uri.open(&rq, &none, cast(*u8, &nb_uri), eun, "", 0) == 1 &&
+          open_uri.how(&rq) == open_uri.XDG_OPEN);
+    n = xdg_wait();
+    check("no bus, a file: handed over as it is", same(cast(*u8, &out_buf), n, cast(*u8, &nb_uri)) == 1);
+    xdg_forget();
+    linux.unlink(cast(*u8, &nb_path));
+
+    // --- A connection broken under it: xdg-open ---
+    let is dbus.conn.Limits as bl = dbus.conn.limits_default();
+    let is dbus.conn.Conn as broken with mut = dbus.conn.open_session(&bl);
+    linux.close(dbus.conn.fd(&broken));
+    check("broken: asked all the same", open_uri.open(&rq, &broken, "https://example.org/y", 21, "", 0) == 1 &&
+          open_uri.how(&rq) == open_uri.XDG_OPEN);
+    n = xdg_wait();
+    check("broken: handed to xdg-open", same(cast(*u8, &out_buf), n, "https://example.org/y") == 1);
+    xdg_forget();
+
+    dbus.conn.close(&w);
+    dbus.conn.close(&c);
+    if (fails == 0) {
+        io.printf("open uri: all checks passed\n");
+        return 0;
+    }
+    io.printf("open uri: %d failures\n", fails);
+    return 1;
+}

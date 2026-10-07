@@ -1,0 +1,227 @@
+// ui/open_uri.cst — a link opened in the desktop's application for it.
+//
+// A link clicked in the about dialog, "Show in folder", a help page: the
+// desktop knows which program opens it — the browser, the mail program, the
+// file manager. The program asks the desktop portal
+// (org.freedesktop.portal.OpenURI), which every Linux desktop answers, and
+// which a sandboxed program can reach: OpenURI for a link, and for a file of
+// this machine — which OpenURI refuses — OpenFile, handed the file itself,
+// opened only to say where it is (O_PATH), as the portal asks. The window
+// asking is named (x11_parent) so the desktop can put what it shows above it.
+//
+// Where there is no portal — no session bus, or nobody on it answering —
+// the program runs xdg-open, the freedesktop command for the same, with the
+// link as one argument, never read by a shell as words.
+//
+// The call to the portal does not wait: open asks, the program's loop
+// dispatches the connection (session.cst), and how says, once the answer
+// came, who opened it. Windows' ShellExecuteW comes with its backend.
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+
+let is *u8 as PORTAL_NAME  with imut = "org.freedesktop.portal.Desktop";
+let is *u8 as PORTAL_PATH  with imut = "/org/freedesktop/portal/desktop";
+let is *u8 as PORTAL_IFACE with imut = "org.freedesktop.portal.OpenURI";
+
+// Who opened it.
+let is i32 as PENDING  with imut = 0;   // asked of the portal, no answer yet
+let is i32 as PORTAL   with imut = 1;
+let is i32 as XDG_OPEN with imut = 2;   // handed to xdg-open
+let is i32 as FAILED   with imut = 3;   // nobody: a bad link, a file not there, no portal and no xdg-open
+
+// The longest link.
+let is i64 as MAX_URI with imut = 4096;
+
+let is i64 as _O_PATH with imut = 2097152;
+
+struct Request {
+    c      as *dbus.conn.Conn;
+    how    as i32;
+    _pad   as i32;
+    serial as i64;              // the portal's answer awaited
+    n      as i64;
+    uri    as [4097]u8;
+}
+
+fn _lower(c as u8) as u8 {
+    if (c >= 65 && c <= 90) { return cast(u8, c + 32); }
+    return c;
+}
+
+// Whether s (n bytes) begins with p, letters in either case.
+fn _starts(s as *u8, n as i64, p as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (p[i] != 0) {
+        if (i >= n || _lower(s[i]) != p[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _hex(c as u8) as i64 {
+    if (c >= 48 && c <= 57) { return cast(i64, c) - 48; }
+    let is u8 as l = _lower(c);
+    if (l >= 97 && l <= 102) { return cast(i64, l) - 87; }
+    return 0 - 1;
+}
+
+// The path of a file URI of this machine — "file:///p", "file://localhost/p",
+// "file:/p" — its escapes undone, into out (MAX_URI bytes, zero-terminated):
+// its length, or -1 when it names another machine or is not one.
+fn _local_path(s as *u8, n as i64, out as *u8) as i64 {
+    if (_starts(s, n, "file:") == 0) { return 0 - 1; }
+    let is i64 as i with mut = 5;
+    if (i + 1 < n && s[i] == 47 && s[i + 1] == 47) {
+        i = i + 2;
+        let is i64 as h = i;
+        while (i < n && s[i] != 47) { i = i + 1; }
+        if (i > h && (i - h != 9 || _starts(cast(*u8, cast(i64, s) + h), 9, "localhost") == 0)) { return 0 - 1; }
+    }
+    if (i >= n || s[i] != 47) { return 0 - 1; }
+    let is i64 as k with mut = 0;
+    while (i < n && s[i] != 63 && s[i] != 35) {
+        let is i64 as v with mut = cast(i64, s[i]);
+        if (v == 37) {
+            if (i + 2 >= n) { return 0 - 1; }
+            let is i64 as hi = _hex(s[i + 1]);
+            let is i64 as lo = _hex(s[i + 2]);
+            if (hi < 0 || lo < 0) { return 0 - 1; }
+            v = hi * 16 + lo;
+            i = i + 2;
+        }
+        if (v == 0 || k >= MAX_URI - 1) { return 0 - 1; }
+        out[k] = cast(u8, v);
+        k = k + 1;
+        i = i + 1;
+    }
+    out[k] = cast(u8, 0);
+    return k;
+}
+
+// The window an X program asks from, as the portal names it: "x11:" and its
+// id in hex, into out (at least 21 bytes). Its length; 0 for no window.
+fn x11_parent(xid as i64, out as *u8) as i64 {
+    if (xid <= 0) {
+        out[0] = cast(u8, 0);
+        return 0;
+    }
+    mem.memcpy(out, "x11:", 4);
+    let is [16]u8 as r;
+    let is i64 as rn with mut = 0;
+    let is i64 as x with mut = xid;
+    while (x > 0) {
+        r[rn] = "0123456789abcdef"[x % 16];
+        x = x / 16;
+        rn = rn + 1;
+    }
+    let is i64 as k with mut = 4;
+    while (rn > 0) {
+        rn = rn - 1;
+        out[k] = r[rn];
+        k = k + 1;
+    }
+    out[k] = cast(u8, 0);
+    return k;
+}
+
+// The link handed to xdg-open, if there is one, which goes on alone: XDG_OPEN,
+// or FAILED.
+fn _xdg_open(rq as *Request) as i32 {
+    // The shell only finds it and leaves it running: the link is its first
+    // argument, "$1", never part of the command.
+    let is [6]*u8 as argv;
+    argv[0] = "sh";
+    argv[1] = "-c";
+    argv[2] = "command -v xdg-open >/dev/null 2>&1 || exit 127; xdg-open \"$1\" </dev/null & exit 0";
+    argv[3] = "sh";
+    argv[4] = cast(*u8, &rq.uri);
+    argv[5] = cast(*u8, 0);
+    let is i64 as pid = linux.fork();
+    if (pid == 0) {
+        linux.execve("/bin/sh", cast(*u8, &argv), env.envp());
+        linux.exit(126);
+    }
+    if (pid < 0) { return FAILED; }
+    let is i32 as status with mut = 0 - 1;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+    if (status != 0) { return FAILED; }
+    return XDG_OPEN;
+}
+
+fn _answered(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *Request as rq = cast(*Request, user);
+    rq.serial = 0;
+    if (m.kind == dbus.message.METHOD_RETURN) {
+        rq.how = PORTAL;
+        return;
+    }
+    // Nobody there, or a portal without OpenURI.
+    rq.how = _xdg_open(rq);
+}
+
+fn _no_options(w as *dbus.wire.Writer) as void {
+    let is i64 as at = dbus.wire.put_array(w, 8);
+    dbus.wire.put_array_end(w, at, 8);
+}
+
+// Uri (n bytes) opened in the desktop's application for it, asked from the
+// window parent (pn bytes, "" for none; see x11_parent), over c — the
+// program's session connection, or one not open. 1 when it was asked of
+// someone: how says of whom, rq — kept where it is until the answer comes —
+// PENDING meanwhile. 0 when nobody can: a bad link, a file that is not there.
+fn open(rq as *Request, c as *dbus.conn.Conn, uri as *u8, n as i64, parent as *u8, pn as i64) as i32 {
+    if (rq.serial != 0) { dbus.conn.cancel_reply(rq.c, rq.serial); }
+    rq.c = c;
+    rq.serial = 0;
+    rq.how = FAILED;
+    if (n <= 0 || n > MAX_URI) { return 0; }
+    mem.memcpy(cast(*u8, &rq.uri), uri, n);
+    rq.uri[n] = cast(u8, 0);
+    rq.n = n;
+    let is i32 as bus = dbus.conn.is_open(c);
+    let is dbus.message.Message as m with mut = dbus.message.empty();
+    if (_starts(uri, n, "file:") == 1) {
+        let is [4097]u8 as path;
+        if (_local_path(uri, n, cast(*u8, &path)) < 0) { return 0; }
+        let is i64 as fd = linux.open(cast(*u8, &path), _O_PATH | linux.O_CLOEXEC, 0);
+        if (fd < 0) { return 0; }
+        if (bus == 0 || dbus.conn.can_pass_fds(c) == 0) {
+            linux.close(fd);
+            rq.how = _xdg_open(rq);
+            return cast(i32, rq.how == XDG_OPEN);
+        }
+        m = dbus.message.method_call(PORTAL_NAME, PORTAL_PATH, PORTAL_IFACE, "OpenFile");
+        m.signature = "sha{sv}";
+        let is *dbus.wire.Writer as w = dbus.conn.body(c);
+        dbus.wire.put_string_n(w, parent, pn);
+        dbus.wire.put_fd(w, fd);
+        _no_options(w);
+        rq.serial = dbus.conn.call_async(c, &m, fn_ptr(_answered), cast(*u8, rq));
+        // Sent: the portal has its own.
+        linux.close(fd);
+    } else {
+        if (bus == 0) {
+            rq.how = _xdg_open(rq);
+            return cast(i32, rq.how == XDG_OPEN);
+        }
+        m = dbus.message.method_call(PORTAL_NAME, PORTAL_PATH, PORTAL_IFACE, "OpenURI");
+        m.signature = "ssa{sv}";
+        let is *dbus.wire.Writer as w = dbus.conn.body(c);
+        dbus.wire.put_string_n(w, parent, pn);
+        dbus.wire.put_string_n(w, uri, n);
+        _no_options(w);
+        rq.serial = dbus.conn.call_async(c, &m, fn_ptr(_answered), cast(*u8, rq));
+    }
+    if (rq.serial == 0) {
+        // Not sent: the connection broken.
+        rq.how = _xdg_open(rq);
+        return cast(i32, rq.how == XDG_OPEN);
+    }
+    rq.how = PENDING;
+    return 1;
+}
+
+// Who opened it: PENDING, PORTAL, XDG_OPEN or FAILED.
+fn how(rq as *Request) as i32 { return rq.how; }
