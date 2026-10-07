@@ -105,6 +105,7 @@ type GetFn    = fn(*Conn, *wire.Writer, *u8) as void;      // writes the value, 
 type SetFn    = fn(*Conn, *wire.Reader, *u8) as i32;       // reads it; 0 refuses it
 type SignalFn = fn(*Conn, *message.Message, *u8) as void;
 type ExistsFn = fn(*u8, *u8, i64) as i32;                 // a subtree's: whether path, n bytes, is there
+type ReplyFn  = fn(*Conn, *message.Message, *u8) as void; // a reply, or an error, to a call_async
 
 // Names are for Introspect: the arguments' names, comma-separated, or null.
 struct Method {
@@ -161,6 +162,13 @@ struct Match {
 // --- The connection ---
 
 let is i64 as MAX_QUEUED_FDS with imut = 64;
+let is i64 as MAX_REPLIES    with imut = 16;   // calls in flight with a reply handler
+
+struct Pending {
+    serial  as i64;   // 0 for a free slot
+    handler as ReplyFn;
+    user    as *u8;
+}
 
 struct Conn {
     fd        as i64;
@@ -193,6 +201,7 @@ struct Conn {
     guid      as [40]u8;
     last      as message.Message;
     cur_path  as *u8;   // the path a call being answered was made to; null between calls
+    replies   as [16]Pending;
 }
 
 fn _p(base as *u8, off as i64) as *u8 { return cast(*u8, cast(i64, base) + off); }
@@ -330,6 +339,11 @@ fn _empty(l as *Limits) as Conn {
     c.held_fds = 0;
     c.xlen = 0;
     c.cur_path = cast(*u8, 0);
+    let is i64 as pi with mut = 0;
+    while (pi < MAX_REPLIES) {
+        c.replies[pi].serial = 0;
+        pi = pi + 1;
+    }
     c.obj_cap = l.objects;
     c.match_cap = l.matches;
     c.unique[0] = 0;
@@ -579,6 +593,40 @@ fn wait_reply(c as *Conn, serial as i64, timeout_ms as i64, out as *message.Mess
     return c.err;
 }
 
+// Sends m, with body(c) as its arguments, its reply — or error — handed to
+// handler(c, reply, user) when dispatch, or a wait for another reply, comes
+// to it. Nothing waits: for a program's loop, and for calls made from
+// inside a handler. The serial, or 0 with last_error set — FULL with
+// MAX_REPLIES in flight already.
+fn call_async(c as *Conn, m as *message.Message, handler as ReplyFn, user as *u8) as i64 {
+    let is i64 as free with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_REPLIES && free < 0) {
+        if (c.replies[i].serial == 0) { free = i; }
+        i = i + 1;
+    }
+    if (free < 0) {
+        wire.reset(&c.bodyw);
+        c.err = FULL;
+        return 0;
+    }
+    let is i64 as serial = send(c, m);
+    if (serial == 0) { return 0; }
+    c.replies[free].serial = serial;
+    c.replies[free].handler = handler;
+    c.replies[free].user = user;
+    return serial;
+}
+
+// A call_async given up on: its reply, when it comes, dropped.
+fn cancel_reply(c as *Conn, serial as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_REPLIES) {
+        if (c.replies[i].serial == serial) { c.replies[i].serial = 0; }
+        i = i + 1;
+    }
+}
+
 // send, then wait_reply: the reply in out, or what went wrong.
 fn call_method(c as *Conn, m as *message.Message, timeout_ms as i64, out as *message.Message) as i32 {
     *out = message.empty();
@@ -653,11 +701,25 @@ fn _dispatch_front(c as *Conn, f as *message.Message) as void {
     c.in_handler = 1;
     if (m.kind == message.SIGNAL) { _deliver_signal(c, &m); }
     if (m.kind == message.METHOD_CALL) { _answer(c, &m); }
+    if (m.kind == message.METHOD_RETURN || m.kind == message.ERROR) { _deliver_reply(c, &m); }
     c.in_handler = 0;
     _close_fds(cast(*i32, &c.dfds), nf);
 }
 
 fn _same(a as *u8, b as *u8) as i32 { return message.named(a, b); }
+
+// A reply to a call_async, to its handler; any other dropped.
+fn _deliver_reply(c as *Conn, m as *message.Message) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_REPLIES) {
+        if (c.replies[i].serial != 0 && c.replies[i].serial == m.reply_serial) {
+            c.replies[i].serial = 0;
+            call(c.replies[i].handler, c, m, c.replies[i].user);
+            return;
+        }
+        i = i + 1;
+    }
+}
 
 fn _deliver_signal(c as *Conn, m as *message.Message) as void {
     let is i64 as i with mut = 0;
