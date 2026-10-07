@@ -1,0 +1,256 @@
+// ui/notify_test.cst — desktop notifications, through
+// org.freedesktop.Notifications, played by a child process on a private bus:
+//   sh dbus/tools/run_dbus.sh ./build/notify_test
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+use "notify.cst" as notify;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+// --- The server, played by a child ---
+
+let is [512]u8 as heard with mut;   // what Notify was given, a line a field
+let is i64 as heard_n with mut = 0;
+let is i32 as quit with mut = 0;
+
+fn note(s as *u8, n as i64) as void {
+    if (heard_n + n + 1 > 512) { return; }
+    mem.memcpy(cast(*u8, cast(i64, &heard) + heard_n), s, n);
+    heard[heard_n + n] = cast(u8, 10);
+    heard_n = heard_n + n + 1;
+}
+
+fn note_int(v as i64) as void {
+    let is [24]u8 as b;
+    let is i64 as k with mut = 0;
+    let is i64 as x with mut = v;
+    if (x < 0) {
+        b[0] = cast(u8, 45);
+        k = 1;
+        x = 0 - x;
+    }
+    let is [24]u8 as r;
+    let is i64 as n with mut = 0;
+    if (x == 0) {
+        r[0] = cast(u8, 48);
+        n = 1;
+    }
+    while (x > 0) {
+        r[n] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    while (n > 0) {
+        n = n - 1;
+        b[k] = r[n];
+        k = k + 1;
+    }
+    note(cast(*u8, &b), k);
+}
+
+fn m_notify(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    heard_n = 0;
+    let is i64 as n with mut = 0;
+    let is *u8 as app = dbus.wire.get_string(&k.args, &n);
+    note(app, n);
+    note_int(cast(i64, dbus.wire.get_u32(&k.args)));
+    let is *u8 as icon = dbus.wire.get_string(&k.args, &n);
+    note(icon, n);
+    let is *u8 as summary = dbus.wire.get_string(&k.args, &n);
+    note(summary, n);
+    let is *u8 as body = dbus.wire.get_string(&k.args, &n);
+    note(body, n);
+    let is i64 as end = dbus.wire.get_array(&k.args, 4);
+    while (k.args.err == 0 && k.args.pos < end) {
+        let is *u8 as a = dbus.wire.get_string(&k.args, &n);
+        note(a, n);
+    }
+    let is i64 as hend = dbus.wire.get_array(&k.args, 8);
+    if (k.args.err == 0) { k.args.pos = hend; }
+    note_int(dbus.wire.get_i32(&k.args));
+    dbus.wire.put_u32(k.reply, 7);
+}
+
+fn m_close(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as id = cast(i64, dbus.wire.get_u32(&k.args));
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    dbus.wire.put_u32(w, id);
+    dbus.wire.put_u32(w, 3);
+    dbus.conn.emit(c, notify.PATH, notify.IFACE, "NotificationClosed", "uu");
+}
+
+fn m_heard(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    dbus.wire.put_string_n(k.reply, cast(*u8, &heard), heard_n);
+}
+
+fn m_invoke(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as id = cast(i64, dbus.wire.get_u32(&k.args));
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    dbus.wire.put_u32(w, id);
+    dbus.wire.put_string(w, "reply");
+    dbus.conn.emit(c, notify.PATH, notify.IFACE, "ActionInvoked", "us");
+}
+
+fn m_quit(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { quit = 1; }
+
+let is [2]dbus.conn.Method as server_methods with mut;
+let is [3]dbus.conn.Method as fake_methods with mut;
+let is [2]dbus.conn.Interface as ifaces with mut;
+
+fn method(t as *dbus.conn.Method, name as *u8, ins as *u8, outs as *u8, h as dbus.conn.MethodFn) as void {
+    t.name = name;
+    t.in_sig = ins;
+    t.out_sig = outs;
+    t.handler = h;
+    t.in_names = cast(*u8, 0);
+    t.out_names = cast(*u8, 0);
+}
+
+fn iface(f as *dbus.conn.Interface, name as *u8, ms as *dbus.conn.Method, n as i64) as void {
+    f.name = name;
+    f.methods = ms;
+    f.nmethods = n;
+    f.props = cast(*dbus.conn.Property, 0);
+    f.nprops = 0;
+    f.signals = cast(*dbus.conn.SignalDecl, 0);
+    f.nsignals = 0;
+}
+
+fn serve() as i64 {
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    if (dbus.conn.is_open(&c) == 0) { return 2; }
+    method(&server_methods[0], "Notify", "susssasa{sv}i", "u", fn_ptr(m_notify));
+    method(&server_methods[1], "CloseNotification", "u", "", fn_ptr(m_close));
+    method(&fake_methods[0], "Heard", "", "s", fn_ptr(m_heard));
+    method(&fake_methods[1], "Invoke", "u", "", fn_ptr(m_invoke));
+    method(&fake_methods[2], "Quit", "", "", fn_ptr(m_quit));
+    iface(&ifaces[0], notify.IFACE, cast(*dbus.conn.Method, &server_methods), 2);
+    iface(&ifaces[1], "org.caustic.FakeNotifications", cast(*dbus.conn.Method, &fake_methods), 3);
+    dbus.conn.export(&c, notify.PATH, cast(*dbus.conn.Interface, &ifaces), 2, cast(*u8, 0));
+    if (dbus.conn.request_name(&c, notify.NAME, 4) != 1) { return 3; }
+    let is i64 as until = time.now_ms() + 20000;
+    while (quit == 0 && time.now_ms() < until) {
+        if (dbus.conn.dispatch(&c, 100) < 0) { return 4; }
+    }
+    dbus.conn.close(&c);
+    return 0;
+}
+
+fn tell(member as *u8, arg as i64, sig as *u8, out as *dbus.message.Message, c as *dbus.conn.Conn) as i32 {
+    let is dbus.message.Message as m with mut = dbus.message.method_call(notify.NAME, notify.PATH, "org.caustic.FakeNotifications", member);
+    m.signature = sig;
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    if (sig[0] == 117) { dbus.wire.put_u32(w, arg); }
+    return dbus.conn.call_method(c, &m, 2000, out);
+}
+
+// --- The program ---
+
+let is i64 as acted_id with mut = 0;
+let is [32]u8 as acted with mut;
+let is i64 as acted_n with mut = 0;
+let is i64 as closed_id with mut = 0;
+let is i64 as closed_why with mut = 0;
+
+fn on_action(user as *u8, id as i64, key as *u8, n as i64) as void {
+    acted_id = id;
+    if (n <= 32) {
+        mem.memcpy(cast(*u8, &acted), key, n);
+        acted_n = n;
+    }
+}
+
+fn on_closed(user as *u8, id as i64, reason as i64) as void {
+    closed_id = id;
+    closed_why = reason;
+}
+
+let is notify.Notifier as nt with mut;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i64 as pid = linux.fork();
+    if (pid == 0) { linux.exit(serve()); }
+    time.sleep_ms(300);
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    notify.open(&nt, &c, "Notes", 5, fn_ptr(on_action), fn_ptr(on_closed), cast(*u8, 0));
+    let is i64 as id = notify.send(&nt, "Saved", 5, "Notes saved the file.", 21, "document-save", 13,
+                                   "reply\0Reply\0dismiss\0Dismiss", 28, 2, 5000);
+    check("sent: its id", id == 7);
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    check("asked what it heard", tell("Heard", 0, "", &rep, &c) == dbus.conn.OK);
+    let is dbus.wire.Reader as r with mut = dbus.message.body(&rep);
+    let is i64 as hn with mut = 0;
+    let is *u8 as h with mut = dbus.wire.get_string(&r, &hn);
+    check("the application, a new one, its icon, its summary and body, its actions, its time",
+          same(h, hn, "Notes\n0\ndocument-save\nSaved\nNotes saved the file.\nreply\nReply\ndismiss\nDismiss\n5000\n") == 1);
+    tell("Invoke", id, "u", &rep, &c);
+    let is i64 as until with mut = time.now_ms() + 2000;
+    while (acted_id == 0 && time.now_ms() < until) { dbus.conn.dispatch(&c, 20); }
+    check("an action chosen: told, which", acted_id == 7 && same(cast(*u8, &acted), acted_n, "reply") == 1);
+    notify.close(&nt, id);
+    until = time.now_ms() + 2000;
+    while (closed_id == 0 && time.now_ms() < until) { dbus.conn.dispatch(&c, 20); }
+    check("closed: told, and why", closed_id == 7 && closed_why == 3);
+    let is i64 as again = notify.replace(&nt, id, "Saved again", 11, "", 0, "", 0, "", 0, 0, 0 - 1);
+    tell("Heard", 0, "", &rep, &c);
+    r = dbus.message.body(&rep);
+    h = dbus.wire.get_string(&r, &hn);
+    check("in place of it, the server's own time", again == 7 && same(h, hn, "Notes\n7\n\nSaved again\n\n-1\n") == 1);
+
+    // Fewer actions asked for than are there; the length ending inside them.
+    notify.send(&nt, "One", 3, "", 0, "", 0, "reply\0Reply\0dismiss\0Dismiss", 28, 1, 0);
+    tell("Heard", 0, "", &rep, &c);
+    r = dbus.message.body(&rep);
+    h = dbus.wire.get_string(&r, &hn);
+    check("one action asked for: one", same(h, hn, "Notes\n0\n\nOne\n\nreply\nReply\n0\n") == 1);
+    notify.send(&nt, "Cut", 3, "", 0, "", 0, "reply\0Reply\0dismiss\0Dismiss", 11, 2, 0);
+    tell("Heard", 0, "", &rep, &c);
+    r = dbus.message.body(&rep);
+    h = dbus.wire.get_string(&r, &hn);
+    check("the length ending inside them: as far as it goes", same(h, hn, "Notes\n0\n\nCut\n\nreply\nReply\n0\n") == 1);
+    notify.send(&nt, "Edge", 4, "", 0, "", 0, "reply\0Reply\0dismiss\0Dismiss", 12, 2, 0);
+    tell("Heard", 0, "", &rep, &c);
+    r = dbus.message.body(&rep);
+    h = dbus.wire.get_string(&r, &hn);
+    check("the length ending between two: no empty one after", same(h, hn, "Notes\n0\n\nEdge\n\nreply\nReply\n0\n") == 1);
+    notify.send(&nt, "Mid", 3, "", 0, "", 0, "reply\0Reply\0dismiss\0Dismiss", 9, 2, 0);
+    tell("Heard", 0, "", &rep, &c);
+    r = dbus.message.body(&rep);
+    h = dbus.wire.get_string(&r, &hn);
+    check("the length ending inside the second: that much of it", same(h, hn, "Notes\n0\n\nMid\n\nreply\nRep\n0\n") == 1);
+
+    tell("Quit", 0, "", &rep, &c);
+    let is i32 as status with mut = 0;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+    // Nobody there now, and nobody started for it on this bus.
+    check("nobody to tell: no id", notify.send(&nt, "Gone", 4, "", 0, "", 0, "", 0, 0, 0) == 0);
+    notify.stop(&nt);
+    dbus.conn.close(&c);
+    if (fails == 0) {
+        io.printf("notify: all checks passed\n");
+        return 0;
+    }
+    io.printf("notify: %d failures\n", fails);
+    return 1;
+}

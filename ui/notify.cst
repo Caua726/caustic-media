@@ -1,0 +1,128 @@
+// ui/notify.cst — the desktop's notifications.
+//
+// A message shown outside the application's windows — a download finished,
+// a message came — through org.freedesktop.Notifications, which every Linux
+// desktop answers: a summary, a body, an icon of the desktop's icon theme,
+// actions to choose (each a key and what it says), how long to show it. The
+// desktop tells which action was chosen and when one closed, as the
+// program's connection is dispatched (session.cst). Windows' toasts come
+// with its backend.
+use "std/mem.cst" as mem;
+use "../dbus/dbus.cst" as dbus;
+
+let is *u8 as NAME  with imut = "org.freedesktop.Notifications";
+let is *u8 as PATH  with imut = "/org/freedesktop/Notifications";
+let is *u8 as IFACE with imut = "org.freedesktop.Notifications";
+
+// Why one closed: as the specification numbers them.
+let is i64 as EXPIRED   with imut = 1;
+let is i64 as DISMISSED with imut = 2;
+let is i64 as CLOSED    with imut = 3;   // asked by close
+
+// An action chosen: cb(user, id, key, n). One closed: cb(user, id, why).
+type ActionFn = fn(*u8, i64, *u8, i64) as void;
+type ClosedFn = fn(*u8, i64, i64) as void;
+
+struct Notifier {
+    c        as *dbus.conn.Conn;
+    app      as [64]u8;
+    app_n    as i64;
+    action   as ActionFn;
+    closed   as ClosedFn;
+    user     as *u8;
+    m_action as i64;
+    m_closed as i64;
+}
+
+fn _invoked(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *Notifier as nt = cast(*Notifier, user);
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as id = cast(i64, dbus.wire.get_u32(&r));
+    let is i64 as n with mut = 0;
+    let is *u8 as key = dbus.wire.get_string(&r, &n);
+    if (r.err == 0 && cast(i64, nt.action) != 0) { call(nt.action, nt.user, id, key, n); }
+}
+
+fn _gone(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *Notifier as nt = cast(*Notifier, user);
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as id = cast(i64, dbus.wire.get_u32(&r));
+    let is i64 as why = cast(i64, dbus.wire.get_u32(&r));
+    if (r.err == 0 && cast(i64, nt.closed) != 0) { call(nt.closed, nt.user, id, why); }
+}
+
+// Notifications from the application named app (n bytes) over c — told of
+// what is chosen and closed through the callbacks, either null.
+fn open(nt as *Notifier, c as *dbus.conn.Conn, app as *u8, n as i64, on_action as ActionFn, on_closed as ClosedFn,
+        user as *u8) as void {
+    nt.c = c;
+    let is i64 as k with mut = n;
+    if (k > 63) { k = 63; }
+    mem.memcpy(cast(*u8, &nt.app), app, k);
+    nt.app[k] = cast(u8, 0);
+    nt.app_n = k;
+    nt.action = on_action;
+    nt.closed = on_closed;
+    nt.user = user;
+    nt.m_action = dbus.conn.add_match(c, cast(*u8, 0), PATH, IFACE, "ActionInvoked", fn_ptr(_invoked), cast(*u8, nt));
+    nt.m_closed = dbus.conn.add_match(c, cast(*u8, 0), PATH, IFACE, "NotificationClosed", fn_ptr(_gone), cast(*u8, nt));
+}
+
+// No longer told.
+fn stop(nt as *Notifier) as void {
+    if (nt.m_action > 0) { dbus.conn.remove_match(nt.c, nt.m_action); }
+    if (nt.m_closed > 0) { dbus.conn.remove_match(nt.c, nt.m_closed); }
+    nt.m_action = 0;
+    nt.m_closed = 0;
+}
+
+// Shown in place of notification id (0: a new one): summary, body, an icon
+// name of the desktop's theme ("" for none), count actions — a key and what
+// it says, back to back at actions, each zero-terminated, an bytes in all —
+// for timeout_ms (0: until dismissed; -1: as the desktop likes). Its id, 0
+// when nobody showed it.
+fn replace(nt as *Notifier, id as i64, summary as *u8, sn as i64, body as *u8, bn as i64, icon as *u8, inn as i64,
+           actions as *u8, an as i64, count as i64, timeout_ms as i64) as i64 {
+    let is dbus.message.Message as m with mut = dbus.message.method_call(NAME, PATH, IFACE, "Notify");
+    m.signature = "susssasa{sv}i";
+    let is *dbus.wire.Writer as w = dbus.conn.body(nt.c);
+    dbus.wire.put_string_n(w, cast(*u8, &nt.app), nt.app_n);
+    dbus.wire.put_u32(w, id);
+    dbus.wire.put_string_n(w, icon, inn);
+    dbus.wire.put_string_n(w, summary, sn);
+    dbus.wire.put_string_n(w, body, bn);
+    let is i64 as at = dbus.wire.put_array(w, 4);
+    let is i64 as i with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < count * 2 && i < an) {
+        let is i64 as e with mut = i;
+        while (e < an && actions[e] != 0) { e = e + 1; }
+        dbus.wire.put_string_n(w, cast(*u8, cast(i64, actions) + i), e - i);
+        i = e + 1;
+        k = k + 1;
+    }
+    dbus.wire.put_array_end(w, at, 4);
+    let is i64 as hints = dbus.wire.put_array(w, 8);
+    dbus.wire.put_array_end(w, hints, 8);
+    dbus.wire.put_i32(w, timeout_ms);
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    if (dbus.conn.call_method(nt.c, &m, 2000, &rep) != dbus.conn.OK) { return 0; }
+    let is dbus.wire.Reader as r with mut = dbus.message.body(&rep);
+    let is i64 as got = cast(i64, dbus.wire.get_u32(&r));
+    if (r.err != 0) { return 0; }
+    return got;
+}
+
+// A new notification: see replace.
+fn send(nt as *Notifier, summary as *u8, sn as i64, body as *u8, bn as i64, icon as *u8, inn as i64, actions as *u8,
+        an as i64, count as i64, timeout_ms as i64) as i64 {
+    return replace(nt, 0, summary, sn, body, bn, icon, inn, actions, an, count, timeout_ms);
+}
+
+// Notification id taken away.
+fn close(nt as *Notifier, id as i64) as void {
+    let is dbus.message.Message as m with mut = dbus.message.method_call(NAME, PATH, IFACE, "CloseNotification");
+    m.signature = "u";
+    dbus.wire.put_u32(dbus.conn.body(nt.c), id);
+    dbus.conn.send(nt.c, &m);
+}
