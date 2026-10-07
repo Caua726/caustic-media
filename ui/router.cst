@@ -29,6 +29,8 @@ use "tree.cst" as tree;
 use "widget.cst" as widget;
 use "layout.cst" as layout;
 use "event.cst" as event;
+use "signal.cst" as signal;
+use "dnd.cst" as dnd;
 use "../window/keys.cst" as keys;
 
 // Deepest tree the hover chain follows. Past it, the innermost widgets are
@@ -131,7 +133,22 @@ struct Router {
     shortcuts       as [64]Shortcut;
     mnemonic_w      as [128]i64;   // widget, 0 for a free slot
     mnemonic_key    as [128]i32;
+    // A drag over the window (see Dragging): one a widget here began, run from
+    // the pointer, or one from outside, told by the platform's loop.
+    drag            as dnd.Payload;
+    drag_on         as i32;
+    drag_own        as i32;        // begun here, by drag_src
+    drag_src        as i64;
+    drag_to         as i64;        // what takes it where it is, 0 for nothing
+    drag_takes      as i32;        // what drag_to takes of what it offers
+    drag_by_table   as i32;        // drag_to took it as a drop target of the program's
+    drag_x          as f64;
+    drag_y          as f64;
+    drop_w          as [16]i64;    // the program's drop targets; 0 for a free slot
+    drop_offers     as [16]i32;
 }
+
+let is i64 as MAX_DROP_TARGETS with imut = 16;
 
 fn init(s as Settings) as Router {
     let is Router as r;
@@ -180,6 +197,22 @@ fn init(s as Settings) as Router {
     while (i < MAX_MNEMONICS) {
         r.mnemonic_w[i] = 0;
         r.mnemonic_key[i] = 0;
+        i = i + 1;
+    }
+    r.drag = dnd.text(cast(*u8, 0), 0, 0);
+    r.drag.offers = 0;
+    r.drag_on = 0;
+    r.drag_own = 0;
+    r.drag_src = 0;
+    r.drag_to = 0;
+    r.drag_takes = 0;
+    r.drag_by_table = 0;
+    r.drag_x = 0.0;
+    r.drag_y = 0.0;
+    i = 0;
+    while (i < MAX_DROP_TARGETS) {
+        r.drop_w[i] = 0;
+        r.drop_offers[i] = 0;
         i = i + 1;
     }
     return r;
@@ -438,6 +471,13 @@ fn _pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64)
         let is f64 as th = r.settings.drag_threshold;
         if (lx * lx + ly * ly > th * th) { r.lp_armed = 0; }
     }
+    // A drag begun here goes where the pointer goes.
+    if (r.drag_on == 1 && r.drag_own == 1) {
+        r.drag_x = x;
+        r.drag_y = y;
+        _drag_over(t, r, time);
+        return;
+    }
     let is i64 as captor = _captor(t, r);
     if (captor != 0) {
         if (r.buttons != 0 && r.dragging == 0) {
@@ -451,6 +491,8 @@ fn _pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64)
                 ds.y = y;
                 ds.mods = r.mods;
                 _direct(t, captor, &ds);
+                // It began a drag: the pointer is the drag's from here.
+                if (r.drag_on == 1 && r.drag_own == 1) { return; }
             }
         }
         let is event.Event as e = event.make(event.POINTER_MOVE, time);
@@ -481,6 +523,12 @@ fn _pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64)
 // disabled has none — a shape says what can be done there. The default
 // outside the window and outside a modal scope.
 fn pointer_shape(t as *tree.Tree, r as *Router) as i32 {
+    // Dragging from here: whether it can be let go here, and as what.
+    if (r.drag_on == 1 && r.drag_own == 1) {
+        if (r.drag_to == 0) { return tree.SHAPE_NO_DROP; }
+        if (_action(r) == dnd.COPY) { return tree.SHAPE_COPY; }
+        return tree.SHAPE_MOVE;
+    }
     if (r.pointer_in == 0) { return tree.SHAPE_DEFAULT; }
     let is i64 as w with mut = _captor(t, r);
     if (w == 0) { w = _hit_scoped(t, r, r.pointer_x, r.pointer_y); }
@@ -603,6 +651,18 @@ fn _pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,
 
     r.buttons = (r.buttons | bit) - bit;
     r.lp_armed = 0;
+    // Let go: a drag begun here is dropped where it is.
+    if (r.drag_on == 1 && r.drag_own == 1 && r.buttons == 0) {
+        r.drag_x = x;
+        r.drag_y = y;
+        _drag_over(t, r, time);
+        _end(t, r, _drop(t, r, time), time);
+        r.capture = 0;
+        r.dragging = 0;
+        r.spent = 0;
+        if (r.pointer_in == 1) { _update_hover(t, r, _hit_scoped(t, r, x, y), time); }
+        return;
+    }
     if (r.swallow == 1 && button == 1) {
         // The long press already answered this press with a menu.
         r.swallow = 0;
@@ -1095,6 +1155,15 @@ fn _key(t as *tree.Tree, r as *Router, k as i32, mods as i32, pressed as i32,
     // Alt going down or up shows or hides every mnemonic's underline.
     if (((r.mods ^ mods) & keys.MOD_ALT) != 0) { tree.invalidate_paint_subtree(t, tree.root(t)); }
     r.mods = mods;
+    // Escape calls off a drag begun here; the release after it does nothing.
+    if (pressed == 1 && k == keys.ESCAPE && r.drag_on == 1 && r.drag_own == 1) {
+        _drag_target(t, r, 0, 0, 0, time);
+        _end(t, r, 0, time);
+        r.capture = 0;
+        r.dragging = 0;
+        r.swallow = 1;
+        return 1;
+    }
     let is i64 as f = focused(t, r);
     let is event.Event as e = event.make(event.KEY_DOWN, time);
     e.key = k;
@@ -1312,4 +1381,226 @@ fn _run_mnemonic(t as *tree.Tree, r as *Router, k as i32, time as i64) as i32 {
 fn mnemonics_visible(r as *Router) as i32 {
     if ((r.mods & keys.MOD_ALT) != 0) { return 1; }
     return 0;
+}
+
+// --- Dragging ---
+//
+// A drag is over the window in one of two ways. A widget here began it — on
+// DRAG_START, as the widget holding the pointer — with begin_drag: from then
+// the pointer is the drag's, moving it over the window, until the button is
+// let go, dropping it, or Escape calls it off; the widget hears DRAG_END with
+// what was done (a move is its to finish, removing what moved). Or it comes
+// from outside — another program, another window of this one — and the
+// platform's loop tells it with drag_enter, drag_move, drag_leave and
+// drag_drop, answering the platform with what they return.
+//
+// Either way, the widget under the pointer is asked with DRAG_OVER, bubbling,
+// and the first to return some of what is offered takes it there; the one that
+// took it hears DRAG_LEAVE when it no longer does, and DROP when it is let go
+// over it. A widget may also be taken as a drop target by the program,
+// add_drop_target: it takes what it is said to, and a drop on it is said with
+// signal.DROPPED.
+
+// Begins a drag of p from w, which holds the pointer — a widget does on
+// DRAG_START. p is copied; what it points at is w's until DRAG_END. 1 when
+// begun; 0 with one already going or nothing offered.
+fn begin_drag(t as *tree.Tree, r as *Router, w as i64, p as *dnd.Payload) as i32 {
+    if (r.drag_on == 1 || p.offers == 0) { return 0; }
+    r.drag = *p;
+    r.drag_on = 1;
+    r.drag_own = 1;
+    r.drag_src = w;
+    r.drag_to = 0;
+    r.drag_takes = 0;
+    r.drag_x = r.pointer_x;
+    r.drag_y = r.pointer_y;
+    _drag_over(t, r, r.now);
+    return 1;
+}
+
+// A drag from outside came over the window at x, y: what is taken there, dnd
+// bits, 0 for nothing — the platform's answer. p is copied; what it points at
+// stays the caller's until drag_leave or drag_drop.
+fn drag_enter(t as *tree.Tree, r as *Router, p as *dnd.Payload, x as f64, y as f64, time as i64) as i32 {
+    if (r.drag_on == 1 && r.drag_own == 1) { return 0; }
+    _drag_target(t, r, 0, 0, 0, time);
+    r.drag = *p;
+    r.drag_on = 1;
+    r.drag_own = 0;
+    r.drag_src = 0;
+    r.drag_x = x;
+    r.drag_y = y;
+    _drag_over(t, r, time);
+    return r.drag_takes;
+}
+
+// It moved to x, y: what is taken there.
+fn drag_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as i32 {
+    if (r.drag_on == 0 || r.drag_own == 1) { return 0; }
+    r.drag_x = x;
+    r.drag_y = y;
+    _drag_over(t, r, time);
+    return r.drag_takes;
+}
+
+// It left, or was let go somewhere it was not taken.
+fn drag_leave(t as *tree.Tree, r as *Router, time as i64) as void {
+    if (r.drag_on == 0 || r.drag_own == 1) { return; }
+    _drag_target(t, r, 0, 0, 0, time);
+    r.drag_on = 0;
+}
+
+// It was let go at x, y, what it offers now there to be had: what was done
+// with it, dnd.COPY or MOVE, 0 for nothing.
+fn drag_drop(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as i32 {
+    if (r.drag_on == 0 || r.drag_own == 1) { return 0; }
+    r.drag_x = x;
+    r.drag_y = y;
+    _drag_over(t, r, time);
+    let is i32 as done = _drop(t, r, time);
+    r.drag_on = 0;
+    return done;
+}
+
+fn drag_active(r as *Router) as i32 { return r.drag_on; }
+
+// The widget a drag over the window began from, 0 for one from outside.
+fn drag_source(r as *Router) as i64 {
+    if (r.drag_on == 0) { return 0; }
+    return r.drag_src;
+}
+
+// What takes it where it is, 0 for nothing; and what of it.
+fn drag_target(r as *Router) as i64 { return r.drag_to; }
+fn drag_takes(r as *Router) as i32 { return r.drag_takes; }
+
+// w taken as a drop target of the program's, of what offers says: a drag
+// offering some of it is taken there, and a drop on it said with
+// signal.DROPPED. 1, or 0 with the table full.
+fn add_drop_target(r as *Router, w as i64, offers as i32) as i32 {
+    let is i64 as free with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_DROP_TARGETS) {
+        if (r.drop_w[i] == w) {
+            r.drop_offers[i] = offers;
+            return 1;
+        }
+        if (r.drop_w[i] == 0 && free < 0) { free = i; }
+        i = i + 1;
+    }
+    if (free < 0) { return 0; }
+    r.drop_w[free] = w;
+    r.drop_offers[free] = offers;
+    return 1;
+}
+
+fn remove_drop_target(r as *Router, w as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_DROP_TARGETS) {
+        if (r.drop_w[i] == w) {
+            r.drop_w[i] = 0;
+            r.drop_offers[i] = 0;
+        }
+        i = i + 1;
+    }
+}
+
+fn _registered(r as *Router, w as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_DROP_TARGETS) {
+        if (r.drop_w[i] == w) { return r.drop_offers[i]; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// What a drop would do: a move when one may be and Control is not held, a
+// copy otherwise.
+fn _action(r as *Router) as i32 {
+    if ((r.drag.actions & dnd.MOVE) != 0 && (r.mods & keys.MOD_CONTROL) == 0) { return dnd.MOVE; }
+    if ((r.drag.actions & dnd.COPY) != 0) { return dnd.COPY; }
+    return dnd.MOVE;
+}
+
+// Who takes the drag where it is: the widget under it asked, then what holds
+// it, until one takes some of what is offered.
+fn _drag_over(t as *tree.Tree, r as *Router, time as i64) as void {
+    let is i64 as w = _hit_scoped(t, r, r.drag_x, r.drag_y);
+    let is i64 as got with mut = 0;
+    let is i32 as takes with mut = 0;
+    let is i32 as by_table with mut = 0;
+    let is i64 as cur with mut = w;
+    while (cur != 0 && got == 0) {
+        if (tree.is_enabled(t, cur) == 1) {
+            let is event.Event as e = event.make(event.DRAG_OVER, time);
+            e.x = r.drag_x;
+            e.y = r.drag_y;
+            e.mods = r.mods;
+            e.which = r.drag.offers;
+            e.drag = cast(*u8, &r.drag);
+            e.target = w;
+            e.phase = event.BUBBLE;
+            if (cur == w) { e.phase = event.TARGET; }
+            let is i32 as k with mut = cast(i32, _deliver(t, cur, &e)) & r.drag.offers;
+            if (k == 0) {
+                k = _registered(r, cur) & r.drag.offers;
+                if (k != 0) { by_table = 1; }
+            }
+            if (k != 0) {
+                got = cur;
+                takes = k;
+            }
+        }
+        cur = tree.parent(t, cur);
+    }
+    _drag_target(t, r, got, takes, by_table, time);
+}
+
+// w takes it now: the one that did before hears it does not.
+fn _drag_target(t as *tree.Tree, r as *Router, w as i64, takes as i32, by_table as i32, time as i64) as void {
+    if (r.drag_to != 0 && r.drag_to != w) {
+        let is event.Event as e = event.make(event.DRAG_LEAVE, time);
+        e.x = r.drag_x;
+        e.y = r.drag_y;
+        _direct(t, r.drag_to, &e);
+    }
+    r.drag_to = w;
+    r.drag_takes = takes;
+    r.drag_by_table = by_table;
+}
+
+// Let go where it is: DROP to what takes it there — said with
+// signal.DROPPED for a drop target of the program's. What was done.
+fn _drop(t as *tree.Tree, r as *Router, time as i64) as i32 {
+    let is i64 as w = r.drag_to;
+    let is i32 as by_table = r.drag_by_table;
+    r.drag_to = 0;
+    r.drag_takes = 0;
+    r.drag_by_table = 0;
+    if (w == 0 || tree.is_valid(t, w) == 0) { return 0; }
+    let is i32 as action = _action(r);
+    if (by_table == 1) {
+        signal.emit(t, w, signal.DROPPED, cast(*u8, &r.drag));
+        return action;
+    }
+    let is event.Event as e = event.make(event.DROP, time);
+    e.x = r.drag_x;
+    e.y = r.drag_y;
+    e.mods = r.mods;
+    e.which = action;
+    e.drag = cast(*u8, &r.drag);
+    return cast(i32, _direct(t, w, &e)) & action;
+}
+
+// A drag begun here is over: its source told what was done.
+fn _end(t as *tree.Tree, r as *Router, done as i32, time as i64) as void {
+    let is i64 as src = r.drag_src;
+    r.drag_on = 0;
+    r.drag_own = 0;
+    r.drag_src = 0;
+    let is event.Event as e = event.make(event.DRAG_END, time);
+    e.x = r.drag_x;
+    e.y = r.drag_y;
+    e.which = done;
+    _direct(t, src, &e);
 }
