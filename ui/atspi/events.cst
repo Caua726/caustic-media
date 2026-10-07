@@ -1,0 +1,688 @@
+// ui/atspi/events.cst — what changed, told as AT-SPI's events.
+//
+// Every window's tree is watched (tree.set_watch): a widget made, moved,
+// destroyed, changed or focused is queued as it happens — the watch runs in
+// the middle of the tree's own work, so nothing is said there — and told in
+// pump. What was last told of each widget is kept (bridge.Seen): a change is
+// the widget described again and compared, and only what differs is said —
+// a repaint says nothing. The windows themselves are compared in each pump:
+// shown or not, active or not, their titles.
+//
+// A text's change is told as what was deleted and what was inserted: as the
+// widget tells it, when it does (tree.notify_text) — a text view, whose text
+// is never read whole — or else found by comparing the text kept with the
+// text now; such a text longer than TEXT_KEEP is not kept, and its changes
+// are not told. What was inserted or deleted is said up to CHANGE_KEEP bytes
+// of each change and CHANGE_TEXTS of all between two pumps, cut where a
+// character starts; its length is always right. More changes at once than the
+// queue holds lose those of structure (children added and removed); what
+// was seen is compared again all the same.
+use "std/mem.cst" as mem;
+use "../../dbus/dbus.cst" as dbus;
+use "../tree.cst" as tree;
+use "../router.cst" as router;
+use "../app.cst" as app;
+use "../access.cst" as access;
+use "bridge.cst" as bridge;
+use "names.cst" as names;
+use "object.cst" as obj;
+use "text.cst" as atext;
+
+let is *u8 as E_OBJECT with imut = "org.a11y.atspi.Event.Object";
+let is *u8 as E_FOCUS  with imut = "org.a11y.atspi.Event.Focus";
+let is *u8 as E_WINDOW with imut = "org.a11y.atspi.Event.Window";
+
+let is i64 as TEXT_KEEP with imut = 1048576;
+
+// --- Saying ---
+//
+// An event's body: its detail, two numbers, a value, and properties (none).
+
+fn _head(b as *bridge.Bridge, detail as *u8, d1 as i64, d2 as i64) as *dbus.wire.Writer {
+    let is *dbus.wire.Writer as w = dbus.conn.body(&b.bus);
+    dbus.wire.put_string(w, detail);
+    dbus.wire.put_i32(w, d1);
+    dbus.wire.put_i32(w, d2);
+    return w;
+}
+
+fn _send(b as *bridge.Bridge, w as *dbus.wire.Writer, win as i64, wid as i64, iface as *u8, member as *u8) as void {
+    let is i64 as at = dbus.wire.put_array(w, 8);
+    dbus.wire.put_array_end(w, at, 8);
+    dbus.conn.emit(&b.bus, bridge.path_of(b, win, wid), iface, member, "siiva{sv}");
+}
+
+fn say(b as *bridge.Bridge, win as i64, wid as i64, iface as *u8, member as *u8, detail as *u8, d1 as i64, d2 as i64) as void {
+    let is *dbus.wire.Writer as w = _head(b, detail, d1, d2);
+    dbus.wire.put_variant(w, "i");
+    dbus.wire.put_i32(w, 0);
+    _send(b, w, win, wid, iface, member);
+}
+
+fn say_string(b as *bridge.Bridge, win as i64, wid as i64, iface as *u8, member as *u8, detail as *u8, d1 as i64, d2 as i64,
+              s as *u8, n as i64) as void {
+    let is *dbus.wire.Writer as w = _head(b, detail, d1, d2);
+    dbus.wire.put_variant(w, "s");
+    dbus.wire.put_string_n(w, s, n);
+    _send(b, w, win, wid, iface, member);
+}
+
+fn say_double(b as *bridge.Bridge, win as i64, wid as i64, iface as *u8, member as *u8, detail as *u8, v as f64) as void {
+    let is *dbus.wire.Writer as w = _head(b, detail, 0, 0);
+    dbus.wire.put_variant(w, "d");
+    dbus.wire.put_double(w, v);
+    _send(b, w, win, wid, iface, member);
+}
+
+// With a reference to rwin/rw as its value.
+fn say_ref(b as *bridge.Bridge, win as i64, wid as i64, iface as *u8, member as *u8, detail as *u8, d1 as i64,
+           rwin as i64, rw as i64) as void {
+    let is *dbus.wire.Writer as w = _head(b, detail, d1, 0);
+    dbus.wire.put_variant(w, "(so)");
+    obj.put_ref(b, w, rwin, rw);
+    _send(b, w, win, wid, iface, member);
+}
+
+// --- Texts kept ---
+
+fn _hash(s as *u8, n as i64) as i64 {
+    let is i64 as h with mut = 0 - 3750763034362895579;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        h = (h ^ cast(i64, s[i])) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn _text_at(b as *bridge.Bridge, s as *bridge.Seen) as *u8 { return cast(*u8, cast(i64, b.texts) + s.text); }
+
+fn _text_drop(b as *bridge.Bridge, s as *bridge.Seen) as void {
+    if (s.text >= 0) { b.texts_live = b.texts_live - s.text_len; }
+    s.text = 0 - 1;
+}
+
+// The texts still held, moved into a block of their own: what was dropped
+// given back.
+fn _compact(b as *bridge.Bridge, need as i64) as i32 {
+    let is i64 as cap with mut = 4096;
+    while (cap < (b.texts_live + need) * 2) { cap = cap * 2; }
+    let is *u8 as nb = mem.core.mmap_anon(cap);
+    if (cast(i64, nb) == 0 || cast(i64, nb) == 0 - 1) { return 0; }
+    let is i64 as len with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < bridge.MAX_SEEN) {
+        let is *bridge.Seen as s = &b.seen[i];
+        if (s.win != 0 && s.text >= 0) {
+            if (s.text_len > 0) { mem.memcpy(cast(*u8, cast(i64, nb) + len), _text_at(b, s), s.text_len); }
+            s.text = len;
+            len = len + s.text_len;
+        }
+        i = i + 1;
+    }
+    if (b.texts_cap > 0) { mem.core.munmap(b.texts, b.texts_cap); }
+    b.texts = nb;
+    b.texts_cap = cap;
+    b.texts_len = len;
+    b.texts_live = len;
+    return 1;
+}
+
+// n bytes of s kept for seen: 1, or 0 when there is no room (nothing kept).
+fn _text_keep(b as *bridge.Bridge, seen as *bridge.Seen, s as *u8, n as i64) as i32 {
+    _text_drop(b, seen);
+    if (n > TEXT_KEEP) { return 0; }
+    if (b.texts_len + n > b.texts_cap) {
+        if (_compact(b, n) == 0) { return 0; }
+    }
+    if (n > 0) { mem.memcpy(cast(*u8, cast(i64, b.texts) + b.texts_len), s, n); }
+    seen.text = b.texts_len;
+    seen.text_len = n;
+    b.texts_len = b.texts_len + n;
+    b.texts_live = b.texts_live + n;
+    return 1;
+}
+
+// --- What was seen ---
+
+fn _find(b as *bridge.Bridge, win as i64, w as i64) as *bridge.Seen {
+    let is i64 as i with mut = 0;
+    while (i < bridge.MAX_SEEN) {
+        let is *bridge.Seen as s = &b.seen[i];
+        if (s.win == win && s.w == w) { return s; }
+        i = i + 1;
+    }
+    return cast(*bridge.Seen, 0);
+}
+
+fn _forget(b as *bridge.Bridge, s as *bridge.Seen) as void {
+    _text_drop(b, s);
+    s.win = 0;
+    s.w = 0;
+}
+
+// A slot for a widget newly seen: a free one, one of a widget gone, or
+// the clock's.
+fn _slot(b as *bridge.Bridge) as *bridge.Seen {
+    let is i64 as i with mut = 0;
+    while (i < bridge.MAX_SEEN) {
+        if (b.seen[i].win == 0) { return &b.seen[i]; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < bridge.MAX_SEEN) {
+        let is *bridge.Seen as g = &b.seen[i];
+        let is *tree.Tree as t = bridge.tree_of(b, g.win);
+        if (cast(i64, t) == 0 || tree.is_valid(t, g.w) == 0) {
+            _forget(b, g);
+            return g;
+        }
+        i = i + 1;
+    }
+    let is *bridge.Seen as s = &b.seen[b.clock];
+    b.clock = (b.clock + 1) % bridge.MAX_SEEN;
+    _forget(b, s);
+    return s;
+}
+
+// What there is to see of s's widget now, compared with what was last told
+// — said when say is 1 — and kept. 0 when it is no longer there to see.
+fn _look(b as *bridge.Bridge, s as *bridge.Seen, say as i32) as i32 {
+    let is obj.Obj as o;
+    obj.describe(b, s.win, s.w, &o);
+    if (cast(i64, o.t) == 0 || tree.is_valid(o.t, s.w) == 0) {
+        _forget(b, s);
+        return 0;
+    }
+    let is i64 as win = s.win;
+    let is i64 as w = s.w;
+    let is i64 as states = obj.states(b, &o);
+    let is i64 as name = _hash(o.q.name, o.q.name_len);
+    let is i64 as desc = _hash(o.q.description, o.q.description_len);
+    let is f64 as value with mut = 0.0;
+    if (o.q.has_value == 1) { value = o.q.value; }
+    // Its text: what it is, but not the text itself, unless the widget does
+    // not tell its changes — then all of it, to compare with what was kept.
+    let is tree.TextQuery as tq;
+    let is i32 as has_text = access.text_info(o.t, w, &tq);
+    let is i32 as compare with mut = cast(i32, has_text == 1 && tq.tells == 0 && tq.text_len <= TEXT_KEEP);
+    let is tree.TextQuery as whole;
+    if (compare == 1 && access.text_span(o.t, w, 0, tq.text_len, &whole) == 0) { compare = 0; }
+    let is i64 as caret with mut = 0 - 1;
+    let is i64 as sa with mut = 0;
+    let is i64 as sb with mut = 0;
+    if (has_text == 1) {
+        if (tq.caret >= 0) { caret = access.text_char_of(o.t, w, tq.caret); }
+        sa = access.text_char_of(o.t, w, tq.a);
+        sb = access.text_char_of(o.t, w, tq.b);
+        if (sb < sa) {
+            let is i64 as x = sa;
+            sa = sb;
+            sb = x;
+        }
+    }
+    if (say == 1) {
+        // States, but the focus's: the focus is told as it moves.
+        let is i64 as changed = (states ^ s.states) & (0 - 1 - (1 << names.S_FOCUSED));
+        let is i64 as bit with mut = 0;
+        while (bit < 63) {
+            if ((changed & (1 << bit)) != 0) {
+                let is *u8 as sn = names.state_name(bit);
+                if (cast(i64, sn) != 0) {
+                    say(b, win, w, E_OBJECT, "StateChanged", sn, (states >> bit) & 1, 0);
+                }
+            }
+            bit = bit + 1;
+        }
+        if (name != s.name) {
+            say_string(b, win, w, E_OBJECT, "PropertyChange", "accessible-name", 0, 0, o.q.name, o.q.name_len);
+        }
+        if (desc != s.desc) {
+            say_string(b, win, w, E_OBJECT, "PropertyChange", "accessible-description", 0, 0, o.q.description,
+                       o.q.description_len);
+        }
+        if (value != s.value) { say_double(b, win, w, E_OBJECT, "PropertyChange", "accessible-value", value); }
+        if (compare == 1 && s.text >= 0) { _text_said(b, s, whole.text, whole.text_len); }
+        if (has_text == 1 && caret != s.caret && caret >= 0) { say(b, win, w, E_OBJECT, "TextCaretMoved", "", caret, 0); }
+        if (has_text == 1 && (sa != s.sel_a || sb != s.sel_b)) { say(b, win, w, E_OBJECT, "TextSelectionChanged", "", 0, 0); }
+    }
+    s.states = states;
+    s.name = name;
+    s.desc = desc;
+    s.value = value;
+    s.caret = caret;
+    s.sel_a = sa;
+    s.sel_b = sb;
+    if (compare == 1) {
+        if (s.text < 0 || s.text_len != whole.text_len || mem.memcmp(_text_at(b, s), whole.text, whole.text_len) != 0) {
+            _text_keep(b, s, whole.text, whole.text_len);
+        }
+    } else {
+        _text_drop(b, s);
+    }
+    return 1;
+}
+
+// What was deleted from the text kept and what was inserted in its place,
+// said: the text between what both begin and end with.
+fn _text_said(b as *bridge.Bridge, s as *bridge.Seen, now as *u8, n as i64) as void {
+    let is *u8 as old = _text_at(b, s);
+    let is i64 as m = s.text_len;
+    let is i64 as p with mut = 0;
+    while (p < m && p < n && old[p] == now[p]) { p = p + 1; }
+    while (p > 0 && p < m && (old[p] & 192) == 128) { p = p - 1; }
+    while (p > 0 && p < n && (now[p] & 192) == 128) { p = p - 1; }
+    let is i64 as q with mut = 0;
+    while (q < m - p && q < n - p && old[m - 1 - q] == now[n - 1 - q]) { q = q + 1; }
+    while (q > 0 && (old[m - q] & 192) == 128) { q = q - 1; }
+    let is i64 as at = atext.chars(old, p);
+    let is *u8 as gone = cast(*u8, cast(i64, old) + p);
+    let is i64 as ngone = m - q - p;
+    let is *u8 as put = cast(*u8, cast(i64, now) + p);
+    let is i64 as nput = n - q - p;
+    if (ngone > 0) {
+        say_string(b, s.win, s.w, E_OBJECT, "TextChanged", "delete", at, atext.chars(gone, ngone), gone, ngone);
+    }
+    if (nput > 0) {
+        say_string(b, s.win, s.w, E_OBJECT, "TextChanged", "insert", at, atext.chars(put, nput), put, nput);
+    }
+}
+
+// Everything seen under w compared again.
+fn _look_under(b as *bridge.Bridge, t as *tree.Tree, w as i64, win as i64) as void {
+    let is i64 as c with mut = tree.first_child(t, w);
+    while (c != 0) {
+        let is *bridge.Seen as s = _find(b, win, c);
+        if (cast(i64, s) != 0) { _look(b, s, 1); }
+        _look_under(b, t, c, win);
+        c = tree.next_sibling(t, c);
+    }
+}
+
+// w seen, as it is, saying nothing.
+fn _see(b as *bridge.Bridge, win as i64, w as i64) as void {
+    let is *bridge.Seen as s with mut = _find(b, win, w);
+    if (cast(i64, s) == 0) {
+        s = _slot(b);
+        s.win = win;
+        s.w = w;
+        s.text = 0 - 1;
+        s.text_len = 0;
+    }
+    _look(b, s, 0);
+}
+
+// w and everything told under it seen.
+fn _see_all(b as *bridge.Bridge, win as i64, t as *tree.Tree, w as i64) as void {
+    if (bridge.exposed(t, w) == 0) { return; }
+    _see(b, win, w);
+    let is i64 as c with mut = tree.first_child(t, w);
+    while (c != 0) {
+        _see_all_under(b, win, t, c);
+        c = tree.next_sibling(t, c);
+    }
+}
+
+// Through what is not told, to what is.
+fn _see_all_under(b as *bridge.Bridge, win as i64, t as *tree.Tree, w as i64) as void {
+    if (tree.is_visible(t, w) == 0) { return; }
+    if (bridge.exposed(t, w) == 1) {
+        _see_all(b, win, t, w);
+        return;
+    }
+    let is i64 as c with mut = tree.first_child(t, w);
+    while (c != 0) {
+        _see_all_under(b, win, t, c);
+        c = tree.next_sibling(t, c);
+    }
+}
+
+// Every widget of win forgotten.
+fn _forget_window(b as *bridge.Bridge, win as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < bridge.MAX_SEEN) {
+        if (b.seen[i].win == win) { _forget(b, &b.seen[i]); }
+        i = i + 1;
+    }
+    if (b.focus_win == win) {
+        b.focus_win = 0;
+        b.focus_w = 0;
+    }
+}
+
+// --- The watch ---
+
+fn _watched(user as *u8, t as *tree.Tree, w as i64, what as i32) as void {
+    let is *bridge.Bridge as b = cast(*bridge.Bridge, user);
+    if (b.stage != bridge.ON || cast(i64, b.changes) == 0) { return; }
+    let is i64 as win = app.window_of(b.a, t);
+    if (win == 0) { return; }
+    if (what == tree.WATCH_TEXT) {
+        _text_changed(b, t, win, w);
+        return;
+    }
+    if (what == tree.WATCH_CHANGED) {
+        let is i64 as i with mut = 0;
+        while (i < b.nchanges) {
+            let is *bridge.Change as c = &b.changes[i];
+            if (c.what == tree.WATCH_CHANGED && c.w == w && c.win == win) { return; }
+            i = i + 1;
+        }
+    }
+    if (b.nchanges >= bridge.MAX_CHANGES) {
+        b.overflow = 1;
+        return;
+    }
+    let is *bridge.Change as c = &b.changes[b.nchanges];
+    c.win = win;
+    c.w = w;
+    c.what = what;
+    c.parent = 0;
+    c.index = 0 - 1;
+    // Where it was told, before it goes.
+    if (what == tree.WATCH_REMOVED && app.is_shown(b.a, win) == 1 && bridge.exposed(t, w) == 1) {
+        c.parent = bridge.parent_of(t, w);
+        c.index = bridge.index_of(t, w);
+    }
+    b.nchanges = b.nchanges + 1;
+}
+
+// A widget's text changed, as it tells: queued with what changed and where
+// in characters, found now — by the time it is told, the text may have
+// changed again. A change of the widget queued before it goes after it, so
+// the caret is told after the text it moved over.
+fn _text_changed(b as *bridge.Bridge, t as *tree.Tree, win as i64, w as i64) as void {
+    let is *tree.TextChange as tc = tree.text_change(t);
+    if (cast(i64, tc) == 0 || app.is_shown(b.a, win) == 0 || bridge.exposed(t, w) == 0) { return; }
+    let is i64 as i with mut = 0;
+    let is i64 as o with mut = 0;
+    while (i < b.nchanges) {
+        let is *bridge.Change as old = &b.changes[i];
+        if (old.what != tree.WATCH_CHANGED || old.w != w || old.win != win) {
+            if (o != i) { b.changes[o] = b.changes[i]; }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    b.nchanges = o;
+    if (b.nchanges + 2 > bridge.MAX_CHANGES) {
+        b.overflow = 1;
+        return;
+    }
+    let is i64 as keep with mut = tc.len;
+    if (keep > bridge.CHANGE_KEEP) { keep = bridge.CHANGE_KEEP; }
+    if (keep > bridge.CHANGE_TEXTS - b.ctexts_len) { keep = bridge.CHANGE_TEXTS - b.ctexts_len; }
+    // Cut at a character's start: what is said is UTF-8.
+    while (keep > 0 && keep < tc.len && (tc.text[keep] & 192) == 128) { keep = keep - 1; }
+    let is *bridge.Change as c = &b.changes[b.nchanges];
+    c.win = win;
+    c.w = w;
+    c.what = tree.WATCH_TEXT;
+    c.parent = 0;
+    c.index = 0 - 1;
+    c.how = tc.what;
+    c.at = access.text_char_of(t, w, tc.at);
+    c.chars = atext.chars(tc.text, tc.len);
+    c.text = b.ctexts_len;
+    c.len = keep;
+    if (keep > 0) { mem.memcpy(cast(*u8, cast(i64, b.ctexts) + b.ctexts_len), tc.text, keep); }
+    b.ctexts_len = b.ctexts_len + keep;
+    b.nchanges = b.nchanges + 1;
+    let is *bridge.Change as after = &b.changes[b.nchanges];
+    after.win = win;
+    after.w = w;
+    after.what = tree.WATCH_CHANGED;
+    after.parent = 0;
+    after.index = 0 - 1;
+    b.nchanges = b.nchanges + 1;
+}
+
+fn _focus(b as *bridge.Bridge, win as i64, w as i64) as void {
+    if (b.focus_w != 0 && (b.focus_win != win || b.focus_w != w)) {
+        let is *tree.Tree as ot = bridge.tree_of(b, b.focus_win);
+        if (cast(i64, ot) != 0 && tree.is_valid(ot, b.focus_w) == 1) {
+            say(b, b.focus_win, b.focus_w, E_OBJECT, "StateChanged", "focused", 0, 0);
+            let is *bridge.Seen as os = _find(b, b.focus_win, b.focus_w);
+            if (cast(i64, os) != 0) { _look(b, os, 0); }
+        }
+    }
+    b.focus_win = 0;
+    b.focus_w = 0;
+    let is *tree.Tree as t = bridge.tree_of(b, win);
+    if (w == 0 || cast(i64, t) == 0 || bridge.exposed(t, w) == 0) { return; }
+    b.focus_win = win;
+    b.focus_w = w;
+    say(b, win, w, E_OBJECT, "StateChanged", "focused", 1, 0);
+    say(b, win, w, E_FOCUS, "Focus", "", 0, 0);
+    _see(b, win, w);
+}
+
+fn _change(b as *bridge.Bridge, c as *bridge.Change) as void {
+    let is *tree.Tree as t = bridge.tree_of(b, c.win);
+    if (c.what == tree.WATCH_REMOVED) {
+        if (c.parent != 0) {
+            say_ref(b, c.win, c.parent, E_OBJECT, "ChildrenChanged", "remove", c.index, c.win, c.w);
+        }
+        let is *bridge.Seen as gone = _find(b, c.win, c.w);
+        if (cast(i64, gone) != 0 && (cast(i64, t) == 0 || tree.is_valid(t, c.w) == 0)) { _forget(b, gone); }
+        return;
+    }
+    if (cast(i64, t) == 0) { return; }
+    if (c.what == tree.WATCH_FOCUS) {
+        _focus(b, c.win, c.w);
+        return;
+    }
+    if (c.what == tree.WATCH_TEXT) {
+        if (bridge.exposed(t, c.w) == 0) { return; }
+        let is *u8 as said with mut = "insert";
+        if (c.how == tree.TEXT_DELETED) { said = "delete"; }
+        say_string(b, c.win, c.w, E_OBJECT, "TextChanged", said, c.at, c.chars, cast(*u8, cast(i64, b.ctexts) + c.text), c.len);
+        return;
+    }
+    if (c.what == tree.WATCH_STATE) {
+        _state(b, t, c.win, c.w);
+        return;
+    }
+    if (c.what == tree.WATCH_ADDED) {
+        if (bridge.exposed(t, c.w) == 1) {
+            say_ref(b, c.win, bridge.parent_of(t, c.w), E_OBJECT, "ChildrenChanged", "add", bridge.index_of(t, c.w), c.win, c.w);
+            _see_all(b, c.win, t, c.w);
+        }
+        return;
+    }
+    let is *bridge.Seen as s = _find(b, c.win, c.w);
+    if (cast(i64, s) != 0) {
+        _look(b, s, 1);
+        return;
+    }
+    if (bridge.exposed(t, c.w) == 1) { _see(b, c.win, c.w); }
+}
+
+// w shown or hidden, enabled or disabled, and with it what is under it: it
+// told come or gone from its parent's children, and every one seen compared.
+fn _state(b as *bridge.Bridge, t as *tree.Tree, win as i64, w as i64) as void {
+    let is *bridge.Seen as s = _find(b, win, w);
+    let is i32 as told = bridge.exposed(t, w);
+    if (cast(i64, s) != 0) {
+        let is i64 as was = (s.states >> names.S_SHOWING) & 1;
+        _look(b, s, 1);
+        if (was == 1 && told == 0 && tree.is_valid(t, w) == 1) {
+            say_ref(b, win, bridge.parent_of(t, w), E_OBJECT, "ChildrenChanged", "remove", 0 - 1, win, w);
+        }
+        if (was == 0 && told == 1) {
+            say_ref(b, win, bridge.parent_of(t, w), E_OBJECT, "ChildrenChanged", "add", bridge.index_of(t, w), win, w);
+        }
+    } else if (told == 1) {
+        say_ref(b, win, bridge.parent_of(t, w), E_OBJECT, "ChildrenChanged", "add", bridge.index_of(t, w), win, w);
+        _see_all(b, win, t, w);
+    }
+    _look_under(b, t, w, win);
+}
+
+// --- Windows ---
+
+fn _title(b as *bridge.Bridge, win as i64, member as *u8) as void {
+    let is *tree.Tree as t = app.tree(b.a, win);
+    say_string(b, win, tree.root(t), E_WINDOW, member, "", 0, 0, app.title(b.a, win), app.title_length(b.a, win));
+}
+
+fn _drop_window(b as *bridge.Bridge, i as i64) as void {
+    let is i64 as k with mut = i;
+    while (k + 1 < b.nwins) {
+        b.wins[k] = b.wins[k + 1];
+        b.win_shown[k] = b.win_shown[k + 1];
+        b.win_active[k] = b.win_active[k + 1];
+        b.win_root[k] = b.win_root[k + 1];
+        k = k + 1;
+    }
+    b.nwins = b.nwins - 1;
+}
+
+// The windows compared with what was told of them: watched when new, told
+// shown, hidden, closed, active or not, their roots compared.
+fn _windows(b as *bridge.Bridge, say_it as i32) as void {
+    // Closed.
+    let is i64 as i with mut = 0;
+    while (i < b.nwins) {
+        let is i64 as h = b.wins[i];
+        if (app.window_valid(b.a, h) == 0) {
+            if (say_it == 1 && b.win_shown[i] == 1) {
+                // Its tree is gone: told by the path it had.
+                say_string(b, h, b.win_root[i], E_WINDOW, "Destroy", "", 0, 0, "", 0);
+                say_ref(b, 0, 0, E_OBJECT, "ChildrenChanged", "remove", 0 - 1, h, b.win_root[i]);
+            }
+            _forget_window(b, h);
+            _drop_window(b, i);
+        } else {
+            i = i + 1;
+        }
+    }
+    let is i64 as h with mut = app.next_window(b.a, 0);
+    while (h != 0) {
+        let is i64 as k with mut = 0;
+        while (k < b.nwins && b.wins[k] != h) { k = k + 1; }
+        if (k == b.nwins && b.nwins < bridge.MAX_WINDOWS) {
+            b.wins[k] = h;
+            b.win_shown[k] = 0;
+            b.win_active[k] = 0;
+            b.win_root[k] = tree.root(app.tree(b.a, h));
+            b.nwins = b.nwins + 1;
+            tree.set_watch(app.tree(b.a, h), fn_ptr(_watched), cast(*u8, b));
+        }
+        if (k < b.nwins) { _window(b, k, say_it); }
+        h = app.next_window(b.a, h);
+    }
+}
+
+fn _window(b as *bridge.Bridge, k as i64, say_it as i32) as void {
+    let is i64 as h = b.wins[k];
+    let is *tree.Tree as t = app.tree(b.a, h);
+    let is i64 as root = tree.root(t);
+    let is i32 as shown = app.is_shown(b.a, h);
+    let is i32 as active = cast(i32, shown == 1 && app.is_active(b.a, h) == 1);
+    if (shown == 1 && b.win_shown[k] == 0) {
+        b.win_shown[k] = 1;
+        _see_all(b, h, t, root);
+        if (say_it == 1) {
+            say_ref(b, 0, 0, E_OBJECT, "ChildrenChanged", "add", bridge.window_index(b, h), h, root);
+            _title(b, h, "Create");
+        }
+    }
+    if (shown == 0 && b.win_shown[k] == 1) {
+        b.win_shown[k] = 0;
+        if (say_it == 1) {
+            _title(b, h, "Destroy");
+            say_ref(b, 0, 0, E_OBJECT, "ChildrenChanged", "remove", 0 - 1, h, root);
+        }
+        _forget_window(b, h);
+    }
+    if (active != b.win_active[k]) {
+        b.win_active[k] = active;
+        if (say_it == 1 && active == 1) { _title(b, h, "Activate"); }
+        if (say_it == 1 && active == 0) { _title(b, h, "Deactivate"); }
+    }
+    if (shown == 1) {
+        let is *bridge.Seen as s = _find(b, h, root);
+        if (cast(i64, s) != 0) { _look(b, s, say_it); }
+    }
+}
+
+// --- On and off ---
+
+// Told from now on: the windows watched, everything there seen as it is.
+fn start(b as *bridge.Bridge) as i32 {
+    b.changes = cast(*bridge.Change, mem.core.mmap_anon(bridge.MAX_CHANGES * sizeof(bridge.Change)));
+    b.seen = cast(*bridge.Seen, mem.core.mmap_anon(bridge.MAX_SEEN * sizeof(bridge.Seen)));
+    b.ctexts = mem.core.mmap_anon(bridge.CHANGE_TEXTS);
+    b.ctexts_len = 0;
+    if (cast(i64, b.changes) == 0 || cast(i64, b.seen) == 0 || cast(i64, b.ctexts) == 0) {
+        stop(b);
+        return 0;
+    }
+    mem.memset(cast(*u8, b.seen), 0, bridge.MAX_SEEN * sizeof(bridge.Seen));
+    b.nchanges = 0;
+    b.overflow = 0;
+    b.clock = 0;
+    b.nwins = 0;
+    b.focus_win = 0;
+    b.focus_w = 0;
+    _windows(b, 0);
+    // The focus as it is: an active window's, or the first there is.
+    let is i64 as k with mut = 0;
+    while (k < b.nwins) {
+        let is i64 as h = b.wins[k];
+        let is i64 as f = router.focused(app.tree(b.a, h), app.router(b.a, h));
+        if (b.win_shown[k] == 1 && f != 0 && (b.focus_w == 0 || app.is_active(b.a, h) == 1)) {
+            b.focus_win = h;
+            b.focus_w = f;
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
+// What changed since the last time, told.
+fn flush(b as *bridge.Bridge) as void {
+    if (b.stage != bridge.ON || cast(i64, b.changes) == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < b.nchanges) {
+        _change(b, &b.changes[i]);
+        i = i + 1;
+    }
+    b.nchanges = 0;
+    b.ctexts_len = 0;
+    if (b.overflow == 1) {
+        b.overflow = 0;
+        let is i64 as k with mut = 0;
+        while (k < bridge.MAX_SEEN) {
+            if (b.seen[k].win != 0) { _look(b, &b.seen[k], 1); }
+            k = k + 1;
+        }
+    }
+    _windows(b, 1);
+}
+
+// Nothing watched or kept any more.
+fn stop(b as *bridge.Bridge) as void {
+    let is i64 as k with mut = 0;
+    while (k < b.nwins) {
+        if (app.window_valid(b.a, b.wins[k]) == 1) {
+            tree.set_watch(app.tree(b.a, b.wins[k]), cast(tree.WatchFn, 0), cast(*u8, 0));
+        }
+        k = k + 1;
+    }
+    b.nwins = 0;
+    if (cast(i64, b.changes) != 0) { mem.core.munmap(cast(*u8, b.changes), bridge.MAX_CHANGES * sizeof(bridge.Change)); }
+    if (cast(i64, b.seen) != 0) { mem.core.munmap(cast(*u8, b.seen), bridge.MAX_SEEN * sizeof(bridge.Seen)); }
+    if (cast(i64, b.ctexts) != 0) { mem.core.munmap(b.ctexts, bridge.CHANGE_TEXTS); }
+    b.ctexts = cast(*u8, 0);
+    b.ctexts_len = 0;
+    if (b.texts_cap > 0) { mem.core.munmap(b.texts, b.texts_cap); }
+    b.changes = cast(*bridge.Change, 0);
+    b.seen = cast(*bridge.Seen, 0);
+    b.texts = cast(*u8, 0);
+    b.texts_len = 0;
+    b.texts_cap = 0;
+    b.texts_live = 0;
+    b.nchanges = 0;
+}

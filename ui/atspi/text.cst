@@ -1,0 +1,853 @@
+// ui/atspi/text.cst — Text and EditableText, from a widget's text entry.
+//
+// AT-SPI counts in characters, the toolkit in UTF-8 bytes: every offset
+// crosses here, converted by the widget (access.text_char_of, text_byte_of)
+// — a text view from its index, so a large document is not read whole. A
+// character starts at every byte that does not continue one.
+//
+// Pieces of text are asked for by kind (AtspiTextBoundaryType): a
+// character; a word or a sentence from its start to the next one's, or from
+// the end of the one before to its own end; a line likewise. Words and
+// sentences are UAX #29's, a word being a segment of letters, marks,
+// numbers or connectors; lines are where the widget laid them out, found by
+// asking it where its characters are; paragraphs end at line breaks.
+use "std/mem.cst" as mem;
+use "caustic-unicode/src/ucd/props.cst" as ucd;
+use "caustic-unicode/src/segment/word.cst" as word;
+use "caustic-unicode/src/segment/sentence.cst" as sentence;
+use "../../math/math.cst" as math;
+use "../../dbus/dbus.cst" as dbus;
+use "../tree.cst" as tree;
+use "../layout.cst" as layout;
+use "../access.cst" as access;
+use "bridge.cst" as bridge;
+
+let is *u8 as I_TEXT     with imut = "org.a11y.atspi.Text";
+let is *u8 as I_EDITABLE with imut = "org.a11y.atspi.EditableText";
+
+// AtspiTextBoundaryType, and AtspiTextGranularity in GetStringAtOffset.
+let is i64 as CHAR           with imut = 0;
+let is i64 as WORD_START     with imut = 1;
+let is i64 as WORD_END       with imut = 2;
+let is i64 as SENTENCE_START with imut = 3;
+let is i64 as SENTENCE_END   with imut = 4;
+let is i64 as LINE_START     with imut = 5;
+let is i64 as LINE_END       with imut = 6;
+let is i64 as G_CHAR         with imut = 0;
+let is i64 as G_WORD         with imut = 1;
+let is i64 as G_SENTENCE     with imut = 2;
+let is i64 as G_LINE         with imut = 3;
+let is i64 as G_PARAGRAPH    with imut = 4;
+
+// --- Characters and bytes ---
+
+// How many characters the first n bytes of s hold.
+fn chars(s as *u8, n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if ((s[i] & 192) != 128) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+// The code points of the n bytes at s into out, one per character; what is
+// not UTF-8 is U+FFFD. How many.
+fn decode(s as *u8, n as i64, out as *i32) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]);
+        if ((c & 192) == 128) {
+            i = i + 1;
+        } else {
+            let is i64 as more with mut = 0;
+            let is i64 as cp with mut = c;
+            if (c >= 240) {
+                more = 3;
+                cp = c & 7;
+            } else if (c >= 224) {
+                more = 2;
+                cp = c & 15;
+            } else if (c >= 192) {
+                more = 1;
+                cp = c & 31;
+            }
+            let is i64 as got with mut = 0;
+            i = i + 1;
+            while (i < n && (s[i] & 192) == 128) {
+                if (got < more) { cp = (cp << 6) | cast(i64, s[i] & 63); }
+                got = got + 1;
+                i = i + 1;
+            }
+            // Cut short or too long; past the last code point; longer than
+            // it needs to be; a surrogate, which UTF-8 never holds.
+            let is i32 as bad with mut = cast(i32, got != more || cp > 1114111);
+            if ((more == 1 && cp < 128) || (more == 2 && cp < 2048) || (more == 3 && cp < 65536)) { bad = 1; }
+            if (cp >= 55296 && cp <= 57343) { bad = 1; }
+            if (bad == 1) { cp = 65533; }
+            out[k] = cast(i32, cp);
+            k = k + 1;
+        }
+    }
+    return k;
+}
+
+// --- The widget asked about ---
+//
+// Its text is asked for in pieces (access.text_span and the rest): a large
+// document answers from what it keeps and is never read whole. Words and
+// sentences are found in the paragraph they are in, decoded on its own —
+// a paragraph's start and end are boundaries of both.
+
+struct Target {
+    b   as *bridge.Bridge;
+    win as i64;
+    t   as *tree.Tree;
+    w   as i64;
+    q   as tree.TextQuery;   // what its text is (access.text_info): lengths, caret, selection
+    n   as i64;              // characters
+    pc  as i64;              // the paragraph decoded: its first character, -1 for none yet
+    pn  as i64;              // and how many it has
+    cps as *i32;
+}
+
+// The widget the call is at and what its text is: 1, or 0 with the error set
+// — the object gone, or not one with text (with editable text, editable 1).
+fn _target(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8, editable as i32, tg as *Target) as i32 {
+    tg.b = cast(*bridge.Bridge, user);
+    tg.cps = cast(*i32, 0);
+    tg.pc = 0 - 1;
+    tg.pn = 0;
+    tg.n = 0;
+    let is *u8 as p = dbus.conn.current_path(c);
+    if (cast(i64, p) == 0 || bridge.resolve(tg.b, p, dbus.wire.cstr_len(p), &tg.win, &tg.w) == 0) {
+        k.error_name = dbus.conn.E_UNKNOWN_OBJECT;
+        k.error_text = "no such accessible";
+        return 0;
+    }
+    tg.t = bridge.tree_of(tg.b, tg.win);
+    if (access.text_info(tg.t, tg.w, &tg.q) == 0 || (editable == 1 && tg.q.editable == 0)) {
+        k.error_name = dbus.conn.E_UNKNOWN_INTERFACE;
+        k.error_text = "not an interface of this accessible";
+        return 0;
+    }
+    tg.n = tg.q.chars;
+    return 1;
+}
+
+// The same for a property: 1, or 0 for nothing to tell.
+fn _prop_target(c as *dbus.conn.Conn, user as *u8, tg as *Target) as i32 {
+    let is dbus.conn.Call as k;
+    return _target(c, &k, user, 0, tg);
+}
+
+// Room in the bridge's buffer for need code points: 1, or 0 when refused.
+fn _room(b as *bridge.Bridge, need as i64) as i32 {
+    if (need <= b.cps_cap) { return 1; }
+    if (cast(i64, b.cps) != 0) { mem.core.munmap(cast(*u8, b.cps), b.cps_cap * 4); }
+    let is i64 as cap with mut = b.cps_cap * 2;
+    if (cap < need) { cap = need; }
+    if (cap < 1024) { cap = 1024; }
+    b.cps = cast(*i32, mem.core.mmap_anon(cap * 4));
+    b.cps_cap = cap;
+    if (cast(i64, b.cps) <= 0) {
+        b.cps = cast(*i32, 0);
+        b.cps_cap = 0;
+        return 0;
+    }
+    return 1;
+}
+
+// The bridge's buffer given back.
+fn release(b as *bridge.Bridge) as void {
+    if (cast(i64, b.cps) != 0) { mem.core.munmap(cast(*u8, b.cps), b.cps_cap * 4); }
+    b.cps = cast(*i32, 0);
+    b.cps_cap = 0;
+}
+
+fn _clamp(tg as *Target, k as i64) as i64 {
+    if (k < 0) { return 0; }
+    if (k > tg.n) { return tg.n; }
+    return k;
+}
+
+// Where character k starts, in bytes; the characters before byte at.
+fn _byte(tg as *Target, k as i64) as i64 { return access.text_byte_of(tg.t, tg.w, _clamp(tg, k)); }
+
+fn _char(tg as *Target, at as i64) as i64 {
+    let is i64 as a with mut = at;
+    if (a < 0) { a = 0; }
+    if (a > tg.q.text_len) { a = tg.q.text_len; }
+    return access.text_char_of(tg.t, tg.w, a);
+}
+
+// The paragraph character i is in, decoded: 1, or 0 when it could not be.
+fn _load(tg as *Target, i as i64) as i32 {
+    if (tg.pc >= 0 && i >= tg.pc && i < tg.pc + tg.pn) { return 1; }
+    let is i64 as pa with mut = 0;
+    let is i64 as pb with mut = 0;
+    if (access.text_paragraph(tg.t, tg.w, _byte(tg, i), &pa, &pb) == 0) { return 0; }
+    let is tree.TextQuery as sq;
+    if (access.text_span(tg.t, tg.w, pa, pb, &sq) == 0 || _room(tg.b, sq.text_len + 1) == 0) { return 0; }
+    tg.cps = tg.b.cps;
+    tg.pn = decode(sq.text, sq.text_len, tg.cps);
+    tg.pc = access.text_char_of(tg.t, tg.w, pa);
+    return cast(i32, i >= tg.pc && i < tg.pc + tg.pn);
+}
+
+// The code point of character i; 0 past the text.
+fn _cp(tg as *Target, i as i64) as i32 {
+    if (i < 0 || i >= tg.n || _load(tg, i) == 0) { return 0; }
+    return tg.cps[i - tg.pc];
+}
+
+// --- Words and sentences ---
+
+// A letter, a mark, a number or a connector: what words are made of.
+fn _wordy(cp as i32) as i32 {
+    let is i64 as gc = ucd.general_category(cp);
+    return cast(i32, (gc >= ucd.GC_LU && gc <= ucd.GC_NO) || gc == ucd.GC_PC);
+}
+
+fn _space(cp as i32) as i32 {
+    if (cp == 32 || (cp >= 9 && cp <= 13)) { return 1; }
+    let is i64 as gc = ucd.general_category(cp);
+    return cast(i32, gc == ucd.GC_ZS || gc == ucd.GC_ZL || gc == ucd.GC_ZP);
+}
+
+fn _newline(cp as i32) as i32 {
+    return cast(i32, (cp >= 10 && cp <= 13) || cp == 133 || cp == 8232 || cp == 8233);
+}
+
+// Whether a boundary — a word's, words 1, or a sentence's — is before
+// character i, judged in the paragraph character `in` is in.
+fn _boundary(tg as *Target, in as i64, i as i64, words as i32) as i32 {
+    if (_load(tg, in) == 0) { return 1; }
+    let is i64 as local = i - tg.pc;
+    if (local <= 0 || local >= tg.pn) { return 1; }
+    if (words == 1) { return cast(i32, word.word_is_boundary(tg.cps, tg.pn, local) == 1); }
+    return cast(i32, sentence.sentence_is_boundary(tg.cps, tg.pn, local) == 1);
+}
+
+// Whether i, 0 to n, is where a piece of kind starts (or, for the _END
+// kinds, ends).
+fn _is(tg as *Target, kind as i64, i as i64) as i32 {
+    let is i64 as n = tg.n;
+    if (kind == WORD_START) {
+        return cast(i32, i < n && _wordy(_cp(tg, i)) == 1 && _boundary(tg, i, i, 1) == 1);
+    }
+    if (kind == WORD_END) {
+        return cast(i32, i > 0 && _wordy(_cp(tg, i - 1)) == 1 && _boundary(tg, i - 1, i, 1) == 1);
+    }
+    if (kind == SENTENCE_START) { return cast(i32, i < n && _boundary(tg, i, i, 0) == 1); }
+    if (kind == SENTENCE_END) {
+        // After the sentence's last character that is not a space.
+        if (i == 0 || _space(_cp(tg, i - 1)) == 1) { return 0; }
+        let is i64 as j with mut = i;
+        while (j < n && _space(_cp(tg, j)) == 1) { j = j + 1; }
+        if (j >= n) { return 1; }
+        return _boundary(tg, j, j, 0);
+    }
+    return 1;
+}
+
+// The piece of kind at k, from *s to *e: from the boundary at or before k
+// to the next after it; the text's start and end when there is none.
+fn _by(tg as *Target, kind as i64, k as i64, s as *i64, e as *i64) as void {
+    let is i64 as a with mut = k;
+    while (a > 0 && _is(tg, kind, a) == 0) { a = a - 1; }
+    let is i64 as b with mut = k + 1;
+    while (b < tg.n && _is(tg, kind, b) == 0) { b = b + 1; }
+    if (b > tg.n) { b = tg.n; }
+    *s = a;
+    *e = b;
+}
+
+// --- Lines and paragraphs ---
+
+// Where character k is drawn, the widget's own coordinates: 1, or 0 when it
+// cannot say.
+fn _rect(tg as *Target, k as i64, r as *math.rect.Rect) as i32 {
+    let is tree.TextQuery as q;
+    mem.memset(cast(*u8, &q), 0, sizeof(tree.TextQuery));
+    q.op = tree.TEXT_EXTENTS;
+    q.at = _byte(tg, k);
+    if (access.text_do(tg.t, tg.w, &q) == 0) { return 0; }
+    *r = q.rect;
+    return 1;
+}
+
+// The character nearest a point of the widget; -1 when it cannot say.
+fn _offset_at(tg as *Target, x as f64, y as f64) as i64 {
+    let is tree.TextQuery as q;
+    mem.memset(cast(*u8, &q), 0, sizeof(tree.TextQuery));
+    q.op = tree.TEXT_OFFSET_AT;
+    q.x = x;
+    q.y = y;
+    if (access.text_do(tg.t, tg.w, &q) == 0) { return 0 - 1; }
+    return _char(tg, q.at);
+}
+
+fn _same_line(tg as *Target, k as i64, r as *math.rect.Rect) as i32 {
+    let is math.rect.Rect as o;
+    if (_rect(tg, k, &o) == 0) { return 0; }
+    let is f64 as d with mut = o.y - r.y;
+    if (d < 0.0) { d = 0.0 - d; }
+    return cast(i32, d < r.h / 2.0);
+}
+
+// The line character k is on: where it starts, where its text ends (before
+// its break), and where the next starts. A widget that cannot say where its
+// characters are has one line.
+fn _line(tg as *Target, k as i64, s as *i64, e as *i64, next as *i64) as void {
+    *s = 0;
+    *e = tg.n;
+    *next = tg.n;
+    if (tg.n == 0) { return; }
+    let is i64 as kk with mut = k;
+    if (kk >= tg.n) { kk = tg.n - 1; }
+    let is math.rect.Rect as r;
+    if (_rect(tg, kk, &r) == 0) { return; }
+    let is f64 as y = r.y + r.h / 2.0;
+    let is i64 as a with mut = _offset_at(tg, 0.0 - 1000000.0, y);
+    let is i64 as b with mut = _offset_at(tg, 1000000.0, y);
+    if (a < 0 || a > kk) { a = kk; }
+    if (b < kk) { b = kk; }
+    while (b > a && _newline(_cp(tg, b - 1)) == 1) { b = b - 1; }
+    let is i64 as c with mut = b;
+    while (c < tg.n && _same_line(tg, c, &r) == 1) { c = c + 1; }
+    *s = a;
+    *e = b;
+    *next = c;
+}
+
+// The paragraph k is in: from after the break before it to after its own.
+fn _paragraph(tg as *Target, k as i64, s as *i64, e as *i64) as void {
+    let is i64 as pa with mut = 0;
+    let is i64 as pb with mut = 0;
+    *s = 0;
+    *e = tg.n;
+    if (access.text_paragraph(tg.t, tg.w, _byte(tg, k), &pa, &pb) == 0) { return; }
+    *s = _char(tg, pa);
+    *e = _char(tg, pb);
+}
+
+// --- Pieces ---
+
+// The piece of kind at k, from *s to *e.
+fn piece(tg as *Target, kind as i64, k0 as i64, s as *i64, e as *i64) as void {
+    let is i64 as k = _clamp(tg, k0);
+    if (kind == CHAR) {
+        *s = k;
+        *e = k;
+        if (k < tg.n) { *e = k + 1; }
+        return;
+    }
+    if (kind == LINE_START) {
+        let is i64 as le with mut = 0;
+        _line(tg, k, s, &le, e);
+        return;
+    }
+    if (kind == LINE_END) {
+        // From the end of the line before to this one's; on a line's break,
+        // from it to the next line's end.
+        let is i64 as ls with mut = 0;
+        let is i64 as le with mut = 0;
+        let is i64 as next with mut = 0;
+        _line(tg, k, &ls, &le, &next);
+        if (k >= le) {
+            *s = le;
+            *e = tg.n;
+            if (next < tg.n) {
+                let is i64 as s2 with mut = 0;
+                let is i64 as n2 with mut = 0;
+                _line(tg, next, &s2, e, &n2);
+            }
+            return;
+        }
+        *s = 0;
+        if (ls > 0) {
+            let is i64 as s0 with mut = 0;
+            let is i64 as n0 with mut = 0;
+            _line(tg, ls - 1, &s0, s, &n0);
+        }
+        *e = le;
+        return;
+    }
+    if (kind < CHAR || kind > LINE_END) {
+        *s = k;
+        *e = k;
+        return;
+    }
+    _by(tg, kind, k, s, e);
+}
+
+// The piece before the one at k, or after it: nothing at the text's ends.
+fn piece_before(tg as *Target, kind as i64, k as i64, s as *i64, e as *i64) as void {
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    piece(tg, kind, k, &a, &b);
+    if (a <= 0) {
+        *s = 0;
+        *e = 0;
+        return;
+    }
+    piece(tg, kind, a - 1, s, e);
+}
+
+fn piece_after(tg as *Target, kind as i64, k as i64, s as *i64, e as *i64) as void {
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    piece(tg, kind, k, &a, &b);
+    if (b >= tg.n) {
+        *s = tg.n;
+        *e = tg.n;
+        return;
+    }
+    piece(tg, kind, b, s, e);
+}
+
+// Characters a to b of the target's text, as a string — TEXT_REPLY bytes at
+// most, cut where a character starts.
+fn _put_range(w as *dbus.wire.Writer, tg as *Target, a as i64, b as i64) as void {
+    let is i64 as x = _byte(tg, a);
+    let is i64 as y with mut = _byte(tg, b);
+    if (y < x) { y = x; }
+    if (y - x > bridge.TEXT_REPLY) { y = _byte(tg, _char(tg, x + bridge.TEXT_REPLY + 1) - 1); }
+    let is tree.TextQuery as sq;
+    if (access.text_span(tg.t, tg.w, x, y, &sq) == 0) {
+        dbus.wire.put_string(w, "");
+        return;
+    }
+    dbus.wire.put_string_n(w, sq.text, sq.text_len);
+}
+
+fn _put_piece(w as *dbus.wire.Writer, tg as *Target, a as i64, b as i64) as void {
+    _put_range(w, tg, a, b);
+    dbus.wire.put_i32(w, a);
+    dbus.wire.put_i32(w, b);
+}
+
+// --- Text: reading ---
+
+fn p_count(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    let is Target as tg;
+    if (_prop_target(c, user, &tg) == 0) {
+        dbus.wire.put_i32(w, 0);
+        return;
+    }
+    dbus.wire.put_i32(w, tg.n);
+}
+
+fn p_caret(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    let is Target as tg;
+    if (_prop_target(c, user, &tg) == 0 || tg.q.caret < 0) {
+        dbus.wire.put_i32(w, 0 - 1);
+        return;
+    }
+    dbus.wire.put_i32(w, _char(&tg, tg.q.caret));
+}
+
+fn p_version(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { dbus.wire.put_u32(w, 1); }
+
+fn m_text(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as a = _clamp(&tg, dbus.wire.get_i32(&k.args));
+    let is i64 as b with mut = dbus.wire.get_i32(&k.args);
+    if (b < 0) { b = tg.n; }
+    b = _clamp(&tg, b);
+    if (b < a) { b = a; }
+    _put_range(k.reply, &tg, a, b);
+}
+
+fn m_char_at(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    dbus.wire.put_i32(k.reply, cast(i64, _cp(&tg, dbus.wire.get_i32(&k.args))));
+}
+
+fn _pieces(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8, which as i64) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as at = dbus.wire.get_i32(&k.args);
+    let is i64 as kind = dbus.wire.get_u32(&k.args);
+    let is i64 as s with mut = 0;
+    let is i64 as e with mut = 0;
+    if (which < 0) {
+        piece_before(&tg, kind, at, &s, &e);
+    } else if (which > 0) {
+        piece_after(&tg, kind, at, &s, &e);
+    } else {
+        piece(&tg, kind, at, &s, &e);
+    }
+    _put_piece(k.reply, &tg, s, e);
+}
+
+fn m_at(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { _pieces(c, k, user, 0); }
+
+fn m_before(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { _pieces(c, k, user, 0 - 1); }
+
+fn m_after(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { _pieces(c, k, user, 1); }
+
+// A word, sentence or line from its start to the next one's; a paragraph.
+fn m_string_at(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as at = _clamp(&tg, dbus.wire.get_i32(&k.args));
+    let is i64 as g = dbus.wire.get_u32(&k.args);
+    let is i64 as s with mut = at;
+    let is i64 as e with mut = at;
+    if (g == G_CHAR) { piece(&tg, CHAR, at, &s, &e); }
+    if (g == G_WORD) { piece(&tg, WORD_START, at, &s, &e); }
+    if (g == G_SENTENCE) { piece(&tg, SENTENCE_START, at, &s, &e); }
+    if (g == G_LINE) { piece(&tg, LINE_START, at, &s, &e); }
+    if (g == G_PARAGRAPH) { _paragraph(&tg, at, &s, &e); }
+    _put_piece(k.reply, &tg, s, e);
+}
+
+// --- Text: where characters are ---
+
+// r, the widget's own, in coord's coordinates.
+fn _to_coord(tg as *Target, r as math.rect.Rect, coord as i64) as math.rect.Rect {
+    let is math.rect.Rect as wr = layout.window_rect(tg.t, tg.w);
+    let is f64 as ox with mut = 0.0;
+    let is f64 as oy with mut = 0.0;
+    bridge.origin(tg.b, tg.win, tg.t, tg.w, coord, &ox, &oy);
+    return math.rect.rect(wr.x + r.x - ox, wr.y + r.y - oy, r.w, r.h);
+}
+
+fn _put_rect(w as *dbus.wire.Writer, r as math.rect.Rect) as void {
+    dbus.wire.put_i32(w, cast(i64, r.x));
+    dbus.wire.put_i32(w, cast(i64, r.y));
+    dbus.wire.put_i32(w, cast(i64, r.w));
+    dbus.wire.put_i32(w, cast(i64, r.h));
+}
+
+fn m_char_extents(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as at = dbus.wire.get_i32(&k.args);
+    let is i64 as coord = dbus.wire.get_u32(&k.args);
+    let is math.rect.Rect as r with mut = math.rect.rect(0.0, 0.0, 0.0, 0.0);
+    if (at < 0 || at >= tg.n || _rect(&tg, at, &r) == 0) {
+        _put_rect(k.reply, r);
+        return;
+    }
+    _put_rect(k.reply, _to_coord(&tg, r, coord));
+}
+
+fn m_range_extents(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as a = _clamp(&tg, dbus.wire.get_i32(&k.args));
+    let is i64 as b = _clamp(&tg, dbus.wire.get_i32(&k.args));
+    let is i64 as coord = dbus.wire.get_u32(&k.args);
+    let is math.rect.Rect as u with mut = math.rect.rect(0.0, 0.0, 0.0, 0.0);
+    let is i32 as any with mut = 0;
+    let is i64 as i with mut = a;
+    while (i < b) {
+        let is math.rect.Rect as r;
+        if (_rect(&tg, i, &r) == 1) {
+            if (any == 0) {
+                u = r;
+                any = 1;
+            } else {
+                u = math.rect.rect_union(u, r);
+            }
+        }
+        i = i + 1;
+    }
+    if (any == 0) {
+        _put_rect(k.reply, u);
+        return;
+    }
+    _put_rect(k.reply, _to_coord(&tg, u, coord));
+}
+
+fn m_offset_at_point(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is f64 as x = cast(f64, dbus.wire.get_i32(&k.args));
+    let is f64 as y = cast(f64, dbus.wire.get_i32(&k.args));
+    let is i64 as coord = dbus.wire.get_u32(&k.args);
+    let is f64 as ox with mut = 0.0;
+    let is f64 as oy with mut = 0.0;
+    bridge.origin(tg.b, tg.win, tg.t, tg.w, coord, &ox, &oy);
+    let is math.rect.Rect as wr = layout.window_rect(tg.t, tg.w);
+    let is f64 as lx = x + ox - wr.x;
+    let is f64 as ly = y + oy - wr.y;
+    if (lx < 0.0 || ly < 0.0 || lx >= wr.w || ly >= wr.h) {
+        dbus.wire.put_i32(k.reply, 0 - 1);
+        return;
+    }
+    dbus.wire.put_i32(k.reply, _offset_at(&tg, lx, ly));
+}
+
+// --- Text: the caret and the selection ---
+
+fn _do(tg as *Target, op as i64, a as i64, b as i64) as i32 {
+    let is tree.TextQuery as q;
+    mem.memset(cast(*u8, &q), 0, sizeof(tree.TextQuery));
+    q.op = op;
+    q.at = _byte(tg, a);
+    q.a = _byte(tg, a);
+    q.b = _byte(tg, b);
+    return access.text_do(tg.t, tg.w, &q);
+}
+
+fn m_set_caret(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as at = dbus.wire.get_i32(&k.args);
+    dbus.wire.put_bool(k.reply, _do(&tg, tree.TEXT_SET_CARET, at, at));
+}
+
+fn _selected(tg as *Target) as i32 { return cast(i32, tg.q.a != tg.q.b); }
+
+fn m_nselections(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    dbus.wire.put_i32(k.reply, _selected(&tg));
+}
+
+fn m_selection(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as i = dbus.wire.get_i32(&k.args);
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    if (i == 0 && _selected(&tg) == 1) {
+        a = _char(&tg, tg.q.a);
+        b = _char(&tg, tg.q.b);
+        if (b < a) {
+            let is i64 as x = a;
+            a = b;
+            b = x;
+        }
+    }
+    dbus.wire.put_i32(k.reply, a);
+    dbus.wire.put_i32(k.reply, b);
+}
+
+// One selection at most: a second refused.
+fn m_add_selection(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as a = dbus.wire.get_i32(&k.args);
+    let is i64 as b = dbus.wire.get_i32(&k.args);
+    if (_selected(&tg) == 1) {
+        dbus.wire.put_bool(k.reply, 0);
+        return;
+    }
+    dbus.wire.put_bool(k.reply, _do(&tg, tree.TEXT_SELECT, a, b));
+}
+
+// The selection let go of, the caret left where it is.
+fn m_remove_selection(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as i = dbus.wire.get_i32(&k.args);
+    if (i != 0 || _selected(&tg) == 0) {
+        dbus.wire.put_bool(k.reply, 0);
+        return;
+    }
+    let is i64 as at with mut = tg.q.caret;
+    if (at < 0) { at = tg.q.b; }
+    let is i64 as ch = _char(&tg, at);
+    dbus.wire.put_bool(k.reply, _do(&tg, tree.TEXT_SET_CARET, ch, ch));
+}
+
+fn m_set_selection(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as i = dbus.wire.get_i32(&k.args);
+    let is i64 as a = dbus.wire.get_i32(&k.args);
+    let is i64 as b = dbus.wire.get_i32(&k.args);
+    if (i != 0) {
+        dbus.wire.put_bool(k.reply, 0);
+        return;
+    }
+    dbus.wire.put_bool(k.reply, _do(&tg, tree.TEXT_SELECT, a, b));
+}
+
+// --- Text: attributes, none told ---
+
+fn _no_attributes(w as *dbus.wire.Writer) as void {
+    let is i64 as at = dbus.wire.put_array(w, 8);
+    dbus.wire.put_array_end(w, at, 8);
+}
+
+fn m_attributes(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    _no_attributes(k.reply);
+    dbus.wire.put_i32(k.reply, 0);
+    dbus.wire.put_i32(k.reply, tg.n);
+}
+
+fn m_default_attributes(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    _no_attributes(k.reply);
+}
+
+fn m_attribute_value(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    dbus.wire.put_string(k.reply, "");
+}
+
+fn m_bounded_ranges(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    let is i64 as at = dbus.wire.put_array(k.reply, 8);
+    dbus.wire.put_array_end(k.reply, at, 8);
+}
+
+// Scrolling a piece of text into view is not offered.
+fn m_no_scroll(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 0, &tg) == 0) { return; }
+    dbus.wire.put_bool(k.reply, 0);
+}
+
+// --- EditableText ---
+
+fn _replace(tg as *Target, a as i64, b as i64, s as *u8, n as i64) as i32 {
+    let is tree.TextQuery as q;
+    mem.memset(cast(*u8, &q), 0, sizeof(tree.TextQuery));
+    q.op = tree.TEXT_REPLACE;
+    q.a = a;
+    q.b = b;
+    q.text = s;
+    q.text_len = n;
+    return access.text_do(tg.t, tg.w, &q);
+}
+
+fn m_set_contents(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 1, &tg) == 0) { return; }
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&k.args, &n);
+    dbus.wire.put_bool(k.reply, _replace(&tg, 0, tg.q.text_len, s, n));
+}
+
+// length is in bytes, as ATK has it: -1 or more than there is for all of it,
+// less cut back to a character's start.
+fn m_insert(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 1, &tg) == 0) { return; }
+    let is i64 as at = _byte(&tg, dbus.wire.get_i32(&k.args));
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&k.args, &n);
+    let is i64 as len with mut = dbus.wire.get_i32(&k.args);
+    if (len < 0 || len > n) { len = n; }
+    while (len > 0 && len < n && (s[len] & 192) == 128) { len = len - 1; }
+    dbus.wire.put_bool(k.reply, _replace(&tg, at, at, s, len));
+}
+
+fn m_delete(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 1, &tg) == 0) { return; }
+    let is i64 as a = _byte(&tg, dbus.wire.get_i32(&k.args));
+    let is i64 as b = _byte(&tg, dbus.wire.get_i32(&k.args));
+    dbus.wire.put_bool(k.reply, _replace(&tg, a, b, cast(*u8, 0), 0));
+}
+
+fn m_copy(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 1, &tg) == 0) { return; }
+    let is i64 as a = dbus.wire.get_i32(&k.args);
+    let is i64 as b = dbus.wire.get_i32(&k.args);
+    _do(&tg, tree.TEXT_COPY, a, b);
+}
+
+fn m_cut(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 1, &tg) == 0) { return; }
+    let is i64 as a = dbus.wire.get_i32(&k.args);
+    let is i64 as b = dbus.wire.get_i32(&k.args);
+    dbus.wire.put_bool(k.reply, _do(&tg, tree.TEXT_CUT, a, b));
+}
+
+fn m_paste(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is Target as tg;
+    if (_target(c, k, user, 1, &tg) == 0) { return; }
+    let is i64 as at = dbus.wire.get_i32(&k.args);
+    dbus.wire.put_bool(k.reply, _do(&tg, tree.TEXT_PASTE, at, at));
+}
+
+// --- The tables ---
+
+let is [24]dbus.conn.Method as text_methods with mut;
+let is [3]dbus.conn.Property as text_props with mut;
+let is [6]dbus.conn.Method as edit_methods with mut;
+let is [1]dbus.conn.Property as edit_props with mut;
+
+fn _m(m as *dbus.conn.Method, name as *u8, ins as *u8, outs as *u8, h as dbus.conn.MethodFn) as void {
+    m.name = name;
+    m.in_sig = ins;
+    m.out_sig = outs;
+    m.handler = h;
+    m.in_names = cast(*u8, 0);
+    m.out_names = cast(*u8, 0);
+}
+
+fn _p(p as *dbus.conn.Property, name as *u8, sig as *u8, g as dbus.conn.GetFn) as void {
+    p.name = name;
+    p.sig = sig;
+    p.get = g;
+    p.set = cast(dbus.conn.SetFn, 0);
+}
+
+fn _i(f as *dbus.conn.Interface, name as *u8, ms as *dbus.conn.Method, nm as i64, ps as *dbus.conn.Property, np as i64) as void {
+    f.name = name;
+    f.methods = ms;
+    f.nmethods = nm;
+    f.props = ps;
+    f.nprops = np;
+    f.signals = cast(*dbus.conn.SignalDecl, 0);
+    f.nsignals = 0;
+}
+
+// Text's table into *text, EditableText's into *editable.
+fn tables(text as *dbus.conn.Interface, editable as *dbus.conn.Interface) as void {
+    _m(&text_methods[0], "GetStringAtOffset", "iu", "sii", fn_ptr(m_string_at));
+    _m(&text_methods[1], "GetText", "ii", "s", fn_ptr(m_text));
+    _m(&text_methods[2], "SetCaretOffset", "i", "b", fn_ptr(m_set_caret));
+    _m(&text_methods[3], "GetTextBeforeOffset", "iu", "sii", fn_ptr(m_before));
+    _m(&text_methods[4], "GetTextAtOffset", "iu", "sii", fn_ptr(m_at));
+    _m(&text_methods[5], "GetTextAfterOffset", "iu", "sii", fn_ptr(m_after));
+    _m(&text_methods[6], "GetCharacterAtOffset", "i", "i", fn_ptr(m_char_at));
+    _m(&text_methods[7], "GetAttributeValue", "is", "s", fn_ptr(m_attribute_value));
+    _m(&text_methods[8], "GetAttributes", "i", "a{ss}ii", fn_ptr(m_attributes));
+    _m(&text_methods[9], "GetDefaultAttributes", "", "a{ss}", fn_ptr(m_default_attributes));
+    _m(&text_methods[10], "GetCharacterExtents", "iu", "iiii", fn_ptr(m_char_extents));
+    _m(&text_methods[11], "GetOffsetAtPoint", "iiu", "i", fn_ptr(m_offset_at_point));
+    _m(&text_methods[12], "GetNSelections", "", "i", fn_ptr(m_nselections));
+    _m(&text_methods[13], "GetSelection", "i", "ii", fn_ptr(m_selection));
+    _m(&text_methods[14], "AddSelection", "ii", "b", fn_ptr(m_add_selection));
+    _m(&text_methods[15], "RemoveSelection", "i", "b", fn_ptr(m_remove_selection));
+    _m(&text_methods[16], "SetSelection", "iii", "b", fn_ptr(m_set_selection));
+    _m(&text_methods[17], "GetRangeExtents", "iiu", "iiii", fn_ptr(m_range_extents));
+    _m(&text_methods[18], "GetBoundedRanges", "iiiiuuu", "a(iisv)", fn_ptr(m_bounded_ranges));
+    _m(&text_methods[19], "GetAttributeRun", "ib", "a{ss}ii", fn_ptr(m_attributes));
+    _m(&text_methods[20], "GetDefaultAttributeSet", "", "a{ss}", fn_ptr(m_default_attributes));
+    _m(&text_methods[21], "ScrollSubstringTo", "iiu", "b", fn_ptr(m_no_scroll));
+    _m(&text_methods[22], "ScrollSubstringToPoint", "iiuii", "b", fn_ptr(m_no_scroll));
+    _p(&text_props[0], "CharacterCount", "i", fn_ptr(p_count));
+    _p(&text_props[1], "CaretOffset", "i", fn_ptr(p_caret));
+    _p(&text_props[2], "version", "u", fn_ptr(p_version));
+    _i(text, I_TEXT, cast(*dbus.conn.Method, &text_methods), 23, cast(*dbus.conn.Property, &text_props), 3);
+    _m(&edit_methods[0], "SetTextContents", "s", "b", fn_ptr(m_set_contents));
+    _m(&edit_methods[1], "InsertText", "isi", "b", fn_ptr(m_insert));
+    _m(&edit_methods[2], "CopyText", "ii", "", fn_ptr(m_copy));
+    _m(&edit_methods[3], "CutText", "ii", "b", fn_ptr(m_cut));
+    _m(&edit_methods[4], "DeleteText", "ii", "b", fn_ptr(m_delete));
+    _m(&edit_methods[5], "PasteText", "i", "b", fn_ptr(m_paste));
+    _p(&edit_props[0], "version", "u", fn_ptr(p_version));
+    _i(editable, I_EDITABLE, cast(*dbus.conn.Method, &edit_methods), 6, cast(*dbus.conn.Property, &edit_props), 1);
+}

@@ -1,0 +1,469 @@
+// ui/atspi/atspi_test.cst — the bridge, on a private bus: brought up, its
+// application, windows and widgets asked about and asked to act.
+//
+// Run from the repository's root inside dbus/tools/run_dbus.sh.
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "../../math/math.cst" as math;
+use "../../dbus/dbus.cst" as dbus;
+use "../tree.cst" as tree;
+use "../layout.cst" as layout;
+use "../box.cst" as box;
+use "../router.cst" as router;
+use "../signal.cst" as signal;
+use "../app.cst" as app;
+use "../widgets/label.cst" as label;
+use "../widgets/button.cst" as button;
+use "../widgets/check.cst" as check;
+use "../widgets/slider.cst" as slider;
+use "../widgets/entry.cst" as entry;
+use "../geom.cst" as geom;
+use "../widget.cst" as widget;
+use "../access.cst" as access;
+use "bridge.cst" as bridge;
+use "atspi.cst" as atspi;
+use "testing.cst" as tk;
+
+let is i64 as clicks with mut = 0;
+
+fn on_click(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { clicks = clicks + 1; }
+
+// A widget that says what it is, and more.
+fn said_access(t as *tree.Tree, w as i64, data as *u8, q as *tree.Access) as i64 {
+    if (q.action == access.ASK) {
+        access.set_name(q, "Said", 4);
+        access.set_description(q, "What it says", 12);
+    }
+    return 1;
+}
+
+fn said_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    geom.size_zero(out);
+    out.min_w = 10.0;
+    out.min_h = 10.0;
+    out.pref_w = 10.0;
+    out.pref_h = 10.0;
+    out.max_w = 10.0;
+    out.max_h = 10.0;
+}
+
+let is tree.Kind as said_kind with mut;
+
+// A string read: whether it is want.
+fn reads(r as *dbus.wire.Reader, want as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(r, &n);
+    return cast(i32, r.err == 0 && tk.same(s, n, want) == 1);
+}
+
+// A method of (iiu) asked.
+fn call_iiu(p as *u8, iface as *u8, member as *u8, x as i64, y as i64, coord as i64) as dbus.wire.Reader {
+    let is dbus.message.Message as m with mut = tk.msg(p, iface, member);
+    m.signature = "iiu";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(w, x);
+    dbus.wire.put_i32(w, y);
+    dbus.wire.put_u32(w, coord);
+    return tk.reply_of(&m);
+}
+
+// A method of one u32 asked.
+fn call_u(p as *u8, iface as *u8, member as *u8, v as i64) as dbus.wire.Reader {
+    let is dbus.message.Message as m with mut = tk.msg(p, iface, member);
+    m.signature = "u";
+    dbus.wire.put_u32(dbus.conn.body(&tk.at), v);
+    return tk.reply_of(&m);
+}
+
+// Whether a reply is a boolean false — an answer, not an error.
+fn no(r as dbus.wire.Reader) as i32 {
+    let is dbus.wire.Reader as q with mut = r;
+    return cast(i32, dbus.wire.get_bool(&q) == 0 && q.err == 0);
+}
+
+// Whether the bus still has a name.
+fn owned(name as *u8) as i32 {
+    let is dbus.message.Message as m with mut = dbus.message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                                       "org.freedesktop.DBus", "NameHasOwner");
+    m.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&tk.at), name);
+    return tk.yes(tk.reply_of(&m));
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (tk.setup() == 0) { return 1; }
+    let is *app.App as a = &tk.a;
+    let is *bridge.Bridge as b = &tk.b;
+    let is i64 as n with mut = 0;
+
+    // A window: a button, a check box, a slider and a label in a column.
+    let is i64 as win = app.window_open(a, 400.0, 300.0);
+    app.set_title(a, win, "Main window", 11);
+    let is *tree.Tree as t = app.tree(a, win);
+    let is *router.Router as r = app.router(a, win);
+    let is i64 as root = tree.root(t);
+    let is i64 as col = box.create(t, root, box.COLUMN);
+    layout.set_align(t, col, layout.START, layout.START);
+    let is i64 as ok = button.create(t, col, "OK", 2);
+    signal.connect(t, ok, signal.CLICKED, fn_ptr(on_click), cast(*u8, 0));
+    let is i64 as cb = check.create(t, col, "Remember", 8);
+    let is i64 as sl = slider.create(t, col, 1.0, 10.0, 1.0);
+    let is i64 as lb = label.create(t, col, "Hello", 5);
+    app.frame(a, win);
+
+    // --- Nobody listening: nothing more ---
+    tk.enabled = 0;
+    tk.check("opened", atspi.open(b, a, "Caustic test", 12) == 1);
+    tk.settle(300);
+    tk.check("nobody listening: not on, waiting", atspi.is_on(b) == 0 && atspi.stage(b) == bridge.NOBODY && tk.embeds == 0);
+
+    // --- Turned on by the desktop — a screen reader started: here we are ---
+    tk.reader = 1;
+    dbus.conn.properties_changed(&tk.fake, "/org/a11y/bus", "org.a11y.Status", "ScreenReaderEnabled");
+    tk.settle(500);
+    tk.check("turned on: on, embedded", atspi.is_on(b) == 1 && tk.embeds == 1);
+    tk.check("embedded as our root", tk.named(cast(*u8, &tk.embedded_name), atspi.bus_name(b)) == 1 &&
+           tk.named(cast(*u8, &tk.embedded_path), bridge.ROOT_PATH) == 1);
+    let is [2]i64 as fds;
+    tk.check("its descriptors, for a loop to wait on", atspi.fds(b, cast(*i64, &fds)) == 2 &&
+             fds[0] == dbus.conn.fd(&b.session) && fds[1] == dbus.conn.fd(&b.bus) && fds[0] >= 0 && fds[1] >= 0);
+
+    // --- The application ---
+    let is *u8 as ROOT = bridge.ROOT_PATH;
+    tk.check("the application: its role", tk.role_of(ROOT) == 75);
+    tk.check("its name", tk.prop_string(ROOT, tk.ACC, "Name", "Caustic test") == 1);
+    tk.check("its toolkit", tk.prop_string(ROOT, "org.a11y.atspi.Application", "ToolkitName", "caustic") == 1);
+    tk.check("one window", tk.prop_int(ROOT, tk.ACC, "ChildCount") == 1);
+    let is dbus.wire.Reader as past with mut = tk.call_i(ROOT, tk.ACC, "GetChildAtIndex", 1);
+    tk.check("no window past the last", tk.is_null(&past) == 1);
+    let is dbus.wire.Reader as cr with mut = tk.call_i(ROOT, tk.ACC, "GetChildAtIndex", 0);
+    tk.check("the window, its child", tk.ref_is(&cr, win, root) == 1);
+    let is dbus.wire.Reader as pr with mut = tk.prop(ROOT, tk.ACC, "Parent");
+    let is i64 as n with mut = 0;
+    dbus.wire.get_struct(&pr);
+    let is *u8 as ps = dbus.wire.get_string(&pr, &n);
+    tk.check("its parent: the desktop, as embedded", tk.named(ps, "org.a11y.atspi.Registry") == 1);
+    tk.check("an application: its interfaces", tk.has_iface(ROOT, "org.a11y.atspi.Application") == 1 &&
+           tk.has_iface(ROOT, tk.ACC) == 1);
+
+    // --- The window ---
+    let is [96]u8 as winp;
+    tk.path(win, root, cast(*u8, &winp));
+    let is *u8 as WIN = cast(*u8, &winp);
+    tk.check("the window: a frame", tk.role_of(WIN) == 23);
+    tk.check("named by its title", tk.prop_string(WIN, tk.ACC, "Name", "Main window") == 1);
+    tk.check("its children: the four, through the column", tk.prop_int(WIN, tk.ACC, "ChildCount") == 4);
+    let is dbus.wire.Reader as wp with mut = tk.prop(WIN, tk.ACC, "Parent");
+    tk.check("under the application", tk.ref_is(&wp, 0, 0) == 1);
+    let is dbus.wire.Reader as wi with mut = tk.call0(WIN, tk.ACC, "GetIndexInParent");
+    tk.check("its first window", dbus.wire.get_i32(&wi) == 0 && wi.err == 0);
+    let is dbus.wire.Reader as none with mut = tk.call_i(WIN, tk.ACC, "GetChildAtIndex", 0 - 1);
+    tk.check("no child before the first: the null one", tk.is_null(&none) == 1);
+    none = tk.call_i(WIN, tk.ACC, "GetChildAtIndex", 4);
+    tk.check("nor past the last", tk.is_null(&none) == 1);
+    let is dbus.wire.Reader as ch with mut = tk.call0(WIN, tk.ACC, "GetChildren");
+    let is i64 as end = dbus.wire.get_array(&ch, 8);
+    tk.check("all of them at once", tk.ref_is(&ch, win, ok) == 1 && tk.ref_is(&ch, win, cb) == 1 && tk.ref_is(&ch, win, sl) == 1 &&
+           tk.ref_is(&ch, win, lb) == 1 && ch.pos == end);
+
+    // --- A button ---
+    let is [96]u8 as okp;
+    tk.path(win, ok, cast(*u8, &okp));
+    let is *u8 as OK = cast(*u8, &okp);
+    tk.check("a button", tk.role_of(OK) == 43 && tk.prop_string(OK, tk.ACC, "Name", "OK") == 1);
+    let is dbus.wire.Reader as rn with mut = tk.call0(OK, tk.ACC, "GetRoleName");
+    tk.check("its role's name", tk.same(dbus.wire.get_string(&rn, &n), n, "button") == 1);
+    tk.check("tk.enabled, showing, focusable", tk.has_state(OK, 8) == 1 && tk.has_state(OK, 24) == 1 && tk.has_state(OK, 25) == 1 &&
+           tk.has_state(OK, 30) == 1 && tk.has_state(OK, 11) == 1 && tk.has_state(OK, 12) == 0);
+    tk.check("its interfaces", tk.has_iface(OK, tk.ACC) == 1 && tk.has_iface(OK, "org.a11y.atspi.Component") == 1 &&
+           tk.has_iface(OK, "org.a11y.atspi.Action") == 1 && tk.has_iface(OK, "org.a11y.atspi.Value") == 0 &&
+           tk.has_iface(OK, "org.a11y.atspi.Text") == 0);
+    tk.check("one action", tk.prop_int(OK, "org.a11y.atspi.Action", "NActions") == 1);
+    let is dbus.wire.Reader as an with mut = tk.call_i(OK, "org.a11y.atspi.Action", "GetName", 0);
+    tk.check("a click", tk.same(dbus.wire.get_string(&an, &n), n, "click") == 1);
+    clicks = 0;
+    let is dbus.wire.Reader as da with mut = tk.call_i(OK, "org.a11y.atspi.Action", "DoAction", 0);
+    tk.check("done: clicked", dbus.wire.get_bool(&da) == 1 && clicks == 1);
+    let is dbus.wire.Reader as bad with mut = tk.call_i(OK, "org.a11y.atspi.Action", "DoAction", 5);
+    tk.check("an action it has not: not done", dbus.wire.get_bool(&bad) == 0 && clicks == 1);
+    let is dbus.wire.Reader as bp with mut = tk.prop(OK, tk.ACC, "Parent");
+    tk.check("under the window, through the column", tk.ref_is(&bp, win, root) == 1);
+    let is dbus.wire.Reader as bi with mut = tk.call0(OK, tk.ACC, "GetIndexInParent");
+    tk.check("its first child", dbus.wire.get_i32(&bi) == 0);
+
+    // --- A check box: toggled ---
+    let is [96]u8 as cbp;
+    tk.path(win, cb, cast(*u8, &cbp));
+    let is *u8 as CB = cast(*u8, &cbp);
+    tk.check("a check box, not checked", tk.role_of(CB) == 7 && tk.has_state(CB, 4) == 0);
+    let is dbus.wire.Reader as ct with mut = tk.call0(CB, "org.a11y.atspi.Action", "GetActions");
+    tk.check("its actions listed", dbus.wire.get_array(&ct, 8) > 0 && ct.err == 0);
+    let is i64 as k with mut = 0;
+    let is i32 as toggled with mut = 0;
+    while (k < tk.prop_int(CB, "org.a11y.atspi.Action", "NActions")) {
+        let is dbus.wire.Reader as nm with mut = tk.call_i(CB, "org.a11y.atspi.Action", "GetName", k);
+        if (tk.same(dbus.wire.get_string(&nm, &n), n, "toggle") == 1) {
+            tk.call_i(CB, "org.a11y.atspi.Action", "DoAction", k);
+            toggled = 1;
+        }
+        k = k + 1;
+    }
+    tk.check("toggled: checked", toggled == 1 && check.state(t, cb) == check.ON && tk.has_state(CB, 4) == 1);
+
+    // --- A slider: its value ---
+    let is [96]u8 as slp;
+    tk.path(win, sl, cast(*u8, &slp));
+    let is *u8 as SL = cast(*u8, &slp);
+    tk.check("a slider, with a value", tk.role_of(SL) == 51 && tk.has_iface(SL, "org.a11y.atspi.Value") == 1);
+    tk.check("its range", tk.prop_double(SL, "org.a11y.atspi.Value", "MinimumValue") == 1.0 &&
+           tk.prop_double(SL, "org.a11y.atspi.Value", "MaximumValue") == 10.0 &&
+           tk.prop_double(SL, "org.a11y.atspi.Value", "MinimumIncrement") == 1.0);
+    let is dbus.message.Message as set with mut = tk.msg(SL, "org.freedesktop.DBus.Properties", "Set");
+    set.signature = "ssv";
+    let is *dbus.wire.Writer as sw = dbus.conn.body(&tk.at);
+    dbus.wire.put_string(sw, "org.a11y.atspi.Value");
+    dbus.wire.put_string(sw, "CurrentValue");
+    dbus.wire.put_variant(sw, "d");
+    dbus.wire.put_double(sw, 7.0);
+    tk.check("set", tk.ask(&set) == dbus.conn.OK && slider.value(t, sl) == 7.0 &&
+           tk.prop_double(SL, "org.a11y.atspi.Value", "CurrentValue") == 7.0);
+
+    // --- Where things are ---
+    let is math.rect.Rect as okr = layout.window_rect(t, ok);
+    let is dbus.message.Message as ex with mut = tk.msg(OK, "org.a11y.atspi.Component", "GetExtents");
+    ex.signature = "u";
+    dbus.wire.put_u32(dbus.conn.body(&tk.at), 1);
+    tk.check("extents asked", tk.ask(&ex) == dbus.conn.OK);
+    let is dbus.wire.Reader as er with mut = dbus.message.body(&tk.rep);
+    dbus.wire.get_struct(&er);
+    tk.check("in the window", dbus.wire.get_i32(&er) == cast(i64, okr.x) && dbus.wire.get_i32(&er) == cast(i64, okr.y) &&
+           dbus.wire.get_i32(&er) == cast(i64, okr.w) && dbus.wire.get_i32(&er) == cast(i64, okr.h));
+    app.set_position(a, win, 100.0, 50.0);
+    ex = tk.msg(OK, "org.a11y.atspi.Component", "GetExtents");
+    ex.signature = "u";
+    dbus.wire.put_u32(dbus.conn.body(&tk.at), 0);
+    tk.ask(&ex);
+    er = dbus.message.body(&tk.rep);
+    dbus.wire.get_struct(&er);
+    tk.check("on the screen", dbus.wire.get_i32(&er) == cast(i64, okr.x) + 100 && dbus.wire.get_i32(&er) == cast(i64, okr.y) + 50);
+    let is dbus.message.Message as at_point with mut = tk.msg(WIN, "org.a11y.atspi.Component", "GetAccessibleAtPoint");
+    at_point.signature = "iiu";
+    let is *dbus.wire.Writer as aw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(aw, cast(i64, okr.x + 3.0));
+    dbus.wire.put_i32(aw, cast(i64, okr.y + 3.0));
+    dbus.wire.put_u32(aw, 1);
+    tk.check("what is at a point asked", tk.ask(&at_point) == dbus.conn.OK);
+    let is dbus.wire.Reader as apr with mut = dbus.message.body(&tk.rep);
+    tk.check("the button there", tk.ref_is(&apr, win, ok) == 1);
+    let is dbus.wire.Reader as gf with mut = tk.call0(CB, "org.a11y.atspi.Component", "GrabFocus");
+    tk.check("focus asked for: given", dbus.wire.get_bool(&gf) == 1 && router.focused(t, r) == cb);
+    let is dbus.wire.Reader as lay with mut = tk.call0(WIN, "org.a11y.atspi.Component", "GetLayer");
+    tk.check("a window's layer", dbus.wire.get_u32(&lay) == 7);
+    lay = tk.call0(OK, "org.a11y.atspi.Component", "GetLayer");
+    tk.check("a widget's", dbus.wire.get_u32(&lay) == 3);
+
+    // --- A label: its text ---
+    let is [96]u8 as lbp;
+    tk.path(win, lb, cast(*u8, &lbp));
+    let is *u8 as LB = cast(*u8, &lbp);
+    tk.check("a label, with text", tk.role_of(LB) == 29 && tk.has_iface(LB, "org.a11y.atspi.Text") == 1 &&
+           tk.has_iface(LB, "org.a11y.atspi.EditableText") == 0);
+    tk.check("so many characters", tk.prop_int(LB, "org.a11y.atspi.Text", "CharacterCount") == 5);
+
+    // --- The rest of what they answer ---
+    let is dbus.wire.Reader as ri with mut = tk.call0(ROOT, tk.ACC, "GetIndexInParent");
+    tk.check("the application: no place it knows among the desktop's", dbus.wire.get_i32(&ri) == 0 - 1 && ri.err == 0);
+    let is dbus.wire.Reader as rs with mut = tk.call0(ROOT, tk.ACC, "GetState");
+    let is i64 as rend = dbus.wire.get_array(&rs, 4);
+    tk.check("nor states", dbus.wire.get_u32(&rs) == 0 && dbus.wire.get_u32(&rs) == 0 && rs.pos == rend && rs.err == 0);
+    tk.check("a button: nothing to choose among, no table", tk.has_iface(OK, "org.a11y.atspi.Selection") == 0 &&
+             tk.has_iface(OK, "org.a11y.atspi.Table") == 0 && tk.has_iface(OK, "org.a11y.atspi.EditableText") == 0);
+    tk.check("a label: no actions", tk.has_iface(LB, "org.a11y.atspi.Action") == 0);
+    let is dbus.wire.Reader as lrn with mut = tk.call0(OK, tk.ACC, "GetLocalizedRoleName");
+    tk.check("its role's name, as said here", reads(&lrn, "button") == 1);
+    let is dbus.wire.Reader as attrs with mut = tk.call0(OK, tk.ACC, "GetAttributes");
+    let is i64 as attrs_end = dbus.wire.get_array(&attrs, 8);
+    dbus.wire.get_struct(&attrs);
+    tk.check("its attributes: the toolkit's", reads(&attrs, "toolkit") == 1 && reads(&attrs, "caustic") == 1 &&
+             attrs.pos == attrs_end);
+    let is dbus.wire.Reader as ap with mut = tk.call0(OK, tk.ACC, "GetApplication");
+    tk.check("its application", tk.ref_is(&ap, 0, 0) == 1);
+    tk.check("no description", tk.prop_string(OK, tk.ACC, "Description", "") == 1);
+    said_kind = widget.kind("said", 0);
+    said_kind.role = access.ROLE_IMAGE;
+    said_kind.access = fn_ptr(said_access);
+    said_kind.measure = fn_ptr(said_measure);
+    // A row wider than what it holds: a point beside that is on the row,
+    // which says nothing.
+    let is i64 as holder = box.create(t, col, box.ROW);
+    layout.set_min_size(t, holder, 200.0, 30.0);
+    let is i64 as said = tree.create(t, &said_kind, holder);
+    let is i64 as caption = label.create(t, col, "Name:", 5);
+    let is i64 as field = entry.create(t, col);
+    tree.set_labelled_by(t, field, caption);
+    app.frame(a, win);
+    let is [96]u8 as saidp;
+    let is *u8 as SAID = tk.path(win, said, cast(*u8, &saidp));
+    tk.check("one that says more: its description", tk.prop_string(SAID, tk.ACC, "Description", "What it says") == 1);
+    let is [96]u8 as capp;
+    let is *u8 as CAP = tk.path(win, caption, cast(*u8, &capp));
+    let is [96]u8 as fieldp;
+    let is *u8 as FIELD = tk.path(win, field, cast(*u8, &fieldp));
+    let is dbus.wire.Reader as rel with mut = tk.call0(FIELD, tk.ACC, "GetRelationSet");
+    let is i64 as rel_end with mut = dbus.wire.get_array(&rel, 8);
+    dbus.wire.get_struct(&rel);
+    let is i64 as kind1 = dbus.wire.get_u32(&rel);
+    let is i64 as rel_in with mut = dbus.wire.get_array(&rel, 8);
+    tk.check("labelled by its label", kind1 == 2 && tk.ref_is(&rel, win, caption) == 1 && rel.pos == rel_in && rel.pos == rel_end);
+    rel = tk.call0(CAP, tk.ACC, "GetRelationSet");
+    rel_end = dbus.wire.get_array(&rel, 8);
+    dbus.wire.get_struct(&rel);
+    let is i64 as kind2 = dbus.wire.get_u32(&rel);
+    rel_in = dbus.wire.get_array(&rel, 8);
+    tk.check("the label, of what it labels", kind2 == 1 && tk.ref_is(&rel, win, field) == 1 && rel.pos == rel_in &&
+             rel.pos == rel_end);
+    rel = tk.call0(SL, tk.ACC, "GetRelationSet");
+    rel_end = dbus.wire.get_array(&rel, 8);
+    tk.check("none for the rest", rel.pos == rel_end && rel.err == 0);
+    let is math.rect.Rect as hr = layout.window_rect(t, holder);
+    let is math.rect.Rect as sr = layout.window_rect(t, said);
+    let is i64 as gx = cast(i64, hr.x + hr.w) - 5;
+    let is i64 as gy = cast(i64, hr.y) + 5;
+    tk.check("a point of the row beside what it holds", cast(f64, gx) > sr.x + sr.w && hr.w >= 200.0);
+    let is dbus.wire.Reader as gap with mut = call_iiu(WIN, "org.a11y.atspi.Component", "GetAccessibleAtPoint", gx, gy, 1);
+    tk.check("a point on what says nothing: what holds it", tk.ref_is(&gap, win, root) == 1);
+    tree.destroy(t, holder);
+    tree.destroy(t, caption);
+    tree.destroy(t, field);
+    app.frame(a, win);
+
+    // Where: the edges in, the far edges out.
+    let is i64 as ox = cast(i64, okr.x);
+    let is i64 as oy = cast(i64, okr.y);
+    let is i64 as ow = cast(i64, okr.w);
+    let is i64 as oh = cast(i64, okr.h);
+    tk.check("whole pixels", cast(f64, ox) == okr.x && cast(f64, oy) == okr.y && cast(f64, ow) == okr.w && cast(f64, oh) == okr.h);
+    tk.check("a point on its first edges: in it", tk.yes(call_iiu(OK, "org.a11y.atspi.Component", "Contains", ox, oy, 1)) == 1 &&
+             tk.yes(call_iiu(OK, "org.a11y.atspi.Component", "Contains", ox + ow - 1, oy + oh - 1, 1)) == 1);
+    tk.check("on its far ones, or before it: not", tk.yes(call_iiu(OK, "org.a11y.atspi.Component", "Contains", ox + ow, oy, 1)) == 0 &&
+             tk.yes(call_iiu(OK, "org.a11y.atspi.Component", "Contains", ox, oy + oh, 1)) == 0 &&
+             tk.yes(call_iiu(OK, "org.a11y.atspi.Component", "Contains", ox - 1, oy, 1)) == 0 &&
+             tk.yes(call_iiu(OK, "org.a11y.atspi.Component", "Contains", ox, oy - 1, 1)) == 0);
+    tk.check("on the screen too", tk.yes(call_iiu(OK, "org.a11y.atspi.Component", "Contains", ox + 100, oy + 50, 0)) == 1);
+    let is dbus.wire.Reader as gp with mut = call_u(OK, "org.a11y.atspi.Component", "GetPosition", 0);
+    tk.check("its place", dbus.wire.get_i32(&gp) == ox + 100 && dbus.wire.get_i32(&gp) == oy + 50);
+    let is dbus.wire.Reader as gsz with mut = tk.call0(OK, "org.a11y.atspi.Component", "GetSize");
+    tk.check("its size", dbus.wire.get_i32(&gsz) == ow && dbus.wire.get_i32(&gsz) == oh);
+    let is dbus.wire.Reader as zo with mut = tk.call0(OK, "org.a11y.atspi.Component", "GetMDIZOrder");
+    tk.check("no order among windows of one", dbus.wire.get_i16(&zo) == 0 && zo.err == 0);
+    let is dbus.wire.Reader as al with mut = tk.call0(OK, "org.a11y.atspi.Component", "GetAlpha");
+    tk.check("opaque", dbus.wire.get_double(&al) == 1.0);
+    tk.check("not moved by them", no(call_iiu(OK, "org.a11y.atspi.Component", "SetPosition", 0, 0, 1)) == 1 &&
+             no(tk.call_ii(OK, "org.a11y.atspi.Component", "SetSize", 5, 5)) == 1);
+    let is dbus.message.Message as se with mut = tk.msg(OK, "org.a11y.atspi.Component", "SetExtents");
+    se.signature = "iiiiu";
+    let is *dbus.wire.Writer as sew = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(sew, 0);
+    dbus.wire.put_i32(sew, 0);
+    dbus.wire.put_i32(sew, 5);
+    dbus.wire.put_i32(sew, 5);
+    dbus.wire.put_u32(sew, 1);
+    tk.check("nor resized", no(tk.reply_of(&se)) == 1);
+    tk.check("scrolled into view", tk.yes(call_u(OK, "org.a11y.atspi.Component", "ScrollTo", 0)) == 1);
+    let is dbus.message.Message as sp with mut = tk.msg(OK, "org.a11y.atspi.Component", "ScrollToPoint");
+    sp.signature = "uii";
+    let is *dbus.wire.Writer as spw = dbus.conn.body(&tk.at);
+    dbus.wire.put_u32(spw, 1);
+    dbus.wire.put_i32(spw, 0);
+    dbus.wire.put_i32(spw, 0);
+    tk.check("not to a point", no(tk.reply_of(&sp)) == 1);
+    let is dbus.wire.Reader as own with mut = call_iiu(OK, "org.a11y.atspi.Component", "GetAccessibleAtPoint", ox + 2, oy + 2, 1);
+    tk.check("what is at a point of it: itself", tk.ref_is(&own, win, ok) == 1);
+    let is math.rect.Rect as cbr = layout.window_rect(t, cb);
+    let is dbus.wire.Reader as out with mut = call_iiu(OK, "org.a11y.atspi.Component", "GetAccessibleAtPoint",
+                                                      cast(i64, cbr.x) + 2, cast(i64, cbr.y) + 2, 1);
+    tk.check("a point outside it: nothing", tk.is_null(&out) == 1);
+    let is dbus.wire.Reader as scr with mut = call_iiu(WIN, "org.a11y.atspi.Component", "GetAccessibleAtPoint", ox + 102, oy + 52, 0);
+    tk.check("a point of the screen", tk.ref_is(&scr, win, ok) == 1);
+
+    // A value set on what has none: refused.
+    let is dbus.message.Message as nv with mut = tk.msg(OK, "org.freedesktop.DBus.Properties", "Set");
+    nv.signature = "ssv";
+    let is *dbus.wire.Writer as nvw = dbus.conn.body(&tk.at);
+    dbus.wire.put_string(nvw, "org.a11y.atspi.Value");
+    dbus.wire.put_string(nvw, "CurrentValue");
+    dbus.wire.put_variant(nvw, "d");
+    dbus.wire.put_double(nvw, 3.0);
+    tk.check("a value set on a button: refused", tk.ask(&nv) == dbus.conn.REPLY_ERROR);
+
+    // Actions, described.
+    let is dbus.wire.Reader as ad with mut = tk.call_i(OK, "org.a11y.atspi.Action", "GetDescription", 0);
+    tk.check("an action's description", reads(&ad, "click") == 1);
+    ad = tk.call_i(OK, "org.a11y.atspi.Action", "GetLocalizedName", 0);
+    tk.check("its name, as said here", reads(&ad, "click") == 1);
+    ad = tk.call_i(OK, "org.a11y.atspi.Action", "GetKeyBinding", 0);
+    tk.check("no key named", reads(&ad, "") == 1);
+    let is i64 as nacts = tk.prop_int(CB, "org.a11y.atspi.Action", "NActions");
+    let is dbus.wire.Reader as acts with mut = tk.call0(CB, "org.a11y.atspi.Action", "GetActions");
+    let is i64 as acts_end = dbus.wire.get_array(&acts, 8);
+    let is i64 as listed with mut = 0;
+    let is i32 as named_well with mut = 1;
+    while (acts.err == 0 && acts.pos < acts_end) {
+        dbus.wire.get_struct(&acts);
+        let is i64 as an_n with mut = 0;
+        let is *u8 as an_s = dbus.wire.get_string(&acts, &an_n);
+        if (an_n == 0) { named_well = 0; }
+        dbus.wire.get_string(&acts, &an_n);
+        dbus.wire.get_string(&acts, &an_n);
+        listed = listed + 1;
+    }
+    tk.check("every action listed, each named", nacts > 0 && listed == nacts && named_well == 1);
+
+    // The application's id, as the registry sets it.
+    let is dbus.message.Message as sid with mut = tk.msg(ROOT, "org.freedesktop.DBus.Properties", "Set");
+    sid.signature = "ssv";
+    let is *dbus.wire.Writer as sidw = dbus.conn.body(&tk.at);
+    dbus.wire.put_string(sidw, "org.a11y.atspi.Application");
+    dbus.wire.put_string(sidw, "Id");
+    dbus.wire.put_variant(sidw, "i");
+    dbus.wire.put_i32(sidw, 42);
+    tk.check("its id set", tk.ask(&sid) == dbus.conn.OK && tk.prop_int(ROOT, "org.a11y.atspi.Application", "Id") == 42);
+
+    // --- What is not there ---
+    tree.set_visible(t, sl, 0);
+    tk.check("hidden: not told", tk.prop_int(WIN, tk.ACC, "ChildCount") == 3);
+    let is dbus.message.Message as gone = tk.msg(SL, tk.ACC, "GetRole");
+    dbus.conn.body(&tk.at);
+    tk.check("hidden: no object", tk.ask(&gone) == dbus.conn.REPLY_ERROR);
+    tree.set_visible(t, sl, 1);
+    tree.destroy(t, lb);
+    let is dbus.message.Message as dead = tk.msg(LB, tk.ACC, "GetRole");
+    dbus.conn.body(&tk.at);
+    tk.check("destroyed: no object", tk.ask(&dead) == dbus.conn.REPLY_ERROR);
+
+    // --- Paths of nothing: no object, not even to introspect ---
+    let is dbus.message.Message as odd = tk.msg("/org/a11y/atspi/accessible/oops", "org.freedesktop.DBus.Introspectable", "Introspect");
+    dbus.conn.body(&tk.at);
+    tk.check("a path of no widget's shape", tk.ask(&odd) == dbus.conn.REPLY_ERROR);
+    app.hide(a, win);
+    let is dbus.message.Message as away = tk.msg(OK, "org.freedesktop.DBus.Introspectable", "Introspect");
+    dbus.conn.body(&tk.at);
+    tk.check("a widget of a window hidden", tk.ask(&away) == dbus.conn.REPLY_ERROR);
+    app.show(a, win);
+    let is dbus.message.Message as here = tk.msg(OK, "org.freedesktop.DBus.Introspectable", "Introspect");
+    dbus.conn.body(&tk.at);
+    tk.check("shown again: there", tk.ask(&here) == dbus.conn.OK);
+
+    // --- Closed ---
+    let is [256]u8 as bus_name;
+    let is [256]u8 as session_name;
+    tk._keep(cast(*u8, &bus_name), 256, atspi.bus_name(b), dbus.wire.cstr_len(atspi.bus_name(b)));
+    tk._keep(cast(*u8, &session_name), 256, dbus.conn.unique_name(&b.session), dbus.wire.cstr_len(dbus.conn.unique_name(&b.session)));
+    atspi.close(b);
+    tk.check("its connections closed", owned(cast(*u8, &bus_name)) == 0 && owned(cast(*u8, &session_name)) == 0);
+    tk.check("closed: off", atspi.is_on(b) == 0 && atspi.stage(b) == bridge.OFF);
+    tk.check("no descriptors", atspi.fds(b, cast(*i64, &fds)) == 0);
+
+    return tk.finish("atspi");
+}

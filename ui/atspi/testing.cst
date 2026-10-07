@@ -1,0 +1,502 @@
+// ui/atspi/testing.cst — what the bridge's tests share. Not part of the bridge.
+//
+// No desktop's accessibility bus: one connection here plays it — org.a11y.Bus
+// with its status and its address (which is this same bus) and the registry
+// that embeds us — and another plays an assistive technology, asking the
+// bridge's objects what they are, asking them to act, and listening to what
+// they say. The bridge is pumped while they wait, as a program's loop would.
+//
+// The tests run from the repository's root (the test font) inside
+// dbus/tools/run_dbus.sh.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../../gpu/gpu.cst" as gpu;
+use "../../text/sfnt/sfnt.cst" as sfnt;
+use "../../text/sfnt/table.cst" as table;
+use "../../text/layout/font.cst" as font;
+use "../../dbus/dbus.cst" as dbus;
+use "../style.cst" as style;
+use "../text.cst" as text;
+use "../app.cst" as app;
+use "bridge.cst" as bridge;
+use "atspi.cst" as atspi;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn _load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn named(a as *u8, b as *u8) as i32 { return dbus.message.named(a, b); }
+
+// Whether the n bytes at a are the string b.
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    if (cast(i64, a) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (b[i] == 0 || a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, b[n] == 0);
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn _resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is *text.Service as svc with mut;
+let is gpu.device.Device as dv with mut;
+
+// --- The desktop's side ---
+
+let is dbus.conn.Conn as fake with mut;
+let is i32 as enabled with mut = 0;
+let is i32 as reader with mut = 0;
+let is [256]u8 as embedded_name with mut;
+let is [256]u8 as embedded_path with mut;
+let is i64 as embeds with mut = 0;
+let is *u8 as bus_address with mut;
+
+fn _m_get_address(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    dbus.wire.put_string(k.reply, bus_address);
+}
+
+fn _p_enabled(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { dbus.wire.put_bool(w, enabled); }
+
+fn _p_reader(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { dbus.wire.put_bool(w, reader); }
+
+fn _m_embed(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as n with mut = 0;
+    dbus.wire.get_struct(&k.args);
+    let is *u8 as s with mut = dbus.wire.get_string(&k.args, &n);
+    mem.memcpy(cast(*u8, &embedded_name), s, n + 1);
+    s = dbus.wire.get_path(&k.args, &n);
+    mem.memcpy(cast(*u8, &embedded_path), s, n + 1);
+    embeds = embeds + 1;
+    dbus.wire.put_struct(k.reply);
+    dbus.wire.put_string(k.reply, "org.a11y.atspi.Registry");
+    dbus.wire.put_path(k.reply, "/org/a11y/atspi/accessible/root");
+}
+
+let is [1]dbus.conn.Method as bus_methods with mut;
+let is [2]dbus.conn.Property as status_props with mut;
+let is [2]dbus.conn.Interface as bus_ifaces with mut;
+let is [1]dbus.conn.Method as socket_methods with mut;
+let is [1]dbus.conn.Interface as socket_ifaces with mut;
+
+fn _iface(f as *dbus.conn.Interface, name as *u8, ms as *dbus.conn.Method, nm as i64, ps as *dbus.conn.Property, np as i64) as void {
+    f.name = name;
+    f.methods = ms;
+    f.nmethods = nm;
+    f.props = ps;
+    f.nprops = np;
+    f.signals = cast(*dbus.conn.SignalDecl, 0);
+    f.nsignals = 0;
+}
+
+fn _play_desktop() as void {
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    fake = dbus.conn.open_session(&l);
+    dbus.conn.request_name(&fake, "org.a11y.Bus", 4);
+    dbus.conn.request_name(&fake, "org.a11y.atspi.Registry", 4);
+    bus_methods[0].name = "GetAddress";
+    bus_methods[0].in_sig = "";
+    bus_methods[0].out_sig = "s";
+    bus_methods[0].handler = fn_ptr(_m_get_address);
+    bus_methods[0].in_names = cast(*u8, 0);
+    bus_methods[0].out_names = "address";
+    status_props[0].name = "IsEnabled";
+    status_props[0].sig = "b";
+    status_props[0].get = fn_ptr(_p_enabled);
+    status_props[0].set = cast(dbus.conn.SetFn, 0);
+    status_props[1].name = "ScreenReaderEnabled";
+    status_props[1].sig = "b";
+    status_props[1].get = fn_ptr(_p_reader);
+    status_props[1].set = cast(dbus.conn.SetFn, 0);
+    _iface(&bus_ifaces[0], "org.a11y.Bus", cast(*dbus.conn.Method, &bus_methods), 1, cast(*dbus.conn.Property, 0), 0);
+    _iface(&bus_ifaces[1], "org.a11y.Status", cast(*dbus.conn.Method, 0), 0, cast(*dbus.conn.Property, &status_props), 2);
+    dbus.conn.export(&fake, "/org/a11y/bus", cast(*dbus.conn.Interface, &bus_ifaces), 2, cast(*u8, 0));
+    socket_methods[0].name = "Embed";
+    socket_methods[0].in_sig = "(so)";
+    socket_methods[0].out_sig = "(so)";
+    socket_methods[0].handler = fn_ptr(_m_embed);
+    socket_methods[0].in_names = "plug";
+    socket_methods[0].out_names = "socket";
+    _iface(&socket_ifaces[0], "org.a11y.atspi.Socket", cast(*dbus.conn.Method, &socket_methods), 1, cast(*dbus.conn.Property, 0), 0);
+    dbus.conn.export(&fake, "/org/a11y/atspi/accessible/root", cast(*dbus.conn.Interface, &socket_ifaces), 1, cast(*u8, 0));
+}
+
+// --- The application, the bridge, the assistive technology ---
+
+let is app.App as a with mut;
+let is bridge.Bridge as b with mut;
+let is dbus.conn.Conn as at with mut;
+let is dbus.message.Message as rep with mut;
+
+// The test font and theme, the text service, the desktop played, the
+// assistive technology's connection and an application: 1, or 0 with why
+// said.
+fn setup() as i32 {
+    let is *u8 as d = _load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 0;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    theme = style.light();
+    theme.fonts.body.size = 16.0;
+    dv = gpu.open_headless(64, 64, gpu.SOFTWARE);
+    let is text.Limits as lim = text.limits_default();
+    svc = text.open(&dv, &lim, fn_ptr(_resolve), cast(*u8, 0), theme.fonts.family);
+    bus_address = env.getenv("DBUS_SESSION_BUS_ADDRESS");
+    if (cast(i64, bus_address) == 0) {
+        io.printf("atspi: no bus — run inside dbus/tools/run_dbus.sh\n");
+        return 0;
+    }
+    _play_desktop();
+    // An assistive technology reads large texts whole.
+    let is dbus.conn.Limits as cl with mut = dbus.conn.limits_default();
+    cl.buffer = 16777216;
+    at = dbus.conn.open_session(&cl);
+    let is app.Limits as al = app.limits_default();
+    a = app.open(&al);
+    app.set_theme(&a, &theme);
+    app.set_text_service(&a, cast(*u8, svc));
+    return 1;
+}
+
+// The bridge opened with the desktop listening, and pumped until it is on:
+// 1 when it is.
+fn turn_on() as i32 {
+    enabled = 1;
+    if (atspi.open(&b, &a, "Caustic test", 12) == 0) { return 0; }
+    let is i64 as deadline = time.now_ms() + 3000;
+    while (time.now_ms() < deadline && atspi.is_on(&b) == 0) {
+        atspi.pump(&b);
+        dbus.conn.dispatch(&fake, 0);
+        time.sleep_ms(1);
+    }
+    return atspi.is_on(&b);
+}
+
+// Everything closed; the test's exit status, its result said.
+fn finish(name as *u8) as i32 {
+    atspi.close(&b);
+    app.close(&a);
+    dbus.conn.close(&at);
+    dbus.conn.close(&fake);
+    if (fails == 0) {
+        io.printf("%s: all checks passed\n", name);
+        return 0;
+    }
+    io.printf("%s: %d failures\n", name, fails);
+    return 1;
+}
+
+// Everything pumped for ms: the bridge, the desktop played here, the
+// assistive technology's signals.
+fn settle(ms as i64) as void {
+    let is i64 as deadline = time.now_ms() + ms;
+    while (time.now_ms() < deadline) {
+        atspi.pump(&b);
+        dbus.conn.dispatch(&fake, 0);
+        dbus.conn.dispatch(&at, 0);
+        time.sleep_ms(1);
+    }
+}
+
+// m asked of the bridge by the assistive technology, body(&at) its
+// arguments: the reply in rep, or what went wrong.
+fn ask(m as *dbus.message.Message) as i32 {
+    let is i64 as serial = dbus.conn.send(&at, m);
+    if (serial == 0) { return dbus.conn.last_error(&at); }
+    let is i64 as deadline = time.now_ms() + 3000;
+    while (time.now_ms() < deadline) {
+        atspi.pump(&b);
+        dbus.conn.dispatch(&fake, 0);
+        let is i32 as got = dbus.conn.wait_reply(&at, serial, 2, &rep);
+        if (got != dbus.conn.TIMEOUT) { return got; }
+    }
+    return dbus.conn.TIMEOUT;
+}
+
+fn msg(path as *u8, iface as *u8, member as *u8) as dbus.message.Message {
+    return dbus.message.method_call(atspi.bus_name(&b), path, iface, member);
+}
+
+let is *u8 as ACC with imut = "org.a11y.atspi.Accessible";
+
+fn _failed() as dbus.wire.Reader {
+    let is dbus.wire.Reader as none with mut = dbus.wire.reader(cast(*u8, 0), 0, 0);
+    none.err = 1;
+    return none;
+}
+
+// m asked, its reply's reader; one failed to read from if it went wrong.
+fn reply_of(m as *dbus.message.Message) as dbus.wire.Reader {
+    if (ask(m) != dbus.conn.OK) { return _failed(); }
+    return dbus.message.body(&rep);
+}
+
+// A method of no arguments asked.
+fn call0(path as *u8, iface as *u8, member as *u8) as dbus.wire.Reader {
+    let is dbus.message.Message as m = msg(path, iface, member);
+    dbus.conn.body(&at);
+    return reply_of(&m);
+}
+
+// A method of one i32 asked.
+fn call_i(path as *u8, iface as *u8, member as *u8, v as i64) as dbus.wire.Reader {
+    let is dbus.message.Message as m with mut = msg(path, iface, member);
+    m.signature = "i";
+    dbus.wire.put_i32(dbus.conn.body(&at), v);
+    return reply_of(&m);
+}
+
+// A method of two i32 asked.
+fn call_ii(path as *u8, iface as *u8, member as *u8, a as i64, b as i64) as dbus.wire.Reader {
+    let is dbus.message.Message as m with mut = msg(path, iface, member);
+    m.signature = "ii";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&at);
+    dbus.wire.put_i32(w, a);
+    dbus.wire.put_i32(w, b);
+    return reply_of(&m);
+}
+
+// Whether a reply is a boolean true.
+fn yes(r as dbus.wire.Reader) as i32 {
+    let is dbus.wire.Reader as q with mut = r;
+    return cast(i32, dbus.wire.get_bool(&q) == 1 && q.err == 0);
+}
+
+// Whether a reference read is the null one.
+fn is_null(r as *dbus.wire.Reader) as i32 {
+    let is i64 as n with mut = 0;
+    dbus.wire.get_struct(r);
+    dbus.wire.get_string(r, &n);
+    let is *u8 as p = dbus.wire.get_path(r, &n);
+    return cast(i32, r.err == 0 && named(p, bridge.NULL_PATH) == 1);
+}
+
+// A property's value asked, its reader past the variant's signature.
+fn prop(path as *u8, iface as *u8, name as *u8) as dbus.wire.Reader {
+    let is dbus.message.Message as m with mut = msg(path, "org.freedesktop.DBus.Properties", "Get");
+    m.signature = "ss";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&at);
+    dbus.wire.put_string(w, iface);
+    dbus.wire.put_string(w, name);
+    if (ask(&m) != dbus.conn.OK) { return _failed(); }
+    let is dbus.wire.Reader as r with mut = dbus.message.body(&rep);
+    let is i64 as n with mut = 0;
+    dbus.wire.get_variant(&r, &n);
+    return r;
+}
+
+fn prop_string(path as *u8, iface as *u8, name as *u8, want as *u8) as i32 {
+    let is dbus.wire.Reader as r with mut = prop(path, iface, name);
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&r, &n);
+    return cast(i32, r.err == 0 && same(s, n, want) == 1);
+}
+
+fn prop_int(path as *u8, iface as *u8, name as *u8) as i64 {
+    let is dbus.wire.Reader as r with mut = prop(path, iface, name);
+    let is i64 as v = dbus.wire.get_i32(&r);
+    if (r.err != 0) { return 0 - 999; }
+    return v;
+}
+
+fn prop_double(path as *u8, iface as *u8, name as *u8) as f64 {
+    let is dbus.wire.Reader as r with mut = prop(path, iface, name);
+    let is f64 as v = dbus.wire.get_double(&r);
+    if (r.err != 0) { return 0.0 - 999.0; }
+    return v;
+}
+
+// Whether a reference read is the bridge's object for win/w.
+fn ref_is(r as *dbus.wire.Reader, win as i64, w as i64) as i32 {
+    let is i64 as n with mut = 0;
+    dbus.wire.get_struct(r);
+    let is *u8 as s = dbus.wire.get_string(r, &n);
+    let is i32 as ok = named(s, atspi.bus_name(&b));
+    let is *u8 as p = dbus.wire.get_path(r, &n);
+    let is *u8 as wp = bridge.path_of(&b, win, w);
+    return cast(i32, r.err == 0 && ok == 1 && named(p, wp) == 1);
+}
+
+// The path of win/w, into out (96 bytes): path_of writes into the bridge's
+// own scratch, which the next one overwrites.
+fn path(win as i64, w as i64, out as *u8) as *u8 {
+    let is *u8 as p = bridge.path_of(&b, win, w);
+    mem.memcpy(out, p, dbus.wire.cstr_len(p) + 1);
+    return out;
+}
+
+// Whether GetState says state bit n; -1 when it could not be read.
+fn has_state(p as *u8, bit as i64) as i32 {
+    let is dbus.wire.Reader as r with mut = call0(p, ACC, "GetState");
+    let is i64 as end = dbus.wire.get_array(&r, 4);
+    let is i64 as w0 = dbus.wire.get_u32(&r);
+    let is i64 as w1 = dbus.wire.get_u32(&r);
+    if (r.err != 0 || r.pos != end) { return 0 - 1; }
+    let is i64 as set = w0 | (w1 << 32);
+    return cast(i32, (set & (1 << bit)) != 0);
+}
+
+// Whether GetInterfaces lists name.
+fn has_iface(p as *u8, name as *u8) as i32 {
+    let is dbus.wire.Reader as r with mut = call0(p, ACC, "GetInterfaces");
+    let is i64 as end = dbus.wire.get_array(&r, 4);
+    let is i32 as found with mut = 0;
+    while (r.err == 0 && r.pos < end) {
+        let is i64 as n with mut = 0;
+        let is *u8 as s = dbus.wire.get_string(&r, &n);
+        if (named(s, name) == 1) { found = 1; }
+    }
+    return found;
+}
+
+fn role_of(p as *u8) as i64 {
+    let is dbus.wire.Reader as r with mut = call0(p, ACC, "GetRole");
+    let is i64 as v = dbus.wire.get_u32(&r);
+    if (r.err != 0) { return 0 - 1; }
+    return v;
+}
+
+// --- What the bridge says: its events, heard ---
+
+struct Heard {
+    iface  as [48]u8;    // after org.a11y.atspi.Event.
+    member as [32]u8;
+    detail as [32]u8;
+    d1     as i64;
+    d2     as i64;
+    path   as [96]u8;
+    kind   as u8;        // the value's signature: s, i, d, or ( for a reference
+    _pad0  as [7]u8;
+    s      as [128]u8;   // a string, or a reference's path
+    n      as i64;
+    v      as i64;
+    d      as f64;
+}
+
+let is i64 as MAX_HEARD with imut = 2048;
+let is [2048]Heard as heard with mut;
+let is i64 as nheard with mut = 0;
+
+fn _keep(dst as *u8, cap as i64, s as *u8, n as i64) as void {
+    let is i64 as k with mut = n;
+    if (k > cap - 1) { k = cap - 1; }
+    if (k < 0) { k = 0; }
+    if (k > 0) { mem.memcpy(dst, s, k); }
+    dst[k] = 0;
+}
+
+fn _on_event(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    if (nheard >= MAX_HEARD) { return; }
+    let is *Heard as h = &heard[nheard];
+    mem.memset(cast(*u8, h), 0, sizeof(Heard));
+    let is i64 as k = dbus.wire.cstr_len("org.a11y.atspi.Event.");
+    let is i64 as il = dbus.wire.cstr_len(m.interface);
+    if (il > k) { _keep(cast(*u8, &h.iface), 48, cast(*u8, cast(i64, m.interface) + k), il - k); }
+    _keep(cast(*u8, &h.member), 32, m.member, dbus.wire.cstr_len(m.member));
+    _keep(cast(*u8, &h.path), 96, m.path, dbus.wire.cstr_len(m.path));
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as n with mut = 0;
+    let is *u8 as d = dbus.wire.get_string(&r, &n);
+    _keep(cast(*u8, &h.detail), 32, d, n);
+    h.d1 = dbus.wire.get_i32(&r);
+    h.d2 = dbus.wire.get_i32(&r);
+    let is i64 as sn with mut = 0;
+    let is *u8 as sig = dbus.wire.get_variant(&r, &sn);
+    if (sn > 0) {
+        h.kind = sig[0];
+        if (sig[0] == 115) {
+            let is *u8 as v = dbus.wire.get_string(&r, &n);
+            _keep(cast(*u8, &h.s), 128, v, n);
+            h.n = n;
+        } else if (sig[0] == 105) {
+            h.v = dbus.wire.get_i32(&r);
+        } else if (sig[0] == 100) {
+            h.d = dbus.wire.get_double(&r);
+        } else if (sig[0] == 40) {
+            dbus.wire.get_struct(&r);
+            dbus.wire.get_string(&r, &n);
+            let is *u8 as p = dbus.wire.get_path(&r, &n);
+            _keep(cast(*u8, &h.s), 128, p, n);
+            h.n = n;
+        }
+    }
+    if (r.err == 0) { nheard = nheard + 1; }
+}
+
+// The assistive technology listens to the bridge's events.
+fn listen() as void {
+    let is *u8 as from = atspi.bus_name(&b);
+    dbus.conn.add_match(&at, from, cast(*u8, 0), "org.a11y.atspi.Event.Object", cast(*u8, 0), fn_ptr(_on_event), cast(*u8, 0));
+    dbus.conn.add_match(&at, from, cast(*u8, 0), "org.a11y.atspi.Event.Focus", cast(*u8, 0), fn_ptr(_on_event), cast(*u8, 0));
+    dbus.conn.add_match(&at, from, cast(*u8, 0), "org.a11y.atspi.Event.Window", cast(*u8, 0), fn_ptr(_on_event), cast(*u8, 0));
+}
+
+// Everything heard so far forgotten, after what is on its way arrived.
+fn forget() as void {
+    settle(30);
+    nheard = 0;
+}
+
+// The first event heard from path p of member and detail (null for any
+// detail): null for none.
+fn heard_from(p as *u8, member as *u8, detail as *u8) as *Heard {
+    let is i64 as i with mut = 0;
+    while (i < nheard) {
+        let is *Heard as h = &heard[i];
+        if (named(cast(*u8, &h.path), p) == 1 && named(cast(*u8, &h.member), member) == 1 &&
+            (cast(i64, detail) == 0 || named(cast(*u8, &h.detail), detail) == 1)) { return h; }
+        i = i + 1;
+    }
+    return cast(*Heard, 0);
+}
+
+// How many events of member were heard, from anywhere.
+fn heard_count(member as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nheard) {
+        if (named(cast(*u8, &heard[i].member), member) == 1) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}

@@ -1,0 +1,559 @@
+// ui/atspi/text_test.cst — Text and EditableText through the bridge: text
+// read by characters, words, sentences, lines and paragraphs; the caret and
+// the selection; where characters are; text edited.
+//
+// Run from the repository's root inside dbus/tools/run_dbus.sh.
+use "std/env.cst" as env;
+use "../../math/math.cst" as math;
+use "../../dbus/dbus.cst" as dbus;
+use "../tree.cst" as tree;
+use "../layout.cst" as layout;
+use "../box.cst" as box;
+use "../access.cst" as access;
+use "../app.cst" as app;
+use "../widgets/label.cst" as label;
+use "../widgets/entry.cst" as entry;
+use "../widgets/textview.cst" as textview;
+use "../router.cst" as router;
+use "std/time.cst" as time;
+use "std/mem.cst" as mem;
+use "std/io.cst" as io;
+use "bridge.cst" as bridge;
+use "testing.cst" as tk;
+
+let is *u8 as TEXT with imut = "org.a11y.atspi.Text";
+let is *u8 as EDIT with imut = "org.a11y.atspi.EditableText";
+
+// AtspiTextBoundaryType, AtspiTextGranularity.
+let is i64 as CHAR           with imut = 0;
+let is i64 as WORD_START     with imut = 1;
+let is i64 as WORD_END       with imut = 2;
+let is i64 as SENTENCE_START with imut = 3;
+let is i64 as SENTENCE_END   with imut = 4;
+let is i64 as LINE_START     with imut = 5;
+let is i64 as LINE_END       with imut = 6;
+let is i64 as G_WORD         with imut = 1;
+let is i64 as G_SENTENCE     with imut = 2;
+let is i64 as G_LINE         with imut = 3;
+let is i64 as G_PARAGRAPH    with imut = 4;
+
+// member(offset, kind) asked: whether it answers (want, from, to).
+fn piece(p as *u8, member as *u8, offset as i64, kind as i64, want as *u8, from as i64, to as i64) as i32 {
+    let is dbus.message.Message as m with mut = tk.msg(p, TEXT, member);
+    m.signature = "iu";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(w, offset);
+    dbus.wire.put_u32(w, kind);
+    let is dbus.wire.Reader as r with mut = tk.reply_of(&m);
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&r, &n);
+    let is i64 as a = dbus.wire.get_i32(&r);
+    let is i64 as b = dbus.wire.get_i32(&r);
+    return cast(i32, r.err == 0 && tk.same(s, n, want) == 1 && a == from && b == to);
+}
+
+fn at(p as *u8, offset as i64, kind as i64, want as *u8, from as i64, to as i64) as i32 {
+    return piece(p, "GetTextAtOffset", offset, kind, want, from, to);
+}
+
+fn before(p as *u8, offset as i64, kind as i64, want as *u8, from as i64, to as i64) as i32 {
+    return piece(p, "GetTextBeforeOffset", offset, kind, want, from, to);
+}
+
+fn after(p as *u8, offset as i64, kind as i64, want as *u8, from as i64, to as i64) as i32 {
+    return piece(p, "GetTextAfterOffset", offset, kind, want, from, to);
+}
+
+fn string_at(p as *u8, offset as i64, g as i64, want as *u8, from as i64, to as i64) as i32 {
+    return piece(p, "GetStringAtOffset", offset, g, want, from, to);
+}
+
+// GetText(a, b): whether it is want.
+fn text_is(p as *u8, a as i64, b as i64, want as *u8) as i32 {
+    let is dbus.message.Message as m with mut = tk.msg(p, TEXT, "GetText");
+    m.signature = "ii";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(w, a);
+    dbus.wire.put_i32(w, b);
+    let is dbus.wire.Reader as r with mut = tk.reply_of(&m);
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&r, &n);
+    return cast(i32, r.err == 0 && tk.same(s, n, want) == 1);
+}
+
+// A character's extents in coord's coordinates: x, y, w, h.
+fn char_rect(p as *u8, offset as i64, coord as i64) as math.rect.Rect {
+    let is dbus.message.Message as m with mut = tk.msg(p, TEXT, "GetCharacterExtents");
+    m.signature = "iu";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(w, offset);
+    dbus.wire.put_u32(w, coord);
+    let is dbus.wire.Reader as r with mut = tk.reply_of(&m);
+    let is f64 as x = cast(f64, dbus.wire.get_i32(&r));
+    let is f64 as y = cast(f64, dbus.wire.get_i32(&r));
+    let is f64 as ww = cast(f64, dbus.wire.get_i32(&r));
+    let is f64 as h = cast(f64, dbus.wire.get_i32(&r));
+    if (r.err != 0) { return math.rect.rect(0.0 - 1.0, 0.0 - 1.0, 0.0, 0.0); }
+    return math.rect.rect(x, y, ww, h);
+}
+
+// A text view of n bytes of s (chars characters) typed into at its start,
+// forty keys, the bridge asked where the caret is, the line there and how
+// long the text is after each: how long it took, or -1 when an answer was
+// wrong.
+fn typed_into(t as *tree.Tree, col as i64, a as *app.App, win as i64, s as *u8, n as i64, chars as i64) as i64 {
+    let is i64 as tv = textview.create(t, col);
+    layout.set_min_size(t, tv, 300.0, 100.0);
+    textview.set_text(t, tv, s, n);
+    app.frame(a, win);
+    tk.settle(50);
+    let is [96]u8 as pb;
+    let is *u8 as P = tk.path(win, tv, cast(*u8, &pb));
+    let is *router.Router as vr = app.router(a, win);
+    router.focus(t, vr, tv, 1);
+    textview.select(t, tv, 5, 5);
+    let is i64 as started = time.now_ms();
+    let is i32 as right with mut = 1;
+    let is i64 as round with mut = 0;
+    while (round < 40) {
+        router.text(t, vr, "x", 1, 10000 + round);
+        app.frame(a, win);
+        if (tk.prop_int(P, TEXT, "CaretOffset") != 6 + round) { right = 0; }
+        if (at(P, 3, LINE_START, "", 0, 0) == 1) { right = 0; }
+        if (tk.prop_int(P, TEXT, "CharacterCount") != chars + round + 1) { right = 0; }
+        round = round + 1;
+    }
+    let is i64 as took = time.now_ms() - started;
+    // All of it asked for at once: had.
+    let is dbus.message.Message as all with mut = tk.msg(P, TEXT, "GetText");
+    all.signature = "ii";
+    let is *dbus.wire.Writer as aw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(aw, 0);
+    dbus.wire.put_i32(aw, 0 - 1);
+    let is dbus.wire.Reader as ar with mut = tk.reply_of(&all);
+    let is i64 as an with mut = 0;
+    let is *u8 as atext_all = dbus.wire.get_string(&ar, &an);
+    if (ar.err != 0 || an != n + 40 || atext_all[5] != 120) { right = 0; }
+    tree.destroy(t, tv);
+    app.frame(a, win);
+    if (right == 0) { return 0 - 1; }
+    return took;
+}
+
+// GetOffsetAtPoint(x, y, coord).
+fn offset_at(p as *u8, x as i64, y as i64, coord as i64) as i64 {
+    let is dbus.message.Message as m with mut = tk.msg(p, TEXT, "GetOffsetAtPoint");
+    m.signature = "iiu";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(w, x);
+    dbus.wire.put_i32(w, y);
+    dbus.wire.put_u32(w, coord);
+    let is dbus.wire.Reader as r with mut = tk.reply_of(&m);
+    let is i64 as v = dbus.wire.get_i32(&r);
+    if (r.err != 0) { return 0 - 999; }
+    return v;
+}
+
+// InsertText(at, s, len): whether it said it did.
+fn insert_text(p as *u8, at as i64, s as *u8, len as i64) as i32 {
+    let is dbus.message.Message as m with mut = tk.msg(p, EDIT, "InsertText");
+    m.signature = "isi";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(w, at);
+    dbus.wire.put_string(w, s);
+    dbus.wire.put_i32(w, len);
+    return tk.yes(tk.reply_of(&m));
+}
+
+// The program's clipboard.
+let is [256]u8 as clip with mut;
+let is i64 as nclip with mut = 0;
+let is i64 as pastes with mut = 0;
+
+fn on_copy(user as *u8, which as i32, s as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n && i < 256) {
+        clip[i] = s[i];
+        i = i + 1;
+    }
+    nclip = n;
+}
+
+fn on_paste(user as *u8, which as i32, w as i64) as void { pastes = pastes + 1; }
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (tk.setup() == 0) { return 1; }
+    let is *app.App as a = &tk.a;
+    let is i64 as win = app.window_open(a, 400.0, 300.0);
+    let is *tree.Tree as t = app.tree(a, win);
+    tree.set_clipboard(t, fn_ptr(on_copy), cast(*u8, 0));
+    tree.set_paste(t, fn_ptr(on_paste), cast(*u8, 0));
+    let is i64 as root = tree.root(t);
+    let is i64 as col = box.create(t, root, box.COLUMN);
+    layout.set_align(t, col, layout.START, layout.START);
+    let is i64 as words = label.create(t, col, "One two. Three four.", 20);
+    let is i64 as lines = label.create(t, col, "Up\nDown", 7);
+    let is i64 as narrow = box.create(t, col, box.COLUMN);
+    layout.set_min_size(t, narrow, 60.0, 0.0);
+    layout.set_max_size(t, narrow, 60.0, layout.UNBOUNDED);
+    let is i64 as wrapped = label.create(t, narrow, "Hello world", 11);
+    label.set_wrap(t, wrapped, 1);
+    let is i64 as e = entry.create(t, col);
+    entry.set_text(t, e, "héllo wörld", 13);
+    // Away from the window's edge: its own coordinates and the window's differ.
+    layout.set_margin(t, e, 15.0, 0.0, 0.0, 0.0);
+    let is i64 as off = entry.create(t, col);
+    entry.set_text(t, off, "fixed", 5);
+    tree.set_enabled(t, off, 0);
+    // Words of other kinds of character, and sentences before spaces of
+    // other kinds.
+    let is i64 as half = label.create(t, col, "a \xc2\xbd b", 6);
+    let is i64 as tabbed = label.create(t, col, "One.\tTwo.", 9);
+    let is i64 as returned = label.create(t, col, "One.\rTwo.", 9);
+    let is i64 as trailing = label.create(t, col, "Go now. ", 8);
+    // A text view: paragraphs read in pieces, never whole.
+    let is i64 as tv = textview.create(t, col);
+    layout.set_min_size(t, tv, 300.0, 100.0);
+    textview.set_text(t, tv, "One two\nthree four\nfünf sechs", 30);
+    app.frame(a, win);
+    tk.check("on", tk.turn_on() == 1);
+
+    let is [96]u8 as wb;
+    let is *u8 as W = tk.path(win, words, cast(*u8, &wb));
+    let is [96]u8 as lb;
+    let is *u8 as L = tk.path(win, lines, cast(*u8, &lb));
+    let is [96]u8 as nb;
+    let is *u8 as N = tk.path(win, wrapped, cast(*u8, &nb));
+    let is [96]u8 as eb;
+    let is *u8 as E = tk.path(win, e, cast(*u8, &eb));
+    let is [96]u8 as ob;
+    let is *u8 as O = tk.path(win, off, cast(*u8, &ob));
+    let is [96]u8 as vb;
+    let is *u8 as V = tk.path(win, tv, cast(*u8, &vb));
+
+    let is [96]u8 as hb;
+    let is *u8 as HALF = tk.path(win, half, cast(*u8, &hb));
+    let is [96]u8 as tbb;
+    let is *u8 as TAB = tk.path(win, tabbed, cast(*u8, &tbb));
+    let is [96]u8 as rb;
+    let is *u8 as RET = tk.path(win, returned, cast(*u8, &rb));
+    let is [96]u8 as trb;
+    let is *u8 as TRAIL = tk.path(win, trailing, cast(*u8, &trb));
+
+    // --- At the edges ---
+    tk.check("a range from before the start: from it", text_is(W, 0 - 1, 3, "One") == 1);
+    tk.check("an empty range", text_is(W, 0, 0, "") == 1);
+    let is dbus.wire.Reader as c0r with mut = tk.call_i(W, TEXT, "GetCharacterAtOffset", 0);
+    tk.check("the first character", dbus.wire.get_i32(&c0r) == 79);
+    c0r = tk.call_i(W, TEXT, "GetCharacterAtOffset", 0 - 1);
+    tk.check("none before it", dbus.wire.get_i32(&c0r) == 0 && c0r.err == 0);
+    c0r = tk.call_i(W, TEXT, "GetCharacterAtOffset", 20);
+    tk.check("none at the end", dbus.wire.get_i32(&c0r) == 0 && c0r.err == 0);
+    tk.check("the character at the end: none", at(E, 11, CHAR, "", 11, 11) == 1);
+    tk.check("a character as a string", string_at(E, 1, 0, "é", 1, 2) == 1);
+    tk.check("the one before a later one", before(E, 3, CHAR, "l", 2, 3) == 1);
+    tk.check("by ends, on a line's break", at(L, 2, LINE_END, "\nDown", 2, 7) == 1);
+    tk.check("no caret: none", tk.prop_int(W, TEXT, "CaretOffset") == 0 - 1);
+
+    // --- Words and sentences of other characters ---
+    tk.check("a number of another kind: a word", at(HALF, 2, WORD_START, "\xc2\xbd ", 2, 4) == 1);
+    tk.check("a sentence ended before a tab", at(TAB, 6, SENTENCE_END, "\tTwo.", 4, 9) == 1);
+    tk.check("before a carriage return", at(RET, 6, SENTENCE_END, "\rTwo.", 4, 9) == 1);
+    tk.check("before spaces at the end", at(TRAIL, 3, SENTENCE_END, "Go now.", 0, 7) == 1);
+
+    // --- A text view ---
+    tk.check("a text view: its caret at the start", tk.prop_int(V, TEXT, "CaretOffset") == 0);
+    tk.check("a text view: counted", tk.prop_int(V, TEXT, "CharacterCount") == 29);
+    tk.check("a range across paragraphs", text_is(V, 4, 13, "two\nthree") == 1 && text_is(V, 8, 18, "three four") == 1);
+    let is dbus.wire.Reader as vc with mut = tk.call_i(V, TEXT, "GetCharacterAtOffset", 20);
+    tk.check("a character in a later paragraph", dbus.wire.get_i32(&vc) == 252);
+    tk.check("words: the next one in the next paragraph", at(V, 5, WORD_START, "two\n", 4, 8) == 1);
+    tk.check("the one before in the paragraph before", before(V, 21, WORD_START, "four\n", 14, 19) == 1 &&
+             at(V, 21, WORD_START, "fünf ", 19, 24) == 1);
+    tk.check("by ends, across a line end", at(V, 9, WORD_END, "\nthree", 7, 13) == 1);
+    tk.check("the last word: to the end", at(V, 27, WORD_START, "sechs", 24, 29) == 1);
+    tk.check("a paragraph a sentence", at(V, 10, SENTENCE_START, "three four\n", 8, 19) == 1 &&
+             at(V, 20, SENTENCE_START, "fünf sechs", 19, 29) == 1);
+    tk.check("a line, a paragraph", at(V, 10, LINE_START, "three four\n", 8, 19) == 1 &&
+             string_at(V, 21, G_PARAGRAPH, "fünf sechs", 19, 29) == 1);
+    let is dbus.wire.Reader as vs with mut = tk.call_i(V, TEXT, "SetCaretOffset", 21);
+    tk.check("the caret put, in characters", tk.yes(vs) == 1 && textview.caret(t, tv) == 22 &&
+             tk.prop_int(V, TEXT, "CaretOffset") == 21);
+
+    // --- Characters ---
+    tk.check("counted in characters", tk.prop_int(W, TEXT, "CharacterCount") == 20 &&
+             tk.prop_int(E, TEXT, "CharacterCount") == 11);
+    tk.check("a range of it", text_is(W, 0, 3, "One") == 1 && text_is(W, 4, 0 - 1, "two. Three four.") == 1);
+    tk.check("by characters, not bytes", text_is(E, 0, 5, "héllo") == 1 && text_is(E, 6, 11, "wörld") == 1);
+    tk.check("a range outside it: clamped", text_is(E, 9, 50, "ld") == 1 && text_is(E, 4, 2, "") == 1);
+    let is dbus.wire.Reader as ch with mut = tk.call_i(E, TEXT, "GetCharacterAtOffset", 7);
+    tk.check("a character: its code point", dbus.wire.get_i32(&ch) == 246);
+    tk.check("the character at an offset", at(E, 1, CHAR, "é", 1, 2) == 1);
+    tk.check("before it, after it", before(E, 1, CHAR, "h", 0, 1) == 1 && after(E, 1, CHAR, "l", 2, 3) == 1);
+    tk.check("before the first: nothing", before(E, 0, CHAR, "", 0, 0) == 1);
+    tk.check("after the last: nothing", after(E, 10, CHAR, "", 11, 11) == 1);
+
+    // --- Words ---
+    tk.check("a word, from its start to the next's", at(W, 5, WORD_START, "two. ", 4, 9) == 1);
+    tk.check("from the space after it: the word before", at(W, 3, WORD_START, "One ", 0, 4) == 1);
+    tk.check("the last word: to the end", at(W, 17, WORD_START, "four.", 15, 20) == 1);
+    tk.check("the word before, the word after", before(W, 5, WORD_START, "One ", 0, 4) == 1 &&
+             after(W, 5, WORD_START, "Three ", 9, 15) == 1);
+    tk.check("by ends: from the end before to its own", at(W, 5, WORD_END, " two", 3, 7) == 1);
+    tk.check("by ends, from a space: the word after", at(W, 7, WORD_END, ". Three", 7, 14) == 1);
+    tk.check("by ends, before and after", before(W, 5, WORD_END, "One", 0, 3) == 1 &&
+             after(W, 5, WORD_END, ". Three", 7, 14) == 1);
+    tk.check("the word as a string", string_at(W, 5, G_WORD, "two. ", 4, 9) == 1);
+    tk.check("words of other letters", at(E, 8, WORD_START, "wörld", 6, 11) == 1);
+
+    // --- Sentences ---
+    tk.check("a sentence, from its start", at(W, 10, SENTENCE_START, "Three four.", 9, 20) == 1 &&
+             at(W, 2, SENTENCE_START, "One two. ", 0, 9) == 1);
+    tk.check("by ends: from the end of the one before", at(W, 10, SENTENCE_END, " Three four.", 8, 20) == 1);
+    tk.check("the sentence before", before(W, 10, SENTENCE_START, "One two. ", 0, 9) == 1);
+    tk.check("the sentence as a string", string_at(W, 10, G_SENTENCE, "Three four.", 9, 20) == 1);
+
+    // --- Lines and paragraphs ---
+    tk.check("one line: all of it", at(W, 6, LINE_START, "One two. Three four.", 0, 20) == 1);
+    tk.check("a line to its break", at(L, 1, LINE_START, "Up\n", 0, 3) == 1 && at(L, 4, LINE_START, "Down", 3, 7) == 1);
+    tk.check("by ends: the break before it", at(L, 4, LINE_END, "\nDown", 2, 7) == 1 && at(L, 1, LINE_END, "Up", 0, 2) == 1);
+    tk.check("the line before, the line after", before(L, 4, LINE_START, "Up\n", 0, 3) == 1 &&
+             after(L, 1, LINE_START, "Down", 3, 7) == 1);
+    tk.check("lines wrapped", at(N, 2, LINE_START, "Hello ", 0, 6) == 1 && at(N, 8, LINE_START, "world", 6, 11) == 1);
+    tk.check("the line as a string", string_at(N, 8, G_LINE, "world", 6, 11) == 1);
+    tk.check("paragraphs", string_at(L, 1, G_PARAGRAPH, "Up\n", 0, 3) == 1 && string_at(L, 5, G_PARAGRAPH, "Down", 3, 7) == 1);
+
+    // --- The caret and the selection ---
+    let is dbus.wire.Reader as sc with mut = tk.call_i(E, TEXT, "SetCaretOffset", 2);
+    let is tree.TextQuery as q;
+    access.text_of(t, e, &q);
+    tk.check("the caret put: in bytes there", tk.yes(sc) == 1 && q.caret == 3 && tk.prop_int(E, TEXT, "CaretOffset") == 2);
+    let is dbus.wire.Reader as ns with mut = tk.call0(E, TEXT, "GetNSelections");
+    tk.check("no selection", dbus.wire.get_i32(&ns) == 0);
+    tk.check("one added", tk.yes(tk.call_ii(E, TEXT, "AddSelection", 1, 4)) == 1);
+    access.text_of(t, e, &q);
+    tk.check("selected, in bytes", q.a == 1 && q.b == 5);
+    ns = tk.call0(E, TEXT, "GetNSelections");
+    tk.check("one", dbus.wire.get_i32(&ns) == 1);
+    let is dbus.wire.Reader as gs with mut = tk.call_i(E, TEXT, "GetSelection", 0);
+    tk.check("told in characters", dbus.wire.get_i32(&gs) == 1 && dbus.wire.get_i32(&gs) == 4);
+    tk.check("only one: a second refused", tk.yes(tk.call_ii(E, TEXT, "AddSelection", 6, 8)) == 0);
+    let is dbus.message.Message as ss with mut = tk.msg(E, TEXT, "SetSelection");
+    ss.signature = "iii";
+    let is *dbus.wire.Writer as sw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(sw, 0);
+    dbus.wire.put_i32(sw, 6);
+    dbus.wire.put_i32(sw, 11);
+    tk.check("changed", tk.yes(tk.reply_of(&ss)) == 1);
+    access.text_of(t, e, &q);
+    tk.check("to the second word", q.a == 7 && q.b == 13);
+    tk.check("removed", tk.yes(tk.call_i(E, TEXT, "RemoveSelection", 0)) == 1);
+    ns = tk.call0(E, TEXT, "GetNSelections");
+    tk.check("none left", dbus.wire.get_i32(&ns) == 0);
+    tk.check("no such selection: not removed", tk.yes(tk.call_i(E, TEXT, "RemoveSelection", 0)) == 0);
+
+    // --- Where characters are ---
+    let is math.rect.Rect as wr = layout.window_rect(t, e);
+    let is tree.TextQuery as eq;
+    access.text_of(t, e, &eq);
+    eq.op = tree.TEXT_EXTENTS;
+    eq.at = 1;
+    access.text_do(t, e, &eq);
+    let is math.rect.Rect as cr = char_rect(E, 1, 1);
+    tk.check("a character's place in the window", cr.x == cast(f64, cast(i64, wr.x + eq.rect.x)) && cr.y == cast(f64, cast(i64, wr.y + eq.rect.y)) &&
+             cr.w > 0.0 && cr.h > 0.0);
+    app.set_position(a, win, 30.0, 40.0);
+    let is math.rect.Rect as sr = char_rect(E, 1, 0);
+    tk.check("on the screen", sr.x == cr.x + 30.0 && sr.y == cr.y + 40.0);
+    let is math.rect.Rect as c7 = char_rect(E, 7, 1);
+    let is dbus.message.Message as oa with mut = tk.msg(E, TEXT, "GetOffsetAtPoint");
+    oa.signature = "iiu";
+    let is *dbus.wire.Writer as ow = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(ow, cast(i64, c7.x + c7.w / 2.0));
+    dbus.wire.put_i32(ow, cast(i64, c7.y + c7.h / 2.0));
+    dbus.wire.put_u32(ow, 1);
+    let is dbus.wire.Reader as orr with mut = tk.reply_of(&oa);
+    tk.check("the character at a point", dbus.wire.get_i32(&orr) == 7);
+    let is dbus.message.Message as re with mut = tk.msg(E, TEXT, "GetRangeExtents");
+    re.signature = "iiu";
+    let is *dbus.wire.Writer as rw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(rw, 0);
+    dbus.wire.put_i32(rw, 5);
+    dbus.wire.put_u32(rw, 1);
+    // Read before the next call: its reply takes the buffer.
+    let is dbus.wire.Reader as rr with mut = tk.reply_of(&re);
+    let is i64 as rx = dbus.wire.get_i32(&rr);
+    let is i64 as ry = dbus.wire.get_i32(&rr);
+    let is i64 as rwid = dbus.wire.get_i32(&rr);
+    let is math.rect.Rect as c0 = char_rect(E, 0, 1);
+    let is math.rect.Rect as c4 = char_rect(E, 4, 1);
+    tk.check("a range's: around its characters", rx == cast(i64, c0.x) && ry == cast(i64, c0.y) &&
+             rx + rwid >= cast(i64, c4.x + c4.w) - 1 && rx + rwid <= cast(i64, c4.x + c4.w) + 1);
+
+    let is math.rect.Rect as cend = char_rect(E, 11, 1);
+    tk.check("no character at the end: nowhere", cend.x == 0.0 && cend.y == 0.0 && cend.w == 0.0 && cend.h == 0.0);
+    let is dbus.message.Message as re2 with mut = tk.msg(E, TEXT, "GetRangeExtents");
+    re2.signature = "iiu";
+    let is *dbus.wire.Writer as rw2 = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(rw2, 0);
+    dbus.wire.put_i32(rw2, 2);
+    dbus.wire.put_u32(rw2, 1);
+    let is dbus.wire.Reader as rr2 with mut = tk.reply_of(&re2);
+    let is i64 as r2x = dbus.wire.get_i32(&rr2);
+    dbus.wire.get_i32(&rr2);
+    let is i64 as r2w = dbus.wire.get_i32(&rr2);
+    let is math.rect.Rect as d0 = char_rect(E, 0, 1);
+    let is math.rect.Rect as d1 = char_rect(E, 1, 1);
+    tk.check("two characters' range: both", r2x == cast(i64, d0.x) && r2x + r2w >= cast(i64, d1.x + d1.w) - 1 &&
+             r2x + r2w <= cast(i64, d1.x + d1.w) + 1);
+    tk.check("a point of the screen", offset_at(E, cast(i64, c7.x + c7.w / 2.0) + 30, cast(i64, c7.y + c7.h / 2.0) + 40, 0) == 7);
+    let is math.rect.Rect as ewr = layout.window_rect(t, e);
+    let is i64 as midy = cast(i64, ewr.y + ewr.h / 2.0);
+    tk.check("a point outside it: none", offset_at(E, cast(i64, ewr.x) - 5, midy, 1) == 0 - 1 &&
+             offset_at(E, cast(i64, ewr.x + ewr.w), midy, 1) == 0 - 1);
+    tk.check("its left edge: in it", offset_at(E, cast(i64, ewr.x), midy, 1) >= 0);
+    let is i64 as midx = cast(i64, ewr.x + ewr.w / 2.0);
+    tk.check("its top edge: in it", offset_at(E, midx, cast(i64, ewr.y), 1) >= 0);
+    tk.check("its bottom edge: past it", offset_at(E, midx, cast(i64, ewr.y + ewr.h), 1) == 0 - 1 &&
+             offset_at(E, midx, cast(i64, ewr.y) - 1, 1) == 0 - 1);
+    tk.check("in whole pixels", cast(f64, cast(i64, ewr.x)) == ewr.x && cast(f64, cast(i64, ewr.y)) == ewr.y &&
+             cast(f64, cast(i64, ewr.h)) == ewr.h && ewr.x >= 15.0);
+
+    // --- Attributes: none told ---
+    let is dbus.wire.Reader as ga with mut = tk.call_i(E, TEXT, "GetAttributes", 3);
+    let is i64 as aend = dbus.wire.get_array(&ga, 8);
+    tk.check("no attributes, over all of it", ga.pos == aend && dbus.wire.get_i32(&ga) == 0 && dbus.wire.get_i32(&ga) == 11);
+
+    let is dbus.wire.Reader as da with mut = tk.call0(E, TEXT, "GetDefaultAttributes");
+    let is i64 as da_end with mut = dbus.wire.get_array(&da, 8);
+    tk.check("no attributes by default", da.pos == da_end && da.err == 0);
+    da = tk.call0(E, TEXT, "GetDefaultAttributeSet");
+    da_end = dbus.wire.get_array(&da, 8);
+    tk.check("nor a set of them", da.pos == da_end && da.err == 0);
+    let is dbus.message.Message as av with mut = tk.msg(E, TEXT, "GetAttributeValue");
+    av.signature = "is";
+    let is *dbus.wire.Writer as avw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(avw, 0);
+    dbus.wire.put_string(avw, "weight");
+    let is dbus.wire.Reader as avr with mut = tk.reply_of(&av);
+    let is i64 as avn with mut = 0;
+    tk.check("no value of one", tk.same(dbus.wire.get_string(&avr, &avn), avn, "") == 1 && avr.err == 0);
+    let is dbus.message.Message as ar with mut = tk.msg(E, TEXT, "GetAttributeRun");
+    ar.signature = "ib";
+    let is *dbus.wire.Writer as arw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(arw, 2);
+    dbus.wire.put_bool(arw, 1);
+    let is dbus.wire.Reader as arr with mut = tk.reply_of(&ar);
+    let is i64 as ar_end = dbus.wire.get_array(&arr, 8);
+    tk.check("one run over all of it", arr.pos == ar_end && dbus.wire.get_i32(&arr) == 0 && dbus.wire.get_i32(&arr) == 11);
+    let is dbus.message.Message as br with mut = tk.msg(E, TEXT, "GetBoundedRanges");
+    br.signature = "iiiiuuu";
+    let is *dbus.wire.Writer as brw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(brw, 0);
+    dbus.wire.put_i32(brw, 0);
+    dbus.wire.put_i32(brw, 50);
+    dbus.wire.put_i32(brw, 50);
+    dbus.wire.put_u32(brw, 1);
+    dbus.wire.put_u32(brw, 0);
+    dbus.wire.put_u32(brw, 0);
+    let is dbus.wire.Reader as brr with mut = tk.reply_of(&br);
+    let is i64 as br_end = dbus.wire.get_array(&brr, 8);
+    tk.check("no bounded ranges", brr.pos == br_end && brr.err == 0);
+    let is dbus.message.Message as sst with mut = tk.msg(E, TEXT, "ScrollSubstringTo");
+    sst.signature = "iiu";
+    let is *dbus.wire.Writer as sstw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(sstw, 0);
+    dbus.wire.put_i32(sstw, 2);
+    dbus.wire.put_u32(sstw, 0);
+    let is dbus.wire.Reader as sstr with mut = tk.reply_of(&sst);
+    tk.check("not scrolled to", dbus.wire.get_bool(&sstr) == 0 && sstr.err == 0);
+
+    // --- Edited ---
+    tk.check("an editable one", tk.has_iface(E, EDIT) == 1 && tk.has_state(E, 7) == 1 && tk.has_state(E, 26) == 1);
+    tk.check("a label is not", tk.has_iface(W, EDIT) == 0 && tk.has_state(W, 7) == 0);
+    let is dbus.message.Message as ins with mut = tk.msg(E, EDIT, "InsertText");
+    ins.signature = "isi";
+    let is *dbus.wire.Writer as iw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(iw, 5);
+    dbus.wire.put_string(iw, "!");
+    dbus.wire.put_i32(iw, 1);
+    tk.check("inserted", tk.yes(tk.reply_of(&ins)) == 1 && tk.same(entry.text(t, e), entry.length(t, e), "héllo! wörld") == 1);
+    tk.check("all of what was given, its length -1", insert_text(E, 0, "<<", 0 - 1) == 1 &&
+             tk.same(entry.text(t, e), entry.length(t, e), "<<héllo! wörld") == 1);
+    tk.check("or longer than it", insert_text(E, 0, ">", 9) == 1 &&
+             tk.same(entry.text(t, e), entry.length(t, e), "><<héllo! wörld") == 1);
+    insert_text(E, 0, "zz", 0);
+    tk.check("none of it, its length 0", tk.same(entry.text(t, e), entry.length(t, e), "><<héllo! wörld") == 1);
+    insert_text(E, 0, "\xc3\xa9z", 1);
+    tk.check("never part of a character", tk.same(entry.text(t, e), entry.length(t, e), "><<héllo! wörld") == 1);
+    tk.check("taken out again", tk.yes(tk.call_ii(E, EDIT, "DeleteText", 0, 3)) == 1);
+    tk.check("deleted", tk.yes(tk.call_ii(E, EDIT, "DeleteText", 5, 6)) == 1 &&
+             tk.same(entry.text(t, e), entry.length(t, e), "héllo wörld") == 1);
+    let is dbus.message.Message as cp with mut = tk.msg(E, EDIT, "CopyText");
+    cp.signature = "ii";
+    let is *dbus.wire.Writer as cw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(cw, 6);
+    dbus.wire.put_i32(cw, 11);
+    tk.check("copied", tk.ask(&cp) == dbus.conn.OK && tk.same(cast(*u8, &clip), nclip, "wörld") == 1);
+    tk.check("cut", tk.yes(tk.call_ii(E, EDIT, "CutText", 0, 1)) == 1 && tk.same(cast(*u8, &clip), nclip, "h") == 1 &&
+             tk.same(entry.text(t, e), entry.length(t, e), "éllo wörld") == 1);
+    tk.check("paste asked for", tk.yes(tk.call_i(E, EDIT, "PasteText", 0)) == 1 && pastes == 1);
+    let is dbus.message.Message as st with mut = tk.msg(E, EDIT, "SetTextContents");
+    st.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&tk.at), "abc");
+    tk.check("all of it replaced", tk.yes(tk.reply_of(&st)) == 1 && tk.same(entry.text(t, e), entry.length(t, e), "abc") == 1 &&
+             tk.prop_int(E, TEXT, "CharacterCount") == 3);
+    tk.check("disabled: not edited", tk.yes(tk.call_ii(O, EDIT, "DeleteText", 0, 2)) == 0 &&
+             tk.same(entry.text(t, off), entry.length(t, off), "fixed") == 1);
+    tk.check("but read", text_is(O, 0, 0 - 1, "fixed") == 1);
+    tk.check("a label: not edited", tk.call_i(W, EDIT, "PasteText", 0).err != 0);
+
+    // --- A large document, edited at its start while asked about ---
+    // The bridge reads it in pieces: typing in it with the bridge asking
+    // takes about what it takes in a short one, where reading it whole each
+    // time took ten times as long. Both timed here, the machine as busy for
+    // one as for the other.
+    let is i64 as line_n = 25;
+    let is i64 as lines = 160000;
+    let is *u8 as big_text = mem.core.mmap_anon(line_n * lines);
+    let is i64 as li with mut = 0;
+    while (li < lines) {
+        mem.memcpy(cast(*u8, cast(i64, big_text) + li * line_n), "line of a large document\n", line_n);
+        li = li + 1;
+    }
+    let is i64 as short = typed_into(t, col, a, win, big_text, line_n * 40, line_n * 40);
+    let is i64 as long = typed_into(t, col, a, win, big_text, line_n * lines, line_n * lines);
+    tk.check("typed at its start, asked each time: right", short >= 0 && long >= 0);
+    if (long > 2 * short + 300) { io.printf("  forty keys took %d ms, %d in a short text\n", long, short); }
+    tk.check("and as quick as in a short one", long <= 2 * short + 300);
+
+    // --- More than a reply holds, asked for whole: as much as it holds ---
+    // Three-byte characters, so the cut falls in one and backs off.
+    let is i64 as nine = 9 * 1048576;
+    let is *u8 as many = mem.core.mmap_anon(nine);
+    let is i64 as mi with mut = 0;
+    while (mi + 3 <= nine) {
+        mem.memcpy(cast(*u8, cast(i64, many) + mi), "\xe2\x82\xac", 3);
+        mi = mi + 3;
+    }
+    let is i64 as huge = textview.create(t, col);
+    textview.set_text(t, huge, many, mi);
+    app.frame(a, win);
+    tk.settle(50);
+    let is [96]u8 as hgb;
+    let is *u8 as HUGE = tk.path(win, huge, cast(*u8, &hgb));
+    let is dbus.message.Message as hall with mut = tk.msg(HUGE, TEXT, "GetText");
+    hall.signature = "ii";
+    let is *dbus.wire.Writer as hw = dbus.conn.body(&tk.at);
+    dbus.wire.put_i32(hw, 0);
+    dbus.wire.put_i32(hw, 0 - 1);
+    let is dbus.wire.Reader as hr with mut = tk.reply_of(&hall);
+    let is i64 as hn with mut = 0;
+    let is *u8 as hs = dbus.wire.get_string(&hr, &hn);
+    tk.check("nine megabytes asked for: eight, in whole characters", hr.err == 0 && hn == 8388606 && hs[hn - 3] == 226);
+    tree.destroy(t, huge);
+    app.frame(a, win);
+
+    return tk.finish("atspi text");
+}

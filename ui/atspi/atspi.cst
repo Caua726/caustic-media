@@ -1,0 +1,211 @@
+// ui/atspi/atspi.cst — the bridge's hub: opened, pumped, closed.
+//
+// open asks whether anyone is listening and returns; everything after —
+// where the accessibility bus is, our objects put there, the registry told —
+// happens in pump as the replies come (atspi.md). A program calls pump from
+// its loop; nothing here blocks the window waiting for the desktop.
+use "std/mem.cst" as mem;
+use "../../dbus/dbus.cst" as dbus;
+use "../app.cst" as app;
+use "bridge.cst" as bridge;
+use "ifaces.cst" as ifaces;
+use "text.cst" as atext;
+use "events.cst" as events;
+
+let is *u8 as A11Y_BUS      with imut = "org.a11y.Bus";
+let is *u8 as A11Y_BUS_PATH with imut = "/org/a11y/bus";
+let is *u8 as STATUS        with imut = "org.a11y.Status";
+let is *u8 as REGISTRY      with imut = "org.a11y.atspi.Registry";
+let is *u8 as SOCKET        with imut = "org.a11y.atspi.Socket";
+let is *u8 as PROPERTIES    with imut = "org.freedesktop.DBus.Properties";
+
+fn _bridge(user as *u8) as *bridge.Bridge { return cast(*bridge.Bridge, user); }
+
+fn _copy(dst as *u8, cap as i64, s as *u8, n as i64) as i64 {
+    let is i64 as k with mut = n;
+    if (k > cap - 1) { k = cap - 1; }
+    if (k < 0) { k = 0; }
+    mem.memcpy(dst, s, k);
+    dst[k] = 0;
+    return k;
+}
+
+// --- The conversation ---
+
+fn _ask_status(b as *bridge.Bridge) as void {
+    let is dbus.message.Message as m with mut = dbus.message.method_call(A11Y_BUS, A11Y_BUS_PATH, PROPERTIES, "GetAll");
+    m.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&b.session), STATUS);
+    b.stage = bridge.ASKING;
+    if (dbus.conn.call_async(&b.session, &m, fn_ptr(_on_status), cast(*u8, b)) == 0) { b.stage = bridge.FAILED; }
+}
+
+// Whether a{sv} of org.a11y.Status says anyone is listening.
+fn _listening(r as *dbus.wire.Reader) as i32 {
+    let is i32 as on with mut = 0;
+    let is i64 as end = dbus.wire.get_array(r, 8);
+    while (r.err == 0 && r.pos < end) {
+        let is i64 as n with mut = 0;
+        dbus.wire.get_struct(r);
+        let is *u8 as name = dbus.wire.get_string(r, &n);
+        let is i32 as wanted = cast(i32, dbus.message.named(name, "IsEnabled") == 1 ||
+                                         dbus.message.named(name, "ScreenReaderEnabled") == 1);
+        let is i64 as sn with mut = 0;
+        let is *u8 as sig = dbus.wire.get_variant(r, &sn);
+        if (sn == 1 && sig[0] == 98) {
+            if (dbus.wire.get_bool(r) == 1 && wanted == 1) { on = 1; }
+        } else {
+            dbus.wire.skip(r, sig, sn);
+        }
+    }
+    if (r.err != 0) { return 0; }
+    return on;
+}
+
+fn _on_status(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *bridge.Bridge as b = _bridge(user);
+    if (b.stage != bridge.ASKING) { return; }
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    if (m.kind == dbus.message.ERROR || _listening(&r) == 0) {
+        b.stage = bridge.NOBODY;
+        return;
+    }
+    let is dbus.message.Message as q with mut = dbus.message.method_call(A11Y_BUS, A11Y_BUS_PATH, A11Y_BUS, "GetAddress");
+    dbus.conn.body(&b.session);
+    b.stage = bridge.ADDRESS;
+    if (dbus.conn.call_async(&b.session, &q, fn_ptr(_on_address), cast(*u8, b)) == 0) { b.stage = bridge.FAILED; }
+}
+
+// The status changed while nobody was listening: asked again.
+fn _on_changed(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *bridge.Bridge as b = _bridge(user);
+    if (b.stage == bridge.NOBODY) { _ask_status(b); }
+}
+
+fn _on_address(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *bridge.Bridge as b = _bridge(user);
+    if (b.stage != bridge.ADDRESS) { return; }
+    if (m.kind == dbus.message.ERROR) {
+        b.stage = bridge.FAILED;
+        return;
+    }
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as n with mut = 0;
+    let is *u8 as addr = dbus.wire.get_string(&r, &n);
+    if (r.err != 0) {
+        b.stage = bridge.FAILED;
+        return;
+    }
+    // Room for a large text asked for whole.
+    let is dbus.conn.Limits as l with mut = dbus.conn.limits_default();
+    l.buffer = bridge.BUS_BUFFER;
+    b.bus = dbus.conn.open_address(addr, n, &l);
+    if (dbus.conn.is_open(&b.bus) == 0) {
+        dbus.conn.close(&b.bus);
+        b.stage = bridge.FAILED;
+        return;
+    }
+    b.has_bus = 1;
+    let is i64 as nroot with mut = 0;
+    let is i64 as nwidget with mut = 0;
+    let is *dbus.conn.Interface as root = ifaces.root_tables(&nroot);
+    let is *dbus.conn.Interface as widget = ifaces.widget_tables(&nwidget);
+    dbus.conn.export(&b.bus, bridge.ROOT_PATH, root, nroot, cast(*u8, b));
+    dbus.conn.export_subtree(&b.bus, bridge.PREFIX, widget, nwidget, fn_ptr(ifaces.exists), cast(*u8, b));
+    let is dbus.message.Message as e with mut = dbus.message.method_call(REGISTRY, bridge.ROOT_PATH, SOCKET, "Embed");
+    e.signature = "(so)";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&b.bus);
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string(w, dbus.conn.unique_name(&b.bus));
+    dbus.wire.put_path(w, bridge.ROOT_PATH);
+    b.stage = bridge.EMBEDDING;
+    if (dbus.conn.call_async(&b.bus, &e, fn_ptr(_on_embed), cast(*u8, b)) == 0) { b.stage = bridge.FAILED; }
+}
+
+fn _on_embed(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *bridge.Bridge as b = _bridge(user);
+    if (b.stage != bridge.EMBEDDING) { return; }
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as n with mut = 0;
+    dbus.wire.get_struct(&r);
+    let is *u8 as name = dbus.wire.get_string(&r, &n);
+    if (m.kind == dbus.message.ERROR || r.err != 0) {
+        b.stage = bridge.FAILED;
+        return;
+    }
+    _copy(cast(*u8, &b.desktop_name), 256, name, n);
+    let is *u8 as p = dbus.wire.get_path(&r, &n);
+    if (r.err != 0) {
+        b.stage = bridge.FAILED;
+        return;
+    }
+    _copy(cast(*u8, &b.desktop_path), 256, p, n);
+    b.stage = bridge.ON;
+    events.start(b);
+}
+
+// --- Opening and closing ---
+
+// Opens the bridge for a's windows, the application called name (n bytes):
+// 1, the question asked; 0 with no session bus to ask on.
+fn open(b as *bridge.Bridge, a as *app.App, name as *u8, n as i64) as i32 {
+    mem.memset(cast(*u8, b), 0, sizeof(bridge.Bridge));
+    b.a = a;
+    b.name_len = _copy(cast(*u8, &b.name), 64, name, n);
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    b.session = dbus.conn.open_session(&l);
+    if (dbus.conn.is_open(&b.session) == 0) {
+        dbus.conn.close(&b.session);
+        b.stage = bridge.FAILED;
+        return 0;
+    }
+    b.has_session = 1;
+    b.status_match = dbus.conn.add_match(&b.session, A11Y_BUS, A11Y_BUS_PATH, PROPERTIES, "PropertiesChanged",
+                                         fn_ptr(_on_changed), cast(*u8, b));
+    _ask_status(b);
+    return 1;
+}
+
+// What has arrived, answered — the desktop's replies, the calls of assistive
+// technologies — and what changed since, told.
+fn pump(b as *bridge.Bridge) as void {
+    if (b.has_session == 1) { dbus.conn.dispatch(&b.session, 0); }
+    if (b.has_bus == 1) { dbus.conn.dispatch(&b.bus, 0); }
+    events.flush(b);
+}
+
+fn close(b as *bridge.Bridge) as void {
+    events.stop(b);
+    if (b.has_bus == 1) { dbus.conn.close(&b.bus); }
+    if (b.has_session == 1) { dbus.conn.close(&b.session); }
+    b.has_bus = 0;
+    b.has_session = 0;
+    atext.release(b);
+    b.stage = bridge.OFF;
+}
+
+// The descriptors of its connections, into out — two at most: how many. A
+// program's loop waits on them and pumps when one is readable, and after
+// every round of its own events too, so what changed is told.
+fn fds(b as *bridge.Bridge, out as *i64) as i64 {
+    let is i64 as n with mut = 0;
+    if (b.has_session == 1) {
+        out[n] = dbus.conn.fd(&b.session);
+        n = n + 1;
+    }
+    if (b.has_bus == 1) {
+        out[n] = dbus.conn.fd(&b.bus);
+        n = n + 1;
+    }
+    return n;
+}
+
+fn stage(b as *bridge.Bridge) as i32 { return b.stage; }
+
+fn is_on(b as *bridge.Bridge) as i32 { return cast(i32, b.stage == bridge.ON); }
+
+// The bridge's name on the accessibility bus; "" before it is there.
+fn bus_name(b as *bridge.Bridge) as *u8 {
+    if (b.has_bus == 0) { return ""; }
+    return dbus.conn.unique_name(&b.bus);
+}
