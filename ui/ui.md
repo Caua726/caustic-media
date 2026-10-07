@@ -1224,7 +1224,9 @@ widget set applications actually use, done properly, not parity.
    boxes, popovers and menu buttons done; dialogs, message boxes, our own
    file chooser and the desktop's through the portal, colour and font
    choosers, about dialogs and windows' state kept done.*
-7. **The accessibility bridges**, AT-SPI first.
+7. **The accessibility bridges**, AT-SPI first. *AT-SPI done
+   ([`atspi/atspi.md`](atspi/atspi.md)); UI Automation comes with the Win32
+   backend.*
 
 ## Not now, and deliberately
 

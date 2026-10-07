@@ -81,6 +81,12 @@ are where the widget laid them out, found by asking it where its characters
 are (`TEXT_EXTENTS`, `TEXT_OFFSET_AT`); paragraphs end at line breaks. Text
 attributes are not told: every run is the whole text, with none.
 
+Names meant for people are in the application's language (`app.set_locale`,
+`strings.cst`): `GetLocalizedRoleName`, an action's `GetLocalizedName` and
+`GetDescription`; `GetRoleName` and `GetName` stay AT-SPI's own, for programs.
+`Locale` and `Application.GetLocale` are the application's locale as POSIX
+names it ("pt_BR"), "C" when there is none.
+
 Selection and Table are answered from the children told. A list lays out
 only the rows in view, so its children — and the rows a table can give a
 cell of — are those; each row says its place among all of them and how many
