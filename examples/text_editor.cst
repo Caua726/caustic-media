@@ -49,6 +49,11 @@ use "../ui/widgets/statusbar.cst" as statusbar;
 use "../ui/widgets/filechooser.cst" as filechooser;
 use "../ui/widgets/dialog.cst" as dialog;
 use "../ui/widgets/about.cst" as about;
+use "../ui/widgets/check.cst" as check;
+use "../ui/widgets/spin.cst" as spin;
+use "../ui/widgets/group.cst" as group;
+use "../ui/widgets/label.cst" as label;
+use "../window/settings.cst" as wsettings;
 use "../ui/scroll.cst" as scroll;
 use "x11_input.cst" as xin;
 
@@ -62,6 +67,7 @@ let is i64 as SAVE    with imut = 103;
 let is i64 as SAVE_AS with imut = 104;
 let is i64 as QUIT    with imut = 105;
 let is i64 as ABOUT   with imut = 201;
+let is i64 as PREFS   with imut = 202;
 
 // The answers to the question asked before closing over changes.
 let is i64 as KEEP    with imut = 1;
@@ -94,6 +100,15 @@ struct Editor {
     chooser_of as i64;        // the mode it was made for
     choosing   as i64;        // OPEN or SAVE_AS while it is shown
     about      as dialog.Ref;
+    prefs      as dialog.Ref; // the preferences, in a window of their own
+    pf_ui      as i64;        // their fields
+    pf_mono    as i64;
+    pf_size    as i64;
+    pf_wrap    as i64;
+    pf_follow  as i64;
+    pf_light   as i64;
+    pf_dark    as i64;
+    filling    as i64;        // the fields set from what is kept: not a change
     shown_line as i64;        // what the status bar says
     shown_col  as i64;
     saves      as i64;
@@ -360,6 +375,241 @@ fn _website(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
     open_uri.open(&link, program.conn(&prog), uri, _len(uri), "", 0);
 }
 
+// --- Preferences: the text's font and size, wrapping, the look ---
+
+struct Prefs {
+    mono as i64;   // 1: a monospace font; 0: the interface's
+    size as i64;   // logical pixels; 0 for the theme's
+    wrap as i64;   // 1: long lines wrapped at the window's width
+    look as i64;   // 0 the desktop's, 1 light, 2 dark
+}
+
+let is Prefs as pr with mut;
+let is [512]u8 as prefs_path with mut;
+let is [512]u8 as prefs_buf with mut;
+let is i64 as prefs_n with mut = 0;
+
+fn prefs_defaults() as void {
+    pr.mono = 0;
+    pr.size = 0;
+    pr.wrap = 1;
+    pr.look = 0;
+}
+
+// s after the first n bytes of to, zero-terminated: the length now.
+fn _put(to as *u8, n as i64, s as *u8) as i64 {
+    let is i64 as k = _len(s);
+    if (n + k >= 511) { return n; }
+    mem.memcpy(cast(*u8, cast(i64, to) + n), s, k);
+    to[n + k] = cast(u8, 0);
+    return n + k;
+}
+
+// Where they are kept: $XDG_CONFIG_HOME, else ~/.config, under the
+// examples' directory, made when missing; in build/ when checking.
+fn find_prefs(checking as i32) as void {
+    if (checking == 1) {
+        _put(cast(*u8, &prefs_path), 0, "build/editor_prefs.conf");
+        return;
+    }
+    let is *u8 as base with mut = env.getenv("XDG_CONFIG_HOME");
+    let is i64 as n with mut = 0;
+    if (cast(i64, base) != 0 && base[0] == 47) {
+        n = _put(cast(*u8, &prefs_path), 0, base);
+    } else {
+        let is *u8 as home with mut = env.getenv("HOME");
+        if (cast(i64, home) == 0) { home = "/tmp"; }
+        n = _put(cast(*u8, &prefs_path), 0, home);
+        n = _put(cast(*u8, &prefs_path), n, "/.config");
+    }
+    linux.mkdir(cast(*u8, &prefs_path), 448);
+    n = _put(cast(*u8, &prefs_path), n, "/caustic-media-examples");
+    linux.mkdir(cast(*u8, &prefs_path), 448);
+    _put(cast(*u8, &prefs_path), n, "/text-editor.conf");
+}
+
+fn _pref_line(key as *u8, v as i64) as void {
+    let is i64 as k = _len(key);
+    if (prefs_n + k + 24 > 512) { return; }
+    mem.memcpy(cast(*u8, cast(i64, &prefs_buf) + prefs_n), key, k);
+    prefs_n = prefs_n + k;
+    prefs_buf[prefs_n] = cast(u8, 61);
+    prefs_n = prefs_n + 1;
+    let is [24]u8 as r;
+    let is i64 as rn with mut = 0;
+    let is i64 as x with mut = v;
+    if (x <= 0) {
+        r[0] = cast(u8, 48);
+        rn = 1;
+        x = 0;
+    }
+    while (x > 0) {
+        r[rn] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        rn = rn + 1;
+    }
+    while (rn > 0) {
+        rn = rn - 1;
+        prefs_buf[prefs_n] = r[rn];
+        prefs_n = prefs_n + 1;
+    }
+    prefs_buf[prefs_n] = cast(u8, 10);
+    prefs_n = prefs_n + 1;
+}
+
+// Written whole under another name, then moved over the old: never half.
+fn save_prefs() as i32 {
+    prefs_n = 0;
+    _pref_line("mono", pr.mono);
+    _pref_line("size", pr.size);
+    _pref_line("wrap", pr.wrap);
+    _pref_line("look", pr.look);
+    let is [520]u8 as tmp;
+    let is i64 as n = _put(cast(*u8, &tmp), 0, cast(*u8, &prefs_path));
+    _put(cast(*u8, &tmp), n, ".new");
+    let is i64 as fd = linux.open(cast(*u8, &tmp), 577, 384);
+    if (fd < 0) { return 0; }
+    let is i64 as wrote = linux.write(fd, cast(*u8, &prefs_buf), prefs_n);
+    linux.close(fd);
+    if (wrote != prefs_n) { return 0; }
+    return cast(i32, linux.rename(cast(*u8, &tmp), cast(*u8, &prefs_path)) == 0);
+}
+
+// The digits at s, n bytes, between lo and hi; dflt otherwise.
+fn _int(s as *u8, n as i64, lo as i64, hi as i64, dflt as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    if (n == 0 || n > 9) { return dflt; }
+    while (i < n) {
+        if (s[i] < 48 || s[i] > 57) { return dflt; }
+        v = v * 10 + cast(i64, s[i]) - 48;
+        i = i + 1;
+    }
+    if (v < lo || v > hi) { return dflt; }
+    return v;
+}
+
+// What the file says, line by line; what it does not, the defaults'.
+fn load_prefs() as void {
+    prefs_defaults();
+    let is i64 as fd = linux.open(cast(*u8, &prefs_path), 0, 0);
+    if (fd < 0) { return; }
+    let is i64 as n = linux.read(fd, cast(*u8, &prefs_buf), 512);
+    linux.close(fd);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as e with mut = i;
+        while (e < n && prefs_buf[e] != 10) { e = e + 1; }
+        let is i64 as q with mut = i;
+        while (q < e && prefs_buf[q] != 61) { q = q + 1; }
+        if (q < e) {
+            let is *u8 as key = cast(*u8, cast(i64, &prefs_buf) + i);
+            let is *u8 as val = cast(*u8, cast(i64, &prefs_buf) + q + 1);
+            let is i64 as kn = q - i;
+            let is i64 as vn = e - q - 1;
+            if (_same(key, kn, "mono") == 1) { pr.mono = _int(val, vn, 0, 1, 0); }
+            if (_same(key, kn, "size") == 1) { pr.size = _int(val, vn, 0, 72, 0); }
+            if (_same(key, kn, "wrap") == 1) { pr.wrap = _int(val, vn, 0, 1, 1); }
+            if (_same(key, kn, "look") == 1) { pr.look = _int(val, vn, 0, 2, 0); }
+        }
+        i = e + 1;
+    }
+}
+
+// The text, its view and the window's look as they say.
+fn apply_prefs() as void {
+    let is *u8 as family with mut = cast(*u8, 0);
+    if (pr.mono == 1) { family = "monospace"; }
+    textview.set_font(ed.t, ed.tv, family, cast(f64, pr.size));
+    if (pr.wrap == 1) {
+        textview.set_wrap(ed.t, ed.tv, textview.WRAP_WORD);
+    } else {
+        textview.set_wrap(ed.t, ed.tv, textview.WRAP_NONE);
+    }
+    let is wsettings.Settings as s with mut = *host.settings(ed.hs);
+    if (pr.look == 1) { s.dark = 0; }
+    if (pr.look == 2) { s.dark = 1; }
+    app.set_system(ed.a, &s);
+}
+
+// A field changed: what they say now, applied and kept.
+fn _pref_edited(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    if (ed.filling == 1) { return; }
+    let is *tree.Tree as dt = ed.prefs.t;
+    pr.mono = cast(i64, check.state(dt, ed.pf_mono) == check.ON);
+    pr.size = cast(i64, spin.value(dt, ed.pf_size) + 0.5);
+    pr.wrap = cast(i64, check.state(dt, ed.pf_wrap) == check.ON);
+    pr.look = 0;
+    if (check.state(dt, ed.pf_light) == check.ON) { pr.look = 1; }
+    if (check.state(dt, ed.pf_dark) == check.ON) { pr.look = 2; }
+    apply_prefs();
+    save_prefs();
+}
+
+fn _fill_prefs() as void {
+    let is *tree.Tree as dt = ed.prefs.t;
+    ed.filling = 1;
+    if (pr.mono == 1) { check.set_state(dt, ed.pf_mono, check.ON); } else { check.set_state(dt, ed.pf_ui, check.ON); }
+    let is f64 as size with mut = cast(f64, pr.size);
+    if (pr.size == 0) { size = tree.theme(ed.t).fonts.body.size; }
+    spin.set_value(dt, ed.pf_size, size);
+    check.set_state(dt, ed.pf_wrap, cast(i32, pr.wrap));
+    if (pr.look == 1) {
+        check.set_state(dt, ed.pf_light, check.ON);
+    } else if (pr.look == 2) {
+        check.set_state(dt, ed.pf_dark, check.ON);
+    } else {
+        check.set_state(dt, ed.pf_follow, check.ON);
+    }
+    ed.filling = 0;
+}
+
+fn show_prefs() as void {
+    if (dialog.ref_valid(&ed.prefs) == 0) {
+        let is *tree.Tree as dt = dialog.window_tree(ed.t);
+        let is *router.Router as dr = cast(*router.Router, tree.router(dt));
+        let is i64 as dw = dialog.create(dt, "Preferences", 11);
+        let is i64 as page = box.create(dt, dialog.content(dt, dw), box.COLUMN);
+        box.set_spacing(dt, page, 12.0);
+        let is i64 as fg = group.create(dt, page, "Font", 4);
+        let is i64 as fc = box.create(dt, fg, box.COLUMN);
+        box.set_spacing(dt, fc, 6.0);
+        ed.pf_ui = check.radio(dt, fc, "The _interface's", 16, 0);
+        ed.pf_mono = check.radio(dt, fc, "_Monospace", 10, ed.pf_ui);
+        let is i64 as sr = box.create(dt, fc, box.ROW);
+        box.set_spacing(dt, sr, 12.0);
+        label.create(dt, sr, "Size", 4);
+        ed.pf_size = spin.create(dt, sr, 6.0, 72.0, 1.0);
+        ed.pf_wrap = check.create(dt, page, "_Wrap long lines", 16);
+        let is i64 as lg = group.create(dt, page, "Appearance", 10);
+        let is i64 as lc = box.create(dt, lg, box.COLUMN);
+        box.set_spacing(dt, lc, 6.0);
+        ed.pf_follow = check.radio(dt, lc, "_Follow the desktop", 19, 0);
+        ed.pf_light = check.radio(dt, lc, "_Light", 6, ed.pf_follow);
+        ed.pf_dark = check.radio(dt, lc, "_Dark", 5, ed.pf_follow);
+        dialog.add_button(dt, dw, "_Close", 6, dialog.CLOSE);
+        dialog.set_default_response(dt, dw, dialog.CLOSE);
+        if (cast(i64, dr) != 0) {
+            check.bind_mnemonic(dt, dr, ed.pf_ui);
+            check.bind_mnemonic(dt, dr, ed.pf_mono);
+            check.bind_mnemonic(dt, dr, ed.pf_wrap);
+            check.bind_mnemonic(dt, dr, ed.pf_follow);
+            check.bind_mnemonic(dt, dr, ed.pf_light);
+            check.bind_mnemonic(dt, dr, ed.pf_dark);
+        }
+        signal.connect(dt, ed.pf_ui, signal.TOGGLED, fn_ptr(_pref_edited), cast(*u8, 0));
+        signal.connect(dt, ed.pf_mono, signal.TOGGLED, fn_ptr(_pref_edited), cast(*u8, 0));
+        signal.connect(dt, ed.pf_size, signal.VALUE_CHANGED, fn_ptr(_pref_edited), cast(*u8, 0));
+        signal.connect(dt, ed.pf_wrap, signal.TOGGLED, fn_ptr(_pref_edited), cast(*u8, 0));
+        signal.connect(dt, ed.pf_follow, signal.TOGGLED, fn_ptr(_pref_edited), cast(*u8, 0));
+        signal.connect(dt, ed.pf_light, signal.TOGGLED, fn_ptr(_pref_edited), cast(*u8, 0));
+        signal.connect(dt, ed.pf_dark, signal.TOGGLED, fn_ptr(_pref_edited), cast(*u8, 0));
+        ed.prefs = dialog.ref(dt, dw);
+    }
+    _fill_prefs();
+    dialog.show(ed.prefs.t, cast(*router.Router, tree.router(ed.prefs.t)), ed.prefs.w, 0);
+}
+
 fn show_about() as void {
     if (dialog.ref_valid(&ed.about) == 0) {
         let is *tree.Tree as dt = dialog.window_tree(ed.t);
@@ -394,6 +644,8 @@ fn act(id as i64) as void {
         if (on_close(cast(*u8, 0), ed.win) == 1) { app.window_close(ed.a, ed.win); }
     } else if (id == ABOUT) {
         show_about();
+    } else if (id == PREFS) {
+        show_prefs();
     } else {
         textview.act(ed.t, ed.tv, id);
     }
@@ -406,6 +658,7 @@ fn _key_open(user as *u8) as void { act(OPEN); }
 fn _key_save(user as *u8) as void { act(SAVE); }
 fn _key_save_as(user as *u8) as void { act(SAVE_AS); }
 fn _key_quit(user as *u8) as void { act(QUIT); }
+fn _key_prefs(user as *u8) as void { act(PREFS); }
 
 fn _item(m as i64, s as *u8, id as i64, k as i32, mods as i32) as i64 {
     let is i64 as it = menu.add_item(ed.t, m, s, _len(s), id);
@@ -434,6 +687,8 @@ fn build() as void {
     ed.edit_items[textedit.DELETE] = _item(edit_m, "_Delete", textedit.DELETE, 0, 0);
     menu.add_separator(t, edit_m);
     ed.edit_items[textedit.SELECT_ALL] = _item(edit_m, "Select _All", textedit.SELECT_ALL, keys.A, keys.MOD_CONTROL);
+    menu.add_separator(t, edit_m);
+    _item(edit_m, "Pr_eferences\xe2\x80\xa6", PREFS, keys.COMMA, keys.MOD_CONTROL);
     let is i64 as help_m = menu.create(t);
     _item(help_m, "_About", ABOUT, 0, 0);
     menubar.add(t, bar, "_File", 5, file_m);
@@ -456,6 +711,7 @@ fn build() as void {
     router.add_shortcut(ed.r, keys.S, keys.MOD_CONTROL, fn_ptr(_key_save), cast(*u8, 0));
     router.add_shortcut(ed.r, keys.S, keys.MOD_CONTROL | keys.MOD_SHIFT, fn_ptr(_key_save_as), cast(*u8, 0));
     router.add_shortcut(ed.r, keys.Q, keys.MOD_CONTROL, fn_ptr(_key_quit), cast(*u8, 0));
+    router.add_shortcut(ed.r, keys.COMMA, keys.MOD_CONTROL, fn_ptr(_key_prefs), cast(*u8, 0));
     router.focus(t, ed.r, ed.tv, 0);
 }
 
@@ -653,6 +909,31 @@ fn drive() as void {
     xin.button(&xs, xin.WHEEL_UP, wx, wy, 0);
     for_ms(600);
     expect("and back up", scroll.offset_y(ed.t, ed.area) < down);
+    // Its preferences: Ctrl+, from the keyboard, each applied as it changes
+    // and kept.
+    key(keys.COMMA, keys.MOD_CONTROL);
+    rounds(2);
+    expect("Ctrl+,: its preferences shown", dialog.ref_valid(&ed.prefs) == 1 && dialog.is_shown(ed.prefs.t, ed.prefs.w) == 1);
+    let is f64 as line_was = textview.caret_rect(ed.t, ed.tv).h;
+    let is *tree.Tree as pt = ed.prefs.t;
+    check.set_state(pt, ed.pf_mono, check.ON);
+    spin.set_value(pt, ed.pf_size, 24.0);
+    rounds(2);
+    expect("a bigger monospace: the text in it", pr.mono == 1 && pr.size == 24 && textview.caret_rect(ed.t, ed.tv).h > line_was * 1.3);
+    check.set_state(pt, ed.pf_wrap, check.OFF);
+    check.set_state(pt, ed.pf_dark, check.ON);
+    rounds(2);
+    let is math.color.Color as bg = app.theme(ed.a).palette.window_bg;
+    expect("not wrapped, and dark", pr.wrap == 0 && pr.look == 2 && 0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b < 0.5);
+    prefs_defaults();
+    load_prefs();
+    expect("kept: read back as they were", pr.mono == 1 && pr.size == 24 && pr.wrap == 0 && pr.look == 2);
+    check.set_state(pt, ed.pf_follow, check.ON);
+    check.set_state(pt, ed.pf_ui, check.ON);
+    rounds(2);
+    dialog.respond(ed.prefs.t, ed.prefs.w, dialog.CLOSE);
+    rounds(2);
+    expect("closed", dialog.is_shown(ed.prefs.t, ed.prefs.w) == 0);
     // Closed over a change: asked; told to stay, then to lose it.
     type_in("x");
     let is wevent.Event as e;
@@ -714,6 +995,10 @@ fn main(argc as i64, argv as *u8) as i32 {
     ed.t = app.tree(ed.a, ed.win);
     ed.r = app.router(ed.a, ed.win);
     build();
+    find_prefs(checking);
+    if (checking == 1) { linux.unlink(cast(*u8, &prefs_path)); }
+    load_prefs();
+    apply_prefs();
     _title();
     if (cast(i64, file) != 0) { read_file(file, _len(file)); }
     host.set_on_close(ed.hs, fn_ptr(on_close), cast(*u8, 0));
