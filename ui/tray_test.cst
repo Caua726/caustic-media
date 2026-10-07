@@ -1,0 +1,419 @@
+// ui/tray_test.cst — the application's icon in the desktop's tray, a
+// StatusNotifierItem. On a private bus that starts nothing of the desktop's,
+// its stand-in watcher leaving a mark if started:
+//   sh dbus/tools/run_dbus_bare.sh ./build/tray_test
+// The desktop — its org.kde.StatusNotifierWatcher and the panel that shows
+// the items — is played here on a connection of its own, both dispatched in
+// turn, so nothing waits on a reply the other has to send.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+use "tray.cst" as tray;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (s[k] != 0) { k = k + 1; }
+    return k;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    if (n != _len(b)) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+let is dbus.conn.Conn as c with mut;   // the program's
+let is dbus.conn.Conn as w with mut;   // the desktop's
+let is tray.Tray as tr with mut;
+
+// Both connections dispatched for ms.
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        dbus.conn.dispatch(&c, 0);
+        dbus.conn.dispatch(&w, 5);
+    }
+}
+
+// --- The watcher ---
+
+let is i64 as registered with mut = 0;
+let is [128]u8 as service with mut;
+let is i64 as service_n with mut = 0;
+
+fn m_register(cn as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&k.args, &n);
+    if (n < 128) {
+        mem.memcpy(cast(*u8, &service), s, n);
+        service_n = n;
+    }
+    registered = registered + 1;
+}
+
+let is [1]dbus.conn.Method as watcher_methods with mut;
+let is [1]dbus.conn.Interface as watcher_iface with mut;
+
+fn watcher_up() as i32 {
+    return cast(i32, dbus.conn.request_name(&w, "org.kde.StatusNotifierWatcher", 4) == 1);
+}
+
+// --- The panel: what the item says, and the signals it sends ---
+
+let is [64]u8 as heard with mut;   // the last signal's member
+let is i64 as heard_n with mut = 0;
+let is [64]u8 as heard_arg with mut;
+let is i64 as heard_arg_n with mut = 0;
+let is i64 as signals with mut = 0;
+
+fn on_signal(cn as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is i64 as n = _len(m.member);
+    if (n < 64) {
+        mem.memcpy(cast(*u8, &heard), m.member, n);
+        heard_n = n;
+    }
+    heard_arg_n = 0;
+    if (cast(i64, m.signature) != 0 && m.signature[0] == 115) {
+        let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+        let is i64 as an with mut = 0;
+        let is *u8 as a = dbus.wire.get_string(&r, &an);
+        if (r.err == 0 && an < 64) {
+            mem.memcpy(cast(*u8, &heard_arg), a, an);
+            heard_arg_n = an;
+        }
+    }
+    signals = signals + 1;
+}
+
+let is dbus.message.Message as rep with mut;
+
+// The item asked for (iface, member) with body(&w) as its arguments; the
+// reply in rep: OK or why not.
+fn ask(path as *u8, iface as *u8, member as *u8, sig as *u8) as i32 {
+    let is dbus.message.Message as m with mut = dbus.message.method_call(tray.service(&tr), path, iface, member);
+    m.signature = sig;
+    let is i64 as serial = dbus.conn.send(&w, &m);
+    let is i32 as got with mut = dbus.conn.TIMEOUT;
+    let is i64 as until = time.now_ms() + 2000;
+    while (got == dbus.conn.TIMEOUT && time.now_ms() < until) {
+        dbus.conn.dispatch(&c, 5);
+        got = dbus.conn.wait_reply(&w, serial, 1, &rep);
+    }
+    return got;
+}
+
+// Property name of the item, read: the reader after its variant's signature.
+fn prop(name as *u8, sig_want as *u8) as dbus.wire.Reader {
+    let is *dbus.wire.Writer as b = dbus.conn.body(&w);
+    dbus.wire.put_string(b, "org.kde.StatusNotifierItem");
+    dbus.wire.put_string(b, name);
+    let is i32 as got = ask("/StatusNotifierItem", "org.freedesktop.DBus.Properties", "Get", "ss");
+    let is dbus.wire.Reader as r with mut = dbus.message.body(&rep);
+    if (got != dbus.conn.OK) {
+        r.err = 1;
+        return r;
+    }
+    let is i64 as sn with mut = 0;
+    let is *u8 as sig = dbus.wire.get_variant(&r, &sn);
+    if (same(sig, sn, sig_want) == 0) { r.err = 1; }
+    return r;
+}
+
+fn prop_is(name as *u8, want as *u8) as i32 {
+    let is dbus.wire.Reader as r with mut = prop(name, "s");
+    let is i64 as n with mut = 0;
+    let is *u8 as s = dbus.wire.get_string(&r, &n);
+    if (r.err != 0) { return 0; }
+    return same(s, n, want);
+}
+
+// --- The program's callbacks ---
+
+let is i64 as clicked with mut = 0;   // which: 1 activate, 2 menu, 3 secondary
+let is i64 as at_x with mut = 0;
+let is i64 as at_y with mut = 0;
+let is i64 as scrolled with mut = 0;
+let is i32 as scrolled_vertical with mut = 0 - 1;
+
+fn on_activate(user as *u8, x as i64, y as i64) as void {
+    clicked = 1;
+    at_x = x;
+    at_y = y;
+}
+
+fn on_menu(user as *u8, x as i64, y as i64) as void {
+    clicked = 2;
+    at_x = x;
+    at_y = y;
+}
+
+fn on_secondary(user as *u8, x as i64, y as i64) as void {
+    clicked = 3;
+    at_x = x;
+    at_y = y;
+}
+
+fn on_scroll(user as *u8, delta as i64, vertical as i32) as void {
+    scrolled = delta;
+    scrolled_vertical = vertical;
+}
+
+fn click(member as *u8, x as i64, y as i64) as i32 {
+    clicked = 0;
+    let is *dbus.wire.Writer as b = dbus.conn.body(&w);
+    dbus.wire.put_i32(b, x);
+    dbus.wire.put_i32(b, y);
+    return cast(i32, ask("/StatusNotifierItem", "org.kde.StatusNotifierItem", member, "ii") == dbus.conn.OK);
+}
+
+fn scroll(delta as i64, orientation as *u8) as void {
+    let is *dbus.wire.Writer as b = dbus.conn.body(&w);
+    dbus.wire.put_i32(b, delta);
+    dbus.wire.put_string(b, orientation);
+    ask("/StatusNotifierItem", "org.kde.StatusNotifierItem", "Scroll", "is");
+}
+
+// How many bytes the bus's stand-ins wrote when started: -1 off the bare bus.
+fn started() as i64 {
+    let is *u8 as path = env.getenv("CAUSTIC_DBUS_STARTED");
+    if (cast(i64, path) == 0) { return 0 - 1; }
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    let is [256]u8 as b;
+    let is i64 as n = linux.read(fd, cast(*u8, &b), 256);
+    linux.close(fd);
+    return n;
+}
+
+fn heard_is(member as *u8) as i32 { return same(cast(*u8, &heard), heard_n, member); }
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    c = dbus.conn.open_session(&l);
+    w = dbus.conn.open_session(&l);
+    check("two connections", dbus.conn.is_open(&c) == 1 && dbus.conn.is_open(&w) == 1);
+    watcher_methods[0].name = "RegisterStatusNotifierItem";
+    watcher_methods[0].in_sig = "s";
+    watcher_methods[0].out_sig = "";
+    watcher_methods[0].handler = fn_ptr(m_register);
+    watcher_methods[0].in_names = cast(*u8, 0);
+    watcher_methods[0].out_names = cast(*u8, 0);
+    watcher_iface[0].name = "org.kde.StatusNotifierWatcher";
+    watcher_iface[0].methods = cast(*dbus.conn.Method, &watcher_methods);
+    watcher_iface[0].nmethods = 1;
+    watcher_iface[0].props = cast(*dbus.conn.Property, 0);
+    watcher_iface[0].nprops = 0;
+    watcher_iface[0].signals = cast(*dbus.conn.SignalDecl, 0);
+    watcher_iface[0].nsignals = 0;
+    dbus.conn.export(&w, "/StatusNotifierWatcher", cast(*dbus.conn.Interface, &watcher_iface), 1, cast(*u8, 0));
+    dbus.conn.add_match(&w, cast(*u8, 0), "/StatusNotifierItem", "org.kde.StatusNotifierItem", cast(*u8, 0),
+                        fn_ptr(on_signal), cast(*u8, 0));
+
+    // --- No tray on the desktop yet ---
+    check("opened", tray.open(&tr, &c, "org.caustic.Notes", 17, "Notes", 5) == 1);
+    tray.set_handlers(&tr, fn_ptr(on_activate), fn_ptr(on_menu), fn_ptr(on_secondary), fn_ptr(on_scroll), cast(*u8, 0));
+    let is i64 as wn = tray.service_length(&tr);
+    let is *u8 as svc = tray.service(&tr);
+    check("its bus name: StatusNotifierItem, the process, a count",
+          wn > 27 && mem.memcmp(svc, "org.kde.StatusNotifierItem-", 27) == 0 && svc[wn - 2] == 45 && svc[wn - 1] == 49);
+    pump(200);
+    check("no watcher: not shown", tray.shown(&tr) == 0 && registered == 0);
+    check("nor one started for it", started() == 0);
+
+    // --- The watcher comes: the item registers itself ---
+    check("the watcher up", watcher_up() == 1);
+    let is i64 as until with mut = time.now_ms() + 2000;
+    while ((registered == 0 || tray.shown(&tr) == 0) && time.now_ms() < until) { pump(20); }
+    check("registered with it, by its bus name", registered == 1 && same(cast(*u8, &service), service_n, svc) == 1);
+    check("shown", tray.shown(&tr) == 1);
+
+    // --- What the panel reads ---
+    check("its id", prop_is("Id", "org.caustic.Notes") == 1);
+    check("its title", prop_is("Title", "Notes") == 1);
+    check("of the application's status", prop_is("Category", "ApplicationStatus") == 1);
+    check("active", prop_is("Status", "Active") == 1);
+    check("no icon name yet", prop_is("IconName", "") == 1);
+    let is dbus.wire.Reader as r with mut = prop("ItemIsMenu", "b");
+    check("not a menu: clicks are the program's", dbus.wire.get_bool(&r) == 0 && r.err == 0);
+    r = prop("IconPixmap", "a(iiay)");
+    let is i64 as end with mut = dbus.wire.get_array(&r, 8);
+    check("no pixels yet", r.err == 0 && end == r.pos);
+
+    // --- Clicked, scrolled: told ---
+    check("activated", click("Activate", 10, 20) == 1 && clicked == 1 && at_x == 10 && at_y == 20);
+    check("its menu asked for", click("ContextMenu", 5, 6) == 1 && clicked == 2 && at_x == 5 && at_y == 6);
+    check("the middle button", click("SecondaryActivate", 7, 8) == 1 && clicked == 3 && at_x == 7 && at_y == 8);
+    scroll(3, "vertical");
+    check("scrolled up and down", scrolled == 3 && scrolled_vertical == 1);
+    scroll(0 - 2, "horizontal");
+    check("scrolled sideways", scrolled == 0 - 2 && scrolled_vertical == 0);
+
+    // --- Changed: the panel told, and reading it anew ---
+    signals = 0;
+    tray.set_title(&tr, "Notes, 2 new", 12);
+    pump(100);
+    check("a new title: said", signals == 1 && heard_is("NewTitle") == 1 && prop_is("Title", "Notes, 2 new") == 1);
+    tray.set_status(&tr, tray.NEEDS_ATTENTION);
+    pump(100);
+    check("asking for attention: said, with the status",
+          heard_is("NewStatus") == 1 && same(cast(*u8, &heard_arg), heard_arg_n, "NeedsAttention") == 1 &&
+          prop_is("Status", "NeedsAttention") == 1);
+    tray.set_status(&tr, tray.PASSIVE);
+    pump(100);
+    check("passive", heard_is("NewStatus") == 1 && prop_is("Status", "Passive") == 1);
+    tray.set_icon_name(&tr, "accessories-text-editor", 23);
+    pump(100);
+    check("an icon of the theme: said", heard_is("NewIcon") == 1 && prop_is("IconName", "accessories-text-editor") == 1);
+    let is [4]u32 as px;
+    px[0] = cast(u32, 4279246896);   // 0xFF102030
+    px[1] = cast(u32, 2151698528);   // 0x80405060
+    px[2] = cast(u32, 0);
+    px[3] = cast(u32, 16909060);     // 0x01020304
+    tray.set_icon(&tr, cast(*u32, &px), 2);
+    pump(100);
+    check("its own pixels: said", heard_is("NewIcon") == 1);
+    r = prop("IconPixmap", "a(iiay)");
+    end = dbus.wire.get_array(&r, 8);
+    dbus.wire.get_struct(&r);
+    let is i64 as pw = dbus.wire.get_i32(&r);
+    let is i64 as ph = dbus.wire.get_i32(&r);
+    let is i64 as bend = dbus.wire.get_array(&r, 1);
+    let is [16]u8 as got;
+    let is i64 as k with mut = 0;
+    while (k < 16 && r.pos < bend) {
+        got[k] = cast(u8, dbus.wire.get_byte(&r));
+        k = k + 1;
+    }
+    check("one image, 2 by 2, alpha first in network order", r.err == 0 && pw == 2 && ph == 2 && k == 16 &&
+          bend == r.pos && r.pos == end && got[0] == 255 && got[1] == 16 && got[2] == 32 && got[3] == 48 && got[4] == 128 &&
+          got[5] == 64 && got[7] == 96 && got[8] == 0 && got[11] == 0 && got[12] == 1 && got[15] == 4);
+    // A title as long as it keeps, and longer: cut there.
+    let is [300]u8 as long_title;
+    mem.memset(cast(*u8, &long_title), 116, 300);
+    tray.set_title(&tr, cast(*u8, &long_title), 255);
+    pump(50);
+    r = prop("Title", "s");
+    let is i64 as ltn with mut = 0;
+    dbus.wire.get_string(&r, &ltn);
+    check("a title of 255 bytes: whole", ltn == 255 && r.err == 0);
+    tray.set_title(&tr, cast(*u8, &long_title), 300);
+    pump(50);
+    r = prop("Title", "s");
+    dbus.wire.get_string(&r, &ltn);
+    check("of 300: its first 255", ltn == 255 && r.err == 0);
+    tray.set_title(&tr, cast(*u8, &long_title), 256);
+    pump(50);
+    r = prop("Title", "s");
+    dbus.wire.get_string(&r, &ltn);
+    check("of 256: its first 255", ltn == 255 && r.err == 0);
+    // Pixels as many as it keeps, and more, and fewer than none.
+    let is *u32 as many = cast(*u32, mem.core.mmap_anon(130 * 130 * 4));
+    check("128 by 128: taken", tray.set_icon(&tr, many, tray.MAX_ICON) == 1);
+    pump(50);
+    r = prop("IconPixmap", "a(iiay)");
+    dbus.wire.get_array(&r, 8);
+    dbus.wire.get_struct(&r);
+    check("all of them said", dbus.wire.get_i32(&r) == 128 && dbus.wire.get_i32(&r) == 128 && r.err == 0);
+    check("129: not", tray.set_icon(&tr, many, tray.MAX_ICON + 1) == 0);
+    check("a side below none: not", tray.set_icon(&tr, many, 0 - 1) == 0);
+    check("a side of none: none", tray.set_icon(&tr, many, 0) == 1);
+    pump(50);
+    r = prop("IconPixmap", "a(iiay)");
+    let is i64 as none_end = dbus.wire.get_array(&r, 8);
+    check("no pixels said", r.err == 0 && none_end == r.pos);
+    tray.set_icon(&tr, cast(*u32, &px), 2);
+    pump(50);
+    tray.set_tooltip(&tr, "Notes", 5, "2 new notes", 11);
+    pump(100);
+    check("a tooltip: said", heard_is("NewToolTip") == 1);
+    r = prop("ToolTip", "(sa(iiay)ss)");
+    dbus.wire.get_struct(&r);
+    let is i64 as tn with mut = 0;
+    let is *u8 as ticon = dbus.wire.get_string(&r, &tn);
+    check("its icon: the item's", same(ticon, tn, "accessories-text-editor") == 1);
+    end = dbus.wire.get_array(&r, 8);
+    r.pos = end;
+    let is *u8 as ttitle = dbus.wire.get_string(&r, &tn);
+    check("its title", same(ttitle, tn, "Notes") == 1);
+    let is *u8 as tbody = dbus.wire.get_string(&r, &tn);
+    check("what it says", r.err == 0 && same(tbody, tn, "2 new notes") == 1);
+
+    // --- The watcher goes, and comes back ---
+    dbus.conn.release_name(&w, "org.kde.StatusNotifierWatcher");
+    until = time.now_ms() + 2000;
+    while (tray.shown(&tr) == 1 && time.now_ms() < until) { pump(20); }
+    check("the watcher gone: not shown", tray.shown(&tr) == 0);
+    watcher_up();
+    until = time.now_ms() + 2000;
+    while ((registered < 2 || tray.shown(&tr) == 0) && time.now_ms() < until) { pump(20); }
+    check("back: registered again", registered == 2 && tray.shown(&tr) == 1);
+
+    // --- Taken away ---
+    let is [128]u8 as name;
+    mem.memcpy(cast(*u8, &name), svc, wn);
+    name[wn] = cast(u8, 0);
+    tray.close(&tr);
+    pump(50);
+    check("closed: not shown", tray.shown(&tr) == 0);
+    let is dbus.message.Message as q with mut = dbus.message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                                       "org.freedesktop.DBus", "NameHasOwner");
+    q.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&w), cast(*u8, &name));
+    dbus.conn.call_method(&w, &q, 2000, &rep);
+    r = dbus.message.body(&rep);
+    check("its name let go", dbus.wire.get_bool(&r) == 0 && r.err == 0);
+    tray.close(&tr);
+    check("closed twice: no harm", tray.shown(&tr) == 0);
+
+    // --- Another, the count going on ---
+    let is tray.Tray as two with mut;
+    check("another", tray.open(&two, &c, "org.caustic.Notes", 17, "Notes", 5) == 1);
+    let is i64 as n2 = tray.service_length(&two);
+    check("the next count", tray.service(&two)[n2 - 1] == 50);
+    // A third on the same connection while it is open: no room for its object.
+    let is tray.Tray as three with mut;
+    check("a second item on one connection: not", tray.open(&three, &c, "org.caustic.Notes", 17, "Notes", 5) == 0);
+    let is [128]u8 as third;
+    let is i64 as n3 = tray.service_length(&three);
+    mem.memcpy(cast(*u8, &third), tray.service(&three), n3);
+    third[n3] = cast(u8, 0);
+    q = dbus.message.method_call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner");
+    q.signature = "s";
+    dbus.wire.put_string(dbus.conn.body(&w), cast(*u8, &third));
+    dbus.conn.call_method(&w, &q, 2000, &rep);
+    r = dbus.message.body(&rep);
+    check("and its name let go", third[n3 - 1] == 51 && dbus.wire.get_bool(&r) == 0 && r.err == 0);
+    tray.close(&two);
+    // Its name taken by another already: not.
+    let is [128]u8 as taken;
+    mem.memcpy(cast(*u8, &taken), cast(*u8, &third), n3 - 1);
+    taken[n3 - 1] = cast(u8, 52);
+    taken[n3] = cast(u8, 0);
+    dbus.conn.request_name(&w, cast(*u8, &taken), 4);
+    let is tray.Tray as four with mut;
+    check("its name taken: not", tray.open(&four, &c, "org.caustic.Notes", 17, "Notes", 5) == 0);
+    let is tray.Tray as five with mut;
+    check("the next: again", tray.open(&five, &c, "org.caustic.Notes", 17, "Notes", 5) == 1);
+    tray.close(&five);
+
+    dbus.conn.close(&w);
+    dbus.conn.close(&c);
+    if (fails == 0) {
+        io.printf("tray: all checks passed\n");
+        return 0;
+    }
+    io.printf("tray: %d failures\n", fails);
+    return 1;
+}

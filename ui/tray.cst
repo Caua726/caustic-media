@@ -1,0 +1,429 @@
+// ui/tray.cst — the application's icon in the desktop's tray.
+//
+// A program that goes on with its window closed — a chat, a music player —
+// keeps an icon in the panel: clicked, it comes forward. Linux desktops show
+// such icons as StatusNotifierItems: the program owns a bus name of its own
+// ("org.kde.StatusNotifierItem-PID-N"), exports org.kde.StatusNotifierItem at
+// /StatusNotifierItem — its id, title, status, an icon of the theme or its
+// own pixels, a tooltip — and registers it with org.kde.StatusNotifierWatcher,
+// which tells the panels. What changes is said with the item's own signals
+// (NewTitle, NewIcon, NewStatus…), and the panel reads it anew.
+//
+// The watcher may come later than the program, or go and come back (the
+// panel restarted): the item registers itself again whenever it appears, and
+// is not shown meanwhile. It is never started for the item: a desktop
+// without a tray has none.
+//
+// Clicks are the program's: activated (the first button), its menu asked
+// for (the second — the program shows its own), the middle button, the
+// wheel; the item is not a menu, and no menu is exported over D-Bus
+// (com.canonical.dbusmenu). Windows' Shell_NotifyIconW comes with its
+// backend.
+//
+// The connection is the program's, dispatched by its loop (session.cst); one
+// item on a connection at a time.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+
+let is *u8 as WATCHER with imut = "org.kde.StatusNotifierWatcher";
+let is *u8 as IFACE   with imut = "org.kde.StatusNotifierItem";
+let is *u8 as PATH    with imut = "/StatusNotifierItem";
+
+// Its status, as the panel shows it: hidden or out of the way, shown, or
+// asking to be looked at.
+let is i32 as PASSIVE         with imut = 0;
+let is i32 as ACTIVE          with imut = 1;
+let is i32 as NEEDS_ATTENTION with imut = 2;
+
+// Its own pixels at most this side.
+let is i64 as MAX_ICON with imut = 128;
+
+// Clicked at x, y on the screen: cb(user, x, y). The wheel: cb(user, delta,
+// vertical).
+type ClickFn  = fn(*u8, i64, i64) as void;
+type ScrollFn = fn(*u8, i64, i32) as void;
+
+let is i64 as _DO_NOT_QUEUE  with imut = 4;
+let is i64 as _PRIMARY_OWNER with imut = 1;
+
+struct Tray {
+    c           as *dbus.conn.Conn;
+    on          as i32;
+    shown       as i32;
+    status      as i32;
+    _pad        as i32;
+    size        as i64;           // its pixels' side, 0 for none
+    pending     as i64;           // a registration in flight: its serial
+    m_owner     as i64;
+    service     as [96]u8;
+    service_n   as i64;
+    id          as [256]u8;
+    id_n        as i64;
+    title       as [256]u8;
+    title_n     as i64;
+    icon        as [256]u8;
+    icon_n      as i64;
+    tip_title   as [256]u8;
+    tip_title_n as i64;
+    tip_body    as [1024]u8;
+    tip_body_n  as i64;
+    activate    as ClickFn;
+    menu        as ClickFn;
+    secondary   as ClickFn;
+    scroll      as ScrollFn;
+    user        as *u8;
+    methods     as [4]dbus.conn.Method;
+    props       as [15]dbus.conn.Property;
+    sigs        as [6]dbus.conn.SignalDecl;
+    iface       as dbus.conn.Interface;
+    pixels      as [16384]u32;    // MAX_ICON squared, ARGB
+}
+
+// Items opened by this process: the last part of their names.
+let is i64 as _count with mut = 0;
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _same(a as *u8, n as i64, b as *u8) as i32 {
+    if (n != _len(b)) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+// s, n bytes, into to (cap bytes, one kept for the zero): its length there.
+fn _keep(to as *u8, cap as i64, s as *u8, n as i64) as i64 {
+    let is i64 as k with mut = n;
+    if (k > cap - 1) { k = cap - 1; }
+    if (k < 0) { k = 0; }
+    mem.memcpy(to, s, k);
+    to[k] = cast(u8, 0);
+    return k;
+}
+
+// v in decimal at to: how many digits.
+fn _digits(v as i64, to as *u8) as i64 {
+    let is [24]u8 as r;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    if (x <= 0) {
+        r[0] = cast(u8, 48);
+        n = 1;
+    }
+    while (x > 0) {
+        r[n] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        to[k] = r[n - 1 - k];
+        k = k + 1;
+    }
+    return n;
+}
+
+fn _status_word(st as i32) as *u8 {
+    if (st == PASSIVE) { return "Passive"; }
+    if (st == NEEDS_ATTENTION) { return "NeedsAttention"; }
+    return "Active";
+}
+
+// --- What the panel reads ---
+
+fn _tr(user as *u8) as *Tray { return cast(*Tray, user); }
+
+fn _no_pixels(w as *dbus.wire.Writer) as void {
+    let is i64 as at = dbus.wire.put_array(w, 8);
+    dbus.wire.put_array_end(w, at, 8);
+}
+
+fn g_category(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { dbus.wire.put_string(w, "ApplicationStatus"); }
+fn g_id(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    dbus.wire.put_string_n(w, cast(*u8, &_tr(user).id), _tr(user).id_n);
+}
+fn g_title(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    dbus.wire.put_string_n(w, cast(*u8, &_tr(user).title), _tr(user).title_n);
+}
+fn g_status(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    dbus.wire.put_string(w, _status_word(_tr(user).status));
+}
+fn g_window(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { dbus.wire.put_i32(w, 0); }
+fn g_none(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { dbus.wire.put_string(w, ""); }
+fn g_icon(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    dbus.wire.put_string_n(w, cast(*u8, &_tr(user).icon), _tr(user).icon_n);
+}
+fn g_no_pixels(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { _no_pixels(w); }
+
+// Its pixels: one image, width, height and ARGB32 in network order — alpha
+// first.
+fn g_pixels(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    let is *Tray as tr = _tr(user);
+    let is i64 as at = dbus.wire.put_array(w, 8);
+    if (tr.size > 0) {
+        dbus.wire.put_struct(w);
+        dbus.wire.put_i32(w, tr.size);
+        dbus.wire.put_i32(w, tr.size);
+        let is i64 as bytes = dbus.wire.put_array(w, 1);
+        let is i64 as i with mut = 0;
+        while (i < tr.size * tr.size) {
+            let is i64 as v = cast(i64, tr.pixels[i]);
+            dbus.wire.put_byte(w, (v >> 24) & 255);
+            dbus.wire.put_byte(w, (v >> 16) & 255);
+            dbus.wire.put_byte(w, (v >> 8) & 255);
+            dbus.wire.put_byte(w, v & 255);
+            i = i + 1;
+        }
+        dbus.wire.put_array_end(w, bytes, 1);
+    }
+    dbus.wire.put_array_end(w, at, 8);
+}
+
+// Its tooltip: the item's icon name, no pixels of its own, a title, what it
+// says.
+fn g_tooltip(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void {
+    let is *Tray as tr = _tr(user);
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string_n(w, cast(*u8, &tr.icon), tr.icon_n);
+    _no_pixels(w);
+    dbus.wire.put_string_n(w, cast(*u8, &tr.tip_title), tr.tip_title_n);
+    dbus.wire.put_string_n(w, cast(*u8, &tr.tip_body), tr.tip_body_n);
+}
+
+fn g_not_menu(c as *dbus.conn.Conn, w as *dbus.wire.Writer, user as *u8) as void { dbus.wire.put_bool(w, 0); }
+
+// --- What the panel asks ---
+
+fn _click(cb as ClickFn, k as *dbus.conn.Call, user as *u8) as void {
+    let is i64 as x = dbus.wire.get_i32(&k.args);
+    let is i64 as y = dbus.wire.get_i32(&k.args);
+    if (k.args.err == 0 && cast(i64, cb) != 0) { call(cb, _tr(user).user, x, y); }
+}
+
+fn m_activate(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { _click(_tr(user).activate, k, user); }
+fn m_menu(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { _click(_tr(user).menu, k, user); }
+fn m_secondary(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { _click(_tr(user).secondary, k, user); }
+
+fn m_scroll(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is *Tray as tr = _tr(user);
+    let is i64 as delta = dbus.wire.get_i32(&k.args);
+    let is i64 as n with mut = 0;
+    let is *u8 as o = dbus.wire.get_string(&k.args, &n);
+    if (k.args.err != 0 || cast(i64, tr.scroll) == 0) { return; }
+    call(tr.scroll, tr.user, delta, 1 - _same(o, n, "horizontal"));
+}
+
+// --- Registered with the watcher ---
+
+fn _registered(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *Tray as tr = _tr(user);
+    tr.pending = 0;
+    if (tr.on == 1) { tr.shown = cast(i32, m.kind == dbus.message.METHOD_RETURN); }
+}
+
+// Registered with the watcher, if there is one: never started for it.
+fn _register(tr as *Tray) as void {
+    if (tr.pending != 0) { dbus.conn.cancel_reply(tr.c, tr.pending); }
+    let is dbus.message.Message as m with mut = dbus.message.method_call(WATCHER, "/StatusNotifierWatcher", WATCHER,
+                                                                       "RegisterStatusNotifierItem");
+    m.signature = "s";
+    m.flags = dbus.message.NO_AUTO_START;
+    dbus.wire.put_string_n(dbus.conn.body(tr.c), cast(*u8, &tr.service), tr.service_n);
+    tr.pending = dbus.conn.call_async(tr.c, &m, fn_ptr(_registered), cast(*u8, tr));
+}
+
+// The watcher come — registered with it — or gone: not shown.
+fn _owner(c as *dbus.conn.Conn, m as *dbus.message.Message, user as *u8) as void {
+    let is *Tray as tr = _tr(user);
+    let is dbus.wire.Reader as r with mut = dbus.message.body(m);
+    let is i64 as n with mut = 0;
+    let is *u8 as name = dbus.wire.get_string(&r, &n);
+    let is i64 as on with mut = 0;
+    dbus.wire.get_string(&r, &on);
+    let is i64 as nn with mut = 0;
+    dbus.wire.get_string(&r, &nn);
+    if (r.err != 0 || tr.on == 0 || _same(name, n, WATCHER) == 0) { return; }
+    if (nn > 0) {
+        _register(tr);
+    } else {
+        tr.shown = 0;
+    }
+}
+
+fn _say(tr as *Tray, member as *u8) as void {
+    if (tr.on == 0) { return; }
+    dbus.conn.body(tr.c);
+    dbus.conn.emit(tr.c, PATH, IFACE, member, "");
+}
+
+fn _method(m as *dbus.conn.Method, name as *u8, ins as *u8, h as dbus.conn.MethodFn, names as *u8) as void {
+    m.name = name;
+    m.in_sig = ins;
+    m.out_sig = "";
+    m.handler = h;
+    m.in_names = names;
+    m.out_names = cast(*u8, 0);
+}
+
+fn _prop(p as *dbus.conn.Property, name as *u8, sig as *u8, g as dbus.conn.GetFn) as void {
+    p.name = name;
+    p.sig = sig;
+    p.get = g;
+    p.set = cast(dbus.conn.SetFn, 0);
+}
+
+fn _signal(d as *dbus.conn.SignalDecl, name as *u8, sig as *u8, names as *u8) as void {
+    d.name = name;
+    d.sig = sig;
+    d.names = names;
+}
+
+fn _declare(tr as *Tray) as void {
+    _method(&tr.methods[0], "Activate", "ii", fn_ptr(m_activate), "x,y");
+    _method(&tr.methods[1], "ContextMenu", "ii", fn_ptr(m_menu), "x,y");
+    _method(&tr.methods[2], "SecondaryActivate", "ii", fn_ptr(m_secondary), "x,y");
+    _method(&tr.methods[3], "Scroll", "is", fn_ptr(m_scroll), "delta,orientation");
+    _prop(&tr.props[0], "Category", "s", fn_ptr(g_category));
+    _prop(&tr.props[1], "Id", "s", fn_ptr(g_id));
+    _prop(&tr.props[2], "Title", "s", fn_ptr(g_title));
+    _prop(&tr.props[3], "Status", "s", fn_ptr(g_status));
+    _prop(&tr.props[4], "WindowId", "i", fn_ptr(g_window));
+    _prop(&tr.props[5], "IconThemePath", "s", fn_ptr(g_none));
+    _prop(&tr.props[6], "IconName", "s", fn_ptr(g_icon));
+    _prop(&tr.props[7], "IconPixmap", "a(iiay)", fn_ptr(g_pixels));
+    _prop(&tr.props[8], "OverlayIconName", "s", fn_ptr(g_none));
+    _prop(&tr.props[9], "OverlayIconPixmap", "a(iiay)", fn_ptr(g_no_pixels));
+    _prop(&tr.props[10], "AttentionIconName", "s", fn_ptr(g_none));
+    _prop(&tr.props[11], "AttentionIconPixmap", "a(iiay)", fn_ptr(g_no_pixels));
+    _prop(&tr.props[12], "AttentionMovieName", "s", fn_ptr(g_none));
+    _prop(&tr.props[13], "ToolTip", "(sa(iiay)ss)", fn_ptr(g_tooltip));
+    _prop(&tr.props[14], "ItemIsMenu", "b", fn_ptr(g_not_menu));
+    _signal(&tr.sigs[0], "NewTitle", "", cast(*u8, 0));
+    _signal(&tr.sigs[1], "NewIcon", "", cast(*u8, 0));
+    _signal(&tr.sigs[2], "NewAttentionIcon", "", cast(*u8, 0));
+    _signal(&tr.sigs[3], "NewOverlayIcon", "", cast(*u8, 0));
+    _signal(&tr.sigs[4], "NewToolTip", "", cast(*u8, 0));
+    _signal(&tr.sigs[5], "NewStatus", "s", "status");
+    tr.iface.name = IFACE;
+    tr.iface.methods = cast(*dbus.conn.Method, &tr.methods);
+    tr.iface.nmethods = 4;
+    tr.iface.props = cast(*dbus.conn.Property, &tr.props);
+    tr.iface.nprops = 15;
+    tr.iface.signals = cast(*dbus.conn.SignalDecl, &tr.sigs);
+    tr.iface.nsignals = 6;
+}
+
+// --- The program's ---
+
+// The item of the application id (n bytes) titled title (tn), on c, kept at
+// tr while it is open — shown once a watcher takes it (shown). 1, or 0 when
+// its name or object could not be had.
+fn open(tr as *Tray, c as *dbus.conn.Conn, id as *u8, n as i64, title as *u8, tn as i64) as i32 {
+    tr.c = c;
+    tr.on = 0;
+    tr.shown = 0;
+    tr.status = ACTIVE;
+    tr.size = 0;
+    tr.pending = 0;
+    tr.m_owner = 0;
+    tr.id_n = _keep(cast(*u8, &tr.id), 256, id, n);
+    tr.title_n = _keep(cast(*u8, &tr.title), 256, title, tn);
+    tr.icon_n = _keep(cast(*u8, &tr.icon), 256, "", 0);
+    tr.tip_title_n = _keep(cast(*u8, &tr.tip_title), 256, "", 0);
+    tr.tip_body_n = _keep(cast(*u8, &tr.tip_body), 1024, "", 0);
+    tr.activate = cast(ClickFn, 0);
+    tr.menu = cast(ClickFn, 0);
+    tr.secondary = cast(ClickFn, 0);
+    tr.scroll = cast(ScrollFn, 0);
+    tr.user = cast(*u8, 0);
+    _count = _count + 1;
+    let is *u8 as s = cast(*u8, &tr.service);
+    mem.memcpy(s, "org.kde.StatusNotifierItem-", 27);
+    let is i64 as k with mut = 27;
+    k = k + _digits(linux.getpid(), cast(*u8, cast(i64, s) + k));
+    s[k] = cast(u8, 45);
+    k = k + 1;
+    k = k + _digits(_count, cast(*u8, cast(i64, s) + k));
+    s[k] = cast(u8, 0);
+    tr.service_n = k;
+    if (dbus.conn.request_name(c, s, _DO_NOT_QUEUE) != _PRIMARY_OWNER) { return 0; }
+    _declare(tr);
+    if (dbus.conn.export(c, PATH, &tr.iface, 1, cast(*u8, tr)) != dbus.conn.OK) {
+        dbus.conn.release_name(c, s);
+        return 0;
+    }
+    tr.m_owner = dbus.conn.add_match(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                     "NameOwnerChanged", fn_ptr(_owner), cast(*u8, tr));
+    tr.on = 1;
+    _register(tr);
+    return 1;
+}
+
+// Told of clicks and the wheel: any null.
+fn set_handlers(tr as *Tray, on_activate as ClickFn, on_menu as ClickFn, on_secondary as ClickFn, on_scroll as ScrollFn,
+                user as *u8) as void {
+    tr.activate = on_activate;
+    tr.menu = on_menu;
+    tr.secondary = on_secondary;
+    tr.scroll = on_scroll;
+    tr.user = user;
+}
+
+// Whether a watcher has it: shown in a panel.
+fn shown(tr as *Tray) as i32 { return tr.shown; }
+
+// Its bus name.
+fn service(tr as *Tray) as *u8 { return cast(*u8, &tr.service); }
+
+fn service_length(tr as *Tray) as i64 { return tr.service_n; }
+
+fn set_title(tr as *Tray, s as *u8, n as i64) as void {
+    tr.title_n = _keep(cast(*u8, &tr.title), 256, s, n);
+    _say(tr, "NewTitle");
+}
+
+fn set_status(tr as *Tray, st as i32) as void {
+    tr.status = st;
+    if (tr.on == 0) { return; }
+    dbus.wire.put_string(dbus.conn.body(tr.c), _status_word(st));
+    dbus.conn.emit(tr.c, PATH, IFACE, "NewStatus", "s");
+}
+
+// An icon of the desktop's theme by name (n bytes; "" for none).
+fn set_icon_name(tr as *Tray, s as *u8, n as i64) as void {
+    tr.icon_n = _keep(cast(*u8, &tr.icon), 256, s, n);
+    _say(tr, "NewIcon");
+}
+
+// Its own pixels, size by size ARGB (as app.set_icon takes them; 0 for
+// none), for a panel that has no icon of that name. 1, or 0 past MAX_ICON.
+fn set_icon(tr as *Tray, px as *u32, size as i64) as i32 {
+    if (size < 0 || size > MAX_ICON) { return 0; }
+    mem.memcpy(cast(*u8, &tr.pixels), cast(*u8, px), size * size * 4);
+    tr.size = size;
+    _say(tr, "NewIcon");
+    return 1;
+}
+
+// What it says when the pointer rests on it: a title and a line or more.
+fn set_tooltip(tr as *Tray, title as *u8, tn as i64, body as *u8, bn as i64) as void {
+    tr.tip_title_n = _keep(cast(*u8, &tr.tip_title), 256, title, tn);
+    tr.tip_body_n = _keep(cast(*u8, &tr.tip_body), 1024, body, bn);
+    _say(tr, "NewToolTip");
+}
+
+// Taken away: its object and name let go.
+fn close(tr as *Tray) as void {
+    if (tr.on == 0) { return; }
+    tr.on = 0;
+    tr.shown = 0;
+    if (tr.pending != 0) { dbus.conn.cancel_reply(tr.c, tr.pending); }
+    tr.pending = 0;
+    if (tr.m_owner > 0) { dbus.conn.remove_match(tr.c, tr.m_owner); }
+    tr.m_owner = 0;
+    dbus.conn.unexport(tr.c, PATH);
+    dbus.conn.release_name(tr.c, cast(*u8, &tr.service));
+}
