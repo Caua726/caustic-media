@@ -223,6 +223,11 @@ be lost. The toolkit routes them:
   nobody took it do Tab and Shift+Tab walk the focus chain.
 - **text**: composed text and the IME's pre-edit string from `input/`'s
   `text.cst`, to the focused entry.
+- **modifiers**: held as the pointer's events say them, which are right at
+  their moment (`router.set_modifiers`); a key's event says the state before
+  it, so the router counts a modifier key's own press and release in. Ctrl
+  held over a drag makes it a copy, in whichever of the program's windows it
+  is let go.
 
 **Out.** A widget emits signals — clicked, changed, activated — and the program
 connects a callback: a function pointer and a user-data pointer, called
@@ -333,6 +338,88 @@ system dialog on Windows give users their own.
 
 Clipboard and drag-and-drop come from `window/`, where the X11 side is already
 done.
+
+**The application on the screen** (`host.cst`). `app.cst` keeps the program's
+windows and is fed by calls; the host is what feeds it. For every window of
+the application that is shown it opens one of the platform's — a dialog's
+belonging to its owner's, modal when it is — and puts it away when the
+application's is hidden or closed, titling it as it is titled. What the
+platform says becomes what the application and the window's router are told:
+the pointer, buttons and wheel, keys and the text they typed, the keyboard
+focus, the size, the place on the screen, the window manager's state, a drag
+from another program, the close button — which goes to the window's widgets
+first (`router.close_request`: a dialog answers it as Escape), then to the
+program (`set_on_close`), and only then closes the window. A window waiting
+on a modal dialog (`app.blocked`) is told nothing of the pointer or the keys.
+A drag begun in one window and carried over another of the program's is run
+by that window's router, from what the first carries, and the first is told
+what was done there (`router.drag_payload`, `drag_elsewhere`, `drag_finish`).
+The clipboard and the primary selection are the platform's through the
+trees' `set_clipboard` and `set_paste`; the pointer's shape is the one the
+widget under it asks for; the scale is the screen's DPI, or the desktop's
+when its settings say one.
+
+Each window is painted into a texture of its own on the program's device —
+what changed, as the damage says — and that texture is copied whole to the
+platform's buffer to be shown: on X11 the buffer is converted in place as it
+is shown, so it cannot be painted on again. Between rounds the loop sleeps
+(`window/wait.cst`) until a window has an event, a descriptor the program
+watches is readable (`watch`: the accessibility bridge's — `atspi/hosted.cst`
+— a portal's), another thread posts something to run (`post`), or a timer is
+due; an idle program takes no time. An animation steps at the frame clock
+(`app.next_due`), not each time the platform wakes the loop — a frame shown
+is itself an event on X11. `step` is one round, `run` rounds until no window
+is left on the screen — or, while the program holds the loop (`hold`, as one
+living in the tray does with its window closed), until it lets go.
+
+**A program started** (`program.cst`): what every program does before its
+first window, in one call — the software device, the system's fonts for its
+text (`system_fonts.cst`: a chain over the system's font index for each
+family, weight and style the theme and its widgets ask, opened once and
+kept), the application, the host, the desktop's settings followed and a
+session connection for what it says to the desktop. The program opens its
+windows on `program.app` and runs.
+
+## The application and the desktop
+
+What a program says to the desktop besides its windows goes, on Linux, over
+the session bus: one connection of the program's, dispatched by its loop
+whenever it is readable (`session.cst`), shared by the pieces below. Each is
+apart from the host, so a program takes only what it uses, and each is
+answered by every Linux desktop through a freedesktop interface. Windows'
+counterparts — the registry's settings, `Shell_NotifyIconW`, toasts,
+`ShellExecuteW` — come with its backend.
+
+- **Icons.** The toolkit's own (`icons.cst`): symbolic, one colour — that of
+  what they are drawn in, as text is — each a path on a 16 by 16 grid in a
+  small language of SVG's absolute commands plus whole circles, filled even-odd
+  by the text service's rasterizer, so crisp at any scale: message boxes'
+  signs, header bars' buttons, arrows, places, a check, a search; `image` shows
+  one. Turned into pixels (`rasterize`), one is a window's icon
+  (`app.set_icon`, `_NET_WM_ICON` on X11). The desktop's icon theme
+  (`icon_theme.cst`) finds a named icon as the freedesktop Icon Theme
+  Specification looks it up — the theme the settings say
+  (`settings.icon_theme`), its sizes and scales, what it inherits, hicolor —
+  PNG only.
+- **The desktop's settings** (`desktop.cst`): the settings portal, which
+  Wayland has no other way to say, read at first and again when it says one
+  changed, laid over what the window system says (`host.set_settings`).
+- **One instance** (`instance.cst`): the first to own the application's id
+  on the bus is the application; a later start hands it what it was asked —
+  come forward, open these files, do this action — through
+  `org.freedesktop.Application`, and leaves.
+- **Notifications** (`notify.cst`): `org.freedesktop.Notifications` — a
+  summary, a body, an icon of the theme, actions; the program told which
+  action was chosen and when one closed.
+- **The tray** (`tray.cst`): a StatusNotifierItem — its own bus name, the
+  item's id, title, status, an icon of the theme or its own pixels, a tooltip
+  — registered with the watcher whenever one is there, never started for it.
+  Clicks and the wheel are the program's, its menu too: the item exports no
+  menu over D-Bus.
+- **Links** (`open_uri.cst`): opened by the desktop portal — `OpenURI`, or
+  `OpenFile` handed the file itself for one of this machine — without waiting
+  on it; by `xdg-open` where there is no portal, the link one argument that no
+  shell reads as words.
 
 ---
 
@@ -1213,6 +1300,35 @@ the middle, each only once given; Credits and License, toggles at the
 foot's start (a dialog's secondary buttons, `dialog.set_secondary`), show
 who made it and the licence in their place.
 
+**The application on the screen** (`host.cst`, tested by `host_x11_test`
+under Xvfb with a second client playing the user and the window manager):
+real windows for the application's, titled, painted and shown; X's clicks,
+keys, resizes and close buttons reaching the widgets; the clipboard through
+X; a modal dialog in a window of its own above its owner, the owner told
+nothing meanwhile; a text dragged from one window to another; the loop asleep
+until a timer, a descriptor, another thread or an event wakes it. The
+accessibility bridge runs in it (`atspi/hosted.cst`, `atspi_hosted_test` on a
+private bus). Not yet: a toolkit-drawn frame's moving and resizing (6.13b,
+after the examples), an input method's candidates placed at the caret.
+
+**A program started** (`program.cst`, tested by `program_x11_test` under
+Xvfb on a bare private bus, and with none; its fonts by `system_fonts_test`
+over the test fonts): a window of text in the fonts found, run until it is
+closed, everything let go after.
+
+**The application and the desktop**, each on a private bus that starts none
+of the desktop's services (`dbus/tools/run_dbus_bare.sh`: stand-ins that
+leave a mark when something asks for them to be started): the session
+connection in the loop, the loop held with no window (`session_test`); the
+settings portal followed (`desktop_test`, under Xvfb); one instance
+(`instance_test`); notifications (`notify_test`); the tray, never starting a
+watcher (`tray_test`); links through the portal and through a stand-in
+`xdg-open` (`open_uri_test`). The toolkit's icons (`icons_test`), drawn in
+message boxes, header bars and images; the desktop's icon theme
+(`icon_theme_test`, over themes made for it in `testdata/icons`), its name
+from GTK's files, XSETTINGS and the portal. Not yet: SVG icons, a menu
+exported with the tray's item (`com.canonical.dbusmenu`).
+
 **Words** (`strings.cst`, tested by `strings_test`, and each widget's own
 test in Portuguese): the table of the toolkit's words in English and
 Brazilian Portuguese, filled in (`fill`) and cut whole characters at a time
@@ -1274,6 +1390,10 @@ widget set applications actually use, done properly, not parity.
 8. **Words in the user's language**. *Done: `strings.cst` in English and
    Brazilian Portuguese, the locale from the environment, right-to-left
    languages mirrored; Windows' `GetUserDefaultLocaleName` with its backend.*
+9. **The application level**: the loop that puts the application's windows
+   on the screen, the desktop's settings followed, icons, one instance,
+   notifications, the tray, links. *Done on X11 and Linux's desktops; the
+   Win32 and Wayland sides with their backends.*
 
 ## Not now, and deliberately
 
