@@ -379,7 +379,109 @@ fn test_subpixel() as void {
     chk("subpixel: the nearest point of it", q.x > 10.298 && q.x < 10.302);
 }
 
+// --- Blending, against dividing by 255 ---
+
+fn ch(p as i64, k as i64) as i64 { return (p >> (k * 8)) & 255; }
+
+fn ref_over(src as i64, dst as i64) as i64 {
+    let is i64 as sa = ch(src, 3);
+    if (sa == 255) { return src; }
+    if (sa == 0) { return dst; }
+    let is i64 as ia = 255 - sa;
+    let is i64 as a with mut = sa + ch(dst, 3) * ia / 255;
+    if (a > 255) { a = 255; }
+    return (a << 24) | (((ch(src, 2) * sa + ch(dst, 2) * ia) / 255) << 16) |
+           (((ch(src, 1) * sa + ch(dst, 1) * ia) / 255) << 8) | ((ch(src, 0) * sa + ch(dst, 0) * ia) / 255);
+}
+
+fn ref_premul(src as i64, dst as i64) as i64 {
+    let is i64 as sa = ch(src, 3);
+    if (sa == 255) { return src; }
+    let is i64 as ia = 255 - sa;
+    let is [4]i64 as o;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        let is i64 as v with mut = ch(src, k) + ch(dst, k) * ia / 255;
+        if (k == 3) { v = sa + ch(dst, 3) * ia / 255; }
+        if (v > 255) { v = 255; }
+        o[k] = v;
+        k = k + 1;
+    }
+    return (o[3] << 24) | (o[2] << 16) | (o[1] << 8) | o[0];
+}
+
+fn test_blends() as void {
+    let is [8]i64 as vals;
+    vals[0] = 0; vals[1] = 1; vals[2] = 2; vals[3] = 127; vals[4] = 128; vals[5] = 200; vals[6] = 254; vals[7] = 255;
+    let is i64 as bad_over with mut = 0;
+    let is i64 as bad_premul with mut = 0;
+    let is i64 as sa with mut = 0;
+    while (sa < 256) {
+        let is i64 as i with mut = 0;
+        while (i < 8) {
+            let is i64 as j with mut = 0;
+            while (j < 8) {
+                // Each channel its own value, so a channel taken for another shows.
+                let is i64 as src = (sa << 24) | (vals[(i + 1) % 8] << 16) | (vals[(i + 2) % 8] << 8) | vals[i];
+                let is i64 as dst = (vals[(j + 3) % 8] << 24) | (vals[(j + 5) % 8] << 16) | (vals[(j + 6) % 8] << 8) | vals[j];
+                if (soft.raster._blend_over(src, dst) != ref_over(src, dst)) { bad_over = bad_over + 1; }
+                if (soft.raster._blend_premul(src, dst) != ref_premul(src, dst)) { bad_premul = bad_premul + 1; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        sa = sa + 1;
+    }
+    chk_i("blend over: as dividing by 255", bad_over, 0);
+    chk_i("premultiplied: as dividing by 255", bad_premul, 0);
+}
+
+// --- The general path's colours, interpolated ---
+
+fn frag_color(env as *u8, vary as *soft.raster.Varyings) as i64 { return math.color.pack_rgba8(vary.color); }
+
+fn shaded(x as f64, y as f64, c as math.color.Color) as soft.raster.Shaded {
+    let is soft.raster.Shaded as s;
+    s.clip = math.vec.v4(x / cast(f64, W) * 2.0 - 1.0, 1.0 - y / cast(f64, H) * 2.0, 0.0, 1.0);
+    s.vary.color = c;
+    s.vary.u = 0.0;
+    s.vary.v = 0.0;
+    return s;
+}
+
+fn test_shaded_colors() as void {
+    let is soft.target.Target as t = soft.target.target(cast(*u8, &pixels), cast(*u8, 0), cast(i64, W), cast(i64, H));
+    soft.target.clear_color(&t, math.color.black());
+    let is soft.raster.ShadeState as st;
+    st.vx = 0; st.vy = 0; st.vw = cast(i64, W); st.vh = cast(i64, H);
+    st.sx0 = 0; st.sy0 = 0; st.sx1 = cast(i64, W); st.sy1 = cast(i64, H);
+    st.cull = soft.raster.CULL_NONE;
+    st.depth_test = soft.raster.DEPTH_NONE;
+    st.depth_write = 0;
+    st.blend = soft.raster.BLEND_NONE;
+    st.frag = cast(*u8, fn_ptr(frag_color));
+    st.env = cast(*u8, 0);
+    st.unlit = 0;
+    // Every channel of every corner its own, none of them 0.
+    soft.raster.triangle_shaded(&t, shaded(2.0, 2.0, math.color.rgba(1.0, 0.2, 0.3, 1.0)),
+                                shaded(32.0, 62.0, math.color.rgba(0.3, 0.4, 1.0, 1.0)),
+                                shaded(62.0, 2.0, math.color.rgba(0.25, 1.0, 0.5, 1.0)), &st);
+    chk("by each corner, its colour", near(soft.target.get(&t, 4, 3), 255, 51, 77) == 1 &&
+        near(soft.target.get(&t, 59, 3), 64, 255, 128) == 1 && near(soft.target.get(&t, 32, 59), 77, 102, 255) == 1);
+    chk("between two, both halves", near(soft.target.get(&t, 32, 3), 160, 153, 102) == 1);
+}
+
+// Whether packed p is r, g, b give or take a little, and opaque.
+fn near(p as i64, r as i64, g as i64, b as i64) as i32 {
+    let is i64 as dr = ch(p, 0) - r;
+    let is i64 as dg = ch(p, 1) - g;
+    let is i64 as db = ch(p, 2) - b;
+    return cast(i32, dr * dr < 144 && dg * dg < 144 && db * db < 144 && ch(p, 3) == 255);
+}
+
 fn main() as i32 {
+    test_blends();
+    test_shaded_colors();
     test_subpixel();
     test_coverage();
     test_fill_rule();

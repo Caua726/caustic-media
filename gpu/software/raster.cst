@@ -452,6 +452,10 @@ fn _depth_passes(mode as i32, z as f64, stored as f64) as i32 {
     return 1;
 }
 
+// x / 255, rounded down, for x from 0 to 255 * 255 — every product a blend
+// divides — without the division: checked against it over all of them.
+fn _div255(x as i64) as i64 { return (x + 1 + (x >> 8)) >> 8; }
+
 // Source-over, on packed 0xAABBGGRR. Done in 8-bit rather than through
 // math.color so the opaque path — which is most of them — costs nothing.
 fn _blend_over(src as i64, dst as i64) as i64 {
@@ -459,10 +463,14 @@ fn _blend_over(src as i64, dst as i64) as i64 {
     if (sa == 255) { return src; }
     if (sa == 0) { return dst; }
     let is i64 as ia = 255 - sa;
-    let is i64 as r = ((src & 255) * sa + (dst & 255) * ia) / 255;
-    let is i64 as g = (((src >> 8) & 255) * sa + ((dst >> 8) & 255) * ia) / 255;
-    let is i64 as b = (((src >> 16) & 255) * sa + ((dst >> 16) & 255) * ia) / 255;
-    let is i64 as a with mut = sa + ((dst >> 24) & 255) * ia / 255;
+    let is i64 as xr = (src & 255) * sa + (dst & 255) * ia;
+    let is i64 as xg = ((src >> 8) & 255) * sa + ((dst >> 8) & 255) * ia;
+    let is i64 as xb = ((src >> 16) & 255) * sa + ((dst >> 16) & 255) * ia;
+    let is i64 as xa = ((dst >> 24) & 255) * ia;
+    let is i64 as r = (xr + 1 + (xr >> 8)) >> 8;
+    let is i64 as g = (xg + 1 + (xg >> 8)) >> 8;
+    let is i64 as b = (xb + 1 + (xb >> 8)) >> 8;
+    let is i64 as a with mut = sa + ((xa + 1 + (xa >> 8)) >> 8);
     if (a > 255) { a = 255; }
     return (a << 24) | (b << 16) | (g << 8) | r;
 }
@@ -473,10 +481,10 @@ fn _blend_premul(src as i64, dst as i64) as i64 {
     let is i64 as sa = (src >> 24) & 255;
     if (sa == 255) { return src; }
     let is i64 as ia = 255 - sa;
-    let is i64 as r with mut = (src & 255) + (dst & 255) * ia / 255;
-    let is i64 as g with mut = ((src >> 8) & 255) + ((dst >> 8) & 255) * ia / 255;
-    let is i64 as b with mut = ((src >> 16) & 255) + ((dst >> 16) & 255) * ia / 255;
-    let is i64 as a with mut = sa + ((dst >> 24) & 255) * ia / 255;
+    let is i64 as r with mut = (src & 255) + _div255((dst & 255) * ia);
+    let is i64 as g with mut = ((src >> 8) & 255) + _div255(((dst >> 8) & 255) * ia);
+    let is i64 as b with mut = ((src >> 16) & 255) + _div255(((dst >> 16) & 255) * ia);
+    let is i64 as a with mut = sa + _div255(((dst >> 24) & 255) * ia);
     if (r > 255) { r = 255; }
     if (g > 255) { g = 255; }
     if (b > 255) { b = 255; }
@@ -545,6 +553,11 @@ fn triangle_shaded(t as *tgt.Target, a as Shaded, b as Shaded, c as Shaded,
     if (st.depth_test == DEPTH_NONE && st.depth_write == 0) { depth = 0; }
 
     let is Varyings as vary;
+    // A colour the same at every corner is that colour everywhere: taken as
+    // it is, not as weights summing to one but for the last bit, which tips a
+    // channel's rounding at a half.
+    let is i32 as one_color = cast(i32, _same_color(a.vary.color, b.vary.color) == 1 &&
+                                        _same_color(a.vary.color, c.vary.color) == 1);
 
     // The unlit colour material without depth: the colour is computed here,
     // per pixel, with no call — and a triangle of one colour is filled with
@@ -595,11 +608,15 @@ fn triangle_shaded(t as *tgt.Target, a as Shaded, b as Shaded, c as Shaded,
                         let is f64 as fb = qb * inv_qs;
                         let is f64 as fc = qc * inv_qs;
 
-                        vary.color = math.color.rgba(
-                            fa * a.vary.color.r + fb * b.vary.color.r + fc * c.vary.color.r,
-                            fa * a.vary.color.g + fb * b.vary.color.g + fc * c.vary.color.g,
-                            fa * a.vary.color.b + fb * b.vary.color.b + fc * c.vary.color.b,
-                            fa * a.vary.color.a + fb * b.vary.color.a + fc * c.vary.color.a);
+                        if (one_color == 1) {
+                            vary.color = a.vary.color;
+                        } else {
+                            vary.color = math.color.rgba(
+                                fa * a.vary.color.r + fb * b.vary.color.r + fc * c.vary.color.r,
+                                fa * a.vary.color.g + fb * b.vary.color.g + fc * c.vary.color.g,
+                                fa * a.vary.color.b + fb * b.vary.color.b + fc * c.vary.color.b,
+                                fa * a.vary.color.a + fb * b.vary.color.a + fc * c.vary.color.a);
+                        }
                         vary.u = fa * a.vary.u + fb * b.vary.u + fc * c.vary.u;
                         vary.v = fa * a.vary.v + fb * b.vary.v + fc * c.vary.v;
 
@@ -700,6 +717,233 @@ fn _fill_unlit(t as *tgt.Target, pa as Projected, pb as Projected, pc as Project
         }
         py = py + 1;
     }
+}
+
+// --- Rectangles ---
+//
+// render/draw2d.cst draws every rectangle, glyph and image as a quad of two
+// triangles, a b c then a c f — a the top left corner, b the bottom left, c
+// the bottom right, f the top right — and that is most of what a frame of the
+// toolkit's is. Axis-aligned on the screen, the two cover exactly the pixels
+// whose centres lie in [x0, x1) × [y0, y1): the top-left rule gives each of
+// them its left and top edges and neither its right and bottom ones, and
+// their shared diagonal to one of them. With u varying across it only, and v
+// and the colour down it only, what the triangles interpolate is affine in x
+// and in y alone. So a rectangle is filled row by row, with no edge tests
+// and no barycentric weights, each pixel's fragment as the triangles would
+// make it — rect_test.cst draws a frame both ways and compares every pixel.
+//
+// One case is left to the triangles: a texture whose texels are not one to
+// a pixel, centre on centre. Sampled nearest, a pixel centre on a texel's
+// edge takes either texel by the last bit of the arithmetic, and the two
+// ways round would differ there; smoothed, the weights would differ by as
+// much. Text — each glyph rasterized at the size it is drawn, on whole
+// pixels — and images drawn at their own size are always one to one.
+
+// A coverage fragment worked out ahead: an R8 texture sampled nearest, and
+// the packed colour each of its 256 values makes.
+struct Coverage8 {
+    pixels as *u8;
+    width  as i64;
+    height as i64;
+    table  as *i32;
+}
+
+fn _same_clip(a as math.vec.Vec4, b as math.vec.Vec4) as i32 {
+    return cast(i32, a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w);
+}
+
+fn _same_shaded(a as Shaded, b as Shaded) as i32 {
+    return cast(i32, _same_clip(a.clip, b.clip) == 1 && _same_color(a.vary.color, b.vary.color) == 1 &&
+                a.vary.u == b.vary.u && a.vary.v == b.vary.v);
+}
+
+fn _maxi(a as i64, b as i64) as i64 { if (a > b) { return a; } return b; }
+fn _mini(a as i64, b as i64) as i64 { if (a < b) { return a; } return b; }
+
+// Clamped to the texture's edge, as the sampler's CLAMP wrap is.
+fn _clamp01(x as f64) as f64 {
+    if (x < 0.0) { return 0.0; }
+    if (x > 1.0) { return 1.0; }
+    return x;
+}
+
+// Whether a texture size n texels across, sampled from s0 at the first pixel
+// centre in steps of ds a pixel, has one texel to a pixel, centre on centre.
+fn _one_to_one(s0 as f64, ds as f64, n as i64) as i32 {
+    let is f64 as k = ds * cast(f64, n);
+    if (k < 0.999999 || k > 1.000001) { return 0; }
+    let is f64 as at = s0 * cast(f64, n);
+    let is f64 as off = at - fm.floor(at);
+    return cast(i32, off > 0.499 && off < 0.501);
+}
+
+// The triangles a b c and d e f, filled as one rectangle when they are one:
+// 1 when they were (and drawn, or covering no pixel), 0 when not, for the
+// caller to draw them as triangles. tw by th is the texture the fragment
+// stage samples, 0 by 0 for none; cov, when not null, that stage worked out
+// for a coverage texture in the rectangle's one colour.
+fn rect_shaded(t as *tgt.Target, a as Shaded, b as Shaded, c as Shaded, d as Shaded, e as Shaded, f as Shaded,
+               st as *ShadeState, tw as i64, th as i64, cov as *Coverage8) as i32 {
+    // Two triangles sharing their first and second corners' ends: a = d, c = e.
+    if (_same_shaded(a, d) == 0 || _same_shaded(c, e) == 0) { return 0; }
+    // Every pixel covered once, by one face, and nothing in depth.
+    if (st.cull != CULL_NONE) { return 0; }
+    if (tgt.has_depth(t) == 1 && (st.depth_test != DEPTH_NONE || st.depth_write == 1)) { return 0; }
+    let is f64 as fvx = cast(f64, st.vx);
+    let is f64 as fvy = cast(f64, st.vy);
+    let is f64 as fvw = cast(f64, st.vw);
+    let is f64 as fvh = cast(f64, st.vh);
+    let is Projected as pa = project_viewport(a.clip, fvx, fvy, fvw, fvh);
+    let is Projected as pb = project_viewport(b.clip, fvx, fvy, fvw, fvh);
+    let is Projected as pc = project_viewport(c.clip, fvx, fvy, fvw, fvh);
+    let is Projected as pf = project_viewport(f.clip, fvx, fvy, fvw, fvh);
+    if (pa.ok == 0 || pb.ok == 0 || pc.ok == 0 || pf.ok == 0) { return 0; }
+    // Axis-aligned, with no perspective across it.
+    if (pa.x != pb.x || pc.x != pf.x || pa.y != pf.y || pb.y != pc.y) { return 0; }
+    if (pa.inv_w != pb.inv_w || pa.inv_w != pc.inv_w || pa.inv_w != pf.inv_w) { return 0; }
+    // u across it only; v and the colour down it only.
+    if (a.vary.u != b.vary.u || c.vary.u != f.vary.u || a.vary.v != f.vary.v || b.vary.v != c.vary.v) { return 0; }
+    if (_same_color(a.vary.color, f.vary.color) == 0 || _same_color(b.vary.color, c.vary.color) == 0) { return 0; }
+
+    let is f64 as xl with mut = pa.x;
+    let is f64 as xr with mut = pc.x;
+    let is f64 as ul with mut = a.vary.u;
+    let is f64 as ur with mut = c.vary.u;
+    if (xr < xl) {
+        xl = pc.x;
+        xr = pa.x;
+        ul = c.vary.u;
+        ur = a.vary.u;
+    }
+    let is f64 as yt with mut = pa.y;
+    let is f64 as yb with mut = pb.y;
+    let is f64 as vt with mut = a.vary.v;
+    let is f64 as vb with mut = b.vary.v;
+    let is math.color.Color as ct with mut = a.vary.color;
+    let is math.color.Color as cb with mut = b.vary.color;
+    if (yb < yt) {
+        yt = pb.y;
+        yb = pa.y;
+        vt = b.vary.v;
+        vb = a.vary.v;
+        ct = b.vary.color;
+        cb = a.vary.color;
+    }
+    // No area: the triangles draw nothing either.
+    if (xr <= xl || yb <= yt) { return 1; }
+
+    // Clipped to the target, the viewport and the scissor; pixel centres
+    // px + 0.5 in [xl, xr), the first being ceil(xl - 0.5).
+    let is i64 as cx0 = _maxi(_maxi(0, st.vx), st.sx0);
+    let is i64 as cy0 = _maxi(_maxi(0, st.vy), st.sy0);
+    let is i64 as cx1 = _mini(_mini(t.width, st.vx + st.vw), st.sx1);
+    let is i64 as cy1 = _mini(_mini(t.height, st.vy + st.vh), st.sy1);
+    let is i64 as px0 = _maxi(cx0, cast(i64, fm.ceil(xl - 0.5)));
+    let is i64 as px1 = _mini(cx1, cast(i64, fm.ceil(xr - 0.5)));
+    let is i64 as py0 = _maxi(cy0, cast(i64, fm.ceil(yt - 0.5)));
+    let is i64 as py1 = _mini(cy1, cast(i64, fm.ceil(yb - 0.5)));
+    if (px1 <= px0 || py1 <= py0) { return 1; }
+
+    let is f64 as du = (ur - ul) / (xr - xl);
+    let is f64 as dv = (vb - vt) / (yb - yt);
+    let is f64 as dh = yb - yt;
+    if (st.unlit == 0 && tw > 0 && th > 0 &&
+        (_one_to_one(ul + (cast(f64, px0) + 0.5 - xl) * du, du, tw) == 0 ||
+         _one_to_one(vt + (cast(f64, py0) + 0.5 - yt) * dv, dv, th) == 0)) { return 0; }
+    let is i32 as flat = _same_color(ct, cb);
+    let is i64 as stride = t.width * 4;
+    let is i64 as flat_packed = math.color.pack_rgba8(ct);
+    let is Varyings as vary;
+    let is i64 as py with mut = py0;
+    while (py < py1) {
+        let is f64 as sy = cast(f64, py) + 0.5;
+        let is i64 as row = cast(i64, t.color) + py * stride;
+        let is f64 as v = vt + (sy - yt) * dv;
+        let is math.color.Color as col with mut = ct;
+        if (flat == 0) {
+            let is f64 as k = (sy - yt) / dh;
+            col = math.color.rgba(ct.r + k * (cb.r - ct.r), ct.g + k * (cb.g - ct.g), ct.b + k * (cb.b - ct.b),
+                                  ct.a + k * (cb.a - ct.a));
+        }
+        let is i64 as px with mut = px0;
+        if (st.unlit == 1) {
+            // One colour along the row.
+            let is i64 as packed with mut = flat_packed;
+            if (flat == 0) {
+                packed = (_byte(col.a) << 24) | (_byte(col.b) << 16) | (_byte(col.g) << 8) | _byte(col.r);
+            }
+            if (st.blend == BLEND_NONE || ((packed >> 24) & 255) == 255) {
+                // Two pixels a store, once the row is at an even pixel.
+                let is i32 as pv = cast(i32, packed);
+                if ((px & 1) == 1 && px < px1) {
+                    *cast(*i32, row + px * 4) = pv;
+                    px = px + 1;
+                }
+                let is i64 as pair = (packed << 32) | packed;
+                while (px + 1 < px1) {
+                    *cast(*i64, row + px * 4) = pair;
+                    px = px + 2;
+                }
+                if (px < px1) { *cast(*i32, row + px * 4) = pv; }
+            } else if (_blend_noop(st.blend, packed) == 0) {
+                while (px < px1) {
+                    let is *i32 as dst = cast(*i32, row + px * 4);
+                    *dst = cast(i32, _blend(st.blend, packed, cast(i64, *dst) & 4294967295));
+                    px = px + 1;
+                }
+            }
+        } else if (cast(i64, cov) != 0 && flat == 1) {
+            // Coverage sampled nearest, one texel to a pixel (_one_to_one):
+            // the row's texels in turn, and the colour each makes.
+            let is i64 as ty with mut = cast(i64, _clamp01(v) * cast(f64, cov.height));
+            if (ty >= cov.height) { ty = cov.height - 1; }
+            let is i64 as texrow = cast(i64, cov.pixels) + ty * cov.width;
+            let is i64 as tx with mut = cast(i64, _clamp01(ul + (cast(f64, px) + 0.5 - xl) * du) * cast(f64, cov.width));
+            let is i64 as tlast = cov.width - 1;
+            let is i32 as mode = st.blend;
+            let is *i32 as table = cov.table;
+            while (px < px1) {
+                if (tx > tlast) { tx = tlast; }
+                let is i64 as k = cast(i64, *cast(*u8, texrow + tx)) & 255;
+                let is i64 as packed = cast(i64, table[k]) & 4294967295;
+                let is *i32 as dst = cast(*i32, row + px * 4);
+                if (mode == BLEND_NONE) {
+                    *dst = cast(i32, packed);
+                } else if (mode == BLEND_ALPHA) {
+                    // Most of a glyph's box is not ink: nothing to do there.
+                    let is i64 as sa = (packed >> 24) & 255;
+                    if (sa == 255) {
+                        *dst = cast(i32, packed);
+                    } else if (sa != 0) {
+                        *dst = cast(i32, _blend_over(packed, cast(i64, *dst) & 4294967295));
+                    }
+                } else {
+                    *dst = cast(i32, _blend(mode, packed, cast(i64, *dst) & 4294967295));
+                }
+                tx = tx + 1;
+                px = px + 1;
+            }
+        } else {
+            // Any other fragment stage, called with what the triangles
+            // would have interpolated.
+            vary.color = col;
+            vary.v = v;
+            while (px < px1) {
+                vary.u = ul + (cast(f64, px) + 0.5 - xl) * du;
+                let is i64 as out = call(st.frag, st.env, &vary);
+                if (out >= 0) {
+                    let is i64 as packed with mut = out & 4294967295;
+                    let is *i32 as dst = cast(*i32, row + px * 4);
+                    if (st.blend != BLEND_NONE) { packed = _blend(st.blend, packed, cast(i64, *dst) & 4294967295); }
+                    *dst = cast(i32, packed);
+                }
+                px = px + 1;
+            }
+        }
+        py = py + 1;
+    }
+    return 1;
 }
 
 // Wireframe, for debugging a mesh without shading it.

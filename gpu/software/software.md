@@ -146,9 +146,19 @@ Caustic has threads, atomics and a thread-safe allocator, so this is available
 rather than aspirational. It stays behind the same opt-in as the rest of the
 library's threading: single-threaded by default.
 
-Before that, the cheap wins are worth naming: the current rasterizer walks the
-full bounding box testing three edge functions per pixel, when the edge functions
-are linear and can be stepped incrementally.
+Before that, the cheap wins. The rasterizer finds each row's covered
+interval and fills it, rather than testing the whole bounding box. And most
+of a 2D frame is not triangles at all but rectangles — every background,
+glyph and image render/draw2d.cst draws is a quad of two — so those are
+recognised and filled row by row (`raster.rect_shaded`): no edge tests, no
+barycentric weights, a glyph's texels read one after another and the colour
+each coverage makes looked up in a table built once per colour, blends
+divided by 255 without a division, opaque fills two pixels a store. Measured
+on the text editor scrolling a full window of text, 1366x740: the raster
+went from 32 ms a frame to 7, the whole frame (layout, paint, raster, the
+copy to X) from 45 ms to about 12. A full repaint of 1920x1080 is still
+over the 8 ms the plan aims at; scrolling by copying what stays in view
+rather than repainting it is what would close that.
 
 ---
 
@@ -164,9 +174,8 @@ are linear and can be stepped incrementally.
 4. **SPIR-V interpreter**, for custom shaders and for compute's shader half.
 5. **Tiled multithreading**, once there is something worth parallelising.
 
-Before any of those, the cheap wins named above are still unclaimed: the
-rasterizer walks the full bounding box testing three edge functions per pixel,
-when the edge functions are linear and can be stepped incrementally.
+Before any of those: scrolling by copying the pixels that stay in view, and
+painting only the strip that comes into it.
 
 ## Current state
 
@@ -174,5 +183,10 @@ The backend the toolkit draws with, and the reference the others will be
 checked against: the device's whole shape — buffers, textures with
 samplers, pipelines as function pointers, command lists, a swapchain — on
 the rasterizer above, with scissors, an R8 coverage material, straight and
-premultiplied blending, partial uploads, render targets read back. Compute,
-SPIR-V and threads are still to come (the order of work above).
+premultiplied blending, partial uploads, render targets read back, and
+draw2d's rectangles filled as rectangles — the same pixels as their two
+triangles, compared over a frame of everything draw2d draws
+(`rect_test.cst`); a texture not one texel to a pixel is left to the
+triangles, since sampled at a texel's edge the two ways round could pick
+different texels. Compute, SPIR-V and threads are still to come (the order
+of work above).

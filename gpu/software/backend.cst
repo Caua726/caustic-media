@@ -486,6 +486,57 @@ struct Exec {
     uniforms    as *u8;
     in_pass     as i32;
     has_pipe    as i32;
+    cov         as raster.Coverage8;   // the coverage fragment worked out, for cov_color
+    cov_color   as math.color.Color;
+    cov_ok      as i32;
+    _pad0       as i32;
+    table       as [256]i32;
+}
+
+// Quads of render/draw2d.cst's filled as rectangles (raster.rect_shaded), as
+// they are: off, every triangle is drawn as one — for rect_test.cst, which
+// draws a frame both ways.
+let is i32 as _rects with mut = 1;
+let is i64 as _rects_filled with mut = 0;
+
+fn set_rects(on as i32) as void { _rects = on; }
+
+// How many quads have been filled as rectangles: for rect_test.cst.
+fn rects_filled() as i64 { return _rects_filled; }
+
+// The coverage fragment worked out for colour col, when the pipeline bound
+// is the coverage one over an R8 texture sampled nearest and clamped; null
+// otherwise. The table is kept while the colour is the same: text is drawn
+// in one colour, glyph after glyph.
+fn _coverage_for(ex as *Exec, col as math.color.Color) as *raster.Coverage8 {
+    if (cast(i64, ex.st.frag) != cast(i64, fn_ptr(fs_coverage)) || cast(i64, ex.env.tex0) == 0) {
+        return cast(*raster.Coverage8, 0);
+    }
+    let is *tex.Info as inf = cast(*tex.Info, ex.env.tex0);
+    let is *TexState as ts = cast(*TexState, tex.backend_state(ex.env.tex0));
+    if (inf.format != tex.R8 || cast(i64, ts.pixels) == 0) { return cast(*raster.Coverage8, 0); }
+    if (cast(i64, ex.env.samp0) != 0) {
+        let is *tex.SamplerInfo as si = cast(*tex.SamplerInfo, ex.env.samp0);
+        if (si.filter != tex.NEAREST || si.wrap != tex.CLAMP) { return cast(*raster.Coverage8, 0); }
+    }
+    let is math.color.Color as kc = ex.cov_color;
+    if (ex.cov_ok == 0 || kc.r != col.r || kc.g != col.g || kc.b != col.b || kc.a != col.a) {
+        // As fs_coverage makes it: the texel's value scales the alpha.
+        let is i64 as k with mut = 0;
+        while (k < 256) {
+            let is math.color.Color as c with mut = col;
+            c.a = col.a * (cast(f64, k) / 255.0);
+            ex.table[k] = cast(i32, math.color.pack_rgba8(c));
+            k = k + 1;
+        }
+        ex.cov_color = col;
+        ex.cov_ok = 1;
+    }
+    ex.cov.pixels = ts.pixels;
+    ex.cov.width = inf.width;
+    ex.cov.height = inf.height;
+    ex.cov.table = cast(*i32, &ex.table);
+    return &ex.cov;
 }
 
 fn _clear_depth_to(t as *tgt.Target, v as f64) as void {
@@ -536,6 +587,38 @@ fn _emit_triangle(ex as *Exec, ia as i64, ib as i64, ic as i64) as void {
     raster.triangle_shaded(&ex.target, sa, sb, sc, &ex.st);
 }
 
+// Six vertices from first, two triangles: one rectangle, as draw2d draws
+// them, filled as one, else the two triangles. 0 when they run off the
+// buffer, for the triangles to be drawn one by one.
+fn _six(ex as *Exec, first as i64) as i32 {
+    let is i64 as stride = cast(i64, ex.layout.stride);
+    if ((first + 6) * stride > ex.vbytes) { return 0; }
+    let is i64 as base = cast(i64, ex.vdata);
+    let is [6]raster.Shaded as sh;
+    let is i64 as k with mut = 0;
+    while (k < 6) {
+        let is VertexIn as vi;
+        _decode_vertex(base + (first + k) * stride, &ex.layout, &vi);
+        call(ex.vert_stage, cast(*u8, &ex.env), &vi, &sh[k]);
+        k = k + 1;
+    }
+    let is *raster.Coverage8 as cov = _coverage_for(ex, sh[0].vary.color);
+    // The texture the fragment stage samples, if it samples one.
+    let is i64 as tw with mut = 0;
+    let is i64 as th with mut = 0;
+    if (ex.st.unlit == 0 && cast(i64, ex.env.tex0) != 0) {
+        tw = cast(*tex.Info, ex.env.tex0).width;
+        th = cast(*tex.Info, ex.env.tex0).height;
+    }
+    if (raster.rect_shaded(&ex.target, sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], &ex.st, tw, th, cov) == 1) {
+        _rects_filled = _rects_filled + 1;
+        return 1;
+    }
+    raster.triangle_shaded(&ex.target, sh[0], sh[1], sh[2], &ex.st);
+    raster.triangle_shaded(&ex.target, sh[3], sh[4], sh[5], &ex.st);
+    return 1;
+}
+
 fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
     let is *cmd.Info as ci = cast(*cmd.Info, payload);
 
@@ -555,6 +638,7 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
     ex.st.frag = cast(*u8, 0);
     ex.st.env = cast(*u8, &ex.env);
     ex.st.unlit = 0;
+    ex.cov_ok = 0;
 
     let is i64 as n with mut = 0;
     while (n < ci.count) {
@@ -653,8 +737,12 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
             if (ex.in_pass == 1 && ex.has_pipe == 1 && cast(i64, ex.vdata) != 0) {
                 let is i64 as i with mut = 0;
                 while (i + 2 < r.i1) {
-                    _emit_triangle(&ex, r.i0 + i, r.i0 + i + 1, r.i0 + i + 2);
-                    i = i + 3;
+                    if (_rects == 1 && i + 5 < r.i1 && _six(&ex, r.i0 + i) == 1) {
+                        i = i + 6;
+                    } else {
+                        _emit_triangle(&ex, r.i0 + i, r.i0 + i + 1, r.i0 + i + 2);
+                        i = i + 3;
+                    }
                 }
             }
 
