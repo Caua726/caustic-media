@@ -600,7 +600,9 @@ too: only a widget's own hidden flag makes it measure as nothing — and overlay
 not make the window fit it. No container has a fixed ceiling on children: they work in a
 scratch area that is part of the tree's mapping, sized from its capacity, and a
 grid too sparse to fit says so with `LAYOUT_TOO_LARGE` instead of dropping
-cells. Edges land on physical pixels: `layout.set_scale` gives the window's
+cells. The smallest window the content fits in (`layout.min_size`, the
+root's minimum) is the window's floor: the host tells the platform, again
+whenever it changes (`host_x11_test`). Edges land on physical pixels: `layout.set_scale` gives the window's
 scale, and every rectangle's edges — not its size — are rounded to that grid
 relative to a parent already on it, so 100 split three ways at scale 1 is 33,
 34 and 33 edge to edge, and at 1.5 is 50 physical pixels each (`snap_test`). The tests were checked against deliberate breakages — each rule
