@@ -437,7 +437,10 @@ backend.
   `device.pump` hands every event read to the windows it belongs to, for a
   loop that sleeps by itself rather than in `next_frame`.
 - A key press carries the text it typed (`event.text`, UTF-8: XLookupString,
-  or the input method's); `STATE` says the window manager's state of the
+  or the input method's); every key, button and wheel event the modifiers
+  held as `keys.MOD_*` name them, X's bits translated (they number them
+  otherwise: X's Control is the portable Caps Lock's bit); `STATE` says the
+  window manager's state of the
   window; `CLOSE` its close button — `keep_open` when the program says no.
 - `device.set_title` in UTF-8: `_NET_WM_NAME`, and `WM_NAME` in Latin-1 for
   an old window manager, each sequence whole or a `?`; `show`, `hide`,
