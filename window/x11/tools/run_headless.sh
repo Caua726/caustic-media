@@ -33,6 +33,14 @@
 # root's SubstructureRedirect and exits on the X error. Either read as a
 # failing test. -displayfd has the server take the first free display itself,
 # atomically, as it creates the lock.
+#
+# --- Why -noreset ---
+#
+# An X server resets when its last client leaves, and a connection made while
+# it does is dropped (XOpenDisplay fails, errno ECONNRESET). A desktop always
+# has other clients; here the program is the only one, and a test that closes
+# its last window and opens another reopens the display right then: plain
+# Xlib, opening and closing in a loop, failed 27 times in 200.
 set -eu
 
 [ $# -ge 1 ] || { echo "uso: run_headless.sh <programa> [args...]" >&2; exit 2; }
@@ -41,7 +49,7 @@ command -v Xvfb >/dev/null 2>&1 || {
     echo "run_headless: Xvfb nao encontrado (apt: xvfb)" >&2; exit 127
 }
 numfile=$(mktemp "${TMPDIR:-/tmp}/run_headless.XXXXXX")
-Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp 3>"$numfile" >/dev/null 2>&1 &
+Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp -noreset 3>"$numfile" >/dev/null 2>&1 &
 xvfb_pid=$!
 num=""
 
