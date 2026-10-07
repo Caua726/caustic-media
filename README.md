@@ -171,12 +171,21 @@ transforms images links no decoder.
 ## Building
 
 ```sh
-caustic-mk run test     # math, geometry, the rasteriser, the device
+caustic-mk run test       # everything that needs no screen
+caustic-mk run test-x11   # what does, under Xvfb: windows, the toolkit's loop, the examples
 caustic -q examples/cube.cst -o build/cube && ./build/cube
+caustic -q examples/text_editor.cst -o build/text_editor --path .caustic/deps && ./build/text_editor
 ```
 
-Every suite is headless, the device included, so tests run with no `DISPLAY`.
-Only the example needs a screen.
+`test` is headless, the device included, so it runs with no `DISPLAY`;
+`test-x11` starts an Xvfb of its own, and the D-Bus tests a private bus that
+starts none of the desktop's services. The toolkit's examples —
+`settings_form`, `text_editor`, `file_browser` — run as programs, and with
+`--check` drive themselves the way a user would.
+
+A program of the toolkit's imports a few hundred modules; the compiler has
+to take more than 256 of them in one program (Caustic's build of 2026-10-06
+does, an older one leaves the ones past the 256th unlinked).
 
 Needs a standard library new enough to carry the float functions in
 `std/math.cst` — `sin`, `cos`, `atan2`, `pow` and the rest. An older install
@@ -196,26 +205,24 @@ Every sibling project then resolves `use "std/..."` to that tree.
 
 ## Status
 
-Early, and the first milestone is met: a shaded cube turns in a window, drawn
-entirely on the CPU, with nothing between the geometry and the screen but our
-own code.
+The retained toolkit runs on X11: three example applications — a settings
+form, a text editor, a file browser — built from its widgets, with real
+windows, the desktop's settings, its own fonts and text, and accessibility.
 
 | | |
 |---|---|
 | `math/` | vectors, matrices, quaternions, geometry, colour, curves — tested |
 | `gpu/` | the portable device: buffers, textures, pipelines, commands, swapchain — tested |
-| `gpu/software/` | the device implemented with no hardware, over a tested rasterizer |
-| `window/x11` | window, MIT-SHM presentation, events, keys, cursor, clipboard, monitors — 770 of libX11's 774, and libXext, Xss, Xrandr, Xi, Xcursor and Xfixes complete — 1163 symbols |
-| everything else | a design note, and the work it describes |
+| `gpu/software/` | the device implemented with no hardware, over a tested rasterizer: what the toolkit draws with |
+| `render/` | the 2D family: frames, queues, shapes, images, glyphs, filled paths |
+| `image/` | buffers, transforms, an atlas packer, PNG and others loaded through caustic-image |
+| `text/` | fonts read whole (TrueType, CFF, CFF2, variable), rasterized, shaped as HarfBuzz does, laid out with bidi and line breaking, colour glyphs, the system's fonts indexed with fallback |
+| `window/x11` | windows many to a connection, MIT-SHM presentation, events, keys and text, cursors, clipboard, drag and drop, monitors, XSETTINGS, dialogs, frames — libX11, Xext, Xrandr, Xi, Xcursor and Xfixes bound |
+| `dbus/` | the D-Bus wire protocol, connections, objects and calls, our own |
+| `ui/` | the toolkit: widgets, layout, events, painting, themes, animations, dialogs, choosers, menus, lists, trees, tables, drag and drop, AT-SPI, two languages, the application's loop, icons, the tray, notifications, one instance |
+| Wayland, Windows, Vulkan, `input/` | a design note each, and the work it describes |
 
-The cube now turns through the abstraction rather than beside it: it is a
-vertex buffer, a pipeline and a draw submitted to a `gpu.Device`, and nothing
-in `examples/cube.cst` names a rasterizer. Compiling a GPU backend in and
-changing `AUTO` to `VULKAN` would not move that file.
-
-The next pieces are the ones the notes call for first: reshaping `window/x11`
-to the pull model before a second backend exists, then the `vk.xml` generator
-and Vulkan against that one backend.
+Each layer's note says what it holds now under its "Current state".
 
 Two things measured rather than assumed, so they are not rediscovered later.
 

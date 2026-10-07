@@ -141,3 +141,11 @@ up as flickering rather than as an error.
 
 Vulkan lands against **one** window backend before a second exists — the handle
 contract is cheaper to learn on one platform than on three.
+
+## Current state
+
+Begun only: the core bindings, the loader that finds the entry points at
+run time, and the structs checked against the C compiler's layout. No
+instance, device or swapchain yet; the toolkit does not need one, the
+software backend drawing everything. It comes after the toolkit, as the
+first hardware backend.

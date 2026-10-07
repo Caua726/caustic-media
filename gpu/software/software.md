@@ -167,3 +167,12 @@ are linear and can be stepped incrementally.
 Before any of those, the cheap wins named above are still unclaimed: the
 rasterizer walks the full bounding box testing three edge functions per pixel,
 when the edge functions are linear and can be stepped incrementally.
+
+## Current state
+
+The backend the toolkit draws with, and the reference the others will be
+checked against: the device's whole shape — buffers, textures with
+samplers, pipelines as function pointers, command lists, a swapchain — on
+the rasterizer above, with scissors, an R8 coverage material, straight and
+premultiplied blending, partial uploads, render targets read back. Compute,
+SPIR-V and threads are still to come (the order of work above).

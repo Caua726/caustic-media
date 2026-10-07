@@ -107,3 +107,9 @@ After Vulkan, sharing the generator machinery.
 2. **EGL context creation** over the window's native handles.
 3. **The state shadow**, without which every draw pays for state it already had.
 4. **SPIR-V path** on 4.6, GLSL fallback decided only if something needs it.
+
+## Current state
+
+Not built: the design for an OpenGL backend. The toolkit draws through the
+software backend, which needs no GPU; a hardware backend comes after it, Vulkan
+first.

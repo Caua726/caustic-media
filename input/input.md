@@ -243,3 +243,14 @@ raw path but also the gamepad path on Linux.
 4. **The controller database and `action.cst`.**
 5. **Text input**, when `ui/` needs a text field.
 6. **wayland and win32**, alongside their window backends.
+
+## Current state
+
+Nothing of this layer is built yet: this note is its design. The toolkit
+takes its input from `window/` meanwhile — keys with their keysym, keycode,
+modifiers and the text they type, the pointer, the wheel, a drag from
+another program, as `window/event.cst` carries them — and `ui/router.cst`
+cooks what it needs of that (the modifiers as the pointer's events say
+them, repeats, clicks counted). Gamepads, raw devices, text input beyond
+XIM's, scroll at high resolution and the action mapping above come with
+this layer, after the toolkit.

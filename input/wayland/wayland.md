@@ -104,3 +104,8 @@ Alongside the Wayland window backend, which shares the connection.
 4. **Touch, then `tablet` and `gestures`.**
 5. **`text-input`**, when `ui/` needs a field.
 6. **Our own XKB interpretation**, to drop the dependency.
+
+## Current state
+
+Not built: the design for `input/` on Wayland, which comes with the Wayland
+window backend (`window/wayland`).

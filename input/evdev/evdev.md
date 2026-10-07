@@ -98,3 +98,8 @@ first backend that brings something no other path can deliver.
 3. **Gamepad classification and the mapping database.**
 4. **Hotplug over netlink.**
 5. **`ff`.**
+
+## Current state
+
+Not built: the design for reading devices directly, for a program with no
+window system (`window/kms`) and for gamepads.

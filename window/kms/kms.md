@@ -141,3 +141,8 @@ First of the four, per [`../window.md`](../window.md).
 5. **Atomic modesetting** (`MODE_ATOMIC`), which supersedes SETCRTC/PAGE_FLIP and
    is how planes and multi-display are done properly. Worth doing second, not
    first, because the legacy path is much shorter to get a picture with.
+
+## Current state
+
+Not built: the design for a program that owns the display with no window
+system — CausticOS, a kiosk. After the desktop backends.

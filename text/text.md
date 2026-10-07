@@ -189,3 +189,20 @@ answer while the layout is being built than afterwards.
    `CPAL`) — done ([`color/color.md`](color/color.md)); `sbix` and `COLR`
    version 1 are [B].
 7. **SDF**, when text in a 3D scene does.
+
+## Current state
+
+The layer the toolkit sets all its text with, each part's own note saying
+more: faces read whole (`sfnt`: tables, TTC, cmap formats 4, 12 and 14,
+metrics, `kern`); outlines of `glyf` (composites), CFF (CID-keyed too) and
+CFF2 with its blends; variable fonts (`fvar`, `avar`, `gvar`, `HVAR`, `MVAR`,
+optical size by size); coverage rasterized analytically, non-zero and
+even-odd, the filler public (`ui/icons.cst` draws with it); a glyph cache over
+the atlas, coverage and colour pages apart; the system's fonts indexed and
+matched as CSS does, fallback chains by coverage, emoji and CJK preferred by
+language; shaping held to HarfBuzz (every `GSUB` and `GPOS` lookup, `kern`,
+marks); layout with breaking and bidi (caustic-unicode), alignment,
+ellipsis, line limits, spans; caret and hit-testing across bidi runs;
+colour glyphs, `CBDT`/`CBLC` and `COLR` v0 with `CPAL`. Not yet [B]: the
+scripts with shapers of their own, `sbix` and `COLR` v1, WOFF and WOFF2,
+hinting, SDF.

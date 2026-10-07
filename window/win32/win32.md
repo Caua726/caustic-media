@@ -115,3 +115,11 @@ generator exists, since 1600 exports is not something to type.
 2. **Window class, creation, the pump**, with `WndProc` as a Caustic `fn_ptr`.
 3. **DIB section presentation.**
 4. **Modal-loop rendering**, so resizing does not freeze the picture.
+
+## Current state
+
+Not built yet: this note is the design. The libraries the backend stands on
+build for Windows and run under wine (`test-win32`); the window itself, the
+WndProc callback and the Windows sides of the toolkit (UI Automation, the
+tray, the desktop's settings, the known folders) come after the toolkit is
+done on X11.

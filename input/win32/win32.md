@@ -92,3 +92,8 @@ Alongside the Win32 window backend, which owns the message pump.
 4. **Touch and pen** from the message path.
 5. **`ime`**, when `ui/` needs a text field.
 6. **`gameinput`**, when XInput's limits are reached.
+
+## Current state
+
+Not built: the design for `input/` on Windows, which comes with the Win32
+window backend (`window/win32`).

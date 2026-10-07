@@ -145,3 +145,15 @@ back without them (libatspi warns once that the cache is missing). The bus
 is found through `org.a11y.Bus` only — not `AT_SPI_BUS_ADDRESS` nor the X
 root window's property — and every event is sent, whether or not anyone
 registered for it.
+
+## Current state
+
+Done on Linux: the bridge in the application's language (roles, states,
+names, descriptions and actions for people, in English or Brazilian
+Portuguese), the bus found and the application embedded without waiting,
+`Accessible`, `Application`, `Component`, `Action`, `Value`, `Text` (by
+pieces for large documents), `EditableText`, `Selection` and `Table`, events
+told by comparing the tree with what was said, and the bridge run by the
+application's loop (`hosted.cst`). Checked against the desktop's own
+accessibility bus and registry, read by libatspi. UI Automation comes with
+the Win32 backend.

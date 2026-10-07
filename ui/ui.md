@@ -354,6 +354,11 @@ on a modal dialog (`app.blocked`) is told nothing of the pointer or the keys.
 A drag begun in one window and carried over another of the program's is run
 by that window's router, from what the first carries, and the first is told
 what was done there (`router.drag_payload`, `drag_elsewhere`, `drag_finish`).
+Each event is given inside `app.begin_dispatch`/`end_dispatch`, as the
+timers are inside `app.tick`: a window closed by what it sets off — a
+shortcut that quits, a timer's callback — goes on until that is over, its
+tree and router still in use until then, and closes after. `present` brings
+a window forward, as a later start of the program asks (`instance.cst`).
 The clipboard and the primary selection are the platform's through the
 trees' `set_clipboard` and `set_paste`; the pointer's shape is the one the
 widget under it asks for; the scale is the screen's DPI, or the desktop's
@@ -379,6 +384,32 @@ family, weight and style the theme and its widgets ask, opened once and
 kept), the application, the host, the desktop's settings followed and a
 session connection for what it says to the desktop. The program opens its
 windows on `program.app` and runs.
+
+## The examples
+
+Three programs a user would recognise, each built only from the toolkit's
+pieces and each with a `--check` that drives it as a user would — keys and
+clicks through the loop, its dialogs answered — under Xvfb (`test-x11`):
+
+- **A settings form** (`examples/settings_form.cst`): labelled fields on a
+  grid with mnemonics — entries, radio buttons, a switch, a slider, check
+  boxes, a spin box, a combo box — kept in a file between runs; Apply and
+  Revert enabled only when something changed; the look and the language of
+  the toolkit's own words applied as they are chosen; a message box for an
+  email that does not hold, a question before closing over changes, a
+  notification when saved.
+- **A text editor** (`examples/text_editor.cst`): one instance (started
+  again with a file, it hands it over), a menu bar with accelerators shown
+  and shortcuts bound, Edit's items enabled and done through the text view
+  (`textview.can`, `act` — an entry has the same), the file chooser to open
+  and save as, the title saying which file and whether it changed, the
+  caret's place in the status bar, a question before closing over changes,
+  the about dialog, the window's size kept.
+- **A file browser** (`examples/file_browser.cst`): folders as a tree model
+  of its own, branches read when opened; the folder chosen as a table over
+  `dirmodel`; a toolbar and a path that can be typed; menus with a check
+  item and the window's shortcuts; a message box for a folder that cannot
+  be read; files opened by the desktop's program for them.
 
 ## The application and the desktop
 
@@ -1316,6 +1347,14 @@ Xvfb on a bare private bus, and with none; its fonts by `system_fonts_test`
 over the test fonts): a window of text in the fonts found, run until it is
 closed, everything let go after.
 
+**The examples** (`examples/settings_form.cst`, `text_editor.cst`,
+`file_browser.cst`, each checked by its own `--check` under Xvfb and its
+links by `check_needed.sh`): the three programs above. What they asked of
+the toolkit is in it now: a text view's and an entry's edit actions for a
+program's own Edit menu (`can`, `act`), a window closed from inside its own
+event closing after it, `host.present`, a file link's path
+(`open_uri.local_path`).
+
 **The application and the desktop**, each on a private bus that starts none
 of the desktop's services (`dbus/tools/run_dbus_bare.sh`: stand-ins that
 leave a mark when something asks for them to be started): the session
@@ -1394,6 +1433,9 @@ widget set applications actually use, done properly, not parity.
    on the screen, the desktop's settings followed, icons, one instance,
    notifications, the tray, links. *Done on X11 and Linux's desktops; the
    Win32 and Wayland sides with their backends.*
+10. **Examples**: a settings form, a text editor, a file browser. *Done on
+   X11.* Then a toolkit-drawn frame moved and resized through the loop
+   (the rest of decorations), and the Wayland and Win32 backends.
 
 ## Not now, and deliberately
 

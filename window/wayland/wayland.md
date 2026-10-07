@@ -139,3 +139,11 @@ and it is the one with no alternative.
 1. **XML → Caustic generator**, core protocol plus xdg-shell.
 2. **`sendmsg`/`SCM_RIGHTS` and `memfd_create`** in `std/os/linux.cst`.
 3. **The backend**, on whichever transport is chosen by then.
+
+## Current state
+
+Not built yet: this note is the design. The portable window (`window/device.cst`),
+the toolkit's loop (`ui/host.cst`) and the settings portal (`window/linux/portal.cst`)
+are written so that a Wayland backend slots in beside X11's; it comes after the
+toolkit is done on X11, with client-side decorations negotiated through
+`xdg-decoration`.

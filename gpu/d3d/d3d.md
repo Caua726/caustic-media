@@ -98,3 +98,8 @@ parser exists.
 2. **COM vtable extractor** — inheritance chains and slot numbers.
 3. **DXGI**, which is small and needed by everything else here.
 4. **D3D12 backend**, following whatever Vulkan settled.
+
+## Current state
+
+Not built: the design for a Direct3D backend, which comes with the Win32 window
+backend if Vulkan on Windows does not serve.

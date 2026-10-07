@@ -120,7 +120,7 @@ putting the packer somewhere with no relationship to its own output.
 
 ---
 
-## Status
+## Current state
 
 Done, and used. `gpu/software`'s rasterizer, the X11 backend and the cube example
 all run on it. Additions come from the layers above asking rather than from a

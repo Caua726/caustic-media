@@ -92,3 +92,7 @@ controller offers beyond buttons and sticks.
 2. **A layout for one controller**, proving the shape.
 3. **The Windows counterpart**, sharing the layout tables.
 4. **Descriptor parsing**, only if generic devices turn out to matter.
+
+## Current state
+
+Not built: the design for gamepads and other HID devices read raw.

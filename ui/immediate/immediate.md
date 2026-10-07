@@ -121,3 +121,11 @@ it.
 4. **Drawing through `render/draw2d`**, once it exists, so the same widgets run
    on a GPU backend.
 5. **Text through `text/`**, which is when `font.cst` goes.
+
+## Current state
+
+A working prototype, tested, that draws through `gpu/software` with its own
+small font: the immediate-mode layer of `ui/` as this note designs it, before
+`render/`'s 2D family and `text/` existed. It is not yet moved onto them; the
+retained toolkit beside it (`ui/ui.md`) is where the work went, and the move
+comes after it (the order of work above).
