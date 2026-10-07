@@ -1,0 +1,695 @@
+// examples/text_editor.cst — a text editor, on the toolkit.
+//
+//   caustic -q examples/text_editor.cst -o build/text_editor --path .caustic/deps
+//   ./build/text_editor [file]
+//   sh window/x11/tools/run_headless.sh ./build/text_editor --check
+//
+// A program a user would keep open all day: a menu bar, the text, a status
+// bar saying where the caret is. What it shows:
+//
+//   - one instance: started again with a file, it hands the file to the one
+//     running and leaves (instance.cst);
+//   - menus with their accelerators shown, the program's shortcuts bound,
+//     Edit's items enabled as the text says they can be done (textview.can)
+//     and done through it (textview.act);
+//   - files read and written whole, the title saying which and whether it
+//     changed since;
+//   - the file chooser, to open and to save as;
+//   - a question before closing over changes not saved: save them, lose
+//     them, or stay;
+//   - the about dialog, its website opened by the desktop (open_uri.cst);
+//   - the window's size kept between runs (winstate.cst).
+//
+// --check drives it — keys and clicks through the loop, the dialogs' answers
+// given directly — on a file in build/.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../math/math.cst" as math;
+use "../window/event.cst" as wevent;
+use "../window/keys.cst" as keys;
+use "../ui/program.cst" as program;
+use "../ui/app.cst" as app;
+use "../ui/host.cst" as host;
+use "../ui/tree.cst" as tree;
+use "../ui/layout.cst" as layout;
+use "../ui/box.cst" as box;
+use "../ui/signal.cst" as signal;
+use "../ui/router.cst" as router;
+use "../ui/instance.cst" as instance;
+use "../ui/open_uri.cst" as open_uri;
+use "../ui/winstate.cst" as winstate;
+use "../ui/widgets/menubar.cst" as menubar;
+use "../ui/widgets/menu.cst" as menu;
+use "../ui/widgets/textview.cst" as textview;
+use "../ui/widgets/textedit.cst" as textedit;
+use "../ui/widgets/statusbar.cst" as statusbar;
+use "../ui/widgets/filechooser.cst" as filechooser;
+use "../ui/widgets/dialog.cst" as dialog;
+use "../ui/widgets/about.cst" as about;
+
+let is *u8 as ID with imut = "org.caustic.TextEditor";
+let is *u8 as NAME with imut = "Text Editor";
+
+// The File and Help menus' items; Edit's are textedit's own ids.
+let is i64 as NEW     with imut = 101;
+let is i64 as OPEN    with imut = 102;
+let is i64 as SAVE    with imut = 103;
+let is i64 as SAVE_AS with imut = 104;
+let is i64 as QUIT    with imut = 105;
+let is i64 as ABOUT   with imut = 201;
+
+// The answers to the question asked before closing over changes.
+let is i64 as KEEP    with imut = 1;
+let is i64 as DISCARD with imut = 2;
+let is i64 as STAY    with imut = 3;
+
+// The longest file it opens.
+let is i64 as MAX_FILE with imut = 16777216;
+
+struct Editor {
+    a          as *app.App;
+    hs         as *host.Host;
+    win        as i64;
+    t          as *tree.Tree;
+    r          as *router.Router;
+    tv         as i64;
+    status     as i64;
+    edit_items as [8]i64;     // by textedit's ids
+    path       as [4096]u8;   // "" while untitled
+    path_n     as i64;
+    changed    as i32;        // since it was read or written
+    loading    as i32;        // the text set from a file: not a change
+    closing    as i32;        // asked to close: once saved, closed
+    _pad       as i32;
+    question   as dialog.Ref; // each dialog in a window of its own
+    asking     as i32;
+    _pad2      as i32;
+    chooser    as dialog.Ref;
+    chooser_of as i64;        // the mode it was made for
+    choosing   as i64;        // OPEN or SAVE_AS while it is shown
+    about      as dialog.Ref;
+    shown_line as i64;        // what the status bar says
+    shown_col  as i64;
+    saves      as i64;
+}
+
+let is program.Program as prog with mut;
+let is Editor as ed with mut;
+let is instance.Instance as one with mut;
+let is open_uri.Request as link with mut;
+let is *u8 as buf with mut = cast(*u8, 0);
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _same(a as *u8, n as i64, b as *u8) as i32 {
+    if (n != _len(b)) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+// --- The title, the status ---
+
+fn _title() as void {
+    let is [512]u8 as s;
+    let is i64 as n with mut = 0;
+    if (ed.changed == 1) {
+        s[0] = cast(u8, 42);
+        n = 1;
+    }
+    if (ed.path_n == 0) {
+        mem.memcpy(cast(*u8, cast(i64, &s) + n), "Untitled", 8);
+        n = n + 8;
+    } else {
+        // Its name, the last part of its path.
+        let is i64 as k with mut = ed.path_n;
+        while (k > 0 && ed.path[k - 1] != 47) { k = k - 1; }
+        let is i64 as m with mut = ed.path_n - k;
+        if (m > 400) { m = 400; }
+        mem.memcpy(cast(*u8, cast(i64, &s) + n), cast(*u8, cast(i64, &ed.path) + k), m);
+        n = n + m;
+    }
+    mem.memcpy(cast(*u8, cast(i64, &s) + n), " \xe2\x80\x94 ", 5);
+    n = n + 5;
+    mem.memcpy(cast(*u8, cast(i64, &s) + n), NAME, 11);
+    n = n + 11;
+    app.set_title(ed.a, ed.win, cast(*u8, &s), n);
+}
+
+fn _digits(v as i64, to as *u8) as i64 {
+    let is [24]u8 as r;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    if (x <= 0) {
+        r[0] = cast(u8, 48);
+        n = 1;
+    }
+    while (x > 0) {
+        r[n] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        to[k] = r[n - 1 - k];
+        k = k + 1;
+    }
+    return n;
+}
+
+// The caret's line and column, counted from 1, a column a character.
+fn _where(line as *i64, col as *i64) as void {
+    let is *u8 as s = textview.text(ed.t, ed.tv);
+    let is i64 as at = textview.caret(ed.t, ed.tv);
+    *line = textview.paragraph_of(ed.t, ed.tv, at) + 1;
+    let is i64 as k with mut = at;
+    while (k > 0 && s[k - 1] != 10) { k = k - 1; }
+    let is i64 as c with mut = 1;
+    while (k < at) {
+        k = k + textedit.seq(cast(i64, s[k]));
+        c = c + 1;
+    }
+    *col = c;
+}
+
+// Once a round: what the status bar and the Edit menu say, as the text is.
+fn _round(user as *u8) as void {
+    if (tree.is_valid(ed.t, ed.tv) == 0) { return; }
+    let is i64 as line with mut = 0;
+    let is i64 as col with mut = 0;
+    _where(&line, &col);
+    if (line != ed.shown_line || col != ed.shown_col) {
+        ed.shown_line = line;
+        ed.shown_col = col;
+        let is [64]u8 as s;
+        mem.memcpy(cast(*u8, &s), "Line ", 5);
+        let is i64 as n with mut = 5 + _digits(line, cast(*u8, cast(i64, &s) + 5));
+        mem.memcpy(cast(*u8, cast(i64, &s) + n), ", Column ", 9);
+        n = n + 9;
+        n = n + _digits(col, cast(*u8, cast(i64, &s) + n));
+        statusbar.pop(ed.t, ed.status, 1);
+        statusbar.push(ed.t, ed.status, 1, cast(*u8, &s), n);
+    }
+    let is i64 as id with mut = textedit.UNDO;
+    while (id <= textedit.SELECT_ALL) {
+        let is i32 as on = textview.can(ed.t, ed.tv, id);
+        if (ed.edit_items[id] != 0 && tree.is_enabled(ed.t, ed.edit_items[id]) != on) { tree.set_enabled(ed.t, ed.edit_items[id], on); }
+        id = id + 1;
+    }
+}
+
+// --- Files ---
+
+// path (n bytes) read into the text: 1, or 0 when it could not be.
+fn read_file(path as *u8, n as i64) as i32 {
+    if (n <= 0 || n > 4095) { return 0; }
+    let is [4096]u8 as p;
+    mem.memcpy(cast(*u8, &p), path, n);
+    p[n] = cast(u8, 0);
+    let is i64 as fd = linux.open(cast(*u8, &p), 0, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as got with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && got < MAX_FILE) {
+        r = linux.read(fd, cast(*u8, cast(i64, buf) + got), MAX_FILE - got);
+        if (r > 0) { got = got + r; }
+    }
+    linux.close(fd);
+    ed.loading = 1;
+    textview.set_text(ed.t, ed.tv, buf, got);
+    ed.loading = 0;
+    textview.select(ed.t, ed.tv, 0, 0);
+    mem.memcpy(cast(*u8, &ed.path), path, n);
+    ed.path_n = n;
+    ed.changed = 0;
+    _title();
+    return 1;
+}
+
+// The text written to the file at its path, whole under another name and
+// moved over it: 1, or 0 when it could not be.
+fn write_file() as i32 {
+    if (ed.path_n == 0 || ed.path_n > 4090) { return 0; }
+    let is [4100]u8 as tmp;
+    mem.memcpy(cast(*u8, &tmp), cast(*u8, &ed.path), ed.path_n);
+    mem.memcpy(cast(*u8, cast(i64, &tmp) + ed.path_n), ".new", 5);
+    let is i64 as fd = linux.open(cast(*u8, &tmp), 577, 420);
+    if (fd < 0) { return 0; }
+    let is i64 as n = textview.length(ed.t, ed.tv);
+    let is *u8 as s = textview.text(ed.t, ed.tv);
+    let is i64 as done with mut = 0;
+    let is i64 as w with mut = 1;
+    while (w > 0 && done < n) {
+        w = linux.write(fd, cast(*u8, cast(i64, s) + done), n - done);
+        if (w > 0) { done = done + w; }
+    }
+    linux.close(fd);
+    if (done != n) { return 0; }
+    let is [4096]u8 as p;
+    mem.memcpy(cast(*u8, &p), cast(*u8, &ed.path), ed.path_n);
+    p[ed.path_n] = cast(u8, 0);
+    if (linux.rename(cast(*u8, &tmp), cast(*u8, &p)) != 0) { return 0; }
+    ed.changed = 0;
+    ed.saves = ed.saves + 1;
+    _title();
+    return 1;
+}
+
+fn _edited(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    if (ed.loading == 1 || ed.changed == 1) { return; }
+    ed.changed = 1;
+    _title();
+}
+
+// --- The chooser, the question, the about dialog ---
+
+fn _chosen(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is i64 as answer = *cast(*i64, arg);
+    let is i64 as was = ed.choosing;
+    ed.choosing = 0;
+    if (answer != dialog.OK) {
+        ed.closing = 0;
+        return;
+    }
+    let is [4096]u8 as p;
+    let is i64 as n = filechooser.chosen(t, w, cast(*u8, &p), 4095);
+    if (n == 0) { return; }
+    if (was == OPEN) {
+        read_file(cast(*u8, &p), n);
+        return;
+    }
+    mem.memcpy(cast(*u8, &ed.path), cast(*u8, &p), n);
+    ed.path_n = n;
+    if (write_file() == 1 && ed.closing == 1) { app.window_close(ed.a, ed.win); }
+}
+
+// The chooser shown, to open or to save as; one of the other mode let go.
+fn choose(what as i64) as void {
+    if (dialog.ref_valid(&ed.chooser) == 1 && ed.chooser_of != what) { dialog.dispose(&ed.chooser); }
+    if (dialog.ref_valid(&ed.chooser) == 0) {
+        let is *tree.Tree as dt = dialog.window_tree(ed.t);
+        let is i32 as mode with mut = filechooser.OPEN;
+        let is *u8 as title with mut = "Open";
+        if (what == SAVE_AS) {
+            mode = filechooser.SAVE;
+            title = "Save As";
+        }
+        let is i64 as fc = filechooser.create(dt, mode, title, _len(title));
+        filechooser.add_filter(dt, fc, "Text files", 10, "*.txt\0*.md\0*.cst", 16);
+        filechooser.add_filter(dt, fc, "All files", 9, "*", 1);
+        signal.connect(dt, fc, signal.ACTIVATED, fn_ptr(_chosen), cast(*u8, 0));
+        ed.chooser = dialog.ref(dt, fc);
+        ed.chooser_of = what;
+    }
+    ed.choosing = what;
+    dialog.show(ed.chooser.t, cast(*router.Router, tree.router(ed.chooser.t)), ed.chooser.w, 1);
+}
+
+fn save() as void {
+    if (ed.path_n == 0) {
+        choose(SAVE_AS);
+        return;
+    }
+    write_file();
+}
+
+fn _answered(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is i64 as answer = *cast(*i64, arg);
+    ed.asking = 0;
+    if (answer == KEEP) {
+        ed.closing = 1;
+        save();
+        if (ed.changed == 0) { app.window_close(ed.a, ed.win); }
+        return;
+    }
+    if (answer == DISCARD) { app.window_close(ed.a, ed.win); }
+}
+
+// Asked to close: at once with nothing to lose; else asked first.
+fn on_close(user as *u8, h as i64) as i32 {
+    if (h != ed.win || ed.changed == 0) { return 1; }
+    if (ed.asking == 1) { return 0; }
+    if (dialog.ref_valid(&ed.question) == 0) {
+        let is *tree.Tree as dt = dialog.window_tree(ed.t);
+        let is *u8 as say = "Changes not saved are lost.";
+        let is i64 as q = dialog.message(dt, dialog.QUESTION, "Save the changes before closing?", 32, say, _len(say), dialog.CLOSE_ONLY);
+        let is i64 as close_b = dialog.button_for(dt, q, dialog.CLOSE);
+        if (close_b != 0) { tree.destroy(dt, close_b); }
+        dialog.add_button(dt, q, "Close _without saving", 21, DISCARD);
+        dialog.add_button(dt, q, "_Cancel", 7, STAY);
+        dialog.add_button(dt, q, "_Save", 5, KEEP);
+        dialog.set_default_response(dt, q, KEEP);
+        signal.connect(dt, q, signal.ACTIVATED, fn_ptr(_answered), cast(*u8, 0));
+        ed.question = dialog.ref(dt, q);
+    }
+    ed.asking = 1;
+    dialog.show(ed.question.t, cast(*router.Router, tree.router(ed.question.t)), ed.question.w, 1);
+    return 0;
+}
+
+fn _website(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is *u8 as uri = arg;
+    open_uri.open(&link, program.conn(&prog), uri, _len(uri), "", 0);
+}
+
+fn show_about() as void {
+    if (dialog.ref_valid(&ed.about) == 0) {
+        let is *tree.Tree as dt = dialog.window_tree(ed.t);
+        let is i64 as ab = about.create(dt, NAME, 11);
+        about.set_version(dt, ab, "1.0", 3);
+        about.set_comments(dt, ab, "Plain text, on the caustic-media toolkit.", 41);
+        about.set_website(dt, ab, "https://github.com/Caua726/caustic-media", "caustic-media", 13);
+        about.set_copyright(dt, ab, "The caustic-media authors", 25);
+        signal.connect(dt, about.website_link(dt, ab), signal.ACTIVATED, fn_ptr(_website), cast(*u8, 0));
+        ed.about = dialog.ref(dt, ab);
+    }
+    dialog.show(ed.about.t, cast(*router.Router, tree.router(ed.about.t)), ed.about.w, 0);
+}
+
+// --- The menus and the shortcuts ---
+
+fn act(id as i64) as void {
+    if (id == NEW) {
+        ed.loading = 1;
+        textview.set_text(ed.t, ed.tv, "", 0);
+        ed.loading = 0;
+        ed.path_n = 0;
+        ed.changed = 0;
+        _title();
+    } else if (id == OPEN) {
+        choose(OPEN);
+    } else if (id == SAVE) {
+        save();
+    } else if (id == SAVE_AS) {
+        choose(SAVE_AS);
+    } else if (id == QUIT) {
+        if (on_close(cast(*u8, 0), ed.win) == 1) { app.window_close(ed.a, ed.win); }
+    } else if (id == ABOUT) {
+        show_about();
+    } else {
+        textview.act(ed.t, ed.tv, id);
+    }
+}
+
+fn _menu_chosen(t as *tree.Tree, m as i64, arg as *u8, user as *u8) as void { act(*cast(*i64, arg)); }
+
+fn _key_new(user as *u8) as void { act(NEW); }
+fn _key_open(user as *u8) as void { act(OPEN); }
+fn _key_save(user as *u8) as void { act(SAVE); }
+fn _key_save_as(user as *u8) as void { act(SAVE_AS); }
+fn _key_quit(user as *u8) as void { act(QUIT); }
+
+fn _item(m as i64, s as *u8, id as i64, k as i32, mods as i32) as i64 {
+    let is i64 as it = menu.add_item(ed.t, m, s, _len(s), id);
+    if (k != 0) { menu.set_accel(ed.t, it, k, mods); }
+    return it;
+}
+
+fn build() as void {
+    let is *tree.Tree as t = ed.t;
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    let is i64 as bar = menubar.create(t, col);
+    let is i64 as file_m = menu.create(t);
+    _item(file_m, "_New", NEW, keys.N, keys.MOD_CONTROL);
+    _item(file_m, "_Open\xe2\x80\xa6", OPEN, keys.O, keys.MOD_CONTROL);
+    _item(file_m, "_Save", SAVE, keys.S, keys.MOD_CONTROL);
+    _item(file_m, "Save _As\xe2\x80\xa6", SAVE_AS, keys.S, keys.MOD_CONTROL | keys.MOD_SHIFT);
+    menu.add_separator(t, file_m);
+    _item(file_m, "_Quit", QUIT, keys.Q, keys.MOD_CONTROL);
+    let is i64 as edit_m = menu.create(t);
+    ed.edit_items[textedit.UNDO] = _item(edit_m, "_Undo", textedit.UNDO, keys.Z, keys.MOD_CONTROL);
+    ed.edit_items[textedit.REDO] = _item(edit_m, "_Redo", textedit.REDO, keys.Z, keys.MOD_CONTROL | keys.MOD_SHIFT);
+    menu.add_separator(t, edit_m);
+    ed.edit_items[textedit.CUT] = _item(edit_m, "Cu_t", textedit.CUT, keys.X, keys.MOD_CONTROL);
+    ed.edit_items[textedit.COPY] = _item(edit_m, "_Copy", textedit.COPY, keys.C, keys.MOD_CONTROL);
+    ed.edit_items[textedit.PASTE] = _item(edit_m, "_Paste", textedit.PASTE, keys.V, keys.MOD_CONTROL);
+    ed.edit_items[textedit.DELETE] = _item(edit_m, "_Delete", textedit.DELETE, 0, 0);
+    menu.add_separator(t, edit_m);
+    ed.edit_items[textedit.SELECT_ALL] = _item(edit_m, "Select _All", textedit.SELECT_ALL, keys.A, keys.MOD_CONTROL);
+    let is i64 as help_m = menu.create(t);
+    _item(help_m, "_About", ABOUT, 0, 0);
+    menubar.add(t, bar, "_File", 5, file_m);
+    menubar.add(t, bar, "_Edit", 5, edit_m);
+    menubar.add(t, bar, "_Help", 5, help_m);
+    menubar.bind(t, ed.r, bar);
+    signal.connect(t, file_m, signal.ACTIVATED, fn_ptr(_menu_chosen), cast(*u8, 0));
+    signal.connect(t, edit_m, signal.ACTIVATED, fn_ptr(_menu_chosen), cast(*u8, 0));
+    signal.connect(t, help_m, signal.ACTIVATED, fn_ptr(_menu_chosen), cast(*u8, 0));
+    ed.tv = textview.create(t, col);
+    layout.set_stretch(t, ed.tv, 1.0, 1.0);
+    textview.set_accepts_tab(t, ed.tv, 1);
+    signal.connect(t, ed.tv, signal.CHANGED, fn_ptr(_edited), cast(*u8, 0));
+    ed.status = statusbar.create(t, col);
+    router.add_shortcut(ed.r, keys.N, keys.MOD_CONTROL, fn_ptr(_key_new), cast(*u8, 0));
+    router.add_shortcut(ed.r, keys.O, keys.MOD_CONTROL, fn_ptr(_key_open), cast(*u8, 0));
+    router.add_shortcut(ed.r, keys.S, keys.MOD_CONTROL, fn_ptr(_key_save), cast(*u8, 0));
+    router.add_shortcut(ed.r, keys.S, keys.MOD_CONTROL | keys.MOD_SHIFT, fn_ptr(_key_save_as), cast(*u8, 0));
+    router.add_shortcut(ed.r, keys.Q, keys.MOD_CONTROL, fn_ptr(_key_quit), cast(*u8, 0));
+    router.focus(t, ed.r, ed.tv, 0);
+}
+
+// --- Another start's ---
+
+fn _activated(user as *u8) as void { host.present(ed.hs, ed.win); }
+
+// Files another start was asked to open: the first, when nothing would be
+// lost.
+fn _opened(user as *u8, s as *u8, n as i64, count as i64) as void {
+    if (count < 1 || ed.changed == 1) { return; }
+    let is i64 as k with mut = 0;
+    while (k < n && s[k] != 0) { k = k + 1; }
+    let is [4097]u8 as p;
+    let is i64 as pn = open_uri.local_path(s, k, cast(*u8, &p));
+    if (pn > 0) { read_file(cast(*u8, &p), pn); }
+}
+
+// A path given on the command line as a file URI: its length in out.
+fn _as_uri(path as *u8, out as *u8) as i64 {
+    let is i64 as n = _len(path);
+    let is i64 as k with mut = 7;
+    mem.memcpy(out, "file://", 7);
+    if (n > 0 && path[0] != 47) {
+        let is i64 as got = linux.getcwd(cast(*u8, cast(i64, out) + 7), 3000);
+        if (got > 0) {
+            k = 7 + _len(cast(*u8, cast(i64, out) + 7));
+            out[k] = cast(u8, 47);
+            k = k + 1;
+        }
+    }
+    let is i64 as i with mut = 0;
+    let is *u8 as hex = "0123456789ABCDEF";
+    while (i < n && k < 4090) {
+        let is u8 as c = path[i];
+        let is i32 as plain = cast(i32, (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 47 ||
+                                       c == 45 || c == 46 || c == 95 || c == 126);
+        if (plain == 1) {
+            out[k] = c;
+            k = k + 1;
+        } else {
+            out[k] = cast(u8, 37);
+            out[k + 1] = hex[cast(i64, c) / 16];
+            out[k + 2] = hex[cast(i64, c) % 16];
+            k = k + 3;
+        }
+        i = i + 1;
+    }
+    return k;
+}
+
+// --- Driven, as a user would ---
+
+let is i32 as fails with mut = 0;
+
+fn expect(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn rounds(n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        host.step(ed.hs, 20);
+        k = k + 1;
+    }
+}
+
+fn key(k as i32, mods as i32, text as *u8, n as i64) as void {
+    let is wevent.Event as e;
+    wevent.clear(&e);
+    e.kind = wevent.KEY_DOWN;
+    e.key = k;
+    e.keycode = 38;
+    e.modifiers = mods;
+    e.text = text;
+    e.text_len = n;
+    host.feed(ed.hs, ed.win, &e, time.now_ms());
+    e.kind = wevent.KEY_UP;
+    e.text_len = 0;
+    host.feed(ed.hs, ed.win, &e, time.now_ms());
+    rounds(1);
+}
+
+fn type_in(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        key(cast(i32, s[i]), 0, cast(*u8, cast(i64, s) + i), 1);
+        i = i + 1;
+    }
+}
+
+fn holds(s as *u8) as i32 { return _same(textview.text(ed.t, ed.tv), textview.length(ed.t, ed.tv), s); }
+
+fn title_is(s as *u8) as i32 { return _same(app.title(ed.a, ed.win), app.title_length(ed.a, ed.win), s); }
+
+fn file_is(path as *u8, s as *u8) as i32 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return 0; }
+    let is [256]u8 as b;
+    let is i64 as n = linux.read(fd, cast(*u8, &b), 256);
+    linux.close(fd);
+    return _same(cast(*u8, &b), n, s);
+}
+
+fn status_is(s as *u8) as i32 {
+    return _same(statusbar.message(ed.t, ed.status), statusbar.message_length(ed.t, ed.status), s);
+}
+
+fn drive() as void {
+    rounds(6);
+    expect("on the screen", host.shown(ed.hs) == 1);
+    expect("the file read, its name the title's", holds("first line\nsecond") == 1 &&
+           title_is("editor_check.txt \xe2\x80\x94 Text Editor") == 1);
+    expect("the caret at the start", status_is("Line 1, Column 1") == 1);
+    type_in("Hi ");
+    expect("typed: changed, the title says so", holds("Hi first line\nsecond") == 1 &&
+           title_is("*editor_check.txt \xe2\x80\x94 Text Editor") == 1);
+    rounds(1);
+    expect("the caret's place said", status_is("Line 1, Column 4") == 1);
+    expect("Edit: undo, no cut with nothing chosen", tree.is_enabled(ed.t, ed.edit_items[textedit.UNDO]) == 1 &&
+           tree.is_enabled(ed.t, ed.edit_items[textedit.CUT]) == 0);
+    act(textedit.UNDO);
+    expect("undone through the menu's action", holds("first line\nsecond") == 1);
+    act(textedit.REDO);
+    expect("redone", holds("Hi first line\nsecond") == 1);
+    act(textedit.SELECT_ALL);
+    rounds(1);
+    expect("all chosen: cut and copy can be", tree.is_enabled(ed.t, ed.edit_items[textedit.CUT]) == 1 &&
+           tree.is_enabled(ed.t, ed.edit_items[textedit.COPY]) == 1);
+    textview.select(ed.t, ed.tv, 3, 3);
+    key(keys.S, keys.MOD_CONTROL, "", 0);
+    expect("Ctrl+S: written, no longer changed", ed.saves == 1 && file_is("build/editor_check.txt", "Hi first line\nsecond") == 1 &&
+           title_is("editor_check.txt \xe2\x80\x94 Text Editor") == 1);
+    key(keys.RETURN, 0, "\n", 1);
+    rounds(1);
+    expect("a line more: where the caret is", status_is("Line 2, Column 1") == 1);
+    // Save As: the chooser, a name typed in build/, its answer given.
+    act(SAVE_AS);
+    rounds(2);
+    expect("save as: the chooser shown", dialog.ref_valid(&ed.chooser) == 1 && dialog.is_shown(ed.chooser.t, ed.chooser.w) == 1);
+    let is [4096]u8 as cwd;
+    linux.getcwd(cast(*u8, &cwd), 4000);
+    let is i64 as cn with mut = _len(cast(*u8, &cwd));
+    mem.memcpy(cast(*u8, cast(i64, &cwd) + cn), "/build", 6);
+    cn = cn + 6;
+    filechooser.set_folder(ed.chooser.t, ed.chooser.w, cast(*u8, &cwd), cn);
+    filechooser.set_name(ed.chooser.t, ed.chooser.w, "editor_check_as.txt", 19);
+    linux.unlink("build/editor_check_as.txt");
+    dialog.respond(ed.chooser.t, ed.chooser.w, dialog.OK);
+    rounds(2);
+    expect("saved as another: written there, the title its name", ed.saves == 2 &&
+           file_is("build/editor_check_as.txt", "Hi \nfirst line\nsecond") == 1 &&
+           title_is("editor_check_as.txt \xe2\x80\x94 Text Editor") == 1);
+    show_about();
+    rounds(2);
+    expect("its about dialog", dialog.ref_valid(&ed.about) == 1 && dialog.is_shown(ed.about.t, ed.about.w) == 1);
+    dialog.respond(ed.about.t, ed.about.w, dialog.CLOSE);
+    rounds(2);
+    // Closed over a change: asked; told to stay, then to lose it.
+    type_in("x");
+    let is wevent.Event as e;
+    wevent.clear(&e);
+    e.kind = wevent.CLOSE;
+    host.feed(ed.hs, ed.win, &e, time.now_ms());
+    rounds(2);
+    expect("closed over a change: asked", ed.asking == 1 && dialog.is_shown(ed.question.t, ed.question.w) == 1);
+    dialog.respond(ed.question.t, ed.question.w, STAY);
+    rounds(2);
+    expect("told to stay: still there", app.window_valid(ed.a, ed.win) == 1 && ed.asking == 0);
+    act(QUIT);
+    rounds(2);
+    expect("quit over a change: asked again", ed.asking == 1 && dialog.is_shown(ed.question.t, ed.question.w) == 1);
+    dialog.respond(ed.question.t, ed.question.w, DISCARD);
+    rounds(4);
+    expect("told to lose it: closed, the file as it was", host.shown(ed.hs) == 0 &&
+           file_is("build/editor_check_as.txt", "Hi \nfirst line\nsecond") == 1);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i32 as checking = cast(i32, env.argc() > 1 && _same(env.argv(1), _len(env.argv(1)), "--check") == 1);
+    if (program.open(&prog, cast(*u8, 0)) == 0) {
+        io.printf("text editor: no fonts on this system\n");
+        return 1;
+    }
+    let is *u8 as file with mut = cast(*u8, 0);
+    if (checking == 1) {
+        let is i64 as fd = linux.open("build/editor_check.txt", 577, 420);
+        linux.write(fd, "first line\nsecond", 17);
+        linux.close(fd);
+        file = "build/editor_check.txt";
+    } else if (env.argc() > 1) {
+        file = env.argv(1);
+    }
+    // One instance: another running is handed the file, and this one leaves.
+    if (checking == 0 && cast(i64, program.conn(&prog)) != 0) {
+        if (instance.claim(&one, program.conn(&prog), ID, _len(ID), fn_ptr(_activated), fn_ptr(_opened),
+                           cast(instance.ActionFn, 0), cast(*u8, 0)) == 0) {
+            if (cast(i64, file) != 0) {
+                let is [4096]u8 as uri;
+                let is i64 as un = _as_uri(file, cast(*u8, &uri));
+                instance.open_remote(program.conn(&prog), ID, _len(ID), cast(*u8, &uri), un, 1);
+            } else {
+                instance.activate_remote(program.conn(&prog), ID, _len(ID));
+            }
+            program.close(&prog);
+            return 0;
+        }
+    }
+    buf = mem.core.mmap_anon(MAX_FILE);
+    ed.a = program.app(&prog);
+    ed.hs = program.host(&prog);
+    let is winstate.State as st with mut = winstate.state(720.0, 480.0);
+    if (checking == 0) { winstate.load("caustic-text-editor", 19, "main", 4, &st); }
+    ed.win = app.window_open(ed.a, st.width, st.height);
+    ed.t = app.tree(ed.a, ed.win);
+    ed.r = app.router(ed.a, ed.win);
+    build();
+    _title();
+    if (cast(i64, file) != 0) { read_file(file, _len(file)); }
+    host.set_on_close(ed.hs, fn_ptr(on_close), cast(*u8, 0));
+    host.every_round(ed.hs, fn_ptr(_round), cast(*u8, 0));
+    if (checking == 1) {
+        drive();
+    } else {
+        program.run(&prog);
+        st.width = app.width(ed.a, ed.win);
+        st.height = app.height(ed.a, ed.win);
+        winstate.save("caustic-text-editor", 19, "main", 4, &st);
+    }
+    instance.release(&one);
+    program.close(&prog);
+    if (checking == 0) { return 0; }
+    if (fails == 0) {
+        io.printf("text editor: all checks passed\n");
+        return 0;
+    }
+    io.printf("text editor: %d failures\n", fails);
+    return 1;
+}

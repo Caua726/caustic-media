@@ -1,0 +1,683 @@
+// examples/file_browser.cst — a file browser, on the toolkit.
+//
+//   caustic -q examples/file_browser.cst -o build/file_browser --path .caustic/deps
+//   ./build/file_browser [folder]
+//   sh window/x11/tools/run_headless.sh ./build/file_browser --check
+//
+// Folders on one side as a tree, opened as they are asked for; the folder
+// chosen on the other as a table — name, size, when it changed; above them,
+// buttons and the path, which can be typed. What it shows:
+//
+//   - a tree model of the program's own, its branches read only when opened
+//     (model.cst's tree entries, flatten.cst through treeview);
+//   - a table over a folder (dirmodel.cst), its rows activated to go in or
+//     to open a file in the desktop's program for it (open_uri.cst);
+//   - a splitter between them, a toolbar, an entry, a status bar;
+//   - menus with a check item (hidden files shown or not) and the window's
+//     shortcuts: Alt+Up, Ctrl+L, Ctrl+H;
+//   - a message box when a folder cannot be read, the about dialog.
+//
+// --check drives it over a folder made in build/, the file it opens handed
+// to a stand-in xdg-open (ui/testdata/bin, first on the path).
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../window/event.cst" as wevent;
+use "../window/keys.cst" as keys;
+use "../ui/program.cst" as program;
+use "../ui/app.cst" as app;
+use "../ui/host.cst" as host;
+use "../ui/tree.cst" as tree;
+use "../ui/layout.cst" as layout;
+use "../ui/box.cst" as box;
+use "../ui/splitter.cst" as splitter;
+use "../ui/signal.cst" as signal;
+use "../ui/router.cst" as router;
+use "../ui/model.cst" as model;
+use "../ui/flatten.cst" as flatten;
+use "../ui/dirmodel.cst" as dirmodel;
+use "../ui/open_uri.cst" as open_uri;
+use "../ui/widgets/menubar.cst" as menubar;
+use "../ui/widgets/menu.cst" as menu;
+use "../ui/widgets/toolbar.cst" as toolbar;
+use "../ui/widgets/entry.cst" as entry;
+use "../ui/widgets/listview.cst" as listview;
+use "../ui/widgets/tableview.cst" as tableview;
+use "../ui/widgets/treeview.cst" as treeview;
+use "../ui/widgets/statusbar.cst" as statusbar;
+use "../ui/widgets/dialog.cst" as dialog;
+use "../ui/widgets/about.cst" as about;
+
+let is *u8 as NAME with imut = "Files";
+
+// The menus' items.
+let is i64 as OPEN_ITEM with imut = 1;
+let is i64 as QUIT      with imut = 2;
+let is i64 as UP        with imut = 3;
+let is i64 as HOME      with imut = 4;
+let is i64 as HIDDEN    with imut = 5;
+let is i64 as ABOUT     with imut = 6;
+
+// --- The folders, as a tree model of the program's own ---
+//
+// A node a folder: its path in the pool, its parent, and its children —
+// read when it is first opened, made nodes one after another, so a child's
+// place among them is its id less the first's.
+
+let is i64 as MAX_NODES with imut = 16384;
+let is i64 as POOL      with imut = 4194304;
+
+struct Node {
+    off    as i64;   // its path in the pool
+    len    as i64;
+    parent as i64;   // 0 for the root
+    first  as i64;   // its first child's id
+    n      as i64;   // how many children
+    loaded as i32;   // its children read
+    _pad   as i32;
+}
+
+struct Folders {
+    nodes as *Node;   // ids from 1
+    count as i64;
+    pool  as *u8;
+    used  as i64;
+    m     as model.Model;
+}
+
+let is Folders as fo with mut;
+
+fn _node(id as i64) as *Node { return cast(*Node, cast(i64, fo.nodes) + id * sizeof(Node)); }
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _same(a as *u8, n as i64, b as *u8) as i32 {
+    if (n != _len(b)) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+// A node for the folder at p (n bytes) under parent: its id, 0 with no room.
+fn _new_node(parent as i64, p as *u8, n as i64) as i64 {
+    if (fo.count + 1 >= MAX_NODES || fo.used + n > POOL) { return 0; }
+    fo.count = fo.count + 1;
+    let is *Node as d = _node(fo.count);
+    mem.memcpy(cast(*u8, cast(i64, fo.pool) + fo.used), p, n);
+    d.off = fo.used;
+    d.len = n;
+    fo.used = fo.used + n;
+    d.parent = parent;
+    d.first = 0;
+    d.n = 0;
+    d.loaded = 0;
+    return fo.count;
+}
+
+fn _path_of(id as i64) as *u8 { return cast(*u8, cast(i64, fo.pool) + _node(id).off); }
+
+// A folder's children read, its folders alone, hidden ones too.
+fn _load(id as i64) as void {
+    let is *Node as d = _node(id);
+    if (d.loaded == 1) { return; }
+    d.loaded = 1;
+    let is *dirmodel.Dir as dir = dirmodel.open(_path_of(id), d.len);
+    if (cast(i64, dir) == 0) { return; }
+    dirmodel.set_folders_only(dir, 1);
+    dirmodel.reload(dir);
+    let is i64 as k with mut = 0;
+    while (k < dirmodel.count(dir)) {
+        let is [4096]u8 as p;
+        let is i64 as pn = dirmodel.full_path(dir, k, cast(*u8, &p), 4096);
+        let is i64 as c = _new_node(id, cast(*u8, &p), pn);
+        if (c == 0) { k = dirmodel.count(dir); } else {
+            if (_node(id).n == 0) { _node(id).first = c; }
+            _node(id).n = _node(id).n + 1;
+            k = k + 1;
+        }
+    }
+    dirmodel.close(dir);
+}
+
+fn f_count(self as *u8, parent as i64) as i64 {
+    if (parent == 0) { return cast(i64, fo.count > 0); }
+    if (parent < 1 || parent > fo.count) { return 0; }
+    _load(parent);
+    return _node(parent).n;
+}
+
+fn f_row_id(self as *u8, parent as i64, index as i64) as i64 {
+    if (parent == 0) {
+        if (index == 0 && fo.count > 0) { return 1; }
+        return 0;
+    }
+    if (parent > fo.count || index < 0 || index >= f_count(self, parent)) { return 0; }
+    return _node(parent).first + index;
+}
+
+fn f_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    if (id < 1 || id > fo.count || column != 0 || role != model.TEXT) { return 0; }
+    let is *Node as d = _node(id);
+    let is *u8 as p = _path_of(id);
+    if (d.parent == 0) {
+        *out = model.text(p, d.len);
+        return 1;
+    }
+    // Its own name: the path's last part.
+    let is i64 as k with mut = d.len;
+    while (k > 0 && p[k - 1] != 47) { k = k - 1; }
+    *out = model.text(cast(*u8, cast(i64, p) + k), d.len - k);
+    return 1;
+}
+
+fn f_parent_of(self as *u8, id as i64) as i64 {
+    if (id < 1 || id > fo.count) { return 0; }
+    return _node(id).parent;
+}
+
+fn f_index_of(self as *u8, id as i64) as i64 {
+    if (id < 1 || id > fo.count) { return 0 - 1; }
+    let is i64 as parent = _node(id).parent;
+    if (parent == 0) { return 0; }
+    return id - _node(parent).first;
+}
+
+// Whether it may have children: yes until they are read.
+fn f_has_children(self as *u8, id as i64) as i64 {
+    if (id < 1 || id > fo.count) { return 0; }
+    if (_node(id).loaded == 0) { return 1; }
+    return cast(i64, _node(id).n > 0);
+}
+
+// --- The window ---
+
+struct Browser {
+    a       as *app.App;
+    hs      as *host.Host;
+    win     as i64;
+    t       as *tree.Tree;
+    r       as *router.Router;
+    dir     as *dirmodel.Dir;
+    folders as i64;   // the tree view
+    table   as i64;
+    list    as i64;   // the table's list
+    path    as i64;   // the entry
+    status  as i64;
+    hidden_item as i64;
+    hidden  as i32;
+    _pad    as i32;
+    problem as dialog.Ref;
+    about   as dialog.Ref;
+    opened  as i64;   // files handed to the desktop
+}
+
+let is program.Program as prog with mut;
+let is Browser as br with mut;
+let is open_uri.Request as link with mut;
+
+fn _digits(v as i64, to as *u8) as i64 {
+    let is [24]u8 as r;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    if (x <= 0) {
+        r[0] = cast(u8, 48);
+        n = 1;
+    }
+    while (x > 0) {
+        r[n] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        to[k] = r[n - 1 - k];
+        k = k + 1;
+    }
+    return n;
+}
+
+// What is shown of the folder: its path in the entry and the title, how many
+// in the status bar.
+fn _shown() as void {
+    let is *u8 as p = dirmodel.path(br.dir);
+    let is i64 as n = dirmodel.path_length(br.dir);
+    entry.set_text(br.t, br.path, p, n);
+    let is [512]u8 as title;
+    let is i64 as k with mut = n;
+    while (k > 1 && p[k - 1] != 47) { k = k - 1; }
+    let is i64 as m with mut = n - k;
+    if (m <= 0) {
+        k = 0;
+        m = n;
+    }
+    if (m > 400) { m = 400; }
+    mem.memcpy(cast(*u8, &title), cast(*u8, cast(i64, p) + k), m);
+    mem.memcpy(cast(*u8, cast(i64, &title) + m), " \xe2\x80\x94 Files", 10);
+    app.set_title(br.a, br.win, cast(*u8, &title), m + 10);
+    let is [64]u8 as s;
+    let is i64 as c = dirmodel.count(br.dir);
+    let is i64 as sn with mut = _digits(c, cast(*u8, &s));
+    if (c == 1) {
+        mem.memcpy(cast(*u8, cast(i64, &s) + sn), " item", 5);
+        sn = sn + 5;
+    } else {
+        mem.memcpy(cast(*u8, cast(i64, &s) + sn), " items", 6);
+        sn = sn + 6;
+    }
+    statusbar.pop(br.t, br.status, 1);
+    statusbar.push(br.t, br.status, 1, cast(*u8, &s), sn);
+}
+
+fn tell(title as *u8, say as *u8) as void {
+    if (dialog.ref_valid(&br.problem) == 1) { dialog.dispose(&br.problem); }
+    let is *tree.Tree as dt = dialog.window_tree(br.t);
+    let is i64 as w = dialog.message(dt, dialog.ERROR, title, _len(title), say, _len(say), dialog.OK_ONLY);
+    br.problem = dialog.ref(dt, w);
+    dialog.show(dt, cast(*router.Router, tree.router(dt)), w, 1);
+}
+
+// The folder at p (n bytes) shown: 1, or 0 — told so — when it cannot be read.
+fn go(p as *u8, n as i64) as i32 {
+    let is [4097]u8 as z;
+    if (n <= 0 || n > 4096) { return 0; }
+    mem.memcpy(cast(*u8, &z), p, n);
+    z[n] = cast(u8, 0);
+    let is i64 as fd = linux.open(cast(*u8, &z), 65536, 0);
+    if (fd < 0) {
+        tell("This folder cannot be opened", "It is not there, or it is not yours to read.");
+        _shown();
+        return 0;
+    }
+    linux.close(fd);
+    if (dirmodel.set_path(br.dir, p, n) == 0) { return 0; }
+    _shown();
+    return 1;
+}
+
+fn up() as void {
+    if (dirmodel.up(br.dir) == 1) { _shown(); }
+}
+
+fn home() as void {
+    let is *u8 as h = env.getenv("HOME");
+    if (cast(i64, h) != 0) { go(h, _len(h)); }
+}
+
+fn set_hidden(on as i32) as void {
+    br.hidden = on;
+    dirmodel.set_hidden(br.dir, on);
+    dirmodel.reload(br.dir);
+    menu.set_checked(br.t, br.hidden_item, on);
+    _shown();
+}
+
+// Row i of the table: a folder gone into; a file opened by the desktop.
+fn activate(i as i64) as void {
+    if (i < 0 || i >= dirmodel.count(br.dir)) { return; }
+    let is [4096]u8 as p;
+    let is i64 as n = dirmodel.full_path(br.dir, i, cast(*u8, &p), 4096);
+    if (dirmodel.is_dir(br.dir, i) == 1) {
+        go(cast(*u8, &p), n);
+        return;
+    }
+    // As a file link, its bytes escaped where a URI needs them.
+    let is [8200]u8 as uri;
+    mem.memcpy(cast(*u8, &uri), "file://", 7);
+    let is i64 as k with mut = 7;
+    let is *u8 as hex = "0123456789ABCDEF";
+    let is i64 as j with mut = 0;
+    while (j < n) {
+        let is u8 as c = p[j];
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 47 || c == 45 || c == 46 || c == 95 ||
+            c == 126) {
+            uri[k] = c;
+            k = k + 1;
+        } else {
+            uri[k] = cast(u8, 37);
+            uri[k + 1] = hex[cast(i64, c) / 16];
+            uri[k + 2] = hex[cast(i64, c) % 16];
+            k = k + 3;
+        }
+        j = j + 1;
+    }
+    if (open_uri.open(&link, program.conn(&prog), cast(*u8, &uri), k, "", 0) == 1) { br.opened = br.opened + 1; }
+}
+
+fn _row_activated(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void { activate(listview.cursor(t, l)); }
+
+// A folder chosen in the tree: shown in the table.
+fn _folder_chosen(t as *tree.Tree, l as i64, arg as *u8, user as *u8) as void {
+    let is i64 as i = listview.cursor(t, l);
+    if (i < 0) { return; }
+    let is *flatten.Flat as f = treeview.flat(t, br.folders);
+    let is i64 as id = model.row_id(flatten.model_of(f), 0, i);
+    if (id < 1 || id > fo.count) { return; }
+    go(_path_of(id), _node(id).len);
+}
+
+fn _path_typed(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    go(entry.text(t, br.path), entry.length(t, br.path));
+}
+
+fn show_about() as void {
+    if (dialog.ref_valid(&br.about) == 0) {
+        let is *tree.Tree as dt = dialog.window_tree(br.t);
+        let is i64 as ab = about.create(dt, NAME, 5);
+        about.set_version(dt, ab, "1.0", 3);
+        about.set_comments(dt, ab, "Folders and files, on the caustic-media toolkit.", 48);
+        br.about = dialog.ref(dt, ab);
+    }
+    dialog.show(br.about.t, cast(*router.Router, tree.router(br.about.t)), br.about.w, 0);
+}
+
+fn act(id as i64) as void {
+    if (id == OPEN_ITEM) { activate(listview.cursor(br.t, br.list)); }
+    if (id == QUIT) { app.window_close(br.a, br.win); }
+    if (id == UP) { up(); }
+    if (id == HOME) { home(); }
+    if (id == HIDDEN) { set_hidden(1 - br.hidden); }
+    if (id == ABOUT) { show_about(); }
+}
+
+fn _menu_chosen(t as *tree.Tree, m as i64, arg as *u8, user as *u8) as void {
+    let is i64 as id = *cast(*i64, arg);
+    // The check item turned over already: shown as it now says.
+    if (id == HIDDEN) {
+        set_hidden(menu.checked(t, br.hidden_item));
+        return;
+    }
+    act(id);
+}
+
+fn _up_clicked(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { up(); }
+fn _home_clicked(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { home(); }
+fn _key_up(user as *u8) as void { up(); }
+fn _key_hidden(user as *u8) as void { set_hidden(1 - br.hidden); }
+fn _key_location(user as *u8) as void {
+    router.focus(br.t, br.r, br.path, 1);
+}
+fn _key_quit(user as *u8) as void { act(QUIT); }
+
+fn _item(m as i64, s as *u8, id as i64, k as i32, mods as i32) as i64 {
+    let is i64 as it = menu.add_item(br.t, m, s, _len(s), id);
+    if (k != 0) { menu.set_accel(br.t, it, k, mods); }
+    return it;
+}
+
+fn build(start as *u8, n as i64) as void {
+    let is *tree.Tree as t = br.t;
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    let is i64 as bar = menubar.create(t, col);
+    let is i64 as file_m = menu.create(t);
+    _item(file_m, "_Open", OPEN_ITEM, 0, 0);
+    menu.add_separator(t, file_m);
+    _item(file_m, "_Quit", QUIT, keys.Q, keys.MOD_CONTROL);
+    let is i64 as view_m = menu.create(t);
+    _item(view_m, "_Up", UP, keys.UP, keys.MOD_ALT);
+    _item(view_m, "_Home", HOME, keys.HOME, keys.MOD_ALT);
+    menu.add_separator(t, view_m);
+    br.hidden_item = menu.add_check(t, view_m, "Show _hidden files", 18, HIDDEN, 0);
+    menu.set_accel(t, br.hidden_item, keys.H, keys.MOD_CONTROL);
+    let is i64 as help_m = menu.create(t);
+    _item(help_m, "_About", ABOUT, 0, 0);
+    menubar.add(t, bar, "_File", 5, file_m);
+    menubar.add(t, bar, "_View", 5, view_m);
+    menubar.add(t, bar, "_Help", 5, help_m);
+    menubar.bind(t, br.r, bar);
+    signal.connect(t, file_m, signal.ACTIVATED, fn_ptr(_menu_chosen), cast(*u8, 0));
+    signal.connect(t, view_m, signal.ACTIVATED, fn_ptr(_menu_chosen), cast(*u8, 0));
+    signal.connect(t, help_m, signal.ACTIVATED, fn_ptr(_menu_chosen), cast(*u8, 0));
+
+    let is i64 as tools = box.create(t, col, box.ROW);
+    box.set_spacing(t, tools, 6.0);
+    layout.set_margin(t, tools, 6.0, 4.0, 6.0, 4.0);
+    let is i64 as tb = toolbar.create(t, tools);
+    let is i64 as up_b = toolbar.add_button(t, tb, "Up", 2);
+    let is i64 as home_b = toolbar.add_button(t, tb, "Home", 4);
+    signal.connect(t, up_b, signal.CLICKED, fn_ptr(_up_clicked), cast(*u8, 0));
+    signal.connect(t, home_b, signal.CLICKED, fn_ptr(_home_clicked), cast(*u8, 0));
+    br.path = entry.create(t, tools);
+    layout.set_stretch(t, br.path, 1.0, 0.0);
+    signal.connect(t, br.path, signal.ACTIVATED, fn_ptr(_path_typed), cast(*u8, 0));
+
+    let is i64 as split = splitter.create(t, col, splitter.ROW);
+    layout.set_stretch(t, split, 1.0, 1.0);
+    fo.m = model.make(cast(*u8, 0), fn_ptr(f_count), fn_ptr(f_row_id), fn_ptr(f_cell));
+    fo.m.parent_of = fn_ptr(f_parent_of);
+    fo.m.index_of = fn_ptr(f_index_of);
+    fo.m.has_children = fn_ptr(f_has_children);
+    _new_node(0, start, n);
+    br.folders = treeview.create(t, split, &fo.m);
+    layout.set_min_size(t, br.folders, 180.0, 0.0);
+    let is i64 as tl = treeview.list(t, br.folders);
+    listview.set_single_click(t, tl, 1);
+    signal.connect(t, tl, signal.ACTIVATED, fn_ptr(_folder_chosen), cast(*u8, 0));
+    br.table = tableview.create(t, split, dirmodel.model_of(br.dir));
+    tableview.add_column(t, br.table, "Name", 4, 260.0);
+    tableview.add_column(t, br.table, "Size", 4, 90.0);
+    tableview.add_column(t, br.table, "Modified", 8, 150.0);
+    br.list = tableview.list(t, br.table);
+    signal.connect(t, br.list, signal.ACTIVATED, fn_ptr(_row_activated), cast(*u8, 0));
+    splitter.set_position(t, split, 0, 200.0);
+
+    br.status = statusbar.create(t, col);
+    router.add_shortcut(br.r, keys.UP, keys.MOD_ALT, fn_ptr(_key_up), cast(*u8, 0));
+    router.add_shortcut(br.r, keys.H, keys.MOD_CONTROL, fn_ptr(_key_hidden), cast(*u8, 0));
+    router.add_shortcut(br.r, keys.L, keys.MOD_CONTROL, fn_ptr(_key_location), cast(*u8, 0));
+    router.add_shortcut(br.r, keys.Q, keys.MOD_CONTROL, fn_ptr(_key_quit), cast(*u8, 0));
+    router.focus(t, br.r, br.list, 0);
+}
+
+// --- Driven, as a user would ---
+
+let is i32 as fails with mut = 0;
+
+fn expect(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn rounds(n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        host.step(br.hs, 20);
+        k = k + 1;
+    }
+}
+
+fn key(k as i32, mods as i32, text as *u8, n as i64) as void {
+    let is wevent.Event as e;
+    wevent.clear(&e);
+    e.kind = wevent.KEY_DOWN;
+    e.key = k;
+    e.keycode = 38;
+    e.modifiers = mods;
+    e.text = text;
+    e.text_len = n;
+    host.feed(br.hs, br.win, &e, time.now_ms());
+    e.kind = wevent.KEY_UP;
+    e.text_len = 0;
+    host.feed(br.hs, br.win, &e, time.now_ms());
+    rounds(1);
+}
+
+fn type_in(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        key(cast(i32, s[i]), 0, cast(*u8, cast(i64, s) + i), 1);
+        i = i + 1;
+    }
+}
+
+fn ends_with(s as *u8, n as i64, tail as *u8) as i32 {
+    let is i64 as k = _len(tail);
+    if (n < k) { return 0; }
+    return cast(i32, mem.memcmp(cast(*u8, cast(i64, s) + n - k), tail, k) == 0);
+}
+
+fn at_folder(tail as *u8) as i32 { return ends_with(dirmodel.path(br.dir), dirmodel.path_length(br.dir), tail); }
+
+fn status_is(s as *u8) as i32 { return _same(statusbar.message(br.t, br.status), statusbar.message_length(br.t, br.status), s); }
+
+// The row named s in the table, -1 for none.
+fn row_named(s as *u8) as i64 { return dirmodel.index_of_name(br.dir, s, _len(s)); }
+
+fn mk(p as *u8) as void { linux.mkdir(p, 493); }
+
+fn touch(p as *u8) as void { linux.close(linux.open(p, 577, 420)); }
+
+fn opened_said() as i64 {
+    let is *u8 as path = env.getenv("CAUSTIC_XDG_OPEN_OUT");
+    if (cast(i64, path) == 0) { return 0 - 1; }
+    let is i64 as until = time.now_ms() + 2000;
+    let is [512]u8 as b;
+    let is i64 as n with mut = 0 - 1;
+    while (n < 0 && time.now_ms() < until) {
+        let is i64 as fd = linux.open(path, 0, 0);
+        if (fd >= 0) {
+            n = linux.read(fd, cast(*u8, &b), 512);
+            linux.close(fd);
+        } else {
+            rounds(1);
+        }
+    }
+    if (n <= 0) { return 0 - 1; }
+    return cast(i64, ends_with(cast(*u8, &b), n, "/browser_check/b%20c.txt"));
+}
+
+fn drive() as void {
+    rounds(6);
+    expect("on the screen", host.shown(br.hs) == 1);
+    expect("the folder: its two, the hidden one not", dirmodel.count(br.dir) == 2 && row_named("a") >= 0 &&
+           row_named("b c.txt") >= 0 && row_named(".hidden") < 0);
+    expect("said in the status bar, the title its name", status_is("2 items") == 1 &&
+           _same(app.title(br.a, br.win), app.title_length(br.a, br.win), "browser_check \xe2\x80\x94 Files") == 1);
+    // A folder activated: gone into.
+    router.focus(br.t, br.r, br.list, 1);
+    listview.set_cursor(br.t, br.list, row_named("a"));
+    key(keys.RETURN, 0, "", 0);
+    expect("a folder activated: in it", at_folder("/browser_check/a") == 1 && row_named("inner") >= 0 && status_is("1 item") == 1);
+    key(keys.UP, keys.MOD_ALT, "", 0);
+    expect("Alt+Up: back up", at_folder("/browser_check") == 1);
+    key(keys.H, keys.MOD_CONTROL, "", 0);
+    expect("Ctrl+H: the hidden one too, the menu's item checked", dirmodel.count(br.dir) == 3 && row_named(".hidden") >= 0 &&
+           menu.checked(br.t, br.hidden_item) == 1);
+    act(HIDDEN);
+    expect("from the menu: hidden again", dirmodel.count(br.dir) == 2 && menu.checked(br.t, br.hidden_item) == 0);
+    // The path typed.
+    key(keys.L, keys.MOD_CONTROL, "", 0);
+    expect("Ctrl+L: to the path", router.focused(br.t, br.r) == br.path);
+    entry.select(br.t, br.path, entry.length(br.t, br.path), entry.length(br.t, br.path));
+    type_in("/a/inner");
+    key(keys.RETURN, 0, "", 0);
+    expect("a path typed: gone there", at_folder("/browser_check/a/inner") == 1 && status_is("0 items") == 1);
+    // A folder that cannot be read: told, and still where it was.
+    entry.set_text(br.t, br.path, "/nonexistent-caustic-media-folder", 33);
+    router.focus(br.t, br.r, br.path, 1);
+    key(keys.RETURN, 0, "", 0);
+    rounds(2);
+    expect("not there: told, still where it was", dialog.ref_valid(&br.problem) == 1 &&
+           dialog.is_shown(br.problem.t, br.problem.w) == 1 && at_folder("/browser_check/a/inner") == 1);
+    dialog.respond(br.problem.t, br.problem.w, dialog.OK);
+    rounds(2);
+    // The tree: its root, opened, a branch chosen.
+    let is *flatten.Flat as f = treeview.flat(br.t, br.folders);
+    expect("the tree: its root alone at first", flatten.count(f) == 1);
+    treeview.expand(br.t, br.folders, 0);
+    rounds(1);
+    expect("opened: its folders read, and only those", flatten.count(f) == 2);
+    let is i64 as tl = treeview.list(br.t, br.folders);
+    listview.set_cursor(br.t, tl, 1);
+    signal.emit(br.t, tl, signal.ACTIVATED, cast(*u8, 0));
+    rounds(1);
+    expect("a branch chosen: shown in the table", at_folder("/browser_check/a") == 1);
+    // A file activated: opened by the desktop — here, the stand-in.
+    up();
+    router.focus(br.t, br.r, br.list, 1);
+    listview.set_cursor(br.t, br.list, row_named("b c.txt"));
+    key(keys.RETURN, 0, "", 0);
+    expect("a file activated: handed to the desktop as a link, escaped", br.opened == 1 && opened_said() == 1);
+    show_about();
+    rounds(2);
+    expect("its about dialog", dialog.ref_valid(&br.about) == 1 && dialog.is_shown(br.about.t, br.about.w) == 1);
+    dialog.respond(br.about.t, br.about.w, dialog.CLOSE);
+    rounds(1);
+    key(keys.Q, keys.MOD_CONTROL, "", 0);
+    rounds(2);
+    expect("Ctrl+Q: closed", host.shown(br.hs) == 0);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i32 as checking = cast(i32, env.argc() > 1 && _same(env.argv(1), _len(env.argv(1)), "--check") == 1);
+    if (program.open(&prog, cast(*u8, 0)) == 0) {
+        io.printf("file browser: no fonts on this system\n");
+        return 1;
+    }
+    fo.nodes = cast(*Node, mem.core.mmap_anon(MAX_NODES * sizeof(Node)));
+    fo.pool = mem.core.mmap_anon(POOL);
+    let is [4096]u8 as start;
+    let is i64 as sn with mut = 0;
+    if (checking == 1) {
+        let is *u8 as out = env.getenv("CAUSTIC_XDG_OPEN_OUT");
+        if (cast(i64, out) != 0) { linux.unlink(out); }
+        linux.getcwd(cast(*u8, &start), 3900);
+        sn = _len(cast(*u8, &start));
+        mem.memcpy(cast(*u8, cast(i64, &start) + sn), "/build/browser_check", 21);
+        sn = sn + 20;
+        mk(cast(*u8, &start));
+        let is [4096]u8 as p;
+        mem.memcpy(cast(*u8, &p), cast(*u8, &start), sn);
+        mem.memcpy(cast(*u8, cast(i64, &p) + sn), "/a", 3);
+        mk(cast(*u8, &p));
+        mem.memcpy(cast(*u8, cast(i64, &p) + sn), "/a/inner", 9);
+        mk(cast(*u8, &p));
+        mem.memcpy(cast(*u8, cast(i64, &p) + sn), "/b c.txt", 9);
+        touch(cast(*u8, &p));
+        mem.memcpy(cast(*u8, cast(i64, &p) + sn), "/.hidden", 9);
+        touch(cast(*u8, &p));
+    } else if (env.argc() > 1) {
+        sn = _len(env.argv(1));
+        if (sn > 4000) { sn = 4000; }
+        mem.memcpy(cast(*u8, &start), env.argv(1), sn);
+    } else {
+        let is *u8 as h with mut = env.getenv("HOME");
+        if (cast(i64, h) == 0) { h = "/"; }
+        sn = _len(h);
+        mem.memcpy(cast(*u8, &start), h, sn);
+    }
+    br.dir = dirmodel.open(cast(*u8, &start), sn);
+    if (cast(i64, br.dir) == 0) {
+        io.printf("file browser: no such folder\n");
+        program.close(&prog);
+        return 1;
+    }
+    br.a = program.app(&prog);
+    br.hs = program.host(&prog);
+    br.win = app.window_open(br.a, 800.0, 500.0);
+    br.t = app.tree(br.a, br.win);
+    br.r = app.router(br.a, br.win);
+    dirmodel.set_language(br.dir, tree.language(br.t));
+    build(cast(*u8, &start), sn);
+    _shown();
+    if (checking == 1) {
+        drive();
+    } else {
+        program.run(&prog);
+    }
+    dirmodel.close(br.dir);
+    program.close(&prog);
+    if (checking == 0) { return 0; }
+    if (fails == 0) {
+        io.printf("file browser: all checks passed\n");
+        return 0;
+    }
+    io.printf("file browser: %d failures\n", fails);
+    return 1;
+}

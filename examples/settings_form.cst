@@ -1,0 +1,733 @@
+// examples/settings_form.cst — a program's settings, in a form.
+//
+//   caustic -q examples/settings_form.cst -o build/settings_form --path .caustic/deps
+//   ./build/settings_form
+//   sh window/x11/tools/run_headless.sh ./build/settings_form --check
+//
+// The smallest program of the toolkit's that a user would recognise: a
+// window of labelled fields — entries, a group of radio buttons, a switch, a
+// slider, check boxes, a spin box, a combo box — kept in a file between runs
+// and applied as they change. What it shows:
+//
+//   - program.open: the system's fonts, the desktop's settings followed, the
+//     loop, all in one call;
+//   - a form laid out on a grid, its labels' mnemonics (Alt+N goes to Name);
+//   - signals: every field marks the form changed, Apply and Revert enabled
+//     only then;
+//   - a choice applied at once: the look — the desktop's, light or dark,
+//     less motion, bigger text — and the language of the toolkit's own words,
+//     English or Brazilian Portuguese, whatever the desktop says;
+//   - a message box for a field that does not hold (an email without a
+//     domain), and the question asked when the window is closed with changes
+//     not applied;
+//   - a desktop notification when the settings are saved, if asked for.
+//
+// --check drives it the way a user would — clicks and keys through the loop,
+// the answers to its message boxes given directly — and says whether it
+// behaved; under Xvfb, its file in build/ rather than the user's.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../math/math.cst" as math;
+use "../window/event.cst" as wevent;
+use "../window/keys.cst" as keys;
+use "../window/settings.cst" as wsettings;
+use "../ui/program.cst" as program;
+use "../ui/app.cst" as app;
+use "../ui/host.cst" as host;
+use "../ui/tree.cst" as tree;
+use "../ui/layout.cst" as layout;
+use "../ui/box.cst" as box;
+use "../ui/grid.cst" as grid;
+use "../ui/signal.cst" as signal;
+use "../ui/router.cst" as router;
+use "../ui/model.cst" as model;
+use "../ui/notify.cst" as notify;
+use "../ui/widgets/label.cst" as label;
+use "../ui/widgets/entry.cst" as entry;
+use "../ui/widgets/check.cst" as check;
+use "../ui/widgets/switch.cst" as switch;
+use "../ui/widgets/slider.cst" as slider;
+use "../ui/widgets/spin.cst" as spin;
+use "../ui/widgets/combo.cst" as combo;
+use "../ui/widgets/button.cst" as button;
+use "../ui/widgets/group.cst" as group;
+use "../ui/widgets/dialog.cst" as dialog;
+
+// --- What is kept ---
+
+let is i64 as FOLLOW with imut = 0;   // the look: the desktop's
+let is i64 as LIGHT  with imut = 1;
+let is i64 as DARK   with imut = 2;
+
+struct Values {
+    name     as [128]u8;
+    name_n   as i64;
+    email    as [128]u8;
+    email_n  as i64;
+    look     as i64;
+    motion   as i64;   // 1: less of it
+    scale    as i64;   // text, percent
+    notes    as i64;   // notifications
+    sound    as i64;
+    every    as i64;   // minutes between reminders
+    language as i64;   // 0 the desktop's, 1 English, 2 Brazilian Portuguese
+}
+
+fn defaults() as Values {
+    let is Values as v;
+    v.name_n = 0;
+    v.email_n = 0;
+    v.look = FOLLOW;
+    v.motion = 0;
+    v.scale = 100;
+    v.notes = 1;
+    v.sound = 0;
+    v.every = 30;
+    v.language = 0;
+    return v;
+}
+
+let is [512]u8 as path with mut;
+
+// Where it is kept: $XDG_CONFIG_HOME, else ~/.config, under the examples'
+// directory, made when missing.
+fn find_path() as void {
+    let is *u8 as base with mut = env.getenv("XDG_CONFIG_HOME");
+    let is i64 as n with mut = 0;
+    if (cast(i64, base) != 0 && base[0] == 47) {
+        n = _put(cast(*u8, &path), 0, base);
+    } else {
+        let is *u8 as home with mut = env.getenv("HOME");
+        if (cast(i64, home) == 0) { home = "/tmp"; }
+        n = _put(cast(*u8, &path), 0, home);
+        n = _put(cast(*u8, &path), n, "/.config");
+    }
+    linux.mkdir(cast(*u8, &path), 448);
+    n = _put(cast(*u8, &path), n, "/caustic-media-examples");
+    linux.mkdir(cast(*u8, &path), 448);
+    _put(cast(*u8, &path), n, "/settings-form.conf");
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// s after the first n bytes of to, zero-terminated: the length now.
+fn _put(to as *u8, n as i64, s as *u8) as i64 {
+    let is i64 as k = _len(s);
+    if (n + k >= 511) { return n; }
+    mem.memcpy(cast(*u8, cast(i64, to) + n), s, k);
+    to[n + k] = cast(u8, 0);
+    return n + k;
+}
+
+let is [4096]u8 as buf with mut;
+let is i64 as buf_n with mut = 0;
+
+fn _text(key as *u8, s as *u8, n as i64) as void {
+    let is i64 as k = _len(key);
+    if (buf_n + k + n + 2 > 4096) { return; }
+    mem.memcpy(cast(*u8, cast(i64, &buf) + buf_n), key, k);
+    buf[buf_n + k] = cast(u8, 61);
+    mem.memcpy(cast(*u8, cast(i64, &buf) + buf_n + k + 1), s, n);
+    buf[buf_n + k + 1 + n] = cast(u8, 10);
+    buf_n = buf_n + k + n + 2;
+}
+
+fn _number(key as *u8, v as i64) as void {
+    let is [24]u8 as r;
+    let is [24]u8 as d;
+    let is i64 as rn with mut = 0;
+    let is i64 as x with mut = v;
+    if (x <= 0) {
+        r[0] = cast(u8, 48);
+        rn = 1;
+        x = 0;
+    }
+    while (x > 0) {
+        r[rn] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        rn = rn + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k < rn) {
+        d[k] = r[rn - 1 - k];
+        k = k + 1;
+    }
+    _text(key, cast(*u8, &d), rn);
+}
+
+// Written whole under another name, then moved over the old: never half.
+fn save(v as *Values) as i32 {
+    buf_n = 0;
+    _text("name", cast(*u8, &v.name), v.name_n);
+    _text("email", cast(*u8, &v.email), v.email_n);
+    _number("look", v.look);
+    _number("motion", v.motion);
+    _number("scale", v.scale);
+    _number("notes", v.notes);
+    _number("sound", v.sound);
+    _number("every", v.every);
+    _number("language", v.language);
+    let is [520]u8 as tmp;
+    let is i64 as n = _put(cast(*u8, &tmp), 0, cast(*u8, &path));
+    _put(cast(*u8, &tmp), n, ".new");
+    let is i64 as fd = linux.open(cast(*u8, &tmp), 577, 384);
+    if (fd < 0) { return 0; }
+    let is i64 as wrote = linux.write(fd, cast(*u8, &buf), buf_n);
+    linux.close(fd);
+    if (wrote != buf_n) { return 0; }
+    return cast(i32, linux.rename(cast(*u8, &tmp), cast(*u8, &path)) == 0);
+}
+
+fn _same(a as *u8, n as i64, b as *u8) as i32 {
+    if (n != _len(b)) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+fn _int(s as *u8, n as i64, lo as i64, hi as i64, dflt as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    if (n == 0 || n > 9) { return dflt; }
+    while (i < n) {
+        if (s[i] < 48 || s[i] > 57) { return dflt; }
+        v = v * 10 + cast(i64, s[i]) - 48;
+        i = i + 1;
+    }
+    if (v < lo || v > hi) { return dflt; }
+    return v;
+}
+
+// What the file says, line by line; what it does not, or not as it should,
+// the defaults'.
+fn load(v as *Values) as void {
+    *v = defaults();
+    let is i64 as fd = linux.open(cast(*u8, &path), 0, 0);
+    if (fd < 0) { return; }
+    let is i64 as n = linux.read(fd, cast(*u8, &buf), 4096);
+    linux.close(fd);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as e with mut = i;
+        while (e < n && buf[e] != 10) { e = e + 1; }
+        let is i64 as q with mut = i;
+        while (q < e && buf[q] != 61) { q = q + 1; }
+        if (q < e) {
+            let is *u8 as key = cast(*u8, cast(i64, &buf) + i);
+            let is *u8 as val = cast(*u8, cast(i64, &buf) + q + 1);
+            let is i64 as kn = q - i;
+            let is i64 as vn = e - q - 1;
+            if (_same(key, kn, "name") == 1 && vn < 128) {
+                mem.memcpy(cast(*u8, &v.name), val, vn);
+                v.name_n = vn;
+            }
+            if (_same(key, kn, "email") == 1 && vn < 128) {
+                mem.memcpy(cast(*u8, &v.email), val, vn);
+                v.email_n = vn;
+            }
+            if (_same(key, kn, "look") == 1) { v.look = _int(val, vn, 0, 2, FOLLOW); }
+            if (_same(key, kn, "motion") == 1) { v.motion = _int(val, vn, 0, 1, 0); }
+            if (_same(key, kn, "scale") == 1) { v.scale = _int(val, vn, 80, 150, 100); }
+            if (_same(key, kn, "notes") == 1) { v.notes = _int(val, vn, 0, 1, 1); }
+            if (_same(key, kn, "sound") == 1) { v.sound = _int(val, vn, 0, 1, 0); }
+            if (_same(key, kn, "every") == 1) { v.every = _int(val, vn, 1, 120, 30); }
+            if (_same(key, kn, "language") == 1) { v.language = _int(val, vn, 0, 2, 0); }
+        }
+        i = e + 1;
+    }
+}
+
+// --- The form ---
+
+struct Form {
+    a        as *app.App;
+    hs       as *host.Host;
+    win      as i64;
+    t        as *tree.Tree;
+    r        as *router.Router;
+    name     as i64;
+    email    as i64;
+    follow   as i64;
+    light    as i64;
+    dark     as i64;
+    motion   as i64;
+    scale    as i64;
+    notes    as i64;
+    sound    as i64;
+    every    as i64;
+    language as i64;
+    revert   as i64;
+    apply    as i64;
+    question as dialog.Ref;   // asked on closing: in a window of its own
+    problem  as dialog.Ref;   // telling what does not hold
+    asking   as i32;          // the question shown
+    telling  as i32;          // the problem shown
+    filling  as i32;   // the fields being set from values: not a change
+    changed  as i32;
+    closing  as i32;
+    saved    as i32;   // times saved
+    kept     as Values;
+}
+
+let is program.Program as prog with mut;
+let is Form as f with mut;
+let is notify.Notifier as notes with mut;
+
+fn lang_count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return 3;
+}
+
+fn lang_row(self as *u8, parent as i64, index as i64) as i64 {
+    if (parent != 0 || index < 0 || index > 2) { return 0; }
+    return index + 1;
+}
+
+fn lang_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    if (role != model.TEXT || column != 0) { return 0; }
+    if (id == 1) { *out = model.text("The desktop's", 13); }
+    else if (id == 2) { *out = model.text("English", 7); }
+    else if (id == 3) { *out = model.text("Português (Brasil)", 19); }
+    else { return 0; }
+    return 1;
+}
+
+let is model.Model as languages with mut;
+
+// What the fields say now.
+fn read_fields() as Values {
+    let is Values as v with mut = defaults();
+    let is *tree.Tree as t = f.t;
+    let is i64 as n with mut = entry.length(t, f.name);
+    if (n > 127) { n = 127; }
+    mem.memcpy(cast(*u8, &v.name), entry.text(t, f.name), n);
+    v.name_n = n;
+    n = entry.length(t, f.email);
+    if (n > 127) { n = 127; }
+    mem.memcpy(cast(*u8, &v.email), entry.text(t, f.email), n);
+    v.email_n = n;
+    if (check.state(t, f.light) == check.ON) { v.look = LIGHT; }
+    if (check.state(t, f.dark) == check.ON) { v.look = DARK; }
+    v.motion = cast(i64, switch.is_active(t, f.motion));
+    v.scale = cast(i64, slider.value(t, f.scale) + 0.5);
+    v.notes = cast(i64, check.state(t, f.notes) == check.ON);
+    v.sound = cast(i64, check.state(t, f.sound) == check.ON);
+    v.every = cast(i64, spin.value(t, f.every) + 0.5);
+    v.language = combo.selected(t, f.language);
+    if (v.language < 0) { v.language = 0; }
+    return v;
+}
+
+fn _on(b as i64) as i32 {
+    if (b != 0) { return check.ON; }
+    return check.OFF;
+}
+
+// The fields set to v: not a change of the user's.
+fn fill(v as *Values) as void {
+    let is *tree.Tree as t = f.t;
+    f.filling = 1;
+    entry.set_text(t, f.name, cast(*u8, &v.name), v.name_n);
+    entry.set_text(t, f.email, cast(*u8, &v.email), v.email_n);
+    if (v.look == LIGHT) {
+        check.set_state(t, f.light, check.ON);
+    } else if (v.look == DARK) {
+        check.set_state(t, f.dark, check.ON);
+    } else {
+        check.set_state(t, f.follow, check.ON);
+    }
+    switch.set_active(t, f.motion, cast(i32, v.motion));
+    slider.set_value(t, f.scale, cast(f64, v.scale));
+    check.set_state(t, f.notes, _on(v.notes));
+    check.set_state(t, f.sound, _on(v.sound));
+    spin.set_value(t, f.every, cast(f64, v.every));
+    combo.set_selected(t, f.language, v.language);
+    f.filling = 0;
+    set_changed(0);
+    look(v);
+}
+
+fn set_changed(on as i32) as void {
+    f.changed = on;
+    tree.set_enabled(f.t, f.apply, on);
+    tree.set_enabled(f.t, f.revert, on);
+    // A sound only with notifications.
+    tree.set_enabled(f.t, f.sound, cast(i32, check.state(f.t, f.notes) == check.ON));
+}
+
+// The look and the language v asks for, over what the desktop says.
+fn look(v as *Values) as void {
+    let is wsettings.Settings as s with mut = *host.settings(f.hs);
+    if (v.look == LIGHT) { s.dark = 0; }
+    if (v.look == DARK) { s.dark = 1; }
+    if (v.motion == 1) { s.animations = 0; }
+    s.text_scale = s.text_scale * cast(f64, v.scale) / 100.0;
+    app.set_system(f.a, &s);
+    if (v.language == 1) { app.set_locale(f.a, "en", 2); }
+    if (v.language == 2) { app.set_locale(f.a, "pt-BR", 5); }
+}
+
+fn edited(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    if (f.filling == 1) { return; }
+    let is Values as v = read_fields();
+    look(&v);
+    set_changed(1);
+}
+
+// An email holds when something comes before an @ and a dot comes after it,
+// with something on both sides of the dot. Empty, it is not asked for.
+fn email_holds(s as *u8, n as i64) as i32 {
+    if (n == 0) { return 1; }
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (s[i] == 64) {
+            if (at >= 0) { return 0; }
+            at = i;
+        }
+        i = i + 1;
+    }
+    if (at <= 0) { return 0; }
+    let is i64 as dot with mut = 0 - 1;
+    i = at + 2;
+    while (i < n - 1) {
+        if (s[i] == 46) { dot = i; }
+        i = i + 1;
+    }
+    return cast(i32, dot > at + 1);
+}
+
+fn told(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    f.telling = 0;
+    router.focus(f.t, f.r, f.email, 1);
+}
+
+// A message box in a window of its own: kept at r, shown.
+fn tell(r as *dialog.Ref, kind as i32, title as *u8, say as *u8, buttons as i32, cb as tree.SignalFn) as void {
+    if (dialog.ref_valid(r) == 1) { dialog.dispose(r); }
+    let is *tree.Tree as dt = dialog.window_tree(f.t);
+    let is i64 as w = dialog.message(dt, kind, title, _len(title), say, _len(say), buttons);
+    if (cast(i64, cb) != 0) { signal.connect(dt, w, signal.ACTIVATED, cb, cast(*u8, 0)); }
+    *r = dialog.ref(dt, w);
+    dialog.show(dt, cast(*router.Router, tree.router(dt)), w, 1);
+}
+
+// Applied: kept in the file, unless a field does not hold. 1 when kept.
+fn apply() as i32 {
+    let is Values as v = read_fields();
+    if (email_holds(cast(*u8, &v.email), v.email_n) == 0) {
+        f.telling = 1;
+        tell(&f.problem, dialog.ERROR, "The email address is not valid",
+             "Something before the @ and a domain after it, like ana@example.org.", dialog.OK_ONLY, fn_ptr(told));
+        return 0;
+    }
+    if (save(&v) == 0) {
+        tell(&f.problem, dialog.ERROR, "Not saved", "The settings could not be written to their file.", dialog.OK_ONLY,
+             cast(tree.SignalFn, 0));
+        return 0;
+    }
+    f.kept = v;
+    f.saved = f.saved + 1;
+    set_changed(0);
+    if (v.notes == 1 && cast(i64, program.conn(&prog)) != 0) {
+        notify.send(&notes, "Settings saved", 14, "They apply from now on.", 23, "preferences-system", 18, "", 0, 0, 0 - 1);
+    }
+    return 1;
+}
+
+fn on_apply(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { apply(); }
+
+fn on_revert(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { fill(&f.kept); }
+
+// The question on closing answered: saved and closed, closed, or neither.
+fn answered(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is i64 as answer = *cast(*i64, arg);
+    f.asking = 0;
+    if (answer == dialog.YES) {
+        if (apply() == 1) { app.window_close(f.a, f.win); }
+        return;
+    }
+    if (answer == dialog.NO) { app.window_close(f.a, f.win); }
+}
+
+// Asked to close: at once with nothing to lose; else asked first.
+fn on_close(user as *u8, h as i64) as i32 {
+    if (h != f.win || f.changed == 0) { return 1; }
+    if (f.asking == 1) { return 0; }
+    f.asking = 1;
+    tell(&f.question, dialog.QUESTION, "Save the changes?", "Changes not applied are lost if you close without saving.",
+         dialog.YES_NO_CANCEL, fn_ptr(answered));
+    return 0;
+}
+
+// A row of the grid: its label — mnemonic marked — and what it labels.
+fn row(g as i64, at as i32, text as *u8, field as i64) as void {
+    let is i64 as l = label.create(f.t, g, "", 0);
+    label.set_text_mnemonic(f.t, l, text, _len(text));
+    label.set_target(f.t, l, field);
+    layout.set_cell(f.t, l, at, 0, 1, 1);
+    layout.set_align(f.t, l, layout.END, layout.CENTER);
+    tree.reparent(f.t, field, g);
+    layout.set_cell(f.t, field, at, 1, 1, 1);
+    label.bind_mnemonic(f.t, f.r, l);
+}
+
+fn build() as void {
+    let is *tree.Tree as t = f.t;
+    let is i64 as page = box.create(t, tree.root(t), box.COLUMN);
+    box.set_spacing(t, page, 12.0);
+    layout.set_margin(t, page, 18.0, 18.0, 18.0, 18.0);
+
+    let is i64 as g = grid.create(t, page);
+    grid.set_spacing(t, g, 12.0, 8.0);
+    f.name = entry.create(t, page);
+    layout.set_min_size(t, f.name, 240.0, 0.0);
+    row(g, 0, "_Name", f.name);
+    f.email = entry.create(t, page);
+    entry.set_placeholder(t, f.email, "ana@example.org", 15);
+    row(g, 1, "_Email", f.email);
+    f.language = combo.create(t, page, &languages);
+    row(g, 2, "_Language", f.language);
+
+    let is i64 as looks = group.create(t, page, "Appearance", 10);
+    let is i64 as lc = box.create(t, looks, box.COLUMN);
+    box.set_spacing(t, lc, 6.0);
+    f.follow = check.radio(t, lc, "_Follow the desktop", 19, 0);
+    f.light = check.radio(t, lc, "_Light", 6, f.follow);
+    f.dark = check.radio(t, lc, "_Dark", 5, f.follow);
+    let is i64 as mr = box.create(t, lc, box.ROW);
+    box.set_spacing(t, mr, 12.0);
+    label.create(t, mr, "Less motion", 11);
+    f.motion = switch.create(t, mr);
+    let is i64 as sr = box.create(t, lc, box.ROW);
+    box.set_spacing(t, sr, 12.0);
+    label.create(t, sr, "Text size", 9);
+    f.scale = slider.create(t, sr, 80.0, 150.0, 10.0);
+    layout.set_min_size(t, f.scale, 160.0, 0.0);
+
+    let is i64 as told_group = group.create(t, page, "Notifications", 13);
+    let is i64 as nc = box.create(t, told_group, box.COLUMN);
+    box.set_spacing(t, nc, 6.0);
+    f.notes = check.create(t, nc, "_Show notifications", 19);
+    f.sound = check.create(t, nc, "_Play a sound", 13);
+    let is i64 as er = box.create(t, nc, box.ROW);
+    box.set_spacing(t, er, 12.0);
+    label.create(t, er, "Remind me every (minutes)", 25);
+    f.every = spin.create(t, er, 1.0, 120.0, 1.0);
+
+    let is i64 as foot = box.create(t, page, box.ROW);
+    box.set_spacing(t, foot, 8.0);
+    layout.set_align(t, foot, layout.END, layout.END);
+    f.revert = button.create(t, foot, "_Revert", 7);
+    f.apply = button.create(t, foot, "_Apply", 6);
+    button.set_default(t, f.r, f.apply);
+
+    check.bind_mnemonic(t, f.r, f.follow);
+    check.bind_mnemonic(t, f.r, f.light);
+    check.bind_mnemonic(t, f.r, f.dark);
+    check.bind_mnemonic(t, f.r, f.notes);
+    check.bind_mnemonic(t, f.r, f.sound);
+    button.bind_mnemonic(t, f.r, f.revert);
+    button.bind_mnemonic(t, f.r, f.apply);
+    signal.connect(t, f.name, signal.CHANGED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.email, signal.CHANGED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.motion, signal.TOGGLED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.scale, signal.VALUE_CHANGED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.notes, signal.TOGGLED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.sound, signal.TOGGLED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.every, signal.VALUE_CHANGED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.language, signal.VALUE_CHANGED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.follow, signal.TOGGLED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.light, signal.TOGGLED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.dark, signal.TOGGLED, fn_ptr(edited), cast(*u8, 0));
+    signal.connect(t, f.apply, signal.CLICKED, fn_ptr(on_apply), cast(*u8, 0));
+    signal.connect(t, f.revert, signal.CLICKED, fn_ptr(on_revert), cast(*u8, 0));
+}
+
+// --- Driven, as a user would ---
+
+let is i32 as fails with mut = 0;
+
+fn expect(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn rounds(n as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        host.step(f.hs, 20);
+        k = k + 1;
+    }
+}
+
+fn feed(kind as i32, x as i64, y as i64) as void {
+    let is wevent.Event as e;
+    wevent.clear(&e);
+    e.kind = kind;
+    e.button = 1;
+    e.x = x;
+    e.y = y;
+    host.feed(f.hs, f.win, &e, time.now_ms());
+}
+
+// A click in the middle of w — near its start for an entry, where the
+// caret goes to the end of a short text.
+fn click(w as i64) as void {
+    let is math.rect.Rect as r = layout.window_rect(f.t, w);
+    let is f64 as s = app.scale(f.a, f.win);
+    let is i64 as x = cast(i64, (r.x + r.w / 2.0) * s);
+    let is i64 as y = cast(i64, (r.y + r.h / 2.0) * s);
+    feed(wevent.MOUSE_MOVE, x, y);
+    feed(wevent.MOUSE_DOWN, x, y);
+    feed(wevent.MOUSE_UP, x, y);
+    rounds(2);
+}
+
+fn key(k as i32, text as *u8, n as i64) as void {
+    let is wevent.Event as e;
+    wevent.clear(&e);
+    e.kind = wevent.KEY_DOWN;
+    e.key = k;
+    e.keycode = 38;
+    e.text = text;
+    e.text_len = n;
+    host.feed(f.hs, f.win, &e, time.now_ms());
+    e.kind = wevent.KEY_UP;
+    e.text_len = 0;
+    host.feed(f.hs, f.win, &e, time.now_ms());
+}
+
+fn type_in(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        key(cast(i32, s[i]), cast(*u8, cast(i64, s) + i), 1);
+        i = i + 1;
+    }
+    rounds(2);
+}
+
+fn text_is(w as i64, s as *u8) as i32 { return _same(entry.text(f.t, w), entry.length(f.t, w), s); }
+
+fn file_has(s as *u8) as i32 {
+    let is i64 as fd = linux.open(cast(*u8, &path), 0, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as n = linux.read(fd, cast(*u8, &buf), 4096);
+    linux.close(fd);
+    let is i64 as k = _len(s);
+    let is i64 as i with mut = 0;
+    while (i + k <= n) {
+        if (mem.memcmp(cast(*u8, cast(i64, &buf) + i), s, k) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn luminance(c as math.color.Color) as f64 { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
+
+
+fn drive() as void {
+    rounds(6);
+    expect("on the screen", host.shown(f.hs) == 1);
+    expect("nothing changed yet: nothing to apply", tree.is_enabled(f.t, f.apply) == 0 && tree.is_enabled(f.t, f.revert) == 0);
+
+    click(f.name);
+    type_in("Ana");
+    expect("a name typed", text_is(f.name, "Ana") == 1);
+    expect("changed: Apply and Revert", tree.is_enabled(f.t, f.apply) == 1 && tree.is_enabled(f.t, f.revert) == 1);
+
+    click(f.email);
+    type_in("ana@");
+    click(f.apply);
+    expect("an email without a domain: told, in a window of its own", f.telling == 1 && dialog.ref_valid(&f.problem) == 1 &&
+           dialog.is_shown(f.problem.t, f.problem.w) == 1 && f.problem.t != f.t && f.saved == 0);
+    dialog.respond(f.problem.t, f.problem.w, dialog.OK);
+    rounds(2);
+    expect("told: back to the email, all of it chosen to be typed over", f.telling == 0 && router.focused(f.t, f.r) == f.email);
+    type_in("ana@example.org");
+    click(f.apply);
+    expect("applied: kept in its file", f.saved == 1 && file_has("name=Ana\n") == 1 && file_has("email=ana@example.org\n") == 1);
+    expect("applied: nothing left to apply", tree.is_enabled(f.t, f.apply) == 0);
+
+    // Whatever the desktop says: light, then dark, at once.
+    click(f.light);
+    expect("light: at once", luminance(app.theme(f.a).palette.window_bg) > 0.5);
+    click(f.dark);
+    expect("dark: at once", luminance(app.theme(f.a).palette.window_bg) < 0.5);
+
+    combo.set_selected(f.t, f.language, 2);
+    rounds(2);
+    expect("Portuguese: the toolkit's words in it", app.language(f.a) == 1);
+
+    click(f.notes);
+    expect("no notifications: no sound either", tree.is_enabled(f.t, f.sound) == 0);
+    click(f.notes);
+    expect("notifications again: a sound can be asked", tree.is_enabled(f.t, f.sound) == 1);
+
+    click(f.revert);
+    expect("reverted: as kept", text_is(f.name, "Ana") == 1 && check.state(f.t, f.follow) == check.ON &&
+           combo.selected(f.t, f.language) == 0 && tree.is_enabled(f.t, f.apply) == 0);
+
+    // Closed with a change: asked, and kept open meanwhile; then closed.
+    click(f.dark);
+    let is wevent.Event as e;
+    wevent.clear(&e);
+    e.kind = wevent.CLOSE;
+    host.feed(f.hs, f.win, &e, time.now_ms());
+    rounds(2);
+    expect("closed with a change: asked first", f.asking == 1 && dialog.is_shown(f.question.t, f.question.w) == 1);
+    expect("asked in the toolkit's words", dialog.button_for(f.question.t, f.question.w, dialog.YES) != 0);
+    dialog.respond(f.question.t, f.question.w, dialog.NO);
+    rounds(4);
+    expect("not saved, closed", host.shown(f.hs) == 0 && file_has("look=0\n") == 1);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i32 as checking = cast(i32, env.argc() > 1 && _same(env.argv(1), _len(env.argv(1)), "--check") == 1);
+    if (checking == 1) {
+        _put(cast(*u8, &path), 0, "build/settings_form_check.conf");
+        linux.unlink(cast(*u8, &path));
+    } else {
+        find_path();
+    }
+    if (program.open(&prog, cast(*u8, 0)) == 0) {
+        io.printf("settings form: no fonts on this system\n");
+        return 1;
+    }
+    f.a = program.app(&prog);
+    f.hs = program.host(&prog);
+    if (cast(i64, program.conn(&prog)) != 0) {
+        notify.open(&notes, program.conn(&prog), "Settings form", 13, cast(notify.ActionFn, 0), cast(notify.ClosedFn, 0),
+                    cast(*u8, 0));
+    }
+    languages = model.make(cast(*u8, 0), fn_ptr(lang_count), fn_ptr(lang_row), fn_ptr(lang_cell));
+    f.win = app.window_open(f.a, 460.0, 520.0);
+    app.set_title(f.a, f.win, "Settings", 8);
+    f.t = app.tree(f.a, f.win);
+    f.r = app.router(f.a, f.win);
+    build();
+    load(&f.kept);
+    fill(&f.kept);
+    host.set_on_close(f.hs, fn_ptr(on_close), cast(*u8, 0));
+    if (checking == 1) {
+        drive();
+    } else {
+        program.run(&prog);
+    }
+    program.close(&prog);
+    if (checking == 0) { return 0; }
+    if (fails == 0) {
+        io.printf("settings form: all checks passed\n");
+        return 0;
+    }
+    io.printf("settings form: %d failures\n", fails);
+    return 1;
+}
