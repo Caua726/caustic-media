@@ -5,10 +5,17 @@
 // between. Any range can be had in one piece (span) for laying out — the gap
 // moves out of it only when it is inside — and read out anywhere.
 //
-// Paragraphs are indexed: the offset each one starts at, kept through every
-// edit, so a text view finds the paragraph of an offset by a search and lays
-// out only those it shows. Line ends come in as line feeds: CR LF and a lone
-// CR are made one LF on the way in (added says how many bytes went in).
+// Paragraphs are indexed: the offset each one starts at, and the character
+// it starts at, kept through every edit, so a text view finds the paragraph
+// of an offset by a search and lays out only those it shows, and a byte
+// offset and a character's are had one from the other within a paragraph —
+// not from the start of the text. A character starts at every byte that does
+// not continue one. Line ends come in as line feeds: CR LF and a lone CR are
+// made one LF on the way in (added says how many bytes went in).
+//
+// Whoever listens is told every edit as it happens (set_listener): bytes put
+// in, once they are in, and bytes taken out, before they go — for an
+// assistive technology to be told what changed without reading the text.
 //
 // Undo and redo go by the steps a person would undo by: a run of typing is
 // one — a word's start breaks it, so is the caret moving (break_group) — a
@@ -17,6 +24,12 @@
 // plain edits, insert and delete, are a program setting text: they are not
 // remembered, and they forget what was, whose places they move.
 use "std/mem.cst" as mem;
+
+// An edit told to the listener: listen(user, what, at, bytes, n).
+let is i32 as INSERTED with imut = 1;
+let is i32 as DELETED  with imut = 2;
+
+type EditFn = fn(*u8, i32, i64, *u8, i64) as void;
 
 // What a step is, to know what joins it.
 let is i64 as _TYPING   with imut = 1;
@@ -52,8 +65,12 @@ struct Buf {
     len      as i64;
     added    as i64;   // what the last insertion put in, line ends made LF
     paras    as *i64;  // each paragraph's start
+    pchars   as *i64;  // and the character it starts at
     npara    as i64;
     para_cap as i64;
+    nchars   as i64;   // characters in all
+    listen   as EditFn;
+    listen_user as *u8;
     recs     as *Rec;
     nrec     as i64;
     rec_cap  as i64;
@@ -96,15 +113,20 @@ fn open() as Buf {
     mem.memset(cast(*u8, &b), 0, sizeof(Buf));
     let is i64 as c with mut = 0;
     b.paras = cast(*i64, _grow(cast(*u8, 0), 0, 0, 8 * 64, &c));
+    b.pchars = cast(*i64, _grow(cast(*u8, 0), 0, 0, c, &c));
     b.para_cap = c / 8;
     b.paras[0] = 0;
+    b.pchars[0] = 0;
     b.npara = 1;
     return b;
 }
 
 fn close(b as *Buf) as void {
     if (b.cap > 0) { mem.core.munmap(b.block, b.cap); }
-    if (b.para_cap > 0) { mem.core.munmap(cast(*u8, b.paras), b.para_cap * 8); }
+    if (b.para_cap > 0) {
+        mem.core.munmap(cast(*u8, b.paras), b.para_cap * 8);
+        mem.core.munmap(cast(*u8, b.pchars), b.para_cap * 8);
+    }
     if (b.rec_cap > 0) { mem.core.munmap(cast(*u8, b.recs), b.rec_cap * sizeof(Rec)); }
     if (b.group_cap > 0) { mem.core.munmap(cast(*u8, b.groups), b.group_cap * sizeof(Group)); }
     if (b.store_cap > 0) { mem.core.munmap(b.store, b.store_cap); }
@@ -112,6 +134,15 @@ fn close(b as *Buf) as void {
 }
 
 fn length(b as *Buf) as i64 { return b.len; }
+
+// How many characters it holds.
+fn chars(b as *Buf) as i64 { return b.nchars; }
+
+// Who is told every edit, with user; null for nobody.
+fn set_listener(b as *Buf, cb as EditFn, user as *u8) as void {
+    b.listen = cb;
+    b.listen_user = user;
+}
 fn added(b as *Buf) as i64 { return b.added; }
 
 // --- The gap ---
@@ -240,31 +271,85 @@ fn para_of(b as *Buf, at as i64) as i64 {
     return lo;
 }
 
-// Paragraph starts after offset at moved by by.
-fn _shift(b as *Buf, from as i64, by as i64) as void {
+// Paragraphs from paragraph from on moved by by bytes and chs characters.
+fn _shift(b as *Buf, from as i64, by as i64, chs as i64) as void {
     let is i64 as i with mut = from;
     while (i < b.npara) {
         b.paras[i] = b.paras[i] + by;
+        b.pchars[i] = b.pchars[i] + chs;
         i = i + 1;
     }
 }
 
-fn _add_para(b as *Buf, i as i64, start as i64) as i32 {
+fn _add_para(b as *Buf, i as i64, start as i64, ch as i64) as i32 {
     if (b.npara >= b.para_cap) {
-        let is i64 as c with mut = 0;
-        let is *u8 as q = _grow(cast(*u8, b.paras), b.npara * 8, b.para_cap * 8, (b.npara + 1) * 8, &c);
-        if (cast(i64, q) == 0) { return 0; }
+        // Both arrays grown together, or neither.
+        let is i64 as c with mut = b.para_cap * 2;
+        if (c < 64) { c = 64; }
+        let is *u8 as q = mem.core.mmap_anon(c * 8);
+        let is *u8 as q2 = mem.core.mmap_anon(c * 8);
+        if (cast(i64, q) <= 0 || cast(i64, q2) <= 0) {
+            if (cast(i64, q) > 0) { mem.core.munmap(q, c * 8); }
+            if (cast(i64, q2) > 0) { mem.core.munmap(q2, c * 8); }
+            return 0;
+        }
+        mem.memcpy(q, cast(*u8, b.paras), b.npara * 8);
+        mem.memcpy(q2, cast(*u8, b.pchars), b.npara * 8);
+        mem.core.munmap(cast(*u8, b.paras), b.para_cap * 8);
+        mem.core.munmap(cast(*u8, b.pchars), b.para_cap * 8);
         b.paras = cast(*i64, q);
-        b.para_cap = c / 8;
+        b.pchars = cast(*i64, q2);
+        b.para_cap = c;
     }
     let is i64 as k with mut = b.npara;
     while (k > i) {
         b.paras[k] = b.paras[k - 1];
+        b.pchars[k] = b.pchars[k - 1];
         k = k - 1;
     }
     b.paras[i] = start;
+    b.pchars[i] = ch;
     b.npara = b.npara + 1;
     return 1;
+}
+
+fn _starts(c as i64) as i32 { return cast(i32, (c & 192) != 128); }
+
+// The characters before offset at: its paragraph's, then those from its
+// start.
+fn char_of(b as *Buf, at as i64) as i64 {
+    if (at <= 0) { return 0; }
+    if (at >= b.len) { return b.nchars; }
+    let is i64 as p = para_of(b, at);
+    let is i64 as k with mut = b.pchars[p];
+    let is i64 as i with mut = b.paras[p];
+    while (i < at) {
+        if (_starts(byte_at(b, i)) == 1) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+// Where character k starts: found in its paragraph; the end past the last.
+fn byte_of(b as *Buf, k as i64) as i64 {
+    if (k <= 0) { return 0; }
+    if (k >= b.nchars) { return b.len; }
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = b.npara - 1;
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi + 1) / 2;
+        if (b.pchars[mid] <= k) { lo = mid; } else { hi = mid - 1; }
+    }
+    let is i64 as c with mut = b.pchars[lo];
+    let is i64 as i with mut = b.paras[lo];
+    while (i < b.len) {
+        if (_starts(byte_at(b, i)) == 1) {
+            if (c == k) { return i; }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return b.len;
 }
 
 // --- Plain edits ---
@@ -275,6 +360,8 @@ fn _insert(b as *Buf, at as i64, s as *u8, n as i64) as i32 {
     b.added = 0;
     if (at < 0 || at > b.len || n < 0) { return 0; }
     if (_room(b, n) == 0) { return 0; }
+    // Where it goes, in characters, while the text before it is as it was.
+    let is i64 as at_ch = char_of(b, at);
     _move_gap(b, at);
     let is i64 as p = para_of(b, at);
     let is i64 as k with mut = 0;
@@ -295,16 +382,26 @@ fn _insert(b as *Buf, at as i64, s as *u8, n as i64) as i32 {
     b.len = b.len + k;
     b.added = k;
     if (k > 0) { _note(b, at, 0, k); }
-    // The paragraphs after it move, and each line feed starts one.
-    _shift(b, p + 1, k);
+    let is i64 as chs with mut = 0;
     i = 0;
     while (i < k) {
+        if (_starts(cast(i64, b.block[at + i])) == 1) { chs = chs + 1; }
+        i = i + 1;
+    }
+    b.nchars = b.nchars + chs;
+    // The paragraphs after it move, and each line feed starts one.
+    _shift(b, p + 1, k, chs);
+    let is i64 as ch with mut = at_ch;
+    i = 0;
+    while (i < k) {
+        if (_starts(cast(i64, b.block[at + i])) == 1) { ch = ch + 1; }
         if (b.block[at + i] == 10) {
-            if (_add_para(b, p + 1 + made, at + i + 1) == 0) { return 0; }
+            if (_add_para(b, p + 1 + made, at + i + 1, ch) == 0) { return 0; }
             made = made + 1;
         }
         i = i + 1;
     }
+    if (k > 0 && cast(i64, b.listen) != 0) { call(b.listen, b.listen_user, INSERTED, at, cast(*u8, cast(i64, b.block) + at), k); }
     return 1;
 }
 
@@ -312,18 +409,35 @@ fn _insert(b as *Buf, at as i64, s as *u8, n as i64) as i32 {
 fn _delete(b as *Buf, at as i64, n as i64) as i32 {
     if (at < 0 || n < 0 || at + n > b.len) { return 0; }
     _move_gap(b, at);
+    // What goes, right after the gap: told while it is still there.
+    let is *u8 as gone = cast(*u8, cast(i64, b.block) + at + b.gap_len);
+    if (n > 0 && cast(i64, b.listen) != 0) { call(b.listen, b.listen_user, DELETED, at, gone, n); }
+    let is i64 as chs with mut = 0;
+    let is i64 as j with mut = 0;
+    while (j < n) {
+        if (_starts(cast(i64, gone[j])) == 1) { chs = chs + 1; }
+        j = j + 1;
+    }
     b.gap_len = b.gap_len + n;
     b.len = b.len - n;
+    b.nchars = b.nchars - chs;
     if (n > 0) { _note(b, at, n, 0); }
     // Paragraphs starting inside the range go; those after it move back.
     let is i64 as i with mut = 1;
     let is i64 as o with mut = 1;
     while (i < b.npara) {
         let is i64 as st = b.paras[i];
+        let is i64 as sc = b.pchars[i];
         if (st > at && st <= at + n) {
             i = i + 1;
         } else {
-            if (st > at + n) { b.paras[o] = st - n; } else { b.paras[o] = st; }
+            if (st > at + n) {
+                b.paras[o] = st - n;
+                b.pchars[o] = sc - chs;
+            } else {
+                b.paras[o] = st;
+                b.pchars[o] = sc;
+            }
             o = o + 1;
             i = i + 1;
         }
