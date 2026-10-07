@@ -8,8 +8,9 @@
 
 > **Implementation status varies by layer and platform.** The software
 > renderer, image/text stack and retained toolkit have working code and tests;
-> the three toolkit examples are exercised on X11. Wayland has a native socket
-> backend and a Weston host smoke, but complete example acceptance is pending.
+> the three toolkit examples are exercised on X11 and shown with real keyboard
+> and pointer input on a seated Weston/Wayland software compositor. External
+> Wayland clipboard, DnD and installed IME interaction remain unverified.
 > Win32 has generated SDK bindings, an ABI bridge and a directly usable native
 > window backend; the portable toolkit is blocked by the Caustic linker.
 >

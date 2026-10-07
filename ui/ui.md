@@ -549,7 +549,7 @@ theme change restyles them all:
 
 | from | what | state |
 |---|---|---|
-| `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 done; Wayland and Win32 designed |
+| `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 implemented; native Wayland tested with Weston, desktop limits documented; portable Win32 blocked by the compiler |
 | `input/` | events; text input and IME composition | design note |
 | `render/` | `draw2d`, `shapes2d`, scissor, layers | done |
 | `text/` | shaping, layout, caret, hit-testing, colour glyphs | done; complex scripts later |
@@ -1233,6 +1233,13 @@ instead of the window's colour (`draw2d.replace_rect`, written, not blended),
 so the shadow lies over whatever is behind the window. A program gives a
 window its own frame with `app.set_decoration`; the host does the rest.
 
+On Wayland, when the compositor does not supply server decorations, the host
+adds an automatic frame. Original root children keep their overlay layout
+inside its body; popups remain above it. The header follows the window title
+and desktop button layout. Native dialogs are measured with the frame before
+opening, so their content and header fit the native buffer. Explicit
+`app.set_decoration` frames remain application-owned and are not replaced.
+
 **List views** (`widgets/listview.cst`, tested by `listview_test`): the rows
 of a flat model in a scroll area of their own, each as tall as the first,
 with widgets only for the rows in view and one past them; scrolled, each is
@@ -1388,8 +1395,10 @@ pressed, its buttons and its menu are asked of the window manager
 window manager has the pointer; where the window really is and where it takes
 the pointer are told it as the frame is laid out, in physical pixels; the
 frame follows what the window manager says — maximized, full screen, tiled —
-and is drawn flat with no compositing manager. Not yet: an input method's
-candidates placed at the caret.
+and is drawn flat with no compositing manager. Wayland text-input-v3 publishes
+the caret rectangle when the compositor provides the protocol. Candidate
+placement with an installed IME remains unverified; X11 candidate placement
+at the caret is not implemented.
 
 **A program started** (`program.cst`, tested by `program_x11_test` under
 Xvfb on a bare private bus, and with none; its fonts by `system_fonts_test`

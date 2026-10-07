@@ -56,7 +56,9 @@ use "style.cst" as style;
 use "paint.cst" as paint;
 use "layout.cst" as layout;
 use "geom.cst" as geom;
+use "stack.cst" as stack;
 use "widgets/decoration.cst" as decoration;
+use "widgets/headerbar.cst" as headerbar;
 use "../gpu/software/target.cst" as tgt;
 
 // The most windows on the screen at once: X11's table of them.
@@ -101,6 +103,8 @@ struct Native {
     told_in   as [4]i64;         // and the input region
     told_min  as [2]i64;         // the smallest it may be made, as last told, physical pixels
     title     as [256]u8;        // as given to the platform, and a zero
+    frame_layout as [96]u8;
+    frame_layout_len as i32;
     down      as [256]u8;        // keys held, by keycode: a press of one held repeats
 }
 
@@ -347,8 +351,46 @@ fn _paste(user as *u8, which as i32, w as i64) as void {
     }
 }
 
-// A window of the platform's for h, belonging to its owner's if that has
-// one; 1, or 0 when none could be opened.
+// Only the fallback frame follows the system's button layout; an explicit
+// app.set_decoration keeps the program's header widgets and choices.
+fn _sync_frame(hs as *Host, n as *Native) as void {
+    if (n.deco == 0 || app.decoration_is_automatic(hs.a, n.h) == 0) { return; }
+    let is *u8 as buttons with mut = ":minimize,maximize,close";
+    let is i64 as length with mut = 24;
+    if (app.is_dialog(hs.a, n.h) == 1) { buttons = ":close"; length = 6; }
+    if ((hs.desktop.known & wsettings.K_BUTTON_LAYOUT) != 0) {
+        buttons = &hs.desktop.button_layout[0];
+        length = 0;
+        while (length < 96 && buttons[length] != 0) { length = length + 1; }
+    }
+    if (n.frame_layout_len == length && mem.memcmp(&n.frame_layout[0], buttons, length) == 0) { return; }
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    headerbar.set_layout(t, decoration.header_of(t, n.deco), buttons, length);
+    mem.memcpy(&n.frame_layout[0], buttons, length);
+    n.frame_layout_len = cast(i32, length);
+}
+
+// Keep the root's overlay rule when moving its content under a fallback frame.
+fn _automatic_frame(a as *app.App, h as i64) as i64 {
+    let is *tree.Tree as t = app.tree(a, h);
+    let is i64 as root = tree.root(t);
+    let is i64 as child with mut = tree.first_child(t, root);
+    let is i64 as deco = decoration.create(t, root);
+    if (deco == 0) { return 0; }
+    let is i64 as overlay = stack.create_overlay(t, decoration.content_of(t, deco));
+    if (overlay == 0) { tree.destroy(t, deco); return 0; }
+    layout.set_stretch(t, overlay, 1.0, 1.0);
+    while (child != 0 && child != deco) {
+        let is i64 as next = tree.next_sibling(t, child);
+        // Popups keep their root-relative positioning and clip.
+        if (tree.layer(t, child) == 0) { tree.reparent(t, child, overlay); }
+        child = next;
+    }
+    app.set_automatic_decoration(a, h, deco);
+    return deco;
+}
+
+// A platform window for h, owned by its owner's: 1, or 0 on failure.
 fn _put_up(hs as *Host, h as i64) as i32 {
     let is i64 as i with mut = 0;
     while (i < MAX_WINDOWS && _native(hs, i).h != 0) { i = i + 1; }
@@ -357,22 +399,39 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     let is *app.App as a = hs.a;
     _set_title(n, app.title(a, h), app.title_length(a, h));
     let is f64 as s with mut = _scale(hs);
+    let is i64 as o = _slot_of(hs, app.owner(a, h));
+    let is i64 as deco with mut = app.decoration(a, h);
+    if (deco == 0 && o >= 0 && _native(hs, o).win.backend == device.WAYLAND &&
+        app.decoration_is_automatic(a, app.owner(a, h)) == 1) {
+        deco = _automatic_frame(a, h);
+        if (deco == 0) { return 0; }
+    }
+    // Dialogs are sized to their content. Include the fallback frame before
+    // opening, also when a hidden dialog is shown again with different content.
+    if (deco != 0 && app.is_dialog(a, h) == 1 && app.decoration_is_automatic(a, h) == 1) {
+        let is geom.Constraint as free = geom.unbounded();
+        let is geom.Size as pref;
+        layout.measure(app.tree(a, h), deco, &free, &pref);
+        app.resize(a, h, pref.pref_w, pref.pref_h);
+    }
     let is device.Config as c with mut = device.config(cast(*u8, &n.title), cast(i64, app.width(a, h) * s + 0.5),
                                                        cast(i64, app.height(a, h) * s + 0.5));
     if (c.width < 1) { c.width = 1; }
     if (c.height < 1) { c.height = 1; }
-    let is i64 as o = _slot_of(hs, app.owner(a, h));
     if (o >= 0) { c.owner = &_native(hs, o).win; }
     c.dialog = app.is_dialog(a, h);
     c.modal = app.is_modal(a, h);
     // A frame of its own: none of the platform's, its shadow seen through.
-    let is i64 as deco = app.decoration(a, h);
     if (deco != 0) {
         c.transparent = 1;
         c.decorated = 0;
     }
     n.win = device.open_config(&c);
     if (device.is_open(&n.win) == 0) { return 0; }
+    if (deco == 0 && n.win.backend == device.WAYLAND && device.decorated(&n.win) == 0) {
+        deco = _automatic_frame(a, h);
+        if (deco == 0) { device.close(&n.win); return 0; }
+    }
     n.h = h;
     n.hs = hs;
     n.scale = s;
@@ -386,6 +445,7 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.icon_gen = 0;
     n.deco = deco;
     n.let_go = 0;
+    n.frame_layout_len = 0 - 1;
     mem.memset(cast(*u8, &n.down), 0, 256);
     // Nothing told yet (-1 each, all bits set): told with its first frame.
     mem.memset(cast(*u8, &n.told_ext), 255, 32);
@@ -404,6 +464,10 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.scale = _window_scale(hs, n);
     app.set_scale(a, h, n.scale);
     let is *tree.Tree as t = app.tree(a, h);
+    if (deco != 0 && app.decoration_is_automatic(a, h) == 1) {
+        headerbar.set_title(t, decoration.header_of(t, deco), app.title(a, h), app.title_length(a, h));
+        _sync_frame(hs, n);
+    }
     tree.set_clipboard(t, fn_ptr(_copy), cast(*u8, n));
     tree.set_paste(t, fn_ptr(_paste), cast(*u8, n));
     tree.set_window_ops(t, fn_ptr(_window_op), cast(*u8, n));
@@ -465,7 +529,12 @@ fn _sync(hs as *Host) as void {
             if (k != cast(i64, n.title_len) || mem.memcmp(s, cast(*u8, &n.title), k) != 0) {
                 _set_title(n, s, k);
                 device.set_title(&n.win, s, k);
+                if (n.deco != 0 && app.decoration_is_automatic(a, n.h) == 1) {
+                    let is *tree.Tree as t = app.tree(a, n.h);
+                    headerbar.set_title(t, decoration.header_of(t, n.deco), s, k);
+                }
             }
+            _sync_frame(hs, n);
             // The application's icon, as it is now.
             if (n.icon_gen != app.icon_generation(a)) {
                 n.icon_gen = app.icon_generation(a);
