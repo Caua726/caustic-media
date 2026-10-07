@@ -27,7 +27,8 @@ window/
   event.cst       raw platform events and the queue they arrive in
   cursor.cst      shape, visibility, capture
   clipboard.cst   text and data
-  settings.cst    the desktop's settings: dark, accent, fonts, timings
+  settings.cst    the desktop's settings: dark, accent, fonts, timings, language
+  locale.cst      the language the user reads, as a BCP 47 tag
   fonts.cst       where the platform keeps fonts, and the font index
   native.cst      native handle accessors — the public contract
 
@@ -388,7 +389,13 @@ field in order of trust:
   tested against a fake portal on a private bus (`portal_test`) and read from
   this desktop's own by `linux/portal_check.cst`.
 
-`window.read_settings` gives the files and XSETTINGS, and starts watching:
+- `locale.cst`: the user's language, from the environment as POSIX orders
+  it — `LANGUAGE` (its first that is a name; not in the C locale), `LC_ALL`,
+  `LC_MESSAGES`, `LANG` — turned into a tag ("pt_BR.UTF-8" is "pt-BR"), and
+  whether a language is written right to left (`window_locale_test`).
+  Windows' `GetUserDefaultLocaleName` comes with the Win32 backend.
+
+`window.read_settings` gives the files, XSETTINGS and the locale, and starts watching:
 from then on a change arrives as a `SETTINGS` event in the window's queue —
 the pump hands every event to the watcher first, since the daemon's window and
 the root belong to no window here. The portal needs a D-Bus connection, so it
