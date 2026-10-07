@@ -23,7 +23,11 @@
 // below, keeping where across it was; Home and End to its line's ends,
 // Control to the text's; Page Up and Down by the height in view. The
 // pointer places it, drags a selection, a word with a double click and the
-// paragraph with a triple.
+// paragraph with a triple. Pressed inside the selection and dragged, the
+// selection goes where it is dropped — in it, or in another widget that takes
+// text, even another program's — a copy of it with Control, or from a
+// read-only view; text dragged over it from elsewhere goes in where it is
+// dropped, as a paste does, and is selected.
 use "std/mem.cst" as mem;
 use "std/math.cst" as fm;
 use "../../math/math.cst" as math;
@@ -42,6 +46,7 @@ use "../painter.cst" as painter;
 use "../style.cst" as style;
 use "../access.cst" as access;
 use "../router.cst" as router;
+use "../dnd.cst" as dnd;
 use "../scroll.cst" as scroll;
 use "../signal.cst" as signal;
 use "../text.cst" as txt;
@@ -110,7 +115,9 @@ struct Doc {
     wrap        as i32;
     tabs        as i32;     // Tab is typed
     styled      as i32;     // the style is known
-    _pad0       as i32;
+    source      as i32;     // its selection is being dragged, from tmp
+    within      as i32;     // and was dropped in it: done there already
+    _pad1       as i32;
 }
 
 struct Data {
@@ -1302,17 +1309,9 @@ fn _pointer(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
     }
     if (k == event.DRAG_START) {
         if (d.maybe_drag == 0) { return 0; }
-        d.dragging = 1;
-        d.drop = d.press_at;
-        return 1;
+        return _begin_drag(t, w, d);
     }
     if (k == event.POINTER_MOVE) {
-        if (d.dragging == 1) {
-            d.drop = _hit(t, w, d, e.local_x, e.local_y).offset;
-            widget.changed(t, w, widget.CHANGED_PAINT);
-            scroll.follow(t, w, e.x, e.y, e.time);
-            return 1;
-        }
         if (d.pressing == 0 || d.maybe_drag == 1) { return 0; }
         _extend(t, w, d, _hit(t, w, d, e.local_x, e.local_y));
         _moved(t, w, d);
@@ -1323,9 +1322,7 @@ fn _pointer(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
     if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
         if (d.pressing == 0) { return 0; }
         let is i32 as up = cast(i32, k == event.POINTER_UP);
-        if (d.dragging == 1) {
-            if (up == 1) { _drop(t, w, d, cast(i32, (e.mods & keys.MOD_CONTROL) != 0)); }
-        } else if (d.maybe_drag == 1) {
+        if (d.maybe_drag == 1) {
             if (up == 1) {
                 d.anchor = d.press_at;
                 d.caret = d.press_at;
@@ -1336,11 +1333,83 @@ fn _pointer(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
         }
         d.pressing = 0;
         d.maybe_drag = 0;
+        _moved(t, w, d);
+        return 1;
+    }
+    if (k == event.DRAG_OVER) { return _drag_over(t, w, d, e); }
+    if (k == event.DRAG_LEAVE) {
+        d.dragging = 0;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (k == event.DROP) { return _dropped(t, w, d, e); }
+    if (k == event.DRAG_END) {
+        // Moved elsewhere: out of it, as a step of its own.
+        if (d.within == 0 && e.which == dnd.MOVE && d.editable == 1) { _erase_selection(t, w, d); }
+        d.source = 0;
+        d.within = 0;
         d.dragging = 0;
         _moved(t, w, d);
         return 1;
     }
     return 0;
+}
+
+// The selection dragged: a copy of it in tmp, the drag's while it lasts; a
+// move unless it is read-only.
+fn _begin_drag(t as *tree.Tree, w as i64, d as *Doc) as i64 {
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    let is i64 as a = _lo(d);
+    let is i64 as n = _hi(d) - a;
+    if (cast(i64, r) == 0 || n == 0 || _tmp_room(d, n) == 0) { return 0; }
+    textbuf.read(&d.buf, a, n, d.tmp);
+    let is i32 as actions with mut = dnd.COPY;
+    if (d.editable == 1) { actions = actions | dnd.MOVE; }
+    let is dnd.Payload as p = dnd.text(d.tmp, n, actions);
+    if (router.begin_drag(t, r, w, &p) == 0) { return 0; }
+    d.source = 1;
+    d.within = 0;
+    d.pressing = 0;
+    d.maybe_drag = 0;
+    return 1;
+}
+
+// Text dragged over it: taken where the pointer is, unless it is read-only;
+// the area holding it follows past its edge.
+fn _drag_over(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
+    if (d.editable == 0 || (e.which & dnd.TEXT) == 0) {
+        d.dragging = 0;
+        return 0;
+    }
+    d.drop = _hit(t, w, d, e.local_x, e.local_y).offset;
+    d.dragging = 1;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    scroll.follow(t, w, e.x, e.y, e.time);
+    return cast(i64, dnd.TEXT);
+}
+
+// Let go over it: its own selection moved or copied in it; text from
+// elsewhere put in, as a paste, and selected — what was done the drag's
+// action when all of it went in, a copy when part of it did.
+fn _dropped(t as *tree.Tree, w as i64, d as *Doc, e as *event.Event) as i64 {
+    d.dragging = 0;
+    let is *dnd.Payload as p = cast(*dnd.Payload, e.drag);
+    if (d.source == 1 && cast(i64, p.text) == cast(i64, d.tmp)) {
+        _drop(t, w, d, cast(i32, e.which == dnd.COPY));
+        d.within = 1;
+        return cast(i64, e.which);
+    }
+    let is i64 as before = textbuf.length(&d.buf);
+    d.anchor = d.drop;
+    d.caret = d.drop;
+    _put(t, w, d, p.text, p.text_len, 0);
+    let is i64 as k = textbuf.length(&d.buf) - before;
+    if (k <= 0) { return 0; }
+    d.anchor = d.caret - k;
+    tree.request_focus(t, w);
+    _moved(t, w, d);
+    if (k < p.text_len) { return cast(i64, dnd.COPY); }
+    return cast(i64, e.which);
 }
 
 // --- Its context menu ---

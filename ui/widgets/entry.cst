@@ -10,9 +10,13 @@
 // directions meet); Home and End go to the ends; Shift selects as it goes.
 // The pointer places the caret, drags a selection, selects a word with a
 // double click and all of it with a triple; Shift and a click extend. Pressed
-// inside the selection and dragged, the selection goes where it is dropped,
-// a copy of it with Control. What is selected by pointer or keys goes to the
-// primary selection; the middle button pastes it where it is pressed.
+// inside the selection and dragged, the selection goes where it is dropped —
+// in it, or in another widget that takes text, even another program's — a
+// copy of it with Control, or from a read-only entry. Text dragged over it
+// from elsewhere goes in where it is dropped, as a paste does, and is
+// selected; a read-only entry takes none. What is selected by pointer or keys
+// goes to the primary selection; the middle button pastes it where it is
+// pressed.
 // Control and C, X and V — and Insert's old companions — copy, cut and paste
 // through the program's clipboard (tree.set_clipboard, tree.set_paste).
 //
@@ -59,6 +63,7 @@ use "../signal.cst" as signal;
 use "../text.cst" as txt;
 use "../textbuf.cst" as textbuf;
 use "../router.cst" as router;
+use "../dnd.cst" as dnd;
 use "../positioner.cst" as positioner;
 use "menu.cst" as menu;
 use "textedit.cst" as textedit;
@@ -122,10 +127,12 @@ struct Ent {
     activates   as i32;              // Enter is the window's default button's
     pressing    as i32;              // a press is selecting, or may drag
     maybe_drag  as i32;              // pressed inside the selection: a drag or a click, not yet known
-    dragging    as i32;
+    dragging    as i32;              // text dragged over it: where it would go shown
     focused     as i32;
     laid        as i32;              // lay and run hold the text as shown
     bare        as i32;              // drawn with no frame: inside one of its holder's
+    source      as i32;              // its selection is being dragged, from tmp
+    within      as i32;              // and was dropped in it: done there already
 }
 
 struct Data {
@@ -958,16 +965,9 @@ fn _pointer(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
     }
     if (k == event.DRAG_START) {
         if (en.maybe_drag == 0) { return 0; }
-        en.dragging = 1;
-        en.drop = en.press_at;
-        return 1;
+        return _begin_drag(t, w, en);
     }
     if (k == event.POINTER_MOVE) {
-        if (en.dragging == 1) {
-            en.drop = _text_of(en, _hit(t, w, en, e).offset);
-            widget.changed(t, w, widget.CHANGED_PAINT);
-            return 1;
-        }
         if (en.pressing == 0 || en.maybe_drag == 1) { return 0; }
         _end_composition(t, w, en);
         _extend(en, _hit(t, w, en, e));
@@ -977,9 +977,7 @@ fn _pointer(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
     if (k == event.POINTER_UP || k == event.POINTER_CANCEL) {
         if (en.pressing == 0) { return 0; }
         let is i32 as up = cast(i32, k == event.POINTER_UP);
-        if (en.dragging == 1) {
-            if (up == 1) { _drop(t, w, en, cast(i32, (e.mods & keys.MOD_CONTROL) != 0)); }
-        } else if (en.maybe_drag == 1) {
+        if (en.maybe_drag == 1) {
             if (up == 1) {
                 en.anchor = en.press_at;
                 en.caret = en.press_at;
@@ -990,11 +988,81 @@ fn _pointer(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
         }
         en.pressing = 0;
         en.maybe_drag = 0;
+        _moved(t, w, en);
+        return 1;
+    }
+    if (k == event.DRAG_OVER) { return _drag_over(t, w, en, e); }
+    if (k == event.DRAG_LEAVE) {
+        en.dragging = 0;
+        widget.changed(t, w, widget.CHANGED_PAINT);
+        return 1;
+    }
+    if (k == event.DROP) { return _dropped(t, w, en, e); }
+    if (k == event.DRAG_END) {
+        // Moved elsewhere: out of it, as a step of its own.
+        if (en.within == 0 && e.which == dnd.MOVE && en.editable == 1) { _erase_selection(t, w, en); }
+        en.source = 0;
+        en.within = 0;
         en.dragging = 0;
         _moved(t, w, en);
         return 1;
     }
     return 0;
+}
+
+// The selection dragged: a copy of it in tmp, the drag's while it lasts; a
+// move unless it is read-only.
+fn _begin_drag(t as *tree.Tree, w as i64, en as *Ent) as i64 {
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    let is i64 as a = _lo(en);
+    let is i64 as n = _hi(en) - a;
+    if (cast(i64, r) == 0 || n == 0 || _tmp_room(en, n) == 0) { return 0; }
+    textbuf.read(&en.buf, a, n, en.tmp);
+    let is i32 as actions with mut = dnd.COPY;
+    if (en.editable == 1) { actions = actions | dnd.MOVE; }
+    let is dnd.Payload as p = dnd.text(en.tmp, n, actions);
+    if (router.begin_drag(t, r, w, &p) == 0) { return 0; }
+    en.source = 1;
+    en.within = 0;
+    en.pressing = 0;
+    en.maybe_drag = 0;
+    return 1;
+}
+
+// Text dragged over it: taken where the pointer is, unless it is read-only.
+fn _drag_over(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
+    if (en.editable == 0 || en.laid == 0 || (e.which & dnd.TEXT) == 0) {
+        en.dragging = 0;
+        return 0;
+    }
+    en.drop = _text_of(en, _hit(t, w, en, e).offset);
+    en.dragging = 1;
+    widget.changed(t, w, widget.CHANGED_PAINT);
+    return cast(i64, dnd.TEXT);
+}
+
+// Let go over it: its own selection moved or copied in it; text from
+// elsewhere put in, as a paste, and selected — what was done the drag's
+// action when all of it went in, a copy when part of it did.
+fn _dropped(t as *tree.Tree, w as i64, en as *Ent, e as *event.Event) as i64 {
+    en.dragging = 0;
+    let is *dnd.Payload as p = cast(*dnd.Payload, e.drag);
+    if (en.source == 1 && cast(i64, p.text) == cast(i64, en.tmp)) {
+        _drop(t, w, en, cast(i32, e.which == dnd.COPY));
+        en.within = 1;
+        return cast(i64, e.which);
+    }
+    let is i64 as before = _len(en);
+    en.anchor = en.drop;
+    en.caret = en.drop;
+    _put(t, w, en, p.text, p.text_len, _PASTED);
+    let is i64 as k = _len(en) - before;
+    if (k <= 0) { return 0; }
+    en.anchor = en.caret - k;
+    tree.request_focus(t, w);
+    _moved(t, w, en);
+    if (k < p.text_len) { return cast(i64, dnd.COPY); }
+    return cast(i64, e.which);
 }
 
 // --- Keys ---
