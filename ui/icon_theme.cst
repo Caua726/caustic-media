@@ -1,0 +1,489 @@
+// ui/icon_theme.cst — icons by name from the desktop's icon theme.
+//
+// A program asks for "document-save" at 24 pixels and gets its desktop's
+// picture of it, from the icon theme the user chose (the desktop's settings
+// say which: settings.icon_theme). Themes live in directories named after
+// them under base directories — ~/.icons, ~/.local/share/icons, each of
+// XDG_DATA_DIRS' icons — each described by its index.theme: the
+// subdirectories holding icons, the size and scale of each and how strictly
+// (Fixed, Scalable, Threshold), and the themes it inherits from. The lookup
+// is the freedesktop Icon Theme Specification's: the theme's directories
+// that match the size, in the order it lists them, each in every base;
+// else the nearest size there is; else the themes it inherits, then
+// hicolor; else a file of that name in a base directory itself.
+//
+// PNG only: SVG and XPM are passed over, so an icon a theme has only as SVG
+// is found only where another theme has it as PNG. Linux's: Windows has no
+// icon themes.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../image/image.cst" as image;
+use "../image/load.cst" as load;
+
+let is i64 as MAX_DIRS   with imut = 4096;
+let is i64 as MAX_THEMES with imut = 16;      // inherited, followed at most so deep
+let is i64 as INDEX_BYTES with imut = 1048576;
+
+let is i32 as _FIXED     with imut = 0;
+let is i32 as _SCALABLE  with imut = 1;
+let is i32 as _THRESHOLD with imut = 2;
+
+// A subdirectory of a theme, as its index.theme describes it.
+struct Dir {
+    at        as i64;   // its name in the index's text
+    len       as i64;
+    size      as i64;
+    scale     as i64;
+    min       as i64;
+    max       as i64;
+    threshold as i64;
+    kind      as i32;
+    listed    as i32;   // named in Directories or ScaledDirectories
+}
+
+// One theme's index read: its text, its directories — in the order of its
+// sections, and in the order its lists name them, which is the order they
+// are looked in.
+struct Index {
+    text      as *u8;
+    n         as i64;
+    dirs      as *Dir;
+    ndirs     as i64;
+    order     as *i64;   // MAX_DIRS: the listed ones' places in dirs
+    norder    as i64;
+    inherits  as i64;    // where its Inherits list is in the text, -1 for none
+    inh_len   as i64;
+}
+
+fn _is(s as *u8, n as i64, word as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (word[i] == 0 || word[i] != s[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, word[n] == 0);
+}
+
+fn _int(s as *u8, n as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n && s[i] >= 48 && s[i] <= 57) {
+        v = v * 10 + cast(i64, s[i] - 48);
+        i = i + 1;
+    }
+    if (i == 0) { return 0 - 1; }
+    return v;
+}
+
+fn _space(c as u8) as i32 { return cast(i32, c == 32 || c == 9 || c == 13); }
+
+// path, zero-terminated, read whole into buf (cap bytes): how many, -1 for
+// none.
+fn _read(path as *u8, buf as *u8, cap as i64) as i64 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < cap) {
+        r = linux.read(fd, cast(*u8, cast(i64, buf) + n), cap - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    return n;
+}
+
+fn _exists(path as *u8) as i32 {
+    let is [144]u8 as st;
+    return cast(i32, linux.stat(path, cast(*u8, &st)) == 0);
+}
+
+// The sections of ix's text, each a directory, with their keys; then the
+// Directories and ScaledDirectories lists marking those listed.
+fn _parse(ix as *Index) as void {
+    let is *u8 as s = ix.text;
+    let is i64 as n = ix.n;
+    ix.ndirs = 0;
+    ix.norder = 0;
+    ix.inherits = 0 - 1;
+    ix.inh_len = 0;
+    let is i64 as lists with mut = 0;   // where Directories is
+    let is i64 as lists_n with mut = 0;
+    let is i64 as scaled with mut = 0;
+    let is i64 as scaled_n with mut = 0;
+    let is i32 as in_theme with mut = 0;
+    let is *Dir as cur with mut = cast(*Dir, 0);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as e with mut = i;
+        while (e < n && s[e] != 10) { e = e + 1; }
+        let is i64 as a with mut = i;
+        while (a < e && _space(s[a]) == 1) { a = a + 1; }
+        if (a < e && s[a] == 91) {
+            // [section]
+            let is i64 as b with mut = a + 1;
+            while (b < e && s[b] != 93) { b = b + 1; }
+            in_theme = _is(cast(*u8, cast(i64, s) + a + 1), b - a - 1, "Icon Theme");
+            cur = cast(*Dir, 0);
+            if (in_theme == 0 && ix.ndirs < MAX_DIRS) {
+                cur = cast(*Dir, cast(i64, ix.dirs) + ix.ndirs * sizeof(Dir));
+                cur.at = a + 1;
+                cur.len = b - a - 1;
+                cur.size = 0 - 1;
+                cur.scale = 1;
+                cur.min = 0 - 1;
+                cur.max = 0 - 1;
+                cur.threshold = 2;
+                cur.kind = _THRESHOLD;
+                cur.listed = 0;
+                ix.ndirs = ix.ndirs + 1;
+            }
+        } else if (a < e && s[a] != 35) {
+            // key=value
+            let is i64 as k with mut = a;
+            while (k < e && s[k] != 61) { k = k + 1; }
+            if (k < e) {
+                let is i64 as ke with mut = k;
+                while (ke > a && _space(s[ke - 1]) == 1) { ke = ke - 1; }
+                let is i64 as v with mut = k + 1;
+                while (v < e && _space(s[v]) == 1) { v = v + 1; }
+                let is i64 as ve with mut = e;
+                while (ve > v && _space(s[ve - 1]) == 1) { ve = ve - 1; }
+                let is *u8 as key = cast(*u8, cast(i64, s) + a);
+                let is *u8 as val = cast(*u8, cast(i64, s) + v);
+                let is i64 as kn = ke - a;
+                let is i64 as vn = ve - v;
+                if (in_theme == 1) {
+                    if (_is(key, kn, "Directories") == 1) {
+                        lists = v;
+                        lists_n = vn;
+                    } else if (_is(key, kn, "ScaledDirectories") == 1) {
+                        scaled = v;
+                        scaled_n = vn;
+                    } else if (_is(key, kn, "Inherits") == 1) {
+                        ix.inherits = v;
+                        ix.inh_len = vn;
+                    }
+                } else if (cast(i64, cur) != 0) {
+                    if (_is(key, kn, "Size") == 1) { cur.size = _int(val, vn); }
+                    if (_is(key, kn, "Scale") == 1) { cur.scale = _int(val, vn); }
+                    if (_is(key, kn, "MinSize") == 1) { cur.min = _int(val, vn); }
+                    if (_is(key, kn, "MaxSize") == 1) { cur.max = _int(val, vn); }
+                    if (_is(key, kn, "Threshold") == 1) { cur.threshold = _int(val, vn); }
+                    if (_is(key, kn, "Type") == 1) {
+                        if (_is(val, vn, "Fixed") == 1) { cur.kind = _FIXED; }
+                        if (_is(val, vn, "Scalable") == 1) { cur.kind = _SCALABLE; }
+                        if (_is(val, vn, "Threshold") == 1) { cur.kind = _THRESHOLD; }
+                    }
+                }
+            }
+        }
+        i = e + 1;
+    }
+    _mark(ix, lists, lists_n);
+    _mark(ix, scaled, scaled_n);
+    // A size not given is no directory; the bounds not given are its size.
+    let is i64 as d with mut = 0;
+    while (d < ix.ndirs) {
+        let is *Dir as dir = cast(*Dir, cast(i64, ix.dirs) + d * sizeof(Dir));
+        if (dir.size <= 0 || dir.scale <= 0) { dir.listed = 0; }
+        if (dir.min < 0) { dir.min = dir.size; }
+        if (dir.max < 0) { dir.max = dir.size; }
+        d = d + 1;
+    }
+}
+
+// The directories named in the comma-separated list at text[at], n bytes,
+// marked listed, and put in the order they are looked in — each once.
+fn _mark(ix as *Index, at as i64, n as i64) as void {
+    let is i64 as i with mut = at;
+    let is i64 as end = at + n;
+    while (i < end) {
+        let is i64 as e with mut = i;
+        while (e < end && ix.text[e] != 44) { e = e + 1; }
+        let is i64 as d with mut = 0;
+        while (d < ix.ndirs) {
+            let is *Dir as dir = cast(*Dir, cast(i64, ix.dirs) + d * sizeof(Dir));
+            if (dir.listed == 0 && dir.len == e - i &&
+                mem.memcmp(cast(*u8, cast(i64, ix.text) + dir.at), cast(*u8, cast(i64, ix.text) + i), e - i) == 0) {
+                dir.listed = 1;
+                ix.order[ix.norder] = d;
+                ix.norder = ix.norder + 1;
+            }
+            d = d + 1;
+        }
+        i = e + 1;
+    }
+}
+
+// The j-th directory looked in.
+fn _dir(ix as *Index, j as i64) as *Dir { return cast(*Dir, cast(i64, ix.dirs) + ix.order[j] * sizeof(Dir)); }
+
+fn _matches(d as *Dir, size as i64, scale as i64) as i32 {
+    if (d.scale != scale) { return 0; }
+    if (d.kind == _FIXED) { return cast(i32, d.size == size); }
+    if (d.kind == _SCALABLE) { return cast(i32, d.min <= size && size <= d.max); }
+    return cast(i32, d.size - d.threshold <= size && size <= d.size + d.threshold);
+}
+
+fn _distance(d as *Dir, size as i64, scale as i64) as i64 {
+    let is i64 as want = size * scale;
+    if (d.kind == _FIXED) {
+        let is i64 as v = d.size * d.scale - want;
+        if (v < 0) { return 0 - v; }
+        return v;
+    }
+    if (d.kind == _SCALABLE) {
+        if (want < d.min * d.scale) { return d.min * d.scale - want; }
+        if (want > d.max * d.scale) { return want - d.max * d.scale; }
+        return 0;
+    }
+    if (want < (d.size - d.threshold) * d.scale) { return d.min * d.scale - want; }
+    if (want > (d.size + d.threshold) * d.scale) { return want - d.max * d.scale; }
+    return 0;
+}
+
+// --- Paths ---
+
+// base (bn bytes), then each piece there is after a "/", then ".png",
+// zero-terminated, into out (cap bytes): its length, or 0 with no room.
+fn _path(out as *u8, cap as i64, base as *u8, bn as i64, theme as *u8, tn as i64, dir as *u8, dn as i64,
+         name as *u8, nn as i64) as i64 {
+    let is i64 as need with mut = bn + 1 + nn + 5;
+    if (tn > 0) { need = need + 1 + tn; }
+    if (dn > 0) { need = need + 1 + dn; }
+    if (need > cap) { return 0; }
+    let is i64 as k with mut = 0;
+    mem.memcpy(out, base, bn);
+    k = bn;
+    if (tn > 0) {
+        out[k] = cast(u8, 47);
+        mem.memcpy(cast(*u8, cast(i64, out) + k + 1), theme, tn);
+        k = k + 1 + tn;
+    }
+    if (dn > 0) {
+        out[k] = cast(u8, 47);
+        mem.memcpy(cast(*u8, cast(i64, out) + k + 1), dir, dn);
+        k = k + 1 + dn;
+    }
+    out[k] = cast(u8, 47);
+    mem.memcpy(cast(*u8, cast(i64, out) + k + 1), name, nn);
+    k = k + 1 + nn;
+    mem.memcpy(cast(*u8, cast(i64, out) + k), ".png", 5);
+    return k + 4;
+}
+
+// The i-th base of the colon-separated list bases, at *at for *n bytes: 1, or
+// 0 past the last.
+fn _base(bases as *u8, i as i64, at as *i64, n as *i64) as i32 {
+    let is i64 as k with mut = 0;
+    let is i64 as p with mut = 0;
+    while (k < i) {
+        while (bases[p] != 0 && bases[p] != 58) { p = p + 1; }
+        if (bases[p] == 0) { return 0; }
+        p = p + 1;
+        k = k + 1;
+    }
+    let is i64 as e with mut = p;
+    while (bases[e] != 0 && bases[e] != 58) { e = e + 1; }
+    *at = p;
+    *n = e - p;
+    return 1;
+}
+
+let is *u8 as _text with mut = cast(*u8, 0);
+let is *Dir as _dirs with mut = cast(*Dir, 0);
+
+// theme's index.theme, from the first base that has one, into ix: 1, or 0
+// for none.
+fn _index(bases as *u8, theme as *u8, tn as i64, ix as *Index, buf as *u8, dirs as *Dir, order as *i64) as i32 {
+    let is [4096]u8 as path;
+    let is i64 as i with mut = 0;
+    let is i64 as at with mut = 0;
+    let is i64 as bn with mut = 0;
+    while (_base(bases, i, &at, &bn) == 1) {
+        if (bn + tn + 13 < 4096) {
+            mem.memcpy(cast(*u8, &path), cast(*u8, cast(i64, bases) + at), bn);
+            path[bn] = cast(u8, 47);
+            mem.memcpy(cast(*u8, cast(i64, &path) + bn + 1), theme, tn);
+            mem.memcpy(cast(*u8, cast(i64, &path) + bn + 1 + tn), "/index.theme", 13);
+            let is i64 as n = _read(cast(*u8, &path), buf, INDEX_BYTES);
+            if (n >= 0) {
+                ix.text = buf;
+                ix.n = n;
+                ix.dirs = dirs;
+                ix.order = order;
+                _parse(ix);
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The spec's LookupIcon: in theme (tn bytes) alone.
+fn _lookup(bases as *u8, theme as *u8, tn as i64, ix as *Index, name as *u8, nn as i64, size as i64, scale as i64,
+           out as *u8, cap as i64) as i64 {
+    let is [4096]u8 as path;
+    // Its size: the directories that match, in order, each in every base.
+    let is i64 as d with mut = 0;
+    while (d < ix.norder) {
+        let is *Dir as dir = _dir(ix, d);
+        if (dir.listed == 1 && _matches(dir, size, scale) == 1) {
+            let is i64 as b with mut = 0;
+            let is i64 as at with mut = 0;
+            let is i64 as bn with mut = 0;
+            while (_base(bases, b, &at, &bn) == 1) {
+                let is i64 as k = _path(cast(*u8, &path), 4096, cast(*u8, cast(i64, bases) + at), bn, theme, tn,
+                                        cast(*u8, cast(i64, ix.text) + dir.at), dir.len, name, nn);
+                if (k > 0 && _exists(cast(*u8, &path)) == 1) {
+                    if (k + 1 > cap) { return 0; }
+                    mem.memcpy(out, cast(*u8, &path), k + 1);
+                    return k;
+                }
+                b = b + 1;
+            }
+        }
+        d = d + 1;
+    }
+    // Else the nearest: the first of those as near — kept here until the
+    // last is weighed, as one nearer may come with a shorter path.
+    let is [4096]u8 as best_path;
+    let is i64 as best with mut = 0;
+    let is i64 as best_d with mut = 0 - 1;
+    d = 0;
+    while (d < ix.norder) {
+        let is *Dir as dir = _dir(ix, d);
+        if (dir.listed == 1) {
+            let is i64 as b with mut = 0;
+            let is i64 as at with mut = 0;
+            let is i64 as bn with mut = 0;
+            while (_base(bases, b, &at, &bn) == 1) {
+                let is i64 as k = _path(cast(*u8, &path), 4096, cast(*u8, cast(i64, bases) + at), bn, theme, tn,
+                                        cast(*u8, cast(i64, ix.text) + dir.at), dir.len, name, nn);
+                let is i64 as far = _distance(dir, size, scale);
+                if (k > 0 && (best_d < 0 || far < best_d) && _exists(cast(*u8, &path)) == 1) {
+                    mem.memcpy(cast(*u8, &best_path), cast(*u8, &path), k + 1);
+                    best = k;
+                    best_d = far;
+                }
+                b = b + 1;
+            }
+        }
+        d = d + 1;
+    }
+    if (best == 0 || best + 1 > cap) { return 0; }
+    mem.memcpy(out, cast(*u8, &best_path), best + 1);
+    return best;
+}
+
+// A theme's index read, its directories, their order: one mapping.
+fn _buf_bytes() as i64 { return INDEX_BYTES + MAX_DIRS * sizeof(Dir) + MAX_DIRS * 8; }
+
+// The spec's FindIconHelper: in theme, then in what it inherits, depth
+// first; seen holds the themes already looked in.
+fn _helper(bases as *u8, theme as *u8, tn as i64, name as *u8, nn as i64, size as i64, scale as i64,
+           out as *u8, cap as i64, seen as *u8, depth as i64) as i64 {
+    if (depth >= MAX_THEMES) { return 0; }
+    // Each theme once: a theme inheriting back is not looked in again.
+    let is i64 as i with mut = 0;
+    while (i < depth) {
+        let is *u8 as s = cast(*u8, cast(i64, seen) + i * 128);
+        if (_is(theme, tn, s) == 1) { return 0; }
+        i = i + 1;
+    }
+    if (tn >= 128) { return 0; }
+    let is *u8 as mine = cast(*u8, cast(i64, seen) + depth * 128);
+    mem.memcpy(mine, theme, tn);
+    mine[tn] = cast(u8, 0);
+    let is *u8 as buf = mem.core.mmap_anon(_buf_bytes());
+    if (cast(i64, buf) <= 0) { return 0; }
+    let is *Dir as dirs = cast(*Dir, cast(i64, buf) + INDEX_BYTES);
+    let is *i64 as order = cast(*i64, cast(i64, buf) + INDEX_BYTES + MAX_DIRS * sizeof(Dir));
+    let is Index as ix;
+    let is i64 as got with mut = 0;
+    if (_index(bases, theme, tn, &ix, buf, dirs, order) == 1) {
+        got = _lookup(bases, theme, tn, &ix, name, nn, size, scale, out, cap);
+        // Its parents, in the order it lists them.
+        let is i64 as p with mut = ix.inherits;
+        let is i64 as end = ix.inherits + ix.inh_len;
+        while (got == 0 && p >= 0 && p < end) {
+            let is i64 as e with mut = p;
+            while (e < end && buf[e] != 44) { e = e + 1; }
+            got = _helper(bases, cast(*u8, cast(i64, buf) + p), e - p, name, nn, size, scale, out, cap, seen, depth + 1);
+            p = e + 1;
+        }
+    }
+    mem.core.munmap(buf, _buf_bytes());
+    return got;
+}
+
+// Icon name at size by size logical pixels, scale physical pixels to one,
+// from theme — the colon-separated base directories bases looked in, in
+// order (default_bases) — its file's path into out, cap bytes with the NUL:
+// its length, 0 for none.
+fn find(bases as *u8, theme as *u8, name as *u8, size as i64, scale as i64, out as *u8, cap as i64) as i64 {
+    let is i64 as nn with mut = 0;
+    while (name[nn] != 0) { nn = nn + 1; }
+    if (nn == 0) { return 0; }
+    let is i64 as tn with mut = 0;
+    while (theme[tn] != 0) { tn = tn + 1; }
+    let is [2048]u8 as seen;
+    let is i64 as got with mut = _helper(bases, theme, tn, name, nn, size, scale, out, cap, cast(*u8, &seen), 0);
+    if (got == 0) { got = _helper(bases, "hicolor", 7, name, nn, size, scale, out, cap, cast(*u8, &seen), 0); }
+    if (got > 0) { return got; }
+    // A file of that name in a base directory itself.
+    let is [4096]u8 as path;
+    let is i64 as b with mut = 0;
+    let is i64 as at with mut = 0;
+    let is i64 as bn with mut = 0;
+    while (_base(bases, b, &at, &bn) == 1) {
+        let is i64 as k = _path(cast(*u8, &path), 4096, cast(*u8, cast(i64, bases) + at), bn, "", 0, "", 0, name, nn);
+        if (k > 0 && _exists(cast(*u8, &path)) == 1) {
+            if (k + 1 > cap) { return 0; }
+            mem.memcpy(out, cast(*u8, &path), k + 1);
+            return k;
+        }
+        b = b + 1;
+    }
+    return 0;
+}
+
+// The base directories the desktop keeps icons in, colon-separated, into
+// out: home's .icons and .local/share/icons, each of data_dirs (XDG_DATA_DIRS,
+// dn bytes: "" for the usual /usr/local/share:/usr/share) with /icons, then
+// /usr/share/pixmaps. Its length, or 0 when out — cap bytes, its zero too —
+// has no room, and nothing is written past it.
+fn default_bases(home as *u8, hn as i64, data_dirs as *u8, dn as i64, out as *u8, cap as i64) as i64 {
+    let is *u8 as dirs with mut = data_dirs;
+    let is i64 as n with mut = dn;
+    if (n == 0) {
+        dirs = "/usr/local/share:/usr/share";
+        n = 27;
+    }
+    if (2 * hn + 28 > cap) { return 0; }
+    mem.memcpy(out, home, hn);
+    mem.memcpy(cast(*u8, cast(i64, out) + hn), "/.icons:", 8);
+    let is i64 as k with mut = hn + 8;
+    mem.memcpy(cast(*u8, cast(i64, out) + k), home, hn);
+    mem.memcpy(cast(*u8, cast(i64, out) + k + hn), "/.local/share/icons:", 20);
+    k = k + hn + 20;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as e with mut = i;
+        while (e < n && dirs[e] != 58) { e = e + 1; }
+        if (e > i) {
+            if (k + (e - i) + 7 > cap) { return 0; }
+            mem.memcpy(cast(*u8, cast(i64, out) + k), cast(*u8, cast(i64, dirs) + i), e - i);
+            mem.memcpy(cast(*u8, cast(i64, out) + k + e - i), "/icons:", 7);
+            k = k + e - i + 7;
+        }
+        i = e + 1;
+    }
+    if (k + 19 > cap) { return 0; }
+    mem.memcpy(cast(*u8, cast(i64, out) + k), "/usr/share/pixmaps", 19);
+    return k + 18;
+}
+
+// The icon at path, a PNG, decoded: RGBA, its width 0 when it could not be.
+fn load(path as *u8) as image.buffer.Image { return load.file(path); }
