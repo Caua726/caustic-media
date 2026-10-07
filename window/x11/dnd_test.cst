@@ -17,11 +17,18 @@
 //   whose absence breaks drag-and-drop silently.
 //   A drop delivers the paths, decoded: no file:// prefix, no percent escapes.
 //   A source offering a type we do not take is refused rather than left hanging.
+//   The program hears the drag as events — entered (with what is offered),
+//   moved (in window coordinates), left, dropped (with what arrived) — and can
+//   refuse it, or take only text or only files, position by position.
+//   Text is taken as well as files: UTF8_STRING, text/plain;charset=utf-8,
+//   text/plain, offered in the message or in XdndTypeList.
 //
 // Exit code is the number of failures.
 use "std/io.cst" as io;
 use "std/time.cst" as time;
+use "std/mem.cst" as mem;
 use "x11.cst" as x11;
+use "events.cst" as events;
 use "bind/x.cst" as x;
 use "bind/xlib.cst" as xlib;
 use "bind/xevent.cst" as xev;
@@ -118,6 +125,120 @@ fn await_status(w as *x11.window.Window, sd as *u8, a_status as i64, ms as i64) 
     return 0 - 1;
 }
 
+// --- What the program heard ---
+
+let is [32]events.Event as seen;
+let is i64 as nseen with mut = 0;
+// Client messages and selection notices that reached the program: none of the
+// drag's own, every other one.
+let is i64 as messages with mut = 0;
+let is i64 as notices with mut = 0;
+
+fn drain(w as *x11.window.Window) as void {
+    let is events.Event as e;
+    while (x11.poll_event(w, &e) == 1) {
+        if (e.kind >= events.DND_ENTER && e.kind <= events.DND_DROP && nseen < 32) {
+            seen[nseen] = e;
+            nseen = nseen + 1;
+        }
+        if (e.kind == events.OTHER && e.xkind == x.ClientMessage) { messages = messages + 1; }
+        if (e.kind == events.OTHER && e.xkind == x.SelectionNotify) { notices = notices + 1; }
+    }
+}
+
+fn forget() as void {
+    nseen = 0;
+    messages = 0;
+    notices = 0;
+}
+
+// How many drag events of kind k were heard.
+fn heard(k as i32) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nseen) {
+        if (seen[i].kind == k) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The first drag event of kind k heard, from the i-th on: its index, or -1.
+fn saw(k as i32, from as i64) as i64 {
+    let is i64 as i with mut = from;
+    while (i < nseen) {
+        if (seen[i].kind == k) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Pumps both sides for ms: the target's events kept, the source's answers
+// read. The status's accept bit, the finished's accepted bit and the target
+// asked for in a SelectionRequest are left in these, -1 for none.
+let is i64 as status with mut = 0;
+let is i64 as finished with mut = 0;
+let is i64 as asked with mut = 0;
+let is *u8 as serve_data with mut;
+let is i64 as serve_n with mut = 0;
+
+fn pump(w as *x11.window.Window, sd as *u8, a_status as i64, a_finished as i64, ms as i64, until as i32) as void {
+    status = 0 - 1;
+    finished = 0 - 1;
+    asked = 0 - 1;
+    let is i64 as deadline = time.now_ns() + ms * 1000000;
+    while (time.now_ns() < deadline) {
+        x11.next_frame(w);
+        drain(w);
+        while (xlib.XPending(sd) > 0) {
+            xlib.XNextEvent(sd, cast(*u8, &_got));
+            if (xev.kind(&_got) == x.ClientMessage) {
+                let is *xev.XClientMessageEvent as c = xev.client(&_got);
+                if (c.message_type == a_status) { status = c.data[1] & 1; }
+                if (c.message_type == a_finished) { finished = c.data[1] & 1; }
+            }
+            if (xev.kind(&_got) == x.SelectionRequest) {
+                let is *xev.XSelectionRequestEvent as r = xev.selection_request(&_got);
+                asked = r.target;
+                xlib.XChangeProperty(sd, r.requestor, r.property, r.target, 8, x.PropModeReplace, serve_data,
+                                     cast(i32, serve_n));
+                xev.clear(&_ev);
+                let is *xev.XSelectionEvent as sn = xev.selection(&_ev);
+                sn.kind = x.SelectionNotify;
+                sn.requestor = r.requestor;
+                sn.selection = r.selection;
+                sn.target = r.target;
+                sn.property = r.property;
+                sn.time = r.time;
+                xlib.XSendEvent(sd, r.requestor, 0, 0, cast(*u8, &_ev));
+                xlib.XFlush(sd);
+            }
+        }
+        // Done early: 1 a status, 2 a finished.
+        if (until == 1 && status >= 0) { return; }
+        if (until == 2 && finished >= 0) { return; }
+        time.sleep_ms(2);
+    }
+}
+
+fn length(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+fn same_bytes(a as *u8, n as i64, b as *u8) as i32 {
+    if (cast(i64, a) == 0 || n != length(b)) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn hello() as *u8 { return "h\xc3\xa9llo w\xc3\xb6rld"; }
+
 fn main(argc as i64, argv as *u8) as i32 {
     // The target: a normal window, pumped normally.
     let is x11.window.Window as w = x11.open("caustic-dnd-target", 300, 200);
@@ -170,10 +291,14 @@ fn main(argc as i64, argv as *u8) as i32 {
     // --- A drag offering something we do not take ---
     //
     // The answer must be a refusal, not silence.
+    forget();
     send_to(sd, target, a_enter, source, 5 << 24, a_junk, 0, 0);
     send_to(sd, target, a_position, source, 0, (10 << 16) | 20, 0, 0);
     chk_i("an unwanted type is refused, not ignored",
           await_status(&w, sd, a_status, 2000), 0);
+    drain(&w);
+    chk("heard: entered, nothing it takes offered", saw(events.DND_ENTER, 0) >= 0 && seen[saw(events.DND_ENTER, 0)].drop == 0);
+    forget();
 
     // --- A drag offering text/uri-list ---
     send_to(sd, target, a_enter, source, 5 << 24, a_uri, 0, 0);
@@ -218,13 +343,202 @@ fn main(argc as i64, argv as *u8) as i32 {
     chk_str("the first path is decoded", x11.dropped_file(&w, 0), "/tmp/one.txt");
     // %20 is a space, and a path that keeps the escape is the bug this catches.
     chk_str("and so is the second", x11.dropped_file(&w, 1), "/tmp/two three.txt");
+    drain(&w);
+    let is i64 as en with mut = saw(events.DND_ENTER, 0);
+    let is i64 as mv with mut = saw(events.DND_MOVE, 0);
+    let is i64 as dr with mut = saw(events.DND_DROP, 0);
+    chk("heard: entered with files offered", en >= 0 && seen[en].drop == x11.DROP_FILES);
+    chk("heard: moved, where", mv > en && seen[mv].x == 30 && seen[mv].y == 40);
+    chk("heard: dropped, files, where", dr > mv && seen[dr].drop == x11.DROP_FILES && seen[dr].x == 30 && seen[dr].y == 40);
+    chk("heard once each, and none of it as anything else", heard(events.DND_ENTER) == 1 && heard(events.DND_DROP) == 1 &&
+        messages == 0 && notices == 0);
+    chk("past the last file: none", cast(i64, x11.dropped_file(&w, 2)) == 0);
 
     x11.clear_drop(&w);
     chk_i("clearing forgets the drop", x11.dropped_files(&w), 0);
 
+    let is i64 as a_finished = xlib.XInternAtom(sd, "XdndFinished", 0);
+    let is i64 as a_leave    = xlib.XInternAtom(sd, "XdndLeave", 0);
+    let is i64 as a_utf8     = xlib.XInternAtom(sd, "UTF8_STRING", 0);
+    let is i64 as a_text_utf8 = xlib.XInternAtom(sd, "text/plain;charset=utf-8", 0);
+    let is i64 as a_text     = xlib.XInternAtom(sd, "text/plain", 0);
+    let is i64 as a_types    = xlib.XInternAtom(sd, "XdndTypeList", 0);
+    serve_data = uris();
+    serve_n = uri_bytes();
+
+    // --- Where, in the window: the source says where on the screen ---
+    x11.move_to(&w, 50, 60);
+    xlib.XSync(td, 0);
+    n = 0;
+    while (n < 8) { x11.next_frame(&w); n = n + 1; }
+    forget();
+    send_to(sd, target, a_enter, source, 5 << 24, a_uri, 0, 0);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    drain(&w);
+    mv = saw(events.DND_MOVE, 0);
+    chk("moved: in the window's coordinates", mv >= 0 && seen[mv].x == 30 && seen[mv].y == 40 &&
+        x11.drag_x(&w) == 30 && x11.drag_y(&w) == 40);
+    send_to(sd, target, a_leave, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 300, 0);
+    chk("left: heard", saw(events.DND_LEAVE, 0) >= 0 && x11.dragging(&w) == 0);
+
+    // --- Not ours: still the program's ---
+    chk("no drag: nothing to answer", x11.drop_answer(&w, x11.DROP_FILES) == 0 && x11.drop_offered(&w) == 0);
+    forget();
+    send_to(sd, target, xlib.XInternAtom(sd, "CAUSTIC_SOMETHING", 0), source, 0, 0, 0, 0);
+    // The clipboard's answer, a SelectionNotify as the drop's is: the clipboard's.
+    let is i64 as clip_at = xlib.XInternAtom(sd, "CAUSTIC_SELECTION", 0);
+    xlib.XChangeProperty(sd, target, clip_at, a_utf8, 8, x.PropModeReplace, "clip", 4);
+    xev.clear(&_ev);
+    let is *xev.XSelectionEvent as other = xev.selection(&_ev);
+    other.kind = x.SelectionNotify;
+    other.requestor = target;
+    other.selection = xlib.XInternAtom(sd, "CLIPBOARD", 0);
+    other.target = a_utf8;
+    other.property = clip_at;
+    xlib.XSendEvent(sd, target, 0, 0, cast(*u8, &_ev));
+    xlib.XFlush(sd);
+    pump(&w, sd, a_status, a_finished, 300, 0);
+    chk("a message of someone else's: heard, and as nothing of a drag", messages == 1 && nseen == 0);
+    let is [16]u8 as clip;
+    chk("a selection notice for the clipboard: the clipboard's", x11.clipboard_text(&w, cast(*u8, &clip), 16) == 4 &&
+        clip[0] == cast(u8, 99) && notices == 0);
+
+    // --- A position with no enter before it: still answered ---
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk_i("a position out of nowhere: answered, nothing taken", status, 0);
+    send_to(sd, target, a_leave, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 300, 0);
+
+    // --- Refused by the program, where it is ---
+    forget();
+    send_to(sd, target, a_enter, source, 5 << 24, a_uri, 0, 0);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk_i("files: taken, until the program says", status, 1);
+    chk("refused: said at once", x11.drop_answer(&w, 0) == 1);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk_i("refused: the source told without asking", status, 0);
+    send_to(sd, target, a_position, source, 0, (81 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk_i("refused: still, at the next position", status, 0);
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 2);
+    chk("refused: dropped, finished unaccepted, nothing asked", finished == 0 && asked == 0 - 1);
+    chk("refused: heard as left, nothing dropped", saw(events.DND_LEAVE, 0) >= 0 && saw(events.DND_DROP, 0) == 0 - 1 &&
+        x11.dropped_files(&w) == 0);
+
+    // --- Text ---
+    serve_data = hello();
+    serve_n = length(hello());
+    forget();
+    send_to(sd, target, a_enter, source, 5 << 24, a_utf8, 0, 0);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk_i("text: taken", status, 1);
+    chk("text: heard offered", saw(events.DND_ENTER, 0) >= 0 && seen[saw(events.DND_ENTER, 0)].drop == x11.DROP_TEXT);
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 3000, 2);
+    chk("text: asked as UTF8_STRING, finished accepted", asked == a_utf8 && finished == 1);
+    dr = saw(events.DND_DROP, 0);
+    chk("text: dropped, heard", dr >= 0 && seen[dr].drop == x11.DROP_TEXT && seen[dr].x == 30);
+    chk("text: what arrived", same_bytes(x11.dropped_text(&w), x11.dropped_text_length(&w), hello()) == 1 &&
+        x11.dropped_files(&w) == 0);
+    x11.clear_drop(&w);
+    chk("text: cleared", x11.dropped_text_length(&w) == 0 && cast(i64, x11.dropped_text(&w)) == 0);
+
+    // --- Of the text types, UTF8_STRING first, then text/plain;charset=utf-8 ---
+    serve_data = "pick";
+    serve_n = 4;
+    send_to(sd, target, a_enter, source, 5 << 24, a_text_utf8, a_utf8, a_text);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk("text types: what is offered, while it is", x11.drop_offered(&w) == x11.DROP_TEXT);
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 3000, 2);
+    chk("text types: UTF8_STRING asked for", asked == a_utf8);
+    send_to(sd, target, a_enter, source, 5 << 24, a_text, a_text_utf8, 0);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 3000, 2);
+    chk("text types: text/plain;charset=utf-8 before text/plain", asked == a_text_utf8);
+    chk("text types: over, nothing offered", x11.drop_offered(&w) == 0);
+
+    // --- Text longer than is kept: cut at a character's start ---
+    let is *u8 as big = mem.core.mmap_anon(70000);
+    let is i64 as b with mut = 0;
+    while (b < 70000) {
+        big[b] = cast(u8, 97);
+        b = b + 1;
+    }
+    // A two-byte character across the limit.
+    big[65535] = cast(u8, 195);
+    big[65536] = cast(u8, 169);
+    serve_data = big;
+    serve_n = 70000;
+    send_to(sd, target, a_enter, source, 5 << 24, a_utf8, 0, 0);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 3000, 2);
+    chk_i("long text: kept up to the character the limit falls in", x11.dropped_text_length(&w), 65535);
+    mem.core.munmap(big, 70000);
+
+    // --- Both offered: files first, text when the program takes only that ---
+    forget();
+    send_to(sd, target, a_enter, source, 5 << 24, a_text_utf8, a_uri, 0);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk("both: heard offered", saw(events.DND_ENTER, 0) >= 0 &&
+        seen[saw(events.DND_ENTER, 0)].drop == (x11.DROP_FILES | x11.DROP_TEXT));
+    x11.drop_answer(&w, x11.DROP_TEXT);
+    serve_data = "plain";
+    serve_n = 5;
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 3000, 2);
+    chk("both, text taken: asked as text/plain;charset=utf-8", asked == a_text_utf8 && finished == 1 &&
+        same_bytes(x11.dropped_text(&w), x11.dropped_text_length(&w), "plain") == 1);
+    forget();
+    serve_data = uris();
+    serve_n = uri_bytes();
+    send_to(sd, target, a_enter, source, 5 << 24, a_text_utf8, a_uri, 0);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 3000, 2);
+    chk("both, nothing said: files", asked == a_uri && x11.dropped_files(&w) == 2 && x11.dropped_text_length(&w) == 0);
+
+    // --- More than three: in XdndTypeList ---
+    let is [4]i64 as types;
+    types[0] = a_junk;
+    types[1] = xlib.XInternAtom(sd, "application/x-more", 0);
+    types[2] = xlib.XInternAtom(sd, "image/png", 0);
+    types[3] = a_text;
+    xlib.XChangeProperty(sd, source, a_types, xlib.XInternAtom(sd, "ATOM", 0), 32, x.PropModeReplace, cast(*u8, &types), 4);
+    xlib.XFlush(sd);
+    forget();
+    serve_data = "listed";
+    serve_n = 6;
+    send_to(sd, target, a_enter, source, (5 << 24) | 1, a_junk, types[1], types[2]);
+    send_to(sd, target, a_position, source, 0, (80 << 16) | 100, 0, 0);
+    pump(&w, sd, a_status, a_finished, 2000, 1);
+    chk("listed: text/plain found in the list", status == 1 && saw(events.DND_ENTER, 0) >= 0 &&
+        seen[saw(events.DND_ENTER, 0)].drop == x11.DROP_TEXT);
+    send_to(sd, target, a_drop, source, 0, 0, 0, 0);
+    pump(&w, sd, a_status, a_finished, 3000, 2);
+    chk("listed: asked as text/plain", asked == a_text && same_bytes(x11.dropped_text(&w), x11.dropped_text_length(&w), "listed") == 1);
+    chk("names", same_bytes(events.kind_name(events.DND_ENTER), 9, "dnd enter") == 1 &&
+        same_bytes(events.kind_name(events.DND_MOVE), 8, "dnd move") == 1 &&
+        same_bytes(events.kind_name(events.DND_LEAVE), 9, "dnd leave") == 1 &&
+        same_bytes(events.kind_name(events.DND_DROP), 8, "dnd drop") == 1);
+
     xlib.XDestroyWindow(sd, source);
     xlib.XCloseDisplay(sd);
     x11.close(&w);
+    chk("closed: no answer to give", x11.drop_answer(&w, 0) == 0);
 
     if (fails == 0) { io.printf("x11 dnd: all checks passed\n"); }
     else { io.printf("  dnd_test: %d failure(s)\n", cast(i64, fails)); }

@@ -1,0 +1,127 @@
+// window/x11/dnd_parse_test.cst — what a drop's bytes become: a URI list made
+// paths, text kept to its limit. No server: the bytes are handed straight to
+// the parsers dnd.cst runs once they have arrived.
+//
+// Exit code is the number of failures.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "dnd.cst" as dnd;
+
+let is i32 as fails with mut = 0;
+
+fn chk(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        fails = fails + 1;
+        io.printf("  FAIL %s\n", name);
+    }
+}
+
+fn length(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != cast(u8, 0)) { n = n + 1; }
+    return n;
+}
+
+fn same(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (b[i] != cast(u8, 0)) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, a[i] == cast(u8, 0));
+}
+
+let is dnd.State as st;
+
+// The list parsed: how many paths.
+fn parse(s as *u8) as i64 {
+    st.dropped = 1;
+    st.count = dnd._parse_uri_list(&st, s, length(s));
+    return st.count;
+}
+
+fn path(i as i64) as *u8 { return dnd.path_at(&st, i); }
+
+fn main(argc as i64, argv as *u8) as i32 {
+    st.paths = mem.core.mmap_anon(dnd.MAX_FILES * dnd.PATH_BYTES + dnd.TEXT_BYTES);
+    st.text = cast(*u8, cast(i64, st.paths) + dnd.MAX_FILES * dnd.PATH_BYTES);
+
+    // --- Hex digits, and what is just outside them ---
+    chk("digits", dnd._hex(48) == 0 && dnd._hex(57) == 9 && dnd._hex(47) == 0 - 1 && dnd._hex(58) == 0 - 1);
+    chk("lower case", dnd._hex(97) == 10 && dnd._hex(102) == 15 && dnd._hex(96) == 0 - 1 && dnd._hex(103) == 0 - 1);
+    chk("upper case", dnd._hex(65) == 10 && dnd._hex(70) == 15 && dnd._hex(64) == 0 - 1 && dnd._hex(71) == 0 - 1);
+
+    // --- A list as file managers send it ---
+    chk("lines, CRLF and LF, a comment, blanks", parse("file:///tmp/a%20b\r\n#file:///not\r\n\r\n  \tfile:///x%2fy%2F\nfile:///c%C3%A9") == 3);
+    chk("escapes decoded, either case", same(path(0), "/tmp/a b") == 1 && same(path(1), "/x/y/") == 1);
+    chk("escaped UTF-8", same(path(2), "/c\xc3\xa9") == 1);
+    chk("past the last: none", cast(i64, path(3)) == 0 && cast(i64, path(0 - 1)) == 0);
+
+    // --- The host part, and what is not file:// ---
+    chk("a host: skipped to the path", parse("file://host/srv/f\n") == 1 && same(path(0), "/srv/f") == 1);
+    chk("a host and no path: nothing", parse("file://host\nfile:///\n") == 1 && same(path(0), "/") == 1);
+    chk("file:// alone: taken as it is", parse("file://\n") == 1 && same(path(0), "file://") == 1);
+    chk("one past it: a host, nothing more", parse("file://a\n") == 0);
+    chk("file:// alone, not first: as it is", parse("/x\nfile://\n") == 2 && same(path(1), "file://") == 1);
+    chk("a short host: skipped all the same", parse("file://a/b\n") == 1 && same(path(0), "/b") == 1);
+    chk("not file://: as it is", parse("http://x/y\n/plain/path\nfile:/one\nfile:x//a\n") == 4 &&
+        same(path(0), "http://x/y") == 1 && same(path(1), "/plain/path") == 1 && same(path(2), "file:/one") == 1 &&
+        same(path(3), "file:x//a") == 1);
+
+    // --- Escapes that are not ---
+    chk("a bad escape: as it is", parse("/bad%zz\n/half%4\n/end%2\n%41BC") == 4 && same(path(0), "/bad%zz") == 1 &&
+        same(path(1), "/half%4") == 1 && same(path(2), "/end%2") == 1 && same(path(3), "ABC") == 1);
+    chk("an escape just at the end", parse("/a%41") == 1 && same(path(0), "/aA") == 1);
+    chk("escapes with a zero digit", parse("/z%30%09") == 1 && same(path(0), "/z0\t") == 1);
+    chk("the first of two digits bad", parse("/q%g1\n/r%1g") == 2 && same(path(0), "/q%g1") == 1 && same(path(1), "/r%1g") == 1);
+
+    // --- Limits ---
+    let is *u8 as many = mem.core.mmap_anon(4096);
+    let is i64 as k with mut = 0;
+    let is i64 as at with mut = 0;
+    while (k < dnd.MAX_FILES + 2) {
+        many[at] = cast(u8, 47);
+        many[at + 1] = cast(u8, 97 + k % 26);
+        many[at + 2] = cast(u8, 10);
+        at = at + 3;
+        k = k + 1;
+    }
+    chk("no more files than there is room for", parse(many) == dnd.MAX_FILES && same(path(dnd.MAX_FILES - 1), "/l") == 1);
+    let is *u8 as long = mem.core.mmap_anon(4096);
+    k = 0;
+    while (k < 1500) {
+        long[k] = cast(u8, 98);
+        k = k + 1;
+    }
+    long[0] = cast(u8, 47);
+    chk("a path longer than kept: cut, terminated", parse(long) == 1 && length(path(0)) == dnd.PATH_BYTES - 1);
+
+    // --- Text kept to its limit ---
+    let is *u8 as text = mem.core.mmap_anon(dnd.TEXT_BYTES + 16);
+    k = 0;
+    while (k < dnd.TEXT_BYTES + 16) {
+        text[k] = cast(u8, 120);
+        k = k + 1;
+    }
+    chk("text within the limit: all of it", dnd._take_text(&st, text, 10) == 10 && st.text[9] == cast(u8, 120));
+    chk("text past the limit: up to it", dnd._take_text(&st, text, dnd.TEXT_BYTES + 4) == dnd.TEXT_BYTES);
+    text[dnd.TEXT_BYTES - 1] = cast(u8, 226);
+    text[dnd.TEXT_BYTES] = cast(u8, 130);
+    text[dnd.TEXT_BYTES + 1] = cast(u8, 172);
+    chk("a character across the limit: left out whole", dnd._take_text(&st, text, dnd.TEXT_BYTES + 4) == dnd.TEXT_BYTES - 1);
+    chk("text exactly the limit: all of it", dnd._take_text(&st, text, dnd.TEXT_BYTES) == dnd.TEXT_BYTES);
+    k = 0;
+    while (k < dnd.TEXT_BYTES + 16) {
+        text[k] = cast(u8, 128);
+        k = k + 1;
+    }
+    chk("nothing but the middles of characters: nothing", dnd._take_text(&st, text, dnd.TEXT_BYTES + 4) == 0);
+
+    if (fails == 0) {
+        io.printf("x11 dnd parse: all checks passed\n");
+        return 0;
+    }
+    io.printf("x11 dnd parse: %d failures\n", fails);
+    return fails;
+}
