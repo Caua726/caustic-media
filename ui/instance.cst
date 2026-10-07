@@ -1,0 +1,214 @@
+// ui/instance.cst — one instance of the application.
+//
+// Started again — a file opened from the file manager, the launcher clicked
+// twice — a program should not open a second copy of itself: the first to
+// own its id on the session bus (a reverse-DNS name, "org.example.Notes")
+// is the application; a later start finds it there, hands over what it was
+// asked — to come forward, to open these files, to do this action — and
+// leaves. What is handed over goes through org.freedesktop.Application,
+// the interface desktops call on applications they start over D-Bus, on the
+// object the specification names: the id with its dots slashes and its
+// dashes underscores ("/org/example/Notes").
+//
+// The connection is the program's, dispatched by its loop (session.cst).
+use "std/mem.cst" as mem;
+use "../dbus/dbus.cst" as dbus;
+
+let is *u8 as IFACE with imut = "org.freedesktop.Application";
+
+// Asked to come forward: cb(user).
+type ActivateFn = fn(*u8) as void;
+// Asked to open uris: cb(user, s, n, count) — count of them back to back,
+// each zero-terminated, n bytes in all.
+type OpenFn = fn(*u8, *u8, i64, i64) as void;
+// Asked to do an action: cb(user, name, n).
+type ActionFn = fn(*u8, *u8, i64) as void;
+
+let is i64 as _DO_NOT_QUEUE  with imut = 4;
+let is i64 as _PRIMARY_OWNER with imut = 1;
+
+struct Instance {
+    c        as *dbus.conn.Conn;
+    primary  as i32;
+    _pad     as i32;
+    id       as [256]u8;
+    path     as [258]u8;
+    path_n   as i64;
+    activate as ActivateFn;
+    open     as OpenFn;
+    action   as ActionFn;
+    user     as *u8;
+    methods  as [3]dbus.conn.Method;
+    iface    as dbus.conn.Interface;
+    uris     as [8192]u8;
+}
+
+// The object path of id, n bytes, into out (n + 2 bytes): its length.
+fn _path_of(id as *u8, n as i64, out as *u8) as i64 {
+    out[0] = cast(u8, 47);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is u8 as c with mut = id[i];
+        if (c == 46) { c = cast(u8, 47); }
+        if (c == 45) { c = cast(u8, 95); }
+        out[i + 1] = c;
+        i = i + 1;
+    }
+    out[n + 1] = cast(u8, 0);
+    return n + 1;
+}
+
+fn _activate(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is *Instance as inst = cast(*Instance, user);
+    if (cast(i64, inst.activate) != 0) { call(inst.activate, inst.user); }
+}
+
+fn _open(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is *Instance as inst = cast(*Instance, user);
+    let is i64 as end = dbus.wire.get_array(&k.args, 4);
+    let is i64 as n with mut = 0;
+    let is i64 as count with mut = 0;
+    while (k.args.err == 0 && k.args.pos < end) {
+        let is i64 as len with mut = 0;
+        let is *u8 as s = dbus.wire.get_string(&k.args, &len);
+        if (k.args.err == 0 && n + len + 1 <= 8192) {
+            mem.memcpy(cast(*u8, cast(i64, &inst.uris) + n), s, len);
+            inst.uris[n + len] = cast(u8, 0);
+            n = n + len + 1;
+            count = count + 1;
+        }
+    }
+    // Back to back, the last one's zero not counted.
+    if (n > 0) { n = n - 1; }
+    if (cast(i64, inst.open) != 0) { call(inst.open, inst.user, cast(*u8, &inst.uris), n, count); }
+}
+
+fn _action(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is *Instance as inst = cast(*Instance, user);
+    let is i64 as len with mut = 0;
+    let is *u8 as name = dbus.wire.get_string(&k.args, &len);
+    if (k.args.err == 0 && cast(i64, inst.action) != 0) { call(inst.action, inst.user, name, len); }
+}
+
+fn _method(m as *dbus.conn.Method, name as *u8, ins as *u8, h as dbus.conn.MethodFn, names as *u8) as void {
+    m.name = name;
+    m.in_sig = ins;
+    m.out_sig = "";
+    m.handler = h;
+    m.in_names = names;
+    m.out_names = cast(*u8, 0);
+}
+
+// The application id, n bytes, claimed on c: 1 when this is the instance,
+// what it is asked handed to the callbacks (any null) as c is dispatched;
+// 0 when another is — hand it what this start was asked (*_remote) and
+// leave.
+fn claim(inst as *Instance, c as *dbus.conn.Conn, id as *u8, n as i64, on_activate as ActivateFn, on_open as OpenFn,
+         on_action as ActionFn, user as *u8) as i32 {
+    inst.c = c;
+    inst.primary = 0;
+    inst.activate = on_activate;
+    inst.open = on_open;
+    inst.action = on_action;
+    inst.user = user;
+    if (n <= 0 || n > 255) { return 0; }
+    mem.memcpy(cast(*u8, &inst.id), id, n);
+    inst.id[n] = cast(u8, 0);
+    inst.path_n = _path_of(id, n, cast(*u8, &inst.path));
+    if (dbus.conn.request_name(c, cast(*u8, &inst.id), _DO_NOT_QUEUE) != _PRIMARY_OWNER) { return 0; }
+    _method(&inst.methods[0], "Activate", "a{sv}", fn_ptr(_activate), "platform_data");
+    _method(&inst.methods[1], "Open", "asa{sv}", fn_ptr(_open), "uris,platform_data");
+    _method(&inst.methods[2], "ActivateAction", "sava{sv}", fn_ptr(_action), "action_name,parameter,platform_data");
+    inst.iface.name = IFACE;
+    inst.iface.methods = cast(*dbus.conn.Method, &inst.methods);
+    inst.iface.nmethods = 3;
+    inst.iface.props = cast(*dbus.conn.Property, 0);
+    inst.iface.nprops = 0;
+    inst.iface.signals = cast(*dbus.conn.SignalDecl, 0);
+    inst.iface.nsignals = 0;
+    dbus.conn.export(c, cast(*u8, &inst.path), &inst.iface, 1, cast(*u8, inst));
+    inst.primary = 1;
+    return 1;
+}
+
+fn is_primary(inst as *Instance) as i32 { return inst.primary; }
+
+fn path(inst as *Instance) as *u8 { return cast(*u8, &inst.path); }
+
+fn path_length(inst as *Instance) as i64 { return inst.path_n; }
+
+// No longer the instance: the name and the object let go.
+fn release(inst as *Instance) as void {
+    if (inst.primary == 0) { return; }
+    dbus.conn.unexport(inst.c, cast(*u8, &inst.path));
+    dbus.conn.release_name(inst.c, cast(*u8, &inst.id));
+    inst.primary = 0;
+}
+
+fn _message(id as *u8, n as i64, member as *u8, sig as *u8, name as *u8, p as *u8) as dbus.message.Message {
+    mem.memcpy(name, id, n);
+    name[n] = cast(u8, 0);
+    _path_of(id, n, p);
+    let is dbus.message.Message as m with mut = dbus.message.method_call(name, p, IFACE, member);
+    m.signature = sig;
+    return m;
+}
+
+fn _empty_dict(w as *dbus.wire.Writer) as void {
+    let is i64 as at = dbus.wire.put_array(w, 8);
+    dbus.wire.put_array_end(w, at, 8);
+}
+
+fn _call(c as *dbus.conn.Conn, m as *dbus.message.Message) as i32 {
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    return cast(i32, dbus.conn.call_method(c, m, 2000, &rep) == dbus.conn.OK);
+}
+
+// The instance of id, n bytes, asked to come forward: 1 when it answered.
+fn activate_remote(c as *dbus.conn.Conn, id as *u8, n as i64) as i32 {
+    if (n <= 0 || n > 255) { return 0; }
+    let is [256]u8 as name;
+    let is [258]u8 as p;
+    let is dbus.message.Message as m with mut = _message(id, n, "Activate", "a{sv}", cast(*u8, &name), cast(*u8, &p));
+    _empty_dict(dbus.conn.body(c));
+    return _call(c, &m);
+}
+
+// The instance of id asked to open count uris, back to back at s, each
+// zero-terminated, n bytes in all: 1 when it answered.
+fn open_remote(c as *dbus.conn.Conn, id as *u8, n as i64, s as *u8, sn as i64, count as i64) as i32 {
+    if (n <= 0 || n > 255) { return 0; }
+    let is [256]u8 as name;
+    let is [258]u8 as p;
+    let is dbus.message.Message as m with mut = _message(id, n, "Open", "asa{sv}", cast(*u8, &name), cast(*u8, &p));
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    let is i64 as at = dbus.wire.put_array(w, 4);
+    let is i64 as i with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < count && i < sn) {
+        let is i64 as e with mut = i;
+        while (e < sn && s[e] != 0) { e = e + 1; }
+        dbus.wire.put_string_n(w, cast(*u8, cast(i64, s) + i), e - i);
+        i = e + 1;
+        k = k + 1;
+    }
+    dbus.wire.put_array_end(w, at, 4);
+    _empty_dict(w);
+    return _call(c, &m);
+}
+
+// The instance of id asked to do the action name (an), with no parameter:
+// 1 when it answered.
+fn action_remote(c as *dbus.conn.Conn, id as *u8, n as i64, action as *u8, an as i64) as i32 {
+    if (n <= 0 || n > 255) { return 0; }
+    let is [256]u8 as name;
+    let is [258]u8 as p;
+    let is dbus.message.Message as m with mut = _message(id, n, "ActivateAction", "sava{sv}", cast(*u8, &name), cast(*u8, &p));
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    dbus.wire.put_string_n(w, action, an);
+    // No parameter: an empty array of variants, which align to a byte.
+    let is i64 as at = dbus.wire.put_array(w, 1);
+    dbus.wire.put_array_end(w, at, 1);
+    _empty_dict(w);
+    return _call(c, &m);
+}

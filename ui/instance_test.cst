@@ -1,0 +1,195 @@
+// ui/instance_test.cst — one instance of an application: the first to own
+// its id on the session bus is the application; a later start finds it,
+// hands over what it was asked and leaves. On a private bus:
+//   sh dbus/tools/run_dbus.sh ./build/instance_test
+// The later start is a child process.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+use "instance.cst" as instance;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+let is i64 as activated with mut = 0;
+let is i64 as opened with mut = 0;
+let is i64 as opens with mut = 0;
+let is [8192]u8 as uris with mut;
+let is i64 as uris_n with mut = 0;
+let is [64]u8 as action with mut;
+let is i64 as action_n with mut = 0;
+
+fn on_activate(user as *u8) as void { activated = activated + 1; }
+
+fn on_open(user as *u8, s as *u8, n as i64, count as i64) as void {
+    opened = count;
+    opens = opens + 1;
+    uris_n = n;
+    if (n < 0 || n > 8192) { return; }
+    mem.memcpy(cast(*u8, &uris), s, n);
+}
+
+fn on_action(user as *u8, name as *u8, n as i64) as void {
+    if (n > 64) { return; }
+    mem.memcpy(cast(*u8, &action), name, n);
+    action_n = n;
+}
+
+let is *u8 as ID with imut = "org.caustic.Test-App";
+
+// An id as long as a bus name may be: 255 bytes.
+let is [256]u8 as long_id with mut;
+
+// What each later start does, in turn; the instance looks between them.
+let is i64 as step with mut = 0;
+
+// The later start: not the instance; what it was asked handed over.
+fn later() as i64 {
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    if (dbus.conn.is_open(&c) == 0) { return 2; }
+    if (step == 0) {
+        let is instance.Instance as mine with mut;
+        if (instance.claim(&mine, &c, ID, 20, fn_ptr(on_activate), fn_ptr(on_open), fn_ptr(on_action), cast(*u8, 0)) != 0) { return 3; }
+        let is *u8 as two = "file:///a.txt\0file:///b%20c.txt";
+        if (instance.open_remote(&c, ID, 20, two, 31, 2) != 1) { return 4; }
+        if (instance.action_remote(&c, ID, 20, "new-window", 10) != 1) { return 5; }
+        if (instance.activate_remote(&c, ID, 20) != 1) { return 6; }
+    } else if (step == 1) {
+        // Shorter ones in the same place: each its own zero.
+        if (instance.open_remote(&c, ID, 20, "x\0yy", 4, 2) != 1) { return 7; }
+    } else if (step == 2) {
+        // Fewer asked for than are there.
+        if (instance.open_remote(&c, ID, 20, "one\0two", 7, 1) != 1) { return 8; }
+    } else if (step == 3) {
+        // The length ending where a second would begin; then inside one.
+        if (instance.open_remote(&c, ID, 20, "a\0b", 2, 2) != 1) { return 9; }
+    } else if (step == 4) {
+        if (instance.open_remote(&c, ID, 20, "ab", 1, 1) != 1) { return 10; }
+    } else if (step == 5) {
+        if (instance.open_remote(&c, ID, 20, "", 0, 0) != 1) { return 11; }
+    } else if (step == 6) {
+        // Exactly as much as it keeps, then a byte more.
+        let is *u8 as big = mem.core.mmap_anon(8200);
+        mem.memset(big, 117, 8200);
+        big[4095] = cast(u8, 0);
+        big[8191] = cast(u8, 0);
+        big[8193] = cast(u8, 0);
+        if (instance.open_remote(&c, ID, 20, big, 8194, 3) != 1) { return 12; }
+    } else if (step == 7) {
+        // An id as long as a name may be, and longer, and none.
+        if (instance.activate_remote(&c, cast(*u8, &long_id), 255) != 1) { return 13; }
+        if (instance.open_remote(&c, cast(*u8, &long_id), 255, "z", 1, 1) != 1) { return 14; }
+        if (instance.action_remote(&c, cast(*u8, &long_id), 255, "go", 2) != 1) { return 15; }
+        if (instance.activate_remote(&c, cast(*u8, &long_id), 256) != 0) { return 16; }
+        if (instance.open_remote(&c, cast(*u8, &long_id), 256, "z", 1, 1) != 0) { return 17; }
+        if (instance.action_remote(&c, cast(*u8, &long_id), 256, "go", 2) != 0) { return 18; }
+        if (instance.activate_remote(&c, ID, 0) != 0 || instance.open_remote(&c, ID, 0, "z", 1, 1) != 0 ||
+            instance.action_remote(&c, ID, 0, "go", 2) != 0) { return 19; }
+    }
+    dbus.conn.close(&c);
+    return 0;
+}
+
+// The later start run, the instance dispatching meanwhile: its status.
+fn run_later(c as *dbus.conn.Conn) as i32 {
+    let is i64 as pid = linux.fork();
+    if (pid == 0) { linux.exit(later()); }
+    let is i32 as status with mut = 0 - 1;
+    let is i64 as until = time.now_ms() + 5000;
+    let is i32 as done with mut = 0;
+    while (done == 0 && time.now_ms() < until) {
+        dbus.conn.dispatch(c, 20);
+        if (linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) { done = 1; }
+    }
+    // What it sent last, dispatched.
+    dbus.conn.dispatch(c, 50);
+    step = step + 1;
+    if (done == 0) { return 0 - 1; }
+    return status;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    check("a session bus", dbus.conn.is_open(&c) == 1);
+    let is instance.Instance as first with mut;
+    check("the first: the instance", instance.claim(&first, &c, ID, 20, fn_ptr(on_activate), fn_ptr(on_open), fn_ptr(on_action),
+          cast(*u8, 0)) == 1 && instance.is_primary(&first) == 1);
+    check("its object where the specification puts it", same(instance.path(&first), instance.path_length(&first),
+          "/org/caustic/Test_App") == 1);
+    mem.memcpy(cast(*u8, &long_id), "org.", 4);
+    mem.memset(cast(*u8, cast(i64, &long_id) + 4), 97, 251);
+    long_id[255] = cast(u8, 0);
+    let is instance.Instance as longest with mut;
+    check("an id of 255 bytes: claimed", instance.claim(&longest, &c, cast(*u8, &long_id), 255, fn_ptr(on_activate),
+          fn_ptr(on_open), fn_ptr(on_action), cast(*u8, 0)) == 1 && instance.path_length(&longest) == 256);
+    let is instance.Instance as none with mut;
+    check("of 256: not", instance.claim(&none, &c, cast(*u8, &long_id), 256, fn_ptr(on_activate), fn_ptr(on_open),
+          fn_ptr(on_action), cast(*u8, 0)) == 0);
+    check("of none: not", instance.claim(&none, &c, ID, 0, fn_ptr(on_activate), fn_ptr(on_open), fn_ptr(on_action),
+          cast(*u8, 0)) == 0);
+
+    check("the later start: not the instance, all handed over", run_later(&c) == 0);
+    check("files to open, handed over, back to back", opened == 2 && uris_n == 31 &&
+          mem.memcmp(cast(*u8, &uris), "file:///a.txt\0file:///b%20c.txt", 31) == 0);
+    check("an action", same(cast(*u8, &action), action_n, "new-window") == 1);
+    check("activated", activated == 1);
+    check("shorter ones after: each its own zero", run_later(&c) == 0 && opened == 2 && uris_n == 4 &&
+          mem.memcmp(cast(*u8, &uris), "x\0yy", 4) == 0);
+    check("fewer asked for than there are: those", run_later(&c) == 0 && opened == 1 && uris_n == 3 &&
+          mem.memcmp(cast(*u8, &uris), "one", 3) == 0);
+    check("the length ending where another would begin: one", run_later(&c) == 0 && opened == 1 && uris_n == 1 &&
+          uris[0] == 97);
+    check("the length inside one: that much of it", run_later(&c) == 0 && opened == 1 && uris_n == 1 && uris[0] == 97);
+    check("none: none, nothing", run_later(&c) == 0 && opened == 0 && uris_n == 0);
+    check("as much as it keeps, and no more", run_later(&c) == 0 && opened == 2 && uris_n == 8191);
+    activated = 0;
+    action_n = 0;
+    let is i64 as opens_before = opens;
+    check("an id of 255: asked of it; longer or none: not", run_later(&c) == 0 && activated == 1 &&
+          opens == opens_before + 1 && same(cast(*u8, &action), action_n, "go") == 1);
+    instance.release(&longest);
+
+    instance.release(&first);
+    check("let go: not the instance any more", instance.is_primary(&first) == 0);
+    let is instance.Instance as again with mut;
+    check("the name free again: whoever asks next", instance.claim(&again, &c, ID, 20, fn_ptr(on_activate), fn_ptr(on_open),
+          fn_ptr(on_action), cast(*u8, 0)) == 1);
+    instance.release(&again);
+    // The same place claimed again for a shorter id: its path ends where it
+    // does.
+    check("a shorter id in the same place", instance.claim(&again, &c, "org.x.A", 7, fn_ptr(on_activate), fn_ptr(on_open),
+          fn_ptr(on_action), cast(*u8, 0)) == 1);
+    let is *u8 as short_path = instance.path(&again);
+    let is i64 as spn with mut = 0;
+    while (short_path[spn] != 0) { spn = spn + 1; }
+    check("its path, zero-terminated where it ends", spn == 8 && instance.path_length(&again) == 8 &&
+          same(short_path, spn, "/org/x/A") == 1);
+    check("asked of nobody: not done", instance.activate_remote(&c, "org.caustic.Nobody", 18) == 0);
+    instance.release(&again);
+    dbus.conn.close(&c);
+    if (fails == 0) {
+        io.printf("instance: all checks passed\n");
+        return 0;
+    }
+    io.printf("instance: %d failures\n", fails);
+    return 1;
+}
