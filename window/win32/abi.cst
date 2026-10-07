@@ -1,0 +1,89 @@
+// Win64 at the foreign boundary, Caustic's SysV convention inside.
+// Callback code is made once, then read/execute only; never writable while
+// Windows can call it. A set belongs to its window class or COM vtables and
+// must outlive every foreign reference. Each callback receives (context, slots)
+// and returns an integer/HRESULT. Floating inputs are their raw slot bits.
+use "std/mem.cst" as mem;
+use "bind/kernel32.cst" as k;
+use "bind/types.cst" as t;
+
+let is i64 as MAX_ARGS with imut = 16;
+let is i64 as STRIDE with imut = 48;
+
+struct Callbacks {
+    code as *u8;
+    bytes as i64;
+    count as i64;
+    sealed as i32;
+    _pad as i32;
+}
+
+// The first four native slots have both integer and floating registers loaded;
+// the signature decides which the callee uses. The remainder occupy the stack
+// above Win64's 32-byte shadow space. No argument past count is read.
+fn invoke(proc as *u8, slots as *u64, count as i64) as i64 with naked {
+    asm("push rbx\nsub rsp, 128\nmov rbx, rdi\nmov r10, rsi\nmov r11, rdx\nmov rax, 4\n.Lcm_invoke_stack:\ncmp rax, r11\njge .Lcm_invoke_registers\nmov rdx, QWORD PTR [r10+rax*8]\nmov QWORD PTR [rsp+rax*8], rdx\nadd rax, 1\njmp .Lcm_invoke_stack\n.Lcm_invoke_registers:\ncmp r11, 1\njl .Lcm_invoke_call\nmov rcx, QWORD PTR [r10]\nmovsd xmm0, QWORD PTR [r10]\ncmp r11, 2\njl .Lcm_invoke_call\nmov rdx, QWORD PTR [r10+8]\nmovsd xmm1, QWORD PTR [r10+8]\ncmp r11, 3\njl .Lcm_invoke_call\nmov r8, QWORD PTR [r10+16]\nmovsd xmm2, QWORD PTR [r10+16]\ncmp r11, 4\njl .Lcm_invoke_call\nmov r9, QWORD PTR [r10+24]\nmovsd xmm3, QWORD PTR [r10+24]\n.Lcm_invoke_call:\ncall rbx\nadd rsp, 128\npop rbx\nret\n");
+}
+
+// r10: the Caustic function, r11: its context, rax: count << 8 | float mask.
+// Preserve every Win64 nonvolatile register that SysV permits us to overwrite,
+// including the full 128 bits of xmm6..15, not just their low doubles.
+fn _entry() as i64 with naked {
+    asm("push rdi\npush rsi\npush rbx\nsub rsp, 304\n");
+    // movdqu [rsp + 16*i], xmm(6+i). caustic-as knows the mnemonic but
+    // cannot encode its memory operands yet; preserve all bits with bytes.
+    asm(".byte 243,15,127,52,36,243,15,127,124,36,16,243,68,15,127,68,36,32,243,68,15,127,76,36,48,243,68,15,127,84,36,64,243,68,15,127,92,36,80,243,68,15,127,100,36,96,243,68,15,127,108,36,112,243,68,15,127,180,36,128,0,0,0,243,68,15,127,188,36,144,0,0,0\n");
+    asm("mov rbx, r10\nmov QWORD PTR [rsp+160], rcx\nmov QWORD PTR [rsp+168], rdx\nmov QWORD PTR [rsp+176], r8\nmov QWORD PTR [rsp+184], r9\nmov rdx, rax\nand rdx, 1\ncmp rdx, 0\njz .Lcm_cb_float1\nmovsd QWORD PTR [rsp+160], xmm0\n.Lcm_cb_float1:\nmov rdx, rax\nand rdx, 2\ncmp rdx, 0\njz .Lcm_cb_float2\nmovsd QWORD PTR [rsp+168], xmm1\n.Lcm_cb_float2:\nmov rdx, rax\nand rdx, 4\ncmp rdx, 0\njz .Lcm_cb_float3\nmovsd QWORD PTR [rsp+176], xmm2\n.Lcm_cb_float3:\nmov rdx, rax\nand rdx, 8\ncmp rdx, 0\njz .Lcm_cb_stack\nmovsd QWORD PTR [rsp+184], xmm3\n.Lcm_cb_stack:\nshr rax, 8\nmov rcx, 4\n.Lcm_cb_copy:\ncmp rcx, rax\njge .Lcm_cb_call\nmov rdx, QWORD PTR [rsp+rcx*8+336]\nmov QWORD PTR [rsp+rcx*8+160], rdx\nadd rcx, 1\njmp .Lcm_cb_copy\n.Lcm_cb_call:\nmov rdi, r11\nlea rsi, [rsp+160]\ncall rbx\n");
+    // The matching loads, with opcode 0F 6F instead of 0F 7F.
+    asm(".byte 243,15,111,52,36,243,15,111,124,36,16,243,68,15,111,68,36,32,243,68,15,111,76,36,48,243,68,15,111,84,36,64,243,68,15,111,92,36,80,243,68,15,111,100,36,96,243,68,15,111,108,36,112,243,68,15,111,180,36,128,0,0,0,243,68,15,111,188,36,144,0,0,0\n");
+    asm("add rsp, 304\npop rbx\npop rsi\npop rdi\nret\n");
+}
+
+fn open(count as i64) as Callbacks {
+    let is Callbacks as c;
+    mem.memzero(cast(*u8, &c), sizeof(Callbacks));
+    if (count <= 0 || count > 4096) { return c; }
+    c.bytes = ((count * STRIDE + 4095) / 4096) * 4096;
+    c.code = k.VirtualAlloc(cast(*u8, 0), cast(u64, c.bytes), cast(u32, t.MEM_RESERVE | t.MEM_COMMIT), cast(u32, t.PAGE_READWRITE));
+    if (cast(i64, c.code) == 0) { c.bytes = 0; return c; }
+    c.count = count;
+    return c;
+}
+
+fn put(c as *Callbacks, index as i64, proc as *u8, context as *u8, count as i64, float_mask as i64) as i32 {
+    if (cast(i64, c.code) == 0 || c.sealed != 0 || index < 0 || index >= c.count) { return 0; }
+    if (cast(i64, proc) == 0 || count < 0 || count > MAX_ARGS || float_mask < 0 || float_mask > 15) { return 0; }
+    let is *u8 as p = cast(*u8, cast(i64, c.code) + index * STRIDE);
+    // movabs r10, proc; movabs r11, context; movabs rax, info;
+    // jmp [rip+0]; entry address. The last four bytes remain padding.
+    p[0] = 73; p[1] = 186;
+    *cast(*u64, cast(i64, p) + 2) = cast(u64, proc);
+    p[10] = 73; p[11] = 187;
+    *cast(*u64, cast(i64, p) + 12) = cast(u64, context);
+    p[20] = 72; p[21] = 184;
+    *cast(*u64, cast(i64, p) + 22) = cast(u64, (count << 8) | float_mask);
+    p[30] = 255; p[31] = 37;
+    *cast(*u32, cast(i64, p) + 32) = 0;
+    *cast(*u64, cast(i64, p) + 36) = cast(u64, fn_ptr(_entry));
+    return 1;
+}
+
+fn seal(c as *Callbacks) as i32 {
+    if (cast(i64, c.code) == 0) { return 0; }
+    if (c.sealed == 1) { return 1; }
+    let is u32 as old;
+    if (k.VirtualProtect(c.code, cast(u64, c.bytes), cast(u32, t.PAGE_EXECUTE_READ), &old) == 0) { return 0; }
+    k.FlushInstructionCache(k.GetCurrentProcess(), c.code, cast(u64, c.bytes));
+    c.sealed = 1;
+    return 1;
+}
+
+fn address(c as *Callbacks, index as i64) as *u8 {
+    if (c.sealed != 1 || index < 0 || index >= c.count) { return cast(*u8, 0); }
+    return cast(*u8, cast(i64, c.code) + index * STRIDE);
+}
+
+fn close(c as *Callbacks) as void {
+    if (cast(i64, c.code) != 0) { k.VirtualFree(c.code, 0, cast(u32, t.MEM_RELEASE)); }
+    mem.memzero(cast(*u8, c), sizeof(Callbacks));
+}
