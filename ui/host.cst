@@ -22,14 +22,21 @@
 // a portal's — another thread posts something to run, or the next timer is
 // due: an idle program takes no time at all.
 //
-// The window ops a toolkit-drawn frame asks for (tree.set_window_ops: move,
-// resize, the window menu) are 6.13b's, wired after the examples; an input
-// method's candidates are placed by the platform, not here, until the X input
-// method's spot is (F1/F2).
+// A window with a frame of its own (app.set_decoration) is opened without
+// the platform's, seen through where its shadow is; what the frame asks
+// (tree.set_window_ops) — moved or resized from a press, its menu,
+// minimized, maximized, closed — is asked of the platform's window, and the
+// platform told where the window really is inside the shadow and where it
+// takes the pointer. What the platform says of the window — maximized, full
+// screen, tiled — the frame follows. Where nothing behind the window shows
+// through — X with no compositing manager — the frame is drawn flat. An
+// input method's candidates are placed by the platform, not here, until the
+// X input method's spot is (F1/F2).
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
 use "std/sync.cst" as sync;
 use "../gpu/gpu.cst" as gpu;
+use "../math/math.cst" as math;
 use "../render/draw2d.cst" as draw2d;
 use "../window/device.cst" as device;
 use "../window/event.cst" as wevent;
@@ -45,6 +52,7 @@ use "text.cst" as text;
 use "dnd.cst" as dnd;
 use "style.cst" as style;
 use "paint.cst" as paint;
+use "widgets/decoration.cst" as decoration;
 use "../gpu/software/target.cst" as tgt;
 
 // The most windows on the screen at once: X11's table of them.
@@ -81,6 +89,12 @@ struct Native {
     paste_w   as i64;            // for which widget
     paste_which as i32;
     title_len as i32;
+    let_go    as i32;            // a press the platform took over, to move or resize from: let go of here
+    deco      as i64;            // the frame of its own it was opened for; 0: the platform's
+    go_x      as f64;            // where that press was, logical pixels
+    go_y      as f64;
+    told_ext  as [4]i64;         // the frame's extents as last told, physical pixels
+    told_in   as [4]i64;         // and the input region
     title     as [256]u8;        // as given to the platform, and a zero
     down      as [256]u8;        // keys held, by keycode: a press of one held repeats
 }
@@ -339,6 +353,12 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     if (o >= 0) { c.owner = &_native(hs, o).win; }
     c.dialog = app.is_dialog(a, h);
     c.modal = app.is_modal(a, h);
+    // A frame of its own: none of the platform's, its shadow seen through.
+    let is i64 as deco = app.decoration(a, h);
+    if (deco != 0) {
+        c.transparent = 1;
+        c.decorated = 0;
+    }
     n.win = device.open_config(&c);
     if (device.is_open(&n.win) == 0) { return 0; }
     n.h = h;
@@ -352,7 +372,12 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.paste_on = 0;
     n.over = 0;
     n.icon_gen = 0;
+    n.deco = deco;
+    n.let_go = 0;
     mem.memset(cast(*u8, &n.down), 0, 256);
+    // Nothing told yet (-1 each, all bits set): told with its first frame.
+    mem.memset(cast(*u8, &n.told_ext), 255, 32);
+    mem.memset(cast(*u8, &n.told_in), 255, 32);
     n.cur = cursor.open(&n.win);
     // The screen, and the desktop's settings, with the first window there is.
     if (hs.disp_ok == 0) {
@@ -366,6 +391,9 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     let is *tree.Tree as t = app.tree(a, h);
     tree.set_clipboard(t, fn_ptr(_copy), cast(*u8, n));
     tree.set_paste(t, fn_ptr(_paste), cast(*u8, n));
+    tree.set_window_ops(t, fn_ptr(_window_op), cast(*u8, n));
+    // Its shadow only where what is behind shows through it.
+    decoration.set_flat(t, deco, cast(i32, device.transparent(&n.win) == 0 || device.composited(&n.win) == 0));
     tree.invalidate_paint_subtree(t, tree.root(t));
     return 1;
 }
@@ -376,6 +404,7 @@ fn _put_away(hs as *Host, i as i64) as void {
     if (cast(i64, t) != 0) {
         tree.set_clipboard(t, cast(tree.ClipboardFn, 0), cast(*u8, 0));
         tree.set_paste(t, cast(tree.PasteFn, 0), cast(*u8, 0));
+        tree.set_window_ops(t, cast(tree.WindowOpFn, 0), cast(*u8, 0));
     }
     if (n.tex != 0) { gpu.texture.destroy(hs.dv, n.tex); }
     cursor.close(&n.cur, &n.win);
@@ -385,13 +414,16 @@ fn _put_away(hs as *Host, i as i64) as void {
 }
 
 // The platform's windows as the application's are: opened for those shown,
-// owners first; put away for those hidden or closed; titled.
+// owners first; put away for those hidden or closed, and opened again for
+// those whose frame changed — its own or the platform's; titled.
 fn _sync(hs as *Host) as void {
     let is *app.App as a = hs.a;
     let is i64 as i with mut = 0;
     while (i < MAX_WINDOWS) {
         let is *Native as n = _native(hs, i);
-        if (n.h != 0 && (app.window_valid(a, n.h) == 0 || app.is_shown(a, n.h) == 0)) { _put_away(hs, i); }
+        if (n.h != 0 && (app.window_valid(a, n.h) == 0 || app.is_shown(a, n.h) == 0 || app.decoration(a, n.h) != n.deco)) {
+            _put_away(hs, i);
+        }
         i = i + 1;
     }
     // Owners before what belongs to them: rounds until none is left to open.
@@ -586,6 +618,89 @@ fn _close_asked(hs as *Host, n as *Native, now as i64) as void {
     app.window_close(a, n.h);
 }
 
+// What the window's frame asks — moved or resized from a press, its menu,
+// minimized, maximized or back, closed — asked of the platform's window, at
+// window x, y in logical pixels.
+fn _window_op(user as *u8, op as i32, x as f64, y as f64) as void {
+    let is *Native as n = cast(*Native, user);
+    let is *Host as hs = n.hs;
+    let is i64 as px = cast(i64, x * n.scale);
+    let is i64 as py = cast(i64, y * n.scale);
+    if (op == tree.WIN_MOVE || (op >= tree.WIN_RESIZE_N && op <= tree.WIN_RESIZE_NW)) {
+        let is i64 as how with mut = device.MOVE;
+        // The tree's edges go round from the top, the platform's from the
+        // top left corner.
+        if (op != tree.WIN_MOVE) { how = cast(i64, op - tree.WIN_RESIZE_N + 1) % 8; }
+        device.begin_move_resize(&n.win, px, py, how, 1);
+        n.let_go = 1;
+        n.go_x = x;
+        n.go_y = y;
+        return;
+    }
+    if (op == tree.WIN_MENU) {
+        device.show_window_menu(&n.win, px, py);
+        return;
+    }
+    if (op == tree.WIN_MINIMIZE) {
+        device.minimize(&n.win);
+        return;
+    }
+    if (op == tree.WIN_MAXIMIZE) {
+        device.set_maximized(&n.win, cast(i32, app.is_maximized(hs.a, n.h) == 0));
+        return;
+    }
+    if (op == tree.WIN_CLOSE) { _close_asked(hs, n, time.now_ms()); }
+}
+
+// The press the platform took over to move or resize the window from: its
+// release goes to the platform, so it is let go of here — when one is held.
+fn _let_go(hs as *Host, n as *Native, now as i64) as void {
+    n.let_go = 0;
+    let is *router.Router as r = app.router(hs.a, n.h);
+    if (router.capture(r) == 0) { return; }
+    router.pointer_button(app.tree(hs.a, n.h), r, 1, 0, n.go_x, n.go_y, now);
+}
+
+fn _px(v as f64, s as f64) as i64 { return cast(i64, v * s + 0.5); }
+
+// What the frame says of the window, laid out — where it really is inside
+// the shadow, where it takes the pointer — told the platform when it changed.
+fn _tell_frame(hs as *Host, n as *Native) as void {
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    if (tree.is_valid(t, n.deco) == 0) { return; }
+    let is decoration.Extents as e = decoration.extents(t, n.deco);
+    let is math.rect.Rect as r = decoration.input(t, n.deco);
+    let is f64 as s = n.scale;
+    let is [4]i64 as ext;
+    ext[0] = _px(e.left, s);
+    ext[1] = _px(e.right, s);
+    ext[2] = _px(e.top, s);
+    ext[3] = _px(e.bottom, s);
+    let is [4]i64 as inp;
+    inp[0] = _px(r.x, s);
+    inp[1] = _px(r.y, s);
+    inp[2] = _px(r.w, s);
+    inp[3] = _px(r.h, s);
+    if (mem.memcmp(cast(*u8, &ext), cast(*u8, &n.told_ext), 32) != 0) {
+        device.set_frame_extents(&n.win, ext[0], ext[1], ext[2], ext[3]);
+        mem.memcpy(cast(*u8, &n.told_ext), cast(*u8, &ext), 32);
+    }
+    if (mem.memcmp(cast(*u8, &inp), cast(*u8, &n.told_in), 32) != 0) {
+        device.set_input_region(&n.win, inp[0], inp[1], inp[2], inp[3]);
+        mem.memcpy(cast(*u8, &n.told_in), cast(*u8, &inp), 32);
+    }
+}
+
+// The sides the platform says the window is tiled to, as the frame counts them.
+fn _sides(state as i32) as i32 {
+    let is i32 as s with mut = 0;
+    if ((state & wevent.STATE_TILED_TOP) != 0) { s = s | decoration.TILED_TOP; }
+    if ((state & wevent.STATE_TILED_RIGHT) != 0) { s = s | decoration.TILED_RIGHT; }
+    if ((state & wevent.STATE_TILED_BOTTOM) != 0) { s = s | decoration.TILED_BOTTOM; }
+    if ((state & wevent.STATE_TILED_LEFT) != 0) { s = s | decoration.TILED_LEFT; }
+    return s;
+}
+
 // One event the platform said of the application's window h, given to it as
 // if it came from there now.
 fn feed(hs as *Host, h as i64, e as *wevent.Event, now as i64) as void {
@@ -607,7 +722,9 @@ fn pointer_shape(hs as *Host, h as i64) as i32 {
 fn _feed(hs as *Host, n as *Native, e as *wevent.Event, now as i64) as void {
     if (app.window_valid(hs.a, n.h) == 0) { return; }
     app.begin_dispatch(hs.a);
+    n.let_go = 0;
     _feed_one(hs, n, e, now);
+    if (n.let_go == 1) { _let_go(hs, n, now); }
     app.end_dispatch(hs.a);
 }
 
@@ -695,8 +812,14 @@ fn _feed_one(hs as *Host, n as *Native, e as *wevent.Event, now as i64) as void 
         return;
     }
     if (k == wevent.STATE) {
-        app.set_maximized(a, h, cast(i32, (e.state & wevent.STATE_MAXIMIZED) != 0));
-        app.set_fullscreen(a, h, cast(i32, (e.state & wevent.STATE_FULLSCREEN) != 0));
+        let is i32 as max = cast(i32, (e.state & wevent.STATE_MAXIMIZED) != 0);
+        let is i32 as full = cast(i32, (e.state & wevent.STATE_FULLSCREEN) != 0);
+        app.set_maximized(a, h, max);
+        app.set_fullscreen(a, h, full);
+        // Its frame, if it has one of its own, as the state is.
+        decoration.set_maximized(t, n.deco, max);
+        decoration.set_fullscreen(t, n.deco, full);
+        decoration.set_tiled(t, n.deco, _sides(e.state));
         return;
     }
     if (k == wevent.SETTINGS) {
@@ -793,6 +916,7 @@ fn _frame(hs as *Host, n as *Native, now as i64) as void {
         tree.invalidate_paint_subtree(t, tree.root(t));
     }
     let is i64 as k = app.frame(a, n.h);
+    _tell_frame(hs, n);
     if (k > 0) {
         draw2d.begin(&hs.canvas, cast(f64, pw), cast(f64, ph), n.scale);
         app.paint(a, n.h, &hs.canvas, cast(*style.Theme, 0), now, cast(*paint.Stats, 0));

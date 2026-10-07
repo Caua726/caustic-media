@@ -1194,10 +1194,14 @@ asks the window, through `tree.window_op`, to resize from that edge
 (WIN_RESIZE_N … WIN_RESIZE_NW). Maximized it has no shadow, rounding or
 edges, and its header's button restores; full screen it is only what it
 holds; tiled to a side (TILED_*) it has no shadow or rounding at all and no
-edge on that side; in an inactive window its shadow is lighter. Painted with
+edge on that side; in an inactive window its shadow is lighter; flat
+(`set_flat`) — where nothing behind the window would show through it, X with
+no compositing manager — it has no shadow or rounding either, all of it
+inside the window, still resized from every edge. Painted with
 `paint.Options.see_through`, where every damaged region starts from nothing
 instead of the window's colour (`draw2d.replace_rect`, written, not blended),
-so the shadow lies over whatever is behind the window.
+so the shadow lies over whatever is behind the window. A program gives a
+window its own frame with `app.set_decoration`; the host does the rest.
 
 **List views** (`widgets/listview.cst`, tested by `listview_test`): the rows
 of a flat model in a scroll area of their own, each as tall as the first,
@@ -1339,8 +1343,15 @@ X; a modal dialog in a window of its own above its owner, the owner told
 nothing meanwhile; a text dragged from one window to another; the loop asleep
 until a timer, a descriptor, another thread or an event wakes it. The
 accessibility bridge runs in it (`atspi/hosted.cst`, `atspi_hosted_test` on a
-private bus). Not yet: a toolkit-drawn frame's moving and resizing (6.13b,
-after the examples), an input method's candidates placed at the caret.
+private bus). A window with a frame of its own (`app.set_decoration`) opens
+without the window manager's and seen through; its header dragged, its edges
+pressed, its buttons and its menu are asked of the window manager
+(`_NET_WM_MOVERESIZE`, `_GTK_SHOW_WINDOW_MENU`…), the press let go of once the
+window manager has the pointer; where the window really is and where it takes
+the pointer are told it as the frame is laid out, in physical pixels; the
+frame follows what the window manager says — maximized, full screen, tiled —
+and is drawn flat with no compositing manager. Not yet: an input method's
+candidates placed at the caret.
 
 **A program started** (`program.cst`, tested by `program_x11_test` under
 Xvfb on a bare private bus, and with none; its fonts by `system_fonts_test`
@@ -1434,8 +1445,12 @@ widget set applications actually use, done properly, not parity.
    notifications, the tray, links. *Done on X11 and Linux's desktops; the
    Win32 and Wayland sides with their backends.*
 10. **Examples**: a settings form, a text editor, a file browser. *Done on
-   X11.* Then a toolkit-drawn frame moved and resized through the loop
-   (the rest of decorations), and the Wayland and Win32 backends.
+   X11.*
+11. **A frame of the program's own** moved, resized, maximized and told
+   where the window really is through the loop. *Done on X11; on Wayland —
+   `xdg-decoration` asked first, the frame drawn where the compositor leaves
+   it to the client — and on Windows (`WM_NCCALCSIZE`, `WM_NCHITTEST`) with
+   their backends.* Then the Wayland and Win32 backends.
 
 ## Not now, and deliberately
 
