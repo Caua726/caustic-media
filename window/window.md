@@ -22,11 +22,12 @@ API and still reach the raw display handle underneath.
 ```
 window/
   window.cst      hub
-  device.cst      our portable window: open, next_frame, acquire, submit, close
-  display.cst     monitors, modes, DPI, work area
+  device.cst      our portable window: open, next_frame, acquire, submit, close;
+                  title, shown, its place, its icon, the clipboard
+  display.cst     the screen's DPI: a window's scale
   event.cst       raw platform events and the queue they arrive in
-  cursor.cst      shape, visibility, capture
-  clipboard.cst   text and data
+  wait.cst        the loop's one place to sleep: events, descriptors, wake-ups, time
+  cursor.cst      the pointer's shape: CSS's, by the theme's names
   settings.cst    the desktop's settings: dark, accent, fonts, timings, language
   locale.cst      the language the user reads, as a BCP 47 tag
   fonts.cst       where the platform keeps fonts, and the font index
@@ -425,6 +426,32 @@ writes and no others, home or an absolute path, shell-escaped; a folder said
 to be home itself turned off; its English name under home when the file does
 not say (`window_user_dirs_test`). Windows' known folders come with its
 backend.
+
+**What a toolkit's loop needs of a window**, portable, X11's for now:
+
+- `wait.cst`: `wait(win, timeout)` sleeps in one `poll` until an event comes
+  for any window of the program — on the connection they share, or already
+  read off it into Xlib's queue, which the descriptor does not show — a
+  watched descriptor is readable, another thread calls `wake` (an eventfd),
+  or the time passes; it says which (`wait_test`, `wait_x11_test`).
+  `device.pump` hands every event read to the windows it belongs to, for a
+  loop that sleeps by itself rather than in `next_frame`.
+- A key press carries the text it typed (`event.text`, UTF-8: XLookupString,
+  or the input method's); `STATE` says the window manager's state of the
+  window; `CLOSE` its close button — `keep_open` when the program says no.
+- `device.set_title` in UTF-8: `_NET_WM_NAME`, and `WM_NAME` in Latin-1 for
+  an old window manager, each sequence whole or a `?`; `show`, `hide`,
+  `activate`, `position` on the screen, `set_icon`; `clipboard_set`,
+  `clipboard_request` and the answer for the clipboard and the primary
+  selection (`device_x11_test`, a second client playing the user and the
+  window manager).
+- `cursor.cst`: every CSS cursor, numbered as Wayland's cursor-shape-v1 —
+  the toolkit's `tree.SHAPE_*` — from the user's theme by the freedesktop
+  cursor spec's names, which are CSS's, or the X cursor font's nearest glyph;
+  NONE hides the pointer. `display.cst`: the DPI — Xft.dpi, else the primary
+  monitor's size, else 96 — over 96 is a window's scale (`pointer_x11_test`).
+  Neither is imported by `device.cst`: they link libXcursor, libXfixes, libXi
+  and libXrandr, which a program that sets no cursor does not need.
 
 **Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
 the system's and the user's font directories, and where the font index is
