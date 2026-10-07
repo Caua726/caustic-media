@@ -1,0 +1,882 @@
+// ui/host.cst — the application on the screen.
+//
+// app.cst keeps the program's windows — each a tree and a router — and is fed
+// by calls; nothing in it touches the platform. This is what feeds it: for
+// every window of the application that is shown, a window of the platform's
+// (window/device.cst) — a dialog's above its owner's and modal when it is —
+// put away when the application's is hidden or closed, titled as it is
+// titled. What the platform says of a window becomes what the application
+// and its router are told: the pointer, buttons and wheel, keys and the
+// text they type, the keyboard focus, its size, its place, its state, a
+// drag from another program, a request to close it. A window waiting on a
+// modal dialog (app.blocked) is told nothing of the pointer or the keys.
+//
+// Each window is painted into a texture of its own on the program's device —
+// only what changed, as the damage says — and that texture is what is shown:
+// copied whole to the platform's buffer, which on X11 is converted in place
+// as it is shown and so cannot be painted on again. The text service's glyph
+// cache is the one the program opened on the same device.
+//
+// Between rounds it sleeps (window/wait.cst) until a window has an event, a
+// descriptor the program watches is readable — the accessibility bridge's,
+// a portal's — another thread posts something to run, or the next timer is
+// due: an idle program takes no time at all.
+//
+// The window ops a toolkit-drawn frame asks for (tree.set_window_ops: move,
+// resize, the window menu) are 6.13b's, wired after the examples; an input
+// method's candidates are placed by the platform, not here, until the X input
+// method's spot is (F1/F2).
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/sync.cst" as sync;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../window/device.cst" as device;
+use "../window/event.cst" as wevent;
+use "../window/wait.cst" as wait;
+use "../window/cursor.cst" as cursor;
+use "../window/display.cst" as display;
+use "../window/settings.cst" as wsettings;
+use "../window/keys.cst" as keys;
+use "app.cst" as app;
+use "tree.cst" as tree;
+use "router.cst" as router;
+use "text.cst" as text;
+use "dnd.cst" as dnd;
+use "style.cst" as style;
+use "paint.cst" as paint;
+use "../gpu/software/target.cst" as tgt;
+
+// The most windows on the screen at once: X11's table of them.
+let is i64 as MAX_WINDOWS with imut = 32;
+let is i64 as MAX_WATCHED with imut = 16;
+let is i64 as MAX_POSTED  with imut = 64;
+let is i64 as MAX_ROUND   with imut = 8;
+// The most text a paste brings.
+let is i64 as PASTE_BYTES with imut = 4194304;
+
+// A descriptor readable: cb(user, fd).
+type WatchFn = fn(*u8, i64) as void;
+// Once a round, after the events: cb(user). And what another thread posts.
+type RoundFn = fn(*u8) as void;
+// The platform asked window h to close and nothing in it took the request:
+// cb(user, h), 1 to close it.
+type CloseFn = fn(*u8, i64) as i32;
+
+// A window of the platform's for one of the application's.
+struct Native {
+    h         as i64;            // the application's window; 0: a free slot
+    hs        as *Host;
+    win       as device.Window;
+    cur       as cursor.Cursors;
+    tex       as i64;            // what it is painted into
+    tw        as i64;            // its size, physical pixels
+    th        as i64;
+    scale     as f64;
+    shape     as i32;            // the pointer's, as last set
+    over      as i64;            // a drag begun here over another window: its slot + 1, 0 for none
+    icon_gen  as i64;            // the application's icon as last set on it
+    present   as i32;            // to be shown again though nothing changed: exposed
+    paste_on  as i32;            // a paste asked of the platform, awaited
+    paste_w   as i64;            // for which widget
+    paste_which as i32;
+    title_len as i32;
+    title     as [256]u8;        // as given to the platform, and a zero
+    down      as [256]u8;        // keys held, by keycode: a press of one held repeats
+}
+
+struct Host {
+    a          as *app.App;
+    dv         as *gpu.device.Device;
+    svc        as *u8;           // the program's text service (ui/text.cst)
+    canvas     as draw2d.Canvas;
+    cmd        as i64;
+    wt         as wait.Wait;
+    disp       as display.Display;
+    disp_ok    as i32;
+    quitting   as i32;
+    held       as i64;           // hold's count
+    desktop    as wsettings.Settings;
+    natives    as *Native;       // MAX_WINDOWS of them
+    paste      as *u8;           // PASTE_BYTES
+    wfd        as [16]i64;
+    wcb        as [16]WatchFn;
+    wuser      as [16]*u8;
+    nw         as i64;
+    rcb        as [8]RoundFn;
+    ruser      as [8]*u8;
+    nr         as i64;
+    close_cb   as CloseFn;
+    close_user as *u8;
+    lock       as sync.Mutex;    // what is posted, from any thread
+    pcb        as [64]RoundFn;
+    puser      as [64]*u8;
+    np         as i64;
+}
+
+fn _native(hs as *Host, i as i64) as *Native {
+    return cast(*Native, cast(i64, hs.natives) + i * sizeof(Native));
+}
+
+// The application a, shown with dv — the device its text service svc is on —
+// the windows it has open and those to come. Null when there is no room.
+fn open(a as *app.App, dv as *gpu.device.Device, svc as *u8) as *Host {
+    let is *Host as hs = cast(*Host, mem.core.mmap_anon(sizeof(Host)));
+    if (cast(i64, hs) <= 0) { return cast(*Host, 0); }
+    hs.natives = cast(*Native, mem.core.mmap_anon(MAX_WINDOWS * sizeof(Native)));
+    hs.paste = mem.core.mmap_anon(PASTE_BYTES + 1);
+    hs.a = a;
+    hs.dv = dv;
+    hs.svc = svc;
+    hs.wt = wait.open();
+    hs.desktop = wsettings.defaults();
+    let is draw2d.Limits as dl = draw2d.limits_default();
+    hs.canvas = draw2d.open(dv, &dl);
+    hs.cmd = gpu.command.create(dv);
+    return hs;
+}
+
+fn close(hs as *Host) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_native(hs, i).h != 0) { _put_away(hs, i); }
+        i = i + 1;
+    }
+    if (hs.disp_ok == 1) { display.close(&hs.disp); }
+    draw2d.close(&hs.canvas);
+    wait.close(&hs.wt);
+    mem.core.munmap(hs.paste, PASTE_BYTES + 1);
+    mem.core.munmap(cast(*u8, hs.natives), MAX_WINDOWS * sizeof(Native));
+    mem.core.munmap(cast(*u8, hs), sizeof(Host));
+}
+
+// The platform's window for the application's h, null when it has none.
+fn native(hs as *Host, h as i64) as *device.Window {
+    let is i64 as i = _slot_of(hs, h);
+    if (i < 0) { return cast(*device.Window, 0); }
+    return &_native(hs, i).win;
+}
+
+fn _slot_of(hs as *Host, h as i64) as i64 {
+    if (h == 0) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_native(hs, i).h == h) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// How many windows are on the screen.
+fn shown(hs as *Host) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_native(hs, i).h != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// --- What the program adds to the loop ---
+
+// fd watched: cb(user, fd) when it is readable. 1, or 0 with MAX_WATCHED.
+fn watch(hs as *Host, fd as i64, cb as WatchFn, user as *u8) as i32 {
+    if (hs.nw >= MAX_WATCHED || wait.watch(&hs.wt, fd) == 0) { return 0; }
+    hs.wfd[hs.nw] = fd;
+    hs.wcb[hs.nw] = cb;
+    hs.wuser[hs.nw] = user;
+    hs.nw = hs.nw + 1;
+    return 1;
+}
+
+// How many descriptors are watched.
+fn watched(hs as *Host) as i64 { return hs.nw; }
+
+fn unwatch(hs as *Host, fd as i64) as void {
+    wait.unwatch(&hs.wt, fd);
+    let is i64 as i with mut = 0;
+    while (i < hs.nw) {
+        if (hs.wfd[i] == fd) {
+            hs.nw = hs.nw - 1;
+            hs.wfd[i] = hs.wfd[hs.nw];
+            hs.wcb[i] = hs.wcb[hs.nw];
+            hs.wuser[i] = hs.wuser[hs.nw];
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// cb(user) once every round, after the events: the accessibility bridge's
+// pump. 1, or 0 with MAX_ROUND.
+fn every_round(hs as *Host, cb as RoundFn, user as *u8) as i32 {
+    if (hs.nr >= MAX_ROUND) { return 0; }
+    hs.rcb[hs.nr] = cb;
+    hs.ruser[hs.nr] = user;
+    hs.nr = hs.nr + 1;
+    return 1;
+}
+
+// What is asked when the platform asks to close a window nothing in it kept
+// open; none set: it closes.
+fn set_on_close(hs as *Host, cb as CloseFn, user as *u8) as void {
+    hs.close_cb = cb;
+    hs.close_user = user;
+}
+
+// cb(user) run by the loop, in its thread, as soon as it can: from any
+// thread. 1, or 0 with MAX_POSTED waiting already.
+fn post(hs as *Host, cb as RoundFn, user as *u8) as i32 {
+    sync.mutex_lock(&hs.lock);
+    if (hs.np >= MAX_POSTED) {
+        sync.mutex_unlock(&hs.lock);
+        return 0;
+    }
+    hs.pcb[hs.np] = cb;
+    hs.puser[hs.np] = user;
+    hs.np = hs.np + 1;
+    sync.mutex_unlock(&hs.lock);
+    wait.wake(&hs.wt);
+    return 1;
+}
+
+// The loop going on with no window on the screen — a program living in the
+// tray, its window hidden — until release is called as often.
+fn hold(hs as *Host) as void { hs.held = hs.held + 1; }
+
+fn release(hs as *Host) as void {
+    if (hs.held > 0) { hs.held = hs.held - 1; }
+}
+
+// The loop to end after this round.
+fn quit(hs as *Host) as void {
+    hs.quitting = 1;
+    wait.wake(&hs.wt);
+}
+
+fn _run_posted(hs as *Host) as void {
+    let is [64]RoundFn as cbs;
+    let is [64]*u8 as users;
+    sync.mutex_lock(&hs.lock);
+    let is i64 as n = hs.np;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        cbs[i] = hs.pcb[i];
+        users[i] = hs.puser[i];
+        i = i + 1;
+    }
+    hs.np = 0;
+    sync.mutex_unlock(&hs.lock);
+    i = 0;
+    while (i < n) {
+        call(cbs[i], users[i]);
+        i = i + 1;
+    }
+}
+
+// --- Windows put on the screen and away ---
+
+fn _set_title(n as *Native, s as *u8, k as i64) as void {
+    let is i64 as m with mut = k;
+    if (m > 255) { m = 255; }
+    mem.memcpy(cast(*u8, &n.title), s, m);
+    n.title[m] = cast(u8, 0);
+    n.title_len = cast(i32, m);
+}
+
+fn _scale(hs as *Host) as f64 {
+    if ((hs.desktop.known & wsettings.K_DPI) != 0 && hs.desktop.dpi > 0.0) { return hs.desktop.dpi / 96.0; }
+    if (hs.disp_ok == 1) { return cast(f64, display.dpi(&hs.disp)) / 96.0; }
+    return 1.0;
+}
+
+fn _copy(user as *u8, which as i32, s as *u8, n as i64) as void {
+    let is *Native as nt = cast(*Native, user);
+    let is i32 as w with mut = device.CLIPBOARD;
+    if (which == tree.PRIMARY) { w = device.PRIMARY; }
+    device.clipboard_set(&nt.win, w, s, n);
+}
+
+fn _paste(user as *u8, which as i32, w as i64) as void {
+    let is *Native as nt = cast(*Native, user);
+    let is i32 as sel with mut = device.CLIPBOARD;
+    if (which == tree.PRIMARY) { sel = device.PRIMARY; }
+    nt.paste_w = w;
+    nt.paste_which = which;
+    nt.paste_on = device.clipboard_request(&nt.win, sel);
+    if (nt.paste_on == 0) {
+        // Nobody to ask: nothing pasted.
+        router.paste(app.tree(nt.hs.a, nt.h), app.router(nt.hs.a, nt.h), w, which, "", 0, time.now_ms());
+    }
+}
+
+// A window of the platform's for h, belonging to its owner's if that has
+// one; 1, or 0 when none could be opened.
+fn _put_up(hs as *Host, h as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS && _native(hs, i).h != 0) { i = i + 1; }
+    if (i == MAX_WINDOWS) { return 0; }
+    let is *Native as n = _native(hs, i);
+    let is *app.App as a = hs.a;
+    _set_title(n, app.title(a, h), app.title_length(a, h));
+    let is f64 as s with mut = _scale(hs);
+    let is device.Config as c with mut = device.config(cast(*u8, &n.title), cast(i64, app.width(a, h) * s + 0.5),
+                                                       cast(i64, app.height(a, h) * s + 0.5));
+    if (c.width < 1) { c.width = 1; }
+    if (c.height < 1) { c.height = 1; }
+    let is i64 as o = _slot_of(hs, app.owner(a, h));
+    if (o >= 0) { c.owner = &_native(hs, o).win; }
+    c.dialog = app.is_dialog(a, h);
+    c.modal = app.is_modal(a, h);
+    n.win = device.open_config(&c);
+    if (device.is_open(&n.win) == 0) { return 0; }
+    n.h = h;
+    n.hs = hs;
+    n.scale = s;
+    n.shape = 0;
+    n.tex = 0;
+    n.tw = 0;
+    n.th = 0;
+    n.present = 1;
+    n.paste_on = 0;
+    n.over = 0;
+    n.icon_gen = 0;
+    mem.memset(cast(*u8, &n.down), 0, 256);
+    n.cur = cursor.open(&n.win);
+    // The screen, and the desktop's settings, with the first window there is.
+    if (hs.disp_ok == 0) {
+        hs.disp = display.open(&n.win);
+        hs.disp_ok = 1;
+        _read_settings(hs, n);
+        s = _scale(hs);
+    }
+    n.scale = s;
+    app.set_scale(a, h, s);
+    let is *tree.Tree as t = app.tree(a, h);
+    tree.set_clipboard(t, fn_ptr(_copy), cast(*u8, n));
+    tree.set_paste(t, fn_ptr(_paste), cast(*u8, n));
+    tree.invalidate_paint_subtree(t, tree.root(t));
+    return 1;
+}
+
+fn _put_away(hs as *Host, i as i64) as void {
+    let is *Native as n = _native(hs, i);
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    if (cast(i64, t) != 0) {
+        tree.set_clipboard(t, cast(tree.ClipboardFn, 0), cast(*u8, 0));
+        tree.set_paste(t, cast(tree.PasteFn, 0), cast(*u8, 0));
+    }
+    if (n.tex != 0) { gpu.texture.destroy(hs.dv, n.tex); }
+    cursor.close(&n.cur, &n.win);
+    device.close(&n.win);
+    n.h = 0;
+    n.tex = 0;
+}
+
+// The platform's windows as the application's are: opened for those shown,
+// owners first; put away for those hidden or closed; titled.
+fn _sync(hs as *Host) as void {
+    let is *app.App as a = hs.a;
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        let is *Native as n = _native(hs, i);
+        if (n.h != 0 && (app.window_valid(a, n.h) == 0 || app.is_shown(a, n.h) == 0)) { _put_away(hs, i); }
+        i = i + 1;
+    }
+    // Owners before what belongs to them: rounds until none is left to open.
+    let is i32 as more with mut = 1;
+    while (more == 1) {
+        more = 0;
+        let is i64 as h with mut = app.next_window(a, 0);
+        while (h != 0) {
+            let is i64 as o = app.owner(a, h);
+            if (app.is_shown(a, h) == 1 && _slot_of(hs, h) < 0 && (o == 0 || _slot_of(hs, o) >= 0 || app.is_shown(a, o) == 0)) {
+                if (_put_up(hs, h) == 1) { more = 1; }
+            }
+            h = app.next_window(a, h);
+        }
+    }
+    i = 0;
+    while (i < MAX_WINDOWS) {
+        let is *Native as n = _native(hs, i);
+        if (n.h != 0) {
+            let is i64 as k = app.title_length(a, n.h);
+            let is *u8 as s = app.title(a, n.h);
+            if (k != cast(i64, n.title_len) || mem.memcmp(s, cast(*u8, &n.title), k) != 0) {
+                _set_title(n, s, k);
+                device.set_title(&n.win, s, k);
+            }
+            // The application's icon, as it is now.
+            if (n.icon_gen != app.icon_generation(a)) {
+                n.icon_gen = app.icon_generation(a);
+                let is i64 as size with mut = 0;
+                let is *u32 as px = app.icon(a, &size);
+                if (cast(i64, px) != 0) { device.set_icon(&n.win, cast(*u8, px), size, size); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// --- The desktop's settings ---
+
+fn _read_settings(hs as *Host, n as *Native) as void {
+    let is wsettings.Settings as s with mut = wsettings.defaults();
+    device.read_settings(&n.win, &s);
+    hs.desktop = s;
+    app.set_system(hs.a, &hs.desktop);
+}
+
+// The desktop's settings, from what the program reads beside the platform —
+// the settings portal — laid over what the platform says.
+fn set_settings(hs as *Host, s as *wsettings.Settings) as void {
+    wsettings.merge(&hs.desktop, s);
+    app.set_system(hs.a, &hs.desktop);
+    _rescale(hs);
+}
+
+// The desktop's settings as the windows follow them.
+fn settings(hs as *Host) as *wsettings.Settings { return &hs.desktop; }
+
+fn _rescale(hs as *Host) as void {
+    let is f64 as s = _scale(hs);
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        let is *Native as n = _native(hs, i);
+        if (n.h != 0 && n.scale != s) {
+            n.scale = s;
+            app.set_scale(hs.a, n.h, s);
+            app.resize(hs.a, n.h, cast(f64, device.width(&n.win)) / s, cast(f64, device.height(&n.win)) / s);
+        }
+        i = i + 1;
+    }
+}
+
+// --- What the platform says ---
+
+fn _payload(n as *Native, offers as i32, with_data as i32) as dnd.Payload {
+    let is dnd.Payload as p with mut = dnd.files(cast(*u8, 0), 0);
+    p.offers = 0;
+    if ((offers & wevent.DROP_FILES) != 0) { p.offers = p.offers | dnd.FILES; }
+    if ((offers & wevent.DROP_TEXT) != 0) { p.offers = p.offers | dnd.TEXT; }
+    if (with_data == 1) {
+        let is i64 as nf = device.dropped_files(&n.win);
+        if (nf > 0) {
+            p.files = device.dropped_file(&n.win, 0);
+            p.files_n = nf;
+        }
+        p.text = device.dropped_text(&n.win);
+        p.text_len = device.dropped_text_length(&n.win);
+    }
+    return p;
+}
+
+fn _answer(n as *Native, takes as i32) as void {
+    let is i32 as w with mut = 0;
+    if ((takes & dnd.FILES) != 0) { w = w | wevent.DROP_FILES; }
+    if ((takes & dnd.TEXT) != 0) { w = w | wevent.DROP_TEXT; }
+    device.drop_answer(&n.win, w);
+}
+
+// Another window of the program's under the point x, y of n's window
+// (physical pixels): its slot, and the point in it, at *ox, *oy; -1 for none.
+fn _other_under(hs as *Host, n as *Native, x as i64, y as i64, ox as *i64, oy as *i64) as i64 {
+    let is i64 as ax with mut = 0;
+    let is i64 as ay with mut = 0;
+    if (device.position(&n.win, &ax, &ay) == 0) { return 0 - 1; }
+    let is i64 as rx = ax + x;
+    let is i64 as ry = ay + y;
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        let is *Native as m = _native(hs, i);
+        let is i64 as mx with mut = 0;
+        let is i64 as my with mut = 0;
+        if (m.h != 0 && m.h != n.h && app.blocked(hs.a, m.h) == 0 && device.position(&m.win, &mx, &my) == 1 &&
+            rx >= mx && ry >= my && rx < mx + device.width(&m.win) && ry < my + device.height(&m.win)) {
+            *ox = rx - mx;
+            *oy = ry - my;
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The drag begun in n's window no longer over the one it went to.
+fn _drag_back(hs as *Host, n as *Native, now as i64) as void {
+    if (n.over == 0) { return; }
+    let is *Native as m = _native(hs, n.over - 1);
+    if (m.h != 0) { router.drag_leave(app.tree(hs.a, m.h), app.router(hs.a, m.h), now); }
+    n.over = 0;
+}
+
+// A drag begun in n's window, the pointer at x, y of it, over another of
+// the program's windows: run by that window's router, from what this one
+// carries — and let go there, this one told what was done. 1 when it was.
+fn _drag_across(hs as *Host, n as *Native, e as *wevent.Event, now as i64) as i32 {
+    let is *app.App as a = hs.a;
+    let is *tree.Tree as t = app.tree(a, n.h);
+    let is *router.Router as r = app.router(a, n.h);
+    let is *dnd.Payload as p = router.drag_payload(r);
+    if (cast(i64, p) == 0) {
+        n.over = 0;
+        return 0;
+    }
+    let is i64 as ox with mut = 0;
+    let is i64 as oy with mut = 0;
+    let is i64 as o = _other_under(hs, n, e.x, e.y, &ox, &oy);
+    if (o < 0) {
+        _drag_back(hs, n, now);
+        return 0;
+    }
+    let is *Native as m = _native(hs, o);
+    let is *tree.Tree as mt = app.tree(a, m.h);
+    let is *router.Router as mr = app.router(a, m.h);
+    let is f64 as mx = cast(f64, ox) / m.scale;
+    let is f64 as my = cast(f64, oy) / m.scale;
+    // What is held now, as this window's event says it: Ctrl copies there.
+    router.set_modifiers(mr, e.modifiers);
+    if (n.over != o + 1) {
+        if (n.over == 0) {
+            router.drag_elsewhere(t, r, now);
+        } else {
+            _drag_back(hs, n, now);
+        }
+        router.drag_enter(mt, mr, p, mx, my, now);
+        n.over = o + 1;
+    } else {
+        router.drag_move(mt, mr, mx, my, now);
+    }
+    if (e.kind == wevent.MOUSE_UP) {
+        let is i32 as done = router.drag_drop(mt, mr, mx, my, now);
+        router.drag_finish(t, r, done, now);
+        router.pointer_button(t, r, e.button, 0, cast(f64, e.x) / n.scale, cast(f64, e.y) / n.scale, now);
+        n.over = 0;
+    }
+    return 1;
+}
+
+fn _close_asked(hs as *Host, n as *Native, now as i64) as void {
+    let is *app.App as a = hs.a;
+    if (app.blocked(a, n.h) == 1) { return; }
+    if (router.close_request(app.tree(a, n.h), app.router(a, n.h), now) == 1) {
+        // Taken — a dialog answered it, and hid itself, or asks first.
+        device.keep_open(&n.win);
+        return;
+    }
+    if (app.is_dialog(a, n.h) == 1) {
+        app.hide(a, n.h);
+        return;
+    }
+    if (cast(i64, hs.close_cb) != 0 && call(hs.close_cb, hs.close_user, n.h) == 0) {
+        device.keep_open(&n.win);
+        return;
+    }
+    app.window_close(a, n.h);
+}
+
+// One event the platform said of the application's window h, given to it as
+// if it came from there now.
+fn feed(hs as *Host, h as i64, e as *wevent.Event, now as i64) as void {
+    let is i64 as i = _slot_of(hs, h);
+    if (i < 0) { return; }
+    _feed(hs, _native(hs, i), e, now);
+}
+
+// The pointer's shape over h, as last set; 0 before any.
+fn pointer_shape(hs as *Host, h as i64) as i32 {
+    let is i64 as i = _slot_of(hs, h);
+    if (i < 0) { return 0; }
+    return _native(hs, i).shape;
+}
+
+fn _feed(hs as *Host, n as *Native, e as *wevent.Event, now as i64) as void {
+    let is *app.App as a = hs.a;
+    let is i64 as h = n.h;
+    let is *tree.Tree as t = app.tree(a, h);
+    let is *router.Router as r = app.router(a, h);
+    let is f64 as s = n.scale;
+    let is f64 as x = cast(f64, e.x) / s;
+    let is f64 as y = cast(f64, e.y) / s;
+    let is i32 as input = cast(i32, app.blocked(a, h) == 0);
+    if (app.blocked(a, h) == 1 && e.kind == wevent.CLOSE) { device.keep_open(&n.win); }
+    let is i32 as k = e.kind;
+    // The modifiers held, as a pointer's event says them: right at its
+    // moment, where a key's says the state before it.
+    if (input == 1 && (k == wevent.MOUSE_MOVE || k == wevent.ENTER || k == wevent.MOUSE_DOWN || k == wevent.MOUSE_UP ||
+                       k == wevent.WHEEL)) { router.set_modifiers(r, e.modifiers); }
+    // A drag begun here, carried over another of the program's windows.
+    if (input == 1 && (k == wevent.MOUSE_MOVE || (k == wevent.MOUSE_UP && e.button == 1)) &&
+        _drag_across(hs, n, e, now) == 1) { return; }
+    if (k == wevent.MOUSE_MOVE || k == wevent.ENTER) {
+        if (input == 1) { router.pointer_move(t, r, x, y, now); }
+        return;
+    }
+    if (k == wevent.LEAVE) {
+        router.pointer_leave(t, r, now);
+        return;
+    }
+    if (k == wevent.MOUSE_DOWN || k == wevent.MOUSE_UP) {
+        if (input == 0) { return; }
+        let is i32 as pressed = cast(i32, k == wevent.MOUSE_DOWN);
+        if (e.button >= 1 && e.button <= 3) {
+            router.pointer_button(t, r, e.button, pressed, x, y, now);
+        } else if ((e.button == 6 || e.button == 7) && pressed == 1) {
+            // Sideways wheel notches.
+            let is f64 as dx with mut = 0.0 - 1.0;
+            if (e.button == 7) { dx = 1.0; }
+            router.scroll(t, r, x, y, dx, 0.0, 1, now);
+        }
+        return;
+    }
+    if (k == wevent.WHEEL) {
+        if (input == 1) { router.scroll(t, r, x, y, 0.0, 0.0 - cast(f64, e.wheel), 1, now); }
+        return;
+    }
+    if (k == wevent.KEY_DOWN || k == wevent.KEY_UP) {
+        let is i64 as code = cast(i64, e.keycode) & 255;
+        if (k == wevent.KEY_UP) {
+            n.down[code] = cast(u8, 0);
+            if (input == 1) { router.key(t, r, e.key, e.modifiers, 0, 0, now); }
+            return;
+        }
+        let is i32 as repeat = cast(i32, n.down[code] != 0);
+        n.down[code] = cast(u8, 1);
+        if (input == 0) { return; }
+        let is i32 as taken = router.key(t, r, e.key, e.modifiers, 1, repeat, now);
+        // What it typed, unless the key was taken or held with a modifier
+        // that makes it a command.
+        if (taken == 0 && e.text_len > 0 && (e.modifiers & (keys.MOD_CONTROL | keys.MOD_ALT | keys.MOD_SUPER)) == 0) {
+            router.text(t, r, e.text, e.text_len, now);
+        }
+        return;
+    }
+    if (k == wevent.FOCUS_IN || k == wevent.FOCUS_OUT) {
+        app.set_active(a, h, cast(i32, k == wevent.FOCUS_IN));
+        if (k == wevent.FOCUS_OUT) { mem.memset(cast(*u8, &n.down), 0, 256); }
+        return;
+    }
+    if (k == wevent.RESIZE) {
+        let is f64 as lw = cast(f64, e.width) / s;
+        let is f64 as lh = cast(f64, e.height) / s;
+        if (lw != app.width(a, h) || lh != app.height(a, h)) { app.resize(a, h, lw, lh); }
+        let is i64 as px with mut = 0;
+        let is i64 as py with mut = 0;
+        if (device.position(&n.win, &px, &py) == 1) { app.set_position(a, h, cast(f64, px) / s, cast(f64, py) / s); }
+        return;
+    }
+    if (k == wevent.EXPOSE) {
+        n.present = 1;
+        return;
+    }
+    if (k == wevent.CLOSE) {
+        _close_asked(hs, n, now);
+        return;
+    }
+    if (k == wevent.STATE) {
+        app.set_maximized(a, h, cast(i32, (e.state & wevent.STATE_MAXIMIZED) != 0));
+        app.set_fullscreen(a, h, cast(i32, (e.state & wevent.STATE_FULLSCREEN) != 0));
+        return;
+    }
+    if (k == wevent.SETTINGS) {
+        _read_settings(hs, n);
+        _rescale(hs);
+        return;
+    }
+    if (k == wevent.DND_ENTER) {
+        let is dnd.Payload as p = _payload(n, e.drop, 0);
+        _answer(n, router.drag_enter(t, r, &p, x, y, now));
+        return;
+    }
+    if (k == wevent.DND_MOVE) {
+        _answer(n, router.drag_move(t, r, x, y, now));
+        return;
+    }
+    if (k == wevent.DND_LEAVE) {
+        router.drag_leave(t, r, now);
+        return;
+    }
+    if (k == wevent.DND_DROP) {
+        let is dnd.Payload as got = _payload(n, e.drop, 1);
+        router.drag_update(r, &got);
+        router.drag_drop(t, r, x, y, now);
+        device.clear_drop(&n.win);
+        return;
+    }
+}
+
+// Every window's events, and a paste that came.
+fn _events(hs as *Host, now as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        let is *Native as n = _native(hs, i);
+        if (n.h != 0) {
+            device.pump(&n.win);
+            let is wevent.Event as e;
+            while (n.h != 0 && device.poll_event(&n.win, &e) == 1) { _feed(hs, n, &e, now); }
+            if (n.h != 0 && n.paste_on == 1 && device.clipboard_pending(&n.win) == 0) {
+                let is i64 as got = device.clipboard_text(&n.win, hs.paste, PASTE_BYTES);
+                n.paste_on = 0;
+                router.paste(app.tree(hs.a, n.h), app.router(hs.a, n.h), n.paste_w, n.paste_which, hs.paste, got, now);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// --- Painted and shown ---
+
+fn _paint(hs as *Host, now as i64) as void {
+    let is *app.App as a = hs.a;
+    let is i32 as glyphs with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        let is *Native as n = _native(hs, i);
+        if (n.h != 0 && (app.needs_frame(a, n.h) == 1 || n.present == 1)) {
+            if (glyphs == 0 && cast(i64, hs.svc) != 0) {
+                text.next_frame(cast(*text.Service, hs.svc));
+                glyphs = 1;
+            }
+            _frame(hs, n, now);
+        }
+        // The pointer's shape, as the widget under it asks.
+        if (n.h != 0) {
+            let is i32 as shape with mut = app.pointer_shape(a, n.h);
+            if (shape == tree.SHAPE_INHERIT) { shape = tree.SHAPE_DEFAULT; }
+            if (shape != n.shape) {
+                cursor.set(&n.cur, &n.win, shape);
+                n.shape = shape;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _frame(hs as *Host, n as *Native, now as i64) as void {
+    let is *app.App as a = hs.a;
+    let is *tree.Tree as t = app.tree(a, n.h);
+    let is i64 as pw = device.width(&n.win);
+    let is i64 as ph = device.height(&n.win);
+    if (pw <= 0 || ph <= 0) { return; }
+    // A texture the window's size: made again when it is not, and then all
+    // of it painted.
+    if (n.tex == 0 || n.tw != pw || n.th != ph) {
+        if (n.tex != 0) { gpu.texture.destroy(hs.dv, n.tex); }
+        let is gpu.texture.Desc as td = gpu.texture.desc(pw, ph, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+        n.tex = gpu.texture.create(hs.dv, &td);
+        n.tw = pw;
+        n.th = ph;
+        if (n.tex == 0) { return; }
+        tree.invalidate_paint_subtree(t, tree.root(t));
+    }
+    let is i64 as k = app.frame(a, n.h);
+    if (k > 0) {
+        draw2d.begin(&hs.canvas, cast(f64, pw), cast(f64, ph), n.scale);
+        app.paint(a, n.h, &hs.canvas, cast(*style.Theme, 0), now, cast(*paint.Stats, 0));
+        gpu.command.begin(hs.dv, hs.cmd);
+        let is gpu.command.Pass as ps = gpu.command.pass_load(n.tex, 0);
+        gpu.command.begin_pass(hs.dv, hs.cmd, &ps);
+        draw2d.flush(&hs.canvas, hs.cmd);
+        gpu.command.end_pass(hs.dv, hs.cmd);
+        gpu.command.end(hs.dv, hs.cmd);
+        gpu.command.submit(hs.dv, hs.cmd);
+        tree.damage_clear(t);
+    }
+    if (k == 0 && n.present == 0) { return; }
+    // Shown: the texture copied whole into the platform's buffer, when that
+    // is still the texture's size — a resize just read waits for the next
+    // round.
+    if (device.next_frame(&n.win) == 0) { return; }
+    let is tgt.Target as out = device.acquire(&n.win);
+    if (out.width != pw || out.height != ph || cast(i64, out.color) == 0) {
+        n.present = 1;
+        return;
+    }
+    gpu.texture.read(hs.dv, n.tex, out.color, pw * ph * 4);
+    device.submit(&n.win);
+    n.present = 0;
+}
+
+// Whether a window has something to paint or show.
+fn busy(hs as *Host) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        let is *Native as n = _native(hs, i);
+        if (n.h != 0 && (n.present == 1 || app.needs_frame(hs.a, n.h) == 1)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _first(hs as *Host) as *device.Window {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_native(hs, i).h != 0) { return &_native(hs, i).win; }
+        i = i + 1;
+    }
+    return cast(*device.Window, 0);
+}
+
+// The timers, long presses and animations come due by now: an animation
+// steps at its frame clock, not each time X wakes the loop — a frame shown
+// is itself an event.
+fn _tick(hs as *Host, now as i64) as void {
+    let is i64 as due = app.next_due(hs.a);
+    if (due >= 0 && due <= now) { app.tick(hs.a, now); }
+}
+
+// One round: the windows put up and away as the application's are, every
+// event given to it, what was posted run, the timers, the round's callbacks,
+// what changed painted and shown — then asleep until something is to be
+// done, or timeout_ms (negative: no limit), and what woke it run: a watched
+// descriptor's callback, what was posted, the timers come due. 0 once there
+// is no window left on the screen and nothing holds the loop, or quit was
+// asked; 1 otherwise.
+fn step(hs as *Host, timeout_ms as i64) as i32 {
+    let is *app.App as a = hs.a;
+    _sync(hs);
+    let is i64 as now = time.now_ms();
+    _events(hs, now);
+    _run_posted(hs);
+    _tick(hs, now);
+    let is i64 as i with mut = 0;
+    while (i < hs.nr) {
+        call(hs.rcb[i], hs.ruser[i]);
+        i = i + 1;
+    }
+    _sync(hs);
+    _paint(hs, now);
+    if (hs.quitting == 1) {
+        // Said once: a later round goes on.
+        hs.quitting = 0;
+        return 0;
+    }
+    if (shown(hs) == 0 && hs.held == 0) { return 0; }
+    let is i64 as t with mut = timeout_ms;
+    let is i64 as due = app.next_due(a);
+    if (due >= 0) {
+        let is i64 as d with mut = due - time.now_ms();
+        if (d < 0) { d = 0; }
+        if (t < 0 || d < t) { t = d; }
+    }
+    if (busy(hs) == 1) { t = 0; }
+    let is i32 as got = wait.wait(&hs.wt, _first(hs), t);
+    if ((got & wait.DESCRIPTOR) != 0) {
+        i = 0;
+        while (i < hs.nw) {
+            if (wait.readable(&hs.wt, hs.wfd[i]) == 1) { call(hs.wcb[i], hs.wuser[i], hs.wfd[i]); }
+            i = i + 1;
+        }
+    }
+    // What woke it, run before it returns: posted, or come due.
+    _run_posted(hs);
+    _tick(hs, time.now_ms());
+    return 1;
+}
+
+// Rounds until no window is left on the screen and nothing holds the loop,
+// or quit is asked.
+fn run(hs as *Host) as void {
+    while (step(hs, 0 - 1) == 1) { }
+}

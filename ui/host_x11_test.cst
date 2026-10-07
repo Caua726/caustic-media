@@ -1,0 +1,1165 @@
+// ui/host_x11_test.cst — the application on the screen, under Xvfb, GTK's
+// settings from window/testdata/xdg:
+//   env XDG_CONFIG_HOME=window/testdata/xdg sh window/x11/tools/run_headless.sh ./build/host_x11_test
+// Run from the repository's root (the test font).
+//
+// A window of the application's becomes one of X's, titled as it is and
+// painted as it is drawn; what X says of it — a button pressed, a key typed,
+// its size, its close button — reaches the widgets; a modal dialog is a
+// window of its own above it, the window under it told nothing meanwhile;
+// the loop sleeps until a timer, a descriptor, another thread or an event
+// has something for it. Another client plays the user and the window
+// manager on a connection of its own.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/thread.cst" as thread;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../window/keys.cst" as keys;
+use "../window/device.cst" as device;
+use "../window/event.cst" as wevent;
+use "../window/x11/x11.cst" as x11;
+use "../window/x11/bind/xlib.cst" as xlib;
+use "../window/x11/bind/x.cst" as x;
+use "../window/x11/bind/xevent.cst" as xev;
+use "../text/sfnt/sfnt.cst" as sfnt;
+use "../text/sfnt/table.cst" as table;
+use "../text/layout/font.cst" as font;
+use "tree.cst" as tree;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "style.cst" as style;
+use "router.cst" as router;
+use "signal.cst" as signal;
+use "text.cst" as text;
+use "timer.cst" as timer;
+use "anim.cst" as anim;
+use "app.cst" as app;
+use "host.cst" as host;
+use "icons.cst" as icons;
+use "widgets/button.cst" as button;
+use "widgets/entry.cst" as entry;
+use "widgets/dialog.cst" as dialog;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "event.cst" as event;
+use "scroll.cst" as scroll;
+use "dnd.cst" as dnd;
+use "../window/settings.cst" as wsettings;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is gpu.device.Device as dv with mut;
+let is app.App as a with mut;
+let is *host.Host as hs with mut;
+let is *u8 as other with mut;
+
+let is i64 as clicks with mut = 0;
+fn on_click(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { clicks = clicks + 1; }
+
+let is i64 as answered with mut = 0;
+let is i64 as answers with mut = 0;
+fn on_answer(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    answered = *cast(*i64, arg);
+    answers = answers + 1;
+}
+
+let is i64 as fired with mut = 0;
+fn on_timer(user as *u8) as void { fired = fired + 1; }
+
+let is i64 as readable with mut = 0;
+fn on_readable(user as *u8, fd as i64) as void {
+    let is [8]u8 as b;
+    linux.read(fd, cast(*u8, &b), 8);
+    readable = readable + 1;
+}
+
+let is i64 as posted with mut = 0;
+fn on_posted(user as *u8) as void { posted = posted + 1; }
+
+fn poster(arg as i64) as i64 {
+    time.sleep_ms(60);
+    host.post(hs, fn_ptr(on_posted), cast(*u8, 0));
+    return 0;
+}
+
+let is i32 as refuse with mut = 0;
+let is i64 as asked_close with mut = 0;
+fn on_close(user as *u8, h as i64) as i32 {
+    asked_close = asked_close + 1;
+    return cast(i32, refuse == 0);
+}
+
+// Rounds until a quiet one, at most a second's worth.
+fn settle() as void {
+    let is i64 as until = time.now_ms() + 1000;
+    let is i32 as i with mut = 0;
+    while (i < 6 && time.now_ms() < until) {
+        host.step(hs, 30);
+        i = i + 1;
+    }
+}
+
+// Rounds for a second: animations — a wheel's glide — run out.
+fn settle_long() as void {
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) { host.step(hs, 20); }
+}
+
+// Rounds until nothing is due — a scroll bar's fade after it hides — and
+// nothing is left to show.
+fn quiet() as void {
+    let is i64 as until = time.now_ms() + 5000;
+    while ((app.next_due(&a) >= 0 || host.busy(hs) != 0) && time.now_ms() < until) { host.step(hs, 50); }
+}
+
+// Whether X has the window xid on the screen still: among the root's
+// children, as the other client sees them.
+fn on_screen(xid as i64) as i32 {
+    xlib.XSync(other, 0);
+    let is i64 as root_back with mut = 0;
+    let is i64 as parent_back with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is i32 as nkids with mut = 0;
+    if (xlib.XQueryTree(other, xlib.XDefaultRootWindow(other), cast(*u8, &root_back), cast(*u8, &parent_back),
+                        cast(*u8, &kids), cast(*u8, &nkids)) == 0) { return 0; }
+    let is i32 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, nkids)) {
+        if (kids[i] == xid) { found = 1; }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+// --- A drag from another program, played by the other client ---
+
+let is i64 as dnd_source with mut = 0;
+
+fn xdnd_send(to as i64, kind as *u8, d1 as i64, d2 as i64, d3 as i64, d4 as i64) as void {
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    xev.any(&m).kind = x.ClientMessage;
+    xev.any(&m).window = to;
+    xev.client(&m).message_type = xlib.XInternAtom(other, kind, 0);
+    xev.client(&m).format = 32;
+    xev.client(&m).data[0] = dnd_source;
+    xev.client(&m).data[1] = d1;
+    xev.client(&m).data[2] = d2;
+    xev.client(&m).data[3] = d3;
+    xev.client(&m).data[4] = d4;
+    xlib.XSendEvent(other, to, 0, 0, cast(*u8, &m));
+    xlib.XFlush(other);
+}
+
+// A drag offering only type entering h's window and over its point px, py
+// (physical pixels): the accept bit of the XdndStatus it answers with, -1
+// when none came. Then left.
+fn xdnd_accept(h as i64, type_name as *u8, px as i64, py as i64) as i64 {
+    let is i64 as root = xlib.XDefaultRootWindow(other);
+    if (dnd_source == 0) { dnd_source = xlib.XCreateSimpleWindow(other, root, 0, 0, 10, 10, 0, 0, 0); }
+    let is i64 as to = xid_of(h);
+    let is i32 as rx with mut = 0;
+    let is i32 as ry with mut = 0;
+    let is i64 as child with mut = 0;
+    xlib.XTranslateCoordinates(other, to, root, cast(i32, px), cast(i32, py), cast(*u8, &rx), cast(*u8, &ry), cast(*u8, &child));
+    xdnd_send(to, "XdndEnter", 5 << 24, xlib.XInternAtom(other, type_name, 0), 0, 0);
+    xdnd_send(to, "XdndPosition", 0, (cast(i64, rx) << 16) | cast(i64, ry), 0, xlib.XInternAtom(other, "XdndActionCopy", 0));
+    let is i64 as status_atom = xlib.XInternAtom(other, "XdndStatus", 0);
+    let is i64 as got with mut = 0 - 1;
+    let is i64 as until = time.now_ms() + 2000;
+    let is xev.XEvent as ev;
+    while (got < 0 && time.now_ms() < until) {
+        host.step(hs, 20);
+        while (xlib.XPending(other) > 0) {
+            xlib.XNextEvent(other, cast(*u8, &ev));
+            if (xev.any(&ev).kind == x.ClientMessage && xev.client(&ev).message_type == status_atom) {
+                got = xev.client(&ev).data[1] & 1;
+            }
+        }
+    }
+    xdnd_send(to, "XdndLeave", 0, 0, 0, 0);
+    host.step(hs, 20);
+    return got;
+}
+
+fn xid_of(h as i64) as i64 {
+    let is *device.Window as w = host.native(hs, h);
+    if (cast(i64, w) == 0) { return 0; }
+    return x11.xid(&w.x11_win);
+}
+
+let is i64 as _type with mut = 0;
+let is i32 as _format with mut = 0;
+let is i64 as _n with mut = 0;
+let is i64 as _after with mut = 0;
+let is *u8 as _data with mut;
+
+fn title_is(h as i64, want as *u8) as i32 {
+    _data = cast(*u8, 0);
+    xlib.XSync(other, 0);
+    if (xlib.XGetWindowProperty(other, xid_of(h), xlib.XInternAtom(other, "_NET_WM_NAME", 0), 0, 64, 0, 0, cast(*u8, &_type),
+                                cast(*u8, &_format), cast(*u8, &_n), cast(*u8, &_after), cast(*u8, &_data)) != 0) { return 0; }
+    if (cast(i64, _data) == 0) { return 0; }
+    let is i32 as ok = same(_data, _n, want);
+    xlib.XFree(_data);
+    return ok;
+}
+
+// Whether the window's state, as the window manager reads it, says modal.
+fn modal_of(h as i64) as i32 {
+    _data = cast(*u8, 0);
+    xlib.XSync(other, 0);
+    if (xlib.XGetWindowProperty(other, xid_of(h), xlib.XInternAtom(other, "_NET_WM_STATE", 0), 0, 16, 0, 0, cast(*u8, &_type),
+                                cast(*u8, &_format), cast(*u8, &_n), cast(*u8, &_after), cast(*u8, &_data)) != 0) { return 0; }
+    if (cast(i64, _data) == 0) { return 0; }
+    let is i64 as m = xlib.XInternAtom(other, "_NET_WM_STATE_MODAL", 0);
+    let is i32 as ok with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < _n) {
+        if (*cast(*i64, cast(i64, _data) + i * 8) == m) { ok = 1; }
+        i = i + 1;
+    }
+    xlib.XFree(_data);
+    return ok;
+}
+
+// The colour X shows at x, y of h's window, 0xRRGGBB.
+fn shown_at(h as i64, px as i64, py as i64) as i64 {
+    xlib.XSync(other, 0);
+    let is *u8 as im = xlib.XGetImage(other, xid_of(h), cast(i32, px), cast(i32, py), cast(u32, 1), cast(u32, 1), 0 - 1, 2);
+    if (cast(i64, im) == 0) { return 0 - 1; }
+    let is i64 as v = xlib.XGetPixel(im, 0, 0) & 16777215;
+    xlib.XDestroyImage(im);
+    return v;
+}
+
+fn rgb(c as math.color.Color) as i64 {
+    let is i64 as r = cast(i64, c.r * 255.0 + 0.5);
+    let is i64 as g = cast(i64, c.g * 255.0 + 0.5);
+    let is i64 as b = cast(i64, c.b * 255.0 + 0.5);
+    return (r << 16) | (g << 8) | b;
+}
+
+fn near_rgb(v as i64, want as i64) as i32 {
+    let is i64 as dr with mut = ((v >> 16) & 255) - ((want >> 16) & 255);
+    let is i64 as dg with mut = ((v >> 8) & 255) - ((want >> 8) & 255);
+    let is i64 as db with mut = (v & 255) - (want & 255);
+    if (dr < 0) { dr = 0 - dr; }
+    if (dg < 0) { dg = 0 - dg; }
+    if (db < 0) { db = 0 - db; }
+    return cast(i32, dr <= 3 && dg <= 3 && db <= 3);
+}
+
+fn button_event(h as i64, kind as i32, px as i64, py as i64) as void {
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    let is *xev.XButtonEvent as b = xev.button(&m);
+    b.kind = kind;
+    b.display = other;
+    b.window = xid_of(h);
+    b.root = xlib.XDefaultRootWindow(other);
+    b.x = cast(i32, px);
+    b.y = cast(i32, py);
+    b.button = cast(u32, 1);
+    b.same_screen = 1;
+    if (kind == x.ButtonRelease) { b.state = cast(u32, 256); }
+    xlib.XSendEvent(other, xid_of(h), 0, 0, cast(*u8, &m));
+    xlib.XFlush(other);
+}
+
+// A click on widget w of h's window, where X has it.
+fn click_on(h as i64, w as i64) as void {
+    let is math.rect.Rect as r = layout.window_rect(app.tree(&a, h), w);
+    let is f64 as s = app.scale(&a, h);
+    let is i64 as px = cast(i64, (r.x + r.w / 2.0) * s);
+    let is i64 as py = cast(i64, (r.y + r.h / 2.0) * s);
+    button_event(h, x.ButtonPress, px, py);
+    button_event(h, x.ButtonRelease, px, py);
+}
+
+fn motion_event(h as i64, px as i64, py as i64) as void {
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    let is *xev.XMotionEvent as mo = xev.motion(&m);
+    mo.kind = x.MotionNotify;
+    mo.display = other;
+    mo.window = xid_of(h);
+    mo.root = xlib.XDefaultRootWindow(other);
+    mo.x = cast(i32, px);
+    mo.y = cast(i32, py);
+    mo.state = cast(u32, 256);
+    mo.same_screen = 1;
+    xlib.XSendEvent(other, xid_of(h), 0, 0, cast(*u8, &m));
+    xlib.XFlush(other);
+}
+
+fn type_key(h as i64, keysym as i64) as void {
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    let is *xev.XKeyEvent as k = xev.key(&m);
+    k.kind = x.KeyPress;
+    k.display = other;
+    k.window = xid_of(h);
+    k.root = xlib.XDefaultRootWindow(other);
+    k.keycode = cast(u32, xlib.XKeysymToKeycode(other, keysym));
+    k.same_screen = 1;
+    xlib.XSendEvent(other, xid_of(h), 0, 0, cast(*u8, &m));
+    k.kind = x.KeyRelease;
+    xlib.XSendEvent(other, xid_of(h), 0, 0, cast(*u8, &m));
+    xlib.XFlush(other);
+}
+
+fn close_button(h as i64) as void {
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    xev.any(&m).kind = x.ClientMessage;
+    xev.any(&m).window = xid_of(h);
+    xev.client(&m).message_type = xlib.XInternAtom(other, "WM_PROTOCOLS", 0);
+    xev.client(&m).format = 32;
+    xev.client(&m).data[0] = xlib.XInternAtom(other, "WM_DELETE_WINDOW", 0);
+    xlib.XSendEvent(other, xid_of(h), 0, 0, cast(*u8, &m));
+    xlib.XFlush(other);
+}
+
+// A widget that hears keys: how many presses, and whether the last repeats.
+struct Rec {
+    downs  as i64;
+    ups    as i64;
+    repeat as i32;
+    button as i32;   // the last pressed over it
+}
+
+let is tree.Kind as rec_kind with mut;
+
+fn rec_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Rec as d = cast(*Rec, data);
+    if (e.kind == event.KEY_DOWN) {
+        d.downs = d.downs + 1;
+        d.repeat = e.repeat;
+        return 1;
+    }
+    if (e.kind == event.KEY_UP) {
+        d.ups = d.ups + 1;
+        return 1;
+    }
+    if (e.kind == event.POINTER_DOWN) {
+        d.button = e.button;
+        return 1;
+    }
+    return 0;
+}
+
+fn rec_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    out.min_w = 20.0;
+    out.min_h = 20.0;
+    out.pref_w = 20.0;
+    out.pref_h = 20.0;
+}
+
+fn feed(h as i64, kind as i32, px as i64, py as i64) as void {
+    let is wevent.Event as ev;
+    wevent.clear(&ev);
+    ev.kind = kind;
+    ev.x = px;
+    ev.y = py;
+    host.feed(hs, h, &ev, time.now_ms());
+}
+
+fn feed_button(h as i64, kind as i32, button as i32, px as i64, py as i64) as void {
+    let is wevent.Event as ev;
+    wevent.clear(&ev);
+    ev.kind = kind;
+    ev.button = button;
+    ev.x = px;
+    ev.y = py;
+    host.feed(hs, h, &ev, time.now_ms());
+}
+
+fn feed_key(h as i64, kind as i32, key as i32, code as i32, mods as i32, text as *u8, n as i64) as void {
+    let is wevent.Event as ev;
+    wevent.clear(&ev);
+    ev.kind = kind;
+    ev.key = key;
+    ev.keycode = code;
+    ev.modifiers = mods;
+    ev.text = text;
+    ev.text_len = n;
+    host.feed(hs, h, &ev, time.now_ms());
+}
+
+let is i64 as rounds with mut = 0;
+fn on_round(user as *u8) as void { rounds = rounds + 1; }
+fn nothing_fd(user as *u8, fd as i64) as void { }
+fn nothing(user as *u8) as void { }
+fn stop_running(user as *u8) as void { host.quit(hs); }
+
+let is i64 as quit_after with mut = 0;
+fn on_quit_timer(user as *u8) as void { app.window_close(&a, quit_after); }
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as d = load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 1;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    theme = style.light();
+    theme.fonts.body.size = 16.0;
+    dv = gpu.open_headless(64, 64, gpu.SOFTWARE);
+    let is text.Limits as lim = text.limits_default();
+    let is *text.Service as svc = text.open(&dv, &lim, fn_ptr(resolve), cast(*u8, 0), theme.fonts.family);
+    other = xlib.XOpenDisplay(cast(*u8, 0));
+
+    let is app.Limits as al = app.limits_default();
+    a = app.open(&al);
+    app.set_theme(&a, &theme);
+    app.set_text_service(&a, cast(*u8, svc));
+    let is i64 as main_w = app.window_open(&a, 320.0, 200.0);
+    app.set_title(&a, main_w, "Main", 4);
+    let is *tree.Tree as t = app.tree(&a, main_w);
+    let is *router.Router as r = app.router(&a, main_w);
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    layout.set_align(t, col, layout.START, layout.START);
+    let is i64 as b = button.create(t, col, "Press", 5);
+    signal.connect(t, b, signal.CLICKED, fn_ptr(on_click), cast(*u8, 0));
+    let is i64 as e = entry.create(t, col);
+    layout.set_min_size(t, e, 160.0, 0.0);
+
+    hs = host.open(&a, &dv, cast(*u8, svc));
+    check("open", cast(i64, hs) != 0);
+    settle();
+    check("the desktop's settings, read with the first window", host.settings(hs).double_click_ms == 333 &&
+          app.settings(&a).double_click_ms == 333);
+
+    // --- On the screen ---
+    check("a window of X's for it", host.shown(hs) == 1 && xid_of(main_w) != 0);
+    check("titled as it is", title_is(main_w, "Main") == 1);
+    check("painted: its background where nothing is", near_rgb(shown_at(main_w, 300, 190), rgb(theme.palette.window_bg)) == 1);
+    let is math.rect.Rect as br = layout.window_rect(t, b);
+    let is f64 as s = app.scale(&a, main_w);
+    check("the button drawn where it is", near_rgb(shown_at(main_w, cast(i64, (br.x + 3.0) * s), cast(i64, (br.y + br.h / 2.0) * s)),
+          rgb(theme.palette.window_bg)) == 0);
+    app.set_title(&a, main_w, "Principal", 9);
+    settle();
+    check("titled again", title_is(main_w, "Principal") == 1);
+    app.set_title(&a, main_w, "Principia", 9);
+    settle();
+    check("titled again, as long", title_is(main_w, "Principia") == 1);
+    // Its icon: the program's, one of the toolkit's made into pixels.
+    let is [1024]u32 as icon_px;
+    icons.rasterize(icons.DIALOG_INFO, 32, math.color.rgba(0.2, 0.4, 0.8, 1.0), cast(*u32, &icon_px));
+    app.set_icon(&a, cast(*u32, &icon_px), 32);
+    settle();
+    _data = cast(*u8, 0);
+    xlib.XGetWindowProperty(other, xid_of(main_w), xlib.XInternAtom(other, "_NET_WM_ICON", 0), 0, 2048, 0, 0, cast(*u8, &_type),
+                            cast(*u8, &_format), cast(*u8, &_n), cast(*u8, &_after), cast(*u8, &_data));
+    check("its icon on its window", cast(i64, _data) != 0 && _n == 2 + 1024 && *cast(*i64, _data) == 32 &&
+          (*cast(*i64, cast(i64, _data) + (2 + 3 * 32 + 16) * 8) & 4294967295) == cast(i64, icon_px[3 * 32 + 16]));
+    if (cast(i64, _data) != 0) { xlib.XFree(_data); }
+
+    // --- What X says, to the widgets ---
+    click_on(main_w, b);
+    settle();
+    check("a click: the button's", clicks == 1);
+    router.focus(t, r, e, 1);
+    type_key(main_w, 97);
+    type_key(main_w, 98);
+    settle();
+    check("keys typed: the entry's text", same(entry.text(t, e), entry.length(t, e), "ab") == 1);
+    let is math.rect.Rect as er = layout.window_rect(t, e);
+    let is wevent.Event as mv;
+    wevent.clear(&mv);
+    mv.kind = wevent.MOUSE_MOVE;
+    mv.x = cast(i64, (er.x + 10.0) * s);
+    mv.y = cast(i64, (er.y + er.h / 2.0) * s);
+    host.feed(hs, main_w, &mv, time.now_ms());
+    settle();
+    check("over the entry: a text beam", host.pointer_shape(hs, main_w) == tree.SHAPE_TEXT);
+    xlib.XResizeWindow(other, xid_of(main_w), cast(u32, 420), cast(u32, 260));
+    xlib.XFlush(other);
+    settle();
+    check("resized by X: the window's size", app.width(&a, main_w) == 420.0 / s && app.height(&a, main_w) == 260.0 / s);
+    check("and painted, the new part too", near_rgb(shown_at(main_w, 410, 250), rgb(theme.palette.window_bg)) == 1);
+    // Told a size that changed in one direction only: that one taken.
+    let is wevent.Event as rz;
+    wevent.clear(&rz);
+    rz.kind = wevent.RESIZE;
+    rz.width = 400;
+    rz.height = 260;
+    host.feed(hs, main_w, &rz, time.now_ms());
+    check("narrower only", app.width(&a, main_w) == 400.0 / s && app.height(&a, main_w) == 260.0 / s);
+    rz.height = 240;
+    host.feed(hs, main_w, &rz, time.now_ms());
+    check("lower only", app.width(&a, main_w) == 400.0 / s && app.height(&a, main_w) == 240.0 / s);
+    rz.width = 420;
+    rz.height = 260;
+    host.feed(hs, main_w, &rz, time.now_ms());
+    // Resized by X in one direction only: painted, the new part too.
+    xlib.XResizeWindow(other, xid_of(main_w), cast(u32, 440), cast(u32, 260));
+    xlib.XFlush(other);
+    settle();
+    check("wider only: painted to its new edge", app.width(&a, main_w) == 440.0 / s &&
+          near_rgb(shown_at(main_w, 432, 250), rgb(app.theme(&a).palette.window_bg)) == 1);
+    xlib.XResizeWindow(other, xid_of(main_w), cast(u32, 440), cast(u32, 280));
+    xlib.XFlush(other);
+    settle();
+    check("taller only: painted to its new edge", app.height(&a, main_w) == 280.0 / s &&
+          near_rgb(shown_at(main_w, 432, 272), rgb(app.theme(&a).palette.window_bg)) == 1);
+    xlib.XResizeWindow(other, xid_of(main_w), cast(u32, 420), cast(u32, 260));
+    xlib.XFlush(other);
+    settle();
+    let is style.Theme as dark = style.dark();
+    app.set_theme(&a, &dark);
+    settle();
+    check("painted again when it changes: dark", near_rgb(shown_at(main_w, 410, 250), rgb(dark.palette.window_bg)) == 1);
+    app.set_theme(&a, &theme);
+    settle();
+
+    // --- The clipboard ---
+    tree.copy(t, tree.CLIPBOARD, "olá", 4);
+    entry.set_text(t, e, "", 0);
+    router.focus(t, r, e, 1);
+    router.key(t, r, keys.V, keys.MOD_CONTROL, 1, 0, time.now_ms());
+    router.key(t, r, keys.V, keys.MOD_CONTROL, 0, 0, time.now_ms());
+    settle();
+    check("copied and pasted through X", same(entry.text(t, e), entry.length(t, e), "olá") == 1);
+
+    // --- A modal dialog: a window of its own, the one under it waiting ---
+    let is *tree.Tree as dt = dialog.window_tree(t);
+    let is i64 as dg = dialog.message(dt, dialog.QUESTION, "Sure?", 5, "Really.", 7, dialog.OK_CANCEL);
+    signal.connect(dt, dg, signal.ACTIVATED, fn_ptr(on_answer), cast(*u8, 0));
+    let is i64 as dw = app.window_of(&a, dt);
+    dialog.show(dt, cast(*router.Router, tree.router(dt)), dg, 1);
+    settle();
+    check("the dialog's window, on the screen", host.shown(hs) == 2 && xid_of(dw) != 0);
+    let is i64 as owner_xid with mut = 0;
+    xlib.XGetTransientForHint(other, xid_of(dw), cast(*u8, &owner_xid));
+    check("above its owner's, modal", owner_xid == xid_of(main_w) && modal_of(dw) == 1);
+    click_on(main_w, b);
+    settle();
+    check("the window under it told nothing", clicks == 1 && app.blocked(&a, main_w) == 1);
+    close_button(dw);
+    settle();
+    check("its close button: cancelled, put away", answers == 1 && answered == dialog.CANCEL && host.shown(hs) == 1 &&
+          xid_of(dw) == 0);
+    click_on(main_w, b);
+    settle();
+    check("the window under it going on", clicks == 2);
+
+    // --- Dragged from one window to another of the program's ---
+    let is i64 as side = app.window_open(&a, 200.0, 120.0);
+    app.set_title(&a, side, "Side", 4);
+    let is *tree.Tree as st = app.tree(&a, side);
+    let is i64 as e2 = entry.create(st, tree.root(st));
+    layout.set_align(st, e2, layout.START, layout.START);
+    layout.set_min_size(st, e2, 150.0, 0.0);
+    settle();
+    xlib.XMoveWindow(other, xid_of(main_w), 0, 0);
+    xlib.XMoveWindow(other, xid_of(side), 600, 50);
+    xlib.XSync(other, 0);
+    settle();
+    entry.set_text(t, e, "dragme", 6);
+    entry.select(t, e, 0, 6);
+    settle();
+    let is math.rect.Rect as from = layout.window_rect(t, e);
+    let is math.rect.Rect as to = layout.window_rect(st, e2);
+    let is f64 as s2 = app.scale(&a, side);
+    let is i64 as fx = cast(i64, (from.x + 12.0) * s);
+    let is i64 as fy = cast(i64, (from.y + from.h / 2.0) * s);
+    button_event(main_w, x.ButtonPress, fx, fy);
+    settle();
+    motion_event(main_w, fx + 40, fy);
+    settle();
+    // Over the other window: where it is on the screen, from this one.
+    let is i64 as tx = 600 + cast(i64, (to.x + 20.0) * s2);
+    let is i64 as ty = 50 + cast(i64, (to.y + to.h / 2.0) * s2);
+    let is f64 as sx2 with mut = 0.0;
+    let is f64 as sy2 with mut = 0.0;
+    check("its place, as X has it", app.position(&a, side, &sx2, &sy2) == 1 && sx2 == 600.0 / s2 && sy2 == 50.0 / s2);
+    motion_event(main_w, tx, ty);
+    settle();
+    check("over the other window: taken there", router.drag_target(app.router(&a, side)) == e2 &&
+          router.drag_active(r) == 1 && router.drag_target(r) == 0);
+    motion_event(main_w, tx + 2, ty);
+    settle();
+    check("moved over it: still there", router.drag_target(app.router(&a, side)) == e2);
+    motion_event(main_w, fx + 40, fy);
+    settle();
+    check("back over its own: left the other", router.drag_active(app.router(&a, side)) == 0 && router.drag_active(r) == 1);
+    check("back over its own: over its own entry again", router.drag_target(r) == e);
+    motion_event(main_w, 590, 400);
+    settle();
+    check("over no window of its own: nowhere", router.drag_active(app.router(&a, side)) == 0 && router.drag_active(r) == 1);
+    motion_event(main_w, 600, 50);
+    settle();
+    check("the other's corner: over it", router.drag_active(app.router(&a, side)) == 1);
+    // Its far edges are past it, as X counts them.
+    let is i64 as side_w = device.width(host.native(hs, side));
+    let is i64 as side_h = device.height(host.native(hs, side));
+    motion_event(main_w, 600 + side_w, 60);
+    settle();
+    check("just past its right edge: not over it", router.drag_active(app.router(&a, side)) == 0);
+    motion_event(main_w, 610, 50 + side_h);
+    settle();
+    check("just past its bottom edge: not over it", router.drag_active(app.router(&a, side)) == 0);
+    motion_event(main_w, tx, ty);
+    settle();
+    button_event(main_w, x.ButtonRelease, tx, ty);
+    settle();
+    check("let go there: moved into it", same(entry.text(st, e2), entry.length(st, e2), "dragme") == 1 &&
+          entry.length(t, e) == 0 && router.drag_active(r) == 0 && router.drag_active(app.router(&a, side)) == 0);
+    // And back: from the window in the second place to the first's.
+    entry.select(st, e2, 0, 6);
+    settle();
+    let is i64 as gx = cast(i64, (to.x + 12.0) * s2);
+    let is i64 as gy = cast(i64, (to.y + to.h / 2.0) * s2);
+    button_event(side, x.ButtonPress, gx, gy);
+    settle();
+    motion_event(side, gx + 40, gy);
+    settle();
+    motion_event(side, fx - 600, fy - 50);
+    settle();
+    check("from the other, over the first: taken there", router.drag_target(r) == e);
+    button_event(side, x.ButtonRelease, fx - 600, fy - 50);
+    settle();
+    check("let go there: moved back", same(entry.text(t, e), entry.length(t, e), "dragme") == 1 && entry.length(st, e2) == 0);
+    // From another program: what X's drag says, to the router.
+    let is wevent.Event as dg_ev;
+    wevent.clear(&dg_ev);
+    dg_ev.kind = wevent.DND_ENTER;
+    dg_ev.drop = wevent.DROP_TEXT;
+    dg_ev.x = fx;
+    dg_ev.y = fy;
+    host.feed(hs, main_w, &dg_ev, time.now_ms());
+    check("a drag from outside over the entry: taken there", router.drag_active(r) == 1 && router.drag_target(r) == e);
+    dg_ev.kind = wevent.DND_MOVE;
+    dg_ev.x = 400;
+    dg_ev.y = 250;
+    host.feed(hs, main_w, &dg_ev, time.now_ms());
+    check("moved off it: not", router.drag_target(r) == 0 && router.drag_active(r) == 1);
+    dg_ev.kind = wevent.DND_LEAVE;
+    host.feed(hs, main_w, &dg_ev, time.now_ms());
+    check("left", router.drag_active(r) == 0);
+    app.window_close(&a, side);
+    settle();
+
+    // --- Asleep until something is to be done ---
+    settle();
+    timer.add(app.timers(&a), time.now_ms(), 80, 0, fn_ptr(on_timer), cast(*u8, 0));
+    let is i64 as t0 with mut = time.now_ms();
+    while (fired == 0 && time.now_ms() - t0 < 3000) { host.step(hs, 5000); }
+    let is i64 as took with mut = time.now_ms() - t0;
+    check("woken by a timer, when it is due", fired == 1 && took >= 60 && took < 1500);
+    // Asked not to wait: not even until a timer due later.
+    timer.add(app.timers(&a), time.now_ms(), 400, 0, fn_ptr(nothing), cast(*u8, 0));
+    t0 = time.now_ms();
+    host.step(hs, 0);
+    check("not to wait: at once, a timer due later or not", time.now_ms() - t0 < 150);
+    let is [2]i32 as p;
+    linux.pipe2(cast(*i32, &p), 524288);
+    check("a descriptor watched", host.watch(hs, cast(i64, p[0]), fn_ptr(on_readable), cast(*u8, 0)) == 1);
+    linux.write(cast(i64, p[1]), "x", 1);
+    t0 = time.now_ms();
+    while (readable == 0 && time.now_ms() - t0 < 3000) { host.step(hs, 5000); }
+    check("woken by it, told", readable == 1 && time.now_ms() - t0 < 1500);
+    host.unwatch(hs, cast(i64, p[0]));
+    let is thread.Thread as th;
+    thread.spawn(&th, cast(*u8, fn_ptr(poster)), 0);
+    t0 = time.now_ms();
+    while (posted == 0 && time.now_ms() - t0 < 3000) { host.step(hs, 5000); }
+    took = time.now_ms() - t0;
+    check("woken by another thread's post, run here", posted == 1 && took >= 30 && took < 1500);
+    thread.join(&th);
+
+    // --- Each thing X can say, as the host hears it ---
+    rec_kind = widget.kind("keys heard", sizeof(Rec));
+    rec_kind.event = fn_ptr(rec_event);
+    rec_kind.measure = fn_ptr(rec_measure);
+    let is i64 as fw = app.window_open(&a, 300.0, 200.0);
+    let is *tree.Tree as tf = app.tree(&a, fw);
+    let is *router.Router as rf = app.router(&a, fw);
+    let is i64 as fcol = box.create(tf, tree.root(tf), box.COLUMN);
+    layout.set_align(tf, fcol, layout.START, layout.START);
+    let is i64 as rec = tree.create(tf, &rec_kind, fcol);
+    tree.set_focusable(tf, rec, 1);
+    let is i64 as sc = scroll.create(tf, fcol);
+    layout.set_min_size(tf, sc, 120.0, 80.0);
+    let is i64 as big = box.create(tf, sc, box.COLUMN);
+    layout.set_min_size(tf, big, 600.0, 600.0);
+    let is i64 as e3 = entry.create(tf, fcol);
+    layout.set_min_size(tf, e3, 150.0, 0.0);
+    settle();
+    let is f64 as fs = app.scale(&a, fw);
+    let is math.rect.Rect as scr = layout.window_rect(tf, sc);
+    let is i64 as sx = cast(i64, (scr.x + 20.0) * fs);
+    let is i64 as sy = cast(i64, (scr.y + 20.0) * fs);
+    // The pointer coming in and leaving.
+    feed(fw, wevent.ENTER, sx, sy);
+    check("entering: under the pointer", router.hover(rf) != 0);
+    feed(fw, wevent.LEAVE, sx, sy);
+    check("leaving: nothing under it", router.hover(rf) == 0);
+    // The modifiers held, as the pointer's events say them.
+    let is wevent.Event as pm;
+    wevent.clear(&pm);
+    pm.kind = wevent.MOUSE_MOVE;
+    pm.x = sx;
+    pm.y = sy;
+    pm.modifiers = keys.MOD_CONTROL;
+    host.feed(hs, fw, &pm, time.now_ms());
+    check("moved with Ctrl held: held", router.modifiers(rf) == keys.MOD_CONTROL);
+    pm.modifiers = 0;
+    host.feed(hs, fw, &pm, time.now_ms());
+    check("moved with nothing held: nothing", router.modifiers(rf) == 0);
+    feed(fw, wevent.LEAVE, sx, sy);
+    // The wheel, down and sideways.
+    let is wevent.Event as wh;
+    wevent.clear(&wh);
+    wh.kind = wevent.WHEEL;
+    wh.wheel = 0 - 1;
+    wh.x = sx;
+    wh.y = sy;
+    host.feed(hs, fw, &wh, time.now_ms());
+    settle_long();
+    check("the wheel turned down: scrolled down", scroll.offset_y(tf, sc) > 0.0);
+    wh.wheel = 1;
+    host.feed(hs, fw, &wh, time.now_ms());
+    settle_long();
+    check("and back up", scroll.offset_y(tf, sc) == 0.0);
+    feed_button(fw, wevent.MOUSE_DOWN, 7, sx, sy);
+    feed_button(fw, wevent.MOUSE_UP, 7, sx, sy);
+    settle_long();
+    let is f64 as across = scroll.offset_x(tf, sc);
+    feed_button(fw, wevent.MOUSE_DOWN, 7, sx, sy);
+    settle_long();
+    feed_button(fw, wevent.MOUSE_DOWN, 6, sx, sy);
+    settle_long();
+    check("a sideways notch each way, as far", across > 0.0 && scroll.offset_x(tf, sc) == across);
+    feed_button(fw, wevent.MOUSE_DOWN, 6, sx, sy);
+    settle_long();
+    check("and back", scroll.offset_x(tf, sc) == 0.0);
+    feed_button(fw, wevent.MOUSE_DOWN, 8, sx, sy);
+    feed_button(fw, wevent.MOUSE_UP, 8, sx, sy);
+    check("another button: nothing", scroll.offset_x(tf, sc) == 0.0 && router.capture(rf) == 0);
+    // Every button over what hears them: the third too.
+    let is math.rect.Rect as recr = layout.window_rect(tf, rec);
+    feed_button(fw, wevent.MOUSE_DOWN, 3, cast(i64, (recr.x + 5.0) * fs), cast(i64, (recr.y + 5.0) * fs));
+    feed_button(fw, wevent.MOUSE_UP, 3, cast(i64, (recr.x + 5.0) * fs), cast(i64, (recr.y + 5.0) * fs));
+    check("the third button", cast(*Rec, tree.data(tf, rec)).button == 3);
+    // Keys: held, let go, typed with a command's modifier.
+    router.focus(tf, rf, rec, 1);
+    let is *Rec as rd = cast(*Rec, tree.data(tf, rec));
+    feed_key(fw, wevent.KEY_DOWN, keys.A, 38, 0, "a", 1);
+    let is i32 as first_repeat = rd.repeat;
+    feed_key(fw, wevent.KEY_DOWN, keys.A, 38, 0, "a", 1);
+    check("a key held: its presses after the first repeat", rd.downs == 2 && first_repeat == 0 && rd.repeat == 1);
+    feed_key(fw, wevent.KEY_UP, keys.A, 38, 0, "", 0);
+    feed_key(fw, wevent.KEY_DOWN, keys.A, 38, 0, "a", 1);
+    check("let go, pressed again: not a repeat", rd.ups == 1 && rd.downs == 3 && rd.repeat == 0);
+    feed_key(fw, wevent.KEY_DOWN, keys.B, 56, 0, "b", 1);
+    feed(fw, wevent.FOCUS_OUT, 0, 0);
+    feed_key(fw, wevent.KEY_DOWN, keys.B, 56, 0, "b", 1);
+    check("the keyboard gone and back: nothing held", rd.repeat == 0 && app.is_active(&a, fw) == 0);
+    feed(fw, wevent.FOCUS_IN, 0, 0);
+    check("the keyboard here: active", app.is_active(&a, fw) == 1);
+    router.focus(tf, rf, e3, 1);
+    entry.set_text(tf, e3, "", 0);
+    feed_key(fw, wevent.KEY_DOWN, keys.C, 54, keys.MOD_CONTROL, "c", 1);
+    feed_key(fw, wevent.KEY_DOWN, keys.D, 40, keys.MOD_ALT, "d", 1);
+    feed_key(fw, wevent.KEY_DOWN, keys.E, 26, keys.MOD_SUPER, "e", 1);
+    check("with Control, Alt or Super: no text", entry.length(tf, e3) == 0);
+    feed_key(fw, wevent.KEY_DOWN, keys.F, 41, keys.MOD_SHIFT, "F", 1);
+    check("with Shift: its text", same(entry.text(tf, e3), entry.length(tf, e3), "F") == 1);
+    // The window manager's state of it.
+    let is wevent.Event as sev;
+    wevent.clear(&sev);
+    sev.kind = wevent.STATE;
+    sev.state = wevent.STATE_MAXIMIZED;
+    host.feed(hs, fw, &sev, time.now_ms());
+    check("maximized", app.is_maximized(&a, fw) == 1 && app.is_fullscreen(&a, fw) == 0);
+    sev.state = wevent.STATE_FULLSCREEN;
+    host.feed(hs, fw, &sev, time.now_ms());
+    check("full screen, no longer maximized", app.is_maximized(&a, fw) == 0 && app.is_fullscreen(&a, fw) == 1);
+    // Exposed: shown again, nothing painted — the focus off the entry, whose
+    // caret blinks.
+    router.focus(tf, rf, rec, 0);
+    settle_long();
+    let is *device.Window as fnat = host.native(hs, fw);
+    quiet();
+    // An animation shown at the frame clock: no more frames than its
+    // duration has intervals, however often X wakes the loop meanwhile.
+    let is i64 as anim_from = x11.frame_index(&fnat.x11_win);
+    let is i64 as fade_id = anim.fade(app.animator(&a, fw), big, 0.5, 320, 0);
+    let is i64 as fade_until = time.now_ms() + 3000;
+    while (anim.running(app.animator(&a, fw), fade_id) == 1 && time.now_ms() < fade_until) { host.step(hs, 50); }
+    quiet();
+    let is i64 as anim_frames = x11.frame_index(&fnat.x11_win) - anim_from;
+    check("an animation: shown at the frame clock", anim_frames >= 5 && anim_frames <= 320 / 16 + 4);
+    let is i64 as shown_before = x11.frame_index(&fnat.x11_win);
+    host.step(hs, 0);
+    let is i64 as idle_frames = x11.frame_index(&fnat.x11_win) - shown_before;
+    feed(fw, wevent.EXPOSE, 0, 0);
+    host.step(hs, 0);
+    check("exposed: shown again", idle_frames == 0 && x11.frame_index(&fnat.x11_win) == shown_before + 1);
+    // Dropped from outside: told over, the drop's data let go.
+    let is math.rect.Rect as e3r = layout.window_rect(tf, e3);
+    let is wevent.Event as dv_ev;
+    wevent.clear(&dv_ev);
+    dv_ev.kind = wevent.DND_ENTER;
+    dv_ev.drop = wevent.DROP_TEXT | wevent.DROP_FILES;
+    dv_ev.x = cast(i64, (e3r.x + 10.0) * fs);
+    dv_ev.y = cast(i64, (e3r.y + e3r.h / 2.0) * fs);
+    host.feed(hs, fw, &dv_ev, time.now_ms());
+    check("text and files offered: the entry takes the text", router.drag_target(rf) == e3 && router.drag_takes(rf) == dnd.TEXT);
+    dv_ev.kind = wevent.DND_LEAVE;
+    host.feed(hs, fw, &dv_ev, time.now_ms());
+    router.add_drop_target(rf, rec, dnd.FILES);
+    dv_ev.kind = wevent.DND_ENTER;
+    dv_ev.drop = wevent.DROP_FILES;
+    dv_ev.x = cast(i64, (recr.x + 5.0) * fs);
+    dv_ev.y = cast(i64, (recr.y + 5.0) * fs);
+    host.feed(hs, fw, &dv_ev, time.now_ms());
+    check("files offered: where files are taken, files", router.drag_target(rf) == rec && router.drag_takes(rf) == dnd.FILES);
+    dv_ev.kind = wevent.DND_DROP;
+    dv_ev.drop = wevent.DROP_TEXT;
+    host.feed(hs, fw, &dv_ev, time.now_ms());
+    check("dropped: over", router.drag_active(rf) == 0);
+    // The same from another program: what is taken there answered to it.
+    check("a real drag, text over the entry: accepted",
+          xdnd_accept(fw, "UTF8_STRING", cast(i64, (e3r.x + 10.0) * fs), cast(i64, (e3r.y + e3r.h / 2.0) * fs)) == 1);
+    check("files over the entry: refused",
+          xdnd_accept(fw, "text/uri-list", cast(i64, (e3r.x + 10.0) * fs), cast(i64, (e3r.y + e3r.h / 2.0) * fs)) == 0);
+    check("files where files are taken: accepted",
+          xdnd_accept(fw, "text/uri-list", cast(i64, (recr.x + 5.0) * fs), cast(i64, (recr.y + 5.0) * fs)) == 1);
+    // The desktop's DPI: every window's scale, its size in logical pixels.
+    let is wsettings.Settings as hi with mut = wsettings.defaults();
+    hi.dpi = 192.0;
+    hi.known = wsettings.K_DPI;
+    let is f64 as wide = app.width(&a, fw);
+    host.set_settings(hs, &hi);
+    check("192 DPI: twice", app.scale(&a, fw) == 2.0 && app.width(&a, fw) == wide * fs / 2.0 &&
+          host.settings(hs).dpi == 192.0);
+    hi.dpi = 96.0;
+    host.set_settings(hs, &hi);
+    check("96 again", app.scale(&a, fw) == 1.0);
+    hi.dpi = 0.0;
+    host.set_settings(hs, &hi);
+    check("a DPI of 0: not taken", app.scale(&a, fw) == fs);
+    // Nor by the host: the pointer still where it is, in logical pixels.
+    let is math.rect.Rect as e3at = layout.window_rect(tf, e3);
+    feed(fw, wevent.MOUSE_MOVE, cast(i64, (e3at.x + 5.0) * fs), cast(i64, (e3at.y + e3at.h / 2.0) * fs));
+    check("a DPI of 0: the pointer where it is", router.hover(rf) == e3);
+    feed(fw, wevent.SETTINGS, 0, 0);
+    check("told they changed: read again, the DPI as the desktop says", app.scale(&a, fw) == fs);
+    // A title longer than the platform's: cut where a character starts.
+    let is [300]u8 as long;
+    mem.memset(cast(*u8, &long), 120, 300);
+    app.set_title(&a, fw, cast(*u8, &long), 300);
+    settle();
+    _data = cast(*u8, 0);
+    xlib.XGetWindowProperty(other, xid_of(fw), xlib.XInternAtom(other, "_NET_WM_NAME", 0), 0, 256, 0, 0, cast(*u8, &_type),
+                            cast(*u8, &_format), cast(*u8, &_n), cast(*u8, &_after), cast(*u8, &_data));
+    check("a long title: its first 255 bytes", _n == 255);
+    if (cast(i64, _data) != 0) { xlib.XFree(_data); }
+    // Selections: the primary one apart.
+    tree.copy(tf, tree.PRIMARY, "sel", 3);
+    xlib.XSync(other, 0);
+    check("selected: the primary selection ours", xlib.XGetSelectionOwner(other, 1) == xid_of(fw));
+    // A dialog's window nothing in takes the close button: hidden.
+    let is i64 as bare = app.dialog_open(&a, fw, 120.0, 80.0);
+    app.show(&a, bare);
+    settle();
+    check("a dialog's window: on the screen", xid_of(bare) != 0);
+    close_button(bare);
+    settle();
+    check("closed by its button, nothing in it asked: hidden", app.is_shown(&a, bare) == 0 && xid_of(bare) == 0 &&
+          app.window_valid(&a, bare) == 1);
+    // Modal over its owner: the owner told nothing of the pointer or keys.
+    feed(fw, wevent.LEAVE, sx, sy);
+    app.set_modal(&a, bare, 1);
+    app.show(&a, bare);
+    settle();
+    let is i64 as downs_before = rd.downs;
+    router.focus(tf, rf, rec, 1);
+    feed_key(fw, wevent.KEY_DOWN, keys.G, 42, 0, "g", 1);
+    feed(fw, wevent.ENTER, sx, sy);
+    wh.wheel = 0 - 1;
+    host.feed(hs, fw, &wh, time.now_ms());
+    feed_button(fw, wevent.MOUSE_DOWN, 1, sx, sy);
+    close_button(fw);
+    settle_long();
+    check("blocked: no key", rd.downs == downs_before);
+    check("blocked: no pointer", router.hover(rf) == 0 && router.capture(rf) == 0);
+    check("blocked: no wheel", scroll.offset_y(tf, sc) == 0.0);
+    check("blocked: no close", app.window_valid(&a, fw) == 1 && app.blocked(&a, fw) == 1 &&
+          device.should_close(host.native(hs, fw)) == 0);
+    feed(fw, wevent.FOCUS_OUT, 0, 0);
+    check("but the keyboard leaving, told", app.is_active(&a, fw) == 0);
+    let is i64 as before_close = x11.frame_index(&fnat.x11_win);
+    feed(fw, wevent.EXPOSE, 0, 0);
+    host.step(hs, 0);
+    check("its close button refused: still shown", x11.frame_index(&fnat.x11_win) == before_close + 1);
+    app.window_close(&a, bare);
+    settle();
+
+    // --- What the program adds ---
+    check("no window for 0, nor for one never shown", cast(i64, host.native(hs, 0)) == 0 &&
+          cast(i64, host.native(hs, 12345)) == 0 && host.pointer_shape(hs, 12345) == 0);
+    // Watched, one taken out of the middle: the others still told.
+    let is [3][2]i32 as wp;
+    let is i64 as w0 = host.watched(hs);
+    let is i64 as wi with mut = 0;
+    while (wi < 3) {
+        linux.pipe2(cast(*i32, cast(i64, &wp) + wi * 8), 524288);
+        host.watch(hs, cast(i64, wp[wi][0]), fn_ptr(on_readable), cast(*u8, 0));
+        wi = wi + 1;
+    }
+    host.unwatch(hs, cast(i64, wp[1][0]));
+    check("one let go of", host.watched(hs) == w0 + 2);
+    readable = 0;
+    linux.write(cast(i64, wp[0][1]), "x", 1);
+    linux.write(cast(i64, wp[1][1]), "x", 1);
+    linux.write(cast(i64, wp[2][1]), "x", 1);
+    host.step(hs, 200);
+    check("the rest told, each", readable == 2);
+    wi = 0;
+    while (wi < 3) {
+        host.unwatch(hs, cast(i64, wp[wi][0]));
+        linux.close(cast(i64, wp[wi][0]));
+        linux.close(cast(i64, wp[wi][1]));
+        wi = wi + 1;
+    }
+    check("all let go of", host.watched(hs) == w0);
+    // Let go of twice: the second time nothing, the others still watched.
+    linux.pipe2(cast(*i32, cast(i64, &wp) + 0), 524288);
+    linux.pipe2(cast(*i32, cast(i64, &wp) + 8), 524288);
+    host.watch(hs, cast(i64, wp[0][0]), fn_ptr(on_readable), cast(*u8, 0));
+    host.watch(hs, cast(i64, wp[1][0]), fn_ptr(on_readable), cast(*u8, 0));
+    host.unwatch(hs, cast(i64, wp[1][0]));
+    host.unwatch(hs, cast(i64, wp[1][0]));
+    check("let go of twice: the other still watched", host.watched(hs) == w0 + 1);
+    host.unwatch(hs, cast(i64, wp[0][0]));
+    wi = 0;
+    while (wi < 2) {
+        linux.close(cast(i64, wp[wi][0]));
+        linux.close(cast(i64, wp[wi][1]));
+        wi = wi + 1;
+    }
+    // Posted, two: both run.
+    posted = 0;
+    host.post(hs, fn_ptr(on_posted), cast(*u8, 0));
+    host.post(hs, fn_ptr(on_posted), cast(*u8, 0));
+    host.step(hs, 0);
+    check("posted, each run", posted == 2);
+    // Nothing to do: asleep for its time; an event from X: woken by it.
+    settle_long();
+    let is i64 as t1 with mut = time.now_ms();
+    host.step(hs, 200);
+    check("nothing to do: asleep", time.now_ms() - t1 >= 150);
+    let is xev.XEvent as poke;
+    xev.clear(&poke);
+    xev.any(&poke).kind = x.ClientMessage;
+    xev.any(&poke).window = xid_of(fw);
+    xev.client(&poke).format = 32;
+    xlib.XSendEvent(other, xid_of(fw), 0, 0, cast(*u8, &poke));
+    xlib.XFlush(other);
+    t1 = time.now_ms();
+    host.step(hs, 5000);
+    check("an event from X: woken", time.now_ms() - t1 < 1000);
+    // A window's size in physical pixels, rounded.
+    let is i64 as odd = app.window_open(&a, 200.6, 100.4);
+    settle();
+    let is *device.Window as oddw = host.native(hs, odd);
+    check("its size rounded", device.width(oddw) == cast(i64, 200.6 * fs + 0.5) && device.height(oddw) == cast(i64, 100.4 * fs + 0.5));
+    app.window_close(&a, odd);
+    settle();
+    // A dialog before its owner in the application's table: put up after it,
+    // above it; a dialog whose owner is hidden: on its own.
+    let is i64 as gone = app.window_open(&a, 100.0, 80.0);
+    let is i64 as owner2 = app.window_open(&a, 160.0, 100.0);
+    app.window_close(&a, gone);
+    let is i64 as dlg2 = app.dialog_open(&a, owner2, 120.0, 80.0);
+    app.hide(&a, owner2);
+    settle();
+    app.show(&a, owner2);
+    app.show(&a, dlg2);
+    settle();
+    let is i64 as above with mut = 0;
+    xlib.XGetTransientForHint(other, xid_of(dlg2), cast(*u8, &above));
+    check("a dialog before its owner: above it", xid_of(owner2) != 0 && above == xid_of(owner2));
+    app.hide(&a, dlg2);
+    app.hide(&a, owner2);
+    settle();
+    app.show(&a, dlg2);
+    settle();
+    check("its owner hidden: on its own", xid_of(dlg2) != 0 && xid_of(owner2) == 0);
+    app.window_close(&a, owner2);
+    settle();
+    let is [16][2]i32 as pipes;
+    let is i32 as watched_all with mut = 1;
+    let is i64 as k with mut = 0;
+    while (k < host.MAX_WATCHED) {
+        linux.pipe2(cast(*i32, cast(i64, &pipes) + k * 8), 524288);
+        if (host.watch(hs, cast(i64, pipes[k][0]), fn_ptr(nothing_fd), cast(*u8, 0)) == 0) { watched_all = 0; }
+        k = k + 1;
+    }
+    let is [2]i32 as extra;
+    linux.pipe2(cast(*i32, &extra), 524288);
+    check("as many watched as it holds, not one more", watched_all == 1 &&
+          host.watch(hs, cast(i64, extra[0]), fn_ptr(nothing_fd), cast(*u8, 0)) == 0);
+    k = 0;
+    while (k < host.MAX_WATCHED) {
+        host.unwatch(hs, cast(i64, pipes[k][0]));
+        linux.close(cast(i64, pipes[k][0]));
+        linux.close(cast(i64, pipes[k][1]));
+        k = k + 1;
+    }
+    host.unwatch(hs, 9999);
+    check("all let go: one more watched", host.watch(hs, cast(i64, extra[0]), fn_ptr(nothing_fd), cast(*u8, 0)) == 1);
+    host.unwatch(hs, cast(i64, extra[0]));
+    let is i32 as rounds_all with mut = 1;
+    k = 0;
+    while (k < host.MAX_ROUND) {
+        if (host.every_round(hs, fn_ptr(on_round), cast(*u8, 0)) == 0) { rounds_all = 0; }
+        k = k + 1;
+    }
+    check("as many each round as it holds, not one more", rounds_all == 1 &&
+          host.every_round(hs, fn_ptr(on_round), cast(*u8, 0)) == 0);
+    rounds = 0;
+    host.step(hs, 0);
+    check("each run once a round", rounds == host.MAX_ROUND);
+    let is i32 as posted_all with mut = 1;
+    k = 0;
+    while (k < host.MAX_POSTED) {
+        if (host.post(hs, fn_ptr(nothing), cast(*u8, 0)) == 0) { posted_all = 0; }
+        k = k + 1;
+    }
+    check("as many posted as it holds, not one more", posted_all == 1 && host.post(hs, fn_ptr(nothing), cast(*u8, 0)) == 0);
+    host.step(hs, 0);
+    check("run: room again", host.post(hs, fn_ptr(nothing), cast(*u8, 0)) == 1);
+    // Run until asked to stop.
+    timer.add(app.timers(&a), time.now_ms(), 100, 0, fn_ptr(stop_running), cast(*u8, 0));
+    let is i64 as t2 = time.now_ms();
+    let is i64 as r0 = rounds;
+    host.run(hs);
+    check("run until asked to stop", time.now_ms() - t2 >= 80 && host.shown(hs) >= 1);
+    check("run: asleep meanwhile, a few rounds", (rounds - r0) / host.MAX_ROUND < 20);
+    host.quit(hs);
+    check("asked to quit: the round says so", host.step(hs, 0) == 0 && host.shown(hs) == 2);
+    check("said once", host.step(hs, 0) == 1);
+    app.window_close(&a, fw);
+
+    // --- Its close button ---
+    host.set_on_close(hs, fn_ptr(on_close), cast(*u8, 0));
+    refuse = 1;
+    close_button(main_w);
+    settle();
+    check("asked, refused: still there", asked_close == 1 && host.shown(hs) == 1 && app.window_valid(&a, main_w) == 1);
+    refuse = 0;
+    close_button(main_w);
+    let is i32 as last with mut = 1;
+    t0 = time.now_ms();
+    while (last == 1 && time.now_ms() - t0 < 2000) { last = host.step(hs, 30); }
+    check("asked, agreed: closed, the loop over", asked_close == 2 && last == 0 && app.window_valid(&a, main_w) == 0 &&
+          host.shown(hs) == 0);
+
+    // Closed with windows on the screen: every one put away.
+    let is i64 as left1 = app.window_open(&a, 120.0, 80.0);
+    let is i64 as left2 = app.window_open(&a, 120.0, 80.0);
+    settle();
+    let is i64 as x1 = xid_of(left1);
+    let is i64 as x2 = xid_of(left2);
+    check("two left on the screen", host.shown(hs) == 2 && on_screen(x1) == 1 && on_screen(x2) == 1);
+    host.close(hs);
+    check("closed: neither left there", on_screen(x1) == 0 && on_screen(x2) == 0);
+    hs = host.open(&a, &dv, cast(*u8, svc));
+    settle();
+    check("opened again: both on the screen again", host.shown(hs) == 2);
+    // The only one left in the second place: X's events for it still wake
+    // the loop.
+    app.window_close(&a, left1);
+    settle();
+    check("one left, in the second place", host.shown(hs) == 1 && cast(i64, host.native(hs, left2)) != 0);
+    let is i64 as t6 = time.now_ms();
+    motion_event(left2, 5, 5);
+    host.step(hs, 3000);
+    check("its events wake the loop", time.now_ms() - t6 < 1500);
+    host.close(hs);
+    app.window_close(&a, left2);
+    // More windows than the host keeps: as many as it keeps on the screen,
+    // the round going on.
+    let is app.Limits as many_l with mut = app.limits_default();
+    many_l.windows = host.MAX_WINDOWS + 2;
+    let is app.App as many with mut = app.open(&many_l);
+    app.set_theme(&many, &theme);
+    app.set_text_service(&many, cast(*u8, svc));
+    let is *host.Host as hm = host.open(&many, &dv, cast(*u8, svc));
+    k = 0;
+    while (k < host.MAX_WINDOWS + 1) {
+        app.window_open(&many, 40.0, 30.0);
+        k = k + 1;
+    }
+    let is i64 as tm = time.now_ms();
+    host.step(hm, 0);
+    check("more than it keeps: as many as it keeps, at once", host.shown(hm) == host.MAX_WINDOWS && time.now_ms() - tm < 20000);
+    host.close(hm);
+    app.close(&many);
+    app.close(&a);
+    xlib.XCloseDisplay(other);
+    if (fails == 0) {
+        io.printf("host x11: all checks passed\n");
+        return 0;
+    }
+    io.printf("host x11: %d failures\n", fails);
+    return 1;
+}
