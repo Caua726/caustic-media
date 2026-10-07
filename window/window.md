@@ -471,6 +471,11 @@ backend.
   the map and playing the window manager and the compositing manager.
   Wayland's `xdg-decoration` and Windows' `WM_NCCALCSIZE` come with their
   backends.
+- The smallest a window may be made (`set_min_size`, `min_size`): asked again
+  whenever it changes — what a layout cannot fit into changes after the
+  window is open — as `WM_NORMAL_HINTS` with only `PMinSize`, read back from
+  the server; a fixed window keeps its size as its floor. Tested by
+  `x11/wm_test` and `device_x11_test`.
 
 **Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
 the system's and the user's font directories, and where the font index is
