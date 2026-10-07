@@ -59,6 +59,14 @@ Against a private bus, never the session's: `tools/run_dbus.sh` starts one with
 export objects and call them from a second connection, and cross-check with
 `busctl`, a second implementation, in both directions.
 
+That private bus still starts the desktop's services when asked for one
+nobody owns — a real notification daemon, the portal — as the session's
+does. A test that must not, or must know whether it asked, runs on
+`tools/run_dbus_bare.sh` instead (`testdata/bare.conf`): only the stand-ins
+in `testdata/services` can be started there, and each, started, only writes
+its name to the file `CAUSTIC_DBUS_STARTED` names, its start given up on
+half a second later.
+
 ## Current state
 
 All of the above, tested three ways.
