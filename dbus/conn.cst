@@ -27,7 +27,10 @@
 // for each its methods, properties and signals. Calls to them are routed by
 // path, interface and member, their arguments checked against the declared
 // signature; Introspect, Properties (Get, GetAll, Set) and Peer (Ping,
-// GetMachineId) are answered from the tables.
+// GetMachineId) are answered from the tables. A subtree is one table for
+// every path under a prefix that the program says is there — the objects of
+// a tree too many and too changeable to export one by one — its handlers
+// told which path they answer for by current_path.
 //
 // Signal handlers are registered with add_match, which also asks the bus to
 // route the signal here. The handler is chosen here by path, interface and
@@ -101,6 +104,7 @@ type MethodFn = fn(*Conn, *Call, *u8) as void;
 type GetFn    = fn(*Conn, *wire.Writer, *u8) as void;      // writes the value, of the declared type
 type SetFn    = fn(*Conn, *wire.Reader, *u8) as i32;       // reads it; 0 refuses it
 type SignalFn = fn(*Conn, *message.Message, *u8) as void;
+type ExistsFn = fn(*u8, *u8, i64) as i32;                 // a subtree's: whether path, n bytes, is there
 
 // Names are for Introspect: the arguments' names, comma-separated, or null.
 struct Method {
@@ -136,10 +140,12 @@ struct Interface {
 }
 
 struct Object {
-    path   as *u8;
-    ifaces as *Interface;
-    niface as i64;
-    user   as *u8;
+    path    as *u8;
+    ifaces  as *Interface;
+    niface  as i64;
+    user    as *u8;
+    exists  as ExistsFn;   // a subtree's; null for an object of its own
+    subtree as i64;
 }
 
 struct Match {
@@ -180,13 +186,13 @@ struct Conn {
     xbuf      as *u8;   // Introspect's XML
     xlen      as i64;
     objects   as *Object;
-    nobjects  as i64;
     obj_cap   as i64;
     matches   as *Match;
     match_cap as i64;
     unique    as [256]u8;
     guid      as [40]u8;
     last      as message.Message;
+    cur_path  as *u8;   // the path a call being answered was made to; null between calls
 }
 
 fn _p(base as *u8, off as i64) as *u8 { return cast(*u8, cast(i64, base) + off); }
@@ -323,7 +329,7 @@ fn _empty(l as *Limits) as Conn {
     c.held = 0;
     c.held_fds = 0;
     c.xlen = 0;
-    c.nobjects = 0;
+    c.cur_path = cast(*u8, 0);
     c.obj_cap = l.objects;
     c.match_cap = l.matches;
     c.unique[0] = 0;
@@ -695,7 +701,28 @@ fn _reply(c as *Conn, m as *message.Message, sig as *u8) as void {
     wire.reset(&c.replyw);
 }
 
+// What answers at path: an object of its own there, else a subtree it lies
+// under that says it is there; null for nothing.
 fn _object(c as *Conn, path as *u8) as *Object {
+    let is i64 as i with mut = 0;
+    while (i < c.obj_cap) {
+        let is *Object as o = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
+        if (cast(i64, o.path) != 0 && o.subtree == 0 && _same(o.path, path) == 1) { return o; }
+        i = i + 1;
+    }
+    let is i64 as n = _len(path);
+    i = 0;
+    while (i < c.obj_cap) {
+        let is *Object as o = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
+        if (cast(i64, o.path) != 0 && o.subtree == 1 && _under(path, o.path, _len(o.path)) > 0
+            && call(o.exists, o.user, path, n) == 1) { return o; }
+        i = i + 1;
+    }
+    return cast(*Object, 0);
+}
+
+// What was exported at exactly path, an object or a subtree; null for nothing.
+fn _exported(c as *Conn, path as *u8) as *Object {
     let is i64 as i with mut = 0;
     while (i < c.obj_cap) {
         let is *Object as o = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
@@ -704,6 +731,10 @@ fn _object(c as *Conn, path as *u8) as *Object {
     }
     return cast(*Object, 0);
 }
+
+// The path the call being answered was made to — for a subtree's handlers,
+// which object they answer for; null outside a call.
+fn current_path(c as *Conn) as *u8 { return c.cur_path; }
 
 fn _iface(o as *Object, name as *u8) as *Interface {
     let is i64 as i with mut = 0;
@@ -769,6 +800,12 @@ fn _under(p as *u8, parent as *u8, n as i64) as i64 {
 }
 
 fn _answer(c as *Conn, m as *message.Message) as void {
+    c.cur_path = m.path;
+    _answer_at(c, m);
+    c.cur_path = cast(*u8, 0);
+}
+
+fn _answer_at(c as *Conn, m as *message.Message) as void {
     let is *u8 as iface = m.interface;
     if (_same(iface, "org.freedesktop.DBus.Peer") == 1) { _peer(c, m); return; }
     let is *Object as o = _object(c, m.path);
@@ -923,7 +960,10 @@ fn properties_changed(c as *Conn, path as *u8, interface as *u8, name as *u8) as
     let is i64 as at = wire.put_array(w, 8);
     wire.put_struct(w);
     wire.put_string(w, name);
+    let is *u8 as was = c.cur_path;
+    c.cur_path = path;
     _put_prop(c, w, p, o.user);
+    c.cur_path = was;
     wire.put_array_end(w, at, 8);
     let is i64 as none = wire.put_array(w, 4);
     wire.put_array_end(w, none, 4);
@@ -1080,8 +1120,21 @@ fn _introspect(c as *Conn, m as *message.Message, o as *Object) as void {
 // Exports ifaces (n of them) at path, with user handed to every handler.
 // The program keeps path and the tables alive while exported.
 fn export(c as *Conn, path as *u8, ifaces as *Interface, n as i64, user as *u8) as i32 {
+    return _export(c, path, ifaces, n, user, cast(ExistsFn, 0));
+}
+
+// Exports ifaces at every path under prefix for which exists(user, path, n)
+// says 1 — not at prefix itself. An object exported at one of those paths
+// answers for itself. current_path tells the handlers which path they answer
+// for.
+fn export_subtree(c as *Conn, prefix as *u8, ifaces as *Interface, n as i64, exists as ExistsFn, user as *u8) as i32 {
+    if (cast(i64, exists) == 0) { return BAD_ARGUMENT; }
+    return _export(c, prefix, ifaces, n, user, exists);
+}
+
+fn _export(c as *Conn, path as *u8, ifaces as *Interface, n as i64, user as *u8, exists as ExistsFn) as i32 {
     if (wire.path_valid(path, _len(path)) == 0 || n < 0) { return BAD_ARGUMENT; }
-    if (cast(i64, _object(c, path)) != 0) { return BAD_ARGUMENT; }
+    if (cast(i64, _exported(c, path)) != 0) { return BAD_ARGUMENT; }
     let is i64 as i with mut = 0;
     while (i < c.obj_cap) {
         let is *Object as o = cast(*Object, cast(i64, c.objects) + i * sizeof(Object));
@@ -1090,7 +1143,8 @@ fn export(c as *Conn, path as *u8, ifaces as *Interface, n as i64, user as *u8) 
             o.ifaces = ifaces;
             o.niface = n;
             o.user = user;
-            c.nobjects = c.nobjects + 1;
+            o.exists = exists;
+            o.subtree = cast(i64, cast(i64, exists) != 0);
             return OK;
         }
         i = i + 1;
@@ -1099,10 +1153,9 @@ fn export(c as *Conn, path as *u8, ifaces as *Interface, n as i64, user as *u8) 
 }
 
 fn unexport(c as *Conn, path as *u8) as void {
-    let is *Object as o = _object(c, path);
+    let is *Object as o = _exported(c, path);
     if (cast(i64, o) == 0) { return; }
     o.path = cast(*u8, 0);
-    c.nobjects = c.nobjects - 1;
 }
 
 // --- The bus ---
