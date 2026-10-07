@@ -181,7 +181,8 @@ caustic -q examples/text_editor.cst -o build/text_editor --path .caustic/deps &&
 `test-x11` starts an Xvfb of its own, and the D-Bus tests a private bus that
 starts none of the desktop's services. The toolkit's examples —
 `settings_form`, `text_editor`, `file_browser` — run as programs, and with
-`--check` drive themselves the way a user would.
+`--check` drive themselves the way a user would, their keys, clicks and
+wheel sent through the X server to their own window.
 
 A program of the toolkit's imports a few hundred modules; the compiler has
 to take more than 256 of them in one program (Caustic's build of 2026-10-06

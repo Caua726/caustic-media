@@ -388,8 +388,14 @@ windows on `program.app` and runs.
 ## The examples
 
 Three programs a user would recognise, each built only from the toolkit's
-pieces and each with a `--check` that drives it as a user would — keys and
-clicks through the loop, its dialogs answered — under Xvfb (`test-x11`):
+pieces and each with a `--check` that drives it as a user would, under Xvfb
+(`test-x11`): its keys, clicks and wheel sent through the X server to its own
+window (`examples/x11_input.cst`, XSendEvent from a connection of its own),
+so they are read the whole way — X's keycodes and modifier bits,
+`window/device.cst`, the host, the router — as a user's are; its dialogs
+answered directly. Events handed to the host already in the toolkit's terms
+skip the platform's half: that is how Control came through X as Caps Lock,
+unseen until a user pressed Ctrl+A.
 
 - **A settings form** (`examples/settings_form.cst`): labelled fields on a
   grid with mnemonics — entries, radio buttons, a switch, a slider, check
@@ -401,10 +407,10 @@ clicks through the loop, its dialogs answered — under Xvfb (`test-x11`):
 - **A text editor** (`examples/text_editor.cst`): one instance (started
   again with a file, it hands it over), a menu bar with accelerators shown
   and shortcuts bound, Edit's items enabled and done through the text view
-  (`textview.can`, `act` — an entry has the same), the file chooser to open
-  and save as, the title saying which file and whether it changed, the
-  caret's place in the status bar, a question before closing over changes,
-  the about dialog, the window's size kept.
+  (`textview.can`, `act` — an entry has the same), the text in a scroll
+  area, the file chooser to open and save as, the title saying which file
+  and whether it changed, the caret's place in the status bar, a question
+  before closing over changes, the about dialog, the window's size kept.
 - **A file browser** (`examples/file_browser.cst`): folders as a tree model
   of its own, branches read when opened; the folder chosen as a table over
   `dirmodel`; a toolbar and a path that can be typed; menus with a check
