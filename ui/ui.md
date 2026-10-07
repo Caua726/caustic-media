@@ -358,6 +358,37 @@ text of its own takes its name from the label that says `labelled_by` it.
 
 ---
 
+## Words and languages
+
+A toolkit says things of its own — a dialog's Cancel, a text's context menu,
+the places of a file chooser, the names a screen reader reads out — and says
+them in the user's language. They are one table (`strings.cst`): every word in
+every language it has (English and Brazilian Portuguese), each holding what
+the English holds — the same mnemonic underscore, the same places to fill in,
+`%1` and `%2`, in the order the language puts them ("Light %1", "%1 claro").
+A language it does not have reads English. There is no catalogue loaded at
+run time: the words are code, checked by `strings_test` for being all there.
+
+The language is the tree's (`tree.set_language`), so a widget asks for its
+words with nothing but the tree it is in; the application sets it on every
+window's tree from the user's locale (`app.set_locale`, or the desktop's
+settings through `app.set_system`) — before the widgets are made, since words
+already shown stay as they were. The user's locale is a BCP 47 tag
+(`window/locale.cst`), read on Linux as POSIX has it: `LANGUAGE`'s first that
+is a name, unless the locale is C; then `LC_ALL`, `LC_MESSAGES`, `LANG`. A
+language written right to left (Arabic, Hebrew, Persian, Urdu…) turns the
+windows' layout direction to right to left, which mirrors every container.
+
+Numbers take the language's decimal mark ("1,5 kB", a spin box's "2,5"); a
+spin box reads either. Text is UTF-8 throughout, and what is cut to fit a
+buffer is cut where a character starts (`strings.fits`). The folders a file
+chooser offers are where `user-dirs.dirs` puts them — "Área de trabalho" on a
+desktop in Portuguese (`window/linux/user_dirs.cst`). A font's own style names
+are shown as the font gives them; the ones the toolkit makes up for a variable
+font's weights are in the language.
+
+---
+
 ## The first widgets
 
 Each a kind with its data, its setters that say what they changed, its
@@ -1182,6 +1213,19 @@ the middle, each only once given; Credits and License, toggles at the
 foot's start (a dialog's secondary buttons, `dialog.set_secondary`), show
 who made it and the licence in their place.
 
+**Words** (`strings.cst`, tested by `strings_test`, and each widget's own
+test in Portuguese): the table of the toolkit's words in English and
+Brazilian Portuguese, filled in (`fill`) and cut whole characters at a time
+(`fits`); the tree's language, set by the application from the locale
+(`window/locale.cst`, tested by `window_locale_test`, through the desktop's
+settings, `settings.K_LOCALE`), the windows' direction right to left for a
+language written so; message boxes, assistants, the text's context menu,
+accelerators ("Ctrl+Espaço"), about dialogs, file choosers (places where
+`user-dirs.dirs` says, tested by `window_user_dirs_test`; sizes with the
+decimal mark), colour and font choosers, header bars, combo boxes, spin
+boxes and the AT-SPI bridge (its `Locale`, roles' and actions' names for
+people) all in it.
+
 **A window's state** (`winstate.cst`, tested by `winstate_test`): its size
 and whether it was maximized or full screen, kept between runs in a file of
 its own under `$XDG_STATE_HOME` (else `~/.local/state`), written whole under
@@ -1227,6 +1271,9 @@ widget set applications actually use, done properly, not parity.
 7. **The accessibility bridges**, AT-SPI first. *AT-SPI done
    ([`atspi/atspi.md`](atspi/atspi.md)); UI Automation comes with the Win32
    backend.*
+8. **Words in the user's language**. *Done: `strings.cst` in English and
+   Brazilian Portuguese, the locale from the environment, right-to-left
+   languages mirrored; Windows' `GetUserDefaultLocaleName` with its backend.*
 
 ## Not now, and deliberately
 
