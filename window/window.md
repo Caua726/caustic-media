@@ -452,6 +452,22 @@ backend.
   monitor's size, else 96 — over 96 is a window's scale (`pointer_x11_test`).
   Neither is imported by `device.cst`: they link libXcursor, libXfixes, libXi
   and libXrandr, which a program that sets no cursor does not need.
+- A frame of the program's own (`device.cst`, `x11/frame.cst`): a window
+  opened see-through (`Config.transparent`, a visual with alpha) and without
+  the window manager's decoration (`Config.decorated` 0, told before it is
+  first mapped — `_MOTIF_WM_HINTS`), or told later (`set_decorated`); where it
+  really is inside its shadow (`set_frame_extents`, `_GTK_FRAME_EXTENTS`) and
+  where it takes the pointer (`set_input_region`, SHAPE); moved or resized
+  from a press (`begin_move_resize`, `MOVE` and the eight `RESIZE_*`, as
+  EWMH numbers them), its menu, minimized, maximized, all asked of the window
+  manager (`_NET_WM_MOVERESIZE`, `_GTK_SHOW_WINDOW_MENU`, `WM_CHANGE_STATE`,
+  `_NET_WM_STATE`); its state with the tiled sides (`state`); and whether a
+  compositing manager shows what is behind it (`composited`,
+  `_NET_WM_CM_S<screen>`'s owner), without which the frame is drawn flat.
+  Tested by `device_x11_test` and `x11/frame_test`, a second client holding
+  the map and playing the window manager and the compositing manager.
+  Wayland's `xdg-decoration` and Windows' `WM_NCCALCSIZE` come with their
+  backends.
 
 **Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
 the system's and the user's font directories, and where the font index is
