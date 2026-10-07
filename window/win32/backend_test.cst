@@ -1,0 +1,132 @@
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "../../gpu/software/target.cst" as tgt;
+use "../event.cst" as event;
+use "../keys.cst" as keys;
+use "bind/types.cst" as t;
+use "bind/user32.cst" as u;
+use "bind/gdi32.cst" as g;
+use "backend.cst" as win;
+
+let is i32 as failures with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { io.printf("FAIL %s\n", name); failures = failures + 1; }
+}
+
+fn take(w as *win.Window, kind as i32, out as *event.Event) as i32 {
+    while (win.poll_event(w, out) == 1) {
+        if (out.kind == kind) { return 1; }
+    }
+    return 0;
+}
+
+fn main() as i32 {
+    let is win.Window as w with mut = win.open("Janela Win32 — teste", 240, 160);
+    check("native window opens", w.ok == 1 && win.is_open(&w) == 1 && u.IsWindow(w.hwnd) == 1);
+    if (w.ok == 0) { return 1; }
+
+    let is event.Event as e;
+    win.pump(&w);
+    while (win.poll_event(&w, &e) == 1) { }
+    check("DPI scale is nonzero", win.scale_120(&w) >= 120);
+    check("software target", win.next_frame(&w) == 1);
+    let is tgt.Target as target = win.acquire(&w);
+    check("target maps the client", target.width == 240 && target.height == 160 && cast(i64, target.color) != 0);
+    if (cast(i64, target.color) != 0) {
+        tgt.put(&target, 3, 4, 1144201745);
+        win.submit(&w);
+        let is i64 as dc = u.GetDC(w.hwnd);
+        check("native client receives the exact RGB channels", g.GetPixel(dc, 3, 4) == 3351057);
+        u.ReleaseDC(w.hwnd, dc);
+    }
+
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, 65), 0);
+    check("virtual key maps to portable key", take(&w, event.KEY_DOWN, &e) == 1 && e.key == keys.A && e.keycode == 65);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_KEYUP), cast(u64, 65), 0);
+    check("key release is routed", take(&w, event.KEY_UP, &e) == 1 && e.key == keys.A);
+    check("released key is not held", win.key_down(&w, keys.A) == 0);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), 55357, 0);
+    check("surrogate lead emits no text", take(&w, event.TEXT, &e) == 0);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), 56832, 0);
+    check("surrogate pair becomes one UTF-8 scalar", take(&w, event.TEXT, &e) == 1 && e.text_len == 4 &&
+          e.text[0] == 240 && e.text[1] == 159 && e.text[2] == 152 && e.text[3] == 128);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), 1, 0);
+    check("command characters do not enter the document", take(&w, event.TEXT, &e) == 0);
+    let is i64 as sent with mut = 0;
+    while (sent < 200) {
+        u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), cast(u64, 33 + sent % 90), 0);
+        sent = sent + 1;
+    }
+    let is i64 as received with mut = 0;
+    let is i32 as ordered with mut = 1;
+    while (win.poll_event(&w, &e) == 1) {
+        if (e.kind != event.TEXT || e.text_len != 1 || e.text[0] != cast(u8, 33 + (72 + received) % 90)) { ordered = 0; }
+        received = received + 1;
+    }
+    check("a full event queue retains the latest events in order", received == 128 && ordered == 1);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_MOUSEMOVE), 0, 1376270);
+    check("pointer coordinates", take(&w, event.MOUSE_MOVE, &e) == 1 && e.x == 14 && e.y == 21);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_LBUTTONDOWN), 0, 1376270);
+    check("pointer capture starts on press", u.GetCapture() == w.hwnd && win.button_down(&w, 1) == 1);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_LBUTTONUP), 0, 1376270);
+    check("pointer capture ends on release", u.GetCapture() != w.hwnd && win.button_down(&w, 1) == 0);
+    while (win.poll_event(&w, &e) == 1) { }
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_MOUSEWHEEL), cast(u64, 60 << 16), 0);
+    check("partial wheel notch is retained", take(&w, event.WHEEL, &e) == 0);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_MOUSEWHEEL), cast(u64, 60 << 16), 0);
+    check("partial wheel notches accumulate", take(&w, event.WHEEL, &e) == 1 && e.wheel == 1 && win.wheel(&w) == 1);
+    let is win.Config as modal_config = win.config("Modal child", 220, 140);
+    modal_config.owner = w.hwnd; modal_config.dialog = 1; modal_config.modal = 1;
+    let is win.Window as child = win.open_config(&modal_config);
+    check("modal child disables its owner", child.ok == 1 && u.IsWindowEnabled(w.hwnd) == 0);
+    check("Unicode clipboard is published", win.clipboard_set(&w, 0, "Área — 窓 😀", 18) == 1);
+    check("a different native window can read the selection", win.clipboard_request(&child, 0) == 1 &&
+          win.clipboard_ready(&child) == 1);
+    let is [64]u8 as copied;
+    check("clipboard preserves all UTF-8 scalars", win.clipboard_text(&child, cast(*u8, &copied), 64) == 18 &&
+          mem.memcmp(cast(*u8, &copied), "Área — 窓 😀", 18) == 0 && copied[18] == 0);
+    check("empty clipboard replaces the old selection", win.clipboard_set(&w, 0, "", 0) == 1 &&
+          win.clipboard_request(&child, 0) == 1 &&
+          win.clipboard_text(&child, cast(*u8, &copied), 64) == 0 && copied[0] == 0);
+    win.close(&child);
+    check("closing the modal child re-enables its owner", u.IsWindowEnabled(w.hwnd) == 1);
+    win.pump(&w);
+    while (win.poll_event(&w, &e) == 1) { }
+    let is t.RECT as client;
+    check("client resize succeeds", u.SetWindowPos(w.hwnd, 0, 0, 0, 320, 240, cast(u32, t.SWP_NOZORDER)) == 1);
+    win.pump(&w);
+    check("client geometry follows resize", u.GetClientRect(w.hwnd, &client) == 1 &&
+          win.width(&w) == cast(i64, client.right - client.left) &&
+          win.height(&w) == cast(i64, client.bottom - client.top) &&
+          win.width(&w) > 240 && win.height(&w) > 160);
+    check("resize event matches client geometry", take(&w, event.RESIZE, &e) == 1 &&
+          e.width == win.width(&w) && e.height == win.height(&w));
+    let is tgt.Target as resized = win.acquire(&w);
+    check("resized target follows client size",
+          resized.width == win.width(&w) && resized.height == win.height(&w) && cast(i64, resized.color) != 0);
+    let is t.RECT as before_full;
+    let is t.RECT as after_full;
+    u.GetWindowRect(w.hwnd, &before_full);
+    check("fullscreen updates native geometry and state", win.set_fullscreen(&w, 1) == 1 &&
+          (win.state(&w) & event.STATE_FULLSCREEN) != 0 &&
+          u.GetWindowRect(w.hwnd, &after_full) == 1 && after_full.right - after_full.left > before_full.right - before_full.left);
+    check("fullscreen restores the original native rectangle", win.set_fullscreen(&w, 0) == 1 &&
+          (win.state(&w) & event.STATE_FULLSCREEN) == 0 &&
+          u.GetWindowRect(w.hwnd, &after_full) == 1 &&
+          before_full.left == after_full.left && before_full.top == after_full.top &&
+          before_full.right == after_full.right && before_full.bottom == after_full.bottom);
+
+    win.set_title(&w, "Área — 窓", 13);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_CLOSE), 0, 0);
+    check("close request is observable", win.should_close(&w) == 1 && take(&w, event.CLOSE, &e) == 1);
+    win.keep_open(&w);
+    check("close can be declined", win.should_close(&w) == 0 && win.is_open(&w) == 1);
+
+    let is i64 as hwnd = w.hwnd;
+    win.close(&w);
+    check("close destroys native window", win.is_open(&w) == 0 && u.IsWindow(hwnd) == 0);
+    if (failures != 0) { return 1; }
+    io.printf("win32 backend: all checks passed\n");
+    return 0;
+}

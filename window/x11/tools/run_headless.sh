@@ -77,4 +77,7 @@ done
 [ "$i" -lt 100 ] || { echo "run_headless: Xvfb nao respondeu em 5s" >&2; exit 1; }
 num=$(head -n 1 "$numfile")
 
+# AUTO must use this private X server, not the caller's Wayland session.
+unset WAYLAND_DISPLAY
+export XDG_SESSION_TYPE=x11
 DISPLAY=":$num" "$@"

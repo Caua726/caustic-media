@@ -89,19 +89,12 @@ The buffer itself is shared memory:
 
 ---
 
-## Two syscalls the standard library does not have
+## File-descriptor transport
 
-Step 3 above is the blocker for speaking the protocol directly, and it is
-concrete:
-
-- **`sendmsg` with control messages.** The pool's file descriptor travels as
-  `SCM_RIGHTS` ancillary data over the unix socket. `std/os/linux.cst` has the
-  `AF_UNIX` constant and nothing else — no `sendmsg`, no `recvmsg`, no `cmsg`.
-- **`memfd_create`.** How the pool is made in the first place.
-
-Both are plain syscalls and belong in `std/os/linux.cst` regardless of this
-library. They are the prerequisite for the zero-dependency path, and they are not
-needed at all for the libwayland path.
+`std/os/linux.cst` still has no `sendmsg`/`recvmsg` or `memfd_create` surface.
+The project-level `sys/linux.cst` already supplies `connect_unix`,
+`send_fds`/`recv_fds` (`SCM_RIGHTS`), `memfd_create`, `poll` and `eventfd`;
+Wayland can use that transport without libwayland-client or libffi.
 
 ---
 
@@ -130,20 +123,41 @@ window.wayland.surface(&w)   // wl_surface*
 
 ---
 
-## Order of work
-
-Wayland comes after KMS and after the C header generator, per
-[`../window.md`](../window.md). By then the XML generator is the remaining piece,
-and it is the one with no alternative.
-
-1. **XML → Caustic generator**, core protocol plus xdg-shell.
-2. **`sendmsg`/`SCM_RIGHTS` and `memfd_create`** in `std/os/linux.cst`.
-3. **The backend**, on whichever transport is chosen by then.
-
 ## Current state
 
-Not built yet: this note is the design. The portable window (`window/device.cst`),
-the toolkit's loop (`ui/host.cst`) and the settings portal (`window/linux/portal.cst`)
-are written so that a Wayland backend slots in beside X11's; it comes after the
-toolkit is done on X11, with client-side decorations negotiated through
-`xdg-decoration`.
+`backend.cst` is a direct Wayland socket client; it does not link
+`libwayland-client` or `libffi`. It implements registry binding, xdg-shell
+windows, configure/close/state events, double-buffered `wl_shm` presentation,
+frame pacing, output and fractional scale, constraints, decorations, dialogs,
+cursors, keyboard/pointer input, text selections, and file/text drag-and-drop.
+The portable `window/device.cst` and `ui/host.cst` use it to open and paint
+toolkit windows.
+
+Optional globals degrade independently. Clipboard and DnD require
+`wl_data_device_manager`; primary selection requires
+`zwp_primary_selection_device_manager_v1`; fractional scaling requires both
+`wp_viewporter` and `wp_fractional_scale_manager_v1`; server decorations,
+dialog roles and cursor shapes use their corresponding optional protocols.
+When `zwp_text_input_manager_v3` and a seat are present, focused text widgets
+enable text input, publish their caret rectangle, and receive inline preedit,
+committed text and delete-surrounding edits. The latter are expanded to UTF-8
+character boundaries by `entry` and `textview`. The backend does not publish
+surrounding text, so IME suggestions that need surrounding context are limited.
+
+`caustic-mk run test-wayland` checks the generated protocol catalog, exercises
+clipboard/DnD and text-input-v3 through internal wire tests, opens and presents
+windows on Weston at scale 1 and 2, and runs the toolkit application loop on
+Weston until a timer closes its window. The headless Weston used here does not
+provide a keyboard/pointer seat; real key, clipboard, DnD and IME interaction
+therefore remains unverified by this test. The current smoke proves surface,
+frame, timer and toolkit-host integration, not real desktop input.
+
+A separate seated Weston/X11 smoke showed the file browser on the compositor.
+The settings form and editor did not become visible in that run; their normal
+startup and keyboard interaction are not accepted as verified. This is not
+three-example platform parity. Presentation sends explicit surface damage
+before the frame request and commit, including when a buffer is reused.
+
+Regenerate the protocol inventory from XML with
+`sh window/wayland/tools/check_protocols.sh`; it also validates the inputs
+against the independent `wayland-scanner`.

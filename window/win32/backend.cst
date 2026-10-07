@@ -1,0 +1,885 @@
+// window/win32/backend.cst — HWND, messages, and the software presentation surface.
+use "std/mem.cst" as mem;
+use "../../gpu/software/target.cst" as tgt;
+use "../event.cst" as event;
+use "../keys.cst" as keys;
+use "bind/types.cst" as t;
+use "bind/user32.cst" as u;
+use "bind/gdi32.cst" as g;
+use "bind/kernel32.cst" as k;
+use "bind/imm32.cst" as ime;
+use "abi.cst" as abi;
+use "clipboard.cst" as clipboard;
+use "bind/dwmapi.cst" as dwm;
+use "settings.cst" as desktop_settings;
+
+let is i32 as OK with imut = 0;
+let is i32 as NO_WINDOW with imut = 1;
+let is i32 as NO_MEMORY with imut = 2;
+let is i32 as NO_SURFACE with imut = 3;
+let is i32 as BAD_ARGUMENT with imut = 4;
+let is i64 as MAX_WINDOWS with imut = 32;
+let is i64 as MAX_EVENTS with imut = 128;
+let is i64 as WM_ERASEBKGND with imut = 20;
+let is i64 as WM_NCDESTROY with imut = 130;
+let is i64 as BI_BITFIELDS with imut = 3;
+let is i64 as VK_BACK with imut = 8;
+let is i64 as VK_TAB with imut = 9;
+let is i64 as VK_RETURN with imut = 13;
+let is i64 as VK_SHIFT with imut = 16;
+let is i64 as VK_CONTROL with imut = 17;
+let is i64 as VK_MENU with imut = 18;
+let is i64 as VK_PAUSE with imut = 19;
+let is i64 as VK_CAPITAL with imut = 20;
+let is i64 as VK_ESCAPE with imut = 27;
+let is i64 as VK_PRIOR with imut = 33;
+let is i64 as VK_NEXT with imut = 34;
+let is i64 as VK_END with imut = 35;
+let is i64 as VK_HOME with imut = 36;
+let is i64 as VK_LEFT with imut = 37;
+let is i64 as VK_UP with imut = 38;
+let is i64 as VK_RIGHT with imut = 39;
+let is i64 as VK_DOWN with imut = 40;
+let is i64 as VK_INSERT with imut = 45;
+let is i64 as VK_DELETE with imut = 46;
+let is i32 as DIB_RGB_COLORS with imut = 0;
+
+struct DIBInfo {
+    header as t.BITMAPINFOHEADER;
+    masks as [3]u32;
+}
+
+struct Queued {
+    e as event.Event;
+    text as [256]u8;
+    owned as *u8;
+}
+
+struct Native {
+    hwnd as i64;
+    owner as i64;
+    used as i32;
+    alive as i32;
+    asked as i32;
+    fixed as i32;
+    modal as i32;
+    decorated as i32;
+    dpi as i32;
+    width as i64;
+    height as i64;
+    min_width as i64;
+    min_height as i64;
+    max_width as i64;
+    max_height as i64;
+    restore_rect as t.RECT;
+    restore_style as i64;
+    resized as i32;
+    state as i32;
+    key_down as [256]u8;
+    focused as i32;
+    mouse_x as i64;
+    mouse_y as i64;
+    mouse_dx as i64;
+    mouse_dy as i64;
+    buttons as i32;
+    wheel_y as i64;
+    wheel_remainder as i32;
+    wheel_x_remainder as i32;
+    entered as i32;
+    text_enabled as i32;
+    composition_on as i32;
+    caret_x as i64;
+    caret_y as i64;
+    caret_w as i64;
+    caret_h as i64;
+    high_surrogate as u16;
+    cursor as i64;
+    hdc as i64;
+    bitmap as i64;
+    pixels as *u8;
+    dib as DIBInfo;
+    clip as clipboard.State;
+    event_head as i64;
+    event_len as i64;
+    last_text as *u8;
+    last_bytes as i64;
+    events as [128]Queued;
+}
+
+struct Config {
+    title as *u8;
+    width as i64;
+    height as i64;
+    resizable as i32;
+    owner as i64;
+    dialog as i32;
+    modal as i32;
+    decorated as i32;
+}
+
+struct Window {
+    hwnd as i64;
+    slot as i32;
+    ok as i32;
+    err as i32;
+    dpi as i32;
+}
+
+let is [32]Native as _windows with mut;
+let is abi.Callbacks as _callbacks with mut;
+let is i32 as _class_ready with mut = 0;
+let is i32 as _dpi_ready with mut = 0;
+let is i64 as _instance with mut = 0;
+let is [32]u16 as _class_name with mut;
+
+fn _mods() as i32 {
+    let is i32 as m with mut = 0;
+    if ((cast(i32, u.GetKeyState(16)) & 32768) != 0) { m = m | keys.MOD_SHIFT; }
+    if ((cast(i32, u.GetKeyState(17)) & 32768) != 0) { m = m | keys.MOD_CONTROL; }
+    if ((cast(i32, u.GetKeyState(18)) & 32768) != 0) { m = m | keys.MOD_ALT; }
+    if ((cast(i32, u.GetKeyState(20)) & 1) != 0) { m = m | keys.MOD_LOCK; }
+    if ((cast(i32, u.GetKeyState(91)) & 32768) != 0 || (cast(i32, u.GetKeyState(92)) & 32768) != 0) {
+        m = m | keys.MOD_SUPER;
+    }
+    return m;
+}
+
+fn _key(vk as u32) as i32 {
+    let is i32 as v = cast(i32, vk);
+    if (v >= 65 && v <= 90) { return keys.A + v - 65; }
+    if (v >= 48 && v <= 57) { return keys.NUM_0 + v - 48; }
+    if (v >= 112 && v <= 123) { return keys.F1 + v - 112; }
+    if (v == 32) { return keys.SPACE; }
+    if (v == 8) { return keys.BACKSPACE; }
+    if (v == 9) { return keys.TAB; }
+    if (v == 13) { return keys.RETURN; }
+    if (v == 19) { return keys.PAUSE; }
+    if (v == 27) { return keys.ESCAPE; }
+    if (v == 33) { return keys.PAGE_UP; }
+    if (v == 34) { return keys.PAGE_DOWN; }
+    if (v == 35) { return keys.END; }
+    if (v == 36) { return keys.HOME; }
+    if (v == 37) { return keys.LEFT; }
+    if (v == 38) { return keys.UP; }
+    if (v == 39) { return keys.RIGHT; }
+    if (v == 40) { return keys.DOWN; }
+    if (v == 45) { return keys.INSERT; }
+    if (v == 46) { return keys.DELETE; }
+    if (v == 144) { return keys.NUM_LOCK; }
+    if (v == 160) { return keys.SHIFT_L; }
+    if (v == 161) { return keys.SHIFT_R; }
+    if (v == 162) { return keys.CONTROL_L; }
+    if (v == 163) { return keys.CONTROL_R; }
+    if (v == 164) { return keys.ALT_L; }
+    if (v == 165) { return keys.ALT_R; }
+    if (v == 91) { return keys.SUPER_L; }
+    if (v == 92) { return keys.SUPER_R; }
+    if (v == 20) { return keys.CAPS_LOCK; }
+    if (v == 186) { return keys.SEMICOLON; }
+    if (v == 187) { return keys.EQUAL; }
+    if (v == 188) { return keys.COMMA; }
+    if (v == 189) { return keys.MINUS; }
+    if (v == 190) { return keys.PERIOD; }
+    if (v == 191) { return keys.SLASH; }
+    if (v == 192) { return keys.GRAVE; }
+    if (v == 219) { return keys.LEFT_BRACKET; }
+    if (v == 220) { return keys.BACKSLASH; }
+    if (v == 221) { return keys.RIGHT_BRACKET; }
+    if (v == 222) { return keys.APOSTROPHE; }
+    return keys.UNKNOWN;
+}
+
+fn _signed16(v as u64) as i64 {
+    let is i64 as n with mut = cast(i64, v & 65535);
+    if (n >= 32768) { n = n - 65536; }
+    return n;
+}
+
+fn _release_text(q as *Queued) as void {
+    if (cast(i64, q.owned) != 0) { mem.core.munmap(q.owned, q.e.text_len + 1); q.owned = cast(*u8, 0); }
+}
+
+fn _reserve(n as *Native, e as *event.Event) as *Queued {
+    if (n.event_len == MAX_EVENTS) {
+        _release_text(&n.events[n.event_head]);
+        n.event_head = (n.event_head + 1) % MAX_EVENTS;
+        n.event_len = n.event_len - 1;
+    }
+    let is i64 as at = (n.event_head + n.event_len) % MAX_EVENTS;
+    let is *Queued as q = &n.events[at];
+    q.e = *e; q.owned = cast(*u8, 0); q.e.text = cast(*u8, &q.text[0]);
+    if (e.text_len > 255) {
+        q.owned = mem.core.mmap_anon(e.text_len + 1);
+        if (cast(i64, q.owned) == 0) { return cast(*Queued, 0); }
+        q.e.text = q.owned;
+    }
+    q.e.text[e.text_len] = cast(u8, 0);
+    n.event_len = n.event_len + 1;
+    return q;
+}
+
+fn _enqueue(n as *Native, e as *event.Event) as void {
+    let is *Queued as q = _reserve(n, e);
+    if (cast(i64, q) != 0 && e.text_len > 0) { mem.memcpy(q.e.text, e.text, e.text_len); }
+}
+
+fn _emit(n as *Native, kind as i32, raw as i32, x as i64, y as i64, value as i64) as void {
+    let is event.Event as e;
+    event.clear(&e);
+    e.kind = kind;
+    e.raw_kind = raw;
+    e.x = x;
+    e.y = y;
+    if (kind == event.RESIZE) { e.width = n.width; e.height = n.height; }
+    if (kind == event.STATE) { e.state = cast(i32, value); }
+    if (kind == event.KEY_DOWN || kind == event.KEY_UP) {
+        let is i64 as vk = cast(i64, value & 65535);
+        e.key = _key(cast(u32, vk));
+        e.keycode = cast(i32, (value >> 16) & 255);
+        if (e.keycode == 0) { e.keycode = cast(i32, vk); }
+        e.modifiers = _mods();
+        if (vk >= 0 && vk < 256) {
+            if (kind == event.KEY_DOWN) { n.key_down[vk] = cast(u8, 1); }
+            else { n.key_down[vk] = cast(u8, 0); }
+        }
+    }
+    if (kind == event.MOUSE_DOWN || kind == event.MOUSE_UP) {
+        e.button = cast(i32, value);
+        e.modifiers = _mods();
+    }
+    if (kind == event.MOUSE_MOVE || kind == event.ENTER || kind == event.LEAVE || kind == event.WHEEL) {
+        e.modifiers = _mods();
+    }
+    if (kind == event.WHEEL) { e.wheel = cast(i32, value); }
+    _enqueue(n, &e);
+}
+
+fn _utf8(n as *Native, code as i64, kind as i32, cursor as i64) as void {
+    if (code <= 0) { return; }
+    let is [4]u8 as b;
+    let is i64 as count with mut = 0;
+    if (code <= 127) { b[0] = cast(u8, code); count = 1; }
+    else if (code <= 2047) {
+        b[0] = cast(u8, 192 | (code >> 6));
+        b[1] = cast(u8, 128 | (code & 63));
+        count = 2;
+    } else if (code <= 65535) {
+        b[0] = cast(u8, 224 | (code >> 12));
+        b[1] = cast(u8, 128 | ((code >> 6) & 63));
+        b[2] = cast(u8, 128 | (code & 63));
+        count = 3;
+    } else {
+        b[0] = cast(u8, 240 | (code >> 18));
+        b[1] = cast(u8, 128 | ((code >> 12) & 63));
+        b[2] = cast(u8, 128 | ((code >> 6) & 63));
+        b[3] = cast(u8, 128 | (code & 63));
+        count = 4;
+    }
+    let is event.Event as e;
+    event.clear(&e);
+    e.kind = kind;
+    e.text = cast(*u8, &b[0]);
+    e.text_len = count;
+    e.cursor = cursor;
+    _enqueue(n, &e);
+}
+fn _empty_preedit(n as *Native) as void {
+    let is event.Event as empty;
+    event.clear(&empty);
+    empty.kind = event.PREEDIT;
+    _enqueue(n, &empty);
+}
+
+
+fn _dib(n as *Native, width as i64, height as i64) as i32 {
+    if (width == n.width && height == n.height && cast(i64, n.pixels) != 0) { return 1; }
+    if (width < 0 || height < 0 || width > 16384 || height > 16384 || width * height > 67108864) { return 0; }
+    if (n.hdc != 0) { g.DeleteDC(n.hdc); n.hdc = 0; }
+    if (n.bitmap != 0) { g.DeleteObject(n.bitmap); n.bitmap = 0; }
+    n.pixels = cast(*u8, 0);
+    n.width = width;
+    n.height = height;
+    if (width == 0 || height == 0) { return 1; }
+    mem.memset(cast(*u8, &n.dib), 0, sizeof(DIBInfo));
+    n.dib.header.biSize = cast(u32, sizeof(t.BITMAPINFOHEADER));
+    n.dib.header.biWidth = cast(i32, width);
+    n.dib.header.biHeight = cast(i32, 0 - height);
+    n.dib.header.biPlanes = cast(u16, 1);
+    n.dib.header.biBitCount = cast(u16, 32);
+    n.dib.header.biCompression = cast(u32, BI_BITFIELDS);
+    n.dib.header.biSizeImage = cast(u32, width * height * 4);
+    n.dib.masks[0] = cast(u32, 255);
+    n.dib.masks[1] = cast(u32, 65280);
+    n.dib.masks[2] = cast(u32, 16711680);
+    n.bitmap = g.CreateDIBSection(0, cast(*t.BITMAPINFO, &n.dib), cast(u32, DIB_RGB_COLORS), &n.pixels, 0, 0);
+    if (n.bitmap == 0 || cast(i64, n.pixels) == 0) {
+        if (n.bitmap != 0) { g.DeleteObject(n.bitmap); }
+        n.bitmap = 0; n.pixels = cast(*u8, 0); return 0;
+    }
+    n.hdc = g.CreateCompatibleDC(0);
+    if (n.hdc == 0) { g.DeleteObject(n.bitmap); n.bitmap = 0; n.pixels = cast(*u8, 0); return 0; }
+    g.SelectObject(n.hdc, n.bitmap);
+    mem.memset(n.pixels, 0, width * height * 4);
+    return 1;
+}
+
+fn _paint(n as *Native) as void {
+    let is t.PAINTSTRUCT as ps;
+    let is i64 as dc = u.BeginPaint(n.hwnd, &ps);
+    if (dc != 0 && n.hdc != 0 && n.width > 0 && n.height > 0) {
+        g.BitBlt(dc, 0, 0, cast(i32, n.width), cast(i32, n.height), n.hdc, 0, 0, cast(u32, t.SRCCOPY));
+    }
+    u.EndPaint(n.hwnd, &ps);
+}
+
+fn _ime_text(n as *Native, h as i64, index as i32, kind as i32) as void {
+    let is i32 as bytes = ime.ImmGetCompositionStringW(h, cast(u32, index), cast(*u8, 0), 0);
+    if (bytes < 0 || (bytes % 2) != 0) { return; }
+    let is [256]u16 as short_wide;
+    let is *u8 as storage with mut = cast(*u8, &short_wide[0]);
+    if (bytes > 512) {
+        storage = mem.core.mmap_anon(bytes);
+        if (cast(i64, storage) == 0) { return; }
+    }
+    if (bytes > 0 && ime.ImmGetCompositionStringW(h, cast(u32, index), storage, cast(u32, bytes)) != bytes) {
+        if (bytes > 512) { mem.core.munmap(storage, bytes); }
+        return;
+    }
+    let is *u16 as wide = cast(*u16, storage);
+    let is event.Event as e;
+    event.clear(&e); e.kind = kind;
+    if (bytes > 0) {
+        e.text_len = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2,
+                                         cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0));
+    }
+    if (kind == event.PREEDIT) {
+        let is i32 as pos with mut = ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_CURSORPOS), cast(*u8, 0), 0);
+        if (pos < 0) { pos = 0; }
+        if (pos > bytes / 2) { pos = bytes / 2; }
+        if (pos > 0 && pos < bytes / 2 && wide[pos] >= 56320 && wide[pos] <= 57343) { pos = pos - 1; }
+        if (pos > 0) {
+            e.cursor = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, pos,
+                                            cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0));
+        }
+        n.composition_on = cast(i32, e.text_len > 0);
+    }
+    if (e.text_len > 0 || kind == event.PREEDIT) {
+        let is *Queued as q = _reserve(n, &e);
+        if (cast(i64, q) != 0 && e.text_len > 0) {
+            k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2,
+                                 cast(*i8, q.e.text), cast(i32, e.text_len), cast(*i8, 0), cast(*i32, 0));
+        }
+    }
+    if (bytes > 512) { mem.core.munmap(storage, bytes); }
+}
+
+fn _composition(n as *Native, flags as i64) as void {
+    let is i64 as h = ime.ImmGetContext(n.hwnd);
+    if (h == 0) { return; }
+    if ((flags & t.GCS_RESULTSTR) != 0) {
+        _ime_text(n, h, cast(i32, t.GCS_RESULTSTR), event.TEXT);
+        n.composition_on = 0; _empty_preedit(n);
+    }
+    if ((flags & t.GCS_COMPSTR) != 0) { _ime_text(n, h, cast(i32, t.GCS_COMPSTR), event.PREEDIT); }
+    ime.ImmReleaseContext(n.hwnd, h);
+}
+
+fn _position_ime(n as *Native) as void {
+    let is i64 as h = ime.ImmGetContext(n.hwnd);
+    if (h == 0) { return; }
+    let is t.COMPOSITIONFORM as cf;
+    mem.memset(cast(*u8, &cf), 0, sizeof(t.COMPOSITIONFORM));
+    cf.dwStyle = cast(u32, t.CFS_POINT);
+    cf.ptCurrentPos.x = cast(i32, n.caret_x);
+    cf.ptCurrentPos.y = cast(i32, n.caret_y + n.caret_h);
+    ime.ImmSetCompositionWindow(h, &cf);
+    let is t.CANDIDATEFORM as candidate;
+    mem.memset(cast(*u8, &candidate), 0, sizeof(t.CANDIDATEFORM));
+    candidate.dwIndex = 0;
+    candidate.dwStyle = cast(u32, t.CFS_CANDIDATEPOS);
+    candidate.ptCurrentPos.x = cast(i32, n.caret_x);
+    candidate.ptCurrentPos.y = cast(i32, n.caret_y + n.caret_h);
+    ime.ImmSetCandidateWindow(h, &candidate);
+    ime.ImmReleaseContext(n.hwnd, h);
+}
+
+fn _window_proc(ctx as *u8, args as *u64) as i64 {
+    let is i64 as hwnd = cast(i64, args[0]);
+    let is u32 as msg = cast(u32, args[1]);
+    let is u64 as wp = args[2];
+    let is i64 as lp = cast(i64, args[3]);
+    if (cast(i64, msg) == t.WM_NCCREATE) {
+        let is *t.CREATESTRUCTW as cs = cast(*t.CREATESTRUCTW, lp);
+        let is *Native as n = cast(*Native, cs.lpCreateParams);
+        n.hwnd = hwnd; n.alive = 1;
+        u.SetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA), cast(i64, n));
+        return 1;
+    }
+    let is *Native as n = cast(*Native, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA)));
+    if (cast(i64, n) == 0) { return u.DefWindowProcW(hwnd, msg, wp, lp); }
+    if (cast(i64, msg) == t.WM_SETCURSOR && (lp & 65535) == t.HTCLIENT) {
+        u.SetCursor(n.cursor); return 1;
+    }
+    if (cast(i64, msg) == t.WM_GETMINMAXINFO) {
+        let is *t.MINMAXINFO as limits = cast(*t.MINMAXINFO, lp);
+        let is t.RECT as outer;
+        outer.left = 0; outer.top = 0; outer.right = 0; outer.bottom = 0;
+        u.AdjustWindowRectExForDpi(&outer, cast(u32, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWL_STYLE))),
+                                  0, 0, cast(u32, n.dpi));
+        let is i32 as border_w = outer.right - outer.left;
+        let is i32 as border_h = outer.bottom - outer.top;
+        if (n.min_width > 0) { limits.ptMinTrackSize.x = cast(i32, n.min_width) + border_w; }
+        if (n.min_height > 0) { limits.ptMinTrackSize.y = cast(i32, n.min_height) + border_h; }
+        if (n.max_width > 0) { limits.ptMaxTrackSize.x = cast(i32, n.max_width) + border_w; }
+        if (n.max_height > 0) { limits.ptMaxTrackSize.y = cast(i32, n.max_height) + border_h; }
+        return 0;
+    }
+    if (cast(i64, msg) == t.WM_PAINT) { _paint(n); return 0; }
+    if (cast(i64, msg) == WM_ERASEBKGND) { return 1; }
+    if (cast(i64, msg) == t.WM_CLOSE) { n.asked = 1; _emit(n, event.CLOSE, cast(i32, msg), 0, 0, 0); return 0; }
+    if (cast(i64, msg) == t.WM_SIZE) {
+        let is i64 as nw = cast(i64, lp & 65535);
+        let is i64 as nh = cast(i64, (lp >> 16) & 65535);
+        let is i64 as ow = n.width; let is i64 as oh = n.height;
+        if (_dib(n, nw, nh) == 0) { n.width = 0; n.height = 0; }
+        if (ow != n.width || oh != n.height) { n.resized = 1; _emit(n, event.RESIZE, cast(i32, msg), 0, 0, 0); }
+        if (wp == cast(u64, t.SIZE_MAXIMIZED)) {
+            n.state = n.state | event.STATE_MAXIMIZED;
+            _emit(n, event.STATE, cast(i32, msg), 0, 0, n.state);
+        } else if (wp == 0) {
+            n.state = n.state & cast(i32, 0 - 2);
+            _emit(n, event.STATE, cast(i32, msg), 0, 0, n.state);
+        }
+        return 0;
+    }
+    if (cast(i64, msg) == t.WM_DPICHANGED) {
+        n.dpi = cast(i32, wp & 65535);
+        let is *t.RECT as suggested = cast(*t.RECT, lp);
+        u.SetWindowPos(hwnd, 0, suggested.left, suggested.top, suggested.right - suggested.left,
+                       suggested.bottom - suggested.top, cast(u32, t.SWP_NOZORDER | t.SWP_NOACTIVATE));
+        let is event.Event as e; event.clear(&e); e.kind = event.RESIZE; e.raw_kind = cast(i32, msg);
+        e.width = n.width; e.height = n.height; _enqueue(n, &e);
+        n.resized = 1;
+        return 0;
+    }
+    if (cast(i64, msg) == t.WM_SETTINGCHANGE) { _emit(n, event.SETTINGS, cast(i32, msg), 0, 0, 0); return 0; }
+    if (cast(i64, msg) == t.WM_SETFOCUS) { n.focused = 1; _emit(n, event.FOCUS_IN, cast(i32, msg), 0, 0, 0); return 0; }
+    if (cast(i64, msg) == t.WM_KILLFOCUS) {
+        n.focused = 0; n.high_surrogate = 0;
+        mem.memzero(cast(*u8, &n.key_down[0]), 256);
+        if (n.composition_on == 1) { n.composition_on = 0; _empty_preedit(n); }
+        _emit(n, event.FOCUS_OUT, cast(i32, msg), 0, 0, 0); return 0;
+    }
+    if (cast(i64, msg) == t.WM_KEYDOWN || cast(i64, msg) == t.WM_SYSKEYDOWN ||
+        cast(i64, msg) == t.WM_KEYUP || cast(i64, msg) == t.WM_SYSKEYUP) {
+        let is i32 as key_kind with mut = event.KEY_DOWN;
+        if (cast(i64, msg) == t.WM_KEYUP || cast(i64, msg) == t.WM_SYSKEYUP) { key_kind = event.KEY_UP; }
+        let is i64 as vk with mut = cast(i64, wp);
+        let is i64 as scan = (lp >> 16) & 255;
+        let is i64 as extended = (lp >> 24) & 1;
+        if (vk == VK_SHIFT) { vk = cast(i64, u.MapVirtualKeyW(cast(u32, scan), 3)); }
+        else if (vk == VK_CONTROL) { vk = 162 + extended; }
+        else if (vk == VK_MENU) { vk = 164 + extended; }
+        _emit(n, key_kind, cast(i32, msg), 0, 0, vk | ((scan | (extended << 7)) << 16));
+        if (cast(i64, msg) == t.WM_SYSKEYDOWN || cast(i64, msg) == t.WM_SYSKEYUP) { return u.DefWindowProcW(hwnd, msg, wp, lp); }
+        return 0;
+    }
+    if (cast(i64, msg) == t.WM_CHAR) {
+        let is i64 as unit = cast(i64, wp & 65535);
+        if (unit < 32 || unit == 127) { return 0; }
+        if (unit >= 55296 && unit <= 56319) { n.high_surrogate = cast(u16, unit); return 0; }
+        if (unit >= 56320 && unit <= 57343) {
+            if (n.high_surrogate != 0) {
+                _utf8(n, 65536 + ((cast(i64, n.high_surrogate) - 55296) << 10) + unit - 56320, event.TEXT, 0);
+                n.high_surrogate = 0;
+            }
+            return 0;
+        }
+        if (n.high_surrogate != 0) { _utf8(n, 65533, event.TEXT, 0); n.high_surrogate = 0; }
+        _utf8(n, unit, event.TEXT, 0);
+        return 0;
+    }
+    if (cast(i64, msg) == t.WM_IME_COMPOSITION) { _composition(n, lp); return 0; }
+    if (cast(i64, msg) == t.WM_IME_ENDCOMPOSITION) {
+        n.composition_on = 0; _empty_preedit(n); return 0;
+    }
+    if (cast(i64, msg) == t.WM_MOUSEMOVE) {
+        let is i64 as mx = _signed16(cast(u64, lp));
+        let is i64 as my = _signed16(cast(u64, lp) >> 16);
+        n.mouse_dx = n.mouse_dx + mx - n.mouse_x; n.mouse_dy = n.mouse_dy + my - n.mouse_y;
+        n.mouse_x = mx; n.mouse_y = my;
+        if (n.entered == 0) {
+            n.entered = 1; _emit(n, event.ENTER, cast(i32, msg), mx, my, 0);
+            let is t.TRACKMOUSEEVENT as track; mem.memset(cast(*u8, &track), 0, sizeof(t.TRACKMOUSEEVENT));
+            track.cbSize = cast(u32, sizeof(t.TRACKMOUSEEVENT)); track.dwFlags = cast(u32, t.TME_LEAVE);
+            track.hwndTrack = hwnd; u.TrackMouseEvent(&track);
+        }
+        _emit(n, event.MOUSE_MOVE, cast(i32, msg), mx, my, 0); return 0;
+    }
+    if (cast(i64, msg) == t.WM_MOUSELEAVE) { n.entered = 0; _emit(n, event.LEAVE, cast(i32, msg), n.mouse_x, n.mouse_y, 0); return 0; }
+    if (cast(i64, msg) == t.WM_LBUTTONDOWN || cast(i64, msg) == t.WM_LBUTTONUP ||
+        cast(i64, msg) == t.WM_MBUTTONDOWN || cast(i64, msg) == t.WM_MBUTTONUP ||
+        cast(i64, msg) == t.WM_RBUTTONDOWN || cast(i64, msg) == t.WM_RBUTTONUP) {
+        let is i32 as button with mut = 1; let is i32 as down with mut = 1;
+        if (cast(i64, msg) == t.WM_MBUTTONDOWN || cast(i64, msg) == t.WM_MBUTTONUP) { button = 2; }
+        if (cast(i64, msg) == t.WM_RBUTTONDOWN || cast(i64, msg) == t.WM_RBUTTONUP) { button = 3; }
+        if (cast(i64, msg) == t.WM_LBUTTONUP || cast(i64, msg) == t.WM_MBUTTONUP || cast(i64, msg) == t.WM_RBUTTONUP) { down = 0; }
+        n.mouse_x = _signed16(cast(u64, lp)); n.mouse_y = _signed16(cast(u64, lp) >> 16);
+        let is i32 as mask = cast(i32, 1 << (button - 1));
+        if (down == 1) { n.buttons = n.buttons | mask; u.SetCapture(hwnd); }
+        else { n.buttons = n.buttons & cast(i32, 0 - 1 - mask); if (n.buttons == 0) { u.ReleaseCapture(); } }
+        let is i32 as mouse_kind with mut = event.MOUSE_DOWN; if (down == 0) { mouse_kind = event.MOUSE_UP; }
+        _emit(n, mouse_kind, cast(i32, msg), n.mouse_x, n.mouse_y, button); return 0;
+    }
+    if (cast(i64, msg) == t.WM_MOUSEWHEEL || cast(i64, msg) == t.WM_MOUSEHWHEEL) {
+        let is i64 as wx = _signed16(cast(u64, lp)); let is i64 as wy = _signed16(cast(u64, lp) >> 16);
+        let is t.POINT as p; p.x = cast(i32, wx); p.y = cast(i32, wy); u.ScreenToClient(hwnd, &p);
+        let is i32 as delta with mut = cast(i32, (wp >> 16) & 65535); if (delta >= 32768) { delta = delta - 65536; }
+        if (cast(i64, msg) == t.WM_MOUSEHWHEEL) {
+            n.wheel_x_remainder = n.wheel_x_remainder + delta;
+            let is i32 as sideways = n.wheel_x_remainder / 120;
+            n.wheel_x_remainder = n.wheel_x_remainder - sideways * 120;
+            let is i32 as side_button with mut = 7;
+            if (sideways < 0) { side_button = 6; }
+            let is i64 as steps with mut = cast(i64, sideways);
+            if (steps < 0) { steps = 0 - steps; }
+            while (steps > 0) {
+                _emit(n, event.MOUSE_DOWN, cast(i32, msg), p.x, p.y, side_button);
+                steps = steps - 1;
+            }
+        } else {
+            n.wheel_remainder = n.wheel_remainder + delta;
+            let is i32 as notch = n.wheel_remainder / 120;
+            n.wheel_remainder = n.wheel_remainder - notch * 120;
+            n.wheel_y = n.wheel_y + notch;
+            if (notch != 0) { _emit(n, event.WHEEL, cast(i32, msg), p.x, p.y, notch); }
+        }
+        return 0;
+    }
+    if (cast(i64, msg) == WM_NCDESTROY) {
+        n.alive = 0; u.SetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA), 0);
+        return u.DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    return u.DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+fn _ensure_class() as i32 {
+    if (_class_ready == 1) { return 1; }
+    if (_dpi_ready == 0) { u.SetProcessDpiAwarenessContext(0 - 4); _dpi_ready = 1; }
+    _instance = k.GetModuleHandleW(cast(*u16, 0));
+    k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, "CausticMediaWindow"), cast(i32, 0 - 1), &_class_name[0], 32);
+    _callbacks = abi.open(1);
+    if (cast(i64, _callbacks.code) == 0) { return 0; }
+    if (abi.put(&_callbacks, 0, fn_ptr(_window_proc), cast(*u8, 0), 4, 0) == 0 || abi.seal(&_callbacks) == 0) {
+        abi.close(&_callbacks); return 0;
+    }
+    let is t.WNDCLASSEXW as wc; mem.memset(cast(*u8, &wc), 0, sizeof(t.WNDCLASSEXW));
+    wc.cbSize = cast(u32, sizeof(t.WNDCLASSEXW));
+    wc.style = cast(u32, t.CS_HREDRAW | t.CS_VREDRAW | t.CS_DBLCLKS);
+    wc.lpfnWndProc = abi.address(&_callbacks, 0); wc.hInstance = _instance; wc.lpszClassName = &_class_name[0];
+    wc.hCursor = u.LoadCursorW(0, cast(*u16, 32512));
+    if (u.RegisterClassExW(&wc) == 0) { abi.close(&_callbacks); return 0; }
+    _class_ready = 1; return 1;
+}
+
+fn config(title as *u8, width as i64, height as i64) as Config {
+    let is Config as c; c.title = title; c.width = width; c.height = height;
+    c.resizable = 1; c.owner = 0; c.dialog = 0; c.modal = 0; c.decorated = 1; return c;
+}
+
+fn open_config(c as *Config) as Window {
+    let is Window as w; mem.memzero(cast(*u8, &w), sizeof(Window));
+    w.slot = 0 - 1; w.err = BAD_ARGUMENT;
+    if (c.width <= 0 || c.height <= 0 || c.width > 16384 || c.height > 16384) { return w; }
+    if (_ensure_class() == 0) { w.err = NO_WINDOW; return w; }
+    let is i64 as slot with mut = 0 - 1; let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) { if (_windows[i].used == 0) { slot = i; break; } i = i + 1; }
+    if (slot < 0) { w.err = NO_MEMORY; return w; }
+    let is *Native as n = &_windows[slot]; mem.memset(cast(*u8, n), 0, sizeof(Native));
+    n.used = 1; n.owner = c.owner; n.fixed = cast(i32, c.resizable == 0); n.modal = c.modal;
+    n.decorated = c.decorated; n.dpi = cast(i32, u.GetDpiForSystem()); if (n.dpi < 96) { n.dpi = 96; }
+    n.cursor = u.LoadCursorW(0, cast(*u16, 32512));
+    if (n.fixed == 1) {
+        n.min_width = c.width; n.max_width = c.width;
+        n.min_height = c.height; n.max_height = c.height;
+    }
+    let is u32 as style with mut = cast(u32, t.WS_OVERLAPPEDWINDOW);
+    if (c.decorated == 0) { style = cast(u32, t.WS_POPUP | t.WS_VISIBLE); }
+    if (c.resizable == 0) { style = cast(u32, cast(i64, style) & (0 - 262145)); }
+    if (c.dialog == 1) { style = cast(u32, t.WS_CAPTION | t.WS_SYSMENU | t.WS_VISIBLE); }
+    let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, c.width); r.bottom = cast(i32, c.height);
+    if (u.AdjustWindowRectExForDpi(&r, style, 0, 0, cast(u32, n.dpi)) == 0) { u.AdjustWindowRectEx(&r, style, 0, 0); }
+    let is [512]u16 as title; title[0] = cast(u16, 0);
+    if (cast(i64, c.title) != 0) { k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, c.title), cast(i32, 0 - 1), &title[0], 512); }
+    let is i32 as outer_width = r.right - r.left;
+    let is i32 as outer_height = r.bottom - r.top;
+    let is i64 as hwnd = u.CreateWindowExW(0, &_class_name[0], &title[0], style,
+        cast(i32, t.CW_USEDEFAULT), cast(i32, t.SW_SHOW), outer_width, outer_height, c.owner, 0, _instance, cast(*u8, n));
+    if (hwnd == 0) { n.used = 0; w.err = NO_WINDOW; return w; }
+    n.hwnd = hwnd; n.alive = 1; n.dpi = cast(i32, u.GetDpiForWindow(hwnd)); if (n.dpi < 96) { n.dpi = 96; }
+    let is t.RECT as client; u.GetClientRect(hwnd, &client);
+    if (_dib(n, cast(i64, client.right - client.left), cast(i64, client.bottom - client.top)) == 0) {
+        u.DestroyWindow(hwnd); n.used = 0; w.err = NO_SURFACE; return w;
+    }
+    if (n.modal == 1 && n.owner != 0) { u.EnableWindow(n.owner, 0); }
+    u.ShowWindow(hwnd, cast(i32, t.SW_SHOW)); u.UpdateWindow(hwnd);
+    w.hwnd = hwnd; w.slot = cast(i32, slot); w.ok = 1; w.err = OK; w.dpi = n.dpi; return w;
+}
+
+fn open(title as *u8, width as i64, height as i64) as Window {
+    let is Config as c = config(title, width, height); return open_config(&c);
+}
+
+fn _native(w as *Window) as *Native {
+    if (w.ok != 1 || w.slot < 0 || w.slot >= MAX_WINDOWS) { return cast(*Native, 0); }
+    let is *Native as n = &_windows[w.slot];
+    if (n.used != 1 || n.hwnd != w.hwnd) { return cast(*Native, 0); }
+    return n;
+}
+
+fn close(w as *Window) as void {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.used == 0) { w.ok = 0; return; }
+    if (n.modal == 1 && n.owner != 0 && u.IsWindow(n.owner) == 1) { u.EnableWindow(n.owner, 1); }
+    if (n.hwnd != 0 && u.IsWindow(n.hwnd) == 1) { u.DestroyWindow(n.hwnd); }
+    if (n.hdc != 0) { g.DeleteDC(n.hdc); n.hdc = 0; }
+    if (n.bitmap != 0) { g.DeleteObject(n.bitmap); n.bitmap = 0; }
+    clipboard.clear(&n.clip);
+    let is i64 as queued with mut = 0;
+    while (queued < MAX_EVENTS) { _release_text(&n.events[queued]); queued = queued + 1; }
+    if (cast(i64, n.last_text) != 0) { mem.core.munmap(n.last_text, n.last_bytes); n.last_text = cast(*u8, 0); }
+    n.pixels = cast(*u8, 0); n.used = 0; n.alive = 0; w.ok = 0;
+}
+
+fn is_open(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.used == 1 && n.alive == 1 && u.IsWindow(n.hwnd) == 1); }
+fn hwnd(w as *Window) as i64 { return w.hwnd; }
+fn width(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.width; }
+fn height(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.height; }
+fn scale_120(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.dpi < 96) { return 120; } return n.dpi * 120 / 96; }
+fn resized(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.resized; }
+fn should_close(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.asked; }
+fn keep_open(w as *Window) as void { let is *Native as n = _native(w); if (cast(i64, n) != 0) { n.asked = 0; } }
+fn request_close(w as *Window) as void { let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.asked == 1) { return; } n.asked = 1; _emit(n, event.CLOSE, cast(i32, t.WM_CLOSE), 0, 0, 0); }
+fn state(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.state; }
+fn focused(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.focused; }
+
+fn pump(w as *Window) as void {
+    if (is_open(w) == 0) { return; }
+    let is t.MSG as msg;
+    while (u.PeekMessageW(&msg, 0, 0, 0, cast(u32, t.PM_REMOVE)) == 1) {
+        u.TranslateMessage(&msg); u.DispatchMessageW(&msg);
+    }
+}
+fn next_frame(w as *Window) as i32 { if (is_open(w) == 0) { return 0; } pump(w); return 1; }
+fn pending(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.event_len > 0); }
+fn connection_fd(w as *Window) as i64 { return 0 - 1; }
+fn poll_event(w as *Window, out as *event.Event) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.event_len == 0) { return 0; }
+    if (cast(i64, n.last_text) != 0) { mem.core.munmap(n.last_text, n.last_bytes); }
+    let is *Queued as q = &n.events[n.event_head];
+    *out = q.e;
+    n.last_text = q.owned; n.last_bytes = q.e.text_len + 1; q.owned = cast(*u8, 0);
+    n.event_head = (n.event_head + 1) % MAX_EVENTS; n.event_len = n.event_len - 1;
+    return 1;
+}
+fn acquire(w as *Window) as tgt.Target {
+    let is *Native as n = _native(w); let is tgt.Target as out;
+    if (cast(i64, n) == 0 || is_open(w) == 0) { out.color = cast(*u8, 0); out.depth = cast(*u8, 0); out.width = 0; out.height = 0; return out; }
+    out.color = n.pixels; out.depth = cast(*u8, 0); out.width = n.width; out.height = n.height; return out;
+}
+fn submit(w as *Window) as void {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.used == 0 || n.hwnd == 0) { return; }
+    u.InvalidateRect(n.hwnd, cast(*t.RECT, 0), 0); u.UpdateWindow(n.hwnd);
+}
+fn show(w as *Window) as void { if (is_open(w) == 1) { u.ShowWindow(w.hwnd, cast(i32, t.SW_SHOW)); } }
+fn hide(w as *Window) as void { if (is_open(w) == 1) { u.ShowWindow(w.hwnd, cast(i32, t.SW_HIDE)); } }
+fn set_title(w as *Window, s as *u8, nbytes as i64) as void {
+    if (is_open(w) == 0) { return; }
+    let is [512]u16 as wide;
+    mem.memzero(cast(*u8, &wide[0]), 1024);
+    if (cast(i64, s) != 0 && nbytes > 0) {
+        let is i32 as units = k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, s), cast(i32, nbytes), &wide[0], 511);
+        if (units > 0) { wide[units] = cast(u16, 0); }
+    }
+    u.SetWindowTextW(w.hwnd, &wide[0]);
+}
+fn _vk(key as i32) as i32 {
+    if (key >= keys.A && key <= keys.Z) { return 65 + key - keys.A; }
+    if (key >= keys.NUM_0 && key <= keys.NUM_9) { return key; }
+    if (key == keys.SPACE) { return 32; }
+    if (key == keys.BACKSPACE) { return cast(i32, VK_BACK); }
+    if (key == keys.TAB) { return cast(i32, VK_TAB); }
+    if (key == keys.RETURN) { return cast(i32, VK_RETURN); }
+    if (key == keys.ESCAPE) { return cast(i32, VK_ESCAPE); }
+    if (key == keys.PAUSE) { return cast(i32, VK_PAUSE); }
+    if (key == keys.LEFT) { return cast(i32, VK_LEFT); }
+    if (key == keys.UP) { return cast(i32, VK_UP); }
+    if (key == keys.RIGHT) { return cast(i32, VK_RIGHT); }
+    if (key == keys.DOWN) { return cast(i32, VK_DOWN); }
+    if (key == keys.HOME) { return cast(i32, VK_HOME); }
+    if (key == keys.END) { return cast(i32, VK_END); }
+    if (key == keys.PAGE_UP) { return cast(i32, VK_PRIOR); }
+    if (key == keys.PAGE_DOWN) { return cast(i32, VK_NEXT); }
+    if (key == keys.INSERT) { return cast(i32, VK_INSERT); }
+    if (key == keys.DELETE) { return cast(i32, VK_DELETE); }
+    if (key == keys.SHIFT_L) { return 160; }
+    if (key == keys.SHIFT_R) { return 161; }
+    if (key == keys.CONTROL_L) { return 162; }
+    if (key == keys.CONTROL_R) { return 163; }
+    if (key == keys.ALT_L) { return 164; }
+    if (key == keys.ALT_R) { return 165; }
+    if (key == keys.SUPER_L) { return 91; }
+    if (key == keys.SUPER_R) { return 92; }
+    if (key >= keys.F1 && key <= keys.F12) { return 112 + key - keys.F1; }
+    if (key == keys.SEMICOLON) { return 186; }
+    if (key == keys.EQUAL) { return 187; }
+    if (key == keys.COMMA) { return 188; }
+    if (key == keys.MINUS) { return 189; }
+    if (key == keys.PERIOD) { return 190; }
+    if (key == keys.SLASH) { return 191; }
+    if (key == keys.GRAVE) { return 192; }
+    if (key == keys.LEFT_BRACKET) { return 219; }
+    if (key == keys.BACKSLASH) { return 220; }
+    if (key == keys.RIGHT_BRACKET) { return 221; }
+    if (key == keys.APOSTROPHE) { return 222; }
+    return 0;
+}
+
+fn key_down(w as *Window, key as i32) as i32 {
+    let is *Native as n = _native(w); let is i32 as vk = _vk(key);
+    if (cast(i64, n) == 0 || vk <= 0 || vk >= 256) { return 0; }
+    return cast(i32, n.key_down[vk] != 0);
+}
+fn button_down(w as *Window, button as i32) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0 || button < 1 || button > 3) { return 0; } return (n.buttons >> (button - 1)) & 1; }
+fn mouse_x(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_x; }
+fn mouse_y(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_y; }
+fn mouse_dx(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } let is i64 as d = n.mouse_dx; n.mouse_dx = 0; return d; }
+fn mouse_dy(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } let is i64 as d = n.mouse_dy; n.mouse_dy = 0; return d; }
+fn wheel(w as *Window) as i64 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    let is i64 as value = n.wheel_y; n.wheel_y = 0; return value;
+}
+
+fn text_input_enable(w as *Window, on as i32) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } n.text_enabled = cast(i32, on != 0); return 1; }
+fn text_input_active(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.text_enabled == 1 && n.focused == 1); }
+fn text_input_rect(w as *Window, x as i64, y as i64, width as i64, height as i64) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    n.caret_x = x; n.caret_y = y; n.caret_w = width; n.caret_h = height;
+    if (n.focused == 1) { _position_ime(n); } return 1;
+}
+
+fn set_modal(w as *Window, on as i32) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.owner == 0) { return 0; }
+    n.modal = cast(i32, on != 0); if (u.IsWindow(n.owner) == 1) { u.EnableWindow(n.owner, cast(i32, n.modal == 0)); } return 1;
+}
+fn activate(w as *Window) as void { if (is_open(w) == 1) { u.SetForegroundWindow(w.hwnd); u.SetFocus(w.hwnd); } }
+fn set_decorated(w as *Window, on as i32) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    let is i64 as style = u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE));
+    let is i64 as next with mut = style;
+    if (on == 0) { next = next & (0 - 12582913); }
+    else { next = next | t.WS_CAPTION | t.WS_SYSMENU; }
+    u.SetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE), next);
+    u.SetWindowPos(w.hwnd, 0, 0, 0, 0, 0, cast(u32, t.SWP_NOMOVE | t.SWP_NOSIZE | t.SWP_NOZORDER | t.SWP_FRAMECHANGED));
+    n.decorated = cast(i32, on != 0); return 1;
+}
+fn decorated(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.decorated; }
+fn set_maximized(w as *Window, on as i32) as i32 { if (is_open(w) == 0) { return 0; } if (on != 0) { u.ShowWindow(w.hwnd, cast(i32, t.SW_MAXIMIZE)); } else { u.ShowWindow(w.hwnd, cast(i32, t.SW_RESTORE)); } return 1; }
+fn set_fullscreen(w as *Window, on as i32) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0) { return 0; }
+    let is i32 as full = cast(i32, (n.state & event.STATE_FULLSCREEN) != 0);
+    if (full == cast(i32, on != 0)) { return 1; }
+    if (on != 0) {
+        let is t.MONITORINFO as monitor;
+        mem.memzero(cast(*u8, &monitor), sizeof(t.MONITORINFO));
+        monitor.cbSize = cast(u32, sizeof(t.MONITORINFO));
+        if (u.GetMonitorInfoW(u.MonitorFromWindow(w.hwnd, 2), &monitor) == 0 ||
+            u.GetWindowRect(w.hwnd, &n.restore_rect) == 0) { return 0; }
+        n.restore_style = u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE));
+        u.SetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE), n.restore_style & (0 - 13565953));
+        u.SetWindowPos(w.hwnd, 0, monitor.rcMonitor.left, monitor.rcMonitor.top,
+                       monitor.rcMonitor.right - monitor.rcMonitor.left,
+                       monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                       cast(u32, t.SWP_NOZORDER | t.SWP_FRAMECHANGED));
+        n.state = n.state | event.STATE_FULLSCREEN;
+    } else {
+        u.SetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE), n.restore_style);
+        u.SetWindowPos(w.hwnd, 0, n.restore_rect.left, n.restore_rect.top,
+                       n.restore_rect.right - n.restore_rect.left, n.restore_rect.bottom - n.restore_rect.top,
+                       cast(u32, t.SWP_NOZORDER | t.SWP_FRAMECHANGED));
+        n.state = n.state & cast(i32, 0 - 3);
+    }
+    _emit(n, event.STATE, 0, 0, 0, n.state);
+    return 1;
+}
+fn minimize(w as *Window) as i32 { if (is_open(w) == 0) { return 0; } u.ShowWindow(w.hwnd, cast(i32, t.SW_MINIMIZE)); return 1; }
+fn composited(w as *Window) as i32 {
+    let is i32 as enabled with mut = 0;
+    if (is_open(w) == 0 || dwm.DwmIsCompositionEnabled(&enabled) != 0) { return 0; }
+    return cast(i32, enabled != 0);
+}
+fn transparent(w as *Window) as i32 { return 0; }
+
+fn set_cursor(w as *Window, shape as i32) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || shape < 1 || shape > 35) { return 0; }
+    let is i64 as id with mut = 32512;
+    if (shape == 3) { id = 32651; }
+    else if (shape == 4 || shape == 16 || shape == 17) { id = 32649; }
+    else if (shape == 5) { id = 32650; }
+    else if (shape == 6) { id = 32514; }
+    else if (shape == 7 || shape == 8) { id = 32515; }
+    else if (shape == 9 || shape == 10) { id = 32513; }
+    else if (shape == 13 || shape == 32) { id = 32646; }
+    else if (shape == 14 || shape == 15) { id = 32648; }
+    else if (shape == 18 || shape == 25 || shape == 26 || shape == 30) { id = 32644; }
+    else if (shape == 19 || shape == 22 || shape == 27 || shape == 31) { id = 32645; }
+    else if (shape == 20 || shape == 24 || shape == 28) { id = 32643; }
+    else if (shape == 21 || shape == 23 || shape == 29) { id = 32642; }
+    let is i64 as cursor with mut = 0;
+    if (shape != 35) { cursor = u.LoadCursorW(0, cast(*u16, id)); if (cursor == 0) { return 0; } }
+    n.cursor = cursor;
+    if (n.entered == 1) { u.SetCursor(cursor); }
+    return 1;
+}
+
+fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || n.fixed == 1 || width < 0 || height < 0) { return 0; }
+    n.min_width = width; n.min_height = height; return 1;
+}
+fn min_size(w as *Window, width as *i64, height as *i64) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    *width = n.min_width; *height = n.min_height; return 1;
+}
+fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || n.fixed == 1 || width < 0 || height < 0) { return 0; }
+    n.max_width = width; n.max_height = height; return 1;
+}
+
+fn position(w as *Window, x as *i64, y as *i64) as i32 {
+    if (is_open(w) == 0) { return 0; }
+    let is t.POINT as p; p.x = 0; p.y = 0;
+    if (u.ClientToScreen(w.hwnd, &p) == 0) { return 0; }
+    *x = p.x; *y = p.y; return 1;
+}
+
+fn clipboard_set(w as *Window, which as i32, text as *u8, length as i64) as i32 {
+    if (is_open(w) == 0 || which != 0) { return 0; }
+    return clipboard.set(w.hwnd, text, length);
+}
+fn clipboard_request(w as *Window, which as i32) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || which != 0) { return 0; }
+    return clipboard.request(&n.clip, w.hwnd);
+}
+fn clipboard_ready(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.clip.ready;
+}
+fn clipboard_text(w as *Window, out as *u8, cap as i64) as i64 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return clipboard.read(&n.clip, out, cap);
+}
+
+fn read_settings(w as *Window, out as *desktop_settings.settings.Settings) as i32 {
+    *out = desktop_settings.read();
+    return 1;
+}

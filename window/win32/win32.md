@@ -79,17 +79,17 @@ pacing of its own, like X11.
 so the same arrangement as everywhere else: the backend owns the buffer, hands it
 out per frame, and `StretchDIBits` or `BitBlt` carries it to the window.
 
-Channel order is `0xAARRGGBB` on little-endian, which is what
-`math/color.pack_argb8` already produces — so unlike X11 there is no swizzle in
-the copy.
+The top-down DIB uses `BI_BITFIELDS` with RGBA byte masks matching the
+software target. `BitBlt` presents that memory without a channel-swapping
+copy. The native smoke checks the presented RGB values with GDI `GetPixel`.
 
 ---
 
 ## Native handles
 
 ```cst
-window.win32.hwnd(&w)        // HWND       -> VK_KHR_win32_surface, WGL
-window.win32.hinstance(&w)   // HINSTANCE
+use "window/win32/backend.cst" as win32;
+win32.hwnd(&w)        // HWND
 ```
 
 ---
@@ -118,8 +118,46 @@ generator exists, since 1600 exports is not something to type.
 
 ## Current state
 
-Not built yet: this note is the design. The libraries the backend stands on
-build for Windows and run under wine (`test-win32`); the window itself, the
-WndProc callback and the Windows sides of the toolkit (UI Automation, the
-tray, the desktop's settings, the known folders) come after the toolkit is
-done on X11.
+The SDK boundary is generated in `bind/` by `tools/generate.py` (clang Python
+bindings, mingw headers), selected by `tools/sdk.json`. Regenerate with
+`python3 window/win32/tools/generate.py`. It covers the window, GDI, IMM32,
+shell, OLE, UI Automation and registry APIs, records, constants, GUIDs and
+inherited COM vtable slots. `tools/layout.c` independently checks the exposed
+layouts with mingw-gcc; `layout_test.cst` checks Caustic's same sizes and offsets.
+
+Caustic functions retain their SysV convention in a PE. `abi.cst` bridges
+indirect native calls and callbacks, including stack arguments and doubles;
+callbacks preserve the full Win64 nonvolatile XMM registers. Callback sets are
+writable during construction and read/execute only after `seal`; they must
+outlive every foreign reference. `caustic-mk run test-win32-native` runs the
+independent C layout and ABI oracles, a real window procedure, the native
+backend and the shell's real file-dialog COM object. These checks passed under
+Wine, not on a real Windows installation. The group owns one private Wine
+prefix and X server; it cannot reuse another test's stale native desktop.
+
+`backend.cst` opens native windows with DPI-aware client geometry, a reentrant
+procedure, a nonblocking message pump and directly writable software frames.
+It handles close requests, resize, key state, UTF-16 character input, IMM32
+composition messages, pointer capture, accumulated wheel notches, modal owners,
+fullscreen restore, size constraints and native cursors. Unicode clipboard
+ownership and reads use `CF_UNICODETEXT`. `settings.cst` reads the desktop's
+locale, font, DPI, timings, high contrast, animation preference and available
+registry/DWM preferences.
+
+`backend_test.cst` exercises actual windows under Wine/Xvfb: presented pixels,
+Unicode surrogate pairs, control-character filtering, queue overflow ordering,
+pointer capture, partial wheel notches, modal ownership, clipboard transfer,
+resize, fullscreen restore and a close request that can be declined. Desktop
+preference reads were also exercised in a native smoke. Real Windows, monitor
+transitions and interaction with an installed IME remain unverified.
+
+The portable `device.cst` and toolkit Windows integration are blocked by the
+Caustic linker: a program with an 8192-byte local array, using only `std/io`
+and `std/mem`, fails with `undefined symbol: __caustic_chkstk`. The same blocker
+also stops the existing `win_image` target before the later `test-win32`
+checks. Adding this backend to the portable dispatcher additionally leaked
+Windows DLL dependencies into Linux ELF examples despite OS guards; that
+experimental dispatcher integration was removed, rather than shipping
+unloadable Linux executables. The native backend is usable directly;
+`device.available(WIN32)` remains false. OLE DnD, toolkit UIA, platform choosers,
+complete CSD and modal-loop toolkit rendering are not implemented here.

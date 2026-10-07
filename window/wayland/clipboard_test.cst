@@ -1,0 +1,288 @@
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../sys/linux.cst" as sys;
+use "../event.cst" as event;
+use "backend.cst" as wayland;
+
+let is i32 as failures with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("  FAIL: %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+fn put(p as *u8, offset as i64, value as u32) as void {
+    *cast(*u32, cast(i64, p) + offset) = value;
+}
+
+fn text_size(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+fn main() as i32 {
+    let is [2]i32 as pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &pair[0]) < 0) {
+        io.printf("FAIL: clipboard socketpair\n");
+        return 1;
+    }
+    let is wayland.Window as owner;
+    wayland._zero(&owner);
+    owner.fd = pair[0]; owner.opened = 1;
+    owner.data_manager = 10; owner.data_device = 11; owner.input_serial = 91;
+    owner.input_serial = 0;
+    check("clipboard ownership requires a recent input serial",
+          wayland.clipboard_set(&owner, 0, "rejected", 8) == 0);
+    owner.input_serial = 91;
+    check("set clipboard source advertises text with an input serial",
+          wayland.clipboard_set(&owner, 0, "sample", 6) == 1 && owner.clip_source != 0);
+    let is i32 as source = owner.clip_source;
+    check("requesting the owned selection returns its exact bytes",
+          wayland.clipboard_request(&owner, 0) == 1 && wayland.clipboard_ready(&owner) == 1);
+    let is [16]u8 as text;
+    check("owned text is NUL-terminated and reports byte length",
+          wayland.clipboard_text(&owner, &text[0], 16) == 6 && mem.memcmp(&text[0], "sample", 6) == 0 && text[6] == 0);
+
+    let is [2]i32 as sent_pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &sent_pair[0]) < 0) {
+        io.printf("FAIL: data source send socketpair\n");
+        return 1;
+    }
+    owner.recv_fds[0] = sent_pair[0]; owner.recv_fd_count = 1;
+    wayland._source_event(&owner, source, 1, 0);
+    linux.close(sent_pair[0]);
+    let is [16]u8 as served;
+    let is i64 as served_len = linux.read(sent_pair[1], &served[0], 16);
+    check("data source sends the retained selection bytes", served_len == 6 && mem.memcmp(&served[0], "sample", 6) == 0);
+    linux.close(sent_pair[1]);
+
+    linux.close(owner.fd); linux.close(pair[1]);
+
+    let is [2]i32 as request_pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &request_pair[0]) < 0) {
+        io.printf("FAIL: clipboard request socketpair\n");
+        return 1;
+    }
+    let is wayland.Window as receiver;
+    wayland._zero(&receiver);
+    receiver.fd = request_pair[0]; receiver.opened = 1;
+    receiver.data_device = 12; receiver.clipboard_offer = 42;
+    receiver.offers[0].object = 42; receiver.offers[0].text_mime = 2;
+    check("external clipboard request starts a pending transfer",
+          wayland.clipboard_request(&receiver, 0) == 1 && wayland.clipboard_pending(&receiver) == 1);
+
+    let is [256]u8 as wire;
+    let is [16]i32 as received_fds;
+    let is i64 as fd_count with mut = 0;
+    let is i64 as wire_len = sys.recv_fds(request_pair[1], &wire[0], 256,
+                                          &received_fds[0], &fd_count, 1);
+    check("clipboard offer request passes its transfer descriptor", wire_len >= 8 && fd_count == 1);
+    if (fd_count == 1) {
+        let is i64 as written = linux.write(received_fds[0], "remote", 6);
+        linux.close(received_fds[0]);
+        check("compositor writes a complete text payload", written == 6);
+        check("EOF completes the asynchronous clipboard request",
+              wayland.clipboard_ready(&receiver) == 1 && wayland.clipboard_pending(&receiver) == 0);
+        check("received text matches the external selection",
+              wayland.clipboard_text(&receiver, &text[0], 16) == 6 && mem.memcmp(&text[0], "remote", 6) == 0 && text[6] == 0);
+    }
+    if (receiver.transfer_fd >= 0) { linux.close(receiver.transfer_fd); }
+    if (cast(i64, receiver.received_text) != 0) { mem.core.munmap(receiver.received_text, 1048577); }
+    linux.close(receiver.fd); linux.close(request_pair[1]);
+    let is [2]i32 as drag_pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &drag_pair[0]) < 0) {
+        io.printf("FAIL: drop socketpair\n");
+        return 1;
+    }
+    let is wayland.Window as drag;
+    wayland._zero(&drag);
+    drag.fd = drag_pair[0]; drag.opened = 1; drag.mapped = 1; drag.data_device = 13; drag.surface = 77;
+    drag.offers[0].object = 44; drag.offers[0].files = 1;
+    wayland._wire_size = 28;
+    put(&wayland._wire[0], 4, cast(u32, (28 << 16) | 1));
+    put(&wayland._wire[0], 8, 15); put(&wayland._wire[0], 12, 77);
+    put(&wayland._wire[0], 16, 512); put(&wayland._wire[0], 20, 768);
+    put(&wayland._wire[0], 24, 44);
+    wayland._dispatch(&drag, 13);
+    let is event.Event as e;
+    check("drag enter reports offered file data and scaled position",
+          wayland.poll_event(&drag, &e) == 1 && e.kind == event.DND_ENTER &&
+          e.drop == event.DROP_FILES && e.x == 2 && e.y == 3);
+    check("target accepts the files offered by the source",
+          wayland.drop_answer(&drag, event.DROP_FILES) == 1);
+    wayland._wire_size = 8;
+    put(&wayland._wire[0], 4, cast(u32, (8 << 16) | 4));
+    wayland._dispatch(&drag, 13);
+    let is [256]u8 as drop_wire;
+    let is [16]i32 as drop_fds;
+    let is i64 as drop_fd_count with mut = 0;
+    let is i64 as drop_fd with mut = 0 - 1;
+    let is i32 as reads with mut = 0;
+    while (drop_fd < 0 && reads < 8) {
+        let is i64 as n = sys.recv_fds(drag_pair[1], &drop_wire[0], 256,
+                                       &drop_fds[0], &drop_fd_count, 1);
+        if (drop_fd_count > 0) { drop_fd = drop_fds[0]; }
+        if (n <= 0) { break; }
+        reads = reads + 1;
+    }
+    check("file drop asks the source to send through its descriptor", drop_fd >= 0);
+    if (drop_fd >= 0) {
+        let is *u8 as uris = "file:///tmp/a%20b.txt\r\n# ignored\r\nfile:///var/x\r\n";
+        let is i64 as uri_len = text_size(uris);
+        let is i64 as wrote = linux.write(drop_fd, uris, uri_len);
+        linux.close(drop_fd);
+        check("source transfers the complete URI list", wrote == uri_len);
+        check("event loop wakes on file data and completes the drop", wayland.next_frame(&drag) == 1);
+        check("completed transfer queues a file drop with decoded paths",
+              wayland.poll_event(&drag, &e) == 1 && e.kind == event.DND_DROP &&
+              e.drop == event.DROP_FILES && wayland.dropped_files(&drag) == 2);
+        let is *u8 as first = wayland.dropped_file(&drag, 0);
+        let is *u8 as second = wayland.dropped_file(&drag, 1);
+        check("URI percent escapes and file path boundaries are decoded",
+              cast(i64, first) != 0 && cast(i64, second) != 0 &&
+              mem.memcmp(first, "/tmp/a b.txt", 12) == 0 && first[12] == 0 &&
+              mem.memcmp(second, "/var/x", 6) == 0 && second[6] == 0 &&
+              cast(i64, wayland.dropped_file(&drag, 2)) == 0);
+        wayland.clear_drop(&drag);
+        check("clear_drop invalidates the prior file list", wayland.dropped_files(&drag) == 0);
+        drag.offers[1].object = 45; drag.offers[1].text_mime = 2;
+        wayland._wire_size = 28;
+        put(&wayland._wire[0], 4, cast(u32, (28 << 16) | 1));
+        put(&wayland._wire[0], 8, 16); put(&wayland._wire[0], 12, 77);
+        put(&wayland._wire[0], 16, 256); put(&wayland._wire[0], 20, 512);
+        put(&wayland._wire[0], 24, 45);
+        wayland._dispatch(&drag, 13);
+        check("text drag enter reports the offered text type",
+              wayland.poll_event(&drag, &e) == 1 && e.kind == event.DND_ENTER &&
+              e.drop == event.DROP_TEXT && e.x == 1 && e.y == 2);
+        check("target can select text rather than files", wayland.drop_answer(&drag, event.DROP_TEXT) == 1);
+        wayland._wire_size = 8;
+        put(&wayland._wire[0], 4, cast(u32, (8 << 16) | 4));
+        wayland._dispatch(&drag, 13);
+        drop_fd = 0 - 1; drop_fd_count = 0; reads = 0;
+        while (drop_fd < 0 && reads < 8) {
+            let is i64 as n = sys.recv_fds(drag_pair[1], &drop_wire[0], 256,
+                                           &drop_fds[0], &drop_fd_count, 1);
+            if (drop_fd_count > 0) { drop_fd = drop_fds[0]; }
+            if (n <= 0) { break; }
+            reads = reads + 1;
+        }
+        check("text drop requests the offered UTF-8 representation", drop_fd >= 0);
+        if (drop_fd >= 0) {
+            let is *u8 as utf8 = "olá";
+            let is i64 as utf8_len = text_size(utf8);
+            let is i64 as wrote = linux.write(drop_fd, utf8, utf8_len);
+            linux.close(drop_fd);
+            check("pending reports readable text-transfer data", wayland.pending(&drag) == 1);
+            wayland.pump(&drag);
+            check("text drop is exposed as the transferred UTF-8 bytes",
+                  wrote == 4 && wayland.poll_event(&drag, &e) == 1 &&
+                  e.kind == event.DND_DROP && e.drop == event.DROP_TEXT &&
+                  wayland.dropped_text_length(&drag) == 4 &&
+                  mem.memcmp(wayland.dropped_text(&drag), utf8, 4) == 0);
+            wayland.clear_drop(&drag);
+        }
+    }
+    let is [2]i32 as ime_pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &ime_pair[0]) < 0) {
+        io.printf("FAIL: text-input socketpair\n");
+        return 1;
+    }
+    let is wayland.Window as ime;
+    wayland._zero(&ime);
+    ime.fd = ime_pair[0]; ime.opened = 1; ime.text_input = 55; ime.surface = 77;
+    ime.scale120 = 150;
+    check("text input enables through text-input-v3", wayland.text_input_enable(&ime, 1) == 1);
+    let is [32]u8 as enable_wire;
+    check("enable sends content type, enable and commit",
+          linux.read(ime_pair[1], &enable_wire[0], 32) == 32 &&
+          *cast(*u32, &enable_wire[0]) == 55 &&
+          *cast(*u32, cast(i64, &enable_wire[0]) + 4) == cast(u32, (16 << 16) | 5) &&
+          *cast(*u32, cast(i64, &enable_wire[0]) + 16 + 4) == cast(u32, (8 << 16) | 1) &&
+          *cast(*u32, cast(i64, &enable_wire[0]) + 24 + 4) == cast(u32, (8 << 16) | 7));
+    check("candidate rectangle is converted from device pixels to surface units",
+          wayland.text_input_rect(&ime, 10, 20, 30, 40) == 1);
+    let is [32]u8 as rect_wire;
+    check("cursor rectangle and commit are sent together",
+          linux.read(ime_pair[1], &rect_wire[0], 32) == 32 &&
+          *cast(*u32, cast(i64, &rect_wire[0]) + 4) == cast(u32, (24 << 16) | 6) &&
+          *cast(*u32, cast(i64, &rect_wire[0]) + 8) == 8 &&
+          *cast(*u32, cast(i64, &rect_wire[0]) + 12) == 16 &&
+          *cast(*u32, cast(i64, &rect_wire[0]) + 16) == 24 &&
+          *cast(*u32, cast(i64, &rect_wire[0]) + 20) == 32);
+    wayland._wire_size = 12;
+    put(&wayland._wire[0], 8, 77);
+    wayland._text_input_event(&ime, 0, &wayland._wire[8]);
+    check("surface enter activates text input", wayland.text_input_active(&ime) == 1);
+    wayland._wire_size = 16;
+    put(&wayland._wire[0], 8, 1); put(&wayland._wire[0], 12, 1);
+    wayland._text_input_event(&ime, 4, &wayland._wire[8]);
+    wayland._wire_size = 16;
+    put(&wayland._wire[0], 8, 4);
+    mem.memcpy(&wayland._wire[12], "漢", 3);
+    wayland._wire[15] = 0;
+    wayland._text_input_event(&ime, 3, &wayland._wire[8]);
+    wayland._wire_size = 28;
+    put(&wayland._wire[0], 8, 7);
+    mem.memcpy(&wayland._wire[12], "かな", 6);
+    wayland._wire[18] = 0; wayland._wire[19] = 0;
+    put(&wayland._wire[0], 20, 3); put(&wayland._wire[0], 24, 6);
+    wayland._text_input_event(&ime, 2, &wayland._wire[8]);
+    wayland._wire_size = 12;
+    put(&wayland._wire[0], 8, 1);
+    wayland._text_input_event(&ime, 5, &wayland._wire[8]);
+    check("done delivers delete-before, committed UTF-8, then inline preedit",
+          wayland.poll_event(&ime, &e) == 1 && e.kind == event.DELETE_SURROUNDING &&
+          e.delete_before == 1 && e.delete_after == 1 &&
+          wayland.poll_event(&ime, &e) == 1 && e.kind == event.TEXT && e.text_len == 3 &&
+          mem.memcmp(e.text, "漢", 3) == 0 &&
+          wayland.poll_event(&ime, &e) == 1 && e.kind == event.PREEDIT &&
+          e.text_len == 6 && e.cursor == 3 && mem.memcmp(e.text, "かな", 6) == 0);
+    wayland._wire_size = 12;
+    put(&wayland._wire[0], 8, 77);
+    wayland._text_input_event(&ime, 1, &wayland._wire[8]);
+    check("surface leave ends text focus and clears composition",
+          wayland.text_input_active(&ime) == 0 && wayland.poll_event(&ime, &e) == 1 &&
+          e.kind == event.PREEDIT && e.text_len == 0);
+    check("text input disables and commits", wayland.text_input_enable(&ime, 0) == 1);
+    let is [16]u8 as disable_wire;
+    check("disable sends disable and commit",
+          linux.read(ime_pair[1], &disable_wire[0], 16) == 16 &&
+          *cast(*u32, cast(i64, &disable_wire[0]) + 4) == cast(u32, (8 << 16) | 2) &&
+          *cast(*u32, cast(i64, &disable_wire[0]) + 12) == cast(u32, (8 << 16) | 7));
+    linux.close(ime_pair[0]); linux.close(ime_pair[1]);
+
+    let is [2]i32 as large_pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &large_pair[0]) < 0) {
+        io.printf("FAIL: UTF-8 truncation socketpair\n");
+        return 1;
+    }
+    let is wayland.Window as large;
+    wayland._zero(&large);
+    large.drop_storage = mem.core.mmap_anon(131073);
+    large.drop_pending = 1; large.drop_kind = event.DROP_TEXT;
+    large.transfer_fd = large_pair[0]; large.transfer_purpose = 2;
+    linux.fcntl(large.transfer_fd, 4, 2048);
+    let is [65538]u8 as long_text;
+    let is i64 as i with mut = 0;
+    while (i < 65535) { long_text[i] = 97; i = i + 1; }
+    long_text[65535] = 195; long_text[65536] = 169; long_text[65537] = 0;
+    let is i64 as long_written = linux.write(large_pair[1], &long_text[0], 65537);
+    linux.close(large_pair[1]);
+    if (sys.wait_readable(large.transfer_fd, 0) > 0) { wayland._read_transfer(&large); }
+    let is *u8 as shortened = wayland.dropped_text(&large);
+    check("oversized UTF-8 drops stop before a split code point",
+          long_written == 65537 && wayland.dropped_text_length(&large) == 65535 &&
+          cast(i64, shortened) != 0 && shortened[65534] == 97 && shortened[65535] == 0);
+    if (large.transfer_fd >= 0) { linux.close(large.transfer_fd); }
+    if (cast(i64, large.drop_storage) != 0) { mem.core.munmap(large.drop_storage, 131073); }
+    if (drag.transfer_fd >= 0) { linux.close(drag.transfer_fd); }
+    if (cast(i64, drag.drop_storage) != 0) { mem.core.munmap(drag.drop_storage, 131073); }
+    linux.close(drag.fd); linux.close(drag_pair[1]);
+    if (failures != 0) { return 1; }
+    io.printf("wayland clipboard and DnD: all checks passed\n");
+    return 0;
+}

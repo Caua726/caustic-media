@@ -69,7 +69,7 @@ native handles it is built from.
 | Backend | Platform | Transport |
 |---------|----------|-----------|
 | `x11` | Linux, BSD — and **Wayland sessions through XWayland** | libX11 today, X11 wire protocol later |
-| `wayland` | Linux, native | libwayland-client today, wire protocol later |
+| `wayland` | Linux, native | direct socket protocol; xkbcommon for keyboard translation |
 | `kms` | Linux with no compositor: console, embedded, CausticOS | DRM ioctls — no library at all |
 | `win32` | Windows | user32 + gdi32 |
 
@@ -78,7 +78,9 @@ protocol, same library, same code path. A Wayland session running XWayland is
 served by `x11` with nothing extra.
 
 `AUTO` selects on Linux in this order: `WAYLAND_DISPLAY` set → `wayland`;
-otherwise `DISPLAY` set → `x11`; otherwise → `kms`.
+otherwise → `x11`. KMS is not implemented. Win32 currently has a direct native
+backend, not a portable dispatcher integration; see its compiler blockers in
+[`win32/win32.md`](win32/win32.md#current-state).
 
 **The program can always name one instead.** `window.open_with(WAYLAND, ...)`
 opens a Wayland window in a session where `AUTO` would have chosen X11, and
