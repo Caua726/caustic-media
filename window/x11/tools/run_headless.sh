@@ -20,9 +20,19 @@
 # between the lock file appearing and the socket accepting connections, and in
 # CI it would read as a flaky window layer rather than as a flaky harness.
 #
-# So the server is started explicitly and polled until it actually answers.
-# xdpyinfo connecting is the readiness signal, because it is the same thing the
-# program under test is about to do.
+# So the server is started explicitly and the program run only once the
+# server says it accepts connections: with -displayfd it writes its display
+# number back when it does.
+#
+# --- Why the server picks the display ---
+#
+# This used to pick a number whose lock file was missing and start Xvfb on it.
+# Two runs at once — the mutation runner starts several — saw the same number
+# free: the second server died on the first one's lock, or both programs ended
+# up on one server, where a test playing the window manager is refused the
+# root's SubstructureRedirect and exits on the X error. Either read as a
+# failing test. -displayfd has the server take the first free display itself,
+# atomically, as it creates the lock.
 set -eu
 
 [ $# -ge 1 ] || { echo "uso: run_headless.sh <programa> [args...]" >&2; exit 2; }
@@ -30,34 +40,25 @@ set -eu
 command -v Xvfb >/dev/null 2>&1 || {
     echo "run_headless: Xvfb nao encontrado (apt: xvfb)" >&2; exit 127
 }
-command -v xdpyinfo >/dev/null 2>&1 || {
-    echo "run_headless: xdpyinfo nao encontrado (apt: x11-utils)" >&2; exit 127
-}
-
-# A display number nobody is using. The lock file is what X itself checks, so
-# checking it too is the same question the server would ask.
-num=99
-while [ "$num" -lt 200 ]; do
-    [ -e "/tmp/.X${num}-lock" ] || [ -e "/tmp/.X11-unix/X${num}" ] || break
-    num=$((num + 1))
-done
-[ "$num" -lt 200 ] || { echo "run_headless: nenhum display livre" >&2; exit 1; }
-
-Xvfb ":$num" -screen 0 1280x1024x24 -nolisten tcp >/dev/null 2>&1 &
+numfile=$(mktemp "${TMPDIR:-/tmp}/run_headless.XXXXXX")
+Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp 3>"$numfile" >/dev/null 2>&1 &
 xvfb_pid=$!
+num=""
 
 cleanup() {
     kill "$xvfb_pid" 2>/dev/null || true
     wait "$xvfb_pid" 2>/dev/null || true
-    rm -f "/tmp/.X${num}-lock" 2>/dev/null || true
+    [ -z "$num" ] || rm -f "/tmp/.X${num}-lock" 2>/dev/null || true
+    rm -f "$numfile"
 }
 trap cleanup EXIT INT TERM
 
-# Poll until it answers, rather than sleeping a guess. 100 tries at 50 ms is
-# five seconds, which is far more than Xvfb has ever needed and still bounded.
+# Wait for the number, a whole line of it, rather than sleeping a guess. 100
+# tries at 50 ms is five seconds, far more than Xvfb has ever needed and still
+# bounded.
 i=0
 while [ "$i" -lt 100 ]; do
-    if DISPLAY=":$num" xdpyinfo >/dev/null 2>&1; then break; fi
+    if [ "$(wc -l < "$numfile")" -ge 1 ]; then break; fi
     if ! kill -0 "$xvfb_pid" 2>/dev/null; then
         echo "run_headless: Xvfb morreu antes de aceitar conexoes" >&2
         exit 1
@@ -66,5 +67,6 @@ while [ "$i" -lt 100 ]; do
     i=$((i + 1))
 done
 [ "$i" -lt 100 ] || { echo "run_headless: Xvfb nao respondeu em 5s" >&2; exit 1; }
+num=$(head -n 1 "$numfile")
 
 DISPLAY=":$num" "$@"
