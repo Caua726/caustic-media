@@ -5,6 +5,11 @@ use "window.cst" as window;
 use "native.cst" as native;
 use "../gpu/software/target.cst" as tgt;
 use "x11/x11.cst" as x11;
+use "x11/bind/x.cst" as x;
+use "x11/bind/xlib.cst" as xlib;
+use "x11/bind/xevent.cst" as xev;
+use "std/time.cst" as time;
+use "event.cst" as event;
 
 fn test_static() as i32 {
     if (window.AUTO != cast(i32, 0 - 1)) { return 1; }
@@ -100,6 +105,114 @@ fn test_dialog() as i32 {
     return 0;
 }
 
+// Something dragged over the window from another program: heard as events,
+// answered, its text read — the X11 conversation itself is dnd_test's.
+let is xev.XEvent as _msg;
+let is xev.XEvent as _in;
+
+fn tell(d as *u8, to as i64, t as i64, from as i64, d1 as i64, d2 as i64, d3 as i64) as void {
+    xev.clear(&_msg);
+    let is *xev.XClientMessageEvent as c = xev.client(&_msg);
+    c.kind = x.ClientMessage;
+    c.send_event = 1;
+    c.window = to;
+    c.message_type = t;
+    c.format = 32;
+    c.data[0] = from;
+    c.data[1] = d1;
+    c.data[2] = d2;
+    c.data[3] = d3;
+    c.data[4] = 0;
+    xlib.XSendEvent(d, to, 0, 0, cast(*u8, &_msg));
+    xlib.XFlush(d);
+}
+
+let is [8]event.Event as heard;
+let is i64 as nheard with mut = 0;
+
+// Both sides pumped for ms; the source answers a request for the selection
+// with text.
+fn both(w as *window.device.Window, sd as *u8, ms as i64) as void {
+    let is i64 as deadline = time.now_ns() + ms * 1000000;
+    while (time.now_ns() < deadline) {
+        window.next_frame(w);
+        let is event.Event as e;
+        while (window.poll_event(w, &e) == 1) {
+            if (e.kind >= event.DND_ENTER && e.kind <= event.DND_DROP && nheard < 8) {
+                heard[nheard] = e;
+                nheard = nheard + 1;
+            }
+        }
+        while (xlib.XPending(sd) > 0) {
+            xlib.XNextEvent(sd, cast(*u8, &_in));
+            if (xev.kind(&_in) == x.SelectionRequest) {
+                let is *xev.XSelectionRequestEvent as r = xev.selection_request(&_in);
+                if (r.target == xlib.XInternAtom(sd, "text/uri-list", 0)) {
+                    xlib.XChangeProperty(sd, r.requestor, r.property, r.target, 8, x.PropModeReplace, "file:///tmp/f\r\n", 15);
+                } else {
+                    xlib.XChangeProperty(sd, r.requestor, r.property, r.target, 8, x.PropModeReplace, "dropped", 7);
+                }
+                xev.clear(&_msg);
+                let is *xev.XSelectionEvent as sn = xev.selection(&_msg);
+                sn.kind = x.SelectionNotify;
+                sn.requestor = r.requestor;
+                sn.selection = r.selection;
+                sn.target = r.target;
+                sn.property = r.property;
+                sn.time = r.time;
+                xlib.XSendEvent(sd, r.requestor, 0, 0, cast(*u8, &_msg));
+                xlib.XFlush(sd);
+            }
+        }
+        time.sleep_ms(2);
+    }
+}
+
+fn test_drop() as i32 {
+    let is window.device.Window as w = window.open("drop", 200, 150);
+    let is i64 as k with mut = 0;
+    while (k < 8) { window.next_frame(&w); k = k + 1; }
+    let is *u8 as sd = xlib.XOpenDisplay(cast(*u8, 0));
+    let is i64 as src = xlib.XCreateSimpleWindow(sd, xlib.XDefaultRootWindow(sd), 0, 0, 1, 1, 0, 0, 0);
+    xlib.XSetSelectionOwner(sd, xlib.XInternAtom(sd, "XdndSelection", 0), src, 0);
+    let is i64 as to = native.x11_xid(&w);
+    if (window.drop_answer(&w, window.DROP_TEXT) != 0) { return 1; }
+    tell(sd, to, xlib.XInternAtom(sd, "XdndEnter", 0), src, 5 << 24, xlib.XInternAtom(sd, "UTF8_STRING", 0), 0);
+    tell(sd, to, xlib.XInternAtom(sd, "XdndPosition", 0), src, 0, (12 << 16) | 34, 0);
+    both(&w, sd, 300);
+    if (nheard < 2 || heard[0].kind != event.DND_ENTER || heard[0].drop != window.DROP_TEXT) { return 2; }
+    if (heard[1].kind != event.DND_MOVE || heard[1].x != 12 || heard[1].y != 34) { return 3; }
+    if (window.drop_answer(&w, window.DROP_TEXT) != 1) { return 4; }
+    tell(sd, to, xlib.XInternAtom(sd, "XdndDrop", 0), src, 0, 0, 0);
+    both(&w, sd, 500);
+    if (nheard < 3 || heard[2].kind != event.DND_DROP || heard[2].drop != window.DROP_TEXT) { return 5; }
+    let is *u8 as got = window.dropped_text(&w);
+    if (window.dropped_text_length(&w) != 7 || cast(i64, got) == 0 || got[0] != 100 || got[6] != 100) { return 6; }
+    if (window.dropped_files(&w) != 0 || cast(i64, window.dropped_file(&w, 0)) != 0) { return 7; }
+    window.clear_drop(&w);
+    if (window.dropped_text_length(&w) != 0) { return 8; }
+    tell(sd, to, xlib.XInternAtom(sd, "XdndEnter", 0), src, 5 << 24, xlib.XInternAtom(sd, "UTF8_STRING", 0), 0);
+    tell(sd, to, xlib.XInternAtom(sd, "XdndLeave", 0), src, 0, 0, 0);
+    both(&w, sd, 300);
+    if (nheard < 5 || heard[4].kind != event.DND_LEAVE) { return 9; }
+    // Files.
+    tell(sd, to, xlib.XInternAtom(sd, "XdndEnter", 0), src, 5 << 24, xlib.XInternAtom(sd, "text/uri-list", 0), 0);
+    tell(sd, to, xlib.XInternAtom(sd, "XdndPosition", 0), src, 0, (12 << 16) | 34, 0);
+    both(&w, sd, 300);
+    tell(sd, to, xlib.XInternAtom(sd, "XdndDrop", 0), src, 0, 0, 0);
+    both(&w, sd, 500);
+    let is *u8 as f = window.dropped_file(&w, 0);
+    if (window.dropped_files(&w) != 1 || cast(i64, f) == 0 || f[0] != 47 || f[4] != 47 || f[5] != 102 || f[6] != 0) { return 11; }
+    xlib.XDestroyWindow(sd, src);
+    xlib.XCloseDisplay(sd);
+    window.close(&w);
+    if (window.drop_answer(&w, 0) != 0 || window.dropped_text_length(&w) != 0) { return 10; }
+    if (window.dropped_files(&w) != 0 || cast(i64, window.dropped_file(&w, 0)) != 0 ||
+        cast(i64, window.dropped_text(&w)) != 0) { return 12; }
+    window.clear_drop(&w);
+    return 0;
+}
+
 fn main() as i32 {
     let is i32 as stat = test_static();
     if (stat != 0) {
@@ -118,6 +231,12 @@ fn main() as i32 {
     if (dlg != 0) {
         io.printf("FAIL: dialog checks failed with code %d\n", dlg);
         return 3;
+    }
+
+    let is i32 as dropt = test_drop();
+    if (dropt != 0) {
+        io.printf("FAIL: drop checks failed with code %d\n", dropt);
+        return 4;
     }
 
     io.printf("portable window layer: all checks passed\n");
