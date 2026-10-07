@@ -27,9 +27,11 @@ opens it on a desktop where nothing is listening pays one D-Bus question.
 
 Every step is asynchronous: sent, and its reply handled when it comes, in
 `pump`, which the program's loop calls when one of the bridge's descriptors
-(`fds`) is readable — 6.17's loop watches them like any other — and after
-every round of its own events, so what changed is told. Nothing blocks the
-window.
+(`fds`) is readable and after every round of its own events, so what changed
+is told. Nothing blocks the window. In the toolkit's loop (`../host.cst`),
+`hosted.cst` does both: attached, the loop watches whichever connections the
+bridge has — the session bus, then the accessibility bus too — and pumps it
+every round.
 
 ## Objects
 
