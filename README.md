@@ -6,19 +6,16 @@
 ![status](https://img.shields.io/badge/status-4%20of%2010%20layers%20started-yellow)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **This repository is partly an implementation and mostly a design.** Four of
-> the ten layers have code: `math/` (complete and tested), `gpu/software/` (a
-> working software rasteriser, tested), `gpu/` (the portable device, tested) and
-> `window/x11/` (complete: 1163 bound functions, MIT-SHM, cursors, clipboard,
-> monitors, tested against a real server). The other six — input, render, 3d,
-> image, text, audio, ui — are **design notes with no code behind them**, and
-> several backends named below (Wayland, KMS, Win32, Vulkan, OpenGL, D3D, ALSA,
-> WASAPI) are not written either.
+> **Implementation status varies by layer and platform.** The software
+> renderer, image/text stack and retained toolkit have working code and tests;
+> the three toolkit examples are exercised on X11. Wayland has a native socket
+> backend and a Weston host smoke, but complete example acceptance is pending.
+> Win32 has generated SDK bindings, an ABI bridge and a directly usable native
+> window backend; the portable toolkit is blocked by the Caustic linker.
 >
-> The API examples further down describe the **designed** interface. They will
-> not compile today. The design is the point of the repository at this stage —
-> it is written down so the implementation has something to be measured against
-> — but nobody should mistake it for a library they can use.
+> The architecture examples below also include designed interfaces that are
+> not implemented. See **Status** and each module's **Current state** before
+> treating a platform or API as supported.
 
 ## Layers
 
@@ -30,7 +27,7 @@ window and drive the GPU itself.
 |---|---|---|
 | `math/` | vectors, matrices, quaternions, geometry, colour, curves — pure | **done**, 2,500 lines, two test suites |
 | `gpu/software/` | the software rasteriser | **done**, tested |
-| `window/` | window, display, platform | **X11 done** (`window/x11/`, 1163 functions bound, tested); wayland, kms, win32 designed |
+| `window/` | window, display, platform | X11 tested; native Wayland socket backend and direct Win32 backend; see each backend's current state for verification and blockers |
 | `gpu/` (device) | the portable device, in the shape of wgpu | in progress; vk, gl, d3d designed |
 | `input/` | keyboard, mouse, touch, pen, gamepad, haptics, sensors | design note only |
 | `render/` | the framework: meshes, sprites, materials, cameras, a frame | design note only |
@@ -221,7 +218,9 @@ windows, the desktop's settings, its own fonts and text, and accessibility.
 | `window/x11` | windows many to a connection, MIT-SHM presentation, events, keys and text, cursors, clipboard, drag and drop, monitors, XSETTINGS, dialogs, frames — libX11, Xext, Xrandr, Xi, Xcursor and Xfixes bound |
 | `dbus/` | the D-Bus wire protocol, connections, objects and calls, our own |
 | `ui/` | the toolkit: widgets, layout, events, painting, themes, animations, dialogs, choosers, menus, lists, trees, tables, drag and drop, AT-SPI, two languages, the application's loop, icons, the tray, notifications, one instance |
-| Wayland, Windows, Vulkan, `input/` | a design note each, and the work it describes |
+| `window/wayland` | direct socket backend, xkbcommon input, selections, DnD, text-input-v3; Weston backend/host smoke; three-example visual acceptance remains incomplete |
+| `window/win32` | generated SDK/COM declarations, Win64 ABI bridge and native software window backend exercised under Wine; portable toolkit integration blocked by `__caustic_chkstk` |
+| Vulkan, `input/` | a design note each, and the work it describes |
 
 Each layer's note says what it holds now under its "Current state".
 

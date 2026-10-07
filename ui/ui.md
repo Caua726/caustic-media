@@ -688,26 +688,27 @@ captured the press hears `POINTER_CANCEL`, and the release that follows is no
 click. The router says when one is due and the application's loop ticks it,
 since nothing arrives while a finger is still (`longpress_test`); the touch and
 pen events themselves come from `input/`, which says which the pointer is with
-`router.set_source`. The
-router is fed by plain calls — `pointer_move`, `pointer_button`, `key`, `text` —
-which is what `input/` will call; and `paste`, giving a widget the text it asked
-the clipboard for (`tree.request_paste`, answered by the program), and
-`preedit`, the input method's composition with its caret, to the focus. The
-widget text is typed into says where its caret is (`tree.set_text_area`), for
-the input method's candidates, and when it gives a composition up — the caret
-moved away from it — says so (`tree.reset_ime`, passed on by the program), so
-that what the input method commits next is not what was given up. FOCUS_IN
-says whether the focus came by keyboard. A press outside a modal scope goes
-nowhere, but the scope hears of it (`PRESS_OUTSIDE`), so a popup closes; the
-press is spent on that, and opens no context menu where it landed; the pointer
-moving outside it, over nothing it may reach, is told to it too
-(`MOVE_OUTSIDE`), for a menu bar's open menu to find the pointer on another
+`router.set_source`. The router is fed by plain calls — `pointer_move`,
+`pointer_button`, `key` and `text` — which `input/` calls, `paste`, giving a
+widget the text it asked the clipboard for (`tree.request_paste`, answered by
+the program), `preedit`, the input method's composition with its caret, and
+`delete_surrounding`, its byte counts around the caret, to the focused widget.
+The Wayland host feeds text-input-v3's `TEXT`, `PREEDIT` and
+`DELETE_SURROUNDING` events into these routes, and places the compositor's
+candidate UI at `tree.text_area_rect`. The widget says where its caret is
+(`tree.set_text_area`) and when it gives a composition up (`tree.reset_ime`),
+so the program can tell its input method that what it commits next is not what
+was given up. FOCUS_IN says whether the focus came by keyboard. A press outside
+a modal scope goes nowhere, but the scope hears of it (`PRESS_OUTSIDE`), so a
+popup closes; the press is spent on that, and opens no context menu where it
+landed; the pointer moving outside it, over nothing it may reach, is told to it
+too (`MOVE_OUTSIDE`), for a menu bar's open menu to find the pointer on another
 title. One subtree outside a scope may be let through it (`set_scope_also`):
 an entry keeps the focus, and its presses, while what it suggests is shown.
-When the popup ends, `restore` puts the scope back and gives the focus
-back in one step (`give_back`: the ring as it was, but no move by keyboard, so
-an entry does not select all of itself), nothing else focused on the way; a
-scope destroyed while set is none, so the window is never left shut.
+When the popup ends, `restore` puts the scope back and gives the focus back in
+one step (`give_back`: the ring as it was, but no move by keyboard, so an entry
+does not select all of itself), nothing else focused on the way; a scope
+destroyed while set is none, so the window is never left shut.
 
 The router keeps a text caret's blink (`blink_test`): on for two thirds of the
 desktop's cycle and off for the rest, as GTK draws it, started again by each
@@ -1476,11 +1477,14 @@ widget set applications actually use, done properly, not parity.
    backend.*
 8. **Words in the user's language**. *Done: `strings.cst` in English and
    Brazilian Portuguese, the locale from the environment, right-to-left
-   languages mirrored; Windows' `GetUserDefaultLocaleName` with its backend.*
+   languages mirrored. Windows locale is read by the native backend; its
+   toolkit integration remains blocked by the compiler.*
 9. **The application level**: the loop that puts the application's windows
    on the screen, the desktop's settings followed, icons, one instance,
-   notifications, the tray, links. *Done on X11 and Linux's desktops; the
-   Win32 and Wayland sides with their backends.*
+   notifications, the tray, links. *Done on X11 and Linux's desktops. The
+   Wayland host has a Weston surface/timer smoke and text-input-v3 routing;
+   the three normal example applications are not all visually verified.
+   The Windows toolkit integration is blocked; see `window/win32/win32.md`.*
 10. **Examples**: a settings form, a text editor, a file browser. *Done on
    X11.*
 11. **A frame of the program's own** moved, resized, maximized and told
