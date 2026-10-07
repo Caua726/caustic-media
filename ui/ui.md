@@ -1235,8 +1235,10 @@ of a flat model in a scroll area of their own, each as tall as the first,
 with widgets only for the rows in view and one past them; scrolled, each is
 given to the row that comes into view in its place — row i always in the
 same one while it is seen, so a scroll by a row binds one row again. A row
-shows its model's TEXT of column 0, or what the program's factory makes of
-it (`set_factory`: setup a new row widget, bind a row to one). Selection is
+shows its model's TEXT of column 0 after its ICON when it has one — one of
+the toolkit's icons (an integer) or a texture of the program's (a handle),
+`ICON_SIZE` square, at the row's start — or what the program's factory makes
+of it (`set_factory`: setup a new row widget, bind a row to one). Selection is
 of positions, none, one or many, kept as ranges — a million rows chosen is
 two numbers — that move with the rows inserted and removed. The keyboard's
 row moves with the arrows, Page Up and Down, Home and End, choosing it
@@ -1267,9 +1269,10 @@ expandable, expanded while open.
 model's rows in the order of a column — its SORT value, else its TEXT;
 numbers as numbers, text with ASCII letters' case aside; equal rows as they
 came — passing the model's changes on where the rows now stand. A table view
-is a list view of one cell per column under a header of the columns' titles:
-columns side by side, the last reaching the view's end, wider ones scrolled
-across with the header following. A column's edge in its header is dragged
+is a list view of one cell per column under a header of the columns' titles,
+each cell its column's TEXT after its ICON as a list's rows show them:
+columns side by side, one — the last, or the one `set_stretch` says — taking
+the room they leave, wider ones scrolled across with the header following. A column's edge in its header is dragged
 to resize it, never below `MIN_WIDTH`; a sortable column's header clicked
 asks the sort hook for the rows sorted by it, up and then down, and shows the
 arrow. Told as a table of table rows under column headers.
@@ -1323,18 +1326,23 @@ text, and a set of buttons. Told as a dialog, a message box as an alert.
 **Folders as models** (`dirmodel.cst`, tested by `dirmodel_test`): one
 folder's entries, read with getdents64 and stat, as a flat model of three
 columns — the name; the size as a person reads it, sorted by its bytes; when
-it changed, sorted by its seconds. Folders first, then names with letters'
-case aside; hidden names, files no pattern of a filter matches ("*.txt;*.md",
+it changed, sorted by its seconds; the name with an icon for a folder or a
+file once the program says which (`set_icons`). Folders first, then names
+with letters' case aside; hidden names, files no pattern of a filter matches ("*.txt;*.md",
 `*` and `?`), or all files when only folders are wanted, left out. Another
 path, up, or the same again says a reset.
 
 **File choosers** (`widgets/filechooser.cst`, tested by `filechooser_test`):
 our own, a dialog holding the places a person starts from (home, its
-desktop, documents and downloads when there, the computer's top) beside the
-current folder — its path, a button up, its entries in a table, the filters
-in a combo box once added. To open a file, to save to a name typed (asking
-first before replacing one), or to choose a folder; a folder activated
-opens, Backspace goes up, Control+H shows the hidden ones. Open, Save or
+desktop, documents and downloads when there, the computer's top), each with
+its icon, beside the current folder — a button up and its path in an entry,
+its entries in a table with a folder's icon or a file's, the names taking
+the room, the filters in a combo box once added. To open a file, to save to
+a name typed (asking first before replacing one), or to choose a folder; a
+folder activated opens, Backspace and Alt+Up go up, Control+H shows the
+hidden ones. A path typed where it is ("~" home, a name in the folder shown,
+"." and ".." taken) opens a folder, or is taken as a file chosen — a name in
+a folder there when saving; Control+L goes there. Open, Save or
 Select does nothing until the answer is right; then `chosen()` is the whole
 path.
 
