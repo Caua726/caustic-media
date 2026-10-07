@@ -33,7 +33,8 @@ window/
   native.cst      native handle accessors — the public contract
 
   x11/      done — 8 modules over bind/, see x11/x11.md
-  linux/    what every Linux backend shares: GTK's settings.ini, the portals
+  linux/    what every Linux backend shares: GTK's settings.ini, the portals,
+            the user's folders (user-dirs.dirs)
   wayland/  protocol.cst  + backend.cst      see wayland/wayland.md
   kms/      drm.cst       + backend.cst      see kms/kms.md
   win32/    user32.cst gdi32.cst + backend.cst   see win32/win32.md
@@ -416,6 +417,14 @@ still open. Tested against a fake portal on a private bus answering later,
 at once, on its own path, or never (`portal_files_test`); asked of this
 desktop's own by hand with `linux/filechooser_check.cst`. Our own chooser is
 `../ui/widgets/filechooser.cst`; Windows' comes with the Win32 backend.
+
+**The user's folders** (`linux/user_dirs.cst`): desktop, documents,
+downloads… where xdg-user-dirs put them, in the user's language ("Área de
+trabalho"), read from `user-dirs.dirs` in the config folder — the lines it
+writes and no others, home or an absolute path, shell-escaped; a folder said
+to be home itself turned off; its English name under home when the file does
+not say (`window_user_dirs_test`). Windows' known folders come with its
+backend.
 
 **Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
 the system's and the user's font directories, and where the font index is
