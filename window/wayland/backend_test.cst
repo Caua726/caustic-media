@@ -1,19 +1,27 @@
 use "std/io.cst" as io;
 use "std/env.cst" as env;
+use "std/time.cst" as time;
 use "../event.cst" as event;
 use "backend.cst" as wayland;
 use "../../gpu/software/target.cst" as tgt;
 
+fn wait_state(w as *wayland.Window, wanted as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 200) {
+        wayland.pump(w);
+        if (wayland.state(w) == wanted) { return 1; }
+        time.sleep_ms(5);
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main(argc as i64, argv as *u8) as i32 {
     env.init(argc, argv);
-    let is wayland.Window as w = wayland.open("wayland backend test", 320, 200);
+    let is wayland.Window as w;
+    wayland.open(&w, "wayland backend test", 320, 200);
     if (wayland.is_open(&w) == 0) {
         io.printf("FAIL: Wayland open, error %d\n", wayland.error(&w));
-        wayland.close(&w);
-        return 1;
-    }
-    if (wayland.native_fd(&w) < 0 || wayland.native_surface(&w) == 0) {
-        io.printf("FAIL: native handles\n");
         wayland.close(&w);
         return 1;
     }
@@ -22,6 +30,12 @@ fn main(argc as i64, argv as *u8) as i32 {
         wayland.close(&w);
         return 1;
     }
+    // The host can abandon an acquisition when a resize invalidates its
+    // texture. Unsubmitted buffers still belong to the client, not the server.
+    wayland.next_frame(&w);
+    wayland.acquire(&w);
+    wayland.acquire(&w);
+    wayland.next_frame(&w);
     let is tgt.Target as t = wayland.acquire(&w);
     if (t.width < 1 || t.height < 1 || cast(i64, t.color) == 0) {
         io.printf("FAIL: acquired shm buffer %d x %d\n", t.width, t.height);
@@ -44,24 +58,97 @@ fn main(argc as i64, argv as *u8) as i32 {
     }
     let is event.Event as e;
     while (wayland.poll_event(&w, &e) == 1) { }
-    wayland.set_title(&w, "Wayland title changed", 21);
-    let is i64 as min_w with mut = 0; let is i64 as min_h with mut = 0;
-    if (wayland.set_min_size(&w, 100, 80) != 1 ||
-        wayland.min_size(&w, &min_w, &min_h) != 1 || min_w != 100 || min_h != 80 ||
-        wayland.set_max_size(&w, 800, 600) != 1) {
-        io.printf("FAIL: size constraints\n");
-        wayland.close(&w);
-        return 1;
+    // A dialog must refer to its owner's objects on the same connection.
+    // Its configure/frame events must not be swallowed by the other window.
+    let is wayland.Options as dialog_options = wayland.options();
+    dialog_options.parent = wayland.native_toplevel(&w);
+    dialog_options.dialog = 1; dialog_options.modal = 1;
+    let is wayland.Window as child;
+    if (wayland.open_config(&child, "Wayland child", 140, 100, &dialog_options) != 1 ||
+        wayland.next_frame(&child) != 1) {
+        io.printf("FAIL: owned dialog configure\n");
+        wayland.close(&child); wayland.close(&w); return 1;
     }
-    if (wayland.set_maximized(&w, 1) != 1 || wayland.set_maximized(&w, 0) != 1 ||
-        wayland.set_fullscreen(&w, 1) != 1 || wayland.set_fullscreen(&w, 0) != 1 ||
-        wayland.minimize(&w) != 1) {
-        io.printf("FAIL: toplevel state requests\n");
-        wayland.close(&w);
-        return 1;
+    let is tgt.Target as child_pixels = wayland.acquire(&child);
+    tgt.put(&child_pixels, 0, 0, 4278190335);
+    wayland.submit(&child);
+    if (wayland.next_frame(&child) != 1 || wayland.error(&w) != wayland.OK) {
+        io.printf("FAIL: owned dialog frame\n");
+        wayland.close(&child); wayland.close(&w); return 1;
+    }
+    wayland.close(&child);
+    let is tgt.Target as owner_pixels = wayland.acquire(&w);
+    tgt.put(&owner_pixels, 0, 0, 4294901760);
+    wayland.submit(&w);
+    if (wayland.next_frame(&w) != 1) {
+        io.printf("FAIL: owner remains usable after dialog closes\n");
+        wayland.close(&w); return 1;
+    }
+
+    let is i64 as normal_w = wayland.width(&w);
+    let is i64 as normal_h = wayland.height(&w);
+    wayland.set_frame_extents(&w, 12, 12, 12, 12);
+    wayland.set_maximized(&w, 1);
+    if (wait_state(&w, event.STATE_MAXIMIZED) != 1 ||
+        wayland.width(&w) <= normal_w || wayland.height(&w) <= normal_h) {
+        io.printf("FAIL: maximize changes configured state and buffer dimensions\n");
+        wayland.close(&w); return 1;
+    }
+    let is tgt.Target as maximized_pixels = wayland.acquire(&w);
+    tgt.put(&maximized_pixels, 0, 0, 4278190335);
+    wayland.submit(&w);
+    wayland.set_maximized(&w, 0);
+    if (wait_state(&w, 0) != 1 ||
+        wayland.width(&w) != normal_w || wayland.height(&w) != normal_h) {
+        io.printf("FAIL: restore returns to the normal buffer dimensions\n");
+        wayland.close(&w); return 1;
+    }
+    let is tgt.Target as restored_pixels = wayland.acquire(&w);
+    if (restored_pixels.width != normal_w || restored_pixels.height != normal_h) {
+        io.printf("FAIL: restored frame uses the normal-sized buffer\n");
+        wayland.close(&w); return 1;
+    }
+    tgt.put(&restored_pixels, 0, 0, 4278255360);
+    wayland.submit(&w);
+    wayland.set_fullscreen(&w, 1);
+    if (wait_state(&w, event.STATE_FULLSCREEN) != 1 ||
+        wayland.width(&w) <= normal_w || wayland.height(&w) <= normal_h) {
+        io.printf("FAIL: fullscreen changes configured state and buffer dimensions\n");
+        wayland.close(&w); return 1;
+    }
+    let is tgt.Target as fullscreen_pixels = wayland.acquire(&w);
+    tgt.put(&fullscreen_pixels, 0, 0, 4294901760);
+    wayland.submit(&w);
+    while (wayland.poll_event(&w, &e) == 1) { }
+    if (wayland.next_frame(&w) != 1) {
+        io.printf("FAIL: fullscreen frame reaches the compositor\n");
+        wayland.close(&w); return 1;
+    }
+    wayland.set_fullscreen(&w, 0);
+    if (wait_state(&w, 0) != 1 ||
+        wayland.width(&w) != normal_w || wayland.height(&w) != normal_h) {
+        io.printf("FAIL: leaving fullscreen restores the normal buffer dimensions: got %d x %d, want %d x %d, configure %d x %d\n",
+                  wayland.width(&w), wayland.height(&w), normal_w, normal_h, w.configured_width, w.configured_height);
+        wayland.close(&w); return 1;
+    }
+    // Closing the first window must not destroy borrowed globals or the
+    // shared socket while a second independent window is alive.
+    let is wayland.Window as sibling;
+    if (wayland.open(&sibling, "Wayland sibling", 160, 120) != 1 ||
+        wayland.next_frame(&sibling) != 1) {
+        io.printf("FAIL: independent window configure\n");
+        wayland.close(&sibling); wayland.close(&w); return 1;
     }
     wayland.close(&w);
     if (wayland.is_open(&w) != 0) { return 1; }
+    let is tgt.Target as sibling_pixels = wayland.acquire(&sibling);
+    tgt.put(&sibling_pixels, 0, 0, 4278255360);
+    wayland.submit(&sibling);
+    if (wayland.next_frame(&sibling) != 1) {
+        io.printf("FAIL: second window remains usable after first closes\n");
+        wayland.close(&sibling); return 1;
+    }
+    wayland.close(&sibling);
     io.printf("wayland backend: all checks passed\n");
     return 0;
 }

@@ -1,5 +1,5 @@
-// A small direct Wayland client. It owns one socket per window and speaks the
-// generated core/xdg protocol metadata without a libwayland runtime dependency.
+// A direct Wayland client. All windows share a connection and protocol IDs;
+// each owns its event queue, shm buffers and xdg_toplevel.
 use "std/mem.cst" as mem;
 use "std/os/linux.cst" as linux;
 use "std/env.cst" as env;
@@ -84,10 +84,44 @@ fn options() as Options {
     return o;
 }
 
+struct GlobalOutput {
+    global as i32;
+    version as i32;
+}
+
+struct Globals {
+    compositor_global as i32;
+    compositor_version as i32;
+    shm_global as i32;
+    shell_global as i32;
+    shell_version as i32;
+    decoration_global as i32;
+    decoration_version as i32;
+    dialog_global as i32;
+    dialog_version as i32;
+    cursor_shape_global as i32;
+    cursor_shape_version as i32;
+    viewporter_global as i32;
+    viewporter_version as i32;
+    fractional_global as i32;
+    fractional_version as i32;
+    seat_global as i32;
+    seat_version as i32;
+    data_manager_global as i32;
+    data_manager_version as i32;
+    primary_manager_global as i32;
+    primary_manager_version as i32;
+    text_input_manager_global as i32;
+    text_input_manager_version as i32;
+    output_count as i32;
+    outputs as [8]GlobalOutput;
+}
+
 struct Window {
     fd as i64;
     memfd as i64;
     registry as i32;
+    registry_sync as i32;
     compositor as i32;
     shm as i32;
     wm_base as i32;
@@ -113,30 +147,6 @@ struct Window {
     toplevel as i32;
     pool as i32;
     callback as i32;
-    next_id as i32;
-    compositor_global as i32;
-    compositor_version as i32;
-    shm_global as i32;
-    shm_version as i32;
-    shell_global as i32;
-    shell_version as i32;
-    decoration_global as i32;
-    decoration_version as i32;
-    dialog_global as i32;
-    dialog_version as i32;
-    cursor_shape_global as i32;
-    viewporter_global as i32;
-    viewporter_version as i32;
-    fractional_global as i32;
-    fractional_version as i32;
-    cursor_shape_version as i32;
-    seat_global as i32;
-    data_manager_global as i32;
-    data_manager_version as i32;
-    primary_manager_global as i32;
-    primary_manager_version as i32;
-    text_input_manager_global as i32;
-    text_input_manager_version as i32;
     output_count as i32;
     outputs as [8]Output;
     active_output as i32;
@@ -164,8 +174,6 @@ struct Window {
     modifiers as i32;
     text_len as i32;
     text_buf as [256]u8;
-    recv_fd_count as i32;
-    recv_fds as [16]i32;
     input_serial as u32;
     text_input_enabled as i32;
     text_input_entered as i32;
@@ -233,6 +241,8 @@ struct Window {
     height as i64;
     logical_width as i64;
     logical_height as i64;
+    normal_width as i64;
+    normal_height as i64;
     configured_width as i64;
     last_buffer as i32;
     visible as i32;
@@ -263,27 +273,104 @@ struct Window {
     frame_ready as i32;
     close_requested as i32;
     acked as i32;
-    _pad0 as i32;
+    connection_slot as i32;
     _pad1 as i32;
 }
 
 let is [4096]u8 as _wire with mut;
 let is i32 as _wire_size with mut = 0;
+let is i32 as MAX_WINDOWS with imut = 64;
+let is i32 as MAX_OBJECTS with imut = 8192;
+struct ObjectSlot {
+    owner as *Window;
+    next as i32;
+    fd_opcode as i32; // retained until delete_id, including after owner closes
+}
+struct Binding {
+    global as u32;
+    object as i32;
+}
+let is [8192]ObjectSlot as _objects with mut;
+let is [64]*Window as _windows with mut;
+let is [32]Binding as _bindings with mut;
+let is Globals as _globals with mut;
+let is i32 as _registry with mut = 0;
+let is i32 as _objects_ready with mut = 0;
+let is i32 as _free_object with mut = 0;
+let is i64 as _connection_fd with mut = 0 - 1;
+let is i32 as _connection_refs with mut = 0;
+let is [16]i32 as _recv_fds with mut;
+let is i32 as _recv_fd_count with mut = 0;
+let is i32 as _recv_fd_head with mut = 0;
+
+fn _object_pool() as void {
+    let is i32 as i with mut = 2;
+    while (i < MAX_OBJECTS) {
+        _objects[i].owner = cast(*Window, 0);
+        _objects[i].next = i + 1;
+        _objects[i].fd_opcode = 0 - 1;
+        i = i + 1;
+    }
+    _objects[MAX_OBJECTS - 1].next = 0;
+    _free_object = 2; _objects_ready = 1;
+}
+
+fn _release_object(id as i32) as void {
+    if (id < 2 || id >= MAX_OBJECTS || _objects[id].next != 0 - 1) { return; }
+    _objects[id].owner = cast(*Window, 0);
+    _objects[id].fd_opcode = 0 - 1;
+    _objects[id].next = _free_object;
+    _free_object = id;
+}
+
+fn _attach(w as *Window) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (cast(i64, _windows[i]) == 0) {
+            _windows[i] = w; w.connection_slot = i;
+            _connection_refs = _connection_refs + 1;
+            return 1;
+        }
+        i = i + 1;
+    }
+    w.fd = 0 - 1;
+    return 0;
+}
+
+fn _disconnect(w as *Window) as void {
+    let is i32 as i with mut = 2;
+    while (i < MAX_OBJECTS) {
+        if (_objects[i].owner == w) { _objects[i].owner = cast(*Window, 0); }
+        i = i + 1;
+    }
+    if (w.connection_slot >= 0) {
+        _windows[w.connection_slot] = cast(*Window, 0);
+        _connection_refs = _connection_refs - 1;
+    }
+    if (_connection_refs == 0 && _connection_fd >= 0) {
+        _close_recv_fds();
+        linux.close(_connection_fd);
+        _connection_fd = 0 - 1; _objects_ready = 0;
+        mem.memzero(cast(*u8, &_bindings[0]), 32 * sizeof(Binding));
+        mem.memzero(cast(*u8, &_globals), sizeof(Globals));
+        _registry = 0;
+    }
+    w.fd = 0 - 1; w.connection_slot = 0 - 1;
+}
 
 fn _zero(w as *Window) as void {
     mem.memzero(cast(*u8, w), sizeof(Window));
-    w.fd = 0 - 1; w.memfd = 0 - 1;
+    w.fd = 0 - 1; w.memfd = 0 - 1; w.connection_slot = 0 - 1;
     w.registry = 0; w.compositor = 0; w.shm = 0; w.wm_base = 0;
     w.surface = 0; w.xdg_surface = 0; w.toplevel = 0; w.pool = 0;
-    w.callback = 0; w.next_id = 2;
-    w.compositor_global = 0; w.compositor_version = 0;
+    w.callback = 0;
     w.width = 0; w.height = 0; w.logical_width = 0; w.logical_height = 0;
     w.configured_width = 0; w.configured_height = 0;
     w.scale = 1; w.scale120 = 120; w.fractional_active = 0;
     w.active_output = 0 - 1; w.output_count = 0;
     w.buffer_width = 0; w.buffer_height = 0; w.resize_detached = 0;
     w.buffers[0].object = 0; w.buffers[0].busy = 0;
-    w.buffers[1].object = 0; w.buffers[1].busy = 0; w.current = 0;
+    w.buffers[1].object = 0; w.buffers[1].busy = 0; w.current = 0 - 1;
     w.last_buffer = 0 - 1; w.visible = 0;
     w.event_head = 0; w.event_len = 0;
     w.state = 0; w.old_state = 0; w.err = OK; w.opened = 0; w.mapped = 0;
@@ -317,8 +404,13 @@ fn _event(w as *Window, kind as i32) as void {
 }
 
 fn _id(w as *Window) as i32 {
-    let is i32 as id = w.next_id;
-    w.next_id = w.next_id + 1;
+    if (_objects_ready == 0) { _object_pool(); }
+    let is i32 as id = _free_object;
+    if (id == 0) { w.err = NO_MEMORY; return 0; }
+    _free_object = _objects[id].next;
+    _objects[id].next = 0 - 1;
+    _objects[id].owner = w;
+    _objects[id].fd_opcode = 0 - 1;
     return id;
 }
 
@@ -346,7 +438,9 @@ fn _read_all(fd as i64, p as *u8, n as i64) as i32 {
 }
 
 fn _send(w as *Window, object as i32, opcode as i32, body as *u8, n as i32, pass_fd as i64) as i32 {
+    if (w.fd < 0) { return 0; }
     if (n < 0 || n > MAX_WIRE - 8) { return 0; }
+    if (w.err == NO_MEMORY) { return 0; }
     let is [4096]u8 as packet;
     _put(&packet[0], cast(u32, object));
     _put(&packet[4], cast(u32, ((n + 8) << 16) | opcode));
@@ -367,14 +461,23 @@ fn _surface_commit(w as *Window) as i32 {
     return _send(w, w.surface, 6, cast(*u8, 0), 0, 0 - 1);
 }
 
-fn _close_recv_fds(w as *Window) as void {
-    let is i32 as i with mut = 0;
-    while (i < w.recv_fd_count) {
-        if (w.recv_fds[i] >= 0) { linux.close(w.recv_fds[i]); }
-        w.recv_fds[i] = 0 - 1;
-        i = i + 1;
+// SCM_RIGHTS is an ordered stream independent of message byte boundaries:
+// a descriptor received with an earlier event waits for its FD argument.
+fn _take_recv_fd() as i64 {
+    if (_recv_fd_count == 0) { return 0 - 1; }
+    let is i32 as index = _recv_fd_head;
+    let is i64 as fd = _recv_fds[index];
+    _recv_fds[index] = 0 - 1;
+    _recv_fd_head = (index + 1) & 15;
+    _recv_fd_count = _recv_fd_count - 1;
+    return fd;
+}
+
+fn _close_recv_fds() as void {
+    while (_recv_fd_count > 0) {
+        let is i64 as fd = _take_recv_fd();
+        if (fd >= 0) { linux.close(fd); }
     }
-    w.recv_fd_count = 0;
 }
 
 fn _recv_part(w as *Window, p as *u8, n as i64) as i32 {
@@ -387,15 +490,19 @@ fn _recv_part(w as *Window, p as *u8, n as i64) as i32 {
         if (r <= 0) {
             let is i64 as j with mut = 0;
             while (j < count) { linux.close(fds[j]); j = j + 1; }
-            _close_recv_fds(w);
+            _close_recv_fds();
             return 0;
         }
         let is i64 as j with mut = 0;
         while (j < count) {
-            if (w.recv_fd_count < 16) {
-                w.recv_fds[w.recv_fd_count] = fds[j];
-                w.recv_fd_count = w.recv_fd_count + 1;
-            } else { linux.close(fds[j]); }
+            if (_recv_fd_count < 16) {
+                _recv_fds[(_recv_fd_head + _recv_fd_count) & 15] = fds[j];
+                _recv_fd_count = _recv_fd_count + 1;
+            } else {
+                while (j < count) { linux.close(fds[j]); j = j + 1; }
+                _close_recv_fds();
+                return 0;
+            }
             j = j + 1;
         }
         got = got + r;
@@ -404,7 +511,6 @@ fn _recv_part(w as *Window, p as *u8, n as i64) as i32 {
 }
 
 fn _recv(w as *Window) as i32 {
-    w.recv_fd_count = 0;
     if (_recv_part(w, &_wire[0], 8) == 0) { return 0; }
     let is u32 as obj = _word(&_wire[0]);
     let is u32 as oh = _word(&_wire[4]);
@@ -578,7 +684,25 @@ fn _bind(w as *Window, name as u32, iface as *u8, version as i32, id as i32) as 
     return _send(w, w.registry, 0, &p[0], n, 0 - 1);
 }
 
-fn _registry_global(w as *Window) as void {
+// Globals with no per-window event stream live until the shared connection
+// closes. Seat and output objects remain per-window and are released there.
+fn _binding(w as *Window, name as u32, iface as *u8, version as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 32) {
+        if (_bindings[i].object != 0 && _bindings[i].global == name) { return _bindings[i].object; }
+        if (_bindings[i].object == 0) {
+            let is i32 as id = _id(w);
+            if (id == 0 || _bind(w, name, iface, version, id) == 0) { return 0; }
+            _bindings[i].global = name; _bindings[i].object = id;
+            return id;
+        }
+        i = i + 1;
+    }
+    w.err = NO_MEMORY;
+    return 0;
+}
+
+fn _registry_global() as void {
     if (_wire_size < 20) { return; }
     let is u32 as name = _word(&_wire[8]);
     let is i32 as len = cast(i32, _word(&_wire[12]));
@@ -588,53 +712,52 @@ fn _registry_global(w as *Window) as void {
     let is i32 as version_at = 16 + padded;
     if (version_at + 4 > _wire_size) { return; }
     let is i32 as version = cast(i32, _word(&_wire[version_at]));
-    if (_same(text, len - 1, "wl_compositor") == 1 && w.compositor_global == 0) {
-        w.compositor_global = cast(i32, name); w.compositor_version = version;
+    if (_same(text, len - 1, "wl_compositor") == 1 && _globals.compositor_global == 0) {
+        _globals.compositor_global = cast(i32, name); _globals.compositor_version = version;
     }
-    if (_same(text, len - 1, "wl_shm") == 1 && w.shm_global == 0) {
-        w.shm_global = cast(i32, name); w.shm_version = version;
+    if (_same(text, len - 1, "wl_shm") == 1 && _globals.shm_global == 0) {
+        _globals.shm_global = cast(i32, name);
     }
-    if (_same(text, len - 1, "xdg_wm_base") == 1 && w.shell_global == 0) {
-        w.shell_global = cast(i32, name); w.shell_version = version;
+    if (_same(text, len - 1, "xdg_wm_base") == 1 && _globals.shell_global == 0) {
+        _globals.shell_global = cast(i32, name); _globals.shell_version = version;
     }
-    if (_same(text, len - 1, "wl_seat") == 1 && w.seat_global == 0) {
-        w.seat_global = cast(i32, name); w.seat_version = version;
+    if (_same(text, len - 1, "wl_seat") == 1 && _globals.seat_global == 0) {
+        _globals.seat_global = cast(i32, name); _globals.seat_version = version;
     }
-    if (_same(text, len - 1, "zxdg_decoration_manager_v1") == 1 && w.decoration_global == 0) {
-        w.decoration_global = cast(i32, name); w.decoration_version = version;
+    if (_same(text, len - 1, "zxdg_decoration_manager_v1") == 1 && _globals.decoration_global == 0) {
+        _globals.decoration_global = cast(i32, name); _globals.decoration_version = version;
     }
-    if (_same(text, len - 1, "xdg_wm_dialog_v1") == 1 && w.dialog_global == 0) {
-        w.dialog_global = cast(i32, name); w.dialog_version = version;
+    if (_same(text, len - 1, "xdg_wm_dialog_v1") == 1 && _globals.dialog_global == 0) {
+        _globals.dialog_global = cast(i32, name); _globals.dialog_version = version;
     }
     if (_same(text, len - 1, "wp_cursor_shape_manager_v1") == 1 &&
-        w.cursor_shape_global == 0) {
-        w.cursor_shape_global = cast(i32, name); w.cursor_shape_version = version;
+        _globals.cursor_shape_global == 0) {
+        _globals.cursor_shape_global = cast(i32, name); _globals.cursor_shape_version = version;
     }
-    if (_same(text, len - 1, "wl_output") == 1 && w.output_count < 8) {
-        let is i32 as i = w.output_count;
-        w.outputs[i].global = cast(i32, name);
-        w.outputs[i].version = version;
-        w.outputs[i].scale = 1;
-        w.output_count = w.output_count + 1;
+    if (_same(text, len - 1, "wl_output") == 1 && _globals.output_count < 8) {
+        let is i32 as i = _globals.output_count;
+        _globals.outputs[i].global = cast(i32, name);
+        _globals.outputs[i].version = version;
+        _globals.output_count = _globals.output_count + 1;
     }
-    if (_same(text, len - 1, "wp_viewporter") == 1 && w.viewporter_global == 0) {
-        w.viewporter_global = cast(i32, name); w.viewporter_version = version;
+    if (_same(text, len - 1, "wp_viewporter") == 1 && _globals.viewporter_global == 0) {
+        _globals.viewporter_global = cast(i32, name); _globals.viewporter_version = version;
     }
     if (_same(text, len - 1, "wp_fractional_scale_manager_v1") == 1 &&
-        w.fractional_global == 0) {
-        w.fractional_global = cast(i32, name); w.fractional_version = version;
+        _globals.fractional_global == 0) {
+        _globals.fractional_global = cast(i32, name); _globals.fractional_version = version;
     }
-    if (_same(text, len - 1, "wl_data_device_manager") == 1 && w.data_manager_global == 0) {
-        w.data_manager_global = cast(i32, name); w.data_manager_version = version;
+    if (_same(text, len - 1, "wl_data_device_manager") == 1 && _globals.data_manager_global == 0) {
+        _globals.data_manager_global = cast(i32, name); _globals.data_manager_version = version;
     }
     if (_same(text, len - 1, "zwp_primary_selection_device_manager_v1") == 1 &&
-        w.primary_manager_global == 0) {
-        w.primary_manager_global = cast(i32, name); w.primary_manager_version = version;
+        _globals.primary_manager_global == 0) {
+        _globals.primary_manager_global = cast(i32, name); _globals.primary_manager_version = version;
     }
     if (_same(text, len - 1, "zwp_text_input_manager_v3") == 1 &&
-        w.text_input_manager_global == 0) {
-        w.text_input_manager_global = cast(i32, name);
-        w.text_input_manager_version = version;
+        _globals.text_input_manager_global == 0) {
+        _globals.text_input_manager_global = cast(i32, name);
+        _globals.text_input_manager_version = version;
     }
 }
 
@@ -1024,6 +1147,7 @@ fn _source_release(w as *Window, index as i32, destroy as i32) as void {
     if (cast(i64, s.data) != 0) { mem.core.munmap(s.data, s.bytes); }
     if (w.clip_source == s.object) { w.clip_source = 0; }
     if (w.primary_source == s.object) { w.primary_source = 0; }
+    if (s.object >= 2 && s.object < MAX_OBJECTS) { _objects[s.object].owner = cast(*Window, 0); }
     mem.memzero(cast(*u8, s), sizeof(DataSource));
 }
 
@@ -1031,15 +1155,16 @@ fn _source_event(w as *Window, object as i32, op as i32, primary as i32) as void
     let is i32 as index = _source_index(w, object);
     if (index < 0 || w.sources[index].primary != primary) { return; }
     if ((primary == 0 && op == 1) || (primary == 1 && op == 0)) {
-        if (w.recv_fd_count < 1 || w.sources[index].data == cast(*u8, 0)) { return; }
-        let is i64 as fd = w.recv_fds[0];
+        let is i64 as fd = _take_recv_fd();
+        if (fd < 0) { return; }
         let is i64 as sent with mut = 0;
-        while (sent < w.sources[index].length) {
+        while (w.sources[index].data != cast(*u8, 0) && sent < w.sources[index].length) {
             let is i64 as n = linux.write(fd, cast(*u8, cast(i64, w.sources[index].data) + sent),
                                          w.sources[index].length - sent);
-            if (n <= 0) { return; }
+            if (n <= 0) { break; }
             sent = sent + n;
         }
+        linux.close(fd);
         return;
     }
     if ((primary == 0 && op == 2) || (primary == 1 && op == 1)) {
@@ -1154,11 +1279,13 @@ fn _seat_capabilities(w as *Window, caps as u32) as void {
     }
     if ((caps & 2) != 0 && w.keyboard == 0) {
         w.keyboard = _id(w);
+        if (w.keyboard != 0) { _objects[w.keyboard].fd_opcode = 0; }
         _put(&body[0], cast(u32, w.keyboard));
         _send(w, w.seat, 1, &body[0], 4, 0 - 1);
     } else if ((caps & 2) == 0 && w.keyboard != 0) {
         if (w.keyboard_focus == 1) { _event(w, event.FOCUS_OUT); }
         if (w.seat_version >= 3) { _send(w, w.keyboard, 0, cast(*u8, 0), 0, 0 - 1); }
+        if (w.keyboard != 0) { _objects[w.keyboard].owner = cast(*Window, 0); }
         w.keyboard = 0; w.keyboard_focus = 0;
         mem.memzero(cast(*u8, &w.key_down[0]), 256 * 4);
         mem.memzero(cast(*u8, &w.key_syms[0]), 256 * 4);
@@ -1239,11 +1366,14 @@ fn _key_text(w as *Window, sym as u32, keycode as u32) as i32 {
 
 fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
     if (op == 0) {
+        let is i64 as fd = _take_recv_fd();
+        if (fd < 0) { return; }
         if (_wire_size >= 16) {
             let is u32 as format = _word(p);
             let is i64 as size = cast(i64, _word(cast(*u8, cast(i64, p) + 4)));
-            if (format == 1 && w.recv_fd_count > 0) { _load_keymap(w, w.recv_fds[0], size); }
+            if (format == 1) { _load_keymap(w, fd, size); }
         }
+        linux.close(fd);
         return;
     }
     if (op == 1) {
@@ -1368,6 +1498,7 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
         _queue(w, &e);
         return;
     }
+    if (w.pointer_inside == 0) { return; }
     if (op == 2) {
         let is i64 as x = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 4))) / 256), w.scale120);
         let is i64 as y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
@@ -1454,7 +1585,7 @@ fn _retire_current(w as *Window) as i32 {
     w.bytes = 0; w.stride = 0; w.buffer_width = 0; w.buffer_height = 0;
     w.buffers[0].object = 0; w.buffers[0].busy = 0;
     w.buffers[1].object = 0; w.buffers[1].busy = 0;
-    w.current = 0; w.last_buffer = 0 - 1;
+    w.current = 0 - 1; w.last_buffer = 0 - 1;
     return 1;
 }
 
@@ -1465,7 +1596,7 @@ fn _dispatch(w as *Window, obj as i32) as void {
     let is *u8 as p = &_wire[8];
     if (obj == 1 && op == 0) { w.err = NO_COMPOSITOR; w.opened = 0; return; }
     
-    if (obj == w.registry && op == 0) { _registry_global(w); return; }
+    if (obj == w.registry && op == 0) { _registry_global(); return; }
     if (obj == w.surface && (op == 0 || op == 1)) {
         _surface_output(w, cast(i32, _word(p)), cast(i32, op == 0));
         return;
@@ -1495,7 +1626,7 @@ fn _dispatch(w as *Window, obj as i32) as void {
     if (obj == w.seat && op == 0) { _seat_capabilities(w, _word(p)); return; }
     if (obj == w.keyboard) { _keyboard_event(w, op, p); return; }
     if (obj == w.pointer) { _pointer_event(w, op, p); return; }
-    if (obj == 3 && op == 0) { w.acked = 1; return; }
+    if (obj == w.registry_sync && op == 0) { w.registry_sync = 0; w.acked = 1; return; }
     if (obj == w.wm_base && op == 0) {
         let is [4]u8 as b;
         _put(&b[0], _word(p));
@@ -1512,8 +1643,9 @@ fn _dispatch(w as *Window, obj as i32) as void {
     if (obj == w.toplevel && op == 0) {
         let is i32 as nw = cast(i32, _word(p));
         let is i32 as nh = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
-        if (nw > 0) { w.configured_width = nw; }
-        if (nh > 0) { w.configured_height = nh; }
+        // Zero means the client chooses this axis; do not keep maximized size.
+        w.configured_width = nw;
+        w.configured_height = nh;
         let is i32 as bytes = cast(i32, _word(cast(*u8, cast(i64, p) + 8)));
         if (bytes >= 0 && (bytes & 3) == 0 && 20 + bytes <= _wire_size) {
             let is i32 as count = bytes / 4;
@@ -1528,6 +1660,10 @@ fn _dispatch(w as *Window, obj as i32) as void {
                 if (s == 7) { state = state | event.STATE_TILED_TOP; }
                 if (s == 8) { state = state | event.STATE_TILED_BOTTOM; }
                 i = i + 1;
+            }
+            if (w.state == 0 && state != 0) {
+                w.normal_width = w.logical_width;
+                w.normal_height = w.logical_height;
             }
             w.state = state;
         }
@@ -1580,9 +1716,33 @@ fn _pump_one(w as *Window, wait as i32) as i32 {
         }
     } else if (sys.wait_readable(w.fd, 0) <= 0) { return 0; }
     let is i32 as obj = _recv(w);
-    if (obj <= 0) { _close_recv_fds(w); return 0; }
-    _dispatch(w, obj);
-    _close_recv_fds(w);
+    if (obj == 0) { _close_recv_fds(); return 0; }
+    if (obj == 1 && (_word(&_wire[4]) & 65535) == 1 && _wire_size == 12) {
+        _release_object(cast(i32, _word(&_wire[8])));
+        return 1;
+    }
+    let is i32 as op = cast(i32, _word(&_wire[4]) & 65535);
+    if (obj >= 2 && obj < MAX_OBJECTS && cast(i64, _objects[obj].owner) == 0 &&
+        _objects[obj].fd_opcode == op) {
+        let is i64 as abandoned = _take_recv_fd();
+        if (abandoned >= 0) { linux.close(abandoned); }
+        return 1;
+    }
+    let is *Window as target with mut = w;
+    if (obj >= 2 && obj < MAX_OBJECTS && cast(i64, _objects[obj].owner) != 0) {
+        target = _objects[obj].owner;
+    } else if (cast(u32, obj) >= 0xff000000) {
+        let is i32 as i with mut = 0;
+        while (i < MAX_WINDOWS) {
+            let is *Window as candidate = _windows[i];
+            if (cast(i64, candidate) != 0 &&
+                (_offer_index(candidate, obj, 0, 0) >= 0 || _offer_index(candidate, obj, 1, 0) >= 0)) {
+                target = candidate; break;
+            }
+            i = i + 1;
+        }
+    }
+    _dispatch(target, obj);
     return 1;
 }
 
@@ -1703,6 +1863,10 @@ fn clipboard_set(w as *Window, which as i32, text as *u8, n as i64) as i32 {
     if (n > 0) { mem.memcpy(copy, text, n); }
     copy[n] = 0;
     let is i32 as object = _id(w);
+    if (object != 0) {
+        _objects[object].fd_opcode = 1;
+        if (primary == 1) { _objects[object].fd_opcode = 0; }
+    }
     w.sources[index].object = object;
     w.sources[index].primary = primary;
     w.sources[index].which = which;
@@ -1839,6 +2003,7 @@ fn clear_drop(w as *Window) as void {
 
 
 fn _runtime_socket(w as *Window) as i32 {
+    if (_connection_fd >= 0) { w.fd = _connection_fd; return _attach(w); }
     let is *u8 as display with mut = env.getenv("WAYLAND_DISPLAY");
     let is *u8 as runtime = env.getenv("XDG_RUNTIME_DIR");
     if (cast(i64, display) == 0 || display[0] == 0) { display = "wayland-0"; }
@@ -1858,77 +2023,76 @@ fn _runtime_socket(w as *Window) as i32 {
     if (n <= 0 || n >= 240) { return 0; }
     path[n] = 0;
     w.fd = sys.connect_unix(&path[0], n, 0);
-    return cast(i32, w.fd >= 0);
+    if (w.fd < 0) { return 0; }
+    _connection_fd = w.fd;
+    return _attach(w);
 }
 
 fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
-    w.registry = _id(w);
     let is [8]u8 as idbody;
-    _put(&idbody[0], cast(u32, w.registry));
-    if (_send(w, 1, 1, &idbody[0], 4, 0 - 1) == 0) { return 0; }
-    let is i32 as sync_id = _id(w);
-    _put(&idbody[0], cast(u32, sync_id));
+    if (_registry == 0) {
+        _registry = _id(w);
+        _put(&idbody[0], cast(u32, _registry));
+        if (_send(w, 1, 1, &idbody[0], 4, 0 - 1) == 0) { return 0; }
+    }
+    w.registry = _registry;
+    w.registry_sync = _id(w);
+    _put(&idbody[0], cast(u32, w.registry_sync));
     if (_send(w, 1, 0, &idbody[0], 4, 0 - 1) == 0) { return 0; }
     let is i32 as waited with mut = 0;
     while (w.acked == 0 && waited < 200) {
         if (_pump_one(w, 1) == 0) { return 0; }
         waited = waited + 1;
     }
-    if (w.compositor_global == 0 || w.shm_global == 0 || w.shell_global == 0) { return 0; }
-    w.compositor = _id(w);
-    if (_bind(w, cast(u32, w.compositor_global), "wl_compositor", _bounded(w.compositor_version, 4), w.compositor) == 0) { return 0; }
-    w.shm = _id(w);
-    if (_bind(w, cast(u32, w.shm_global), "wl_shm", 1, w.shm) == 0) { return 0; }
-    w.wm_base = _id(w);
-    if (_bind(w, cast(u32, w.shell_global), "xdg_wm_base", _bounded(w.shell_version, 6), w.wm_base) == 0) { return 0; }
-    if (w.seat_global != 0) {
+    if (_globals.compositor_global == 0 || _globals.shm_global == 0 || _globals.shell_global == 0) { return 0; }
+    w.compositor = _binding(w, cast(u32, _globals.compositor_global), "wl_compositor", _bounded(_globals.compositor_version, 4));
+    w.shm = _binding(w, cast(u32, _globals.shm_global), "wl_shm", 1);
+    w.wm_base = _binding(w, cast(u32, _globals.shell_global), "xdg_wm_base", _bounded(_globals.shell_version, 6));
+    if (w.compositor == 0 || w.shm == 0 || w.wm_base == 0) { return 0; }
+    if (_globals.seat_global != 0) {
         w.seat = _id(w);
-        if (_bind(w, cast(u32, w.seat_global), "wl_seat", _bounded(w.seat_version, 7), w.seat) == 0) { return 0; }
+        w.seat_version = _bounded(_globals.seat_version, 7);
+        if (_bind(w, cast(u32, _globals.seat_global), "wl_seat", w.seat_version, w.seat) == 0) { return 0; }
     }
+    w.output_count = _globals.output_count;
     let is i32 as output_i with mut = 0;
     while (output_i < w.output_count) {
+        w.outputs[output_i].global = _globals.outputs[output_i].global;
+        w.outputs[output_i].version = _globals.outputs[output_i].version;
+        w.outputs[output_i].scale = 1;
         w.outputs[output_i].object = _id(w);
         if (_bind(w, cast(u32, w.outputs[output_i].global), "wl_output",
-                    _bounded(w.outputs[output_i].version, 2), w.outputs[output_i].object) == 0) { return 0; }
+                    _bounded(w.outputs[output_i].version, 4), w.outputs[output_i].object) == 0) { return 0; }
         output_i = output_i + 1;
     }
-    if (w.viewporter_global != 0 && w.fractional_global != 0) {
-        w.viewporter = _id(w);
-        if (_bind(w, cast(u32, w.viewporter_global), "wp_viewporter",
-                  _bounded(w.viewporter_version, 1), w.viewporter) == 0) { return 0; }
-        w.fractional_manager = _id(w);
-        if (_bind(w, cast(u32, w.fractional_global), "wp_fractional_scale_manager_v1",
-                  _bounded(w.fractional_version, 1), w.fractional_manager) == 0) { return 0; }
+    if (_globals.viewporter_global != 0 && _globals.fractional_global != 0) {
+        w.viewporter = _binding(w, cast(u32, _globals.viewporter_global), "wp_viewporter", _bounded(_globals.viewporter_version, 1));
+        w.fractional_manager = _binding(w, cast(u32, _globals.fractional_global), "wp_fractional_scale_manager_v1", _bounded(_globals.fractional_version, 1));
+        if (w.viewporter == 0 || w.fractional_manager == 0) { return 0; }
     }
-    if (w.decoration_global != 0) {
-        w.decoration_manager = _id(w);
-        if (_bind(w, cast(u32, w.decoration_global), "zxdg_decoration_manager_v1",
-                  _bounded(w.decoration_version, 2), w.decoration_manager) == 0) { return 0; }
+    if (_globals.decoration_global != 0) {
+        w.decoration_manager = _binding(w, cast(u32, _globals.decoration_global), "zxdg_decoration_manager_v1", _bounded(_globals.decoration_version, 2));
+        if (w.decoration_manager == 0) { return 0; }
     }
-    if (w.dialog_global != 0) {
-        w.dialog_manager = _id(w);
-        if (_bind(w, cast(u32, w.dialog_global), "xdg_wm_dialog_v1",
-                  _bounded(w.dialog_version, 1), w.dialog_manager) == 0) { return 0; }
+    if (_globals.dialog_global != 0) {
+        w.dialog_manager = _binding(w, cast(u32, _globals.dialog_global), "xdg_wm_dialog_v1", _bounded(_globals.dialog_version, 1));
+        if (w.dialog_manager == 0) { return 0; }
     }
-    if (w.cursor_shape_global != 0) {
-        w.cursor_shape_manager = _id(w);
-        if (_bind(w, cast(u32, w.cursor_shape_global), "wp_cursor_shape_manager_v1",
-                  _bounded(w.cursor_shape_version, 1), w.cursor_shape_manager) == 0) { return 0; }
+    if (_globals.cursor_shape_global != 0) {
+        w.cursor_shape_manager = _binding(w, cast(u32, _globals.cursor_shape_global), "wp_cursor_shape_manager_v1", _bounded(_globals.cursor_shape_version, 1));
+        if (w.cursor_shape_manager == 0) { return 0; }
     }
-    if (w.data_manager_global != 0) {
-        w.data_manager = _id(w);
-        if (_bind(w, cast(u32, w.data_manager_global), "wl_data_device_manager",
-                  _bounded(w.data_manager_version, 3), w.data_manager) == 0) { return 0; }
+    if (_globals.data_manager_global != 0) {
+        w.data_manager = _binding(w, cast(u32, _globals.data_manager_global), "wl_data_device_manager", _bounded(_globals.data_manager_version, 3));
+        if (w.data_manager == 0) { return 0; }
     }
-    if (w.primary_manager_global != 0) {
-        w.primary_manager = _id(w);
-        if (_bind(w, cast(u32, w.primary_manager_global), "zwp_primary_selection_device_manager_v1",
-                  _bounded(w.primary_manager_version, 1), w.primary_manager) == 0) { return 0; }
+    if (_globals.primary_manager_global != 0) {
+        w.primary_manager = _binding(w, cast(u32, _globals.primary_manager_global), "zwp_primary_selection_device_manager_v1", _bounded(_globals.primary_manager_version, 1));
+        if (w.primary_manager == 0) { return 0; }
     }
-    if (w.text_input_manager_global != 0) {
-        w.text_input_manager = _id(w);
-        if (_bind(w, cast(u32, w.text_input_manager_global), "zwp_text_input_manager_v3",
-                  _bounded(w.text_input_manager_version, 1), w.text_input_manager) == 0) { return 0; }
+    if (_globals.text_input_manager_global != 0) {
+        w.text_input_manager = _binding(w, cast(u32, _globals.text_input_manager_global), "zwp_text_input_manager_v3", _bounded(_globals.text_input_manager_version, 1));
+        if (w.text_input_manager == 0) { return 0; }
     }
     if (w.seat != 0 && w.data_manager != 0) {
         w.data_device = _id(w);
@@ -2041,7 +2205,7 @@ fn _destroy_buffers(w as *Window) as void {
     let is [0]u8 as empty;
     let is i32 as i with mut = 0;
     while (i < BUFFER_COUNT) {
-        if (w.buffers[i].object != 0 && w.buffers[i].busy == 0) {
+        if (w.buffers[i].object != 0) {
             _send(w, w.buffers[i].object, 0, &empty[0], 0, 0 - 1);
             w.buffers[i].object = 0;
         }
@@ -2052,53 +2216,46 @@ fn _destroy_buffers(w as *Window) as void {
         w.pixels = cast(*u8, 0);
     }
     w.last_buffer = 0 - 1;
+    w.current = 0 - 1;
     w.buffer_width = 0; w.buffer_height = 0;
 }
 
-fn _discard(w as *Window) as void {
-    if (cast(i64, w.pixels) != 0) {
-        linux.munmap(w.pixels, w.bytes * BUFFER_COUNT);
-        w.pixels = cast(*u8, 0);
-    }
-    if (w.memfd >= 0) { linux.close(w.memfd); w.memfd = 0 - 1; }
-    if (w.fd >= 0) { linux.close(w.fd); w.fd = 0 - 1; }
-    w.opened = 0;
-}
-fn open_config(title as *u8, width as i64, height as i64, options as *Options) as Window {
-    let is Window as w;
-    _zero(&w);
+fn _discard(w as *Window) as void { close(w); }
+// The caller owns the storage and keeps it at this address until close.
+fn open_config(w as *Window, title as *u8, width as i64, height as i64, options as *Options) as i32 {
+    _zero(w);
     let is Options as o with mut = options();
     if (cast(i64, options) != 0) { o = *options; }
     w.width = width; w.height = height; w.decorated_wanted = o.decorated;
-    if (width <= 0 || height <= 0) { w.err = NO_CONFIGURE; return w; }
-    if (_protocol_ready() == 0) { w.err = NO_PROTOCOL; return w; }
-    if (_runtime_socket(&w) == 0) { w.err = NO_RUNTIME; return w; }
-    if (_init_protocol(&w, title, o.app_id) == 0) { w.err = NO_COMPOSITOR; _discard(&w); return w; }
+    if (width <= 0 || height <= 0) { w.err = NO_CONFIGURE; return 0; }
+    if (_protocol_ready() == 0) { w.err = NO_PROTOCOL; return 0; }
+    if (_runtime_socket(w) == 0) { w.err = NO_RUNTIME; return 0; }
+    if (_init_protocol(w, title, o.app_id) == 0) { w.err = NO_COMPOSITOR; _discard(w); return 0; }
     w.opened = 1;
-    if (o.parent != 0 && set_parent(&w, o.parent) == 0) {
-        w.err = NO_SHELL; _discard(&w); return w;
+    if (o.parent != 0 && set_parent(w, o.parent) == 0) {
+        w.err = NO_SHELL; _discard(w); return 0;
     }
     if (o.resizable == 0) {
-        if (set_min_size(&w, width, height) == 0 || set_max_size(&w, width, height) == 0) {
-            w.err = NO_SHELL; _discard(&w); return w;
+        if (set_min_size(w, width, height) == 0 || set_max_size(w, width, height) == 0) {
+            w.err = NO_SHELL; _discard(w); return 0;
         }
     }
-    if (o.modal != 0) { set_modal(&w, 1); }
+    if (o.modal != 0) { set_modal(w, 1); }
     w.stride = w.width * 4; w.bytes = w.stride * w.height;
-    if (_make_buffers(&w) == 0) { w.err = NO_MEMORY; _discard(&w); return w; }
-    let is i32 as id = _id(&w);
+    if (_make_buffers(w) == 0) { w.err = NO_MEMORY; _discard(w); return 0; }
+    let is i32 as id = _id(w);
     let is [4]u8 as p;
     _put(&p[0], cast(u32, id));
-    if (_send(&w, w.surface, 3, &p[0], 4, 0 - 1) == 0) { w.err = NO_SHELL; _discard(&w); return w; }
-    if (_send(&w, w.surface, 6, cast(*u8, 0), 0, 0 - 1) == 0) { w.err = NO_SHELL; _discard(&w); return w; }
+    if (_send(w, w.surface, 3, &p[0], 4, 0 - 1) == 0) { w.err = NO_SHELL; _discard(w); return 0; }
+    if (_send(w, w.surface, 6, cast(*u8, 0), 0, 0 - 1) == 0) { w.err = NO_SHELL; _discard(w); return 0; }
     w.callback = id;
     w.err = OK; w.mapped = 0;
-    return w;
+    return 1;
 }
 
-fn open(title as *u8, width as i64, height as i64) as Window {
+fn open(w as *Window, title as *u8, width as i64, height as i64) as i32 {
     let is Options as o = options();
-    return open_config(title, width, height, &o);
+    return open_config(w, title, width, height, &o);
 }
 
 fn error(w as *Window) as i32 { return w.err; }
@@ -2149,19 +2306,40 @@ fn wheel(w as *Window) as i64 {
 
 
 fn _apply_configure(w as *Window) as void {
-    if (w.configured_width > 0 && w.configured_height > 0) {
-        let is i64 as width = _scale_up(w.configured_width, w.scale120);
-        let is i64 as height = _scale_up(w.configured_height, w.scale120);
-        if (w.logical_width != w.configured_width || w.logical_height != w.configured_height ||
-            w.width != width || w.height != height) {
-            w.logical_width = w.configured_width;
-            w.logical_height = w.configured_height;
-            w.width = width; w.height = height;
-            w.resized = 1;
-            let is event.Event as e;
-            event.clear(&e); e.kind = event.RESIZE; e.width = w.width; e.height = w.height;
-            _queue(w, &e);
-        }
+    let is i64 as logical_w with mut = w.logical_width;
+    let is i64 as logical_h with mut = w.logical_height;
+    let is i64 as shadow_w with mut = 0;
+    let is i64 as shadow_h with mut = 0;
+    if (w.state == 0) {
+        shadow_w = _scale_down(w.ext_left + w.ext_right, w.scale120);
+        shadow_h = _scale_down(w.ext_top + w.ext_bottom, w.scale120);
+    }
+    if (w.configured_width > 0) { logical_w = w.configured_width + shadow_w; }
+    else if (w.state == 0 && w.old_state != 0 && w.normal_width > 0) { logical_w = w.normal_width; }
+    if (w.configured_height > 0) { logical_h = w.configured_height + shadow_h; }
+    else if (w.state == 0 && w.old_state != 0 && w.normal_height > 0) { logical_h = w.normal_height; }
+    let is i64 as width with mut = _scale_up(logical_w, w.scale120);
+    let is i64 as height with mut = _scale_up(logical_h, w.scale120);
+    // A compositor may leave the size to the client, including after the
+    // toolkit publishes a larger minimum for its client-side frame.
+    if (w.state == 0 && width < w.min_width) {
+        logical_w = (w.min_width * 120 + w.scale120 - 1) / w.scale120;
+        width = _scale_up(logical_w, w.scale120);
+    }
+    if (w.state == 0 && height < w.min_height) {
+        logical_h = (w.min_height * 120 + w.scale120 - 1) / w.scale120;
+        height = _scale_up(logical_h, w.scale120);
+    }
+    if (logical_w > 0 && logical_h > 0 &&
+        (w.logical_width != logical_w || w.logical_height != logical_h ||
+         w.width != width || w.height != height)) {
+        w.logical_width = logical_w;
+        w.logical_height = logical_h;
+        w.width = width; w.height = height;
+        w.resized = 1;
+        let is event.Event as e;
+        event.clear(&e); e.kind = event.RESIZE; e.width = w.width; e.height = w.height;
+        _queue(w, &e);
     }
     if (w.state != w.old_state) {
         w.old_state = w.state;
@@ -2175,9 +2353,9 @@ fn resized(w as *Window) as i32 { return w.resized; }
 
 fn next_frame(w as *Window) as i32 {
     if (w.opened == 0) { return 0; }
-    if (w.mapped == 0) { w.mapped = 1; return 1; }
+    if (w.mapped == 0) { w.mapped = 1; w.frame_ready = 1; return 1; }
     if (w.event_len > 0) { return 1; }
-    if (w.frame_ready == 1) { w.frame_ready = 0; w.resized = 0; return 1; }
+    if (w.frame_ready == 1) { w.resized = 0; return 1; }
     w.resized = 0;
     if (w.close_requested == 1) { return 0; }
     while (w.frame_ready == 0 && w.resized == 0 && w.event_len == 0 && w.close_requested == 0) {
@@ -2185,7 +2363,7 @@ fn next_frame(w as *Window) as i32 {
         _apply_configure(w);
     }
     if (w.resized == 1 || w.event_len > 0) { return 1; }
-    if (w.frame_ready == 1) { w.frame_ready = 0; return 1; }
+    if (w.frame_ready == 1) { return 1; }
     return cast(i32, w.close_requested == 0);
 }
 
@@ -2211,6 +2389,7 @@ fn request_close(w as *Window) as void {
 fn acquire(w as *Window) as tgt.Target {
     let is tgt.Target as t;
     t.color = cast(*u8, 0); t.depth = cast(*u8, 0); t.width = 0; t.height = 0;
+    w.current = 0 - 1;
     if (w.opened == 0) { return t; }
     if (w.buffer_width != w.width || w.buffer_height != w.height) {
         pump(w);
@@ -2234,7 +2413,6 @@ fn acquire(w as *Window) as tgt.Target {
     while (i < BUFFER_COUNT && w.buffers[i].busy == 1) { i = i + 1; }
     if (i >= BUFFER_COUNT) { return t; }
     w.current = i;
-    w.buffers[i].busy = 1;
     t.color = cast(*u8, cast(i64, w.pixels) + i * w.bytes);
     t.width = w.width; t.height = w.height;
     return t;
@@ -2261,7 +2439,7 @@ fn _set_window_geometry(w as *Window, with_extents as i32) as i32 {
 
 
 fn submit(w as *Window) as void {
-    if (w.opened == 0 || w.buffers[w.current].busy == 0) { return; }
+    if (w.opened == 0 || w.current < 0 || w.buffers[w.current].busy == 1) { return; }
     if (_set_window_geometry(w, cast(i32, (w.state & (event.STATE_MAXIMIZED | event.STATE_FULLSCREEN |
         event.STATE_TILED_LEFT | event.STATE_TILED_RIGHT | event.STATE_TILED_TOP |
         event.STATE_TILED_BOTTOM)) == 0)) == 0) { return; }
@@ -2298,7 +2476,8 @@ fn submit(w as *Window) as void {
     w.buffers[w.current].busy = 1;
     w.last_buffer = w.current;
     w.visible = 1; w.resize_detached = 0;
-    w.current = (w.current + 1) % BUFFER_COUNT;
+    w.frame_ready = 0;
+    w.current = 0 - 1;
 }
 
 fn hide(w as *Window) as void {
@@ -2407,6 +2586,7 @@ fn set_frame_extents(w as *Window, left as i64, right as i64, top as i64, bottom
     if (w.opened == 0 || left < 0 || right < 0 || top < 0 || bottom < 0 ||
         left + right >= w.width || top + bottom >= w.height) { return 0; }
     w.ext_left = left; w.ext_right = right; w.ext_top = top; w.ext_bottom = bottom;
+    _apply_configure(w);
     return _set_window_geometry(w, cast(i32, (w.state & (event.STATE_MAXIMIZED | event.STATE_FULLSCREEN |
         event.STATE_TILED_LEFT | event.STATE_TILED_RIGHT | event.STATE_TILED_TOP |
         event.STATE_TILED_BOTTOM)) == 0));
@@ -2480,6 +2660,7 @@ fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
     _put(&p[4], cast(u32, (height * 120 + w.scale120 - 1) / w.scale120));
     if (_send(w, w.toplevel, 8, &p[0], 8, 0 - 1) == 0 || _surface_commit(w) == 0) { return 0; }
     w.min_width = width; w.min_height = height;
+    _apply_configure(w);
     return 1;
 }
 
@@ -2501,7 +2682,7 @@ fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
 }
 
 fn set_maximized(w as *Window, on as i32) as i32 {
-    if (w.opened == 0 || _set_window_geometry(w, 0) == 0) { return 0; }
+    if (w.opened == 0) { return 0; }
     let is i32 as op with mut = 10;
     if (on != 0) { op = 9; }
     if (_send(w, w.toplevel, op, cast(*u8, 0), 0, 0 - 1) == 0) { return 0; }
@@ -2509,7 +2690,7 @@ fn set_maximized(w as *Window, on as i32) as i32 {
 }
 
 fn set_fullscreen(w as *Window, on as i32) as i32 {
-    if (w.opened == 0 || _set_window_geometry(w, 0) == 0) { return 0; }
+    if (w.opened == 0) { return 0; }
     if (on == 0) {
         if (_send(w, w.toplevel, 12, cast(*u8, 0), 0, 0 - 1) == 0) { return 0; }
         return _surface_commit(w);
@@ -2572,47 +2753,65 @@ fn text_input_rect(w as *Window, x as i64, y as i64, width as i64, height as i64
 
 
 fn close(w as *Window) as void {
-    if (w.fd < 0) { return; }
     let is [0]u8 as empty;
-        _cancel_transfer(w);
-        let is i32 as data_i with mut = 0;
-        while (data_i < MAX_DATA) {
-            if (w.offers[data_i].object != 0) { _offer_release(w, data_i, 1); }
-            if (w.sources[data_i].object != 0) { _source_release(w, data_i, 1); }
-            data_i = data_i + 1;
-        }
-        if (w.data_device != 0) { _send(w, w.data_device, 2, &empty[0], 0, 0 - 1); }
-        if (w.primary_device != 0) { _send(w, w.primary_device, 1, &empty[0], 0, 0 - 1); }
-        if (w.text_input != 0) { _send(w, w.text_input, 0, &empty[0], 0, 0 - 1); }
-        if (w.text_input_manager != 0) { _send(w, w.text_input_manager, 0, &empty[0], 0, 0 - 1); }
-    if (w.opened == 1) {
-        if (w.cursor_shape_device != 0) {
-            _send(w, w.cursor_shape_device, 0, &empty[0], 0, 0 - 1);
-        }
-        if (w.cursor_shape_manager != 0) {
-            _send(w, w.cursor_shape_manager, 0, &empty[0], 0, 0 - 1);
-        }
-        if (w.viewport != 0) { _send(w, w.viewport, 0, &empty[0], 0, 0 - 1); }
-        if (w.fractional_surface != 0) { _send(w, w.fractional_surface, 0, &empty[0], 0, 0 - 1); }
-        if (w.viewporter != 0) { _send(w, w.viewporter, 0, &empty[0], 0, 0 - 1); }
-        if (w.fractional_manager != 0) { _send(w, w.fractional_manager, 0, &empty[0], 0, 0 - 1); }
-        _send(w, w.toplevel, 0, &empty[0], 0, 0 - 1);
-        _send(w, w.xdg_surface, 0, &empty[0], 0, 0 - 1);
-        _send(w, w.surface, 0, &empty[0], 0, 0 - 1);
-        _send(w, w.wm_base, 0, &empty[0], 0, 0 - 1);
-        _send(w, w.registry, 0, &empty[0], 0, 0 - 1);
+    _cancel_transfer(w);
+    let is i32 as data_i with mut = 0;
+    while (data_i < MAX_DATA) {
+        if (w.offers[data_i].object != 0) { _offer_release(w, data_i, 1); }
+        if (w.sources[data_i].object != 0) { _source_release(w, data_i, 1); }
+        data_i = data_i + 1;
     }
+    if (w.data_device != 0) { _send(w, w.data_device, 2, &empty[0], 0, 0 - 1); }
+    if (w.primary_device != 0) { _send(w, w.primary_device, 1, &empty[0], 0, 0 - 1); }
+    if (w.text_input != 0) { _send(w, w.text_input, 0, &empty[0], 0, 0 - 1); }
+    if (w.cursor_shape_device != 0) {
+        _send(w, w.cursor_shape_device, 0, &empty[0], 0, 0 - 1);
+    }
+    if (w.viewport != 0) { _send(w, w.viewport, 0, &empty[0], 0, 0 - 1); }
+    if (w.fractional_surface != 0) { _send(w, w.fractional_surface, 0, &empty[0], 0, 0 - 1); }
+    if (w.toplevel_decoration != 0) { _send(w, w.toplevel_decoration, 0, &empty[0], 0, 0 - 1); }
+    if (w.dialog != 0) { _send(w, w.dialog, 0, &empty[0], 0, 0 - 1); }
+    if (w.toplevel != 0) { _send(w, w.toplevel, 0, &empty[0], 0, 0 - 1); }
+    if (w.xdg_surface != 0) { _send(w, w.xdg_surface, 0, &empty[0], 0, 0 - 1); }
+    if (w.surface != 0) { _send(w, w.surface, 0, &empty[0], 0, 0 - 1); }
+    if (w.pool != 0) { _send(w, w.pool, 1, &empty[0], 0, 0 - 1); w.pool = 0; }
+    if (w.memfd >= 0) { linux.close(w.memfd); w.memfd = 0 - 1; }
     _destroy_buffers(w);
     if (cast(i64, w.received_text) != 0) { mem.core.munmap(w.received_text, MAX_TEXT + 1); }
     if (cast(i64, w.drop_storage) != 0) { mem.core.munmap(w.drop_storage, DROP_STORAGE_BYTES); }
-    linux.close(w.fd);
-    w.fd = 0 - 1; w.opened = 0;
+    w.received_text = cast(*u8, 0); w.drop_storage = cast(*u8, 0);
+    if (w.pointer != 0 && w.pointer_version >= 3) { _send(w, w.pointer, 1, &empty[0], 0, 0 - 1); }
+    if (w.keyboard != 0 && w.seat_version >= 3) { _send(w, w.keyboard, 0, &empty[0], 0, 0 - 1); }
+    if (w.seat != 0 && w.seat_version >= 5) { _send(w, w.seat, 3, &empty[0], 0, 0 - 1); }
+    let is i32 as output_i with mut = 0;
+    while (output_i < w.output_count) {
+        if (w.outputs[output_i].object != 0 && w.outputs[output_i].version >= 3) {
+            _send(w, w.outputs[output_i].object, 0, &empty[0], 0, 0 - 1);
+        }
+        output_i = output_i + 1;
+    }
+    if (cast(i64, w.compose_state) != 0) { xkb.xkb_compose_state_unref(w.compose_state); }
+    if (cast(i64, w.compose_table) != 0) { xkb.xkb_compose_table_unref(w.compose_table); }
+    if (cast(i64, w.xkb_state) != 0) { xkb.xkb_state_unref(w.xkb_state); }
+    if (cast(i64, w.xkb_keymap) != 0) { xkb.xkb_keymap_unref(w.xkb_keymap); }
+    if (cast(i64, w.xkb_context) != 0) { xkb.xkb_context_unref(w.xkb_context); }
+    w.compose_state = cast(*u8, 0); w.compose_table = cast(*u8, 0);
+    w.xkb_state = cast(*u8, 0); w.xkb_keymap = cast(*u8, 0); w.xkb_context = cast(*u8, 0);
     let is i32 as i with mut = 0;
     while (i < RETIRED_COUNT) {
         if (cast(i64, w.retired[i].pixels) != 0) {
+            let is i32 as retired_i with mut = 0;
+            while (retired_i < BUFFER_COUNT) {
+                if (w.retired[i].buffers[retired_i].object != 0) {
+                    _send(w, w.retired[i].buffers[retired_i].object, 0, &empty[0], 0, 0 - 1);
+                }
+                retired_i = retired_i + 1;
+            }
             linux.munmap(w.retired[i].pixels, w.retired[i].bytes * BUFFER_COUNT);
         }
         mem.memzero(cast(*u8, &w.retired[i]), sizeof(BufferSet));
         i = i + 1;
     }
+    _disconnect(w);
+    w.fd = 0 - 1; w.opened = 0;
 }

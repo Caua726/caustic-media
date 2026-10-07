@@ -51,13 +51,69 @@ fn main() as i32 {
         io.printf("FAIL: data source send socketpair\n");
         return 1;
     }
-    owner.recv_fds[0] = sent_pair[0]; owner.recv_fd_count = 1;
-    wayland._source_event(&owner, source, 1, 0);
+    // Ancillary descriptors belong to the ordered protocol FD stream, not
+    // necessarily to the first message in a compositor's sendmsg batch.
+    let is [36]u8 as batch;
+    mem.memzero(&batch[0], 36);
+    put(&batch[0], 0, cast(u32, source)); put(&batch[0], 4, 12 << 16);
+    put(&batch[0], 8, 0);
+    put(&batch[0], 12, cast(u32, source)); put(&batch[0], 16, cast(u32, (24 << 16) | 1));
+    put(&batch[0], 20, 11);
+    mem.memcpy(&batch[24], "text/plain", 11);
+    check("compositor batches a non-FD event before selection send",
+          sys.send_fds(pair[1], &batch[0], 36, &sent_pair[0], 1) == 36);
     linux.close(sent_pair[0]);
+    check("client dispatches both batched events",
+          wayland._pump_one(&owner, 0) == 1 && wayland._pump_one(&owner, 0) == 1);
     let is [16]u8 as served;
-    let is i64 as served_len = linux.read(sent_pair[1], &served[0], 16);
-    check("data source sends the retained selection bytes", served_len == 6 && mem.memcmp(&served[0], "sample", 6) == 0);
+    let is i64 as served_len with mut = 0 - 1;
+    if (sys.wait_readable(sent_pair[1], 0) > 0) { served_len = linux.read(sent_pair[1], &served[0], 16); }
+    check("batched source send retains its descriptor and exact selection bytes",
+          served_len == 6 && mem.memcmp(&served[0], "sample", 6) == 0);
     linux.close(sent_pair[1]);
+    // Events already queued for released keyboard/source objects must consume
+    // their FDs without stealing the following live selection's descriptor.
+    owner.seat = 13; owner.seat_version = 7;
+    wayland._seat_capabilities(&owner, 2);
+    let is i32 as old_keyboard = owner.keyboard;
+    wayland._seat_capabilities(&owner, 0);
+    wayland._source_release(&owner, wayland._source_index(&owner, source), 1);
+    check("replacement selection is accepted",
+          wayland.clipboard_set(&owner, 0, "new value", 9) == 1);
+    let is [2]i32 as key_pair;
+    let is [2]i32 as old_pair;
+    let is [2]i32 as live_pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &key_pair[0]) < 0 ||
+        sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &old_pair[0]) < 0 ||
+        sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &live_pair[0]) < 0) {
+        io.printf("FAIL: pending descriptor socketpairs\n");
+        return 1;
+    }
+    let is [64]u8 as pending;
+    mem.memzero(&pending[0], 64);
+    put(&pending[0], 0, cast(u32, old_keyboard)); put(&pending[0], 4, 16 << 16);
+    put(&pending[0], 16, cast(u32, source)); put(&pending[0], 20, cast(u32, (24 << 16) | 1));
+    put(&pending[0], 24, 11); mem.memcpy(&pending[28], "text/plain", 11);
+    put(&pending[0], 40, cast(u32, owner.clip_source)); put(&pending[0], 44, cast(u32, (24 << 16) | 1));
+    put(&pending[0], 48, 11); mem.memcpy(&pending[52], "text/plain", 11);
+    let is [3]i32 as pending_fds;
+    pending_fds[0] = key_pair[0]; pending_fds[1] = old_pair[0]; pending_fds[2] = live_pair[0];
+    check("compositor queues old and live FD-bearing events together",
+          sys.send_fds(pair[1], &pending[0], 64, &pending_fds[0], 3) == 64);
+    linux.close(key_pair[0]); linux.close(old_pair[0]); linux.close(live_pair[0]);
+    check("pending events are consumed in protocol order",
+          wayland._pump_one(&owner, 0) == 1 && wayland._pump_one(&owner, 0) == 1 &&
+          wayland._pump_one(&owner, 0) == 1);
+    let is i64 as key_eof with mut = 0 - 1;
+    let is i64 as old_eof with mut = 0 - 1;
+    let is i64 as live_len with mut = 0 - 1;
+    if (sys.wait_readable(key_pair[1], 0) > 0) { key_eof = linux.read(key_pair[1], &served[0], 16); }
+    if (sys.wait_readable(old_pair[1], 0) > 0) { old_eof = linux.read(old_pair[1], &served[0], 16); }
+    if (sys.wait_readable(live_pair[1], 0) > 0) { live_len = linux.read(live_pair[1], &served[0], 16); }
+    check("released objects close their descriptors without sending another selection", key_eof == 0 && old_eof == 0);
+    check("live selection keeps its own descriptor and exact replacement bytes",
+          live_len == 9 && mem.memcmp(&served[0], "new value", 9) == 0);
+    linux.close(key_pair[1]); linux.close(old_pair[1]); linux.close(live_pair[1]);
 
     linux.close(owner.fd); linux.close(pair[1]);
 
@@ -69,10 +125,24 @@ fn main() as i32 {
     let is wayland.Window as receiver;
     wayland._zero(&receiver);
     receiver.fd = request_pair[0]; receiver.opened = 1;
-    receiver.data_device = 12; receiver.clipboard_offer = 42;
-    receiver.offers[0].object = 42; receiver.offers[0].text_mime = 2;
+    receiver.data_device = 12;
+    // Compositor-created objects use the unsigned high-ID namespace.
+    let is [48]u8 as offered;
+    mem.memzero(&offered[0], 48);
+    put(&offered[0], 0, 12); put(&offered[0], 4, 12 << 16); put(&offered[0], 8, 0xff000042);
+    put(&offered[0], 12, 0xff000042); put(&offered[0], 16, 24 << 16); put(&offered[0], 20, 12);
+    mem.memcpy(&offered[24], "UTF8_STRING", 12);
+    put(&offered[0], 36, 12); put(&offered[0], 40, cast(u32, (12 << 16) | 5)); put(&offered[0], 44, 0xff000042);
+    check("compositor advertises an external selection in its object namespace",
+          linux.write(request_pair[1], &offered[0], 48) == 48);
+    check("high-ID MIME events are dispatched before the selection is received",
+          wayland._pump_one(&receiver, 0) == 1 && wayland._pump_one(&receiver, 0) == 1 &&
+          wayland._pump_one(&receiver, 0) == 1);
     check("external clipboard request starts a pending transfer",
           wayland.clipboard_request(&receiver, 0) == 1 && wayland.clipboard_pending(&receiver) == 1);
+    if (wayland.clipboard_pending(&receiver) == 0) {
+        linux.close(receiver.fd); linux.close(request_pair[1]); return 1;
+    }
 
     let is [256]u8 as wire;
     let is [16]i32 as received_fds;

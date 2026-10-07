@@ -116,10 +116,24 @@ in the address space.
 
 ## Native handles
 
+The raw client exposes a socket descriptor and protocol object IDs, not
+`wl_display*` or `wl_surface*` pointers from `libwayland-client`:
+
 ```cst
-window.wayland.display(&w)   // wl_display*  -> VK_KHR_wayland_surface, EGL
-window.wayland.surface(&w)   // wl_surface*
+let is backend.Window as w with mut;
+if (backend.open(&w, "Example", 640, 480) == 1) {
+    let is i64 as fd = backend.native_fd(&w);
+    let is i32 as surface_id = backend.native_surface(&w);
+    let is i32 as toplevel_id = backend.native_toplevel(&w);
+    // Pump, paint and close w before its storage goes away.
+    backend.close(&w);
+}
 ```
+
+`backend` above is `window/wayland/backend.cst`. These IDs cannot be passed to
+EGL or `VK_KHR_wayland_surface` as native library pointers. `open_config`
+also takes caller-owned `*Window` storage and returns success; the address
+must remain stable until `close`. The portable device owns that storage.
 
 ---
 
@@ -132,6 +146,18 @@ frame pacing, output and fractional scale, constraints, decorations, dialogs,
 cursors, keyboard/pointer input, text selections, and file/text drag-and-drop.
 The portable `window/device.cst` and `ui/host.cst` use it to open and paint
 toolkit windows.
+
+All live windows share one connection, registry and client object namespace.
+This lets native dialogs refer to their parent's actual object ID. The last
+close releases the shared globals and connection; closing the first window
+does not invalidate its siblings. Capacity is 64 windows and 8191 nonzero
+client IDs, recycled only after `wl_display.delete_id`. Ancillary descriptors
+form a connection-wide FIFO: intervening messages do not discard them, and
+late events for released keyboards or data sources close their descriptors.
+Connection state is single-threaded: open, pump and close from the owning
+application loop. A normal buffer grows to the toolkit's published minimum
+when the compositor leaves sizing to the client; maximize/fullscreen sizing
+remains compositor-controlled.
 
 Optional globals degrade independently. Clipboard and DnD require
 `wl_data_device_manager`; primary selection requires
@@ -146,16 +172,24 @@ surrounding text, so IME suggestions that need surrounding context are limited.
 
 `caustic-mk run test-wayland` checks the generated protocol catalog, exercises
 clipboard/DnD and text-input-v3 through internal wire tests, opens and presents
-windows on Weston at scale 1 and 2, and runs the toolkit application loop on
-Weston until a timer closes its window. The headless Weston used here does not
-provide a keyboard/pointer seat; real key, clipboard, DnD and IME interaction
-therefore remains unverified by this test. The current smoke proves surface,
-frame, timer and toolkit-host integration, not real desktop input.
+windows on Weston at scale 1 and 2, and runs the toolkit application loop.
+Native regressions cover parent/child and independent-window lifetimes,
+abandoned acquisitions, presentation permits, maximize/fullscreen frames and
+normal-size restoration.
+The toolkit regression checks that dialogs fit their native buffer and stay
+below their client-side header. The headless Weston has no keyboard/pointer
+seat; it cannot prove desktop clipboard, DnD or IME interaction.
 
-A separate seated Weston/X11 smoke showed the file browser on the compositor.
-The settings form and editor did not become visible in that run; their normal
-startup and keyboard interaction are not accepted as verified. This is not
-three-example platform parity. Presentation sends explicit surface damage
+A separate Weston/X11 software-rendering smoke uses a real compositor seat,
+with XTest keyboard and pointer input. The editor accepts typing and Ctrl+A,
+opens Preferences with Ctrl+, and resumes input after its dialog is closed.
+The settings form accepts text and Tab; header maximize/restore preserves
+its original buffer size. The browser accepts an edited directory path and
+scrolls its table. Closing the modified settings form shows its native
+confirmation dialog; selecting No exits cleanly. Screenshots establish the
+visible native surfaces and client-side frames. External desktop clipboard,
+DnD and installed IME interaction remain unverified. Presentation sends
+explicit surface damage
 before the frame request and commit, including when a buffer is reused.
 
 Regenerate the protocol inventory from XML with
