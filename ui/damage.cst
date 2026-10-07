@@ -24,13 +24,143 @@
 //       ... paint the region, present it ...
 //       tree.damage_clear(&t);
 //   }
+use "std/math.cst" as fm;
 use "../math/math.cst" as math;
 use "tree.cst" as tree;
+use "style.cst" as style;
+use "router.cst" as router;
 use "layout.cst" as layout;
 
 fn _same(a as math.rect.Rect, b as math.rect.Rect) as i32 {
     if (a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h) { return 1; }
     return 0;
+}
+
+// --- Moving what is drawn (tree.shift_request) ---
+//
+// A scroll area's ask to move its pixels is taken when nothing but what it
+// holds is drawn over them: no widget on a layer above, no ancestor drawn
+// through a texture or drawing over its children, nothing drawn after the
+// area reaching them, the area where it was. Then what moved with its
+// content is not damaged — its pixels go with the move — and the area damages
+// what it shows less what the move covers: what comes into view, its bars,
+// its edges. Where a focus ring round the area or round something holding
+// it is shown — or goes, or comes, this frame — its edges are kept from
+// moving by a band as deep as the ring reaches into it, its corners' arcs and
+// their soft edge included: the ring is drawn there and must stay put. A
+// ring round what the area holds moves with it, as its pixels do.
+
+fn _ring_band(t as *tree.Tree, w as i64) as f64 {
+    let is i64 as f with mut = 0;
+    let is *router.Router as r = cast(*router.Router, tree.router(t));
+    if (cast(i64, r) != 0 && router.focus_visible(r) == 1) { f = router.focused(t, r); }
+    let is i64 as a with mut = w;
+    while (a != 0) {
+        if (a == f || tree.needs_paint(t, a) == 1) {
+            let is *style.Theme as th = tree.theme(t);
+            return th.metrics.focus_offset + th.metrics.focus_width + th.metrics.focus_radius + 1.0;
+        }
+        a = tree.parent(t, a);
+    }
+    return 0.0;
+}
+
+struct Shift {
+    w  as i64;              // the area whose pixels move; 0 for none
+    dx as f64;              // how far, logical pixels
+    dy as f64;
+    to as math.rect.Rect;   // where the moved pixels land, in the window
+}
+
+fn _moved(r as math.rect.Rect, dx as f64, dy as f64) as math.rect.Rect {
+    return math.rect.rect(r.x + dx, r.y + dy, r.w, r.h);
+}
+
+// r less what lies inside cut, damaged as up to four rectangles.
+fn _damage_outside(t as *tree.Tree, r as math.rect.Rect, cut as math.rect.Rect) as void {
+    let is math.rect.Rect as c = math.rect.rect_intersect(r, cut);
+    if (math.rect.rect_is_empty(c) == 1) {
+        tree.damage_add(t, &r);
+        return;
+    }
+    let is math.rect.Rect as top = math.rect.rect(r.x, r.y, r.w, c.y - r.y);
+    let is math.rect.Rect as bottom = math.rect.rect(r.x, c.y + c.h, r.w, r.y + r.h - c.y - c.h);
+    let is math.rect.Rect as left = math.rect.rect(r.x, c.y, c.x - r.x, c.h);
+    let is math.rect.Rect as right = math.rect.rect(c.x + c.w, c.y, r.x + r.w - c.x - c.w, c.h);
+    tree.damage_add(t, &top);
+    tree.damage_add(t, &bottom);
+    tree.damage_add(t, &left);
+    tree.damage_add(t, &right);
+}
+
+// r shrunk to whole physical pixels at scale s.
+fn _inward(r as math.rect.Rect, s as f64) as math.rect.Rect {
+    let is f64 as x0 = fm.ceil(r.x * s - 0.000001) / s;
+    let is f64 as y0 = fm.ceil(r.y * s - 0.000001) / s;
+    let is f64 as x1 = fm.floor((r.x + r.w) * s + 0.000001) / s;
+    let is f64 as y1 = fm.floor((r.y + r.h) * s + 0.000001) / s;
+    if (x1 <= x0 || y1 <= y0) { return math.rect.rect_zero(); }
+    return math.rect.rect(x0, y0, x1 - x0, y1 - y0);
+}
+
+// Whether a widget shown over r is drawn after w's pixels: one past w's
+// subtree — so neither in it nor under it — or one on a layer above,
+// wherever it is, where it was painted or where it is laid out now.
+fn _drawn_after(t as *tree.Tree, x as i64, w as i64, r as math.rect.Rect, past as *i32) as i32 {
+    if (x == w) {
+        *past = 1;
+        if (tree.has_layered(t) == 0) { return 0; }
+    }
+    if (tree.is_hidden_here(t, x) == 1) { return 0; }
+    if (x != w && ((*past == 1 && _within(t, x, w) == 0) || tree.layer(t, x) > 0)) {
+        if (math.rect.rect_is_empty(math.rect.rect_intersect(tree.painted(t, x), r)) == 0 ||
+            math.rect.rect_is_empty(math.rect.rect_intersect(layout.window_rect(t, x), r)) == 0) { return 1; }
+    }
+    let is i64 as ch with mut = tree.first_child(t, x);
+    while (ch != 0) {
+        if (_drawn_after(t, ch, w, r, past) == 1) { return 1; }
+        ch = tree.next_sibling(t, ch);
+    }
+    return 0;
+}
+
+// Whether x is in w's subtree.
+fn _within(t as *tree.Tree, x as i64, w as i64) as i32 {
+    let is i64 as a with mut = x;
+    while (a != 0) {
+        if (a == w) { return 1; }
+        a = tree.parent(t, a);
+    }
+    return 0;
+}
+
+// The pixels w asked to move, when they can be: 1, sh filled, and *from the
+// window's rectangle to move — what of w's keep lands inside it again.
+fn _can_shift(t as *tree.Tree, w as i64, dx as f64, dy as f64, keep as math.rect.Rect, sh as *Shift,
+              from as *math.rect.Rect) as i32 {
+    if (dx == 0.0 && dy == 0.0) { return 0; }
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    if (_same(tree.placed(t, w), wr) == 0) { return 0; }
+    let is i64 as a with mut = w;
+    while (a != 0) {
+        if (tree.is_textured(t, a) == 1) { return 0; }
+        if (a != w && cast(i64, tree.kind(t, a).paint_over) != 0) { return 0; }
+        a = tree.parent(t, a);
+    }
+    let is f64 as band = _ring_band(t, w);
+    let is math.rect.Rect as kept = math.rect.rect(wr.x + keep.x + band, wr.y + keep.y + band,
+                                                   keep.w - 2.0 * band, keep.h - 2.0 * band);
+    let is math.rect.Rect as at = _inward(math.rect.rect_intersect(kept, tree.painted(t, w)), layout.scale(t));
+    let is math.rect.Rect as src = math.rect.rect_intersect(at, _moved(at, 0.0 - dx, 0.0 - dy));
+    if (math.rect.rect_is_empty(src) == 1) { return 0; }
+    let is i32 as past with mut = 0;
+    if (_drawn_after(t, tree.root(t), w, at, &past) == 1) { return 0; }
+    sh.w = w;
+    sh.dx = dx;
+    sh.dy = dy;
+    sh.to = _moved(src, dx, dy);
+    *from = src;
+    return 1;
 }
 
 // Walks w's subtree; ox, oy is the parent's window position, shown whether
@@ -50,7 +180,7 @@ fn _same(a as math.rect.Rect, b as math.rect.Rect) as i32 {
 // not for moving within the outer one: that is the outer's to paint again.
 fn _visit(t as *tree.Tree, w as i64, ox as f64, oy as f64, shown as i32,
           clip0 as math.rect.Rect, layer0 as i64,
-          cached0 as i64, cdx0 as f64, cdy0 as f64) as void {
+          cached0 as i64, cdx0 as f64, cdy0 as f64, sh as *Shift, inside as i32) as void {
     let is i32 as here with mut = shown;
     if (tree.is_hidden_here(t, w) == 1) { here = 0; }
     let is math.rect.Rect as clip with mut = clip0;
@@ -85,7 +215,22 @@ fn _visit(t as *tree.Tree, w as i64, ox as f64, oy as f64, shown as i32,
         cdy = now.y - placed.y;
     }
     if (here == 1) {
-        if (_same(tree.placed(t, w), now) == 0) {
+        if (sh.w != 0 && w == sh.w) {
+            // The area whose pixels move: what it shows, less where they land.
+            _damage_outside(t, vis, sh.to);
+        } else if (inside == 1) {
+            // In it: moved along with the content, nothing to do — its
+            // pixels went with the move. Otherwise where it was (and where
+            // that went) and where it is.
+            let is i32 as along = cast(i32, now.x - placed.x == sh.dx && now.y - placed.y == sh.dy &&
+                                            now.w == placed.w && now.h == placed.h);
+            if (tree.needs_paint(t, w) == 1 || (along == 0 && _same(placed, now) == 0)) {
+                let is math.rect.Rect as went = _moved(was, sh.dx, sh.dy);
+                tree.damage_add(t, &was);
+                tree.damage_add(t, &went);
+                tree.damage_add(t, &vis);
+            }
+        } else if (_same(tree.placed(t, w), now) == 0) {
             tree.damage_add(t, &was);
             tree.damage_add(t, &vis);
         } else if (tree.needs_paint(t, w) == 1) {
@@ -94,14 +239,19 @@ fn _visit(t as *tree.Tree, w as i64, ox as f64, oy as f64, shown as i32,
         tree.set_painted(t, w, now, vis);
     } else {
         // Off screen now: where it was is uncovered, and nothing of it is
-        // painted until it is shown again.
+        // painted until it is shown again — nor where its pixels were moved.
         tree.damage_add(t, &was);
+        if (inside == 1) {
+            let is math.rect.Rect as went = _moved(was, sh.dx, sh.dy);
+            tree.damage_add(t, &went);
+        }
         tree.set_painted(t, w, math.rect.rect_zero(), math.rect.rect_zero());
     }
     tree.clear_paint(t, w);
+    let is i32 as within = cast(i32, inside == 1 || (sh.w != 0 && w == sh.w));
     let is i64 as ch with mut = tree.first_child(t, w);
     while (ch != 0) {
-        _visit(t, ch, now.x, now.y, here, vis, layer, cached, cdx, cdy);
+        _visit(t, ch, now.x, now.y, here, vis, layer, cached, cdx, cdy, sh, within);
         ch = tree.next_sibling(t, ch);
     }
 }
@@ -112,7 +262,35 @@ fn _visit(t as *tree.Tree, w as i64, ox as f64, oy as f64, shown as i32,
 fn collect(t as *tree.Tree) as i64 {
     if (tree.paint_wanted(t) == 0) { return tree.damage_count(t); }
     let is i64 as root = tree.root(t);
-    _visit(t, root, 0.0, 0.0, 1, layout.rect(t, root), 0, 0, 0.0, 0.0);
+    // A scroll area's pixels to move, if it asked and they can be.
+    let is Shift as sh;
+    sh.w = 0;
+    sh.dx = 0.0;
+    sh.dy = 0.0;
+    sh.to = math.rect.rect_zero();
+    let is math.rect.Rect as from with mut = math.rect.rect_zero();
+    let is f64 as dx with mut = 0.0;
+    let is f64 as dy with mut = 0.0;
+    let is math.rect.Rect as keep with mut = math.rect.rect_zero();
+    let is i64 as asked = tree.shift_asked(t, &dx, &dy, &keep);
+    let is i32 as ok with mut = 0;
+    if (asked != 0 && tree.moves(t) == 1) { ok = _can_shift(t, asked, dx, dy, keep, &sh, &from); }
+    tree.set_shifted(t, ok, from);
+    _visit(t, root, 0.0, 0.0, 1, layout.rect(t, root), 0, 0, 0.0, 0.0, &sh, 0);
+    // A caret that blinked: where it is now, laid out and moved, as its kind
+    // says — else all of what it is in.
+    let is i64 as bw = tree.blinked(t);
+    if (tree.is_valid(t, bw) == 1) {
+        let is math.rect.Rect as vis = tree.painted(t, bw);
+        let is math.rect.Rect as cr with mut = vis;
+        let is *tree.Kind as k = tree.kind(t, bw);
+        if (cast(i64, k.caret) != 0) {
+            let is math.rect.Rect as got with mut = math.rect.rect_zero();
+            cr = math.rect.rect_zero();
+            if (call(k.caret, t, bw, tree.data(t, bw), &got) == 1) { cr = math.rect.rect_intersect(got, vis); }
+        }
+        tree.damage_add(t, &cr);
+    }
     tree.damage_clip(t, layout.rect(t, root));
     return tree.damage_count(t);
 }

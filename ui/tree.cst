@@ -145,6 +145,9 @@ type AccessFn  = fn(*Tree, i64, *u8, *Access) as i64;
 // coordinates: a SHAPE_ below, or SHAPE_INHERIT for its parent's to decide.
 // See router.pointer_shape.
 type ShapeFn   = fn(*Tree, i64, *u8, *math.vec.Vec2) as i32;
+// Where a text widget's caret is now, in the window — what to draw again
+// when it blinks: 1 and *out, or 0 for no caret shown.
+type CaretFn   = fn(*Tree, i64, *u8, *math.rect.Rect) as i32;
 
 // --- Pointer shapes ---
 //
@@ -202,6 +205,7 @@ struct Kind {
     shape      as ShapeFn;   // the pointer's shape over it; null for its parent's
     paint_over as PaintFn;   // drawn after its children, over them: a scroll area's bars
     text       as TextFn;    // its text, to assistive technology; null for none (access.text_of)
+    caret      as CaretFn;   // where its caret is: drawn again alone when it blinks; null for all of it
 }
 
 // A widget's text asked of it, or something done to it (TEXT_*), by
@@ -377,6 +381,15 @@ struct Tree {
     damage        as [16]math.rect.Rect;
     damage_n      as i64;
     paint_wanted  as i64;   // anything changed since damage_clear
+    shift_w       as i64;   // the scroll area that asked to move its pixels this frame; see shift_request
+    shift_n       as i64;   // how many asked: more than one, none moved
+    shift_dx      as f64;   // how far its content moved, logical pixels
+    shift_dy      as f64;
+    shift_keep    as math.rect.Rect;   // what of it may move, in its own coordinates
+    shift_ok      as i64;   // damage.collect took the ask
+    blink_w       as i64;   // the widget whose caret blinked since the last frame; see blink
+    moves         as i64;   // the window moves pixels when told (shift); see set_moves
+    shift_at      as math.rect.Rect;   // and moves this, in the window
     scale         as f64;   // physical pixels per logical one; layout.set_scale
     layered       as i64;   // widgets with a layer above 0
     theme         as *style.Theme;   // the program's; null for the default. See set_theme
@@ -473,6 +486,9 @@ fn open(l as *Limits) as Tree {
     t.emitting = 0;
     t.damage_n = 0;
     t.paint_wanted = 0;
+    _shift_reset(&t);
+    t.blink_w = 0;
+    t.moves = 0;
     t.scale = 1.0;
     t.layered = 0;
     t.theme = cast(*style.Theme, 0);
@@ -548,6 +564,7 @@ fn open(l as *Limits) as Tree {
     _root_kind.access = cast(AccessFn, 0);
     _root_kind.shape = cast(ShapeFn, 0);
     _root_kind.paint_over = cast(PaintFn, 0);
+    _root_kind.caret = cast(CaretFn, 0);
     _default_theme = style.light();
     t.root = _claim(&t, &_root_kind);
     return t;
@@ -1206,15 +1223,17 @@ fn set_painted(t as *Tree, w as i64, at as math.rect.Rect, shown as math.rect.Re
 
 fn _area(r as math.rect.Rect) as f64 { return r.w * r.h; }
 
-// Whether two rectangles overlap or share a stretch of edge — merging those
-// costs nothing extra. Touching at a corner only does not count: the box
-// around two such rectangles is twice what they cover.
+// Whether two rectangles that overlap or share a stretch of edge are better
+// painted as their box: when the box is no larger than the two of them, so
+// painting it never costs more than painting both. Two that only touch at a
+// corner, or whose box reaches well past both — a band along a hole's top
+// and one down its side — are kept apart: the box would paint the hole.
 fn _joinable(a as math.rect.Rect, b as math.rect.Rect) as i32 {
     let is f64 as ox = _minf(a.x + a.w, b.x + b.w) - _maxf(a.x, b.x);
     let is f64 as oy = _minf(a.y + a.h, b.y + b.h) - _maxf(a.y, b.y);
     if (ox < 0.0 || oy < 0.0) { return 0; }
-    if (ox > 0.0 || oy > 0.0) { return 1; }
-    return 0;
+    if (ox == 0.0 && oy == 0.0) { return 0; }
+    return cast(i32, _area(math.rect.rect_union(a, b)) <= _area(a) + _area(b) + 0.5);
 }
 
 fn _minf(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
@@ -1297,7 +1316,95 @@ fn want_paint(t as *Tree) as void { t.paint_wanted = 1; }
 fn damage_clear(t as *Tree) as void {
     t.damage_n = 0;
     t.paint_wanted = 0;
+    _shift_reset(t);
+    t.blink_w = 0;
 }
+
+// The caret of w — the widget text is typed into — blinked: drawn again
+// where it is when the frame is collected, as w's kind says (Kind.caret), or
+// all of w when it says nothing. A blink costs its caret, not its text.
+fn blink(t as *Tree, w as i64) as void {
+    if (t.ok == 0 || w == 0) { return; }
+    t.blink_w = w;
+    t.paint_wanted = 1;
+}
+
+// The widget whose caret blinked since the last frame; 0 for none.
+fn blinked(t as *Tree) as i64 { return t.blink_w; }
+
+// --- Moving what is drawn ---
+//
+// Scrolled, a scroll area's content moves while the area stays: what was in
+// view and still is has only moved, and drawing it again is most of what
+// scrolling costs on the software backend. So the area asks to move those
+// pixels instead (shift_request), and damage.collect takes the ask when
+// nothing but what the area holds is drawn over them, damaging only what
+// comes into view, what changed, and the area's own edges. The window then
+// moves the pixels (shift, command.move_region) before painting the damage.
+
+fn _shift_reset(t as *Tree) as void {
+    t.shift_w = 0;
+    t.shift_n = 0;
+    t.shift_dx = 0.0;
+    t.shift_dy = 0.0;
+    t.shift_keep = math.rect.rect_zero();
+    t.shift_ok = 0;
+    t.shift_at = math.rect.rect_zero();
+}
+
+// Whether the window the tree is drawn in moves pixels as shift says before
+// painting the damage over them — as ui/host.cst does. Off, as a tree
+// starts: a scroll area's ask is never taken, and what moved is painted.
+fn set_moves(t as *Tree, on as i32) as void { t.moves = cast(i64, on); }
+
+fn moves(t as *Tree) as i32 { return cast(i32, t.moves); }
+
+// Widget w's content moved dx, dy, logical pixels: the pixels of keep — in
+// w's own coordinates, what of it shows the content, not its bars — may be
+// moved rather than painted again. Asked again by w before the frame, the
+// moves add up; asked by another, neither is moved.
+fn shift_request(t as *Tree, w as i64, dx as f64, dy as f64, keep as *math.rect.Rect) as void {
+    if (t.ok == 0) { return; }
+    t.paint_wanted = 1;
+    if (t.shift_n > 0 && t.shift_w != w) {
+        t.shift_n = t.shift_n + 1;
+        return;
+    }
+    t.shift_w = w;
+    t.shift_n = 1;
+    t.shift_dx = t.shift_dx + dx;
+    t.shift_dy = t.shift_dy + dy;
+    t.shift_keep = *keep;
+}
+
+// The widget whose ask damage.collect is to weigh, with how far and what
+// may move; 0 when none asked, or more than one did.
+fn shift_asked(t as *Tree, dx as *f64, dy as *f64, keep as *math.rect.Rect) as i64 {
+    if (t.shift_n != 1 || is_valid(t, t.shift_w) == 0) { return 0; }
+    *dx = t.shift_dx;
+    *dy = t.shift_dy;
+    *keep = t.shift_keep;
+    return t.shift_w;
+}
+
+// damage.collect's answer: the window's rectangle at to be moved, or none.
+fn set_shifted(t as *Tree, ok as i32, at as math.rect.Rect) as void {
+    t.shift_ok = cast(i64, ok);
+    t.shift_at = at;
+}
+
+// After collect: 1 when the pixels of *r — window coordinates, logical
+// pixels — are to be moved dx, dy before the damage is painted over them.
+fn shift(t as *Tree, r as *math.rect.Rect, dx as *f64, dy as *f64) as i32 {
+    if (t.shift_ok == 0) { return 0; }
+    *r = t.shift_at;
+    *dx = t.shift_dx;
+    *dy = t.shift_dy;
+    return 1;
+}
+
+// Whether any widget is on a layer above 0, shown or not.
+fn has_layered(t as *Tree) as i32 { return cast(i32, t.layered > 0); }
 
 // --- Layers ---
 //

@@ -157,8 +157,12 @@ divided by 255 without a division, opaque fills two pixels a store. Measured
 on the text editor scrolling a full window of text, 1366x740: the raster
 went from 32 ms a frame to 7, the whole frame (layout, paint, raster, the
 copy to X) from 45 ms to about 12. A full repaint of 1920x1080 is still
-over the 8 ms the plan aims at; scrolling by copying what stays in view
-rather than repainting it is what would close that.
+over the 8 ms the plan aims at; what a scrolling window does instead is
+move what stays in view (`command.move_region`, rows moved eight bytes at a
+time in the direction that reads each before it is overwritten) and paint
+the strip that comes in — with draw2d leaving out whatever lies wholly
+outside the clip, and text not looking up glyphs far from it: about 4 ms a
+frame at 1366x740.
 
 ---
 
@@ -174,8 +178,8 @@ rather than repainting it is what would close that.
 4. **SPIR-V interpreter**, for custom shaders and for compute's shader half.
 5. **Tiled multithreading**, once there is something worth parallelising.
 
-Before any of those: scrolling by copying the pixels that stay in view, and
-painting only the strip that comes into it.
+Before any of those: presenting only what changed, which on X11 is still a
+copy of the whole frame and its conversion to the server's order.
 
 ## Current state
 

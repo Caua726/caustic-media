@@ -1,0 +1,353 @@
+// ui/shift_test.cst — a scroll area scrolled by moving what stays in view.
+//
+// Scrolled, a scroll area asks the tree to move its pixels (tree.shift)
+// rather than paint them again; damage.collect takes the ask when nothing
+// else is drawn over them, and then damages only what comes into view and
+// the bars. A window paints into a texture that keeps what it holds, as a
+// real window's does: moved there first (command.move_region), then the
+// damage painted. Every frame is checked against the same frame painted
+// whole, pixel for pixel — and where the ask cannot hold, it is refused and
+// the frame is still right.
+use "std/io.cst" as io;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../render/shapes2d.cst" as shapes;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "layout.cst" as layout;
+use "router.cst" as router;
+use "damage.cst" as damage;
+use "painter.cst" as painter;
+use "style.cst" as style;
+use "paint.cst" as paint;
+use "box.cst" as box;
+use "scroll.cst" as scroll;
+use "anim.cst" as anim;
+use "timer.cst" as timer;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as W with imut = 96;
+let is i64 as H with imut = 80;
+let is [7680]i32 as moved_px with mut;
+let is [7680]i32 as whole_px with mut;
+
+let is gpu.device.Device as dv with mut;
+let is i64 as moved_tex with mut = 0;
+let is i64 as whole_tex with mut = 0;
+let is i64 as cmd with mut = 0;
+let is draw2d.Canvas as cv with mut;
+let is style.Theme as theme with mut;
+let is paint.Options as opts with mut;
+
+// --- A block: a rectangle of colour, with a mark inside its left half ---
+
+struct Block {
+    w     as f64;
+    h     as f64;
+    color as i64;
+}
+
+fn block_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    let is *Block as b = cast(*Block, data);
+    out.min_w = b.w;
+    out.min_h = b.h;
+    out.pref_w = b.w;
+    out.pref_h = b.h;
+    out.max_w = b.w;
+    out.max_h = b.h;
+}
+
+fn block_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    let is *Block as b = cast(*Block, data);
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, style.hex(b.color));
+    shapes.fill_rect(p.canvas, p.rect.x + 3.0, p.rect.y + 2.0, 5.0, p.rect.h - 4.0, style.hex(b.color ^ 16777215));
+}
+
+let is tree.Kind as block_kind with mut;
+
+fn block(t as *tree.Tree, parent as i64, w as f64, h as f64, color as i64) as i64 {
+    let is i64 as b = tree.create(t, &block_kind, parent);
+    let is *Block as d = cast(*Block, tree.data(t, b));
+    d.w = w;
+    d.h = h;
+    d.color = color;
+    return b;
+}
+
+// A scroll area at x, y, w by h on the root, its content a column of rows
+// wide wide, each a colour of its own.
+fn area(t as *tree.Tree, x as f64, y as f64, w as f64, h as f64, rows as i64, wide as f64) as i64 {
+    let is i64 as sa = scroll.create(t, tree.root(t));
+    layout.set_align(t, sa, layout.START, layout.START);
+    layout.set_margin(t, sa, x, y, 0.0, 0.0);
+    layout.set_min_size(t, sa, w, h);
+    layout.set_max_size(t, sa, w, h);
+    let is i64 as col = box.create(t, sa, box.COLUMN);
+    let is i64 as k with mut = 0;
+    while (k < rows) {
+        block(t, col, wide, 9.0 + cast(f64, k % 3), (k * 2654435761 + 1234567) % 16777216);
+        k = k + 1;
+    }
+    return sa;
+}
+
+// --- Frames ---
+
+let is i32 as last_moved with mut = 0;
+let is f64 as last_area with mut = 0.0;
+let is f64 as last_over with mut = 0.0;   // damage over where the moved pixels landed
+
+// Laid out and collected, then painted onto what tex holds — moved first,
+// when the tree says to — and read back into out.
+fn frame_into(t as *tree.Tree, tex as i64, out as *i32) as void {
+    layout.run(t, cast(f64, W), cast(f64, H));
+    damage.collect(t);
+    let is math.rect.Rect as sr;
+    let is f64 as sdx with mut = 0.0;
+    let is f64 as sdy with mut = 0.0;
+    last_moved = tree.shift(t, &sr, &sdx, &sdy);
+    last_area = 0.0;
+    last_over = 0.0;
+    let is math.rect.Rect as landed = math.rect.rect(sr.x + sdx, sr.y + sdy, sr.w, sr.h);
+    let is i64 as i with mut = 0;
+    while (i < tree.damage_count(t)) {
+        let is math.rect.Rect as d = tree.damage_at(t, i);
+        last_area = last_area + d.w * d.h;
+        let is math.rect.Rect as o = math.rect.rect_intersect(d, landed);
+        if (last_moved == 1 && math.rect.rect_is_empty(o) == 0) { last_over = last_over + o.w * o.h; }
+        i = i + 1;
+    }
+    draw2d.begin(&cv, cast(f64, W), cast(f64, H), 1.0);
+    paint.frame(t, &cv, &opts, cast(*paint.Stats, 0));
+    gpu.command.begin(&dv, cmd);
+    if (last_moved == 1) {
+        gpu.command.move_region(&dv, cmd, tex, cast(i64, sr.x), cast(i64, sr.y), cast(i64, sr.w), cast(i64, sr.h),
+                                cast(i64, sdx), cast(i64, sdy));
+    }
+    let is gpu.command.Pass as ps = gpu.command.pass_load(tex, 0);
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(&cv, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, tex, cast(*u8, out), W * H * 4);
+    tree.damage_clear(t);
+}
+
+// The frame as it is now: moved and patched into one texture, painted whole
+// into the other — the same pixels.
+fn same_as_whole(t as *tree.Tree) as i32 {
+    frame_into(t, moved_tex, cast(*i32, &moved_px));
+    let is i32 as moved = last_moved;
+    let is f64 as patched = last_area;
+    let is f64 as over = last_over;
+    tree.invalidate_paint_subtree(t, tree.root(t));
+    frame_into(t, whole_tex, cast(*i32, &whole_px));
+    last_moved = moved;
+    last_area = patched;
+    last_over = over;
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        if (moved_px[i] != whole_px[i]) {
+            if (n == 0) { io.printf("  first difference at %d,%d\n", i % W, i / W); }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return cast(i32, n == 0);
+}
+
+// Both textures as the tree is now, painted whole.
+fn fresh(t as *tree.Tree) as void {
+    tree.invalidate_paint_subtree(t, tree.root(t));
+    frame_into(t, moved_tex, cast(*i32, &moved_px));
+    tree.invalidate_paint_subtree(t, tree.root(t));
+    frame_into(t, whole_tex, cast(*i32, &whole_px));
+}
+
+fn scrolled() as void {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_moves(&t, 1);
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    opts.router = &r;
+    let is i64 as sa = area(&t, 10.0, 8.0, 60.0, 50.0, 20, 50.0);
+    let is i64 as outside = block(&t, tree.root(&t), 12.0, 12.0, 4210752);
+    layout.set_align(&t, outside, layout.END, layout.END);
+    fresh(&t);
+    // Down, up, far: moved, only what came into view painted.
+    scroll.set_offset(&t, sa, 0.0, 13.0);
+    check("scrolled down: the same as painted whole", same_as_whole(&t) == 1);
+    check("and moved, nothing painted where it landed", last_moved == 1 && last_over == 0.0 && last_area < 60.0 * 50.0);
+    scroll.set_offset(&t, sa, 0.0, 8.0);
+    check("back up a little: the same", same_as_whole(&t) == 1 && last_moved == 1 && last_over == 0.0);
+    scroll.set_offset(&t, sa, 0.0, 120.0);
+    check("further than it shows: the same", same_as_whole(&t) == 1);
+    scroll.set_offset(&t, sa, 0.0, 400.0);
+    check("to the end: the same", same_as_whole(&t) == 1);
+    // A row changed while it scrolls: painted after the move.
+    let is i64 as row = tree.next_sibling(&t, tree.first_child(&t, tree.first_child(&t, sa)));
+    cast(*Block, tree.data(&t, row)).color = 16711680;
+    tree.invalidate_paint(&t, row);
+    scroll.set_offset(&t, sa, 0.0, 20.0);
+    check("a row repainted as it scrolls: the same", same_as_whole(&t) == 1);
+    scroll.set_offset(&t, sa, 0.0, 25.0);
+    cast(*Block, tree.data(&t, row)).color = 65280;
+    tree.invalidate_paint(&t, row);
+    check("repainted after the scroll was asked: the same", same_as_whole(&t) == 1);
+    // Focused: its ring drawn round its edge, which does not move.
+    tree.set_focusable(&t, sa, 1);
+    router.focus(&t, &r, sa, 1);
+    fresh(&t);
+    scroll.set_offset(&t, sa, 0.0, 37.0);
+    check("focused, its ring at its edge: the same", same_as_whole(&t) == 1 && last_moved == 1);
+    // The focus leaving it as it scrolls: the ring goes, none of it moved.
+    router.focus(&t, &r, 0, 0);
+    scroll.set_offset(&t, sa, 0.0, 41.0);
+    check("the focus gone as it scrolls: the same", same_as_whole(&t) == 1);
+    // And coming back as it scrolls.
+    router.focus(&t, &r, sa, 1);
+    scroll.set_offset(&t, sa, 0.0, 46.0);
+    check("the focus come back as it scrolls: the same", same_as_whole(&t) == 1);
+    router.focus(&t, &r, 0, 0);
+    fresh(&t);
+    // Two asking in one frame: neither moved.
+    let is i64 as sb = area(&t, 72.0, 8.0, 20.0, 40.0, 12, 18.0);
+    fresh(&t);
+    scroll.set_offset(&t, sa, 0.0, 30.0);
+    scroll.set_offset(&t, sb, 0.0, 6.0);
+    check("two scrolled at once: the same, painted", same_as_whole(&t) == 1 && last_moved == 0);
+    // Something over it on a layer above: not moved.
+    let is i64 as pop = block(&t, tree.root(&t), 16.0, 10.0, 16776960);
+    layout.set_align(&t, pop, layout.START, layout.START);
+    layout.set_margin(&t, pop, 30.0, 30.0, 0.0, 0.0);
+    tree.set_layer(&t, pop, 1);
+    fresh(&t);
+    scroll.set_offset(&t, sa, 0.0, 44.0);
+    check("a popup over it: the same, painted", same_as_whole(&t) == 1 && last_moved == 0);
+    tree.set_layer(&t, pop, 0);
+    tree.set_visible(&t, pop, 0);
+    fresh(&t);
+    scroll.set_offset(&t, sa, 0.0, 50.0);
+    check("the popup gone: moved again", same_as_whole(&t) == 1 && last_moved == 1);
+    tree.close(&t);
+}
+
+fn across() as void {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_moves(&t, 1);
+    opts.router = cast(*router.Router, 0);
+    let is i64 as sa = area(&t, 4.0, 4.0, 86.0, 70.0, 12, 200.0);
+    fresh(&t);
+    scroll.set_offset(&t, sa, 17.0, 0.0);
+    check("across: the same as painted whole", same_as_whole(&t) == 1 && last_moved == 1);
+    scroll.set_offset(&t, sa, 9.0, 11.0);
+    check("both ways at once: the same", same_as_whole(&t) == 1 && last_moved == 1);
+    // Faded: its pixels are a texture's, put back faded — not moved.
+    tree.set_opacity(&t, sa, 0.5);
+    fresh(&t);
+    scroll.set_offset(&t, sa, 3.0, 4.0);
+    check("faded: the same, painted", same_as_whole(&t) == 1 && last_moved == 0);
+    tree.close(&t);
+}
+
+// The wheel's glide and the bars fading, with the window's animator and
+// timers: every frame of them moved and patched as painted whole.
+fn glided() as void {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    tree.set_moves(&t, 1);
+    let is timer.Timers as ts = timer.init();
+    tree.set_timers(&t, cast(*u8, &ts));
+    let is anim.Animator as an = anim.init(&t);
+    tree.set_animator(&t, cast(*u8, &an));
+    let is router.Router as r = router.init(router.settings_default());
+    tree.set_router(&t, cast(*u8, &r));
+    opts.router = &r;
+    let is i64 as sa = area(&t, 4.0, 4.0, 86.0, 70.0, 30, 60.0);
+    fresh(&t);
+    router.scroll(&t, &r, 40.0, 40.0, 0.0, 1.0, 1, 1000);
+    let is i32 as all with mut = 1;
+    let is i32 as moved with mut = 0;
+    let is i64 as now with mut = 1000;
+    while (now <= 1000 + theme.motion.normal + 20) {
+        anim.tick(&an, now);
+        if (same_as_whole(&t) == 0) { all = 0; }
+        if (last_moved == 1) { moved = moved + 1; }
+        now = now + 16;
+    }
+    check("glided: every frame as painted whole, most of them moved", all == 1 && moved >= 5 && scroll.offset_y(&t, sa) > 0.0);
+    // Left alone: the bars fade, and only they are drawn again.
+    timer.fire(&ts, now + scroll.HIDE_MS);
+    now = now + scroll.HIDE_MS;
+    let is f64 as most with mut = 0.0;
+    let is i64 as k with mut = 0;
+    while (k < 14) {
+        anim.tick(&an, now);
+        if (same_as_whole(&t) == 0) { all = 0; }
+        if (last_area > most) { most = last_area; }
+        now = now + 16;
+        k = k + 1;
+    }
+    check("faded: every frame as painted whole, only the bars drawn", all == 1 && most > 0.0 && most < 86.0 * 70.0 / 4.0);
+    opts.router = cast(*router.Router, 0);
+    tree.close(&t);
+}
+
+// A tree whose window does not move pixels: never told to.
+fn unmoved() as void {
+    let is tree.Limits as l = tree.limits_default();
+    let is tree.Tree as t = tree.open(&l);
+    tree.set_theme(&t, &theme);
+    opts.router = cast(*router.Router, 0);
+    let is i64 as sa = area(&t, 4.0, 4.0, 86.0, 70.0, 12, 60.0);
+    fresh(&t);
+    scroll.set_offset(&t, sa, 0.0, 15.0);
+    check("a window that moves nothing: painted, the same", tree.moves(&t) == 0 && same_as_whole(&t) == 1 && last_moved == 0);
+    tree.close(&t);
+}
+
+fn main() as i32 {
+    block_kind = widget.kind("block", sizeof(Block));
+    block_kind.measure = fn_ptr(block_measure);
+    block_kind.paint = fn_ptr(block_paint);
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    moved_tex = gpu.texture.create(&dv, &td);
+    whole_tex = gpu.texture.create(&dv, &td);
+    cmd = gpu.command.create(&dv);
+    let is draw2d.Limits as dl = draw2d.limits_default();
+    cv = draw2d.open(&dv, &dl);
+    theme = style.light();
+    opts = paint.options(&theme);
+    let is paint.Cache as cache = paint.cache_open(&dv, &dl);
+    opts.cache = &cache;
+
+    scrolled();
+    across();
+    glided();
+    unmoved();
+
+    if (fails == 0) {
+        io.printf("shift: all checks passed\n");
+        return 0;
+    }
+    io.printf("shift: %d failures\n", fails);
+    return 1;
+}

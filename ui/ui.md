@@ -742,9 +742,30 @@ one whose look changed says so with `tree.invalidate_paint` or, from a setter,
 `widget.changed(t, w, CHANGED_LAYOUT | CHANGED_PAINT)`. Destroying, disabling
 and resizing the window are accounted for. The region is at most
 `tree.MAX_DAMAGE` rectangles in window coordinates, clipped to the window:
-overlapping and bordering ones merge, and past the limit a rectangle goes into
-the one it enlarges least, so it can cover more than changed but never less.
-`tree.paint_wanted` says whether a frame has anything to collect at all.
+overlapping and bordering ones merge when their box is no larger than the two
+of them — a band along a hole's top and one down its side stay two — and past
+the limit a rectangle goes into the one it enlarges least, so it can cover
+more than changed but never less. `tree.paint_wanted` says whether a frame
+has anything to collect at all.
+
+Scrolled, a scroll area does not have its content painted again: it asks to
+move the pixels that stay in view (`tree.shift_request`), and `collect` takes
+the ask when the window moves pixels (`tree.set_moves`, as the host's does)
+and nothing but what the area holds is drawn over them — no shown widget on a
+layer above, no ancestor drawn through a texture or over its children,
+nothing drawn after the area reaching them. Then what moved with the content
+is not damaged; the area damages what comes into view, its bars, and, where
+a focus ring round it or round what holds it is shown or changes, a band at
+its edges as deep as the ring reaches. The window moves the pixels
+(`tree.shift`, `command.move_region`) before painting the damage over them;
+`shift_test` checks every frame of it — scrolled either way, both ways at
+once, past the view, a row changed meanwhile, focused, the focus leaving, a
+popup over it, two scrolled at once, a faded area, the wheel's glide and the
+bars fading — against the same frame painted whole. The glide and the bars'
+fade step quietly (`anim.set_quiet`): their steps draw what they change, the
+offset or the bars, rather than the whole area. A caret that blinks is drawn
+again alone where it is when the frame is collected (`tree.blink`,
+`Kind.caret`, given by the text view and the entry), not the text around it.
 
 **Painting** (`paint.cst`, `painter.cst`, the `paint` entry, tested by
 `paint_test` on a headless software device): each damage rectangle gets the
