@@ -194,7 +194,39 @@ struct Kind {
     access     as AccessFn;
     shape      as ShapeFn;   // the pointer's shape over it; null for its parent's
     paint_over as PaintFn;   // drawn after its children, over them: a scroll area's bars
+    text       as TextFn;    // its text, to assistive technology; null for none (access.text_of)
 }
+
+// A widget's text asked of it, or something done to it (TEXT_*), by
+// assistive technology through access.cst. Offsets are UTF-8 bytes of the
+// text as the widget has it; a rectangle and a point are the widget's own
+// coordinates.
+struct TextQuery {
+    op       as i64;
+    editable as i64;             // GET: it can be edited
+    text     as *u8;             // GET: its text, the kind's to keep; REPLACE: what goes in
+    text_len as i64;
+    caret    as i64;             // GET: the caret, -1 for none
+    a        as i64;             // GET: the selection, a to b; SELECT, REPLACE, COPY, CUT: the range
+    b        as i64;
+    at       as i64;             // EXTENTS, SET_CARET, PASTE: an offset; OFFSET_AT: the answer
+    x        as f64;             // OFFSET_AT: the point
+    y        as f64;
+    rect     as math.rect.Rect;  // EXTENTS: the answer
+}
+
+let is i64 as TEXT_GET        with imut = 0;
+let is i64 as TEXT_EXTENTS    with imut = 1;   // the character at `at`
+let is i64 as TEXT_OFFSET_AT  with imut = 2;   // the offset nearest x, y
+let is i64 as TEXT_SET_CARET  with imut = 3;
+let is i64 as TEXT_SELECT     with imut = 4;
+let is i64 as TEXT_REPLACE    with imut = 5;   // a to b by text: an insertion when a == b, a deletion with no text
+let is i64 as TEXT_COPY       with imut = 6;   // a to b to the clipboard
+let is i64 as TEXT_CUT        with imut = 7;
+let is i64 as TEXT_PASTE      with imut = 8;   // the clipboard's text at `at`
+
+// q asked of, or done to, a widget's text: 1 when answered or done.
+type TextFn = fn(*Tree, i64, *u8, *TextQuery) as i64;
 
 // Text handed to the platform: cb(user, which, text, n). See set_clipboard.
 type ClipboardFn = fn(*u8, i32, *u8, i64) as void;
@@ -240,6 +272,15 @@ struct HostText {
     s as *u8;
     n as i64;
 }
+
+// Who watches the tree change — an accessibility bridge — told of widget w
+// (WATCH_*): cb(user, t, w, what). See set_watch.
+type WatchFn = fn(*u8, *Tree, i64, i32) as void;
+
+let is i32 as WATCH_ADDED   with imut = 1;   // made, or moved here: its parent's children changed
+let is i32 as WATCH_REMOVED with imut = 2;   // about to be destroyed, or moved away
+let is i32 as WATCH_CHANGED with imut = 3;   // it may look or say something else now
+let is i32 as WATCH_FOCUS   with imut = 4;   // the focus came to it (0: went nowhere)
 
 // The input method told to give up its composition for widget w: cb(user,
 // w). See set_ime_reset.
@@ -325,6 +366,8 @@ struct Tree {
     host_fn       as HostFn;         // the application's, null for none; see set_host
     host_user     as *u8;
     host_window   as i64;
+    watch_fn      as WatchFn;        // null for none; see set_watch
+    watch_user    as *u8;
     err         as i32;
     ok          as i32;
 }
@@ -416,6 +459,8 @@ fn open(l as *Limits) as Tree {
     t.host_fn = cast(HostFn, 0);
     t.host_user = cast(*u8, 0);
     t.host_window = 0;
+    t.watch_fn = cast(WatchFn, 0);
+    t.watch_user = cast(*u8, 0);
     t.cap = 0;
     t.live = 0;
     t.next_free = 0;
@@ -682,6 +727,7 @@ fn create_before(t as *Tree, k as *Kind, parent as i64, before as i64) as i64 {
     if (i < 0) { t.err = FULL; return 0; }
     _link_before(t, p, i, b);
     _invalidate_from(t, p);
+    notify(t, _handle(t, i), WATCH_ADDED);
     return _handle(t, i);
 }
 
@@ -691,6 +737,7 @@ fn destroy(t as *Tree, w as i64) as void {
     let is i64 as i = _index(t, w);
     if (i < 0) { return; }
     if (i == t.root) { t.err = BAD_ARGUMENT; return; }
+    notify(t, w, WATCH_REMOVED);
     let is i64 as p = _node(t, i).parent;
     // The textures around it still show what is about to go.
     if (p != 0 - 1) { _stale_from(t, p); }
@@ -723,10 +770,12 @@ fn insert(t as *Tree, w as i64, parent as i64, before as i64) as i32 {
     if (b == 0 - 2) { return 0; }
     if (b == i) { return 1; }
     let is i64 as old = _node(t, i).parent;
+    notify(t, w, WATCH_REMOVED);
     _unlink(t, i);
     _link_before(t, p, i, b);
     if (old != 0 - 1) { _invalidate_from(t, old); }
     _invalidate_from(t, i);
+    notify(t, w, WATCH_ADDED);
     return 1;
 }
 
@@ -834,6 +883,7 @@ fn set_visible(t as *Tree, w as i64, on as i32) as void {
     let is *Node as n = _node(t, i);
     n.flags = _set(n.flags, F_HIDDEN, 1 - on);
     _invalidate_from(t, i);
+    notify(t, w, WATCH_CHANGED);
 }
 
 fn is_visible(t as *Tree, w as i64) as i32 {
@@ -849,6 +899,7 @@ fn set_enabled(t as *Tree, w as i64, on as i32) as void {
     n.flags = _set(n.flags, F_DISABLED, 1 - on);
     // Disabled is inherited, so the whole subtree looks different now.
     invalidate_paint_subtree(t, w);
+    notify(t, w, WATCH_CHANGED);
 }
 
 fn is_enabled(t as *Tree, w as i64) as i32 {
@@ -996,6 +1047,7 @@ fn invalidate_layout(t as *Tree, w as i64) as void {
     let is i64 as i = _index(t, w);
     if (i < 0) { return; }
     _invalidate_from(t, i);
+    notify(t, w, WATCH_CHANGED);
 }
 
 fn needs_layout(t as *Tree, w as i64) as i32 {
@@ -1031,6 +1083,7 @@ fn invalidate_paint(t as *Tree, w as i64) as void {
     let is i64 as i = _index(t, w);
     if (i < 0) { return; }
     _mark_paint(t, i);
+    notify(t, w, WATCH_CHANGED);
 }
 
 // w and everything under it — for a change every descendant shows, such as
@@ -1400,6 +1453,19 @@ fn window_op(t as *Tree, op as i32, x as f64, y as f64) as i32 {
 // Who keeps the window this tree is in — the application — and how it names
 // the window, for what a widget asks of it: a window of its own for a dialog,
 // shown or hidden (HOST_*).
+// Who watches the tree change: told of every widget made, moved, destroyed,
+// changed or focused (WATCH_*). Null, as a tree starts: nobody, nothing told.
+fn set_watch(t as *Tree, cb as WatchFn, user as *u8) as void {
+    t.watch_fn = cb;
+    t.watch_user = user;
+}
+
+// Whoever watches told what happened to w.
+fn notify(t as *Tree, w as i64, what as i32) as void {
+    if (cast(i64, t.watch_fn) == 0) { return; }
+    call(t.watch_fn, t.watch_user, t, w, what);
+}
+
 fn set_host(t as *Tree, cb as HostFn, user as *u8, window as i64) as void {
     t.host_fn = cb;
     t.host_user = user;
