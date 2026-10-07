@@ -1,0 +1,116 @@
+// ui/session_test.cst — a session bus connection run by the application's
+// loop, and the loop held with no window on the screen, as a program living
+// in the tray is. On a private bus, no display needed:
+//   sh dbus/tools/run_dbus.sh ./build/session_test
+// and with no bus at all:
+//   env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent ./build/session_test none
+// The desktop's call comes from a child process.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+use "../gpu/gpu.cst" as gpu;
+use "app.cst" as app;
+use "host.cst" as host;
+use "session.cst" as session;
+use "instance.cst" as instance;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is *u8 as ID with imut = "org.caustic.SessionTest";
+
+let is i64 as activated with mut = 0;
+
+fn on_activate(user as *u8) as void { activated = activated + 1; }
+
+// The desktop, asking the application to come forward.
+fn desktop() as i64 {
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    if (dbus.conn.is_open(&c) == 0) { return 2; }
+    if (instance.activate_remote(&c, ID, 23) != 1) { return 3; }
+    dbus.conn.close(&c);
+    return 0;
+}
+
+let is app.App as a with mut;
+let is gpu.device.Device as dv with mut;
+let is session.Session as s with mut;
+let is instance.Instance as inst with mut;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is app.Limits as al = app.limits_default();
+    a = app.open(&al);
+    dv = gpu.open_headless(64, 64, gpu.SOFTWARE);
+    let is *host.Host as hs = host.open(&a, &dv, cast(*u8, 0));
+
+    if (env.argc() > 1) {
+        // No session bus: nothing to watch, and closing it does no harm.
+        check("no bus: not opened", session.open(&s, hs) == 0);
+        check("no bus: nothing watched", host.watched(hs) == 0);
+        session.close(&s);
+        check("no bus: still nothing watched", host.watched(hs) == 0);
+        host.close(hs);
+        if (fails == 0) {
+            io.printf("session, no bus: all checks passed\n");
+            return 0;
+        }
+        io.printf("session, no bus: %d failures\n", fails);
+        return 1;
+    }
+
+    // --- Held with no window ---
+    check("nothing on the screen: the loop ends", host.step(hs, 50) == 0);
+    host.hold(hs);
+    let is i64 as t0 = time.now_ms();
+    check("held: it goes on", host.step(hs, 60) == 1);
+    check("held: asleep meanwhile", time.now_ms() - t0 >= 50);
+    host.hold(hs);
+    host.release(hs);
+    check("held twice, let go once: still held", host.step(hs, 0) == 1);
+    host.release(hs);
+    check("let go as often as held: it ends", host.step(hs, 0) == 0);
+    host.release(hs);
+    host.hold(hs);
+    check("let go once too often, then held: held", host.step(hs, 0) == 1);
+
+    // --- The connection, run by the loop ---
+    check("opened", session.open(&s, hs) == 1);
+    check("its connection watched", host.watched(hs) == 1);
+    check("the application's id claimed on it",
+          instance.claim(&inst, session.conn(&s), ID, 23, fn_ptr(on_activate), cast(instance.OpenFn, 0),
+                         cast(instance.ActionFn, 0), cast(*u8, 0)) == 1);
+    let is i64 as pid = linux.fork();
+    if (pid == 0) { linux.exit(desktop()); }
+    let is i32 as status with mut = 0 - 1;
+    let is i32 as done with mut = 0;
+    let is i64 as until = time.now_ms() + 5000;
+    while ((done == 0 || activated == 0) && time.now_ms() < until) {
+        host.step(hs, 100);
+        if (done == 0 && linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) { done = 1; }
+    }
+    check("the desktop's call answered by the loop alone", done == 1 && status == 0 && activated == 1);
+    instance.release(&inst);
+    session.close(&s);
+    check("closed: no longer watched", host.watched(hs) == 0);
+    session.close(&s);
+    check("closed twice: no harm", host.watched(hs) == 0);
+    host.release(hs);
+    check("let go: it ends", host.step(hs, 0) == 0);
+    host.close(hs);
+    if (fails == 0) {
+        io.printf("session: all checks passed\n");
+        return 0;
+    }
+    io.printf("session: %d failures\n", fails);
+    return 1;
+}

@@ -1,0 +1,174 @@
+// ui/desktop_test.cst — the settings portal followed in the application's
+// loop: read at first, read again when it says one changed, the windows'
+// theme following. A child process plays the portal on a private bus:
+//   sh dbus/tools/run_dbus.sh sh window/x11/tools/run_headless.sh ./build/desktop_test
+// and with no session bus:
+//   env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent ./build/desktop_test none
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/os/linux.cst" as linux;
+use "../dbus/dbus.cst" as dbus;
+use "../gpu/gpu.cst" as gpu;
+use "../window/settings.cst" as wsettings;
+use "../window/linux/portal.cst" as portal;
+use "app.cst" as app;
+use "host.cst" as host;
+use "style.cst" as style;
+use "desktop.cst" as desktop;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+// --- The portal, played by a child ---
+
+let is i64 as scheme with mut = 1;   // org.freedesktop.appearance color-scheme: 1 prefer dark
+let is i32 as quit with mut = 0;
+
+fn m_read_all(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    let is *dbus.wire.Writer as w = k.reply;
+    let is i64 as all = dbus.wire.put_array(w, 8);
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string(w, "org.freedesktop.appearance");
+    let is i64 as ns = dbus.wire.put_array(w, 8);
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string(w, "color-scheme");
+    dbus.wire.put_variant(w, "u");
+    dbus.wire.put_u32(w, scheme);
+    dbus.wire.put_array_end(w, ns, 8);
+    dbus.wire.put_array_end(w, all, 8);
+}
+
+fn m_change(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
+    scheme = dbus.wire.get_u32(&k.args);
+    let is *dbus.wire.Writer as w = dbus.conn.body(c);
+    dbus.wire.put_string(w, "org.freedesktop.appearance");
+    dbus.wire.put_string(w, "color-scheme");
+    dbus.wire.put_variant(w, "u");
+    dbus.wire.put_u32(w, scheme);
+    dbus.conn.emit(c, portal.PATH, portal.IFACE, "SettingChanged", "ssv");
+}
+
+fn m_quit(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void { quit = 1; }
+
+let is [1]dbus.conn.Method as settings_methods with mut;
+let is [2]dbus.conn.Method as fake_methods with mut;
+let is [2]dbus.conn.Interface as ifaces with mut;
+
+fn method(t as *dbus.conn.Method, name as *u8, ins as *u8, outs as *u8, h as dbus.conn.MethodFn) as void {
+    t.name = name;
+    t.in_sig = ins;
+    t.out_sig = outs;
+    t.handler = h;
+    t.in_names = cast(*u8, 0);
+    t.out_names = cast(*u8, 0);
+}
+
+fn iface(f as *dbus.conn.Interface, name as *u8, ms as *dbus.conn.Method, n as i64) as void {
+    f.name = name;
+    f.methods = ms;
+    f.nmethods = n;
+    f.props = cast(*dbus.conn.Property, 0);
+    f.nprops = 0;
+    f.signals = cast(*dbus.conn.SignalDecl, 0);
+    f.nsignals = 0;
+}
+
+fn serve() as i64 {
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    if (dbus.conn.is_open(&c) == 0) { return 2; }
+    method(&settings_methods[0], "ReadAll", "as", "a{sa{sv}}", fn_ptr(m_read_all));
+    method(&fake_methods[0], "Change", "u", "", fn_ptr(m_change));
+    method(&fake_methods[1], "Quit", "", "", fn_ptr(m_quit));
+    iface(&ifaces[0], portal.IFACE, cast(*dbus.conn.Method, &settings_methods), 1);
+    iface(&ifaces[1], "org.caustic.FakePortal", cast(*dbus.conn.Method, &fake_methods), 2);
+    dbus.conn.export(&c, portal.PATH, cast(*dbus.conn.Interface, &ifaces), 2, cast(*u8, 0));
+    if (dbus.conn.request_name(&c, portal.DESKTOP, 4) != 1) { return 3; }
+    let is i64 as until = time.now_ms() + 20000;
+    while (quit == 0 && time.now_ms() < until) {
+        if (dbus.conn.dispatch(&c, 100) < 0) { return 4; }
+    }
+    dbus.conn.close(&c);
+    return 0;
+}
+
+// Told to the child, from a connection of the test's own.
+fn tell(member as *u8, arg as i64, sig as *u8) as void {
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    let is dbus.message.Message as m with mut = dbus.message.method_call(portal.DESKTOP, portal.PATH, "org.caustic.FakePortal", member);
+    m.signature = sig;
+    let is *dbus.wire.Writer as w = dbus.conn.body(&c);
+    if (sig[0] == 117) { dbus.wire.put_u32(w, arg); }
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    dbus.conn.call_method(&c, &m, 2000, &rep);
+    dbus.conn.close(&c);
+}
+
+let is gpu.device.Device as dv with mut;
+let is app.App as a with mut;
+let is style.Theme as theme with mut;
+let is desktop.Desktop as dk with mut;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() > 1) {
+        // No bus: not followed, nothing watched.
+        dv = gpu.open_headless(64, 64, gpu.SOFTWARE);
+        let is app.Limits as nl = app.limits_default();
+        a = app.open(&nl);
+        let is *host.Host as nh = host.open(&a, &dv, cast(*u8, 0));
+        check("no bus: not followed", desktop.follow(&dk, nh) == 0 && host.watched(nh) == 0);
+        host.close(nh);
+        if (fails == 0) {
+            io.printf("desktop, no bus: all checks passed\n");
+            return 0;
+        }
+        io.printf("desktop, no bus: %d failures\n", fails);
+        return 1;
+    }
+    let is i64 as pid = linux.fork();
+    if (pid == 0) { linux.exit(serve()); }
+    // The portal on the bus before it is asked.
+    time.sleep_ms(300);
+
+    theme = style.light();
+    dv = gpu.open_headless(64, 64, gpu.SOFTWARE);
+    let is app.Limits as al = app.limits_default();
+    a = app.open(&al);
+    app.set_theme(&a, &theme);
+    app.window_open(&a, 200.0, 100.0);
+    let is *host.Host as hs = host.open(&a, &dv, cast(*u8, 0));
+    host.step(hs, 50);
+    check("followed", desktop.follow(&dk, hs) == 1);
+    check("read at first: dark", host.settings(hs).dark == 1 && (host.settings(hs).known & wsettings.K_DARK) != 0 &&
+          app.theme(&a).dark == 1);
+    tell("Change", 2, "u");
+    let is i64 as until = time.now_ms() + 3000;
+    while (host.settings(hs).dark == 1 && time.now_ms() < until) { host.step(hs, 100); }
+    check("a change said: read again, light", host.settings(hs).dark == 0 && app.theme(&a).dark == 0);
+    desktop.stop(&dk);
+    tell("Change", 1, "u");
+    let is i64 as later = time.now_ms() + 400;
+    while (time.now_ms() < later) { host.step(hs, 100); }
+    check("stopped: no longer followed", host.settings(hs).dark == 0);
+
+    tell("Quit", 0, "");
+    let is i32 as status with mut = 0;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+    host.close(hs);
+    app.close(&a);
+    if (fails == 0) {
+        io.printf("desktop: all checks passed\n");
+        return 0;
+    }
+    io.printf("desktop: %d failures\n", fails);
+    return 1;
+}
