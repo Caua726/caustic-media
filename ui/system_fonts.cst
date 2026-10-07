@@ -1,0 +1,151 @@
+// ui/system_fonts.cst — the system's fonts, for the text service.
+//
+// A program's text is set in the families its theme names — the desktop's
+// interface font, monospace for code — at the weights and styles its widgets
+// ask, and the text service asks a resolver for each (text.ResolveFn). This
+// one answers from an index of font files (text/fonts): the system's,
+// scanned once and kept where the platform keeps caches, or a directory's —
+// a program shipping its own fonts, a test. Each family, weight and style
+// asked is a chain opened the first time and kept: the family's face nearest
+// what was asked, and behind it the families that draw what it lacks —
+// emoji, CJK, any script the system has a face for. No family — the theme's
+// own — is the interface's, system-ui, which the preferences say (set_prefs).
+use "std/mem.cst" as mem;
+use "../text/fonts/fonts.cst" as fonts;
+use "../text/fonts/scan.cst" as scan;
+use "../text/fonts/index.cst" as index;
+use "../text/fonts/chain.cst" as chain;
+use "../text/fonts/face.cst" as face;
+use "../text/layout/font.cst" as font;
+
+// The most chains kept; asked for more, the first stands in.
+let is i64 as MAX_CHAINS with imut = 32;
+// The longest family name, or list of them, kept.
+let is i64 as MAX_NAME with imut = 127;
+
+struct Entry {
+    named  as i64;          // 0: the interface's, no family given
+    family as [128]u8;
+    weight as i64;
+    italic as i64;
+    ch     as chain.Chain;
+    fo     as font.Font;
+}
+
+struct Fonts {
+    ix      as index.Index;
+    prefs   as chain.Prefs;
+    n       as i64;
+    entries as *Entry;      // MAX_CHAINS, so never moved
+}
+
+fn _entry(sf as *Fonts, i as i64) as *Entry { return cast(*Entry, cast(i64, sf.entries) + i * sizeof(Entry)); }
+
+// The index made: kept with room for the chains, or — no fonts in it, no
+// memory — closed, and nothing is left open.
+fn _start(sf as *Fonts) as i32 {
+    sf.n = 0;
+    sf.prefs = fonts.prefs();
+    sf.entries = cast(*Entry, 0);
+    if (index.face_count(&sf.ix) == 0) {
+        index.close(&sf.ix);
+        return 0;
+    }
+    let is *u8 as e = mem.core.mmap_anon(MAX_CHAINS * sizeof(Entry));
+    if (cast(i64, e) <= 0) {
+        index.close(&sf.ix);
+        return 0;
+    }
+    sf.entries = cast(*Entry, e);
+    return 1;
+}
+
+// The system's fonts: 1, or 0 when it has none, and nothing is left open.
+// std/env's environment, so the program must have called env.init.
+fn open(sf as *Fonts) as i32 {
+    sf.ix = index.empty();
+    fonts.system(&sf.ix);
+    return _start(sf);
+}
+
+// The fonts under path, and only those: 1, or 0 when there are none.
+fn open_dir(sf as *Fonts, path as *u8) as i32 {
+    let is scan.Scan as s with mut = scan.open();
+    scan.walk(&s, path);
+    let is index.Index as none with mut = index.empty();
+    sf.ix = index.update(&none, &s);
+    scan.close(&s);
+    return _start(sf);
+}
+
+// The families the generic names stand for — sans-serif, monospace,
+// system-ui, emoji, CJK — for chains opened from now on.
+fn set_prefs(sf as *Fonts, p as *chain.Prefs) as void { sf.prefs = *p; }
+
+fn index_of(sf as *Fonts) as *index.Index { return &sf.ix; }
+
+// How many chains are kept.
+fn count(sf as *Fonts) as i64 { return sf.n; }
+
+fn _same(e as *Entry, named as i64, family as *u8, n as i64) as i32 {
+    if (e.named != named) { return 0; }
+    if (named == 0) { return 1; }
+    if (e.family[n] != 0) { return 0; }
+    return cast(i32, mem.memcmp(cast(*u8, &e.family), family, n) == 0);
+}
+
+// The text service's resolver (text.ResolveFn), user the Fonts: the font for
+// a family — or a list of them, as CSS's font-family; null for the
+// interface's — a weight, 100 to 900, and italic or not. Null when there are
+// no fonts.
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font {
+    let is *Fonts as sf = cast(*Fonts, user);
+    if (cast(i64, sf.entries) == 0) { return cast(*font.Font, 0); }
+    let is i64 as named with mut = cast(i64, cast(i64, family) != 0);
+    let is i64 as n with mut = 0;
+    if (named == 1) {
+        while (n <= MAX_NAME && family[n] != 0) { n = n + 1; }
+        // Longer than kept: not cut, which would name another family.
+        if (n > MAX_NAME) {
+            named = 0;
+            n = 0;
+        }
+    }
+    let is i64 as it = cast(i64, italic != 0);
+    let is i64 as i with mut = 0;
+    while (i < sf.n) {
+        let is *Entry as e = _entry(sf, i);
+        if (e.weight == weight && e.italic == it && _same(e, named, family, n) == 1) { return &e.fo; }
+        i = i + 1;
+    }
+    if (sf.n >= MAX_CHAINS) { return &_entry(sf, 0).fo; }
+    let is *Entry as e = _entry(sf, sf.n);
+    e.named = named;
+    if (named == 1) { mem.memcpy(cast(*u8, &e.family), family, n); }
+    e.family[n] = cast(u8, 0);
+    e.weight = weight;
+    e.italic = it;
+    let is *u8 as list with mut = cast(*u8, &e.family);
+    if (named == 0) { list = "system-ui"; }
+    let is i64 as style with mut = face.NORMAL;
+    if (it == 1) { style = face.ITALIC; }
+    chain.open(&e.ch, &sf.ix, list, cast(f64, weight), 100.0, style, &sf.prefs);
+    e.fo = font.of_chain(&e.ch);
+    sf.n = sf.n + 1;
+    return &e.fo;
+}
+
+// Every chain closed, their files let go, and the index; nothing after an
+// open that found no fonts, or a close.
+fn close(sf as *Fonts) as void {
+    if (cast(i64, sf.entries) == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < sf.n) {
+        chain.close(&_entry(sf, i).ch);
+        i = i + 1;
+    }
+    sf.n = 0;
+    mem.core.munmap(cast(*u8, sf.entries), MAX_CHAINS * sizeof(Entry));
+    sf.entries = cast(*Entry, 0);
+    index.close(&sf.ix);
+}
