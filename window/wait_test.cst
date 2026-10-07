@@ -1,0 +1,123 @@
+// window/wait_test.cst — the loop's one place to sleep, without a display:
+// woken by a descriptor it watches, by another thread, or by its time.
+use "std/io.cst" as io;
+use "std/os/linux.cst" as linux;
+use "std/time.cst" as time;
+use "std/thread.cst" as thread;
+use "../sys/linux.cst" as sys;
+use "device.cst" as device;
+use "wait.cst" as wait;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is wait.Wait as w with mut;
+
+// Another thread: sleeps a little, then wakes the loop.
+fn waker(arg as i64) as i64 {
+    time.sleep_ms(50);
+    wait.wake(&w);
+    return 0;
+}
+
+fn main() as i32 {
+    w = wait.open();
+    check("open", wait.is_open(&w) == 1);
+    let is *device.Window as none = cast(*device.Window, 0);
+
+    // --- Its time ---
+    let is i64 as t0 with mut = time.now_ms();
+    check("nothing to wake it: its time", wait.wait(&w, none, 60) == wait.TIMEOUT);
+    let is i64 as slept = time.now_ms() - t0;
+    check("slept about that long", slept >= 55 && slept < 1000);
+    check("no time: at once", wait.wait(&w, none, 0) == wait.TIMEOUT);
+
+    // --- A descriptor it watches ---
+    let is [2]i32 as p;
+    linux.pipe2(cast(*i32, &p), 524288);
+    let is i64 as rd = cast(i64, p[0]);
+    let is i64 as wr = cast(i64, p[1]);
+    check("watched", wait.watch(&w, rd) == 1 && wait.watching(&w, rd) == 1);
+    check("not readable: its time", wait.wait(&w, none, 0) == wait.TIMEOUT && wait.readable(&w, rd) == 0);
+    linux.write(wr, "x", 1);
+    t0 = time.now_ms();
+    check("readable: woken by it", wait.wait(&w, none, 5000) == wait.DESCRIPTOR && wait.readable(&w, rd) == 1);
+    check("at once", time.now_ms() - t0 < 1000);
+    check("watched twice: once", wait.watch(&w, rd) == 1 && wait.count(&w) == 1);
+    check("never readable unwatched", wait.readable(&w, wr) == 0);
+    let is [4]u8 as b;
+    linux.read(rd, cast(*u8, &b), 1);
+    check("read: not readable again", wait.wait(&w, none, 0) == wait.TIMEOUT && wait.readable(&w, rd) == 0);
+    linux.write(wr, "y", 1);
+    wait.unwatch(&w, rd);
+    check("unwatched: not woken by it", wait.watching(&w, rd) == 0 && wait.wait(&w, none, 0) == wait.TIMEOUT);
+
+    // Two watched, readable in turn: each said, and only while it is.
+    let is [2]i32 as p2;
+    linux.pipe2(cast(*i32, &p2), 524288);
+    let is i64 as rd2 = cast(i64, p2[0]);
+    let is i64 as wr2 = cast(i64, p2[1]);
+    linux.read(rd, cast(*u8, &b), 1);
+    wait.watch(&w, rd);
+    wait.watch(&w, rd2);
+    linux.write(wr2, "z", 1);
+    check("the second readable: it, not the first", wait.wait(&w, none, 0) == wait.DESCRIPTOR &&
+          wait.readable(&w, rd2) == 1 && wait.readable(&w, rd) == 0);
+    linux.read(rd2, cast(*u8, &b), 1);
+    linux.write(wr, "w", 1);
+    check("then the first: it, the second no longer", wait.wait(&w, none, 0) == wait.DESCRIPTOR &&
+          wait.readable(&w, rd) == 1 && wait.readable(&w, rd2) == 0);
+    linux.read(rd, cast(*u8, &b), 1);
+    wait.unwatch(&w, rd);
+    wait.unwatch(&w, rd2);
+    linux.close(rd2);
+    linux.close(wr2);
+    check("descriptor 0 watched like any", wait.watch(&w, 0) == 1 && wait.watching(&w, 0) == 1);
+    wait.unwatch(&w, 0);
+
+    // As many as it holds, not one more.
+    let is i64 as k with mut = 0;
+    let is i32 as all with mut = 1;
+    while (k < wait.MAX_FDS) {
+        if (wait.watch(&w, 1000 + k) == 0) { all = 0; }
+        k = k + 1;
+    }
+    check("as many as it holds", all == 1 && wait.count(&w) == wait.MAX_FDS);
+    check("not one more", wait.watch(&w, 999) == 0 && wait.count(&w) == wait.MAX_FDS);
+    k = 0;
+    while (k < wait.MAX_FDS) {
+        wait.unwatch(&w, 1000 + k);
+        k = k + 1;
+    }
+    check("all let go", wait.count(&w) == 0);
+    check("a negative descriptor: not watched", wait.watch(&w, 0 - 1) == 0);
+
+    // --- Woken by another thread ---
+    wait.wake(&w);
+    check("woken before it slept: at once", wait.wait(&w, none, 5000) == wait.WOKEN);
+    check("once", wait.wait(&w, none, 0) == wait.TIMEOUT);
+    let is thread.Thread as th;
+    thread.spawn(&th, cast(*u8, fn_ptr(waker)), 0);
+    t0 = time.now_ms();
+    check("woken while asleep", wait.wait(&w, none, 5000) == wait.WOKEN);
+    let is i64 as took = time.now_ms() - t0;
+    check("when it was, not at its time", took >= 30 && took < 2000);
+    thread.join(&th);
+
+    wait.close(&w);
+    check("closed", wait.is_open(&w) == 0 && wait.wait(&w, none, 0) == wait.TIMEOUT);
+    linux.close(rd);
+    linux.close(wr);
+    if (fails == 0) {
+        io.printf("window wait: all checks passed\n");
+        return 0;
+    }
+    io.printf("window wait: %d failures\n", fails);
+    return 1;
+}

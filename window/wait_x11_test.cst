@@ -1,0 +1,109 @@
+// window/wait_x11_test.cst — wait() woken by a window's events, under Xvfb:
+//   sh window/x11/tools/run_headless.sh ./build/wait_x11_test
+// Another client sends the window messages on a connection of its own; one
+// is left read off the connection into the window system's queue, where the
+// descriptor no longer shows it, and must still wake the loop at once.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "window.cst" as window;
+use "device.cst" as device;
+use "event.cst" as event;
+use "wait.cst" as wait;
+use "x11/x11.cst" as x11;
+use "x11/bind/xlib.cst" as xlib;
+use "x11/bind/x.cst" as x;
+use "x11/bind/xevent.cst" as xev;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is wait.Wait as wt with mut;
+
+// Every event there is, read and let go; how many.
+fn drain() as i64 {
+    let is i64 as n with mut = 0;
+    device.pump(&win);
+    let is event.Event as e;
+    while (device.poll_event(&win, &e) == 1) { n = n + 1; }
+    return n;
+}
+
+// Quiet: no event for a while.
+fn settle() as void {
+    let is i64 as rounds with mut = 0;
+    while (rounds < 50 && wait.wait(&wt, &win, 150) != wait.TIMEOUT) {
+        drain();
+        rounds = rounds + 1;
+    }
+}
+
+// A message sent to the window by another client.
+fn poke(other as *u8) as void {
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    xev.any(&m).kind = x.ClientMessage;
+    xev.any(&m).window = x11.xid(&win.x11_win);
+    xev.client(&m).format = 32;
+    xlib.XSendEvent(other, x11.xid(&win.x11_win), 0, 0, cast(*u8, &m));
+    xlib.XFlush(other);
+}
+
+fn main() as i32 {
+    win = window.open("wait", 200, 100);
+    if (window.is_open(&win) == 0) {
+        io.printf("FAIL: no window\n");
+        return 1;
+    }
+    wt = wait.open();
+    check("the connection's descriptor", device.connection_fd(&win) >= 0);
+    settle();
+    check("quiet: its time", wait.wait(&wt, &win, 50) == wait.TIMEOUT && device.pending(&win) == 0);
+
+    let is *u8 as other = xlib.XOpenDisplay(cast(*u8, 0));
+    check("another client", cast(i64, other) != 0);
+    poke(other);
+    let is i64 as t0 with mut = time.now_ms();
+    check("an event for the window: woken", (wait.wait(&wt, &win, 5000) & wait.WINDOW) != 0);
+    check("at once", time.now_ms() - t0 < 2000);
+    check("and there to read", drain() >= 1);
+    settle();
+
+    // Read off the connection, not yet handed out: still woken at once.
+    poke(other);
+    time.sleep_ms(100);
+    check("waiting in the queue", device.pending(&win) == 1);
+    t0 = time.now_ms();
+    check("woken by what is queued", (wait.wait(&wt, &win, 5000) & wait.WINDOW) != 0 && time.now_ms() - t0 < 500);
+    check("read", drain() >= 1);
+    settle();
+    check("quiet again", wait.wait(&wt, &win, 50) == wait.TIMEOUT);
+
+    // Handed to the window, not yet read by the program: still waiting.
+    poke(other);
+    time.sleep_ms(100);
+    device.pump(&win);
+    check("in the window's queue", device.pending(&win) == 1 && (wait.wait(&wt, &win, 5000) & wait.WINDOW) != 0);
+    drain();
+    settle();
+
+    // A wake-up while windows are open.
+    wait.wake(&wt);
+    check("woken, not by the window", wait.wait(&wt, &win, 5000) == wait.WOKEN);
+
+    xlib.XCloseDisplay(other);
+    wait.close(&wt);
+    window.close(&win);
+    if (fails == 0) {
+        io.printf("window wait x11: all checks passed\n");
+        return 0;
+    }
+    io.printf("window wait x11: %d failures\n", fails);
+    return 1;
+}
