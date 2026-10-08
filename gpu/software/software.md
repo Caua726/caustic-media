@@ -194,3 +194,11 @@ triangles, compared over a frame of everything draw2d draws
 triangles, since sampled at a texel's edge the two ways round could pick
 different texels. Compute, SPIR-V and threads are still to come (the order
 of work above).
+
+`raster_test.cst` also runs a native fragment with twenty simultaneously
+live floating-point values and verifies every pixel of its two-triangle
+frame. The complete media `test` script runs this consumer at O0 and O2;
+the F0 assembler cutover additionally exercised it at O1. Its O2 native
+disassembly contains XMM values and stack spills. This is compiler/raster
+correctness evidence, not a performance measurement or an assertion that
+the previous ordinary raster test reproduced the missing SSE memory form.
