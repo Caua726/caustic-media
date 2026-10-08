@@ -151,13 +151,17 @@ resize, fullscreen restore and a close request that can be declined. Desktop
 preference reads were also exercised in a native smoke. Real Windows, monitor
 transitions and interaction with an installed IME remain unverified.
 
-The portable `device.cst` and toolkit Windows integration are blocked by the
-Caustic linker: a program with an 8192-byte local array, using only `std/io`
-and `std/mem`, fails with `undefined symbol: __caustic_chkstk`. The same blocker
-also stops the existing `win_image` target before the later `test-win32`
-checks. Adding this backend to the portable dispatcher additionally leaked
-Windows DLL dependencies into Linux ELF examples despite OS guards; that
-experimental dispatcher integration was removed, rather than shipping
-unloadable Linux executables. The native backend is usable directly;
-`device.available(WIN32)` remains false. OLE DnD, toolkit UIA, platform choosers,
-complete CSD and modal-loop toolkit rendering are not implemented here.
+The F0 compiler candidate resolves the real `__caustic_chkstk` definition
+before PE validation/relocation. The permanent compiler fixture with an
+8192-byte recursive local passes in private Wine at `-O0/-O1/-O2` and through
+separate object linking. The media `test-win32` matrix also passed with that
+candidate, including the actual `win_image` PNG decoder. Compound immutable
+target guards now discard the wrong-target branch before IR reachability;
+the regression checks ELF/PE import tables rather than removing library names.
+The installed toolchain is unchanged until the complete F0 gate is validated.
+
+Portable Win32 dispatch and toolkit integration are not yet connected:
+`device.available(WIN32)` remains false. The native backend is usable directly.
+OLE DnD, toolkit UIA, platform choosers, complete CSD and modal-loop toolkit
+rendering remain implementation work. Native Wine checks are not proof of
+portable toolkit or real-Windows support.
