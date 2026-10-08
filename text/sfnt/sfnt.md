@@ -108,6 +108,11 @@ Nothing after that sees an axis's own units again. The reference tool records
 HarfBuzz's own coordinates for each test instance, and `var_test` must match them
 exactly.
 
+Normalization, segment interpolation and store accumulation now use native
+`f32` arithmetic, with no memory-rounding compiler workaround. The public
+`f64` design/delta API is unchanged. The pinned four-font references and the
+single/double precision boundaries pass at O0, O1 and O2.
+
 ### One variation store, four readers
 
 `HVAR` (advance widths), `MVAR` (ascender, x-height, underline and the rest),
