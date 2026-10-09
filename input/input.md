@@ -297,15 +297,18 @@ key's `shortcut`, so Ctrl+C, Ctrl+A and Ctrl+V work in a Cyrillic layout; with
 Alt alone, the layout's key, which mnemonics mean.
 
 Proved with real platform input: `keyboard_x11_test` (XTest, us/ru/de groups:
-keys, Ctrl+C in Russian, Caps Lock, AltGr), `keyboard_wayland_test` (XTest
-through Weston nested in Xvfb with us/ru: Ctrl+C in Russian, Cyrillic text,
-the client's repeat), `keyboard_win32_test` (SendInput under Wine: scan codes,
+keys, Ctrl+C in Russian, Caps Lock, AltGr, the focus taken by another
+program's window while a key is held), `keyboard_wayland_test` (XTest through
+Weston nested in Xvfb with US international, Russian and German: Ctrl+C in
+Russian, Cyrillic text, the client's repeat, a dead acute composing é, Caps
+Lock, AltGr), `keyboard_win32_test` (SendInput under Wine: scan codes,
 repeat, Caps Lock, Alt, Ctrl+C with a Russian layout loaded) and
 `host_x11_test` (Ctrl+A selecting an entry with the Russian group in use).
 Wine translates SendInput's keys to text through its X keymap whatever layout
 is loaded, so a Russian or German layout's text on Windows awaits real
-Windows. X11 types only Latin-1 without an input method (XLookupString), so
-Cyrillic text there comes with the toolkit's input method (below).
+Windows. X11 types only Latin-1, and composes no dead key, without an input
+method (XLookupString), so Cyrillic text and dead keys there come with the
+toolkit's input method (below).
 
 Still to come, in this order: inline XIM on X11 (opened by the toolkit, so
 any layout's text and compose); Wayland and Win32 surrounding-text context;
