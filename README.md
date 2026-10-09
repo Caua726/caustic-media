@@ -170,8 +170,10 @@ transforms images links no decoder.
 ## Building
 
 ```sh
-caustic-mk run test       # everything that needs no screen
-caustic-mk run test-x11   # what does, under Xvfb: windows, the toolkit's loop, the examples
+caustic-mk run test          # everything that needs no screen
+caustic-mk run test-x11      # what does, under Xvfb: windows, the toolkit's loop, the examples
+caustic-mk run test-wayland  # protocol catalog against wayland-scanner, clients on a private Weston
+caustic-mk run test-win32    # Windows libraries and the native backend under a private Wine
 caustic -q examples/cube.cst -o build/cube && ./build/cube
 caustic -q examples/text_editor.cst -o build/text_editor --path .caustic/deps && ./build/text_editor
 ```
@@ -182,6 +184,15 @@ starts none of the desktop's services. The toolkit's examples —
 `settings_form`, `text_editor`, `file_browser` — run as programs, and with
 `--check` drive themselves the way a user would, their keys, clicks and
 wheel sent through the X server to their own window.
+
+Every server a test uses is its own: `window/x11/tools/run_headless.sh`
+(Xvfb, answered by a client before the program starts),
+`window/wayland/tools/run_wayland.sh` (headless Weston, or with
+`WESTON_BACKEND=x11` a Weston nested in that Xvfb whose keyboard and pointer
+are a real seat) and `tools/wine_session.sh` (a temporary Wine prefix on its
+own Xvfb; `tools/run_wine.sh` starts one when run alone). Startup is bounded,
+the program's exit status is the runner's, and a HUP/INT/TERM ends the
+program's process group before the runner removes only what it created.
 
 A program of the toolkit's imports a few hundred modules; the compiler has
 to take more than 256 of them in one program (Caustic's build of 2026-10-06

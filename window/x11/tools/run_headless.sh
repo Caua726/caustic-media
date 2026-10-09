@@ -48,18 +48,23 @@ set -eu
 command -v Xvfb >/dev/null 2>&1 || {
     echo "run_headless: Xvfb nao encontrado (apt: xvfb)" >&2; exit 127
 }
-numfile=$(mktemp "${TMPDIR:-/tmp}/run_headless.XXXXXX")
-Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp -noreset 3>"$numfile" >/dev/null 2>&1 &
-xvfb_pid=$!
 num=""
-
+xvfb_pid=""
+numfile=$(mktemp "${TMPDIR:-/tmp}/run_headless.XXXXXX")
 cleanup() {
-    kill "$xvfb_pid" 2>/dev/null || true
-    wait "$xvfb_pid" 2>/dev/null || true
+    if [ -n "$xvfb_pid" ]; then
+        kill "$xvfb_pid" 2>/dev/null || true
+        wait "$xvfb_pid" 2>/dev/null || true
+    fi
     [ -z "$num" ] || rm -f "/tmp/.X${num}-lock" 2>/dev/null || true
     rm -f "$numfile"
 }
-trap cleanup EXIT INT TERM
+# A signal stops the program and then the server, never a server without
+# its program or a program waited for indefinitely.
+trap cleanup EXIT
+. "$(dirname "$0")/../../../tools/child.sh"
+Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp -noreset 3>"$numfile" >/dev/null 2>&1 &
+xvfb_pid=$!
 
 # Wait for the number, a whole line of it, rather than sleeping a guess. 100
 # tries at 50 ms is five seconds, far more than Xvfb has ever needed and still
@@ -76,8 +81,16 @@ while [ "$i" -lt 100 ]; do
 done
 [ "$i" -lt 100 ] || { echo "run_headless: Xvfb nao respondeu em 5s" >&2; exit 1; }
 num=$(head -n 1 "$numfile")
+# A client's round trip, when the probe is installed, confirms what the
+# server wrote.
+if command -v xdpyinfo >/dev/null 2>&1; then
+    timeout 5 xdpyinfo -display ":$num" >/dev/null 2>&1 || {
+        echo "run_headless: Xvfb :$num nao respondeu a um cliente" >&2; exit 1
+    }
+fi
 
 # AUTO must use this private X server, not the caller's Wayland session.
 unset WAYLAND_DISPLAY
 export XDG_SESSION_TYPE=x11
-DISPLAY=":$num" "$@"
+export DISPLAY=":$num"
+run_child "$@"
