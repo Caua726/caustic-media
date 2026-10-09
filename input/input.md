@@ -17,7 +17,7 @@ input/
   mapping.cst   the controller database
   haptic.cst    rumble and force feedback
   sensor.cst    accelerometer, gyroscope
-  text.cst      text input and IME composition
+  text.cst      what a text field tells an input method: purpose, hints, limit
   state.cst     sampled state, fed from events
   action.cst    action mapping, derived from events
   gesture.cst   tap, drag, pinch, hold — derived from touch
@@ -318,9 +318,44 @@ its spot, reset when the field gives the composition up. Proved with the
 installed Fcitx5 (`xim_x11_test` on and over the spot, `ime_x11_test` an
 entry composing and committing, its panel at the entry's caret, the
 composition given up when the focus moves) and with Xlib's local method (a
-dead key composing é). On Wayland text-input-v3 carries commit, preedit and
-delete-surrounding; on Windows IMM32 the composition.
+dead key composing é).
 
-Still to come, in this order: Wayland and Win32 surrounding-text context and
-resets; continuous scrolling (axis source, stop, value120 on Wayland); touch,
-pen and gestures; gamepads, raw devices and the action mapping.
+What the field is, told the method (`text.cst`, `device.text_input_context`
+from the host for the field with the keyboard): its text around the caret —
+the caret's paragraph, at most 3999 bytes of whole characters, the selection
+in it as far as it fits (`ui/access.cst`'s `text_around`) — and its purpose
+and hints from its role (a password, many lines). A password's text is never
+told; on X11 and Windows the method does not even get its keys. On Wayland,
+text-input-v3 follows the protocol's rules: enable only with the text-input
+focus and everything told again after each enter, state told when it changed
+and held while a `done` is behind the commits, the change's cause (the
+method's commit or not), `done` applied as delete, commit, then the
+composition (its cursor range the part being converted), a composition not
+sent again gone, malformed strings ignored, and a method's commit never cut.
+A key's text is typed whatever the method: a compositor's method grabs the
+keys it composes with. On Windows, IMM32: an input context only while a field
+that is not secret has the keyboard, the composition with its caret and its
+target clause (`GCS_COMPATTR`) as the converted part, candidates under the
+caret and never over it (`CFS_EXCLUDE`), the method's own composition window
+kept hidden, `CPS_CANCEL` to reset, and the field's text with the
+composition in it for a method that asks (`IMR_DOCUMENTFEED`), the caret's
+place on the screen (`IMR_QUERYCHARPOSITION`). Deleting around the caret
+(`DELETE_SURROUNDING`) is counted from the selection's ends and keeps it.
+
+Proved: `wayland/text_input_test` on the wire (order, serials, malformed and
+boundary strings, a password, leave and enter, reset);
+`text_input_wayland_test` on KWin (keys type with text input on — they did
+not before — and the installed Fcitx5, as KWin's input method, told the
+field's text, selection and kind, and a password's kind but not its text);
+`ime_win32_test` through Wine's IMM32 (composition, commit, reset, no context
+without a field or in a password's, the document asked) and
+`program_win32_test` (an entry of a toolkit program composing and
+committing through it). Not proved here: an installed method composing on
+Wayland — KWin nested in Xvfb never hands XTest's keys to its input method's
+grab, a GTK client's neither — and Wine's IMM32 keeps no attributes it is
+given, so the target clause is checked from attributes as a method sets
+them.
+
+Still to come, in this order: continuous scrolling (axis source, stop,
+value120 on Wayland); touch, pen and gestures; gamepads, raw devices and the
+action mapping.

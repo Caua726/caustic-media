@@ -60,6 +60,10 @@ int main(void) {
     printf("COMPOSITIONFORM %zu\n", sizeof(COMPOSITIONFORM));
     _Static_assert(sizeof(CANDIDATEFORM) == 32, "CANDIDATEFORM");
     printf("CANDIDATEFORM %zu\n", sizeof(CANDIDATEFORM));
+    _Static_assert(sizeof(RECONVERTSTRING) == 32, "RECONVERTSTRING");
+    printf("RECONVERTSTRING %zu\n", sizeof(RECONVERTSTRING));
+    _Static_assert(sizeof(IMECHARPOSITION) == 36, "IMECHARPOSITION");
+    printf("IMECHARPOSITION %zu\n", sizeof(IMECHARPOSITION));
     _Static_assert(sizeof(GUID) == 16, "GUID");
     printf("GUID %zu\n", sizeof(GUID));
     _Static_assert(sizeof(NOTIFYICONDATAW) == 976, "NOTIFYICONDATAW");
@@ -393,6 +397,19 @@ int main(void) {
     _Static_assert(offsetof(CANDIDATEFORM, dwStyle) == 4, "CANDIDATEFORM.dwStyle");
     _Static_assert(offsetof(CANDIDATEFORM, ptCurrentPos) == 8, "CANDIDATEFORM.ptCurrentPos");
     _Static_assert(offsetof(CANDIDATEFORM, rcArea) == 16, "CANDIDATEFORM.rcArea");
+    _Static_assert(offsetof(RECONVERTSTRING, dwSize) == 0, "RECONVERTSTRING.dwSize");
+    _Static_assert(offsetof(RECONVERTSTRING, dwVersion) == 4, "RECONVERTSTRING.dwVersion");
+    _Static_assert(offsetof(RECONVERTSTRING, dwStrLen) == 8, "RECONVERTSTRING.dwStrLen");
+    _Static_assert(offsetof(RECONVERTSTRING, dwStrOffset) == 12, "RECONVERTSTRING.dwStrOffset");
+    _Static_assert(offsetof(RECONVERTSTRING, dwCompStrLen) == 16, "RECONVERTSTRING.dwCompStrLen");
+    _Static_assert(offsetof(RECONVERTSTRING, dwCompStrOffset) == 20, "RECONVERTSTRING.dwCompStrOffset");
+    _Static_assert(offsetof(RECONVERTSTRING, dwTargetStrLen) == 24, "RECONVERTSTRING.dwTargetStrLen");
+    _Static_assert(offsetof(RECONVERTSTRING, dwTargetStrOffset) == 28, "RECONVERTSTRING.dwTargetStrOffset");
+    _Static_assert(offsetof(IMECHARPOSITION, dwSize) == 0, "IMECHARPOSITION.dwSize");
+    _Static_assert(offsetof(IMECHARPOSITION, dwCharPos) == 4, "IMECHARPOSITION.dwCharPos");
+    _Static_assert(offsetof(IMECHARPOSITION, pt) == 8, "IMECHARPOSITION.pt");
+    _Static_assert(offsetof(IMECHARPOSITION, cLineHeight) == 16, "IMECHARPOSITION.cLineHeight");
+    _Static_assert(offsetof(IMECHARPOSITION, rcDocument) == 20, "IMECHARPOSITION.rcDocument");
     _Static_assert(offsetof(NOTIFYICONDATAW, cbSize) == 0, "NOTIFYICONDATAW.cbSize");
     _Static_assert(offsetof(NOTIFYICONDATAW, hWnd) == 8, "NOTIFYICONDATAW.hWnd");
     _Static_assert(offsetof(NOTIFYICONDATAW, uID) == 16, "NOTIFYICONDATAW.uID");
@@ -1415,6 +1432,13 @@ int main(void) {
     if ((long long)(IMN_SETOPENSTATUS) != 8LL) { printf("FAIL constant IMN_SETOPENSTATUS\n"); failures++; }
     if ((long long)(IMN_SETSENTENCEMODE) != 7LL) { printf("FAIL constant IMN_SETSENTENCEMODE\n"); failures++; }
     if ((long long)(IMN_SETSTATUSWINDOWPOS) != 12LL) { printf("FAIL constant IMN_SETSTATUSWINDOWPOS\n"); failures++; }
+    if ((long long)(IMR_CANDIDATEWINDOW) != 2LL) { printf("FAIL constant IMR_CANDIDATEWINDOW\n"); failures++; }
+    if ((long long)(IMR_COMPOSITIONFONT) != 3LL) { printf("FAIL constant IMR_COMPOSITIONFONT\n"); failures++; }
+    if ((long long)(IMR_COMPOSITIONWINDOW) != 1LL) { printf("FAIL constant IMR_COMPOSITIONWINDOW\n"); failures++; }
+    if ((long long)(IMR_CONFIRMRECONVERTSTRING) != 5LL) { printf("FAIL constant IMR_CONFIRMRECONVERTSTRING\n"); failures++; }
+    if ((long long)(IMR_DOCUMENTFEED) != 7LL) { printf("FAIL constant IMR_DOCUMENTFEED\n"); failures++; }
+    if ((long long)(IMR_QUERYCHARPOSITION) != 6LL) { printf("FAIL constant IMR_QUERYCHARPOSITION\n"); failures++; }
+    if ((long long)(IMR_RECONVERTSTRING) != 4LL) { printf("FAIL constant IMR_RECONVERTSTRING\n"); failures++; }
     if ((long long)(INPUT_HARDWARE) != 2LL) { printf("FAIL constant INPUT_HARDWARE\n"); failures++; }
     if ((long long)(INPUT_KEYBOARD) != 1LL) { printf("FAIL constant INPUT_KEYBOARD\n"); failures++; }
     if ((long long)(INPUT_MOUSE) != 0LL) { printf("FAIL constant INPUT_MOUSE\n"); failures++; }
@@ -1835,6 +1859,22 @@ int main(void) {
     if ((long long)(RowOrColumnMajor_ColumnMajor) != 1LL) { printf("FAIL constant RowOrColumnMajor_ColumnMajor\n"); failures++; }
     if ((long long)(RowOrColumnMajor_Indeterminate) != 2LL) { printf("FAIL constant RowOrColumnMajor_Indeterminate\n"); failures++; }
     if ((long long)(RowOrColumnMajor_RowMajor) != 0LL) { printf("FAIL constant RowOrColumnMajor_RowMajor\n"); failures++; }
+    if ((long long)(SCS_32BIT_BINARY) != 0LL) { printf("FAIL constant SCS_32BIT_BINARY\n"); failures++; }
+    if ((long long)(SCS_64BIT_BINARY) != 6LL) { printf("FAIL constant SCS_64BIT_BINARY\n"); failures++; }
+    if ((long long)(SCS_CAP_COMPSTR) != 1LL) { printf("FAIL constant SCS_CAP_COMPSTR\n"); failures++; }
+    if ((long long)(SCS_CAP_MAKEREAD) != 2LL) { printf("FAIL constant SCS_CAP_MAKEREAD\n"); failures++; }
+    if ((long long)(SCS_CAP_SETRECONVERTSTRING) != 4LL) { printf("FAIL constant SCS_CAP_SETRECONVERTSTRING\n"); failures++; }
+    if ((long long)(SCS_CHANGEATTR) != 18LL) { printf("FAIL constant SCS_CHANGEATTR\n"); failures++; }
+    if ((long long)(SCS_CHANGECLAUSE) != 36LL) { printf("FAIL constant SCS_CHANGECLAUSE\n"); failures++; }
+    if ((long long)(SCS_DOS_BINARY) != 1LL) { printf("FAIL constant SCS_DOS_BINARY\n"); failures++; }
+    if ((long long)(SCS_OS216_BINARY) != 5LL) { printf("FAIL constant SCS_OS216_BINARY\n"); failures++; }
+    if ((long long)(SCS_PIF_BINARY) != 3LL) { printf("FAIL constant SCS_PIF_BINARY\n"); failures++; }
+    if ((long long)(SCS_POSIX_BINARY) != 4LL) { printf("FAIL constant SCS_POSIX_BINARY\n"); failures++; }
+    if ((long long)(SCS_QUERYRECONVERTSTRING) != 131072LL) { printf("FAIL constant SCS_QUERYRECONVERTSTRING\n"); failures++; }
+    if ((long long)(SCS_SETRECONVERTSTRING) != 65536LL) { printf("FAIL constant SCS_SETRECONVERTSTRING\n"); failures++; }
+    if ((long long)(SCS_SETSTR) != 9LL) { printf("FAIL constant SCS_SETSTR\n"); failures++; }
+    if ((long long)(SCS_THIS_PLATFORM_BINARY) != 6LL) { printf("FAIL constant SCS_THIS_PLATFORM_BINARY\n"); failures++; }
+    if ((long long)(SCS_WOW_BINARY) != 2LL) { printf("FAIL constant SCS_WOW_BINARY\n"); failures++; }
     if ((long long)(SC_ACTION_NONE) != 0LL) { printf("FAIL constant SC_ACTION_NONE\n"); failures++; }
     if ((long long)(SC_ACTION_REBOOT) != 2LL) { printf("FAIL constant SC_ACTION_REBOOT\n"); failures++; }
     if ((long long)(SC_ACTION_RESTART) != 1LL) { printf("FAIL constant SC_ACTION_RESTART\n"); failures++; }
@@ -3294,6 +3334,6 @@ int main(void) {
     if ((long long)(WVR_VALIDRECTS) != 1024LL) { printf("FAIL constant WVR_VALIDRECTS\n"); failures++; }
     if ((long long)(WVR_VREDRAW) != 512LL) { printf("FAIL constant WVR_VREDRAW\n"); failures++; }
     if (failures != 0) return 1;
-    printf("win32 constants: 2464 checked\n");
+    printf("win32 constants: 2487 checked\n");
     return 0;
 }

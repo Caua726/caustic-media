@@ -1,0 +1,285 @@
+// window/ime_win32_test.cst — a text field and the input method on Windows
+// (here: an isolated Wine), through IMM32 as a method drives it:
+//   sh window/win32/tools/run_native.sh build/ime_win32_test.exe
+// The window has an input context only while a text field has the keyboard
+// and is not a password's (its keys type themselves otherwise); the method
+// is told where the caret is — the candidates below it, never over it; what
+// it composes (ImmSetCompositionStringW, the method's own call) arrives as
+// the composition with its caret and its converted part, what it commits as
+// text and the composition emptied once; the program abandons a composition;
+// and the method that asks is told the field's text around the caret with
+// the composition in it (IMR_DOCUMENTFEED) and where the caret is on the
+// screen (IMR_QUERYCHARPOSITION). An installed IME's own windows are left to
+// real Windows.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "device.cst" as device;
+use "../input/event.cst" as ie;
+use "../input/text.cst" as content;
+use "win32/bind/types.cst" as t;
+use "win32/bind/user32.cst" as u;
+use "win32/bind/imm32.cst" as ime;
+use "win32/bind/kernel32.cst" as k;
+use "win32/backend.cst" as backend;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is i64 as hwnd with mut = 0;
+
+// The next text or composition within half a second: its kind, NONE for none.
+fn next(out as *ie.Event) as i32 {
+    let is i64 as until = time.now_ms() + 500;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, out) == 1) {
+            if (out.kind == ie.TEXT || out.kind == ie.PREEDIT) { return out.kind; }
+        }
+        time.sleep_ms(5);
+    }
+    return ie.NONE;
+}
+
+fn drain() as void {
+    let is ie.Event as e;
+    let is i64 as until = time.now_ms() + 200;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &e) == 1) { }
+        time.sleep_ms(5);
+    }
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+// UTF-16 of s (UTF-8) into w, its units.
+fn wide(s as *u8, w as *u16) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i32 as units = k_utf16(s, n, w);
+    w[units] = cast(u16, 0);
+    return cast(i64, units);
+}
+
+fn k_utf16(s as *u8, n as i64, w as *u16) as i32 {
+    return k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, s), cast(i32, n), w, 256);
+}
+
+// The method composes s (UTF-8), as the user's keys would have it.
+fn compose(s as *u8) as void {
+    let is [256]u16 as w;
+    let is i64 as units = wide(s, &w[0]);
+    let is i64 as h = ime.ImmGetContext(hwnd);
+    ime.ImmSetCompositionStringW(h, cast(u32, t.SCS_SETSTR), cast(*u8, &w[0]), cast(u32, units * 2), cast(*u8, 0), 0);
+    ime.ImmReleaseContext(hwnd, h);
+}
+
+fn keybd(vk as i64, up as i32) as void {
+    let is t.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(t.INPUT));
+    in.c_type = cast(u32, t.INPUT_KEYBOARD);
+    let is *t.KEYBDINPUT as kb = cast(*t.KEYBDINPUT, &in._anon1);
+    kb.wVk = cast(u16, vk);
+    kb.wScan = cast(u16, u.MapVirtualKeyW(cast(u32, vk), cast(u32, t.MAPVK_VK_TO_VSC)));
+    if (up == 1) { kb.dwFlags = cast(u32, t.KEYEVENTF_KEYUP); }
+    u.SendInput(1, &in, cast(i32, sizeof(t.INPUT)));
+}
+
+fn context() as i64 {
+    let is i64 as h = ime.ImmGetContext(hwnd);
+    if (h != 0) { ime.ImmReleaseContext(hwnd, h); }
+    return h;
+}
+
+fn main() as i32 {
+    win = device.open("ime", 300, 200);
+    if (device.is_open(&win) == 0) {
+        io.printf("FAIL: no window\n");
+        return 1;
+    }
+    hwnd = win.win32_win.hwnd;
+    device.next_frame(&win);
+    u.SetForegroundWindow(hwnd);
+    u.SetFocus(hwnd);
+    drain();
+    let is ie.Event as e;
+
+    // --- No field: no method ---
+    check("no text field: no input context, its keys its own",
+          context() == 0 && device.text_input_active(&win) == 0);
+
+    // --- A field: the method, told where the caret is ---
+    check("a text field: the input context", device.text_input_enable(&win, 1) == 1 && context() != 0 &&
+          device.text_input_active(&win) == 1);
+    check("its caret told", device.text_input_rect(&win, 10, 20, 2, 16) == 1);
+    let is i64 as h with mut = ime.ImmGetContext(hwnd);
+    let is t.CANDIDATEFORM as cand;
+    mem.memzero(cast(*u8, &cand), sizeof(t.CANDIDATEFORM));
+    let is t.COMPOSITIONFORM as comp;
+    mem.memzero(cast(*u8, &comp), sizeof(t.COMPOSITIONFORM));
+    check("the candidates below the caret and never over it",
+          ime.ImmGetCandidateWindow(h, 0, &cand) != 0 && cast(i64, cand.dwStyle) == t.CFS_EXCLUDE &&
+          cand.ptCurrentPos.x == 10 && cand.ptCurrentPos.y == 36 &&
+          cand.rcArea.left == 10 && cand.rcArea.top == 20 && cand.rcArea.right == 12 && cand.rcArea.bottom == 36);
+    check("a composition the method draws: at the caret's top left",
+          ime.ImmGetCompositionWindow(h, &comp) != 0 && comp.ptCurrentPos.x == 10 && comp.ptCurrentPos.y == 20);
+    ime.ImmReleaseContext(hwnd, h);
+
+    // --- Composing, committing ---
+    ime.ImmSetOpenStatus(context(), 1);
+    compose("かな");
+    check("composing: the composition, its caret at its end, none of it being converted (all ATTR_INPUT)",
+          next(&e) == ie.PREEDIT && same(e.text, e.text_len, "かな") == 1 && e.cursor == 6 &&
+          e.hl_start == 0 && e.hl_end == 0);
+    // The second character the conversion's target: where this IMM32 lets
+    // the attributes be set (Wine's says yes and keeps them all ATTR_INPUT).
+    h = ime.ImmGetContext(hwnd);
+    let is [2]u8 as attr;
+    attr[0] = cast(u8, t.ATTR_INPUT);
+    attr[1] = cast(u8, t.ATTR_TARGET_CONVERTED);
+    ime.ImmSetCompositionStringW(h, cast(u32, t.SCS_CHANGEATTR), &attr[0], 2, cast(*u8, 0), 0);
+    let is [2]u8 as back;
+    let is i32 as nb = ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_COMPATTR), &back[0], 2);
+    ime.ImmReleaseContext(hwnd, h);
+    if (nb == 2 && cast(i64, back[1]) == t.ATTR_TARGET_CONVERTED) {
+        check("the part being converted: its bytes", next(&e) == ie.PREEDIT && e.hl_start == 3 && e.hl_end == 6);
+    } else {
+        io.printf("  (this IMM32 keeps no attributes it is given: the converted part left to real Windows)\n");
+    }
+    // The conversion itself, from attributes as a method sets them: か𠀋な,
+    // the middle character (a surrogate pair) the target.
+    let is [8]u16 as kana;
+    let is i64 as nk = wide("か𠀋な", &kana[0]);
+    let is [4]u8 as at;
+    at[0] = cast(u8, t.ATTR_INPUT); at[1] = cast(u8, t.ATTR_TARGET_CONVERTED);
+    at[2] = cast(u8, t.ATTR_TARGET_CONVERTED); at[3] = cast(u8, t.ATTR_INPUT);
+    let is ie.Event as seg;
+    mem.memzero(cast(*u8, &seg), sizeof(ie.Event));
+    backend._target_bytes(&at[0], &kana[0], nk, &seg);
+    check("a target clause: its UTF-8 bytes", nk == 4 && seg.hl_start == 3 && seg.hl_end == 7);
+    at[1] = cast(u8, t.ATTR_INPUT);
+    mem.memzero(cast(*u8, &seg), sizeof(ie.Event));
+    backend._target_bytes(&at[0], &kana[0], nk, &seg);
+    check("half a pair marked: the whole character", seg.hl_start == 3 && seg.hl_end == 7);
+    at[2] = cast(u8, t.ATTR_INPUT);
+    mem.memzero(cast(*u8, &seg), sizeof(ie.Event));
+    backend._target_bytes(&at[0], &kana[0], nk, &seg);
+    check("no target: none", seg.hl_start == 0 && seg.hl_end == 0);
+    h = ime.ImmGetContext(hwnd);
+    ime.ImmNotifyIME(h, cast(u32, t.NI_COMPOSITIONSTR), cast(u32, t.CPS_COMPLETE), 0);
+    ime.ImmReleaseContext(hwnd, h);
+    check("committed: the text", next(&e) == ie.TEXT && e.from_key == 0 && same(e.text, e.text_len, "かな") == 1);
+    check("and the composition emptied, once",
+          next(&e) == ie.PREEDIT && e.text_len == 0 && next(&e) == ie.NONE);
+
+    // --- Abandoned by the program ---
+    compose("ab");
+    check("composing again", next(&e) == ie.PREEDIT && e.text_len == 2);
+    check("reset: the composition emptied, once", device.text_input_reset(&win) == 1 &&
+          next(&e) == ie.PREEDIT && e.text_len == 0 && next(&e) == ie.NONE);
+    h = ime.ImmGetContext(hwnd);
+    check("and the method's dropped", ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_COMPSTR), cast(*u8, 0), 0) == 0);
+    ime.ImmReleaseContext(hwnd, h);
+
+    // --- What the method may ask ---
+    check("the field's text told", device.text_input_context(&win, "olá mundo", 10, 4, 4,
+                                                            content.PURPOSE_NORMAL, 0) == 1);
+    let is i64 as size = u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_DOCUMENTFEED), 0);
+    let is i64 as head = cast(i64, sizeof(t.RECONVERTSTRING));
+    check("the document's size asked: the text and its NUL", size == head + (9 + 1) * 2);
+    let is [1024]u8 as feed;
+    mem.memzero(&feed[0], 1024);
+    let is *t.RECONVERTSTRING as rs = cast(*t.RECONVERTSTRING, &feed[0]);
+    rs.dwSize = cast(u32, 1024);
+    let is [64]u16 as expect;
+    let is i64 as units with mut = wide("olá mundo", &expect[0]);
+    check("the document: the text around the caret, the caret after olá",
+          u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_DOCUMENTFEED), cast(i64, rs)) == size &&
+          rs.dwStrLen == cast(u32, units) && rs.dwStrOffset == cast(u32, head) && rs.dwCompStrLen == 0 &&
+          rs.dwCompStrOffset == 6 && mem.memcmp(cast(*u8, cast(i64, rs) + head), cast(*u8, &expect[0]), units * 2) == 0);
+    compose("x");
+    check("composing at the caret", next(&e) == ie.PREEDIT && e.text_len == 1);
+    mem.memzero(&feed[0], 1024);
+    rs.dwSize = cast(u32, 1024);
+    units = wide("oláx mundo", &expect[0]);
+    check("the document with the composition in it",
+          u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_DOCUMENTFEED), cast(i64, rs)) > 0 &&
+          rs.dwStrLen == cast(u32, units) && rs.dwCompStrLen == 1 && rs.dwCompStrOffset == 6 &&
+          mem.memcmp(cast(*u8, cast(i64, rs) + head), cast(*u8, &expect[0]), units * 2) == 0);
+    let is t.RECONVERTSTRING as small;
+    mem.memzero(cast(*u8, &small), sizeof(t.RECONVERTSTRING));
+    small.dwSize = cast(u32, sizeof(t.RECONVERTSTRING));
+    check("a buffer too small: nothing written",
+          u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_DOCUMENTFEED), cast(i64, &small)) == 0 &&
+          small.dwStrLen == 0);
+    device.text_input_reset(&win);
+    drain();
+    let is t.IMECHARPOSITION as cp;
+    mem.memzero(cast(*u8, &cp), sizeof(t.IMECHARPOSITION));
+    cp.dwSize = cast(u32, sizeof(t.IMECHARPOSITION));
+    let is t.POINT as caret;
+    caret.x = 10;
+    caret.y = 20;
+    u.ClientToScreen(hwnd, &caret);
+    check("where the caret is on the screen",
+          u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_QUERYCHARPOSITION), cast(i64, &cp)) == 1 &&
+          cp.pt.x == caret.x && cp.pt.y == caret.y && cp.cLineHeight == 16 &&
+          cp.rcDocument.right - cp.rcDocument.left == 300);
+    check("reconversion not offered",
+          u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_RECONVERTSTRING), 0) == 0);
+
+    // --- A password: no method, its keys type themselves ---
+    compose("pw");
+    check("composing before the field turns secret", next(&e) == ie.PREEDIT && e.text_len == 2);
+    check("a password field: no input context, the composition gone",
+          device.text_input_context(&win, cast(*u8, 0), 0, 0, 0, content.PURPOSE_PASSWORD,
+                                    content.HINT_HIDDEN_TEXT | content.HINT_SENSITIVE_DATA) == 1 &&
+          context() == 0 && device.text_input_active(&win) == 0 &&
+          next(&e) == ie.PREEDIT && e.text_len == 0);
+    check("its text never kept for the method",
+          u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_DOCUMENTFEED), 0) == 0);
+    keybd(65, 0);
+    keybd(65, 1);
+    check("a key: its own text", next(&e) == ie.TEXT && e.from_key == 1 && same(e.text, e.text_len, "a") == 1);
+    check("a plain field again: the input context back",
+          device.text_input_context(&win, "", 0, 0, 0, content.PURPOSE_NORMAL, 0) == 1 && context() != 0);
+
+    // --- Focus leaving while composing ---
+    compose("z");
+    check("composing", next(&e) == ie.PREEDIT && e.text_len == 1);
+    let is device.Window as other = device.open("other", 100, 100);
+    u.SetForegroundWindow(other.win32_win.hwnd);
+    u.SetFocus(other.win32_win.hwnd);
+    check("the focus gone: the composition emptied, once",
+          next(&e) == ie.PREEDIT && e.text_len == 0 && next(&e) == ie.NONE);
+    device.close(&other);
+    u.SetForegroundWindow(hwnd);
+    u.SetFocus(hwnd);
+    drain();
+
+    // --- No field again ---
+    check("no field: the input context taken away", device.text_input_enable(&win, 0) == 1 && context() == 0 &&
+          device.text_input_active(&win) == 0);
+    check("nothing asked of a window with none",
+          u.SendMessageW(hwnd, cast(u32, t.WM_IME_REQUEST), cast(u64, t.IMR_DOCUMENTFEED), 0) == 0);
+    device.close(&win);
+    if (fails != 0) {
+        io.printf("ime win32: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("ime win32: all checks passed\n");
+    return 0;
+}

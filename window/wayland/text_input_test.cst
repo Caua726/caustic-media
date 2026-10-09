@@ -1,0 +1,315 @@
+// window/wayland/text_input_test.cst — text-input-v3 on the wire: what a
+// window tells the compositor's input method, in which order and when, and
+// what it makes of what the method sends — as a socket pair sees both.
+//   ./build/wayland_text_input_test
+// The protocol's rules under test: enable only with the text-input focus,
+// and everything told again after it (enable resets the state, and nothing
+// sent between leave and enter counts); state told only when changed, in one
+// commit; a done whose serial is behind the commits holds what is told until
+// one that is not; done applies delete, commit, composition in that order,
+// and a composition not sent again is gone; strings whole and UTF-8, offsets
+// on character boundaries; a password's text never sent.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../sys/linux.cst" as sys;
+use "../../input/event.cst" as ie;
+use "../../input/text.cst" as content;
+use "backend.cst" as wayland;
+
+let is i32 as failures with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("  FAIL: %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+fn word(p as *u8, offset as i64) as u32 { return *cast(*u32, cast(i64, p) + offset); }
+fn put(p as *u8, offset as i64, value as u32) as void { *cast(*u32, cast(i64, p) + offset) = value; }
+
+let is i32 as peer with mut = 0 - 1;
+
+// What the window sent since last asked: the requests' opcodes in order, and
+// where each one's arguments start in got.
+let is [65536]u8 as got;
+let is [64]i32 as ops;
+let is [64]i64 as args;
+let is i64 as nops with mut = 0;
+
+fn sent() as i64 {
+    nops = 0;
+    let is i64 as n with mut = 0;
+    while (sys.wait_readable(peer, 0) > 0 && n < 65536) {
+        let is i64 as r = linux.read(peer, cast(*u8, cast(i64, &got[0]) + n), 65536 - n);
+        if (r <= 0) { break; }
+        n = n + r;
+    }
+    let is i64 as at with mut = 0;
+    while (at + 8 <= n && nops < 64) {
+        let is u32 as head = word(&got[0], at + 4);
+        let is i64 as size = cast(i64, head >> 16);
+        if (size < 8) { break; }
+        ops[nops] = cast(i32, head & 65535);
+        args[nops] = at + 8;
+        nops = nops + 1;
+        at = at + size;
+    }
+    return nops;
+}
+
+// Whether the requests sent were exactly these opcodes, -1 ending the list.
+fn were(a as i32, b as i32, c as i32, d as i32, e as i32, f as i32) as i32 {
+    let is [6]i32 as want;
+    want[0] = a; want[1] = b; want[2] = c; want[3] = d; want[4] = e; want[5] = f;
+    let is i64 as k with mut = 0;
+    while (k < 6 && want[k] >= 0) { k = k + 1; }
+    if (k != nops) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < k) {
+        if (ops[i] != want[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn arg(i as i64, offset as i64) as u32 { return word(&got[0], args[i] + offset); }
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+let is wayland.Window as w with mut;
+
+// An event of the text input's, its arguments the bytes given.
+fn event(op as i32, body as *u8, n as i64) as void {
+    wayland._wire_size = cast(i32, 8 + n);
+    if (n > 0) { mem.memcpy(&wayland._wire[8], body, n); }
+    wayland._text_input_event(&w, op, &wayland._wire[8]);
+}
+
+fn event1(op as i32, value as u32) as void {
+    let is [4]u8 as b;
+    put(&b[0], 0, value);
+    event(op, &b[0], 4);
+}
+
+// A string event (3 commit_string; 2 preedit_string with its two offsets).
+let is [8192]u8 as body;
+fn string_event(op as i32, s as *u8, n as i64, begin as i32, end as i32) as void {
+    mem.memset(&body[0], 0, 8192);
+    put(&body[0], 0, cast(u32, n + 1));
+    mem.memcpy(&body[4], s, n);
+    let is i64 as padded = ((n + 1 + 3) / 4) * 4;
+    let is i64 as len with mut = 4 + padded;
+    if (op == 2) {
+        put(&body[0], len, cast(u32, begin));
+        put(&body[0], len + 4, cast(u32, end));
+        len = len + 8;
+    }
+    event(op, &body[0], len);
+}
+
+fn done(serial as u32) as void { event1(5, serial); }
+
+// The next input event, NONE for none.
+fn next(out as *ie.Event) as i32 {
+    if (wayland.poll_input(&w, out) == 1) { return out.kind; }
+    return ie.NONE;
+}
+
+fn main() as i32 {
+    let is [2]i32 as pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &pair[0]) < 0) {
+        io.printf("FAIL: socketpair\n");
+        return 1;
+    }
+    peer = pair[1];
+    wayland._zero(&w);
+    w.fd = pair[0]; w.opened = 1; w.text_input = 55; w.surface = 77;
+    w.scale120 = 180;
+    w.input = ie.create();
+    let is ie.Event as e;
+
+    // --- Wanted before the focus: nothing told until enter ---
+    check("on before the text-input focus: taken, not yet told",
+          wayland.text_input_enable(&w, 1) == 1 && sent() == 0 && wayland.text_input_active(&w) == 0);
+    check("the caret kept for then", wayland.text_input_rect(&w, 30, 60, 3, 30) == 1 && sent() == 0);
+    event1(0, 99);
+    check("another surface's enter: not ours", wayland.text_input_active(&w) == 0 && sent() == 0);
+    event1(0, 77);
+    // enable resets the state: it goes first, what is known after it.
+    check("enter: enable, then the content type and the caret, one commit",
+          wayland.text_input_active(&w) == 1 && sent() == 4 && were(1, 5, 6, 7, 0 - 1, 0 - 1) == 1 &&
+          arg(1, 0) == 0 && arg(1, 4) == 0 &&
+          arg(2, 0) == 20 && arg(2, 4) == 40 && arg(2, 8) == 2 && arg(2, 12) == 20);
+
+    // --- The field: its text around the caret, its kind ---
+    check("its text and kind told, changed by other than the method",
+          wayland.text_input_context(&w, "olá mundo", 10, 4, 0, content.PURPOSE_NORMAL, content.HINT_MULTILINE) == 1 &&
+          sent() == 4 && were(3, 4, 5, 7, 0 - 1, 0 - 1) == 1 &&
+          arg(0, 0) == 11 && same(cast(*u8, cast(i64, &got[0]) + args[0] + 4), 10, "olá mundo") == 1 &&
+          got[args[0] + 4 + 10] == 0 && arg(0, 16) == 4 && arg(0, 20) == 0 &&
+          arg(1, 0) == 1 && arg(2, 0) == cast(u32, content.HINT_MULTILINE) && arg(2, 4) == 0);
+    check("the same again: nothing",
+          wayland.text_input_context(&w, "olá mundo", 10, 4, 0, content.PURPOSE_NORMAL, content.HINT_MULTILINE) == 1 &&
+          sent() == 0);
+    check("the caret moved: the text alone",
+          wayland.text_input_context(&w, "olá mundo", 10, 10, 10, content.PURPOSE_NORMAL, content.HINT_MULTILINE) == 1 &&
+          sent() == 3 && were(3, 4, 7, 0 - 1, 0 - 1, 0 - 1) == 1 && arg(0, 16) == 10 && arg(0, 20) == 10);
+    check("offsets past the text refused",
+          wayland.text_input_context(&w, "abc", 3, 4, 0, content.PURPOSE_NORMAL, 0) == 0 &&
+          wayland.text_input_context(&w, "abc", 3, 0, 9, content.PURPOSE_NORMAL, 0) == 0 &&
+          wayland.text_input_context(&w, "abc", content.CONTEXT_MAX + 1, 0, 0, content.PURPOSE_NORMAL, 0) == 0 &&
+          sent() == 0);
+    // Commits so far: enter's, two of the text's: 3.
+
+    // --- done: in order, whole, and the serial ---
+    event1(4, 1);
+    let is [8]u8 as zero;
+    mem.memset(&zero[0], 0, 8);
+    put(&zero[0], 0, 1);
+    put(&zero[0], 4, 1);
+    event(4, &zero[0], 8);
+    string_event(3, "漢", 3, 0, 0);
+    string_event(2, "かな", 6, 3, 6);
+    done(3);
+    check("done: the text around deleted, the commit, the composition with its converted part",
+          next(&e) == ie.DELETE_SURROUNDING && e.delete_before == 1 && e.delete_after == 1 &&
+          next(&e) == ie.TEXT && e.from_key == 0 && same(e.text, e.text_len, "漢") == 1 &&
+          next(&e) == ie.PREEDIT && same(e.text, e.text_len, "かな") == 1 && e.cursor == 3 &&
+          e.hl_start == 3 && e.hl_end == 6 && next(&e) == ie.NONE);
+    check("in step: nothing waited, nothing told", sent() == 0);
+    // The text the commit made, told as the method's doing.
+    check("the text after the commit: told as the method's",
+          wayland.text_input_context(&w, "olá mundo漢", 13, 13, 13, content.PURPOSE_NORMAL, content.HINT_MULTILINE) == 1 &&
+          sent() == 3 && were(3, 4, 7, 0 - 1, 0 - 1, 0 - 1) == 1 && arg(1, 0) == 0);
+    done(4);
+    check("a done with no composition: the one shown gone, once",
+          next(&e) == ie.PREEDIT && e.text_len == 0 && next(&e) == ie.NONE);
+    done(4);
+    check("and nothing the next time", next(&e) == ie.NONE && sent() == 0);
+
+    // A done behind the commits: what is told waits for one that is not.
+    string_event(3, "x", 1, 0, 0);
+    done(3);
+    check("a commit from a done behind: applied", next(&e) == ie.TEXT && same(e.text, e.text_len, "x") == 1);
+    check("held: the text and the caret wait",
+          wayland.text_input_context(&w, "olá mundo漢x", 14, 14, 14, content.PURPOSE_NORMAL, content.HINT_MULTILINE) == 1 &&
+          wayland.text_input_rect(&w, 33, 60, 3, 30) == 1 && sent() == 0);
+    done(4);
+    check("a done in step: what waited told, in one commit",
+          sent() == 4 && were(3, 4, 6, 7, 0 - 1, 0 - 1) == 1 && arg(0, 0) == 15 && arg(1, 0) == 0 &&
+          arg(2, 0) == 22);
+    // Commits: 5.
+
+    // --- Malformed and boundary strings ---
+    let is [16]u8 as bad;
+    mem.memset(&bad[0], 0, 16);
+    put(&bad[0], 0, 200);
+    bad[4] = cast(u8, 97);
+    event(3, &bad[0], 8);
+    done(5);
+    check("a string longer than its message: ignored", next(&e) == ie.NONE);
+    mem.memset(&bad[0], 0, 16);
+    put(&bad[0], 0, 3);
+    bad[4] = cast(u8, 255); bad[5] = cast(u8, 254);
+    event(3, &bad[0], 8);
+    done(5);
+    check("not UTF-8: ignored", next(&e) == ie.NONE);
+    mem.memset(&bad[0], 0, 16);
+    put(&bad[0], 0, 3);
+    bad[4] = cast(u8, 97); bad[5] = cast(u8, 98); bad[6] = cast(u8, 99);
+    event(3, &bad[0], 8);
+    done(5);
+    check("not ended by its NUL: ignored", next(&e) == ie.NONE);
+    string_event(2, "é", 2, 1, 1);
+    done(5);
+    check("a caret inside a character: at its start",
+          next(&e) == ie.PREEDIT && e.text_len == 2 && e.cursor == 0 && e.hl_start == 0 && e.hl_end == 0);
+    string_event(2, "ab", 2, 0 - 1, 0 - 1);
+    done(5);
+    check("a hidden caret: at the end, nothing converted",
+          next(&e) == ie.PREEDIT && e.cursor == 2 && e.hl_end == 0);
+    string_event(2, "ab", 2, 9, 1);
+    done(5);
+    check("offsets past the composition: its end", next(&e) == ie.PREEDIT && e.cursor == 2 && e.hl_end == 0);
+    // A commit as long as a message carries, whole.
+    let is [3001]u8 as long;
+    let is i64 as i with mut = 0;
+    while (i < 1000) {
+        long[3 * i] = cast(u8, 227); long[3 * i + 1] = cast(u8, 129); long[3 * i + 2] = cast(u8, 130);
+        i = i + 1;
+    }
+    string_event(3, &long[0], 3000, 0, 0);
+    done(5);
+    check("a long commit: whole",
+          next(&e) == ie.TEXT && e.text_len == 3000 && mem.memcmp(e.text, &long[0], 3000) == 0 &&
+          next(&e) == ie.PREEDIT && e.text_len == 0);
+    // A deletion of nothing says nothing.
+    mem.memset(&zero[0], 0, 8);
+    event(4, &zero[0], 8);
+    done(5);
+    check("a deletion of nothing: unsaid", next(&e) == ie.NONE);
+
+    // --- A password: its kind told, its text never ---
+    check("a password's text not sent, its kind is",
+          wayland.text_input_context(&w, "hunter2", 7, 7, 7, content.PURPOSE_PASSWORD,
+                                     content.HINT_HIDDEN_TEXT | content.HINT_SENSITIVE_DATA) == 1 &&
+          sent() == 4 && were(3, 4, 5, 7, 0 - 1, 0 - 1) == 1 && arg(0, 0) == 1 && arg(0, 4) == 0 &&
+          arg(0, 8) == 0 && arg(2, 0) == cast(u32, content.HINT_HIDDEN_TEXT | content.HINT_SENSITIVE_DATA) &&
+          arg(2, 4) == cast(u32, content.PURPOSE_PASSWORD));
+    check("and its text changing tells nothing",
+          wayland.text_input_context(&w, "hunter22", 8, 8, 8, content.PURPOSE_PASSWORD,
+                                     content.HINT_HIDDEN_TEXT | content.HINT_SENSITIVE_DATA) == 1 && sent() == 0);
+    // Commits: 6.
+
+    // --- Leave and enter: everything told again ---
+    string_event(2, "ka", 2, 2, 2);
+    done(6);
+    check("composing", next(&e) == ie.PREEDIT && e.text_len == 2);
+    event1(1, 77);
+    check("leave: off for now, the composition gone",
+          wayland.text_input_active(&w) == 0 && next(&e) == ie.PREEDIT && e.text_len == 0 && next(&e) == ie.NONE);
+    check("while away: kept, not told",
+          wayland.text_input_context(&w, "abc", 3, 1, 1, content.PURPOSE_NORMAL, 0) == 1 &&
+          wayland.text_input_rect(&w, 0, 0, 3, 30) == 1 && sent() == 0);
+    event1(0, 77);
+    check("enter again: enable and all of it, one commit",
+          sent() == 6 && were(1, 3, 4, 5, 6, 7) == 1 && arg(1, 0) == 4 && arg(1, 8) == 1 && arg(1, 12) == 1);
+    // Commits: 7.
+
+    // --- Reset: let go and taken again ---
+    string_event(2, "ka", 2, 2, 2);
+    done(7);
+    check("composing again", next(&e) == ie.PREEDIT && e.text_len == 2);
+    check("reset: the composition gone here, disable and enable told",
+          wayland.text_input_reset(&w) == 1 && next(&e) == ie.PREEDIT && e.text_len == 0 &&
+          sent() == 8 && ops[0] == 2 && ops[1] == 7 && ops[2] == 1 && ops[7] == 7);
+    // Commits: 9.
+
+    // --- Off ---
+    check("off: disable and commit, nothing to empty",
+          wayland.text_input_enable(&w, 0) == 1 && sent() == 2 && were(2, 7, 0 - 1, 0 - 1, 0 - 1, 0 - 1) == 1 &&
+          next(&e) == ie.NONE && wayland.text_input_active(&w) == 0);
+    check("off: its text no longer taken",
+          wayland.text_input_context(&w, "abc", 3, 1, 1, content.PURPOSE_NORMAL, 0) == 0 &&
+          wayland.text_input_rect(&w, 1, 1, 1, 1) == 0 && sent() == 0);
+    string_event(3, "late", 4, 0, 0);
+    done(9);
+    check("a commit after off, before the compositor knew: still the user's text",
+          next(&e) == ie.TEXT && same(e.text, e.text_len, "late") == 1);
+
+    linux.close(pair[0]); linux.close(pair[1]);
+    ie.destroy(w.input);
+    if (failures != 0) {
+        io.printf("wayland text input: %d failures\n", cast(i64, failures));
+        return 1;
+    }
+    io.printf("wayland text input: all checks passed\n");
+    return 0;
+}

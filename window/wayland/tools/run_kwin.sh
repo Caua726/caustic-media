@@ -13,7 +13,9 @@
 # desktop's services. KWIN_BACKEND=virtual (the default) draws nowhere;
 # KWIN_BACKEND=x11 nests it in the X server DISPLAY names, so the screen can
 # be read back. KWIN_SCALE=1.5 sets its output's scale (kscreen-doctor, in
-# process) before the program starts.
+# process) before the program starts. KWIN_INPUT_METHOD=<program> is the
+# input method KWin starts for text fields (input-method-v1):
+# window/wayland/tools/kwin_fcitx.sh, an Fcitx5 of its own.
 set -eu
 [ $# -gt 0 ] || { echo "usage: run_kwin.sh <program> [args...]" >&2; exit 2; }
 if [ "${1:-}" != "--inside" ]; then
@@ -46,7 +48,12 @@ cleanup() {
 }
 trap cleanup EXIT
 . "$(dirname "$0")/../../../tools/child.sh"
-kwin_wayland "$where" --no-lockscreen --no-global-shortcuts --socket=wayland-k --width=1280 --height=1024 \
+im=""
+if [ -n "${KWIN_INPUT_METHOD:-}" ]; then
+    case "$KWIN_INPUT_METHOD" in /*) ;; *) KWIN_INPUT_METHOD="$PWD/$KWIN_INPUT_METHOD" ;; esac
+    im="--inputmethod=$KWIN_INPUT_METHOD"
+fi
+kwin_wayland "$where" --no-lockscreen --no-global-shortcuts --socket=wayland-k --width=1280 --height=1024 $im \
     >"$run/kwin.log" 2>&1 &
 kwin_pid=$!
 export WAYLAND_DISPLAY=wayland-k

@@ -178,11 +178,15 @@ Optional globals degrade independently. Clipboard and DnD require
 `zwp_primary_selection_device_manager_v1`; fractional scaling requires both
 `wp_viewporter` and `wp_fractional_scale_manager_v1`; server decorations,
 dialog roles and cursor shapes use their corresponding optional protocols.
-When `zwp_text_input_manager_v3` and a seat are present, focused text widgets
-enable text input, publish their caret rectangle, and receive inline preedit,
-committed text and delete-surrounding edits. The latter are expanded to UTF-8
-character boundaries by `entry` and `textview`. The backend does not publish
-surrounding text, so IME suggestions that need surrounding context are limited.
+When `zwp_text_input_manager_v3` and a seat are present, the text widget with
+the keyboard enables text input after each `enter`, publishes its caret
+rectangle, its text around the caret with the selection, and its purpose and
+hints (a password's text never), each only when it changed and held while a
+`done` is behind the commits; it receives inline preedit with the part being
+converted, committed text and delete-surrounding edits, which `entry` and
+`textview` count from the selection's ends and widen to whole characters.
+Keys still type while text input is on: an input method grabs the keys it
+composes with (`wayland/text_input_test`, `text_input_wayland_test` on KWin).
 
 `caustic-mk run test-wayland` checks the generated protocol catalog, exercises
 clipboard/DnD and text-input-v3 through internal wire tests, opens and presents

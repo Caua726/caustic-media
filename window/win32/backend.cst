@@ -9,6 +9,7 @@ use "bind/user32.cst" as u;
 use "bind/gdi32.cst" as g;
 use "bind/kernel32.cst" as k;
 use "bind/imm32.cst" as ime;
+use "../../input/text.cst" as content;
 use "abi.cst" as abi;
 use "clipboard.cst" as clipboard;
 use "bind/dwmapi.cst" as dwm;
@@ -73,6 +74,14 @@ struct Native {
     caret_y as i64;
     caret_w as i64;
     caret_h as i64;
+    // Whether the window has an input context — the method gets its keys —
+    // and what the field with the keyboard said of itself: its purpose, its
+    // text around the caret in UTF-8 (-1: none said), the caret in it.
+    ime_on as i32;
+    ime_purpose as i32;
+    ime_text_len as i64;
+    ime_caret as i64;
+    ime_text as [4000]u8;
     high_surrogate as u16;
     after_key as i32;       // a key went down, and nothing let it go since: a WM_CHAR now is its
     cursor as i64;
@@ -307,7 +316,10 @@ fn _typed(n as *Native, code as i64) as void {
     _push(n, &e, &b[0], count);
 }
 
+// The composition said gone, once, if one was said.
 fn _empty_preedit(n as *Native) as void {
+    if (n.composition_on == 0) { return; }
+    n.composition_on = 0;
     let is ie.Event as e = _input(ie.PREEDIT);
     _push(n, &e, cast(*u8, 0), 0);
 }
@@ -447,8 +459,55 @@ fn _edge(n as *Native, hx as i64, hy as i64) as i64 {
     return t.HTRIGHT;
 }
 
+// Bytes of UTF-8 the first count UTF-16 units of wide make.
+fn _utf8_of(wide as *u16, count as i64) as i64 {
+    if (count <= 0) { return 0; }
+    return cast(i64, k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, cast(i32, count),
+                                           cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0)));
+}
+
+// The part of the composition being converted — the target clause, its
+// units ATTR_TARGET_* in attr, one attribute a UTF-16 unit of wide — as
+// UTF-8 offsets into e, whole characters; none when no unit is.
+fn _target_bytes(attr as *u8, wide as *u16, units as i64, e as *ie.Event) as void {
+    let is i64 as first with mut = 0 - 1;
+    let is i64 as last with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < units) {
+        let is i64 as a = cast(i64, attr[i]);
+        if (a == t.ATTR_TARGET_CONVERTED || a == t.ATTR_TARGET_NOTCONVERTED) {
+            if (first < 0) { first = i; }
+            last = i + 1;
+        }
+        i = i + 1;
+    }
+    if (first < 0) { return; }
+    if (first > 0 && wide[first] >= 56320 && wide[first] <= 57343) { first = first - 1; }
+    if (last < units && wide[last] >= 56320 && wide[last] <= 57343) { last = last + 1; }
+    e.hl_start = _utf8_of(wide, first);
+    e.hl_end = _utf8_of(wide, last);
+}
+
+// GCS_COMPATTR read for the composition in wide (units long): its target
+// clause into e (_target_bytes).
+fn _ime_target(h as i64, wide as *u16, units as i64, e as *ie.Event) as void {
+    let is i32 as count = ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_COMPATTR), cast(*u8, 0), 0);
+    if (count <= 0 || cast(i64, count) != units) { return; }
+    let is [512]u8 as short_attr;
+    let is *u8 as attr with mut = &short_attr[0];
+    if (count > 512) {
+        attr = mem.core.mmap_anon(cast(i64, count));
+        if (cast(i64, attr) == 0) { return; }
+    }
+    if (ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_COMPATTR), attr, cast(u32, count)) == count) {
+        _target_bytes(attr, wide, units, e);
+    }
+    if (count > 512) { mem.core.munmap(attr, cast(i64, count)); }
+}
+
 // The composition string index says (GCS_RESULTSTR, GCS_COMPSTR) as kind
-// (TEXT, PREEDIT), UTF-8, the caret with a preedit.
+// (TEXT, PREEDIT), UTF-8: a preedit with its caret and the part being
+// converted, said empty only when one was said before.
 fn _ime_text(n as *Native, h as i64, index as i32, kind as i32) as void {
     let is i32 as bytes = ime.ImmGetCompositionStringW(h, cast(u32, index), cast(*u8, 0), 0);
     if (bytes < 0 || (bytes % 2) != 0) { return; }
@@ -463,29 +522,25 @@ fn _ime_text(n as *Native, h as i64, index as i32, kind as i32) as void {
         return;
     }
     let is *u16 as wide = cast(*u16, storage);
-    let is ie.Event as e = _input(kind);
-    let is i64 as len with mut = 0;
-    if (bytes > 0) {
-        len = cast(i64, k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2,
-                                              cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0)));
-    }
-    if (kind == ie.PREEDIT) {
-        let is i32 as pos with mut = ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_CURSORPOS), cast(*u8, 0), 0);
-        if (pos < 0) { pos = 0; }
-        if (pos > bytes / 2) { pos = bytes / 2; }
-        if (pos > 0 && pos < bytes / 2 && wide[pos] >= 56320 && wide[pos] <= 57343) { pos = pos - 1; }
-        e.cursor = 0;
-        if (pos > 0) {
-            e.cursor = cast(i64, k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, pos,
-                                                       cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0)));
+    let is i64 as units = cast(i64, bytes / 2);
+    let is i64 as len = _utf8_of(wide, units);
+    if (kind == ie.PREEDIT && len == 0) {
+        _empty_preedit(n);
+    } else if (len > 0) {
+        let is ie.Event as e = _input(kind);
+        if (kind == ie.PREEDIT) {
+            let is i64 as pos with mut = cast(i64, ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_CURSORPOS), cast(*u8, 0), 0));
+            if (pos < 0) { pos = 0; }
+            if (pos > units) { pos = units; }
+            if (pos > 0 && pos < units && wide[pos] >= 56320 && wide[pos] <= 57343) { pos = pos - 1; }
+            e.cursor = _utf8_of(wide, pos);
+            _ime_target(h, wide, units, &e);
+            n.composition_on = 1;
         }
-        n.composition_on = cast(i32, len > 0);
-    }
-    if (len > 0 || kind == ie.PREEDIT) {
         // Longer than one event's text: the queue refuses it, and says so.
         let is [4096]u8 as utf8;
-        if (len > 0 && len <= ie.TEXT_MAX) {
-            k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2, cast(*i8, &utf8[0]), cast(i32, len),
+        if (len <= ie.TEXT_MAX) {
+            k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, cast(i32, units), cast(*i8, &utf8[0]), cast(i32, len),
                                   cast(*i8, 0), cast(*i32, 0));
         }
         _push(n, &e, &utf8[0], len);
@@ -498,12 +553,15 @@ fn _composition(n as *Native, flags as i64) as void {
     if (h == 0) { return; }
     if ((flags & t.GCS_RESULTSTR) != 0) {
         _ime_text(n, h, cast(i32, t.GCS_RESULTSTR), ie.TEXT);
-        n.composition_on = 0; _empty_preedit(n);
+        if ((flags & t.GCS_COMPSTR) == 0) { _empty_preedit(n); }
     }
     if ((flags & t.GCS_COMPSTR) != 0) { _ime_text(n, h, cast(i32, t.GCS_COMPSTR), ie.PREEDIT); }
     ime.ImmReleaseContext(n.hwnd, h);
 }
 
+// Where the caret is, told the method: the composition there (a method
+// drawing its own starts at the caret's top left), the candidates below it
+// and never over it (CFS_EXCLUDE: above when there is no room below).
 fn _position_ime(n as *Native) as void {
     let is i64 as h = ime.ImmGetContext(n.hwnd);
     if (h == 0) { return; }
@@ -511,16 +569,124 @@ fn _position_ime(n as *Native) as void {
     mem.memset(cast(*u8, &cf), 0, sizeof(t.COMPOSITIONFORM));
     cf.dwStyle = cast(u32, t.CFS_POINT);
     cf.ptCurrentPos.x = cast(i32, n.caret_x);
-    cf.ptCurrentPos.y = cast(i32, n.caret_y + n.caret_h);
+    cf.ptCurrentPos.y = cast(i32, n.caret_y);
     ime.ImmSetCompositionWindow(h, &cf);
     let is t.CANDIDATEFORM as candidate;
     mem.memset(cast(*u8, &candidate), 0, sizeof(t.CANDIDATEFORM));
     candidate.dwIndex = 0;
-    candidate.dwStyle = cast(u32, t.CFS_CANDIDATEPOS);
+    candidate.dwStyle = cast(u32, t.CFS_EXCLUDE);
     candidate.ptCurrentPos.x = cast(i32, n.caret_x);
     candidate.ptCurrentPos.y = cast(i32, n.caret_y + n.caret_h);
+    candidate.rcArea.left = cast(i32, n.caret_x);
+    candidate.rcArea.top = cast(i32, n.caret_y);
+    candidate.rcArea.right = cast(i32, n.caret_x + n.caret_w);
+    candidate.rcArea.bottom = cast(i32, n.caret_y + n.caret_h);
     ime.ImmSetCandidateWindow(h, &candidate);
     ime.ImmReleaseContext(n.hwnd, h);
+}
+
+// The composition abandoned: the method told to drop it, and it said gone.
+fn _ime_cancel(n as *Native) as void {
+    let is i64 as h = ime.ImmGetContext(n.hwnd);
+    if (h != 0) {
+        ime.ImmNotifyIME(h, cast(u32, t.NI_COMPOSITIONSTR), cast(u32, t.CPS_CANCEL), 0);
+        ime.ImmReleaseContext(n.hwnd, h);
+    }
+    _empty_preedit(n);
+}
+
+// The method gets the window's keys only while a field that keeps nothing
+// secret has them: otherwise the window has no input context, and its keys
+// type themselves (WM_CHAR), as in Windows' own password fields.
+fn _ime_associate(n as *Native) as void {
+    let is i32 as want = cast(i32, n.text_enabled == 1 && content.secret(n.ime_purpose) == 0);
+    if (want == n.ime_on) { return; }
+    if (want == 0) {
+        _ime_cancel(n);
+        ime.ImmAssociateContextEx(n.hwnd, 0, 0);
+    } else {
+        ime.ImmAssociateContextEx(n.hwnd, 0, cast(u32, t.IACE_DEFAULT));
+    }
+    n.ime_on = want;
+    if (want == 1) { _position_ime(n); }
+}
+
+// IMR_DOCUMENTFEED: the field's text around the caret, the composition at
+// the caret in it, for a method that predicts from what is written. The
+// size wanted when asked with no buffer; 0 with nothing to say.
+fn _document_feed(n as *Native, rs as *t.RECONVERTSTRING) as i64 {
+    if (n.ime_on == 0 || n.ime_text_len < 0) { return 0; }
+    let is *u8 as text = &n.ime_text[0];
+    let is i64 as before with mut = 0;
+    let is i64 as after with mut = 0;
+    if (n.ime_caret > 0) {
+        before = cast(i64, k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, text), cast(i32, n.ime_caret), cast(*u16, 0), 0));
+    }
+    if (n.ime_text_len > n.ime_caret) {
+        after = cast(i64, k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, cast(i64, text) + n.ime_caret),
+                                                cast(i32, n.ime_text_len - n.ime_caret), cast(*u16, 0), 0));
+    }
+    let is i64 as h = ime.ImmGetContext(n.hwnd);
+    let is i64 as composing with mut = 0;
+    if (h != 0 && n.composition_on == 1) {
+        let is i32 as cb = ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_COMPSTR), cast(*u8, 0), 0);
+        if (cb > 0) { composing = cast(i64, cb / 2); }
+    }
+    let is i64 as head = cast(i64, sizeof(t.RECONVERTSTRING));
+    let is i64 as units = before + composing + after;
+    let is i64 as size = head + (units + 1) * 2;
+    if (cast(i64, rs) == 0 || rs.dwSize < cast(u32, size)) {
+        if (h != 0) { ime.ImmReleaseContext(n.hwnd, h); }
+        if (cast(i64, rs) == 0) { return size; }
+        return 0;
+    }
+    let is *u16 as s = cast(*u16, cast(i64, rs) + head);
+    if (before > 0) {
+        k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, text), cast(i32, n.ime_caret), s, cast(i32, before));
+    }
+    if (composing > 0) {
+        ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_COMPSTR), cast(*u8, cast(i64, s) + before * 2), cast(u32, composing * 2));
+    }
+    if (after > 0) {
+        k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, cast(i64, text) + n.ime_caret),
+                              cast(i32, n.ime_text_len - n.ime_caret), cast(*u16, cast(i64, s) + (before + composing) * 2),
+                              cast(i32, after));
+    }
+    *cast(*u16, cast(i64, s) + units * 2) = cast(u16, 0);
+    if (h != 0) { ime.ImmReleaseContext(n.hwnd, h); }
+    rs.dwSize = cast(u32, size);
+    rs.dwVersion = 0;
+    rs.dwStrLen = cast(u32, units);
+    rs.dwStrOffset = cast(u32, head);
+    rs.dwCompStrLen = cast(u32, composing);
+    rs.dwCompStrOffset = cast(u32, before * 2);
+    rs.dwTargetStrLen = cast(u32, composing);
+    rs.dwTargetStrOffset = cast(u32, before * 2);
+    return size;
+}
+
+// IMR_QUERYCHARPOSITION: where the composition is on the screen — the
+// caret's place, whichever of its characters is asked — and the window's
+// client area as the document, for a method placing its own windows.
+fn _char_position(n as *Native, cp as *t.IMECHARPOSITION) as i64 {
+    if (n.ime_on == 0 || cast(i64, cp) == 0) { return 0; }
+    let is t.POINT as at;
+    at.x = cast(i32, n.caret_x);
+    at.y = cast(i32, n.caret_y);
+    u.ClientToScreen(n.hwnd, &at);
+    cp.pt = at;
+    cp.cLineHeight = cast(u32, n.caret_h);
+    let is t.RECT as client;
+    u.GetClientRect(n.hwnd, &client);
+    let is t.POINT as corner;
+    corner.x = 0;
+    corner.y = 0;
+    u.ClientToScreen(n.hwnd, &corner);
+    cp.rcDocument.left = corner.x;
+    cp.rcDocument.top = corner.y;
+    cp.rcDocument.right = corner.x + client.right;
+    cp.rcDocument.bottom = corner.y + client.bottom;
+    return 1;
 }
 
 // The open window of hwnd, null for none of the program's.
@@ -721,7 +887,7 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
     if (cast(i64, msg) == t.WM_SETFOCUS) { n.focused = 1; _emit(n, event.FOCUS_IN, cast(i32, msg), 0, 0, 0); return 0; }
     if (cast(i64, msg) == t.WM_KILLFOCUS) {
         n.focused = 0; n.high_surrogate = 0; n.after_key = 0;
-        if (n.composition_on == 1) { n.composition_on = 0; _empty_preedit(n); }
+        _empty_preedit(n);
         // A key let go while another window has the focus is never said
         // here: everything held — keys and buttons — is let go now.
         if (n.buttons != 0 && _ngrab == 0 && u.GetCapture() == hwnd) { u.ReleaseCapture(); }
@@ -760,8 +926,17 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         return 0;
     }
     if (cast(i64, msg) == t.WM_IME_COMPOSITION) { _composition(n, lp); return 0; }
-    if (cast(i64, msg) == t.WM_IME_ENDCOMPOSITION) {
-        n.composition_on = 0; _empty_preedit(n); return 0;
+    if (cast(i64, msg) == t.WM_IME_ENDCOMPOSITION) { _empty_preedit(n); return 0; }
+    // The composition is drawn in the field: the method's own composition
+    // window is not shown, and not started; its candidates and status are.
+    if (cast(i64, msg) == t.WM_IME_SETCONTEXT) {
+        return u.DefWindowProcW(hwnd, msg, wp, lp & (0 - 1 - t.ISC_SHOWUICOMPOSITIONWINDOW));
+    }
+    if (cast(i64, msg) == t.WM_IME_STARTCOMPOSITION) { _position_ime(n); return 0; }
+    if (cast(i64, msg) == t.WM_IME_REQUEST) {
+        if (cast(i64, wp) == t.IMR_DOCUMENTFEED) { return _document_feed(n, cast(*t.RECONVERTSTRING, lp)); }
+        if (cast(i64, wp) == t.IMR_QUERYCHARPOSITION) { return _char_position(n, cast(*t.IMECHARPOSITION, lp)); }
+        return 0;
     }
     if (cast(i64, msg) == t.WM_MOUSEMOVE) {
         let is i64 as mx = _signed16(cast(u64, lp));
@@ -916,6 +1091,10 @@ fn open_config(c as *Config) as Window {
         at_x, at_y, outer_width, outer_height, c.owner, 0, _instance, cast(*u8, n));
     if (hwnd == 0) { ie.destroy(n.input); n.input = cast(*ie.Queue, 0); n.used = 0; w.err = NO_WINDOW; return w; }
     n.hwnd = hwnd; n.alive = 1; n.dpi = cast(i32, u.GetDpiForWindow(hwnd)); if (n.dpi < 96) { n.dpi = 96; }
+    // Created with the thread's input context; it has none until a text
+    // field has the keyboard (text_input_enable).
+    n.ime_on = 1; n.ime_text_len = 0 - 1;
+    _ime_associate(n);
     let is t.RECT as client; u.GetClientRect(hwnd, &client);
     if (_dib(n, cast(i64, client.right - client.left), cast(i64, client.bottom - client.top)) == 0) {
         u.DestroyWindow(hwnd); ie.destroy(n.input); n.input = cast(*ie.Queue, 0); n.used = 0; w.err = NO_SURFACE; return w;
@@ -1022,12 +1201,53 @@ fn set_title(w as *Window, s as *u8, nbytes as i64) as void {
     u.SetWindowTextW(w.hwnd, &wide[0]);
 }
 
-fn text_input_enable(w as *Window, on as i32) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } n.text_enabled = cast(i32, on != 0); return 1; }
-fn text_input_active(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.text_enabled == 1 && n.focused == 1); }
+// Text input wanted (a text field has the keyboard) or not: the window's
+// input context given or taken away (_ime_associate).
+fn text_input_enable(w as *Window, on as i32) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    n.text_enabled = cast(i32, on != 0);
+    if (n.text_enabled == 0) {
+        n.ime_purpose = content.PURPOSE_NORMAL;
+        n.ime_text_len = 0 - 1;
+    }
+    _ime_associate(n);
+    return 1;
+}
+fn text_input_active(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    return cast(i32, n.ime_on == 1 && n.focused == 1);
+}
+// The caret, in client pixels: told the method when it moved.
 fn text_input_rect(w as *Window, x as i64, y as i64, width as i64, height as i64) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    if (x == n.caret_x && y == n.caret_y && width == n.caret_w && height == n.caret_h) { return 1; }
     n.caret_x = x; n.caret_y = y; n.caret_w = width; n.caret_h = height;
-    if (n.focused == 1) { _position_ime(n); } return 1;
+    if (n.focused == 1 && n.ime_on == 1) { _position_ime(n); }
+    return 1;
+}
+// What the field with the keyboard is and holds (input/text.cst): kept for
+// the method to ask (IMR_DOCUMENTFEED); a secret one takes the input context
+// away. IMM32 has no purpose but that.
+fn text_input_context(w as *Window, text as *u8, nbytes as i64, caret as i64, anchor as i64,
+                      purpose as i32, hints as i32) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.text_enabled == 0) { return 0; }
+    if (nbytes < 0 || nbytes > content.CONTEXT_MAX || caret < 0 || caret > nbytes || anchor < 0 || anchor > nbytes) { return 0; }
+    n.ime_purpose = purpose;
+    if (content.secret(purpose) == 1) {
+        n.ime_text_len = 0 - 1;
+    } else {
+        if (nbytes > 0) { mem.memcpy(&n.ime_text[0], text, nbytes); }
+        n.ime_text_len = nbytes;
+        n.ime_caret = caret;
+    }
+    _ime_associate(n);
+    return 1;
+}
+// The composition abandoned (CPS_CANCEL) and said gone.
+fn text_input_reset(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    if (n.ime_on == 1) { _ime_cancel(n); }
+    return 1;
 }
 
 fn set_modal(w as *Window, on as i32) as i32 {

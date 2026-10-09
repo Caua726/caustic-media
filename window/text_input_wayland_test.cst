@@ -1,0 +1,173 @@
+// window/text_input_wayland_test.cst — text input on a compositor that
+// offers text-input-v3 (KWin, nested in Xvfb), keys from XTest:
+//   sh window/x11/tools/run_headless.sh env KWIN_BACKEND=x11 \
+//       sh window/wayland/tools/run_kwin.sh ./build/text_input_wayland_test
+// A text field has the keyboard: the compositor gives the window the
+// text-input focus, and with no input method composing its keys still type —
+// they reach the window as keys, and only a method's grab would take them; a
+// password field's too, and with no field at all.
+use "std/io.cst" as io;
+use "std/os/linux.cst" as linux;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "device.cst" as device;
+use "std/env.cst" as env;
+use "../input/event.cst" as ie;
+use "../input/text.cst" as content;
+use "../gpu/software/target.cst" as tgt;
+use "x11/bind/xlib.cst" as xlib;
+
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is *u8 as xd with mut;
+
+fn settle(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        time.sleep_ms(5);
+    }
+}
+
+// The text that came, concatenated, until it holds n bytes — three seconds
+// at most.
+let is [256]u8 as typed;
+let is i64 as ntyped with mut = 0;
+
+fn until_typed(n as i64) as void {
+    let is ie.Event as e;
+    let is i64 as until = time.now_ms() + 3000;
+    while (ntyped < n && time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &e) == 1) {
+            if (e.kind == ie.TEXT && ntyped + e.text_len < 256) {
+                mem.memcpy(cast(*u8, cast(i64, &typed[0]) + ntyped), e.text, e.text_len);
+                ntyped = ntyped + e.text_len;
+            }
+        }
+        time.sleep_ms(5);
+    }
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+// A key pressed and let go, by keysym, and its text waited for.
+fn typing(keysym as i64) as void {
+    let is u32 as kc = cast(u32, xlib.XKeysymToKeycode(xd, keysym));
+    settle(100);
+    ntyped = 0;
+    XTestFakeKeyEvent(xd, kc, 1, cast(u64, 0));
+    XTestFakeKeyEvent(xd, kc, 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    until_typed(1);
+}
+
+// What the input method was told, as its log has the protocol (method mode:
+// FCITX_LOG): 1 when s is in it.
+let is *u8 as log with mut;
+let is i64 as nlog with mut = 0;
+let is i64 as LOG_MAX with imut = 16777216;
+
+fn reread() as void {
+    nlog = 0;
+    let is *u8 as path = env.getenv("FCITX_LOG");
+    if (cast(i64, path) == 0) { return; }
+    if (cast(i64, log) == 0) { log = mem.core.mmap_anon(LOG_MAX); }
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return; }
+    while (nlog < LOG_MAX) {
+        let is i64 as r = linux.read(fd, cast(*u8, cast(i64, log) + nlog), LOG_MAX - nlog);
+        if (r <= 0) { break; }
+        nlog = nlog + r;
+    }
+    linux.close(fd);
+}
+
+fn told(s as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= nlog) {
+        if (log[i] == s[0] && mem.memcmp(cast(*u8, cast(i64, log) + i), s, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i32 as method = cast(i32, env.argc() > 1 && same(env.argv(1), 6, "method") == 1);
+    win = device.open("text input", 400, 300);
+    if (device.is_open(&win) == 0 || win.backend != device.WAYLAND) {
+        io.printf("FAIL: no Wayland window\n");
+        return 1;
+    }
+    device.next_frame(&win);
+    let is tgt.Target as t = device.acquire(&win);
+    if (cast(i64, t.color) != 0) { device.submit(&win); }
+    settle(300);
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, xd) == 0) { io.printf("FAIL: no X display to send input through\n"); return 1; }
+    // The keys go where the pointer is: KWin's window, the whole screen.
+    XTestFakeMotionEvent(xd, 0 - 1, 640, 512, cast(u64, 0));
+    xlib.XFlush(xd);
+    settle(300);
+
+    // --- A text field has the keyboard ---
+    check("text input on", device.text_input_enable(&win, 1) == 1);
+    let is i64 as until = time.now_ms() + 3000;
+    while (device.text_input_active(&win) == 0 && time.now_ms() < until) { settle(20); }
+    check("the compositor's text-input focus on the window", device.text_input_active(&win) == 1);
+    check("its caret and text told", device.text_input_rect(&win, 40, 30, 2, 20) == 1 &&
+          device.text_input_context(&win, "olá mundo", 10, 4, 0, content.PURPOSE_NORMAL, content.HINT_MULTILINE) == 1);
+    typing(99);
+    check("a key with text input on: its text", same(&typed[0], ntyped, "c") == 1);
+    if (method == 1) {
+        // The installed Fcitx5, KWin's input method, told it through KWin.
+        settle(300);
+        reread();
+        check("the method told the field's text around the caret, and the selection",
+              told("surrounding_text(\"olá mundo\", 4, 0)") == 1);
+        check("and what the field is", told("content_type(512, 0)") == 1);
+    }
+
+    // --- A password field: its keys type, its text not told ---
+    check("a password field told", device.text_input_context(&win, "secret", 6, 6, 6, content.PURPOSE_PASSWORD,
+                                                           content.HINT_HIDDEN_TEXT | content.HINT_SENSITIVE_DATA) == 1);
+    typing(100);
+    check("its keys: their text", same(&typed[0], ntyped, "d") == 1);
+    if (method == 1) {
+        settle(300);
+        reread();
+        check("the method told a password field, not its text",
+              told("content_type(192, 8)") == 1 && told("surrounding_text(\"\", 0, 0)") == 1 && told("secret") == 0);
+    }
+
+    // --- No field ---
+    check("off", device.text_input_enable(&win, 0) == 1 && device.text_input_active(&win) == 0);
+    typing(101);
+    check("keys with no field: their text", same(&typed[0], ntyped, "e") == 1);
+    device.close(&win);
+    if (fails != 0) {
+        io.printf("text input wayland: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("text input wayland: all checks passed\n");
+    return 0;
+}

@@ -160,8 +160,11 @@ prefix and X server; it cannot reuse another test's stale native desktop.
 
 `backend.cst` opens native windows with DPI-aware client geometry, a reentrant
 procedure, a nonblocking message pump and directly writable software frames.
-It handles close requests, resize, UTF-16 character input, IMM32 composition
-messages, pointer capture and wheel deltas — the input translated into
+It handles close requests, resize, UTF-16 character input, IMM32 composition —
+an input context only while a text field that is not a password's has the
+keyboard, the target clause as the part converted, candidates excluded from
+the caret, the field's text for `IMR_DOCUMENTFEED` — pointer capture and wheel
+deltas — the input translated into
 `input/event.cst`'s cooked events as it arrives: a key's scan code as its
 place and bit 30 as the system's repeat, a `WM_CHAR` the key's only right
 after it went down, focus loss a `CANCEL` that lets the buttons and the

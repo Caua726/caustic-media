@@ -473,13 +473,23 @@ where said:
   Wayland's `suspended`, its size kept meanwhile), tiled sides;
   `COMPOSITOR` that a compositing manager started or stopped; `CLOSE` its
   close button — `keep_open` when the program says no.
-- Text input (`text_input_enable`, `text_input_rect`, `text_input_reset`):
-  while a text field has the keyboard the platform's input method composes
-  for it — on X11 the display's XIM, on the spot where offered (`PREEDIT`
-  with the part being converted), over the spot, or Xlib's local method —
-  told where the caret is (its panel and candidates go there) and told to
-  give the composition up when the field does; with no field, it no longer
-  has the keyboard. On Wayland text-input-v3, on Windows IMM32.
+- Text input (`text_input_enable`, `text_input_rect`, `text_input_context`,
+  `text_input_reset`): while a text field has the keyboard the platform's
+  input method composes for it — told where the caret is (its panel and
+  candidates go there), what the field holds around the caret and what it is
+  for (`input/text.cst`), and told to give the composition up when the field
+  does; with no field, it no longer has the keyboard. X11: the display's XIM,
+  on the spot where offered (`PREEDIT` with the part being converted), over
+  the spot, or Xlib's local method; XIM takes no text, and a password field
+  takes the method's focus away. Wayland: text-input-v3 — enable after each
+  enter with everything told again, state told only when changed and held
+  while a `done` is behind the commits, `done` applied as delete, commit,
+  composition (the converted part from its cursor range), malformed strings
+  ignored; a key's text is typed whatever the method, which grabs the keys it
+  composes with. Windows: IMM32 — no input context without a field or in a
+  password's, candidates under the caret and never over it (`CFS_EXCLUDE`),
+  the converted part from `GCS_COMPATTR`, the field's text for a method that
+  asks (`IMR_DOCUMENTFEED`, `IMR_QUERYCHARPOSITION`), `CPS_CANCEL` to reset.
 - `device.set_title` in UTF-8: `_NET_WM_NAME`, and `WM_NAME` in Latin-1 for
   an old window manager, each sequence whole or a `?`; `show`, `hide`,
   `activate`, `position` on the screen, `set_icon`; `clipboard_set`,

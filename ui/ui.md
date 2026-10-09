@@ -692,9 +692,11 @@ pen events themselves come from `input/`, which says which the pointer is with
 widget the text it asked the clipboard for (`tree.request_paste`, answered by
 the program), `preedit`, the input method's composition with its caret, and
 `delete_surrounding`, its byte counts around the caret, to the focused widget.
-The Wayland host feeds text-input-v3's `TEXT`, `PREEDIT` and
-`DELETE_SURROUNDING` events into these routes, and places the compositor's
-candidate UI at `tree.text_area_rect`. The widget says where its caret is
+The host feeds the platform input method's `TEXT`, `PREEDIT` and
+`DELETE_SURROUNDING` events into these routes on all three platforms, places
+its candidates at `tree.text_area_rect`, and tells it what the field with the
+keyboard holds around the caret and what it is for (`access.text_around`,
+the field's role: a password's text never). The widget says where its caret is
 (`tree.set_text_area`) and when it gives a composition up (`tree.reset_ime`),
 so the program can tell its input method that what it commits next is not what
 was given up. FOCUS_IN says whether the focus came by keyboard. A press outside
