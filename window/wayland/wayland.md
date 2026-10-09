@@ -150,10 +150,12 @@ first level, the key a shortcut is matched against (its Latin letter in
 another layout: Ctrl+C in Russian), their keycode as their place, the text
 they type (compose included; never a control character nor a command's),
 repeats this client makes itself at `repeat_info`'s rate and delay — the seat
-is bound at version 7, which sends none — cancelled on release, focus loss,
-keyboard loss and keymap replacement, with `input_due` for the loop's sleep,
-the pointer in buffer pixels, axis and axis_discrete gathered per frame into
-one `SCROLL`, text-input-v3's commit, preedit and delete-surrounding,
+is bound at version 9 at most, below 10's compositor repeats — cancelled on
+release, focus loss, keyboard loss and keymap replacement, with `input_due`
+for the loop's sleep, the pointer in buffer pixels, a frame's `axis`,
+`axis_source`, `axis_value120` (`axis_discrete` before 8) and `axis_stop`
+one `SCROLL` (a wheel's 120ths, fingers' lines and lifting), text-input-v3's
+commit, preedit and delete-surrounding,
 keyboard focus leaving as a `CANCEL` that lets buttons go too, and a press
 `xdg_toplevel.move`/`resize` takes ending in `BUTTON_TAKEN`. `input_test`
 checks it on xkbcommon keymaps (us; us,ru; de: Caps Lock, AltGr, repeat timing)

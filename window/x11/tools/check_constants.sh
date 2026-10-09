@@ -31,9 +31,10 @@ LAYOUT=tools/layout.txt
 # and bind/x.cst carries it; Xutil.h is the conventions layered on top, and the
 # XSizeHints flags live in bind/xutil.cst beside the struct they are the flags
 # word of. shape.h's few are in bind/xshape.cst beside the calls that take
-# them. All are checked as one set, so a constant declared in none is still a
-# gap and one declared in any is still checked against the header.
-SRCS="bind/x.cst bind/xutil.cst bind/xshape.cst"
+# them. XInput2's that smooth scrolling reads are in bind/xinput2.cst. All
+# are checked as one set, so a constant declared in none is still a gap and
+# one declared in any is still checked against the header.
+SRCS="bind/x.cst bind/xutil.cst bind/xshape.cst bind/xinput2.cst"
 TMP="${TMPDIR:-/tmp}/x11_const_$$"
 mkdir -p "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -76,6 +77,6 @@ fi
 
 n=$(wc -l < "$TMP/declared")
 if [ "$fails" -eq 0 ]; then
-    echo "check_constants: $n/$n conferidos contra X.h, Xutil.h e shape.h, ok"
+    echo "check_constants: $n/$n conferidos contra X.h, Xutil.h, shape.h e XInput2.h, ok"
 fi
 exit "$fails"

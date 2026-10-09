@@ -62,6 +62,8 @@ use "wm.cst" as wm;
 use "frame.cst" as frame;
 use "text.cst" as text;
 use "framesync.cst" as framesync;
+use "smooth.cst" as smooth;
+use "bind/xinput2.cst" as xi2;
 use "../../input/event.cst" as ie;
 use "../../input/text.cst" as content;
 use "dnd.cst" as dnd;
@@ -261,6 +263,73 @@ struct Window {
 // stack on every drain.
 let is xev.XEvent as _scratch;
 let is [8]i64 as _protocols;
+
+// Smooth scrolling (smooth.cst), once xinput.cst turned it on: the
+// connection's scrolling devices, XInputExtension's opcode, and how a device
+// not yet known is learned — XIQueryDevice, libXi's, which this file never
+// calls itself so that a program without smooth scrolling links no libXi.
+type SmoothLearnFn = fn(*u8, i32) as void;
+let is smooth.State as _smooth with mut;
+let is i32 as _xi_opcode with mut = 0;
+let is SmoothLearnFn as _smooth_learn with mut;
+
+// Smooth scrolling on for the connection: XI_Motion from opcode's extension
+// read for its scroll valuators, devices learned through learn.
+fn smooth_enable(opcode as i32, learn as SmoothLearnFn) as void {
+    if (_xi_opcode == 0) { smooth.init(&_smooth); }
+    _xi_opcode = opcode;
+    _smooth_learn = learn;
+}
+
+fn smooth_state() as *smooth.State { return &_smooth; }
+
+// A GenericEvent: its payload lives in libX11's memory until XFreeEventData,
+// so it is read here and given back. Its window field is not one (the
+// extension and event type sit there), so it is routed by its payload:
+// XI_Motion to the window it names — the pointer's place, and the scroll its
+// valuators moved — XI_DeviceChanged forgetting the device; raw motion
+// counted on the window pumping.
+fn _generic(w as *Window, e as *xev.XEvent) as void {
+    let is *xev.XGenericEventCookie as ck = xev.cookie(e);
+    if (xlib.XGetEventData(w.display, cast(*u8, e)) == 0) { return; }
+    if (_xi_opcode != 0 && ck.extension == _xi_opcode) {
+        if (ck.evtype == xi2.XI_Motion) {
+            let is *xi2.XIDeviceEvent as dev = cast(*xi2.XIDeviceEvent, ck.data);
+            let is *Window as owner = _window_of(dev.event);
+            if (cast(i64, owner) != 0) { _xi_motion(owner, dev); }
+        } else if (ck.evtype == xi2.XI_DeviceChanged) {
+            smooth.forget(&_smooth, cast(*xi2.XIDeviceChangedEvent, ck.data).sourceid);
+        }
+    }
+    // XI_RawMotion: what cursor_mode(RELATIVE) counts.
+    if (ck.evtype == 17) { w.st.raw_motion = w.st.raw_motion + 1; }
+    xlib.XFreeEventData(w.display, cast(*u8, e));
+}
+
+// XI_Motion stands in for MotionNotify on a window that selected it: its
+// device's scroll axes moved, a SCROLL; the pointer moved — any report but
+// one only of scrolling — a MOTION, as MotionNotify would have been.
+fn _xi_motion(w as *Window, dev as *xi2.XIDeviceEvent) as void {
+    let is i64 as px = cast(i64, dev.event_x);
+    let is i64 as py = cast(i64, dev.event_y);
+    let is u32 as state = cast(u32, dev.mods_effective);
+    let is i64 as time = cast(i64, dev.time);
+    let is ie.Event as s = _cooked(ie.SCROLL, state, time);
+    let is i32 as got with mut = smooth.motion(&_smooth, dev, &s);
+    if (got < 0 && cast(i64, _smooth_learn) != 0) {
+        call(_smooth_learn, w.display, dev.sourceid);
+        got = smooth.motion(&_smooth, dev, &s);
+    }
+    if (got != 1 || px != w.pointer_x || py != w.pointer_y) {
+        w.pointer_x = px;
+        w.pointer_y = py;
+        let is ie.Event as c = _cooked(ie.MOTION, state, time);
+        c.x = px;
+        c.y = py;
+        ie.push(w.input, &c, cast(*u8, 0), 0);
+    }
+    if (got == 1) { ie.push(w.input, &s, cast(*u8, 0), 0); }
+}
 
 // The popups holding the grab, innermost last: a submenu's grab replaces its
 // menu's, which takes it back when the submenu closes. done: taken down by
@@ -720,25 +789,6 @@ fn _ring_push(w as *Window, e as *xev.XEvent) as void {
     w.ring_len = w.ring_len + 1;
 }
 
-// Fetches a generic event's payload, folds what this layer understands out of
-// it, and gives it straight back. The alternative — copying 256 bytes into
-// every ring slot against the chance that a program wants it — costs 64 KB per
-// window for something almost nothing reads.
-//
-// Raw motion is the exception and it is why this exists: cursor_mode(RELATIVE)
-// needs deltas that never reach a normal MotionNotify, so they are folded into
-// the sampled state here, where the payload is still alive.
-fn _absorb_cookie(w as *Window, e as *xev.XEvent) as void {
-    let is *xev.XGenericEventCookie as ck = xev.cookie(e);
-    if (xlib.XGetEventData(w.display, cast(*u8, e)) == 0) { return; }
-    // XI_RawMotion is 17, and its opcode is whatever the server assigned the
-    // XInput extension on this connection. Counting rather than decoding is
-    // deliberate: the valuators are a variable-length tail and reading them is
-    // input/'s job. window/ only guarantees the payload survived the frame.
-    if (ck.evtype == 17) { w.st.raw_motion = w.st.raw_motion + 1; }
-    xlib.XFreeEventData(w.display, cast(*u8, e));
-}
-
 fn _configure_changed(w as *Window, e as *xev.XEvent) as i32 {
     if (xev.kind(e) != x.ConfigureNotify) { return 0; }
     let is *xev.XConfigureEvent as c = xev.configure(e);
@@ -959,6 +1009,9 @@ fn _translate(w as *Window, e as *xev.XEvent) as void {
             // (down), a tilt 6 (left) and 7 (right), each a press and a
             // release. The press is the notch; the release says nothing.
             if (ty == x.ButtonRelease) { return; }
+            // Smooth scrolling said this notch already: the server's
+            // emulation of the same motion for its core clients.
+            if (_xi_opcode != 0 && smooth.emulated(&_smooth, cast(u64, b.time), n) == 1) { return; }
             let is ie.Event as s = _cooked(ie.SCROLL, b.state, b.time);
             s.x = w.pointer_x;
             s.y = w.pointer_y;
@@ -1000,6 +1053,8 @@ fn _translate(w as *Window, e as *xev.XEvent) as void {
         let is *xev.XCrossingEvent as cr = xev.crossing(e);
         w.pointer_x = cast(i64, cr.x);
         w.pointer_y = cast(i64, cr.y);
+        // Scrolled elsewhere meanwhile: each axis's next report a baseline.
+        if (_xi_opcode != 0) { smooth.rebase(&_smooth); }
         let is ie.Event as c = _cooked(ie.ENTER, cr.state, cr.time);
         if (ty == x.LeaveNotify) { c.kind = ie.LEAVE; }
         c.x = w.pointer_x;
@@ -1103,16 +1158,6 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
         if (xev.kind(e) == x.MappingNotify) {
             xlib.XRefreshKeyboardMapping(cast(*u8, e));
             keys.refresh(&w.km, w.display);
-        }
-
-        // 4. XI2 and every other GenericEvent carries a pointer into libX11's
-        //    own memory that XFreeEventData invalidates. Storing the event in
-        //    the ring and reading its payload a frame later is a use-after-free,
-        //    so the payload is fetched and released here and the ring keeps only
-        //    the 192-byte header. A program that needs the payload reads it in
-        //    the same frame through poll_event, which is what raw motion does.
-        if (xev.kind(e) == x.GenericEvent) {
-            _absorb_cookie(w, e);
         }
 
         // 4b. The compositor asking when this frame will be ready. Absorbed
@@ -1219,6 +1264,13 @@ fn _pump(w as *Window, block as i32) as void {
 
         // A popup holding the grab decides first where a press belongs.
         if (_ngrab > 0 && _outside(&_scratch) == 1) { continue; }
+
+        // A GenericEvent's window field is not a window: routed by what it
+        // carries (_generic), never dropped as a stranger's.
+        if (xev.kind(&_scratch) == x.GenericEvent) {
+            _generic(w, &_scratch);
+            continue;
+        }
 
         // Whose event is this? With one connection shared by every window, the
         // answer is usually but not always the window that called pump.

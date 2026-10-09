@@ -1,0 +1,245 @@
+// window/x11/smooth.cst — smooth scrolling, as XInput 2.1 reports it.
+//
+// X has no scroll event. A wheel's notch was buttons 4–7, a press and a
+// release, and that is all a touchpad's two fingers could be either, quantized
+// to whole notches. XI 2.1 gives a scrolling device scroll valuators: each a
+// running total along one axis, reported in XI_Motion, its scroll class
+// saying which valuator it is, which way it runs and how much of it is one
+// notch (increment). Motion along it is the change since the last report:
+// the first report after the pointer comes back, or after the device behind
+// the master pointer switched, is only where the total stands now (the
+// baseline), never a jump.
+//
+// The server goes on sending buttons 4–7 for whoever asked for core events,
+// emulated from the same motion — the same scroll twice. They come with the
+// motion's own timestamp, right after it, so a press of 4–7 at the time
+// smooth scrolling moved that axis is the emulation's and is dropped.
+//
+// This file reads structs and calls nothing, so window.cst can carry it with
+// no libXi in a program that never turns smooth scrolling on: asking the
+// server (XISelectEvents, XIQueryDevice) is xinput.cst's.
+use "bind/xinput2.cst" as xi2;
+use "../../input/event.cst" as ie;
+
+let is i64 as MAX_DEVICES with imut = 16;
+let is i64 as MAX_AXES    with imut = 4;
+
+struct Axis {
+    number    as i32;   // the valuator
+    vertical  as i32;   // 1 vertical, 0 horizontal
+    increment as f64;   // one notch; its sign the axis's direction
+    last      as f64;   // the total last seen
+    based     as i32;   // last is a baseline to measure from
+    rest      as i32;   // 120ths of a notch short of a whole one
+}
+
+struct Device {
+    id       as i32;
+    touchpad as i32;    // fingers: motion, not notches
+    naxes    as i32;
+    axes     as [4]Axis;
+}
+
+struct State {
+    devices  as [16]Device;
+    ndevices as i64;
+    // What the last smooth scroll moved and when: buttons 4–7 at that time
+    // are its emulation.
+    moved_at as u64;
+    moved_v  as i32;
+    moved_h  as i32;
+}
+
+fn init(s as *State) as void {
+    s.ndevices = 0;
+    s.moved_at = cast(u64, 0);
+    s.moved_v = 0;
+    s.moved_h = 0;
+}
+
+fn _device(s as *State, id as i32) as *Device {
+    let is i64 as i with mut = 0;
+    while (i < s.ndevices) {
+        if (s.devices[i].id == id) { return &s.devices[i]; }
+        i = i + 1;
+    }
+    return cast(*Device, 0);
+}
+
+// Whether device id has been learned (learn), scroll axes or none.
+fn knows(s as *State, id as i32) as i32 { return cast(i32, cast(i64, _device(s, id)) != 0); }
+
+// Device id as its classes say (XIDeviceInfo's or XIDeviceChangedEvent's,
+// n of them): its scroll axes, each based at its valuator's value now.
+// touchpad: its motion is fingers', not a wheel's. Learned again, replaced.
+fn learn(s as *State, id as i32, classes as **u8, n as i32, touchpad as i32) as void {
+    let is *Device as d with mut = _device(s, id);
+    if (cast(i64, d) == 0) {
+        if (s.ndevices == MAX_DEVICES) {
+            // The oldest forgotten: learned again if it scrolls again.
+            let is i64 as i with mut = 1;
+            while (i < MAX_DEVICES) {
+                s.devices[i - 1] = s.devices[i];
+                i = i + 1;
+            }
+            s.ndevices = MAX_DEVICES - 1;
+        }
+        d = &s.devices[s.ndevices];
+        s.ndevices = s.ndevices + 1;
+    }
+    d.id = id;
+    d.touchpad = touchpad;
+    d.naxes = 0;
+    let is i64 as k with mut = 0;
+    while (k < cast(i64, n)) {
+        let is *xi2.XIAnyClassInfo as any = cast(*xi2.XIAnyClassInfo, classes[k]);
+        if (any.kind == xi2.XIScrollClass && d.naxes < cast(i32, MAX_AXES)) {
+            let is *xi2.XIScrollClassInfo as sc = cast(*xi2.XIScrollClassInfo, any);
+            if (sc.increment != 0.0 && (sc.scroll_type == xi2.XIScrollTypeVertical ||
+                                        sc.scroll_type == xi2.XIScrollTypeHorizontal)) {
+                let is *Axis as a = &d.axes[d.naxes];
+                a.number = sc.number;
+                a.vertical = cast(i32, sc.scroll_type == xi2.XIScrollTypeVertical);
+                a.increment = sc.increment;
+                a.based = 0;
+                a.rest = 0;
+                d.naxes = d.naxes + 1;
+            }
+        }
+        k = k + 1;
+    }
+    // The valuators' values now: the baselines.
+    k = 0;
+    while (k < cast(i64, n)) {
+        let is *xi2.XIAnyClassInfo as any = cast(*xi2.XIAnyClassInfo, classes[k]);
+        if (any.kind == xi2.XIValuatorClass) {
+            let is *xi2.XIValuatorClassInfo as vc = cast(*xi2.XIValuatorClassInfo, any);
+            let is i32 as j with mut = 0;
+            while (j < d.naxes) {
+                if (d.axes[j].number == vc.number) {
+                    d.axes[j].last = vc.value;
+                    d.axes[j].based = 1;
+                }
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// Every baseline dropped: the pointer left, and what was scrolled meanwhile
+// elsewhere is not this window's. The next report of each axis is its
+// baseline.
+fn rebase(s as *State) as void {
+    let is i64 as i with mut = 0;
+    while (i < s.ndevices) {
+        let is i32 as j with mut = 0;
+        while (j < s.devices[i].naxes) {
+            s.devices[i].axes[j].based = 0;
+            s.devices[i].axes[j].rest = 0;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Device id forgotten: its classes changed, or another device is behind the
+// master pointer now. Learned again when it scrolls.
+fn forget(s as *State, id as i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < s.ndevices) {
+        if (s.devices[i].id == id) {
+            let is i64 as k with mut = i + 1;
+            while (k < s.ndevices) {
+                s.devices[k - 1] = s.devices[k];
+                k = k + 1;
+            }
+            s.ndevices = s.ndevices - 1;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// Valuator n's value in a report: 1 with it in *v, or 0 when the report has
+// none of it. The values are packed: one for each bit set in the mask.
+fn _valuator(vs as *xi2.XIValuatorState, n as i32, v as *f64) as i32 {
+    if (n < 0 || cast(i64, n) >= cast(i64, vs.mask_len) * 8) { return 0; }
+    if ((cast(i64, vs.mask[n >> 3]) & (1 << (n & 7))) == 0) { return 0; }
+    let is i64 as at with mut = 0;
+    let is i32 as b with mut = 0;
+    while (b < n) {
+        if ((cast(i64, vs.mask[b >> 3]) & (1 << (b & 7))) != 0) { at = at + 1; }
+        b = b + 1;
+    }
+    *v = vs.values[at];
+    return 1;
+}
+
+// The scroll in an XI_Motion report, into out's scroll fields: 1 when its
+// device's axes moved, 0 when they did not (or it has none), -1 when its
+// device is not known yet (learn it, then ask again).
+fn motion(s as *State, ev as *xi2.XIDeviceEvent, out as *ie.Event) as i32 {
+    let is *Device as d = _device(s, ev.sourceid);
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    let is f64 as dx with mut = 0.0;
+    let is f64 as dy with mut = 0.0;
+    let is i32 as moved with mut = 0;
+    let is i32 as j with mut = 0;
+    while (j < d.naxes) {
+        let is *Axis as a = &d.axes[j];
+        let is f64 as v with mut = 0.0;
+        if (_valuator(&ev.valuators, a.number, &v) == 1) {
+            if (a.based == 1 && v != a.last) {
+                let is f64 as notches = (v - a.last) / a.increment;
+                if (a.vertical == 1) { dy = dy + notches; } else { dx = dx + notches; }
+                moved = 1;
+            }
+            a.last = v;
+            a.based = 1;
+        }
+        j = j + 1;
+    }
+    if (moved == 0) { return 0; }
+    out.kind = ie.SCROLL;
+    out.dx = dx;
+    out.dy = dy;
+    out.x = cast(i64, ev.event_x);
+    out.y = cast(i64, ev.event_y);
+    if (d.touchpad == 1) {
+        out.source = ie.SCROLL_CONTINUOUS;
+    } else {
+        out.source = ie.SCROLL_WHEEL;
+        out.value120_x = _v120(dx);
+        out.value120_y = _v120(dy);
+        j = 0;
+        while (j < d.naxes) {
+            let is *Axis as a = &d.axes[j];
+            let is i32 as v120 with mut = out.value120_x;
+            if (a.vertical == 1) { v120 = out.value120_y; }
+            a.rest = a.rest + v120;
+            let is i32 as whole = a.rest / 120;
+            a.rest = a.rest - whole * 120;
+            if (a.vertical == 1) { out.steps_y = out.steps_y + whole; } else { out.steps_x = out.steps_x + whole; }
+            j = j + 1;
+        }
+    }
+    s.moved_at = ev.time;
+    s.moved_v = cast(i32, dy != 0.0);
+    s.moved_h = cast(i32, dx != 0.0);
+    return 1;
+}
+
+fn _v120(notches as f64) as i32 {
+    if (notches >= 0.0) { return cast(i32, notches * 120.0 + 0.5); }
+    return 0 - cast(i32, (0.0 - notches) * 120.0 + 0.5);
+}
+
+// Whether core button b (4–7) at time is the emulation of a smooth scroll
+// already said: the same moment, the same axis.
+fn emulated(s as *State, time as u64, b as i64) as i32 {
+    if (s.moved_at == cast(u64, 0) || time != s.moved_at) { return 0; }
+    if ((b == 4 || b == 5) && s.moved_v == 1) { return 1; }
+    if ((b == 6 || b == 7) && s.moved_h == 1) { return 1; }
+    return 0;
+}

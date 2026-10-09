@@ -211,12 +211,21 @@ struct Window {
     pointer_x as i64;
     pointer_y as i64;
     pointer_version as i32;
-    // A pointer frame's axis motion, wl_fixed, and its discrete steps,
-    // vertical and horizontal, said as one SCROLL when the frame ends.
+    // A pointer frame's scrolling, said as one SCROLL when the frame ends:
+    // axis motion (wl_fixed), notches (axis_discrete, before 8), 120ths of a
+    // notch (axis_value120), where it came from (axis_source, -1 unsaid) and
+    // what stopped (STOP_* bits); and the 120ths short of a whole notch kept
+    // from frame to frame.
     scroll_y as i64;
     scroll_x as i64;
     scroll_discrete as i32;
     scroll_discrete_x as i32;
+    scroll_v120_x as i32;
+    scroll_v120_y as i32;
+    scroll_source as i32;
+    scroll_stop as i32;
+    v120_rest_x as i32;
+    v120_rest_y as i32;
     // Each held key as its press said it: which key, and the key a shortcut
     // is matched against (input/event.cst's key and shortcut).
     key_syms as [256]i32;
@@ -499,6 +508,7 @@ fn _zero(w as *Window) as void {
     w.resized = 0; w.frame_ready = 0; w.close_requested = 0; w.acked = 0;
     w.transfer_fd = 0 - 1; w.drop_storage = cast(*u8, 0);
     w.ime_rect_x = 0 - 1; w.ime_rect_y = 0 - 1;
+    w.scroll_source = 0 - 1;
     w.ime_rect_w = 0 - 1; w.ime_rect_h = 0 - 1;
     w.ti_text_len = 0 - 1;
 
@@ -742,6 +752,11 @@ fn _protocol_ready() as i32 {
     let is protocol.Message as pointer_motion = protocol.event_message(15, 2);
     let is protocol.Message as pointer_button = protocol.event_message(15, 3);
     let is protocol.Message as pointer_axis = protocol.event_message(15, 4);
+    let is protocol.Message as pointer_frame = protocol.event_message(15, 5);
+    let is protocol.Message as axis_source = protocol.event_message(15, 6);
+    let is protocol.Message as axis_stop = protocol.event_message(15, 7);
+    let is protocol.Message as axis_discrete = protocol.event_message(15, 8);
+    let is protocol.Message as axis_value120 = protocol.event_message(15, 9);
     let is protocol.Message as keyboard_keymap = protocol.event_message(16, 0);
     let is protocol.Message as keyboard_key = protocol.event_message(16, 3);
     let is protocol.Message as keyboard_modifiers = protocol.event_message(16, 4);
@@ -808,6 +823,11 @@ fn _protocol_ready() as i32 {
                      pointer_motion.opcode == 2 && pointer_motion.arg_count == 3 &&
                      pointer_button.opcode == 3 && pointer_button.arg_count == 4 &&
                      pointer_axis.opcode == 4 && pointer_axis.arg_count == 3 &&
+                     pointer_frame.opcode == 5 && pointer_frame.arg_count == 0 &&
+                     axis_source.opcode == 6 && axis_source.arg_count == 1 &&
+                     axis_stop.opcode == 7 && axis_stop.arg_count == 2 &&
+                     axis_discrete.opcode == 8 && axis_discrete.arg_count == 2 &&
+                     axis_value120.opcode == 9 && axis_value120.arg_count == 2 && axis_value120.since == 8 &&
                      keyboard_keymap.opcode == 0 && keyboard_keymap.arg_count == 3 &&
                      keyboard_key.opcode == 3 && keyboard_key.arg_count == 4 &&
                      keyboard_modifiers.opcode == 4 && keyboard_modifiers.arg_count == 5 &&
@@ -1569,7 +1589,7 @@ fn _seat_capabilities(w as *Window, caps as u32) as void {
         w.pointer = _id(w);
         _put(&body[0], cast(u32, w.pointer));
         _send(w, w.seat, 0, &body[0], 4, 0 - 1);
-        w.pointer_version = _bounded(w.seat_version, 7);
+        w.pointer_version = w.seat_version;
         _cursor_shape_pointer(w);
     } else if ((caps & 1) == 0 && w.pointer != 0) {
         if (w.cursor_shape_device != 0) {
@@ -1880,34 +1900,68 @@ fn _button_id(code as i32) as i32 {
     return 0;
 }
 
-// A pointer frame's scrolling, said as one SCROLL: lines continuous (15 of
-// the compositor's units to a line, a wheel's notch as libinput gives it),
-// whole notches where it said them.
+// Whole notches in 120ths given, the rest kept for the next: toward zero, so
+// a turn back starts from what is left.
+fn _notches(v120 as i32, rest as *i32) as i32 {
+    *rest = *rest + v120;
+    let is i32 as whole = *rest / 120;
+    *rest = *rest - whole * 120;
+    return whole;
+}
+
+// A pointer frame's scrolling, said as one SCROLL. Where it came from as the
+// compositor said (axis_source; a frame with notches and no source a
+// wheel's). A wheel's in notches — 120ths where it says them (value120, 8),
+// whole ones before (axis_discrete), whole notches counted from what is left
+// between frames; fingers' and continuous devices' in lines of LINE_PIXELS
+// of the compositor's motion, and the axes they stopped on (axis_stop).
+// Before version 5 there are no frames: each axis event a wheel's notch.
 fn _scroll(w as *Window) as void {
-    if (w.scroll_x == 0 && w.scroll_y == 0 && w.scroll_discrete == 0 && w.scroll_discrete_x == 0) { return; }
+    if (w.scroll_x == 0 && w.scroll_y == 0 && w.scroll_discrete == 0 && w.scroll_discrete_x == 0 &&
+        w.scroll_v120_x == 0 && w.scroll_v120_y == 0 && w.scroll_stop == 0) { return; }
     let is ie.Event as e = _input(w, ie.SCROLL);
     e.x = w.pointer_x;
     e.y = w.pointer_y;
+    let is i32 as notched = cast(i32, w.scroll_v120_x != 0 || w.scroll_v120_y != 0 ||
+                                     w.scroll_discrete != 0 || w.scroll_discrete_x != 0);
     e.source = ie.SCROLL_CONTINUOUS;
-    e.dx = cast(f64, w.scroll_x) / 256.0 / 15.0;
-    e.dy = cast(f64, w.scroll_y) / 256.0 / 15.0;
-    if (w.scroll_discrete != 0 || w.scroll_discrete_x != 0) {
+    if (w.scroll_source == 0 || (w.scroll_source < 0 && notched == 1)) { e.source = ie.SCROLL_WHEEL; }
+    if (w.scroll_source == 1) { e.source = ie.SCROLL_FINGER; }
+    if (w.scroll_source == 3) { e.source = ie.SCROLL_TILT; }
+    if (w.pointer_version < 5) {
         e.source = ie.SCROLL_WHEEL;
-        e.steps_x = w.scroll_discrete_x;
-        e.steps_y = w.scroll_discrete;
-        e.value120_x = w.scroll_discrete_x * 120;
-        e.value120_y = w.scroll_discrete * 120;
-        e.dx = cast(f64, w.scroll_discrete_x);
-        e.dy = cast(f64, w.scroll_discrete);
-    } else if (w.pointer_version < 5) {
-        // No frames, no steps: each axis event a notch, as old compositors
-        // sent a wheel's.
         if (w.scroll_y > 0) { e.steps_y = 1; } else if (w.scroll_y < 0) { e.steps_y = 0 - 1; }
         if (w.scroll_x > 0) { e.steps_x = 1; } else if (w.scroll_x < 0) { e.steps_x = 0 - 1; }
-        e.source = ie.SCROLL_WHEEL;
+        e.dx = cast(f64, e.steps_x);
+        e.dy = cast(f64, e.steps_y);
+        e.value120_x = e.steps_x * 120;
+        e.value120_y = e.steps_y * 120;
+    } else if (e.source == ie.SCROLL_WHEEL || e.source == ie.SCROLL_TILT) {
+        let is i32 as vx with mut = w.scroll_v120_x;
+        let is i32 as vy with mut = w.scroll_v120_y;
+        if (notched == 0) {
+            // A wheel the compositor gives no notches for: its motion, a
+            // notch every LINE_PIXELS.
+            vx = cast(i32, w.scroll_x * 120 / 256 / 15);
+            vy = cast(i32, w.scroll_y * 120 / 256 / 15);
+        } else if (vx == 0 && vy == 0) {
+            vx = w.scroll_discrete_x * 120;
+            vy = w.scroll_discrete * 120;
+        }
+        e.value120_x = vx;
+        e.value120_y = vy;
+        e.dx = cast(f64, vx) / 120.0;
+        e.dy = cast(f64, vy) / 120.0;
+        e.steps_x = _notches(vx, &w.v120_rest_x);
+        e.steps_y = _notches(vy, &w.v120_rest_y);
+    } else {
+        e.dx = cast(f64, w.scroll_x) / 256.0 / ie.LINE_PIXELS;
+        e.dy = cast(f64, w.scroll_y) / 256.0 / ie.LINE_PIXELS;
+        e.stop = w.scroll_stop;
     }
     _push(w, &e, cast(*u8, 0), 0);
     w.scroll_x = 0; w.scroll_y = 0; w.scroll_discrete = 0; w.scroll_discrete_x = 0;
+    w.scroll_v120_x = 0; w.scroll_v120_y = 0; w.scroll_source = 0 - 1; w.scroll_stop = 0;
 }
 
 fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
@@ -1922,6 +1976,11 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
     }
     if (op == 1) {
         w.pointer_serial = _word(p); w.pointer_inside = 0;
+        // What a wheel turned short of a notch is not carried to another
+        // visit, nor a frame left unended.
+        w.scroll_x = 0; w.scroll_y = 0; w.scroll_discrete = 0; w.scroll_discrete_x = 0;
+        w.scroll_v120_x = 0; w.scroll_v120_y = 0; w.scroll_source = 0 - 1; w.scroll_stop = 0;
+        w.v120_rest_x = 0; w.v120_rest_y = 0;
         _pointer_input(w, ie.LEAVE, 0);
         return;
     }
@@ -1968,10 +2027,26 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
         if (w.pointer_version < 5) { _scroll(w); }
         return;
     }
+    if (op == 6 && _wire_size >= 12) {
+        let is u32 as source = _word(p);
+        if (source <= cast(u32, 3)) { w.scroll_source = cast(i32, source); }
+        return;
+    }
+    if (op == 7 && _wire_size >= 16) {
+        if (_word(cast(*u8, cast(i64, p) + 4)) == 0) { w.scroll_stop = w.scroll_stop | ie.STOP_Y; }
+        else { w.scroll_stop = w.scroll_stop | ie.STOP_X; }
+        return;
+    }
     if (op == 8 && _wire_size >= 16) {
         let is i32 as steps = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
         if (_word(p) == 0) { w.scroll_discrete = w.scroll_discrete + steps; }
         else { w.scroll_discrete_x = w.scroll_discrete_x + steps; }
+        return;
+    }
+    if (op == 9 && _wire_size >= 16) {
+        let is i32 as v120 = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
+        if (_word(p) == 0) { w.scroll_v120_y = w.scroll_v120_y + v120; }
+        else { w.scroll_v120_x = w.scroll_v120_x + v120; }
         return;
     }
     if (op == 5 && w.pointer_version >= 5) { _scroll(w); }
@@ -2567,7 +2642,9 @@ fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
     if (w.compositor == 0 || w.shm == 0 || w.wm_base == 0) { return 0; }
     if (_globals.seat_global != 0) {
         w.seat = _id(w);
-        w.seat_version = _bounded(_globals.seat_version, 7);
+        // 9: axis_value120 (8) and axis_relative_direction; not 10, whose
+        // keyboard repeats keys itself — the repeat here is this client's.
+        w.seat_version = _bounded(_globals.seat_version, 9);
         if (_bind(w, cast(u32, _globals.seat_global), "wl_seat", w.seat_version, w.seat) == 0) { return 0; }
     }
     w.output_count = _globals.output_count;

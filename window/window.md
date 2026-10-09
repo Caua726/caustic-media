@@ -464,7 +464,11 @@ where said:
   `TEXT` (`from_key`), never a control character nor what a key held with
   Control, Alt or Super types; an input method's text is `TEXT` too; every
   event the modifiers held as `keys.MOD_*` name them, X's bits translated.
-  X's buttons 4–7 and Windows' wheel are `SCROLL`, 120 a notch. Focus leaving
+  `SCROLL` says where it came from: a wheel in notches and 120ths (X's
+  buttons 4–7, Windows' deltas, Wayland's `axis_value120`), fingers and
+  continuous devices in lines of motion with `stop` when the fingers lift
+  (Wayland's frames; X11's XI 2.1 valuators with `x11/xinput.cst`, its
+  emulated buttons dropped). Focus leaving
   is a `CANCEL`: everything held let go, a release after it unsaid. A press
   handed to `begin_move_resize` ends in `BUTTON_UP` with `BUTTON_TAKEN`, and
   the release the window manager keeps never arrives. `STATE` says the

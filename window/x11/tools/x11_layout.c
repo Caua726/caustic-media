@@ -27,6 +27,7 @@
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/scrnsaver.h>
 #include <X11/extensions/shape.h>
+#include <X11/extensions/XInput2.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -816,6 +817,86 @@ static void im_structs(void)
     F(XIMText, string);
 }
 
+static void xi2_structs(void)
+{
+    printf("# --- structs: XInput2, what smooth scrolling reads (XI2.h, XInput2.h) ---\n");
+    S(XIEventMask);
+    F(XIEventMask, deviceid);
+    F(XIEventMask, mask_len);
+    F(XIEventMask, mask);
+    S(XIDeviceEvent);
+    F(XIDeviceEvent, type);
+    F(XIDeviceEvent, evtype);
+    F(XIDeviceEvent, time);
+    F(XIDeviceEvent, deviceid);
+    F(XIDeviceEvent, sourceid);
+    F(XIDeviceEvent, detail);
+    F(XIDeviceEvent, root);
+    F(XIDeviceEvent, event);
+    F(XIDeviceEvent, child);
+    F(XIDeviceEvent, root_x);
+    F(XIDeviceEvent, root_y);
+    F(XIDeviceEvent, event_x);
+    F(XIDeviceEvent, event_y);
+    F(XIDeviceEvent, flags);
+    F(XIDeviceEvent, buttons);
+    F(XIDeviceEvent, valuators);
+    F(XIDeviceEvent, mods);
+    F(XIDeviceEvent, group);
+    S(XIValuatorState);
+    F(XIValuatorState, mask_len);
+    F(XIValuatorState, mask);
+    F(XIValuatorState, values);
+    S(XIDeviceChangedEvent);
+    F(XIDeviceChangedEvent, evtype);
+    F(XIDeviceChangedEvent, time);
+    F(XIDeviceChangedEvent, deviceid);
+    F(XIDeviceChangedEvent, sourceid);
+    F(XIDeviceChangedEvent, reason);
+    F(XIDeviceChangedEvent, num_classes);
+    F(XIDeviceChangedEvent, classes);
+    S(XIDeviceInfo);
+    F(XIDeviceInfo, deviceid);
+    F(XIDeviceInfo, name);
+    F(XIDeviceInfo, use);
+    F(XIDeviceInfo, attachment);
+    F(XIDeviceInfo, enabled);
+    F(XIDeviceInfo, num_classes);
+    F(XIDeviceInfo, classes);
+    S(XIAnyClassInfo);
+    F(XIAnyClassInfo, type);
+    F(XIAnyClassInfo, sourceid);
+    S(XIValuatorClassInfo);
+    F(XIValuatorClassInfo, type);
+    F(XIValuatorClassInfo, sourceid);
+    F(XIValuatorClassInfo, number);
+    F(XIValuatorClassInfo, label);
+    F(XIValuatorClassInfo, min);
+    F(XIValuatorClassInfo, max);
+    F(XIValuatorClassInfo, value);
+    F(XIValuatorClassInfo, resolution);
+    F(XIValuatorClassInfo, mode);
+    S(XIScrollClassInfo);
+    F(XIScrollClassInfo, type);
+    F(XIScrollClassInfo, sourceid);
+    F(XIScrollClassInfo, number);
+    F(XIScrollClassInfo, scroll_type);
+    F(XIScrollClassInfo, increment);
+    F(XIScrollClassInfo, flags);
+    C(XI_DeviceChanged);
+    C(XI_Motion);
+    C(XI_ButtonPress);
+    C(XIAllMasterDevices);
+    C(XIValuatorClass);
+    C(XIScrollClass);
+    C(XIScrollTypeVertical);
+    C(XIScrollTypeHorizontal);
+    C(XIScrollFlagNoEmulation);
+    C(XISlaveSwitch);
+    C(XIDeviceChange);
+    C(XIPointerEmulated);
+}
+
 static void constants(void)
 {
     printf("# --- constants: every #define in X.h ---\n");
@@ -1206,6 +1287,7 @@ int main(void)
     events();
     structs();
     im_structs();
+    xi2_structs();
     constants();
     return 0;
 }

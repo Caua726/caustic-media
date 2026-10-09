@@ -289,12 +289,28 @@ What the queue promises:
   `repeat_info` rate and delay, cancelled when the key is let go, the focus
   leaves, the keyboard goes or the keymap is replaced; `window/wait.cst` and
   the host sleep no longer than the next repeat (`device.input_due`).
+- **Scrolling as the device scrolls.** A wheel's in notches — 120ths where
+  the platform is finer, whole `steps` counted from what is left over —
+  fingers' and continuous devices' in lines of `LINE_PIXELS` of motion, with
+  `stop` when the fingers lift. Wayland: `wl_pointer` at the seat's version
+  up to 9, a frame's `axis_source`, `axis`, `axis_value120` (or
+  `axis_discrete` before 8) and `axis_stop` one `SCROLL`, the notch fraction
+  dropped when the pointer leaves. X11: buttons 4–7 a notch each; with
+  `x11/xinput.cst` (the toolkit turns it on) XI 2.1's scroll valuators —
+  motion over each scroll class's increment, measured from a baseline that
+  is taken again when the pointer comes back or the device behind the master
+  pointer changes, a touchpad (libinput's or synaptics' property) continuous,
+  a wheel in 120ths — and the server's emulated buttons for the same motion
+  dropped. Windows: `WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL` deltas, 120ths, the rest
+  kept between messages.
 
 `ui/host.cst` feeds a window's queue to its router: a key's `TEXT` is typed
 unless the router took that key; text an input method or another program sent
 is typed whatever is held. With Control or Super held the router is told the
 key's `shortcut`, so Ctrl+C, Ctrl+A and Ctrl+V work in a Cyrillic layout; with
-Alt alone, the layout's key, which mnemonics mean.
+Alt alone, the layout's key, which mnemonics mean. A wheel's scroll goes to
+the router in notches, each gliding a line; fingers' in pixels, the content
+following at once, and their lifting a fling (`router.scroll_end`).
 
 Proved with real platform input: `keyboard_x11_test` (XTest, us/ru/de groups:
 keys, Ctrl+C in Russian, Caps Lock, AltGr, the focus taken by another
@@ -356,6 +372,18 @@ grab, a GTK client's neither — and Wine's IMM32 keeps no attributes it is
 given, so the target clause is checked from attributes as a method sets
 them.
 
-Still to come, in this order: continuous scrolling (axis source, stop,
-value120 on Wayland); touch, pen and gestures; gamepads, raw devices and the
-action mapping.
+Scrolling proved: `wayland/input_test` (a version 9 frame: a fine wheel's
+half notches, fingers both ways and lifting, a tilt, a continuous device, the
+fraction forgotten on leaving), `scroll_wayland_test` (XTest's buttons 4–7
+through Weston, which offers the seat at 7 — notches — and KWin, at 10, bound
+at 9 — 120ths), `x11/smooth_test` (scroll valuators as the server reports
+them: baselines, packed values, increments either way, touchpad, emulation),
+`scroll_x11_test` (XI_Motion standing in for MotionNotify, XTest's wheel not
+taken for an emulation), `host_x11_test` (fingers move the content by their
+pixels at once and fling when lifted). Not proved here: a real touchpad's
+scroll valuators or Wayland finger frames — no such device reaches Xvfb or a
+nested compositor here, so their translation is proved from the protocol's
+bytes and structs.
+
+Still to come, in this order: touch, pen and gestures; gamepads, raw devices
+and the action mapping.
