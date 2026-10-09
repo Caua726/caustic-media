@@ -78,9 +78,12 @@ protocol, same library, same code path. A Wayland session running XWayland is
 served by `x11` with nothing extra.
 
 `AUTO` selects on Linux in this order: `WAYLAND_DISPLAY` set → `wayland`;
-otherwise → `x11`. KMS is not implemented. Win32 currently has a direct native
-backend, not a portable dispatcher integration; see its compiler blockers in
-[`win32/win32.md`](win32/win32.md#current-state).
+otherwise → `x11`; on Windows it is `win32`. KMS is not implemented. Every
+operation of `device.cst` dispatches on the target's system first — a
+compile-time constant — so a Linux binary imports no Win32 DLL and a Windows
+one no libX11; `available(WIN32)` is 1 on Windows. `device_win32_test` drives
+the portable API under an isolated Wine (`caustic-mk run test-win32-native`);
+see [`win32/win32.md`](win32/win32.md#current-state) for what that proves.
 
 **The program can always name one instead.** `window.open_with(WAYLAND, ...)`
 opens a Wayland window in a session where `AUTO` would have chosen X11, and
@@ -429,13 +432,17 @@ to be home itself turned off; its English name under home when the file does
 not say (`window_user_dirs_test`). Windows' known folders come with its
 backend.
 
-**What a toolkit's loop needs of a window**, portable, X11's for now:
+**What a toolkit's loop needs of a window**, portable — X11's, and Windows'
+where said:
 
 - `wait.cst`: `wait(win, timeout)` sleeps in one `poll` until an event comes
   for any window of the program — on the connection they share, or already
   read off it into Xlib's queue, which the descriptor does not show — a
   watched descriptor is readable, another thread calls `wake` (an eventfd),
-  or the time passes; it says which (`wait_test`, `wait_x11_test`).
+  or the time passes; it says which (`wait_test`, `wait_x11_test`). On
+  Windows it sleeps in `MsgWaitForMultipleObjectsEx`: the thread's queue,
+  input already looked at included, an auto-reset event for `wake`, watched
+  HANDLEs signalled as "readable" (`wait_win32_test`, under Wine).
   `device.pump` hands every event read to the windows it belongs to, for a
   loop that sleeps by itself rather than in `next_frame`.
 - A key press carries the text it typed (`event.text`, UTF-8: XLookupString,

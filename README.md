@@ -11,9 +11,11 @@
 > the three toolkit examples are exercised on X11 and shown with real keyboard
 > and pointer input on a seated Weston/Wayland software compositor. External
 > Wayland clipboard, DnD and installed IME interaction remain unverified.
-> Win32 has generated SDK bindings, an ABI bridge and a directly usable native
-> window backend verified under isolated Wine; portable Win32 toolkit dispatch
-> is not connected yet. The PE stack-probe linker blocker is fixed.
+> Win32 has generated SDK bindings, an ABI bridge and a native window backend
+> behind the portable window device; a toolkit program starts, draws, takes
+> input and closes on Windows, verified under isolated Wine. Native popups and
+> desktop services (dialogs, notifications, DnD, accessibility) are not on
+> Windows yet.
 >
 > The architecture examples below also include designed interfaces that are
 > not implemented. See **Status** and each module's **Current state** before

@@ -549,7 +549,7 @@ theme change restyles them all:
 
 | from | what | state |
 |---|---|---|
-| `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 implemented; native Wayland tested with Weston, desktop limits documented; portable Win32 blocked by the compiler |
+| `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 implemented; native Wayland tested with Weston, desktop limits documented; Win32 under isolated Wine: a program starts, draws, takes input and closes (`program_win32_test`), popups, DnD and desktop services not yet |
 | `input/` | events; text input and IME composition | design note |
 | `render/` | `draw2d`, `shapes2d`, scissor, layers | done |
 | `text/` | shaping, layout, caret, hit-testing, colour glyphs | done; complex scripts later |

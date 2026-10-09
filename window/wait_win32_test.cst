@@ -1,0 +1,248 @@
+// window/wait_win32_test.cst — the loop's one place to sleep, on Windows
+// (here: an isolated Wine):
+//   sh window/win32/tools/run_native.sh build/wait_win32_test.exe
+// Woken by a HANDLE it watches, by another thread, by its time, and by a
+// message for a window of the thread — one already looked at included.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/thread.cst" as thread;
+use "device.cst" as device;
+use "event.cst" as event;
+use "wait.cst" as wait;
+use "win32/bind/types.cst" as t;
+use "win32/bind/user32.cst" as u;
+use "win32/bind/kernel32.cst" as k;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is wait.Wait as w with mut;
+let is i64 as hwnd with mut = 0;
+
+// Another thread: sleeps a little, then wakes the loop.
+fn waker(arg as i64) as i64 {
+    time.sleep_ms(50);
+    wait.wake(&w);
+    return 0;
+}
+
+// Another thread: sleeps a little, then posts to the window.
+fn poster(arg as i64) as i64 {
+    time.sleep_ms(50);
+    u.PostMessageW(hwnd, cast(u32, t.WM_NULL), 0, 0);
+    return 0;
+}
+
+// Another thread: sleeps a little, then sends to the window — the call
+// returns once the window's thread has answered.
+fn sender(arg as i64) as i64 {
+    time.sleep_ms(50);
+    u.SendMessageW(hwnd, cast(u32, t.WM_NULL), 0, 0);
+    return 0;
+}
+
+let is i64 as mutex with mut = 0;
+
+// Another thread: takes the mutex and ends holding it — abandoned.
+fn abandoner(arg as i64) as i64 {
+    k.WaitForSingleObject(mutex, cast(u32, t.INFINITE));
+    return 0;
+}
+
+fn event_handle(manual as i32) as i64 { return k.CreateEventW(cast(*u8, 0), manual, 0, cast(*u16, 0)); }
+
+fn main() as i32 {
+    w = wait.open();
+    check("open", wait.is_open(&w) == 1);
+    let is *device.Window as none = cast(*device.Window, 0);
+
+    // --- Its time ---
+    let is i64 as t0 with mut = time.now_ms();
+    check("nothing to wake it: its time", wait.wait(&w, none, 60) == wait.TIMEOUT);
+    let is i64 as slept = time.now_ms() - t0;
+    check("slept about that long", slept >= 50 && slept < 1000);
+    check("no time: at once", wait.wait(&w, none, 0) == wait.TIMEOUT);
+
+    // --- A handle it watches: signalled is readable ---
+    let is i64 as ev = event_handle(1);
+    check("watched", wait.watch(&w, ev) == 1 && wait.watching(&w, ev) == 1);
+    check("not signalled: its time", wait.wait(&w, none, 0) == wait.TIMEOUT && wait.readable(&w, ev) == 0);
+    k.SetEvent(ev);
+    t0 = time.now_ms();
+    check("signalled: woken by it", wait.wait(&w, none, 5000) == wait.DESCRIPTOR && wait.readable(&w, ev) == 1);
+    check("at once", time.now_ms() - t0 < 1000);
+    check("a manual-reset event stays signalled", wait.wait(&w, none, 0) == wait.DESCRIPTOR && wait.readable(&w, ev) == 1);
+    check("watched twice: once", wait.watch(&w, ev) == 1 && wait.count(&w) == 1);
+    k.ResetEvent(ev);
+    check("reset: not readable again", wait.wait(&w, none, 0) == wait.TIMEOUT && wait.readable(&w, ev) == 0);
+    k.SetEvent(ev);
+    wait.unwatch(&w, ev);
+    check("unwatched: not woken by it", wait.watching(&w, ev) == 0 && wait.wait(&w, none, 0) == wait.TIMEOUT);
+    wait.wake(&w);
+    check("a handle let go: never said, even when woken", wait.wait(&w, none, 1000) == wait.WOKEN && wait.readable(&w, ev) == 0);
+    k.ResetEvent(ev);
+
+    // A mutex its owner ended holding is abandoned: signalled all the same,
+    // and taken by the wait that says so.
+    mutex = k.CreateMutexW(cast(*u8, 0), 0, cast(*u16, 0));
+    let is thread.Thread as owner;
+    thread.spawn(&owner, cast(*u8, fn_ptr(abandoner)), 0);
+    thread.join(&owner);
+    wait.watch(&w, mutex);
+    check("an abandoned mutex: readable", wait.wait(&w, none, 1000) == wait.DESCRIPTOR && wait.readable(&w, mutex) == 1);
+    wait.unwatch(&w, mutex);
+    k.ReleaseMutex(mutex);
+    k.CloseHandle(mutex);
+
+    // Three watched: the wait names the first signalled, the rest are found.
+    let is i64 as ev2 = event_handle(1);
+    let is i64 as ev3 = event_handle(1);
+    wait.watch(&w, ev);
+    wait.watch(&w, ev2);
+    wait.watch(&w, ev3);
+    k.SetEvent(ev2);
+    check("the second signalled: it, not the others", wait.wait(&w, none, 0) == wait.DESCRIPTOR &&
+          wait.readable(&w, ev2) == 1 && wait.readable(&w, ev) == 0 && wait.readable(&w, ev3) == 0);
+    k.SetEvent(ev3);
+    check("two signalled: both said", wait.wait(&w, none, 0) == wait.DESCRIPTOR &&
+          wait.readable(&w, ev2) == 1 && wait.readable(&w, ev3) == 1 && wait.readable(&w, ev) == 0);
+    k.ResetEvent(ev2);
+    check("then one of them no longer", wait.wait(&w, none, 0) == wait.DESCRIPTOR &&
+          wait.readable(&w, ev2) == 0 && wait.readable(&w, ev3) == 1);
+    k.ResetEvent(ev3);
+    wait.unwatch(&w, ev);
+    wait.unwatch(&w, ev2);
+    wait.unwatch(&w, ev3);
+
+    // An auto-reset event is taken by being reported, as a wait takes it —
+    // whether the wait names it or it is found after.
+    let is i64 as once = event_handle(0);
+    wait.watch(&w, once);
+    k.SetEvent(once);
+    check("auto-reset: reported", wait.wait(&w, none, 0) == wait.DESCRIPTOR && wait.readable(&w, once) == 1);
+    check("auto-reset: taken", wait.wait(&w, none, 0) == wait.TIMEOUT && wait.readable(&w, once) == 0);
+    wait.watch(&w, ev2);
+    k.SetEvent(ev2);
+    k.SetEvent(once);
+    check("auto-reset found after the first: reported", wait.wait(&w, none, 0) == wait.DESCRIPTOR &&
+          wait.readable(&w, once) == 1 && wait.readable(&w, ev2) == 1);
+    k.ResetEvent(ev2);
+    check("and taken", wait.wait(&w, none, 0) == wait.TIMEOUT && wait.readable(&w, once) == 0);
+    wait.unwatch(&w, once);
+    wait.unwatch(&w, ev2);
+
+    check("a null handle: not watched", wait.watch(&w, 0) == 0 && wait.count(&w) == 0);
+    check("a negative one: not watched", wait.watch(&w, 0 - 1) == 0);
+    let is i64 as n with mut = 0;
+    let is i32 as all with mut = 1;
+    while (n < wait.MAX_FDS) {
+        if (wait.watch(&w, 1000 + n) == 0) { all = 0; }
+        n = n + 1;
+    }
+    check("as many as it holds", all == 1 && wait.count(&w) == wait.MAX_FDS);
+    check("not one more", wait.watch(&w, 999) == 0 && wait.count(&w) == wait.MAX_FDS);
+    n = 0;
+    while (n < wait.MAX_FDS) {
+        wait.unwatch(&w, 1000 + n);
+        n = n + 1;
+    }
+    check("all let go", wait.count(&w) == 0);
+
+    // --- Woken by another thread ---
+    wait.wake(&w);
+    check("woken before it slept: at once", wait.wait(&w, none, 5000) == wait.WOKEN);
+    check("once", wait.wait(&w, none, 0) == wait.TIMEOUT);
+    let is thread.Thread as th;
+    thread.spawn(&th, cast(*u8, fn_ptr(waker)), 0);
+    t0 = time.now_ms();
+    check("woken while asleep", wait.wait(&w, none, 5000) == wait.WOKEN);
+    let is i64 as took with mut = time.now_ms() - t0;
+    check("when it was, not at its time", took >= 30 && took < 2000);
+    thread.join(&th);
+    wait.watch(&w, ev);
+    k.SetEvent(ev);
+    wait.wake(&w);
+    check("wake and a handle together: both said", wait.wait(&w, none, 1000) == (wait.DESCRIPTOR | wait.WOKEN) &&
+          wait.readable(&w, ev) == 1);
+    k.ResetEvent(ev);
+    wait.unwatch(&w, ev);
+
+    // --- A window's messages: the thread's queue ---
+    let is device.Window as win = device.open("wait", 160, 90);
+    if (device.is_open(&win) == 0) {
+        io.printf("FAIL: no window\n");
+        return 1;
+    }
+    hwnd = win.win32_win.hwnd;
+    let is event.Event as e;
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_event(&win, &e) == 1) { }
+        time.sleep_ms(5);
+    }
+    check("nothing queued: its time", wait.wait(&w, &win, 0) == wait.TIMEOUT);
+    u.PostMessageW(hwnd, cast(u32, t.WM_NULL), 0, 0);
+    check("no window named: a message does not wake it", wait.wait(&w, none, 50) == wait.TIMEOUT);
+    t0 = time.now_ms();
+    check("a window named: woken by it", wait.wait(&w, &win, 5000) == wait.WINDOW);
+    check("at once", time.now_ms() - t0 < 1000);
+    let is t.MSG as msg;
+    check("looked at, left queued", u.PeekMessageW(&msg, 0, 0, 0, cast(u32, t.PM_NOREMOVE)) != 0);
+    t0 = time.now_ms();
+    check("one already looked at still wakes it", wait.wait(&w, &win, 5000) == wait.WINDOW &&
+          time.now_ms() - t0 < 1000);
+    device.pump(&win);
+    check("taken: its time", wait.wait(&w, &win, 0) == wait.TIMEOUT);
+
+    // An event the backend has already read off the queue: no sleeping on it.
+    u.PostMessageW(hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, t.VK_SPACE), 1);
+    device.pump(&win);
+    check("the backend holds an event", device.pending(&win) == 1);
+    t0 = time.now_ms();
+    check("held: not asleep", wait.wait(&w, &win, 5000) == wait.WINDOW && time.now_ms() - t0 < 1000);
+    while (device.poll_event(&win, &e) == 1) { }
+    check("given: its time", wait.wait(&w, &win, 0) == wait.TIMEOUT);
+
+    thread.spawn(&th, cast(*u8, fn_ptr(poster)), 0);
+    t0 = time.now_ms();
+    check("posted while asleep: woken", wait.wait(&w, &win, 5000) == wait.WINDOW);
+    took = time.now_ms() - t0;
+    check("when it was", took >= 30 && took < 2000);
+    thread.join(&th);
+    device.pump(&win);
+    thread.spawn(&th, cast(*u8, fn_ptr(sender)), 0);
+    t0 = time.now_ms();
+    check("sent to while asleep: woken", wait.wait(&w, &win, 5000) == wait.WINDOW);
+    took = time.now_ms() - t0;
+    check("when it was sent", took >= 30 && took < 2000);
+    device.pump(&win);
+    thread.join(&th);
+    wait.watch(&w, ev);
+    k.SetEvent(ev);
+    u.PostMessageW(hwnd, cast(u32, t.WM_NULL), 0, 0);
+    check("a message and a handle together: both said",
+          wait.wait(&w, &win, 1000) == (wait.WINDOW | wait.DESCRIPTOR) && wait.readable(&w, ev) == 1);
+    device.pump(&win);
+    wait.unwatch(&w, ev);
+    device.close(&win);
+
+    k.CloseHandle(ev);
+    k.CloseHandle(ev2);
+    k.CloseHandle(ev3);
+    k.CloseHandle(once);
+    wait.close(&w);
+    check("closed", wait.is_open(&w) == 0 && wait.wait(&w, none, 0) == wait.TIMEOUT);
+    if (fails == 0) {
+        io.printf("window wait win32: all checks passed\n");
+        return 0;
+    }
+    io.printf("window wait win32: %d failures\n", fails);
+    return 1;
+}

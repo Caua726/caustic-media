@@ -156,17 +156,40 @@ resize, fullscreen restore and a close request that can be declined. Desktop
 preference reads were also exercised in a native smoke. Real Windows, monitor
 transitions and interaction with an installed IME remain unverified.
 
-The F0 compiler candidate resolves the real `__caustic_chkstk` definition
-before PE validation/relocation. The permanent compiler fixture with an
-8192-byte recursive local passes in private Wine at `-O0/-O1/-O2` and through
-separate object linking. The media `test-win32` matrix also passed with that
-candidate, including the actual `win_image` PNG decoder. Compound immutable
-target guards now discard the wrong-target branch before IR reachability;
-the regression checks ELF/PE import tables rather than removing library names.
-The installed toolchain is unchanged until the complete F0 gate is validated.
+The compiler resolves the real `__caustic_chkstk` definition before PE
+validation/relocation (8192-byte recursive locals pass at `-O0/-O1/-O2` and
+through separate object linking), and the installed toolchain was validated
+with `test-win32`, including the `win_image` PNG decoder. Calls into a library
+the target cannot load are refused in whole-program builds and trapped without
+an import where a whole module is emitted, so importing this backend never
+adds a Win32 DLL to a Linux binary.
 
-Portable Win32 dispatch and toolkit integration are not yet connected:
-`device.available(WIN32)` remains false. The native backend is usable directly.
-OLE DnD, toolkit UIA, platform choosers, complete CSD and modal-loop toolkit
-rendering remain implementation work. Native Wine checks are not proof of
-portable toolkit or real-Windows support.
+Portable dispatch is connected: `../device.cst` opens `win32` under `AUTO` on
+Windows and `device.available(WIN32)` is 1. `device_win32_test.cst` drives the
+portable API in an isolated Wine, at 96 and at 144 dpi (`CAUSTIC_WINE_DPI`):
+per-monitor DPI awareness and the scale it gives, the class name as the
+process's AppUserModelID, presented pixels, UTF-8 titles past the BMP,
+show/hide, client position, key/text/pointer/wheel events, the resize, motion
+and wheel as per-frame edges, the synchronous clipboard (no PRIMARY), floor and
+ceiling sizes, maximize/restore/fullscreen/minimize state events, activation
+from behind another window, text input and the IME candidate position, the
+desktop's settings, icons (size bounds, rows top-down as read back), the system
+cursor each portable shape shows, decorations, frame extents, an input region
+exact to its edges (HTTRANSPARENT outside), the command each move or resize
+edge gives the system, a system move from a real synthetic left-button drag,
+the system menu's modal loop until Escape and with Close chosen, an owned modal
+dialog and close requests. It found that `WM_NCCREATE` skipped the default
+procedure, so creation titles were lost, and that `resized`, the motion and the
+wheel were never per frame (a window looked resized every frame after its
+first); both are fixed.
+
+`../wait.cst` sleeps in `MsgWaitForMultipleObjectsEx` on Windows: the thread's
+queue (input already looked at included), an auto-reset event for `wake`, and
+watched HANDLEs (`wait_win32_test.cst`). A toolkit program starts and runs on
+Windows (`../../ui/program_win32_test.cst`, at 96 and 144 dpi): its fonts
+found and mapped (`text/fonts`), its window drawn — the painted text read back
+from the window's DC — clicked and typed into, and closed by the system's
+message. The first window is sized once its scale is known. Native popups, OLE
+DnD, toolkit UIA, platform choosers, notifications, complete CSD and modal-loop
+toolkit rendering remain implementation work, and Wine is not proof of
+real-Windows behavior.
