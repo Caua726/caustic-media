@@ -129,6 +129,10 @@ the headers. `tools/layout.c` independently checks the exposed layouts and all
 constant values with mingw-gcc; `layout_test.cst` checks Caustic's same sizes
 and offsets. `tools/exports.c` loads every bound DLL and resolves every bound
 function at run time, because one missing export stops an image from loading.
+Anonymous unions and structs are told apart by where they are declared, not by
+clang's USR alone: it gives every anonymous member of a record the same one, and
+`DEVMODEW`'s two unions (16 and 4 bytes) came out as one until `layout_test`
+caught the size.
 
 Caustic functions retain their SysV convention in a PE. `abi.cst` bridges
 indirect native calls and callbacks, including stack arguments and doubles;

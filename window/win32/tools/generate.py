@@ -74,6 +74,17 @@ def identifier(name):
     return name
 
 
+def record_key(decl):
+    """A record declaration's identity. Clang gives every anonymous union or
+    struct inside one record the same USR (DEVMODEW has two of different
+    sizes), so those are told apart by where they are declared."""
+    usr = decl.get_usr()
+    if decl.is_anonymous() or not decl.spelling:
+        loc = decl.location
+        return f'{usr}@{loc.line}:{loc.column}'
+    return usr
+
+
 class Generator:
     def __init__(self, manifest, headers, clang):
         self.manifest = manifest
@@ -97,7 +108,7 @@ class Generator:
         selected = manifest['records'] + manifest['interfaces'] + [
             n + 'Vtbl' for n in manifest['interfaces']]
         self.preferred = {
-            self.decls[n].type.get_canonical().get_declaration().get_usr(): n
+            record_key(self.decls[n].type.get_canonical().get_declaration()): n
             for n in selected}
         self.names = {}
         self.records = []
@@ -165,7 +176,7 @@ class Generator:
 
     def record(self, t, name=None):
         t = t.get_canonical()
-        key = t.get_declaration().get_usr()
+        key = record_key(t.get_declaration())
         if key in self.names:
             return self.names[key]
         name = self.preferred.get(key, name or identifier(t.get_declaration().spelling))
@@ -231,7 +242,7 @@ class Generator:
             if p.kind in (TK.FUNCTIONPROTO, TK.FUNCTIONNOPROTO, TK.VOID):
                 return '*u8'
             if p.kind == TK.RECORD:
-                key = p.get_declaration().get_usr()
+                key = record_key(p.get_declaration())
                 return '*' + self.names[key] if key in self.names else '*u8'
             return '*' + self.type(p)
         if c.kind == TK.RECORD:
@@ -328,7 +339,7 @@ class Generator:
         c = [*(f'#include <{h}>' for h in self.manifest['headers']), '#include <stddef.h>', '#include <stdio.h>', 'int main(void) {']
         test = [banner, 'use "bind/types.cst" as t;', 'use "std/io.cst" as io;', 'let is i64 as failures with mut = 0;',
                 'fn check(name as *u8, got as i64, want as i64) as void {',
-                '    if (got != want) { io.printf("FAIL %%s: %%d, expected %%d\\n", name, got, want); failures = failures + 1; }', '}']
+                '    if (got != want) { io.printf("FAIL %s: %d, expected %d\\n", name, got, want); failures = failures + 1; }', '}']
         cases = {}
         # Only named SDK records are valid names in independently compiled C.
         selected = set(self.manifest['records']) | {n + 'Vtbl' for n in self.manifest['interfaces']} | set(self.manifest['interfaces'])

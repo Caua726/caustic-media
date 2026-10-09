@@ -111,6 +111,7 @@ static const char *const symbols[][2] = {
     {"user32.dll", "MonitorFromPoint"},
     {"user32.dll", "MonitorFromRect"},
     {"user32.dll", "GetMonitorInfoW"},
+    {"user32.dll", "EnumDisplaySettingsW"},
     {"user32.dll", "EnableMouseInPointer"},
     {"user32.dll", "GetPointerType"},
     {"user32.dll", "GetPointerInfo"},

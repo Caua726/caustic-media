@@ -92,6 +92,10 @@ int main(void) {
     printf("MARGINS %zu\n", sizeof(MARGINS));
     _Static_assert(sizeof(MONITORINFO) == 40, "MONITORINFO");
     printf("MONITORINFO %zu\n", sizeof(MONITORINFO));
+    _Static_assert(sizeof(MONITORINFOEXW) == 104, "MONITORINFOEXW");
+    printf("MONITORINFOEXW %zu\n", sizeof(MONITORINFOEXW));
+    _Static_assert(sizeof(DEVMODEW) == 220, "DEVMODEW");
+    printf("DEVMODEW %zu\n", sizeof(DEVMODEW));
     _Static_assert(sizeof(ICONINFO) == 32, "ICONINFO");
     printf("ICONINFO %zu\n", sizeof(ICONINFO));
     _Static_assert(sizeof(COPYDATASTRUCT) == 24, "COPYDATASTRUCT");
@@ -461,6 +465,32 @@ int main(void) {
     _Static_assert(offsetof(MONITORINFO, rcMonitor) == 4, "MONITORINFO.rcMonitor");
     _Static_assert(offsetof(MONITORINFO, rcWork) == 20, "MONITORINFO.rcWork");
     _Static_assert(offsetof(MONITORINFO, dwFlags) == 36, "MONITORINFO.dwFlags");
+    _Static_assert(offsetof(MONITORINFOEXW, szDevice) == 40, "MONITORINFOEXW.szDevice");
+    _Static_assert(offsetof(DEVMODEW, dmDeviceName) == 0, "DEVMODEW.dmDeviceName");
+    _Static_assert(offsetof(DEVMODEW, dmSpecVersion) == 64, "DEVMODEW.dmSpecVersion");
+    _Static_assert(offsetof(DEVMODEW, dmDriverVersion) == 66, "DEVMODEW.dmDriverVersion");
+    _Static_assert(offsetof(DEVMODEW, dmSize) == 68, "DEVMODEW.dmSize");
+    _Static_assert(offsetof(DEVMODEW, dmDriverExtra) == 70, "DEVMODEW.dmDriverExtra");
+    _Static_assert(offsetof(DEVMODEW, dmFields) == 72, "DEVMODEW.dmFields");
+    _Static_assert(offsetof(DEVMODEW, dmColor) == 92, "DEVMODEW.dmColor");
+    _Static_assert(offsetof(DEVMODEW, dmDuplex) == 94, "DEVMODEW.dmDuplex");
+    _Static_assert(offsetof(DEVMODEW, dmYResolution) == 96, "DEVMODEW.dmYResolution");
+    _Static_assert(offsetof(DEVMODEW, dmTTOption) == 98, "DEVMODEW.dmTTOption");
+    _Static_assert(offsetof(DEVMODEW, dmCollate) == 100, "DEVMODEW.dmCollate");
+    _Static_assert(offsetof(DEVMODEW, dmFormName) == 102, "DEVMODEW.dmFormName");
+    _Static_assert(offsetof(DEVMODEW, dmLogPixels) == 166, "DEVMODEW.dmLogPixels");
+    _Static_assert(offsetof(DEVMODEW, dmBitsPerPel) == 168, "DEVMODEW.dmBitsPerPel");
+    _Static_assert(offsetof(DEVMODEW, dmPelsWidth) == 172, "DEVMODEW.dmPelsWidth");
+    _Static_assert(offsetof(DEVMODEW, dmPelsHeight) == 176, "DEVMODEW.dmPelsHeight");
+    _Static_assert(offsetof(DEVMODEW, dmDisplayFrequency) == 184, "DEVMODEW.dmDisplayFrequency");
+    _Static_assert(offsetof(DEVMODEW, dmICMMethod) == 188, "DEVMODEW.dmICMMethod");
+    _Static_assert(offsetof(DEVMODEW, dmICMIntent) == 192, "DEVMODEW.dmICMIntent");
+    _Static_assert(offsetof(DEVMODEW, dmMediaType) == 196, "DEVMODEW.dmMediaType");
+    _Static_assert(offsetof(DEVMODEW, dmDitherType) == 200, "DEVMODEW.dmDitherType");
+    _Static_assert(offsetof(DEVMODEW, dmReserved1) == 204, "DEVMODEW.dmReserved1");
+    _Static_assert(offsetof(DEVMODEW, dmReserved2) == 208, "DEVMODEW.dmReserved2");
+    _Static_assert(offsetof(DEVMODEW, dmPanningWidth) == 212, "DEVMODEW.dmPanningWidth");
+    _Static_assert(offsetof(DEVMODEW, dmPanningHeight) == 216, "DEVMODEW.dmPanningHeight");
     _Static_assert(offsetof(ICONINFO, fIcon) == 0, "ICONINFO.fIcon");
     _Static_assert(offsetof(ICONINFO, xHotspot) == 4, "ICONINFO.xHotspot");
     _Static_assert(offsetof(ICONINFO, yHotspot) == 8, "ICONINFO.yHotspot");
@@ -865,6 +895,8 @@ int main(void) {
     if ((long long)(IDC_HELP) != 32651LL) { printf("FAIL constant IDC_HELP\n"); failures++; }
     if ((long long)(UiaRootObjectId) != (-25LL)) { printf("FAIL constant UiaRootObjectId\n"); failures++; }
     if ((long long)(UiaAppendRuntimeId) != 3LL) { printf("FAIL constant UiaAppendRuntimeId\n"); failures++; }
+    if ((long long)(ENUM_CURRENT_SETTINGS) != 4294967295LL) { printf("FAIL constant ENUM_CURRENT_SETTINGS\n"); failures++; }
+    if ((long long)(MONITORINFOF_PRIMARY) != 1LL) { printf("FAIL constant MONITORINFOF_PRIMARY\n"); failures++; }
     if ((long long)(AC_LINE_BACKUP_POWER) != 2LL) { printf("FAIL constant AC_LINE_BACKUP_POWER\n"); failures++; }
     if ((long long)(AC_LINE_OFFLINE) != 0LL) { printf("FAIL constant AC_LINE_OFFLINE\n"); failures++; }
     if ((long long)(AC_LINE_ONLINE) != 1LL) { printf("FAIL constant AC_LINE_ONLINE\n"); failures++; }
@@ -3254,6 +3286,6 @@ int main(void) {
     if ((long long)(WVR_VALIDRECTS) != 1024LL) { printf("FAIL constant WVR_VALIDRECTS\n"); failures++; }
     if ((long long)(WVR_VREDRAW) != 512LL) { printf("FAIL constant WVR_VREDRAW\n"); failures++; }
     if (failures != 0) return 1;
-    printf("win32 constants: 2454 checked\n");
+    printf("win32 constants: 2456 checked\n");
     return 0;
 }
