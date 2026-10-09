@@ -121,17 +121,22 @@ generator exists, since 1600 exports is not something to type.
 The SDK boundary is generated in `bind/` by `tools/generate.py` (clang Python
 bindings, mingw headers), selected by `tools/sdk.json`. Regenerate with
 `python3 window/win32/tools/generate.py`. It covers the window, GDI, IMM32,
-shell, OLE, UI Automation and registry APIs, records, constants, GUIDs and
-inherited COM vtable slots. `tools/layout.c` independently checks the exposed
-layouts with mingw-gcc; `layout_test.cst` checks Caustic's same sizes and offsets.
+theme, DPI, shell, OLE, UI Automation and registry APIs, records, GUIDs and
+inherited COM vtable slots. Constants are explicit names plus prefix families
+(`WM_`, `VK_`, `UIA_`, pointer/gesture flags, UIA enums …): every integer
+enumerator or object-like macro with the prefix that is still defined after
+the headers. `tools/layout.c` independently checks the exposed layouts and all
+constant values with mingw-gcc; `layout_test.cst` checks Caustic's same sizes
+and offsets. `tools/exports.c` loads every bound DLL and resolves every bound
+function at run time, because one missing export stops an image from loading.
 
 Caustic functions retain their SysV convention in a PE. `abi.cst` bridges
 indirect native calls and callbacks, including stack arguments and doubles;
 callbacks preserve the full Win64 nonvolatile XMM registers. Callback sets are
 writable during construction and read/execute only after `seal`; they must
 outlive every foreign reference. `caustic-mk run test-win32-native` runs the
-independent C layout and ABI oracles, a real window procedure, the native
-backend and the shell's real file-dialog COM object. These checks passed under
+independent C layout/constant, export and ABI oracles, a real window procedure,
+the native backend and the shell's real file-dialog COM object. These passed under
 Wine, not on a real Windows installation. The group owns one private Wine
 prefix and X server; it cannot reuse another test's stale native desktop.
 

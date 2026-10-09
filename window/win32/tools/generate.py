@@ -21,21 +21,48 @@ SIGNED = {TK.CHAR_S, TK.SCHAR, TK.SHORT, TK.INT, TK.LONG, TK.LONGLONG}
 UNSIGNED = {TK.BOOL, TK.CHAR_U, TK.UCHAR, TK.USHORT, TK.UINT, TK.ULONG, TK.ULONGLONG, TK.WCHAR}
 
 
-def integer_value(cursor):
+def _eval_api():
     # Not all distro versions of clang.cindex expose the evaluation API.
     lib = cindex.conf.lib
     lib.clang_Cursor_Evaluate.argtypes = [cindex.Cursor]
     lib.clang_Cursor_Evaluate.restype = ctypes.c_void_p
+    lib.clang_EvalResult_getKind.argtypes = [ctypes.c_void_p]
+    lib.clang_EvalResult_getKind.restype = ctypes.c_int
+    lib.clang_EvalResult_isUnsignedInt.argtypes = [ctypes.c_void_p]
+    lib.clang_EvalResult_isUnsignedInt.restype = ctypes.c_uint
+    lib.clang_EvalResult_getAsUnsigned.argtypes = [ctypes.c_void_p]
+    lib.clang_EvalResult_getAsUnsigned.restype = ctypes.c_ulonglong
     lib.clang_EvalResult_getAsLongLong.argtypes = [ctypes.c_void_p]
     lib.clang_EvalResult_getAsLongLong.restype = ctypes.c_longlong
     lib.clang_EvalResult_dispose.argtypes = [ctypes.c_void_p]
+    lib.clang_Cursor_isMacroFunctionLike.argtypes = [cindex.Cursor]
+    lib.clang_Cursor_isMacroFunctionLike.restype = ctypes.c_uint
+    return lib
+
+
+def evaluate(cursor):
+    """The integer an initializer evaluates to, or None when it is not one."""
+    lib = _eval_api()
     result = lib.clang_Cursor_Evaluate(cursor)
     if not result:
-        raise ValueError(f'constant not evaluated: {cursor.spelling}')
+        return None
     try:
+        if lib.clang_EvalResult_getKind(result) != 1:  # CXEval_Int
+            return None
+        if lib.clang_EvalResult_isUnsignedInt(result):
+            value = lib.clang_EvalResult_getAsUnsigned(result)
+            # Caustic constants are i64: keep the same 64-bit pattern.
+            return value - (1 << 64) if value >= 1 << 63 else value
         return lib.clang_EvalResult_getAsLongLong(result)
     finally:
         lib.clang_EvalResult_dispose(result)
+
+
+def integer_value(cursor):
+    value = evaluate(cursor)
+    if value is None:
+        raise ValueError(f'constant not evaluated: {cursor.spelling}')
+    return value
 
 
 def identifier(name):
@@ -52,21 +79,21 @@ class Generator:
         self.manifest = manifest
         includes = '#include <initguid.h>\n' + ''.join(
             f'#include <{h}>\n' for h in manifest['headers'])
-        constants = ''.join(f'const long long cm_{n} = (long long)({n});\n'
-                            for n in manifest['constants'])
+        explicit = ''.join(f'const long long cm_{n} = (long long)({n});\n'
+                           for n in manifest['constants'])
         resource = subprocess.check_output([clang, '-print-resource-dir'], text=True).strip()
-        self.tu = cindex.Index.create().parse('caustic_sdk.c', args=[
-            '--target=x86_64-w64-windows-gnu', '-isystem', headers,
-            '-resource-dir', resource, '-D_WIN32_WINNT=0x0A00', '-DCINTERFACE',
-            '-DCOBJMACROS', '-DUNICODE', '-D_UNICODE'],
-            unsaved_files=[('caustic_sdk.c', includes + constants)])
-        errors = [str(d) for d in self.tu.diagnostics if d.severity >= 3]
-        if errors:
-            raise ValueError('\n'.join(errors))
+        self.args = ['--target=x86_64-w64-windows-gnu', '-isystem', headers,
+                     '-resource-dir', resource, '-D_WIN32_WINNT=0x0A00', '-DCINTERFACE',
+                     '-DCOBJMACROS', '-DUNICODE', '-D_UNICODE']
+        self.tu = self.parse(includes + explicit, cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
         self.decls = {}
         for c in self.tu.cursor.get_children():
+            if c.kind.is_preprocessing():
+                continue
             if c.spelling and (c.spelling not in self.decls or c.is_definition()):
                 self.decls[c.spelling] = c
+        self.constants = [(n, integer_value(self.decls['cm_' + n])) for n in manifest['constants']]
+        self.constants += self.families(includes + explicit, set(manifest['constants']))
         selected = manifest['records'] + manifest['interfaces'] + [
             n + 'Vtbl' for n in manifest['interfaces']]
         self.preferred = {
@@ -83,6 +110,58 @@ class Generator:
         for n in manifest['interfaces']:
             self.record(self.decls[n + 'Vtbl'].type, n + 'Vtbl')
             self.record(self.decls[n].type, n)
+
+    def parse(self, source, options=0):
+        tu = cindex.Index.create().parse('caustic_sdk.c', args=self.args,
+                                         unsaved_files=[('caustic_sdk.c', source)], options=options)
+        errors = [d for d in tu.diagnostics if d.severity >= 3]
+        if errors:
+            raise ValueError('\n'.join(str(d) for d in errors))
+        return tu
+
+    def families(self, source, explicit):
+        """Every integer constant whose name starts with a manifest prefix.
+
+        Enumerators come from the AST. Object-like macros are evaluated as the
+        expressions they expand to; a family is integer constants only, so a
+        macro naming a string, a pointer or a float is not one of its members.
+        """
+        prefixes = tuple(self.manifest.get('constant_prefixes', []))
+        if not prefixes:
+            return []
+        lib = _eval_api()
+        macros, values = [], {}
+        for c in self.tu.cursor.get_children():
+            name = c.spelling
+            if c.kind == CK.MACRO_DEFINITION:
+                if (name.startswith(prefixes) and name not in explicit and name not in macros
+                        and not lib.clang_Cursor_isMacroFunctionLike(c)
+                        and len(list(c.get_tokens())) > 1):
+                    macros.append(name)
+            elif c.kind == CK.ENUM_DECL:
+                for e in c.get_children():
+                    if e.kind == CK.ENUM_CONSTANT_DECL and e.spelling.startswith(prefixes) \
+                            and e.spelling not in explicit:
+                        values[e.spelling] = e.enum_value
+        # A macro the headers later #undef (GWL_WNDPROC on Win64) is not a
+        # constant of this target: drop exactly the declarations clang rejects.
+        base = source.count('\n') + 1
+        while True:
+            tu = cindex.Index.create().parse('caustic_sdk.c', args=self.args, unsaved_files=[
+                ('caustic_sdk.c', source + ''.join(f'__auto_type cm_{n} = ({n});\n' for n in macros))])
+            errors = [d for d in tu.diagnostics if d.severity >= 3]
+            if not errors:
+                break
+            rejected = {d.location.line - base for d in errors}
+            if any(i < 0 or i >= len(macros) for i in rejected):
+                raise ValueError('\n'.join(str(d) for d in errors))
+            macros = [n for i, n in enumerate(macros) if i not in rejected]
+        decls = {c.spelling: c for c in tu.cursor.get_children() if c.spelling.startswith('cm_')}
+        for name in macros:
+            value = evaluate(decls['cm_' + name])
+            if value is not None and name not in values:
+                values[name] = value
+        return sorted(values.items())
 
     def record(self, t, name=None):
         t = t.get_canonical()
@@ -172,8 +251,7 @@ class Generator:
             types += [f'// {size} bytes in the Win64 ABI.', f'struct {name} {{', *body, '}', '']
         # Constants are expressions in mingw's headers, including casts and
         # negated flags. clang evaluates them without a handwritten parser.
-        for n in self.manifest['constants']:
-            v = integer_value(self.decls['cm_' + n])
+        for n, v in self.constants:
             lit = str(v) if v >= 0 else f'0 - {-v}'
             types.append(f'let is i64 as {n} with imut = {lit};')
         (out / 'types.cst').write_text('\n'.join(types) + '\n')
@@ -193,7 +271,7 @@ class Generator:
                 guids.append(f'    g.Data4[{i}] = {value};')
             guids += ['    return g;', '}', '']
         (out / 'guids.cst').write_text('\n'.join(guids) + '\n')
-        symbols = []
+        exports = []
         for dll, names in self.manifest['libraries'].items():
             lines = [banner, 'use "types.cst" as t;', '']
             for name in names:
@@ -207,9 +285,23 @@ class Generator:
                                   lambda m: 't.' + m[0] if m[0] in self.names.values() else m[0], ty)
                 sig = ', '.join(f'{n} as {qualify(ty)}' for n, ty in args)
                 lines.append(f'extern "{dll}.dll" fn {name}({sig}) as {qualify(ret)};')
-                symbols.append(f'{dll}.dll {name}')
+                exports.append(f'    {{"{dll}.dll", "{name}"}},')
             (out / (dll + '.cst')).write_text('\n'.join(lines) + '\n')
-        (out / 'symbols.txt').write_text('\n'.join(symbols) + '\n')
+        # Every imported function must exist in the DLL the binding names; an
+        # absent export stops the whole image from loading.
+        (ROOT / 'tools/exports.c').write_text('\n'.join([
+            '/* Generated by window/win32/tools/generate.py; do not edit. */',
+            '#include <windows.h>', '#include <stdio.h>',
+            'static const char *const symbols[][2] = {', *exports, '};',
+            'int main(void) {', '    int failures = 0;',
+            '    for (size_t i = 0; i < sizeof symbols / sizeof symbols[0]; i++) {',
+            '        HMODULE module = LoadLibraryA(symbols[i][0]);',
+            '        if (module == NULL || GetProcAddress(module, symbols[i][1]) == NULL) {',
+            '            printf("FAIL %s!%s\\n", symbols[i][0], symbols[i][1]);',
+            '            failures++;', '        }', '    }',
+            '    if (failures != 0) return 1;',
+            '    printf("win32 exports: %zu functions resolved\\n", sizeof symbols / sizeof symbols[0]);',
+            '    return 0;', '}']) + '\n')
         com = [banner, 'use "types.cst" as t;', 'use "../abi.cst" as abi;', '']
         for iface in self.manifest['interfaces']:
             table = self.decls[iface + 'Vtbl'].type.get_canonical()
@@ -240,11 +332,15 @@ class Generator:
         cases = {}
         # Only named SDK records are valid names in independently compiled C.
         selected = set(self.manifest['records']) | {n + 'Vtbl' for n in self.manifest['interfaces']} | set(self.manifest['interfaces'])
+        typedefs = {c.spelling for c in self.tu.cursor.get_children() if c.kind == CK.TYPEDEF_DECL}
+        def cname(name):
+            # Some SDK records (UiaRect) are only struct tags in C.
+            return name if name in typedefs else 'struct ' + name
         for name, size, _ in self.records:
             if name not in selected:
                 continue
-            c.append(f'    _Static_assert(sizeof({name}) == {size}, "{name}");')
-            c.append(f'    printf("{name} %zu\\n", sizeof({name}));')
+            c.append(f'    _Static_assert(sizeof({cname(name)}) == {size}, "{name}");')
+            c.append(f'    printf("{name} %zu\\n", sizeof({cname(name)}));')
             cases[name] = [f'fn layout_{name}() as void {{',
                            f'    check("{name}", sizeof(t.{name}), {size});']
             if any(record == name for record, *_ in self.checks):
@@ -252,9 +348,16 @@ class Generator:
         for name, cfield, field, off in self.checks:
             if name not in cases:
                 continue
-            c.append(f'    _Static_assert(offsetof({name}, {cfield}) == {off}, "{name}.{cfield}");')
+            c.append(f'    _Static_assert(offsetof({cname(name)}, {cfield}) == {off}, "{name}.{cfield}");')
             cases[name].append(f'    check("{name}.{field}", cast(i64, &v_{name}.{field}) - cast(i64, &v_{name}), {off});')
-        c += ['    return 0;', '}']
+        # mingw-gcc evaluates every constant again from the same headers.
+        c.append('    int failures = 0;')
+        for n, v in self.constants:
+            lit = f'{v}LL' if v >= 0 else ('(-9223372036854775807LL - 1)' if v == -(1 << 63) else f'(-{-v}LL)')
+            c.append(f'    if ((long long)({n}) != {lit}) {{ printf("FAIL constant {n}\\n"); failures++; }}')
+        c += ['    if (failures != 0) return 1;',
+              f'    printf("win32 constants: {len(self.constants)} checked\\n");',
+              '    return 0;', '}']
         for lines in cases.values():
             test += lines + ['}', '']
         test.append('fn main() as i32 {')
