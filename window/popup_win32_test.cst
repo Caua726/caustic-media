@@ -1,0 +1,263 @@
+// window/popup_win32_test.cst — popups through the portable device, on
+// Windows (here: an isolated Wine):
+//   sh window/win32/tools/run_native.sh build/popup_win32_test.exe
+// Placed against a rectangle of their owner within the monitor's work area,
+// tool windows never activated, owned, and grabbing: the user's pointer
+// (SendInput, as a device's) and the owner's keys go to the popups, a press
+// outside them takes the innermost down, a submenu's capture is given back to
+// its menu, and the capture taken by any other window takes the popup down.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "device.cst" as device;
+use "event.cst" as event;
+use "keys.cst" as keys;
+use "positioner.cst" as positioner;
+use "../math/math.cst" as math;
+use "win32/bind/types.cst" as t;
+use "win32/bind/user32.cst" as u;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as owner with mut;
+let is device.Window as menu with mut;
+let is device.Window as sub with mut;
+
+fn settle() as void {
+    let is i64 as until = time.now_ms() + 150;
+    while (time.now_ms() < until) {
+        device.pump(&owner);
+        time.sleep_ms(5);
+    }
+}
+
+fn next(w as *device.Window, kind as i32, out as *event.Event) as i32 {
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) {
+        device.pump(&owner);
+        while (device.poll_event(w, out) == 1) {
+            if (out.kind == kind) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+fn had(w as *device.Window, kind as i32) as i32 {
+    settle();
+    let is event.Event as e;
+    let is i32 as seen with mut = 0;
+    while (device.poll_event(w, &e) == 1) { if (e.kind == kind) { seen = 1; } }
+    return seen;
+}
+
+fn drain(w as *device.Window) as void {
+    settle();
+    let is event.Event as e;
+    while (device.poll_event(w, &e) == 1) { }
+}
+
+// The user's mouse at x, y of the screen, with flags.
+fn mouse(x as i64, y as i64, flags as i64) as void {
+    let is t.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(t.INPUT));
+    in.c_type = cast(u32, t.INPUT_MOUSE);
+    let is *t.MOUSEINPUT as m = cast(*t.MOUSEINPUT, &in._anon1);
+    let is i64 as sw = cast(i64, u.GetSystemMetrics(cast(i32, t.SM_CXSCREEN)));
+    let is i64 as sh = cast(i64, u.GetSystemMetrics(cast(i32, t.SM_CYSCREEN)));
+    // Rounded up: the system takes the pixel as dx * width / 65536, truncated.
+    m.dx = cast(i32, (x * 65536 + sw - 1) / sw);
+    m.dy = cast(i32, (y * 65536 + sh - 1) / sh);
+    m.dwFlags = cast(u32, flags | t.MOUSEEVENTF_ABSOLUTE | t.MOUSEEVENTF_MOVE);
+    u.SendInput(1, &in, cast(i32, sizeof(t.INPUT)));
+}
+
+fn click_at(x as i64, y as i64) as void {
+    mouse(x, y, 0);
+    mouse(x, y, t.MOUSEEVENTF_LEFTDOWN);
+    mouse(x, y, t.MOUSEEVENTF_LEFTUP);
+}
+
+fn key_a() as void {
+    let is t.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(t.INPUT));
+    in.c_type = cast(u32, t.INPUT_KEYBOARD);
+    let is *t.KEYBDINPUT as k = cast(*t.KEYBDINPUT, &in._anon1);
+    k.wVk = cast(u16, 65);
+    u.SendInput(1, &in, cast(i32, sizeof(t.INPUT)));
+    k.dwFlags = cast(u32, t.KEYEVENTF_KEYUP);
+    u.SendInput(1, &in, cast(i32, sizeof(t.INPUT)));
+}
+
+fn hwnd(w as *device.Window) as i64 { return w.win32_win.hwnd; }
+
+// Where the client of w is on the screen.
+fn client_at(w as *device.Window, x as *i64, y as *i64) as void {
+    let is t.POINT as p; p.x = 0; p.y = 0;
+    u.ClientToScreen(hwnd(w), &p);
+    *x = cast(i64, p.x);
+    *y = cast(i64, p.y);
+}
+
+fn popup_config(own as *device.Window, kind as i32, grab as i32, w as i64, h as i64, anchor as math.rect.Rect,
+                a as i32, g as i32) as device.Config {
+    let is device.Config as c with mut = device.config("popup", w, h);
+    c.owner = own;
+    c.popup = kind;
+    c.grab = grab;
+    c.place = positioner.make(cast(f64, w), cast(f64, h), anchor);
+    c.place.anchor = a;
+    c.place.gravity = g;
+    c.place.adjust = positioner.FLIP_X | positioner.FLIP_Y | positioner.SLIDE_X | positioner.SLIDE_Y;
+    return c;
+}
+
+fn main() as i32 {
+    menu.ok = 0;
+    sub.ok = 0;
+    owner = device.open("owner", 300, 200);
+    if (device.is_open(&owner) == 0) { io.printf("FAIL: no owner\n"); return 1; }
+    let is t.RECT as work;
+    u.SystemParametersInfoW(cast(u32, t.SPI_GETWORKAREA), 0, cast(*u8, &work), 0);
+    // Near the work area's bottom right corner, so what opens below and to the
+    // right of it has no room there.
+    let is t.RECT as frame;
+    u.GetWindowRect(hwnd(&owner), &frame);
+    u.SetWindowPos(hwnd(&owner), 0, work.right - (frame.right - frame.left) - 10, work.bottom - (frame.bottom - frame.top) - 10,
+                   0, 0, cast(u32, t.SWP_NOSIZE | t.SWP_NOZORDER));
+    device.activate(&owner);
+    settle();
+    let is i64 as ox with mut = 0;
+    let is i64 as oy with mut = 0;
+    client_at(&owner, &ox, &oy);
+
+    // --- No owner, no popup ---
+    let is device.Config as orphan with mut = popup_config(cast(*device.Window, 0), device.POPUP_MENU, 0, 100, 80,
+                                                           math.rect.rect(0.0, 0.0, 10.0, 10.0), positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT);
+    let is device.Window as none = device.open_config(&orphan);
+    check("a popup needs an owner", device.is_open(&none) == 0 && device.last_error(&none) == device.BAD_ARGUMENT);
+
+    // --- Placed against its owner, flipped where there is no room ---
+    let is math.rect.Rect as anchor = math.rect.rect(250.0, 150.0, 20.0, 20.0);
+    let is device.Config as mc with mut = popup_config(&owner, device.POPUP_MENU, 0, 200, 150, anchor,
+                                                       positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+    menu = device.open_config(&mc);
+    check("a popup opens", device.is_open(&menu) == 1);
+    let is positioner.Positioner as want_p with mut = mc.place;
+    let is math.rect.Rect as want = positioner.place(&want_p, math.rect.rect(cast(f64, cast(i64, work.left) - ox),
+        cast(f64, cast(i64, work.top) - oy), cast(f64, work.right - work.left), cast(f64, work.bottom - work.top)));
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    check("placed as the positioner places it", device.popup_position(&menu, &px, &py) == 1 &&
+          px == cast(i64, want.x) && py == cast(i64, want.y));
+    check("flipped from the work area's edge", px + 200 <= 250 && ox + px + 200 <= cast(i64, work.right));
+    let is i64 as mx with mut = 0;
+    let is i64 as my with mut = 0;
+    client_at(&menu, &mx, &my);
+    check("there on the screen, the size asked", mx == ox + px && my == oy + py &&
+          device.width(&menu) == 200 && device.height(&menu) == 150);
+    let is i64 as style = u.GetWindowLongPtrW(hwnd(&menu), cast(i32, t.GWL_STYLE));
+    let is i64 as ex = u.GetWindowLongPtrW(hwnd(&menu), cast(i32, t.GWL_EXSTYLE));
+    check("a popup's style, no frame", (style & t.WS_POPUP) != 0 && (style & t.WS_CAPTION) != t.WS_CAPTION);
+    check("a tool window never activated", (ex & t.WS_EX_TOOLWINDOW) != 0 && (ex & t.WS_EX_NOACTIVATE) != 0);
+    check("its owner's", u.GetWindow(hwnd(&menu), cast(u32, t.GW_OWNER)) == hwnd(&owner));
+    check("the owner still the active window", u.GetForegroundWindow() == hwnd(&owner));
+    check("no grab asked: no capture", u.GetCapture() == 0 && device.grabbing(&menu) == 0);
+    let is positioner.Positioner as moved with mut = mc.place;
+    moved.anchor_rect = math.rect.rect(10.0, 10.0, 20.0, 20.0);
+    check("placed again", device.reposition(&menu, &moved) == 1 && device.popup_position(&menu, &px, &py) == 1 &&
+          px == 30 && py == 30);
+    client_at(&menu, &mx, &my);
+    check("moved there", mx == ox + 30 && my == oy + 30);
+    device.close(&menu);
+    menu.ok = 0;
+
+    // --- Grabbing: the user's pointer and the owner's keys are the popup's ---
+    let is device.Config as gc with mut = popup_config(&owner, device.POPUP_MENU, 1, 120, 100, math.rect.rect(20.0, 20.0, 10.0, 10.0),
+                                                       positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+    menu = device.open_config(&gc);
+    drain(&owner);
+    drain(&menu);
+    client_at(&menu, &mx, &my);
+    check("the pointer captured", u.GetCapture() == hwnd(&menu) && device.grabbing(&menu) == 1);
+    let is event.Event as e;
+    click_at(mx + 10, my + 10);
+    check("a press inside: the popup's", next(&menu, event.MOUSE_DOWN, &e) == 1 && e.x == 10 && e.y == 10 &&
+          device.popup_done(&menu) == 0);
+    check("still captured after its release", next(&menu, event.MOUSE_UP, &e) == 1 && u.GetCapture() == hwnd(&menu));
+    key_a();
+    check("the owner's keys: the popup's", next(&menu, event.KEY_DOWN, &e) == 1 && e.key == keys.A);
+    check("not the owner's", had(&owner, event.KEY_DOWN) == 0);
+
+    // A submenu takes the capture, and its menu's presses are still its own.
+    let is device.Config as sc with mut = popup_config(&menu, device.POPUP_MENU, 1, 100, 80, math.rect.rect(110.0, 0.0, 10.0, 10.0),
+                                                       positioner.TOP_RIGHT, positioner.BOTTOM_RIGHT);
+    sub = device.open_config(&sc);
+    drain(&sub);
+    check("a submenu, its menu's", u.GetWindow(hwnd(&sub), cast(u32, t.GW_OWNER)) == hwnd(&menu));
+    check("the capture the submenu's", u.GetCapture() == hwnd(&sub));
+    key_a();
+    check("the keys: the submenu's now", next(&sub, event.KEY_DOWN, &e) == 1 && had(&menu, event.KEY_DOWN) == 0);
+    click_at(mx + 5, my + 50);
+    check("a press on its menu: the menu's", next(&menu, event.MOUSE_DOWN, &e) == 1 && e.x == 5 && e.y == 50);
+    check("and neither taken down", device.popup_done(&menu) == 0 && device.popup_done(&sub) == 0);
+    device.close(&sub);
+    sub.ok = 0;
+    check("the submenu gone: the capture its menu's again", u.GetCapture() == hwnd(&menu));
+    key_a();
+    check("its keys too", next(&menu, event.KEY_DOWN, &e) == 1);
+
+    // A press on the owner, outside every popup: taken down, the press no one's.
+    drain(&owner);
+    click_at(ox + 280, oy + 10);
+    check("a press outside: taken down", next(&menu, event.POPUP_DONE, &e) == 1 && device.popup_done(&menu) == 1);
+    check("the press not the owner's", had(&owner, event.MOUSE_DOWN) == 0);
+    click_at(ox + 280, oy + 10);
+    check("told once", had(&menu, event.POPUP_DONE) == 0);
+    device.close(&menu);
+    menu.ok = 0;
+    check("closed: the capture let go", u.GetCapture() == 0);
+    click_at(ox + 280, oy + 10);
+    check("and the owner's presses its own", next(&owner, event.MOUSE_DOWN, &e) == 1);
+    drain(&owner);
+
+    // A press on the desktop: taken down as well.
+    menu = device.open_config(&gc);
+    drain(&menu);
+    click_at(cast(i64, work.left) + 5, cast(i64, work.top) + 5);
+    check("a press over the desktop: taken down", next(&menu, event.POPUP_DONE, &e) == 1);
+    device.close(&menu);
+
+    // The capture taken by another window: taken down, as a menu is.
+    menu = device.open_config(&gc);
+    drain(&menu);
+    let is device.Window as another = device.open("another", 100, 80);
+    u.SetCapture(hwnd(&another));
+    check("the capture taken: taken down", next(&menu, event.POPUP_DONE, &e) == 1);
+    u.ReleaseCapture();
+    device.close(&another);
+    device.close(&menu);
+
+    // The application deactivated: taken down.
+    menu = device.open_config(&gc);
+    drain(&menu);
+    u.SendMessageW(hwnd(&owner), cast(u32, t.WM_ACTIVATEAPP), 0, 0);
+    check("the application left: taken down", next(&menu, event.POPUP_DONE, &e) == 1);
+    device.close(&menu);
+    menu.ok = 0;
+
+    device.close(&owner);
+    if (fails == 0) {
+        io.printf("window popups win32: all checks passed\n");
+        return 0;
+    }
+    io.printf("window popups win32: %d failures\n", fails);
+    return 1;
+}

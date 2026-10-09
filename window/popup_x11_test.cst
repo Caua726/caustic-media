@@ -1,0 +1,303 @@
+// window/popup_x11_test.cst — popups through the portable device, under Xvfb:
+//   sh window/x11/tools/run_headless.sh ./build/popup_x11_test
+// Placed against a rectangle of their owner and kept on the screen, typed for
+// a compositor, no window manager's, and grabbing: the user's pointer and keys
+// (XTest, through the server as a device's are) go to the popups, a press
+// outside them takes the innermost down, and a submenu's grab is given back
+// to its menu. Another client watches: the window attributes, the type, the
+// transient owner, and whether it can take the pointer itself.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "device.cst" as device;
+use "event.cst" as event;
+use "keys.cst" as keys;
+use "positioner.cst" as positioner;
+use "../math/math.cst" as math;
+use "x11/x11.cst" as x11;
+use "x11/bind/xlib.cst" as xlib;
+use "x11/bind/x.cst" as x;
+
+extern "libXtst.so.6" fn XTestFakeButtonEvent(display as *u8, button as u32, is_press as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is *u8 as other with mut;
+let is device.Window as owner with mut;
+let is device.Window as menu with mut;
+let is device.Window as sub with mut;
+
+fn pump_all() as void {
+    device.pump(&owner);
+    if (menu.ok == 1) { device.pump(&menu); }
+    if (sub.ok == 1) { device.pump(&sub); }
+}
+
+fn settle() as void {
+    xlib.XSync(other, 0);
+    let is i64 as until = time.now_ms() + 150;
+    while (time.now_ms() < until) {
+        pump_all();
+        time.sleep_ms(5);
+    }
+}
+
+// The next event of kind for w within a second: 1 when it came.
+fn next(w as *device.Window, kind as i32, out as *event.Event) as i32 {
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) {
+        pump_all();
+        while (device.poll_event(w, out) == 1) {
+            if (out.kind == kind) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+// Whether w had an event of kind queued, every one of its events read.
+fn had(w as *device.Window, kind as i32) as i32 {
+    settle();
+    let is event.Event as e;
+    let is i32 as seen with mut = 0;
+    while (device.poll_event(w, &e) == 1) { if (e.kind == kind) { seen = 1; } }
+    return seen;
+}
+
+fn drain(w as *device.Window) as void {
+    settle();
+    let is event.Event as e;
+    while (device.poll_event(w, &e) == 1) { }
+}
+
+// The user's button 1 at x, y of the screen: moved there, pressed, released.
+fn click_at(sx as i64, sy as i64) as void {
+    XTestFakeMotionEvent(other, 0 - 1, cast(i32, sx), cast(i32, sy), cast(u64, 0));
+    XTestFakeButtonEvent(other, cast(u32, 1), 1, cast(u64, 0));
+    XTestFakeButtonEvent(other, cast(u32, 1), 0, cast(u64, 0));
+    xlib.XFlush(other);
+}
+
+fn key_a() as void {
+    let is u32 as code = cast(u32, xlib.XKeysymToKeycode(other, 97));
+    XTestFakeKeyEvent(other, code, 1, cast(u64, 0));
+    XTestFakeKeyEvent(other, code, 0, cast(u64, 0));
+    xlib.XFlush(other);
+}
+
+// Where window xid's top left is on the screen.
+fn at_root(xid as i64, sx as *i64, sy as *i64) as void {
+    let is i32 as tx with mut = 0;
+    let is i32 as ty with mut = 0;
+    let is i64 as child with mut = 0;
+    xlib.XSync(owner.x11_win.display, 0);
+    xlib.XTranslateCoordinates(other, xid, xlib.XDefaultRootWindow(other), 0, 0, cast(*u8, &tx), cast(*u8, &ty), cast(*u8, &child));
+    *sx = cast(i64, tx);
+    *sy = cast(i64, ty);
+}
+
+// Whether another client can take the pointer: not while one of ours holds it.
+fn pointer_free() as i32 {
+    xlib.XSync(owner.x11_win.display, 0);
+    let is i32 as r = xlib.XGrabPointer(other, xlib.XDefaultRootWindow(other), 0, cast(u32, x.ButtonPressMask),
+                                        x.GrabModeAsync, x.GrabModeAsync, 0, 0, x.CurrentTime);
+    if (r == x.GrabSuccess) { xlib.XUngrabPointer(other, x.CurrentTime); xlib.XSync(other, 0); return 1; }
+    return 0;
+}
+
+let is i64 as _type with mut = 0;
+let is i32 as _format with mut = 0;
+let is i64 as _n with mut = 0;
+let is i64 as _after with mut = 0;
+let is *u8 as _data with mut;
+
+// The window type xid says, as an atom; 0 for none.
+fn window_type(xid as i64) as i64 {
+    xlib.XSync(owner.x11_win.display, 0);
+    _data = cast(*u8, 0);
+    xlib.XGetWindowProperty(other, xid, xlib.XInternAtom(other, "_NET_WM_WINDOW_TYPE", 0), 0, 1, 0, 0, cast(*u8, &_type),
+                            cast(*u8, &_format), cast(*u8, &_n), cast(*u8, &_after), cast(*u8, &_data));
+    if (cast(i64, _data) == 0) { return 0; }
+    let is i64 as a = *cast(*i64, _data);
+    xlib.XFree(_data);
+    if (_n != 1) { return 0; }
+    return a;
+}
+
+fn override_redirect(xid as i64) as i32 {
+    let is xlib.XWindowAttributes as wa;
+    xlib.XSync(owner.x11_win.display, 0);
+    xlib.XGetWindowAttributes(other, xid, cast(*u8, &wa));
+    return wa.override_redirect;
+}
+
+fn transient_for(xid as i64) as i64 {
+    let is i64 as t with mut = 0;
+    xlib.XSync(owner.x11_win.display, 0);
+    if (xlib.XGetTransientForHint(other, xid, cast(*u8, &t)) == 0) { return 0; }
+    return t;
+}
+
+fn popup_config(kind as i32, grab as i32, w as i64, h as i64, anchor as math.rect.Rect, a as i32, g as i32) as device.Config {
+    let is device.Config as c with mut = device.config("popup", w, h);
+    c.owner = &owner;
+    c.popup = kind;
+    c.grab = grab;
+    c.place = positioner.make(cast(f64, w), cast(f64, h), anchor);
+    c.place.anchor = a;
+    c.place.gravity = g;
+    c.place.adjust = positioner.FLIP_X | positioner.FLIP_Y | positioner.SLIDE_X | positioner.SLIDE_Y;
+    return c;
+}
+
+fn main() as i32 {
+    other = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, other) == 0) { io.printf("FAIL: no display\n"); return 1; }
+    let is i64 as root = xlib.XDefaultRootWindow(other);
+    let is i64 as sw = cast(i64, xlib.XDisplayWidth(other, 0));
+    let is i64 as sh = cast(i64, xlib.XDisplayHeight(other, 0));
+    menu.ok = 0;
+    sub.ok = 0;
+
+    owner = device.open("owner", 300, 200);
+    if (device.is_open(&owner) == 0) { io.printf("FAIL: no owner\n"); return 1; }
+    let is i64 as oxid = x11.xid(&owner.x11_win);
+    // Near the screen's bottom right corner, so what opens below and to the
+    // right of it has no room there.
+    xlib.XMoveWindow(other, oxid, cast(i32, sw - 330), cast(i32, sh - 260));
+    settle();
+    let is i64 as ox with mut = 0;
+    let is i64 as oy with mut = 0;
+    at_root(oxid, &ox, &oy);
+    check("the owner where it was moved", ox == sw - 330 && oy == sh - 260);
+
+    // --- No owner, no popup ---
+    let is device.Config as orphan with mut = popup_config(device.POPUP_MENU, 0, 100, 80, math.rect.rect(0.0, 0.0, 10.0, 10.0),
+                                                           positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT);
+    orphan.owner = cast(*device.Window, 0);
+    let is device.Window as none = device.open_config(&orphan);
+    check("a popup needs an owner", device.is_open(&none) == 0 && device.last_error(&none) == device.BAD_ARGUMENT);
+
+    // --- Placed against its owner, flipped where there is no room ---
+    let is math.rect.Rect as anchor = math.rect.rect(250.0, 150.0, 20.0, 20.0);
+    let is device.Config as mc with mut = popup_config(device.POPUP_MENU, 0, 200, 150, anchor,
+                                                       positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+    menu = device.open_config(&mc);
+    check("a popup opens", device.is_open(&menu) == 1);
+    device.pump(&menu);
+    let is i64 as mxid with mut = x11.xid(&menu.x11_win);
+    let is positioner.Positioner as want_p with mut = mc.place;
+    let is math.rect.Rect as want = positioner.place(&want_p, math.rect.rect(0.0 - cast(f64, ox), 0.0 - cast(f64, oy), cast(f64, sw), cast(f64, sh)));
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    check("placed as the positioner places it", device.popup_position(&menu, &px, &py) == 1 &&
+          px == cast(i64, want.x) && py == cast(i64, want.y));
+    check("flipped to the left of its anchor, not off the screen", px + 200 <= 250 && ox + px >= 0 && ox + px + 200 <= sw);
+    let is i64 as mx with mut = 0;
+    let is i64 as my with mut = 0;
+    at_root(mxid, &mx, &my);
+    check("there on the screen", mx == ox + px && my == oy + py);
+    check("no window manager's", override_redirect(mxid) == 1);
+    check("a menu's type", window_type(mxid) == xlib.XInternAtom(other, "_NET_WM_WINDOW_TYPE_POPUP_MENU", 0));
+    check("its owner's", transient_for(mxid) == oxid);
+    check("no grab asked: none taken", pointer_free() == 1 && device.grabbing(&menu) == 0);
+
+    // Placed again: what it was anchored to moved.
+    let is positioner.Positioner as moved with mut = mc.place;
+    moved.anchor_rect = math.rect.rect(10.0, 10.0, 20.0, 20.0);
+    check("placed again", device.reposition(&menu, &moved) == 1 && device.popup_position(&menu, &px, &py) == 1 &&
+          px == 30 && py == 30);
+    at_root(mxid, &mx, &my);
+    check("moved there", mx == ox + 30 && my == oy + 30);
+    device.close(&menu);
+
+    // A list and a tooltip are typed as such.
+    let is device.Config as lc with mut = popup_config(device.POPUP_LIST, 0, 120, 60, anchor, positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT);
+    menu = device.open_config(&lc);
+    check("a list's type", window_type(x11.xid(&menu.x11_win)) == xlib.XInternAtom(other, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", 0));
+    device.close(&menu);
+    let is device.Config as tc with mut = popup_config(device.POPUP_TOOLTIP, 0, 120, 30, anchor, positioner.BOTTOM, positioner.BOTTOM);
+    menu = device.open_config(&tc);
+    check("a tooltip's type", window_type(x11.xid(&menu.x11_win)) == xlib.XInternAtom(other, "_NET_WM_WINDOW_TYPE_TOOLTIP", 0));
+    device.close(&menu);
+    menu.ok = 0;
+
+    // --- Grabbing: the user's pointer and keys are the popup's ---
+    let is device.Config as gc with mut = popup_config(device.POPUP_MENU, 1, 120, 100, math.rect.rect(20.0, 20.0, 10.0, 10.0),
+                                                       positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+    menu = device.open_config(&gc);
+    device.pump(&menu);
+    drain(&owner);
+    drain(&menu);
+    mxid = x11.xid(&menu.x11_win);
+    at_root(mxid, &mx, &my);
+    check("the pointer held: no other client takes it", pointer_free() == 0 && device.grabbing(&menu) == 1);
+    let is event.Event as e;
+    click_at(mx + 10, my + 10);
+    check("a press inside: the popup's", next(&menu, event.MOUSE_DOWN, &e) == 1 && e.x == 10 && e.y == 10 &&
+          device.popup_done(&menu) == 0);
+    key_a();
+    check("the keys: the popup's", next(&menu, event.KEY_DOWN, &e) == 1 && e.key == keys.A);
+    check("not the owner's", had(&owner, event.KEY_DOWN) == 0);
+
+    // A submenu takes the grab, and its menu's presses are still its own.
+    let is device.Config as sc with mut = popup_config(device.POPUP_MENU, 1, 100, 80, math.rect.rect(110.0, 0.0, 10.0, 10.0),
+                                                       positioner.TOP_RIGHT, positioner.BOTTOM_RIGHT);
+    sc.owner = &menu;
+    sub = device.open_config(&sc);
+    device.pump(&sub);
+    drain(&sub);
+    let is i64 as sxid = x11.xid(&sub.x11_win);
+    check("a submenu, its menu's", transient_for(sxid) == mxid);
+    key_a();
+    check("the keys: the submenu's now", next(&sub, event.KEY_DOWN, &e) == 1 && had(&menu, event.KEY_DOWN) == 0);
+    click_at(mx + 5, my + 50);
+    check("a press on its menu: the menu's", next(&menu, event.MOUSE_DOWN, &e) == 1 && e.x == 5 && e.y == 50);
+    check("and neither taken down", device.popup_done(&menu) == 0 && device.popup_done(&sub) == 0);
+    device.close(&sub);
+    sub.ok = 0;
+    check("the submenu gone: the grab its menu's again", pointer_free() == 0);
+    key_a();
+    check("its keys too", next(&menu, event.KEY_DOWN, &e) == 1);
+
+    // A press on the owner, outside every popup: taken down, the press no one's.
+    drain(&owner);
+    click_at(ox + 280, oy + 10);
+    check("a press outside: taken down", next(&menu, event.POPUP_DONE, &e) == 1 && device.popup_done(&menu) == 1);
+    check("the press not the owner's", had(&owner, event.MOUSE_DOWN) == 0);
+    click_at(ox + 280, oy + 10);
+    check("told once", had(&menu, event.POPUP_DONE) == 0);
+    device.close(&menu);
+    menu.ok = 0;
+    check("closed: the pointer free again", pointer_free() == 1);
+    click_at(ox + 280, oy + 10);
+    check("and the owner's presses its own", next(&owner, event.MOUSE_DOWN, &e) == 1);
+
+    // A press over another program: taken down as well.
+    menu = device.open_config(&gc);
+    device.pump(&menu);
+    drain(&menu);
+    click_at(5, 5);
+    check("a press over the desktop: taken down", next(&menu, event.POPUP_DONE, &e) == 1);
+    device.close(&menu);
+    menu.ok = 0;
+
+    device.close(&owner);
+    xlib.XCloseDisplay(other);
+    if (root == 0) { return 1; }
+    if (fails == 0) {
+        io.printf("window popups x11: all checks passed\n");
+        return 0;
+    }
+    io.printf("window popups x11: %d failures\n", fails);
+    return 1;
+}

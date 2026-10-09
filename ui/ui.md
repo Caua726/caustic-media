@@ -17,7 +17,6 @@ ui/
   grid.cst        rows and columns at once
   stack.cst       one page at a time; children layered on each other
   scroll.cst      a viewport onto content larger than it
-  positioner.cst  where a popup goes: xdg_positioner as geometry
   splitter.cst    panes divided by handles the user drags
   event.cst       what a widget receives
   router.cst      where events go: hit-testing, capture, bubbling, hover,
@@ -608,7 +607,7 @@ relative to a parent already on it, so 100 split three ways at scale 1 is 33,
 34 and 33 edge to edge, and at 1.5 is 50 physical pixels each (`snap_test`). The tests were checked against deliberate breakages — each rule
 removed in turn — and catch every one.
 
-**Popups' places** (`positioner.cst`, tested by `positioner_test`): Wayland's
+**Popups' places** (`../window/positioner.cst`, tested by `positioner_test`): Wayland's
 xdg_positioner, the most constrained of the three platforms' models and so
 the one the toolkit speaks everywhere — a popup is put against an anchor
 rectangle, never at a point of the screen: a point of the rectangle, the way

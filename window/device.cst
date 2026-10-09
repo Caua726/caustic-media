@@ -35,6 +35,8 @@ use "keys.cst" as keys;
 use "settings.cst" as settings;
 use "linux/gtk_ini.cst" as gtk_ini;
 use "locale.cst" as locale;
+use "positioner.cst" as positioner;
+use "../math/math.cst" as math;
 
 // --- Backends ---
 
@@ -110,7 +112,20 @@ struct Config {
     // The platform's own title bar and borders round it; 0 for a window that
     // draws its own frame, told before it is first mapped.
     decorated   as i32;
+    // A popup — POPUP_MENU, POPUP_LIST, POPUP_TOOLTIP; 0 for a window — over
+    // owner, which it must have: undecorated, in no taskbar, never placed by
+    // the program at a point of the screen but by place against a rectangle
+    // of the owner's client, physical pixels (place's own size is width and
+    // height). grab 1: it takes the pointer and the keyboard while it is up,
+    // and a press outside the program's popups takes it down (POPUP_DONE).
+    popup       as i32;
+    grab        as i32;
+    place       as positioner.Positioner;
 }
+
+let is i32 as POPUP_MENU    with imut = 1;
+let is i32 as POPUP_LIST    with imut = 2;
+let is i32 as POPUP_TOOLTIP with imut = 3;
 
 fn config(title as *u8, width as i64, height as i64) as Config {
     let is Config as c;
@@ -125,6 +140,9 @@ fn config(title as *u8, width as i64, height as i64) as Config {
     c.modal = 0;
     c.transparent = 0;
     c.decorated = 1;
+    c.popup = 0;
+    c.grab = 0;
+    c.place = positioner.make(0.0, 0.0, math.rect.rect_zero());
     return c;
 }
 
@@ -144,6 +162,49 @@ struct Window {
     x11_win     as x11.window.Window;
     wayland_win as *wayland.Window;
     win32_win   as win32.Window;
+    // A popup's kind, 0 for a window; where it was put, relative to its
+    // owner's client; and its owner, kept where the program keeps it.
+    popup       as i32;
+    _pad0       as i32;
+    popup_x     as i64;
+    popup_y     as i64;
+    popup_owner as *Window;
+}
+
+// The owner's client on the screen and the room a popup has there, both in
+// screen pixels: x11 the root, Win32 the monitor's work area. 1 when known.
+fn _room(owner as *Window, ox as *i64, oy as *i64, room as *math.rect.Rect) as i32 {
+    if (owner.ok == 0) { return 0; }
+    if (os.current() == os.OS_LINUX && owner.backend == X11) {
+        let is i64 as sw with mut = 0;
+        let is i64 as sh with mut = 0;
+        if (x11.position(&owner.x11_win, ox, oy) == 0 || x11.screen_size(&owner.x11_win, &sw, &sh) == 0) { return 0; }
+        *room = math.rect.rect(0.0, 0.0, cast(f64, sw), cast(f64, sh));
+        return 1;
+    }
+    if (os.current() == os.OS_WINDOWS && owner.backend == WIN32) {
+        let is i64 as l with mut = 0; let is i64 as t with mut = 0;
+        let is i64 as r with mut = 0; let is i64 as b with mut = 0;
+        if (win32.popup_room(&owner.win32_win, ox, oy, &l, &t, &r, &b) == 0) { return 0; }
+        *room = math.rect.rect(cast(f64, l), cast(f64, t), cast(f64, r - l), cast(f64, b - t));
+        return 1;
+    }
+    return 0;
+}
+
+// Where place puts a popup of width by height over owner, relative to the
+// owner's client, and the owner's client on the screen: the positioner kept
+// within the room the owner has. 1 when it could be placed.
+fn _placed(owner as *Window, place as *positioner.Positioner, width as i64, height as i64,
+           out as *math.rect.Rect, ox as *i64, oy as *i64) as i32 {
+    let is math.rect.Rect as room;
+    if (_room(owner, ox, oy, &room) == 0) { return 0; }
+    let is positioner.Positioner as p with mut = *place;
+    p.w = cast(f64, width);
+    p.h = cast(f64, height);
+    let is math.rect.Rect as bounds = math.rect.rect(room.x - cast(f64, *ox), room.y - cast(f64, *oy), room.w, room.h);
+    *out = positioner.place(&p, bounds);
+    return 1;
 }
 
 // --- Opening and Lifecycle ---
@@ -157,6 +218,23 @@ fn _open_win32(w as *Window, c as *Config) as void {
     wc.app_id = c.class_name;
     if (cast(i64, c.owner) != 0 && c.owner.backend == WIN32 && c.owner.ok == 1) {
         wc.owner = win32.hwnd(&c.owner.win32_win);
+    }
+    if (c.popup != 0) {
+        let is math.rect.Rect as at;
+        let is i64 as ox with mut = 0;
+        let is i64 as oy with mut = 0;
+        if (wc.owner == 0 || _placed(c.owner, &c.place, c.width, c.height, &at, &ox, &oy) == 0) {
+            w.ok = 0; w.err = BAD_ARGUMENT;
+            return;
+        }
+        wc.popup = c.popup;
+        wc.grab = c.grab;
+        wc.x = ox + cast(i64, at.x);
+        wc.y = oy + cast(i64, at.y);
+        wc.width = cast(i64, at.w);
+        wc.height = cast(i64, at.h);
+        w.popup_x = cast(i64, at.x);
+        w.popup_y = cast(i64, at.y);
     }
     w.win32_win = win32.open_config(&wc);
     w.ok = w.win32_win.ok;
@@ -172,6 +250,7 @@ fn open_config(c as *Config) as Window {
     let is Window as w;
     w.backend = c.backend;
     w.transparent = c.transparent;
+    w.popup = c.popup; w._pad0 = 0; w.popup_x = 0; w.popup_y = 0; w.popup_owner = c.owner;
     w.wayland_win = cast(*wayland.Window, 0);
     if (w.backend == AUTO) {
         if (os.current() == os.OS_WINDOWS) {
@@ -197,6 +276,23 @@ fn open_config(c as *Config) as Window {
         xc.modal = c.modal;
         xc.transparent = c.transparent;
         xc.decorated = c.decorated;
+        if (c.popup != 0) {
+            let is math.rect.Rect as at;
+            let is i64 as ox with mut = 0;
+            let is i64 as oy with mut = 0;
+            if (xc.transient_for == 0 || _placed(c.owner, &c.place, c.width, c.height, &at, &ox, &oy) == 0) {
+                w.ok = 0; w.err = BAD_ARGUMENT;
+                return w;
+            }
+            xc.popup = c.popup;
+            xc.grab = c.grab;
+            xc.x = ox + cast(i64, at.x);
+            xc.y = oy + cast(i64, at.y);
+            xc.width = cast(i64, at.w);
+            xc.height = cast(i64, at.h);
+            w.popup_x = cast(i64, at.x);
+            w.popup_y = cast(i64, at.y);
+        }
         w.x11_win = x11.open_with(&xc);
         w.ok = x11.is_open(&w.x11_win);
         w.err = x11.last_error(&w.x11_win);
@@ -215,13 +311,26 @@ fn open_config(c as *Config) as Window {
         wo.dialog = c.dialog;
         wo.modal = c.modal;
         wo.decorated = c.decorated;
+        let is i64 as popup_w with mut = c.width;
+        let is i64 as popup_h with mut = c.height;
+        if (c.popup != 0) {
+            if (cast(i64, c.owner) == 0 || c.owner.backend != WAYLAND || c.owner.ok == 0 ||
+                _wayland_place(c.owner.wayland_win, &c.place, c.width, c.height, &wo) == 0) {
+                w.ok = 0; w.err = BAD_ARGUMENT;
+                return w;
+            }
+            wo.popup = c.popup;
+            wo.grab = c.grab;
+            popup_w = _logical(c.width, wayland.scale(c.owner.wayland_win));
+            popup_h = _logical(c.height, wayland.scale(c.owner.wayland_win));
+        }
         w.wayland_win = cast(*wayland.Window, mem.core.mmap_anon(sizeof(wayland.Window)));
         if (cast(i64, w.wayland_win) <= 0) {
             w.wayland_win = cast(*wayland.Window, 0);
             w.ok = 0; w.err = NO_MEMORY;
             return w;
         }
-        w.ok = wayland.open_config(w.wayland_win, title, c.width, c.height, &wo);
+        w.ok = wayland.open_config(w.wayland_win, title, popup_w, popup_h, &wo);
         let is i32 as e = wayland.error(w.wayland_win);
         if (e == wayland.OK) { w.err = OK; }
         else if (e == wayland.NO_MEMORY) { w.err = NO_MEMORY; }
@@ -715,6 +824,111 @@ fn minimize(w as *Window) as i32 {
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.minimize(&w.win32_win); }
     return 0;
+}
+
+// Where a popup was put, relative to its owner's client, physical pixels:
+// 1, or 0 for a window that is not a popup.
+fn popup_position(w as *Window, x as *i64, y as *i64) as i32 {
+    if (w.ok == 0 || w.popup == 0) { return 0; }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) {
+        if (cast(i64, w.popup_owner) == 0 || w.popup_owner.ok == 0) { return 0; }
+        return wayland.popup_position(w.wayland_win, w.popup_owner.wayland_win, x, y);
+    }
+    *x = w.popup_x;
+    *y = w.popup_y;
+    return 1;
+}
+
+// Whether the popup holds the pointer and keyboard grab it asked for: not
+// where it could not be had — another client holds it, a Wayland compositor
+// with no seat.
+fn grabbing(w as *Window) as i32 {
+    if (w.ok == 0 || w.popup == 0) { return 0; }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.grabbing(&w.x11_win); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.grabbing(w.wayland_win); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.grabbing(&w.win32_win); }
+    return 0;
+}
+
+// Whether the window system took the popup down — a press outside the
+// program's popups, the compositor's popup_done; POPUP_DONE says so as it
+// happens. The program closes it.
+fn popup_done(w as *Window) as i32 {
+    if (w.ok == 0 || w.popup == 0) { return 0; }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.popup_done(&w.x11_win); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.popup_done(w.wayland_win); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.popup_done(&w.win32_win); }
+    return 0;
+}
+
+// The popup placed again by place — what it is anchored to moved, or its size
+// changed — kept within the room its owner has. 1 when moved.
+fn reposition(w as *Window, place as *positioner.Positioner) as i32 {
+    if (w.ok == 0 || w.popup == 0 || cast(i64, w.popup_owner) == 0) { return 0; }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) {
+        // The compositor places it, and answers with a configure.
+        let is wayland.Options as wo with mut = wayland.options();
+        if (w.popup_owner.ok == 0 || _wayland_place(w.popup_owner.wayland_win, place, cast(i64, place.w), cast(i64, place.h), &wo) == 0) { return 0; }
+        let is i32 as s = wayland.scale(w.popup_owner.wayland_win);
+        return wayland.reposition(w.wayland_win, &wo, _logical(cast(i64, place.w), s), _logical(cast(i64, place.h), s));
+    }
+    let is math.rect.Rect as at;
+    let is i64 as ox with mut = 0;
+    let is i64 as oy with mut = 0;
+    if (_placed(w.popup_owner, place, cast(i64, place.w), cast(i64, place.h), &at, &ox, &oy) == 0) { return 0; }
+    let is i32 as moved with mut = 0;
+    if (os.current() == os.OS_LINUX && w.backend == X11) {
+        moved = x11.move_resize(&w.x11_win, ox + cast(i64, at.x), oy + cast(i64, at.y), cast(i64, at.w), cast(i64, at.h));
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) {
+        moved = win32.move_resize(&w.win32_win, ox + cast(i64, at.x), oy + cast(i64, at.y), cast(i64, at.w), cast(i64, at.h));
+    }
+    if (moved == 1) {
+        w.popup_x = cast(i64, at.x);
+        w.popup_y = cast(i64, at.y);
+    }
+    return moved;
+}
+
+// Physical pixels of a window at scale120 as logical ones, never below 1.
+fn _logical(v as i64, scale120 as i32) as i64 {
+    if (scale120 <= 0) { return v; }
+    let is i64 as l = (v * 120 + scale120 / 2) / scale120;
+    if (l < 1) { return 1; }
+    return l;
+}
+
+// A positioner in the owner's physical client pixels as Wayland's: logical,
+// relative to the owner's window geometry, the owner's xdg_surface its
+// parent, the owner's last press or key the serial a grab is asked under.
+fn _wayland_place(owner as *wayland.Window, place as *positioner.Positioner, width as i64, height as i64,
+                  wo as *wayland.Options) as i32 {
+    if (cast(i64, owner) == 0 || width <= 0 || height <= 0) { return 0; }
+    let is i32 as s = wayland.scale(owner);
+    let is i64 as gx with mut = 0;
+    let is i64 as gy with mut = 0;
+    wayland.geometry_origin(owner, &gx, &gy);
+    let is math.rect.Rect as r = place.anchor_rect;
+    wo.parent_surface = wayland.native_xdg_surface(owner);
+    wo.serial = wayland.grab_serial(owner);
+    let is i64 as ax = _logical_floor(cast(i64, r.x), s) - gx;
+    let is i64 as ay = _logical_floor(cast(i64, r.y), s) - gy;
+    wo.anchor_x = cast(i32, ax);
+    wo.anchor_y = cast(i32, ay);
+    wo.anchor_w = cast(i32, _logical(cast(i64, r.x + r.w), s) - _logical_floor(cast(i64, r.x), s));
+    wo.anchor_h = cast(i32, _logical(cast(i64, r.y + r.h), s) - _logical_floor(cast(i64, r.y), s));
+    wo.anchor = place.anchor;
+    wo.gravity = place.gravity;
+    wo.adjust = place.adjust;
+    wo.off_x = cast(i32, _logical_floor(cast(i64, place.off_x), s));
+    wo.off_y = cast(i32, _logical_floor(cast(i64, place.off_y), s));
+    return cast(i32, wo.parent_surface != 0);
+}
+
+fn _logical_floor(v as i64, scale120 as i32) as i64 {
+    if (scale120 <= 0) { return v; }
+    if (v >= 0) { return v * 120 / scale120; }
+    return 0 - ((0 - v) * 120 + scale120 - 1) / scale120;
 }
 
 // The client asked to be width by height physical pixels: 1 when asked. The

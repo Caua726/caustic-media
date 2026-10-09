@@ -189,7 +189,11 @@ watched HANDLEs (`wait_win32_test.cst`). A toolkit program starts and runs on
 Windows (`../../ui/program_win32_test.cst`, at 96 and 144 dpi): its fonts
 found and mapped (`text/fonts`), its window drawn — the painted text read back
 from the window's DC — clicked and typed into, and closed by the system's
-message. The first window is sized once its scale is known. Native popups, OLE
-DnD, toolkit UIA, platform choosers, notifications, complete CSD and modal-loop
-toolkit rendering remain implementation work, and Wine is not proof of
-real-Windows behavior.
+message. The first window is sized once its scale is known. Popups are
+`WS_POPUP` tool windows never activated, placed within the monitor's work
+area, capturing the pointer and taking the owner's keys, taken down by a press
+outside the program's popups, by the capture going elsewhere and by the
+application's deactivation (`../popup_win32_test.cst`, SendInput). The
+toolkit's own menus are not yet hosted in them; OLE DnD, toolkit UIA, platform
+choosers, notifications, complete CSD and modal-loop toolkit rendering remain
+implementation work, and Wine is not proof of real-Windows behavior.

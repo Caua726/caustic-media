@@ -125,6 +125,7 @@ static const char *const symbols[][2] = {
     {"user32.dll", "AreDpiAwarenessContextsEqual"},
     {"user32.dll", "GetMenuItemCount"},
     {"user32.dll", "GetMenuItemID"},
+    {"user32.dll", "WindowFromPoint"},
     {"gdi32.dll", "CreateDIBSection"},
     {"gdi32.dll", "CreateCompatibleDC"},
     {"gdi32.dll", "DeleteDC"},

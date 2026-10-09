@@ -75,12 +75,33 @@ struct Options {
     dialog as i32;
     modal as i32;
     decorated as i32;
+    // A popup (device.POPUP_*), 0 for a toplevel: an xdg_popup of the
+    // xdg_surface parent_surface, placed by the compositor from the
+    // positioner's numbers — logical pixels relative to the parent's window
+    // geometry — and, with grab, given the seat's grab under serial (an input
+    // event of the parent's: a press, a key).
+    popup as i32;
+    grab as i32;
+    serial as u32;
+    parent_surface as i32;
+    anchor_x as i32;
+    anchor_y as i32;
+    anchor_w as i32;
+    anchor_h as i32;
+    anchor as i32;
+    gravity as i32;
+    adjust as i32;
+    off_x as i32;
+    off_y as i32;
 }
 
 fn options() as Options {
     let is Options as o;
     o.app_id = "caustic-media"; o.parent = 0; o.resizable = 1;
     o.dialog = 0; o.modal = 0; o.decorated = 1;
+    o.popup = 0; o.grab = 0; o.serial = cast(u32, 0); o.parent_surface = 0;
+    o.anchor_x = 0; o.anchor_y = 0; o.anchor_w = 1; o.anchor_h = 1;
+    o.anchor = 0; o.gravity = 0; o.adjust = 0; o.off_x = 0; o.off_y = 0;
     return o;
 }
 
@@ -275,6 +296,20 @@ struct Window {
     acked as i32;
     connection_slot as i32;
     _pad1 as i32;
+    // The serial of the last press or key on this window: what a popup of it
+    // grabs under.
+    grab_serial as u32;
+    // A popup: its xdg_popup, the positioner it is opened with, where the
+    // compositor put it (logical, relative to the parent's window geometry)
+    // and whether the compositor took it down.
+    xdg_popup as i32;
+    popup_kind as i32;
+    popup_done as i32;
+    popup_x as i32;
+    popup_y as i32;
+    pos as Options;
+    reposition_token as i32;
+    swallowed as i32;     // buttons whose press took a popup down: their release no one's
 }
 
 let is [4096]u8 as _wire with mut;
@@ -299,6 +334,23 @@ let is i32 as _objects_ready with mut = 0;
 let is i32 as _free_object with mut = 0;
 let is i64 as _connection_fd with mut = 0 - 1;
 let is i32 as _connection_refs with mut = 0;
+// The popups holding the seat's grab, innermost last. The compositor gives a
+// press on any surface of this client to that surface, as an X server does a
+// grabbing client's; one on a window that is not a popup takes the innermost
+// down here, and goes to no one — as on X11 and Windows.
+let is [16]*Window as _grabbers with mut;
+let is i32 as _ngrabbers with mut = 0;
+
+fn _ungrabber(w as *Window) as void {
+    let is i32 as i with mut = 0;
+    while (i < _ngrabbers && _grabbers[i] != w) { i = i + 1; }
+    if (i == _ngrabbers) { return; }
+    while (i < _ngrabbers - 1) {
+        _grabbers[i] = _grabbers[i + 1];
+        i = i + 1;
+    }
+    _ngrabbers = _ngrabbers - 1;
+}
 let is [16]i32 as _recv_fds with mut;
 let is i32 as _recv_fd_count with mut = 0;
 let is i32 as _recv_fd_head with mut = 0;
@@ -1417,7 +1469,10 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
         }
         return;
     }
-    if (op == 3 && _wire_size >= 24) { w.input_serial = _word(p); }
+    if (op == 3 && _wire_size >= 24) {
+        w.input_serial = _word(p);
+        if (_word(cast(*u8, cast(i64, p) + 12)) != 0) { w.grab_serial = w.input_serial; }
+    }
     if (op == 3) {
         if (w.keyboard_focus == 0) { return; }
         let is i32 as code = cast(i32, _word(cast(*u8, cast(i64, p) + 8)));
@@ -1511,9 +1566,24 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
     }
     if (op == 3) {
         w.pointer_serial = _word(p);
+        if (_word(cast(*u8, cast(i64, p) + 12)) == 1) { w.grab_serial = w.pointer_serial; }
         let is i32 as button = _button_id(cast(i32, _word(cast(*u8, cast(i64, p) + 8))));
         if (button <= 0 || button >= 8) { return; }
         let is i32 as down = cast(i32, _word(cast(*u8, cast(i64, p) + 12)) == 1);
+        let is i32 as bit = cast(i32, 1 << button);
+        if (down == 1 && w.xdg_popup == 0 && _ngrabbers > 0) {
+            let is *Window as top = _grabbers[_ngrabbers - 1];
+            if (top.popup_done == 0) {
+                top.popup_done = 1;
+                _event(top, event.POPUP_DONE);
+            }
+            w.swallowed = w.swallowed | bit;
+            return;
+        }
+        if (down == 0 && (w.swallowed & bit) != 0) {
+            w.swallowed = w.swallowed & cast(i32, 0 - 1 - bit);
+            return;
+        }
         w.pointer_buttons[button] = down;
         let is event.Event as e;
         event.clear(&e); e.kind = event.MOUSE_UP;
@@ -1669,6 +1739,19 @@ fn _dispatch(w as *Window, obj as i32) as void {
         }
         return;
     }
+    if (obj == w.xdg_popup && w.xdg_popup != 0 && op == 0) {
+        w.popup_x = cast(i32, _word(p));
+        w.popup_y = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
+        w.configured_width = cast(i32, _word(cast(*u8, cast(i64, p) + 8)));
+        w.configured_height = cast(i32, _word(cast(*u8, cast(i64, p) + 12)));
+        return;
+    }
+    if (obj == w.xdg_popup && w.xdg_popup != 0 && op == 1) {
+        w.popup_done = 1;
+        _event(w, event.POPUP_DONE);
+        return;
+    }
+    if (obj == w.xdg_popup && w.xdg_popup != 0 && op == 2) { return; }
     if (obj == w.toplevel && op == 1) {
         w.close_requested = 1;
         _event(w, event.CLOSE);
@@ -2028,6 +2111,56 @@ fn _runtime_socket(w as *Window) as i32 {
     return _attach(w);
 }
 
+// A positioner made from pos — the popup's own size w by h, logical — and
+// its id; 0 when it could not be sent.
+fn _positioner(w as *Window, pos as *Options, pw as i64, ph as i64) as i32 {
+    let is i32 as id = _id(w);
+    if (id == 0) { return 0; }
+    let is [16]u8 as b;
+    _put(&b[0], cast(u32, id));
+    if (_send(w, w.wm_base, 1, &b[0], 4, 0 - 1) == 0) { return 0; }
+    _put(&b[0], cast(u32, pw)); _put(&b[4], cast(u32, ph));
+    if (_send(w, id, 1, &b[0], 8, 0 - 1) == 0) { return 0; }
+    let is i32 as aw with mut = pos.anchor_w;
+    let is i32 as ah with mut = pos.anchor_h;
+    if (aw < 1) { aw = 1; }
+    if (ah < 1) { ah = 1; }
+    _put(&b[0], cast(u32, pos.anchor_x)); _put(&b[4], cast(u32, pos.anchor_y));
+    _put(&b[8], cast(u32, aw)); _put(&b[12], cast(u32, ah));
+    if (_send(w, id, 2, &b[0], 16, 0 - 1) == 0) { return 0; }
+    _put(&b[0], cast(u32, pos.anchor));
+    if (_send(w, id, 3, &b[0], 4, 0 - 1) == 0) { return 0; }
+    _put(&b[0], cast(u32, pos.gravity));
+    if (_send(w, id, 4, &b[0], 4, 0 - 1) == 0) { return 0; }
+    _put(&b[0], cast(u32, pos.adjust));
+    if (_send(w, id, 5, &b[0], 4, 0 - 1) == 0) { return 0; }
+    _put(&b[0], cast(u32, pos.off_x)); _put(&b[4], cast(u32, pos.off_y));
+    if (_send(w, id, 6, &b[0], 8, 0 - 1) == 0) { return 0; }
+    return id;
+}
+
+// The xdg_popup role on the xdg_surface: of the parent's, placed by the
+// positioner, with the seat's grab when asked — before the first commit, as
+// the protocol wants it.
+fn _init_popup(w as *Window) as i32 {
+    let is i32 as pos = _positioner(w, &w.pos, w.width, w.height);
+    if (pos == 0) { return 0; }
+    let is [12]u8 as b;
+    w.xdg_popup = _id(w);
+    _put(&b[0], cast(u32, w.xdg_popup)); _put(&b[4], cast(u32, w.pos.parent_surface)); _put(&b[8], cast(u32, pos));
+    if (_send(w, w.xdg_surface, 2, &b[0], 12, 0 - 1) == 0) { return 0; }
+    if (w.pos.grab == 1 && w.seat != 0) {
+        _put(&b[0], cast(u32, w.seat)); _put(&b[4], w.pos.serial);
+        if (_send(w, w.xdg_popup, 1, &b[0], 8, 0 - 1) == 0) { return 0; }
+        if (_ngrabbers < 16) {
+            _grabbers[_ngrabbers] = w;
+            _ngrabbers = _ngrabbers + 1;
+        }
+    }
+    let is [0]u8 as empty;
+    return _send(w, pos, 0, &empty[0], 0, 0 - 1);
+}
+
 fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
     let is [8]u8 as idbody;
     if (_registry == 0) {
@@ -2131,21 +2264,25 @@ fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
     _put(&idbody[0], cast(u32, w.xdg_surface));
     _put(cast(*u8, cast(i64, &idbody) + 4), cast(u32, w.surface));
     if (_send(w, w.wm_base, 2, &idbody[0], 8, 0 - 1) == 0) { return 0; }
-    w.toplevel = _id(w);
-    _put(&idbody[0], cast(u32, w.toplevel));
-    if (_send(w, w.xdg_surface, 1, &idbody[0], 4, 0 - 1) == 0) { return 0; }
-    if (w.decoration_manager != 0) {
-        w.toplevel_decoration = _id(w);
-        _put(&idbody[0], cast(u32, w.toplevel_decoration));
-        _put(cast(*u8, cast(i64, &idbody) + 4), cast(u32, w.toplevel));
-        if (_send(w, w.decoration_manager, 1, &idbody[0], 8, 0 - 1) == 0) { return 0; }
-        let is [4]u8 as mode;
-        if (w.decorated_wanted != 0) { _put(&mode[0], 2); }
-        else { _put(&mode[0], 1); }
-        if (_send(w, w.toplevel_decoration, 1, &mode[0], 4, 0 - 1) == 0) { return 0; }
+    if (w.popup_kind != 0) {
+        if (_init_popup(w) == 0) { return 0; }
+    } else {
+        w.toplevel = _id(w);
+        _put(&idbody[0], cast(u32, w.toplevel));
+        if (_send(w, w.xdg_surface, 1, &idbody[0], 4, 0 - 1) == 0) { return 0; }
+        if (w.decoration_manager != 0) {
+            w.toplevel_decoration = _id(w);
+            _put(&idbody[0], cast(u32, w.toplevel_decoration));
+            _put(cast(*u8, cast(i64, &idbody) + 4), cast(u32, w.toplevel));
+            if (_send(w, w.decoration_manager, 1, &idbody[0], 8, 0 - 1) == 0) { return 0; }
+            let is [4]u8 as mode;
+            if (w.decorated_wanted != 0) { _put(&mode[0], 2); }
+            else { _put(&mode[0], 1); }
+            if (_send(w, w.toplevel_decoration, 1, &mode[0], 4, 0 - 1) == 0) { return 0; }
+        }
+        if (_send_string(w, w.toplevel, 2, title) == 0) { return 0; }
+        if (_send_string(w, w.toplevel, 3, app_id) == 0) { return 0; }
     }
-    if (_send_string(w, w.toplevel, 2, title) == 0) { return 0; }
-    if (_send_string(w, w.toplevel, 3, app_id) == 0) { return 0; }
     // Request the initial configure; the xdg-shell role is not usable until
     // the compositor configures the surface and the client acknowledges it.
     if (_send(w, w.surface, 6, cast(*u8, 0), 0, 0 - 1) == 0) { return 0; }
@@ -2227,20 +2364,22 @@ fn open_config(w as *Window, title as *u8, width as i64, height as i64, options 
     let is Options as o with mut = options();
     if (cast(i64, options) != 0) { o = *options; }
     w.width = width; w.height = height; w.decorated_wanted = o.decorated;
+    w.popup_kind = o.popup; w.pos = o;
+    if (o.popup != 0 && o.parent_surface == 0) { w.err = NO_CONFIGURE; return 0; }
     if (width <= 0 || height <= 0) { w.err = NO_CONFIGURE; return 0; }
     if (_protocol_ready() == 0) { w.err = NO_PROTOCOL; return 0; }
     if (_runtime_socket(w) == 0) { w.err = NO_RUNTIME; return 0; }
     if (_init_protocol(w, title, o.app_id) == 0) { w.err = NO_COMPOSITOR; _discard(w); return 0; }
     w.opened = 1;
-    if (o.parent != 0 && set_parent(w, o.parent) == 0) {
+    if (o.popup == 0 && o.parent != 0 && set_parent(w, o.parent) == 0) {
         w.err = NO_SHELL; _discard(w); return 0;
     }
-    if (o.resizable == 0) {
+    if (o.popup == 0 && o.resizable == 0) {
         if (set_min_size(w, width, height) == 0 || set_max_size(w, width, height) == 0) {
             w.err = NO_SHELL; _discard(w); return 0;
         }
     }
-    if (o.modal != 0) { set_modal(w, 1); }
+    if (o.popup == 0 && o.modal != 0) { set_modal(w, 1); }
     w.stride = w.width * 4; w.bytes = w.stride * w.height;
     if (_make_buffers(w) == 0) { w.err = NO_MEMORY; _discard(w); return 0; }
     let is i32 as id = _id(w);
@@ -2268,6 +2407,57 @@ fn state(w as *Window) as i32 { return w.state; }
 fn native_fd(w as *Window) as i64 { return w.fd; }
 fn native_surface(w as *Window) as i32 { return w.surface; }
 fn native_toplevel(w as *Window) as i32 { return w.toplevel; }
+fn native_xdg_surface(w as *Window) as i32 { return w.xdg_surface; }
+fn grab_serial(w as *Window) as u32 { return w.grab_serial; }
+fn popup_done(w as *Window) as i32 { return w.popup_done; }
+// Whether the popup holds the seat's grab: asked with a seat to ask it of,
+// and not refused (a refused grab takes the popup down).
+fn grabbing(w as *Window) as i32 {
+    return cast(i32, w.opened == 1 && w.xdg_popup != 0 && w.pos.grab == 1 && w.seat != 0 && w.popup_done == 0);
+}
+
+// Where the window geometry starts in the surface, logical pixels: past the
+// shadow of a frame of the program's own while it is a floating window, as
+// _set_window_geometry tells the compositor. A popup's positioner is in these.
+fn geometry_origin(w as *Window, x as *i64, y as *i64) as void {
+    *x = 0; *y = 0;
+    if ((w.state & (event.STATE_MAXIMIZED | event.STATE_FULLSCREEN | event.STATE_TILED_LEFT | event.STATE_TILED_RIGHT |
+        event.STATE_TILED_TOP | event.STATE_TILED_BOTTOM)) != 0) { return; }
+    let is i64 as left = _scale_down(w.ext_left, w.scale120);
+    let is i64 as right = _scale_down(w.ext_right, w.scale120);
+    let is i64 as top = _scale_down(w.ext_top, w.scale120);
+    let is i64 as bottom = _scale_down(w.ext_bottom, w.scale120);
+    if (left + right < w.logical_width) { *x = left; }
+    if (top + bottom < w.logical_height) { *y = top; }
+}
+
+// Where the compositor put the popup, relative to its parent's client in the
+// parent's physical pixels: 1, or 0 for a window that is not a popup.
+fn popup_position(w as *Window, parent as *Window, x as *i64, y as *i64) as i32 {
+    if (w.opened == 0 || w.xdg_popup == 0) { return 0; }
+    let is i64 as gx with mut = 0;
+    let is i64 as gy with mut = 0;
+    geometry_origin(parent, &gx, &gy);
+    *x = _scale_up(cast(i64, w.popup_x) + gx, parent.scale120);
+    *y = _scale_up(cast(i64, w.popup_y) + gy, parent.scale120);
+    return 1;
+}
+
+// The popup placed again by pos, its size pw by ph logical: the compositor
+// answers with a configure. xdg_popup 3 and later; 0 where it cannot be asked.
+fn reposition(w as *Window, pos as *Options, pw as i64, ph as i64) as i32 {
+    if (w.opened == 0 || w.xdg_popup == 0 || _bounded(_globals.shell_version, 6) < 3 || pw <= 0 || ph <= 0) { return 0; }
+    let is i32 as id = _positioner(w, pos, pw, ph);
+    if (id == 0) { return 0; }
+    let is [8]u8 as b;
+    w.reposition_token = w.reposition_token + 1;
+    _put(&b[0], cast(u32, id)); _put(&b[4], cast(u32, w.reposition_token));
+    if (_send(w, w.xdg_popup, 2, &b[0], 8, 0 - 1) == 0) { return 0; }
+    let is [0]u8 as empty;
+    if (_send(w, id, 0, &empty[0], 0, 0 - 1) == 0) { return 0; }
+    w.pos = *pos;
+    return 1;
+}
 fn key_down(w as *Window, key as i32) as i32 {
     let is i32 as i with mut = 0;
     while (i < 256) {
@@ -2771,6 +2961,8 @@ fn close(w as *Window) as void {
     if (w.fractional_surface != 0) { _send(w, w.fractional_surface, 0, &empty[0], 0, 0 - 1); }
     if (w.toplevel_decoration != 0) { _send(w, w.toplevel_decoration, 0, &empty[0], 0, 0 - 1); }
     if (w.dialog != 0) { _send(w, w.dialog, 0, &empty[0], 0, 0 - 1); }
+    _ungrabber(w);
+    if (w.xdg_popup != 0) { _send(w, w.xdg_popup, 0, &empty[0], 0, 0 - 1); w.xdg_popup = 0; }
     if (w.toplevel != 0) { _send(w, w.toplevel, 0, &empty[0], 0, 0 - 1); }
     if (w.xdg_surface != 0) { _send(w, w.xdg_surface, 0, &empty[0], 0, 0 - 1); }
     if (w.surface != 0) { _send(w, w.surface, 0, &empty[0], 0, 0 - 1); }

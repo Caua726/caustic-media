@@ -27,6 +27,8 @@ window/
   display.cst     the screen's DPI: a window's scale
   event.cst       raw platform events and the queue they arrive in
   wait.cst        the loop's one place to sleep: events, descriptors, wake-ups, time
+  positioner.cst  where a popup goes: xdg_positioner as geometry, the
+                  toolkit's and the backends' that place popups themselves
   cursor.cst      the pointer's shape: CSS's, by the theme's names
   settings.cst    the desktop's settings: dark, accent, fonts, timings, language
   locale.cst      the language the user reads, as a BCP 47 tag
@@ -457,6 +459,29 @@ where said:
   `clipboard_request` and the answer for the clipboard and the primary
   selection (`device_x11_test`, a second client playing the user and the
   window manager).
+- Popups (`Config.popup`: `POPUP_MENU`, `POPUP_LIST`, `POPUP_TOOLTIP`), which
+  must have an owner and are never put at a point of the screen: `Config.place`
+  is a `positioner.cst` positioner against a rectangle of the owner's client,
+  physical pixels. X11 makes an override-redirect window of the popup's
+  `_NET_WM_WINDOW_TYPE_*`, transient for its owner, at the place the
+  positioner gives within the screen; Windows a `WS_POPUP` tool window never
+  activated, owned, within the monitor's work area; Wayland an `xdg_popup` of
+  the owner's `xdg_surface`, the positioner's numbers in logical pixels
+  relative to the owner's window geometry, which the compositor places.
+  `popup_position` says where it went, `reposition` places it again.
+  `Config.grab` takes the pointer and keyboard (`XGrabPointer`/`XGrabKeyboard`,
+  the capture and the owner's keys, `xdg_popup.grab` under the owner's last
+  press or key); a submenu's grab replaces its menu's and is given back when
+  it closes; presses on the program's popups go to them; a press anywhere else —
+  another program, the desktop, the program's own window — takes the innermost
+  down (`POPUP_DONE`, `popup_done`) and goes to no one, the same on all three;
+  so does the capture taken elsewhere or the application deactivated on
+  Windows, and the compositor's `popup_done`. `grabbing` says whether the grab
+  could be had: not on a Wayland compositor with no seat. The program closes a
+  taken-down popup, innermost first. Tested by `popup_x11_test` (XTest, a second
+  client checking type, owner and grab), `popup_wayland_test` (kiosk Weston,
+  headless and seated with XTest) and `popup_win32_test` (SendInput, isolated
+  Wine, 96 and 144 dpi).
 - `cursor.cst`: every CSS cursor, numbered as Wayland's cursor-shape-v1 —
   the toolkit's `tree.SHAPE_*` — from the user's theme by the freedesktop
   cursor spec's names, which are CSS's, or the X cursor font's nearest glyph;

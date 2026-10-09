@@ -7,7 +7,8 @@
 # seat. WESTON_BACKEND=x11 nests Weston in an X server instead — run it
 # inside window/x11/tools/run_headless.sh — and its keyboard and pointer
 # become a real Wayland seat that XTest (xdotool) drives. WESTON_SCALE sets
-# the output scale.
+# the output scale; WESTON_SHELL=kiosk shows every toplevel fullscreen at the
+# output's origin, so where a popup has room is known.
 set -eu
 [ $# -gt 0 ] || { echo "usage: run_wayland.sh <program> [args...]" >&2; exit 2; }
 command -v weston >/dev/null 2>&1 || { echo "run_wayland: weston not found" >&2; exit 127; }
@@ -34,8 +35,13 @@ cleanup() {
 }
 trap cleanup EXIT
 . "$(dirname "$0")/../../../tools/child.sh"
+shell=${WESTON_SHELL:-desktop}
+case "$shell" in
+    desktop|kiosk) ;;
+    *) echo "run_wayland: unknown WESTON_SHELL $shell" >&2; exit 2 ;;
+esac
 weston --backend="$backend" --renderer=pixman --socket="$WAYLAND_DISPLAY" --idle-time=0 \
-    --width=1280 --height=1024 --scale="${WESTON_SCALE:-1}" --no-config \
+    --width=1280 --height=1024 --scale="${WESTON_SCALE:-1}" --shell="$shell" --no-config \
     --log="$run/weston.log" >/dev/null 2>&1 &
 weston_pid=$!
 # Ready once a client's registry round trip is answered; the socket file alone

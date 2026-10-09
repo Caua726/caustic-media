@@ -46,6 +46,8 @@ struct Native {
     fixed as i32;
     modal as i32;
     decorated as i32;
+    popup as i32;           // a popup's kind (device.POPUP_*), 0 for a window
+    popup_done as i32;      // taken down by a press outside the program's popups
     dpi as i32;
     width as i64;
     height as i64;
@@ -110,6 +112,14 @@ struct Config {
     // The application's identity for the taskbar (AppUserModelID), UTF-8;
     // null for none. Windows keeps it per process.
     app_id as *u8;
+    // A popup (1 menu, 2 list, 3 tooltip), 0 for a window: WS_POPUP, a tool
+    // window never activated, its client at x, y of the screen, owned by
+    // owner. grab 1 captures the pointer and takes the owner's keys while it
+    // is up; a press outside the program's popups then takes it down.
+    popup as i32;
+    grab as i32;
+    x as i64;
+    y as i64;
 }
 
 struct Window {
@@ -121,6 +131,12 @@ struct Window {
 }
 
 let is [32]Native as _windows with mut;
+
+// The popups holding the capture, innermost last, as slots of _windows: a
+// submenu's capture replaces its menu's, which gets it back when the submenu
+// goes.
+let is [16]i32 as _grab_slot with mut;
+let is i64 as _ngrab with mut = 0;
 let is abi.Callbacks as _callbacks with mut;
 let is i32 as _class_ready with mut = 0;
 let is i32 as _dpi_ready with mut = 0;
@@ -400,6 +416,93 @@ fn _position_ime(n as *Native) as void {
     ime.ImmReleaseContext(n.hwnd, h);
 }
 
+// The open window of hwnd, null for none of the program's.
+fn _native_of(hwnd as i64) as *Native {
+    if (hwnd == 0) { return cast(*Native, 0); }
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_windows[i].used == 1 && _windows[i].hwnd == hwnd) { return &_windows[i]; }
+        i = i + 1;
+    }
+    return cast(*Native, 0);
+}
+
+fn _top_grab() as *Native {
+    if (_ngrab == 0) { return cast(*Native, 0); }
+    return &_windows[_grab_slot[_ngrab - 1]];
+}
+
+fn _grabbed(n as *Native) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < _ngrab) {
+        if (&_windows[_grab_slot[i]] == n) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Taken down: told once, as POPUP_DONE.
+fn _dismiss(n as *Native) as void {
+    if (n.popup_done == 1) { return; }
+    n.popup_done = 1;
+    _emit(n, event.POPUP_DONE, cast(i32, t.WM_CAPTURECHANGED), 0, 0, 0);
+}
+
+fn _grab_popup(n as *Native, slot as i64) as void {
+    if (_ngrab >= 16) { return; }
+    _grab_slot[_ngrab] = cast(i32, slot);
+    _ngrab = _ngrab + 1;
+    u.SetCapture(n.hwnd);
+}
+
+// Out of the stack; the capture given back to the popup under it when this
+// one held it.
+fn _ungrab(n as *Native) as void {
+    let is i64 as i with mut = 0;
+    while (i < _ngrab && &_windows[_grab_slot[i]] != n) { i = i + 1; }
+    if (i == _ngrab) { return; }
+    let is i32 as top = cast(i32, i == _ngrab - 1);
+    while (i < _ngrab - 1) {
+        _grab_slot[i] = _grab_slot[i + 1];
+        i = i + 1;
+    }
+    _ngrab = _ngrab - 1;
+    if (top == 0) { return; }
+    if (_ngrab > 0) { u.SetCapture(_top_grab().hwnd); }
+    else if (u.GetCapture() == n.hwnd) { u.ReleaseCapture(); }
+}
+
+fn _is_key(m as i64) as i32 {
+    return cast(i32, m == t.WM_KEYDOWN || m == t.WM_KEYUP || m == t.WM_SYSKEYDOWN || m == t.WM_SYSKEYUP || m == t.WM_CHAR);
+}
+
+fn _is_press(m as i64) as i32 { return cast(i32, m == t.WM_LBUTTONDOWN || m == t.WM_MBUTTONDOWN || m == t.WM_RBUTTONDOWN); }
+
+fn _is_pointer(m as i64) as i32 {
+    return cast(i32, m == t.WM_MOUSEMOVE || _is_press(m) == 1 || m == t.WM_LBUTTONUP || m == t.WM_MBUTTONUP || m == t.WM_RBUTTONUP);
+}
+
+// While a popup holds the capture every pointer message comes to it, in its
+// client's coordinates. One outside it is for the window of the program's
+// beneath: another popup takes presses and motion, a window motion only, as
+// an X server reports a grabbing client's own windows. A press over anything
+// else takes the popup down and goes no further. -1: not decided here.
+fn _grab_route(n as *Native, hwnd as i64, m as i64, wp as u64, lp as i64) as i64 {
+    let is i64 as px = _signed16(cast(u64, lp));
+    let is i64 as py = _signed16(cast(u64, lp) >> 16);
+    if (px >= 0 && py >= 0 && px < n.width && py < n.height) { return 0 - 1; }
+    let is t.POINT as sp; sp.x = cast(i32, px); sp.y = cast(i32, py);
+    u.ClientToScreen(hwnd, &sp);
+    let is *Native as under = _native_of(u.WindowFromPoint((cast(u64, sp.x) & 4294967295) | (cast(u64, sp.y) << 32)));
+    if (cast(i64, under) != 0 && under != n && (under.popup != 0 || m == t.WM_MOUSEMOVE)) {
+        u.ScreenToClient(under.hwnd, &sp);
+        return u.SendMessageW(under.hwnd, cast(u32, m), wp, (cast(i64, sp.x) & 65535) | ((cast(i64, sp.y) & 65535) << 16));
+    }
+    if (m == t.WM_MOUSEMOVE) { return 0 - 1; }
+    if (_is_press(m) == 1) { _dismiss(n); }
+    return 0;
+}
+
 fn _window_proc(ctx as *u8, args as *u64) as i64 {
     let is i64 as hwnd = cast(i64, args[0]);
     let is u32 as msg = cast(u32, args[1]);
@@ -425,6 +528,30 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         }
     }
     if (cast(i64, msg) == _WM_WINDOW_MENU) { _window_menu(n, lp); return 0; }
+    if (_ngrab > 0) {
+        let is *Native as top = _top_grab();
+        // The owner's keys are the grabbing popup's.
+        if (top != n && _is_key(cast(i64, msg)) == 1) { return u.SendMessageW(top.hwnd, msg, wp, lp); }
+        if (top == n && _is_pointer(cast(i64, msg)) == 1) {
+            let is i64 as routed = _grab_route(n, hwnd, cast(i64, msg), wp, lp);
+            if (routed >= 0) { return routed; }
+        }
+    }
+    if (cast(i64, msg) == t.WM_MOUSEACTIVATE && n.popup != 0) { return t.MA_NOACTIVATE; }
+    if (cast(i64, msg) == t.WM_CAPTURECHANGED && _grabbed(n) == 1) {
+        // Taken by a window not of this popup chain: the system's, another
+        // program's — the popup goes, as a menu does.
+        let is *Native as to = _native_of(lp);
+        if (cast(i64, to) == 0 || _grabbed(to) == 0) { _dismiss(n); }
+        return 0;
+    }
+    if (cast(i64, msg) == t.WM_ACTIVATEAPP && wp == 0) {
+        let is i64 as gi with mut = 0;
+        while (gi < _ngrab) {
+            _dismiss(&_windows[_grab_slot[gi]]);
+            gi = gi + 1;
+        }
+    }
     if (cast(i64, msg) == t.WM_SETCURSOR && (lp & 65535) == t.HTCLIENT) {
         u.SetCursor(n.cursor); return 1;
     }
@@ -534,8 +661,8 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         if (cast(i64, msg) == t.WM_LBUTTONUP || cast(i64, msg) == t.WM_MBUTTONUP || cast(i64, msg) == t.WM_RBUTTONUP) { down = 0; }
         n.mouse_x = _signed16(cast(u64, lp)); n.mouse_y = _signed16(cast(u64, lp) >> 16);
         let is i32 as mask = cast(i32, 1 << (button - 1));
-        if (down == 1) { n.buttons = n.buttons | mask; u.SetCapture(hwnd); }
-        else { n.buttons = n.buttons & cast(i32, 0 - 1 - mask); if (n.buttons == 0) { u.ReleaseCapture(); } }
+        if (down == 1) { n.buttons = n.buttons | mask; if (_ngrab == 0) { u.SetCapture(hwnd); } }
+        else { n.buttons = n.buttons & cast(i32, 0 - 1 - mask); if (n.buttons == 0 && _ngrab == 0) { u.ReleaseCapture(); } }
         let is i32 as mouse_kind with mut = event.MOUSE_DOWN; if (down == 0) { mouse_kind = event.MOUSE_UP; }
         _emit(n, mouse_kind, cast(i32, msg), n.mouse_x, n.mouse_y, button); return 0;
     }
@@ -592,7 +719,9 @@ fn _ensure_class() as i32 {
 
 fn config(title as *u8, width as i64, height as i64) as Config {
     let is Config as c; c.title = title; c.width = width; c.height = height;
-    c.resizable = 1; c.owner = 0; c.dialog = 0; c.modal = 0; c.decorated = 1; c.app_id = cast(*u8, 0); return c;
+    c.resizable = 1; c.owner = 0; c.dialog = 0; c.modal = 0; c.decorated = 1; c.app_id = cast(*u8, 0);
+    c.popup = 0; c.grab = 0; c.x = 0; c.y = 0;
+    return c;
 }
 
 fn open_config(c as *Config) as Window {
@@ -612,6 +741,8 @@ fn open_config(c as *Config) as Window {
     let is *Native as n = &_windows[slot]; mem.memset(cast(*u8, n), 0, sizeof(Native));
     n.used = 1; n.owner = c.owner; n.fixed = cast(i32, c.resizable == 0); n.modal = c.modal;
     n.decorated = c.decorated; n.dpi = cast(i32, u.GetDpiForSystem()); if (n.dpi < 96) { n.dpi = 96; }
+    n.popup = c.popup;
+    if (c.popup != 0 && c.owner == 0) { n.used = 0; return w; }
     n.cursor = u.LoadCursorW(0, cast(*u16, t.IDC_ARROW));
     if (n.fixed == 1) {
         n.min_width = c.width; n.max_width = c.width;
@@ -621,14 +752,24 @@ fn open_config(c as *Config) as Window {
     if (c.decorated == 0) { style = cast(u32, t.WS_POPUP | t.WS_VISIBLE); }
     if (c.resizable == 0) { style = cast(u32, cast(i64, style) & (0 - 262145)); }
     if (c.dialog == 1) { style = cast(u32, t.WS_CAPTION | t.WS_SYSMENU | t.WS_VISIBLE); }
+    // A popup: no frame, no taskbar entry, never activated — the owner keeps
+    // the focus, and its keys come to the popup while it holds the capture.
+    let is u32 as ex with mut = 0;
+    if (c.popup != 0) {
+        style = cast(u32, t.WS_POPUP);
+        ex = cast(u32, t.WS_EX_TOOLWINDOW | t.WS_EX_NOACTIVATE);
+    }
     let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, c.width); r.bottom = cast(i32, c.height);
-    if (u.AdjustWindowRectExForDpi(&r, style, 0, 0, cast(u32, n.dpi)) == 0) { u.AdjustWindowRectEx(&r, style, 0, 0); }
+    if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { u.AdjustWindowRectEx(&r, style, 0, ex); }
     let is [512]u16 as title; title[0] = cast(u16, 0);
     if (cast(i64, c.title) != 0) { k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, c.title), cast(i32, 0 - 1), &title[0], 512); }
     let is i32 as outer_width = r.right - r.left;
     let is i32 as outer_height = r.bottom - r.top;
-    let is i64 as hwnd = u.CreateWindowExW(0, &_class_name[0], &title[0], style,
-        cast(i32, t.CW_USEDEFAULT), cast(i32, t.SW_SHOW), outer_width, outer_height, c.owner, 0, _instance, cast(*u8, n));
+    let is i32 as at_x with mut = cast(i32, t.CW_USEDEFAULT);
+    let is i32 as at_y with mut = cast(i32, t.SW_SHOW);
+    if (c.popup != 0) { at_x = cast(i32, c.x) + r.left; at_y = cast(i32, c.y) + r.top; }
+    let is i64 as hwnd = u.CreateWindowExW(ex, &_class_name[0], &title[0], style,
+        at_x, at_y, outer_width, outer_height, c.owner, 0, _instance, cast(*u8, n));
     if (hwnd == 0) { n.used = 0; w.err = NO_WINDOW; return w; }
     n.hwnd = hwnd; n.alive = 1; n.dpi = cast(i32, u.GetDpiForWindow(hwnd)); if (n.dpi < 96) { n.dpi = 96; }
     let is t.RECT as client; u.GetClientRect(hwnd, &client);
@@ -636,7 +777,10 @@ fn open_config(c as *Config) as Window {
         u.DestroyWindow(hwnd); n.used = 0; w.err = NO_SURFACE; return w;
     }
     if (n.modal == 1 && n.owner != 0) { u.EnableWindow(n.owner, 0); }
-    u.ShowWindow(hwnd, cast(i32, t.SW_SHOW)); u.UpdateWindow(hwnd);
+    if (c.popup != 0) { u.ShowWindow(hwnd, cast(i32, t.SW_SHOWNOACTIVATE)); }
+    else { u.ShowWindow(hwnd, cast(i32, t.SW_SHOW)); }
+    u.UpdateWindow(hwnd);
+    if (c.popup != 0 && c.grab == 1) { _grab_popup(n, slot); }
     w.hwnd = hwnd; w.slot = cast(i32, slot); w.ok = 1; w.err = OK; w.dpi = n.dpi; return w;
 }
 
@@ -654,6 +798,7 @@ fn _native(w as *Window) as *Native {
 fn close(w as *Window) as void {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.used == 0) { w.ok = 0; return; }
     if (n.modal == 1 && n.owner != 0 && u.IsWindow(n.owner) == 1) { u.EnableWindow(n.owner, 1); }
+    _ungrab(n);
     if (n.hwnd != 0 && u.IsWindow(n.hwnd) == 1) { u.DestroyWindow(n.hwnd); }
     if (n.hdc != 0) { g.DeleteDC(n.hdc); n.hdc = 0; }
     if (n.bitmap != 0) { g.DeleteObject(n.bitmap); n.bitmap = 0; }
@@ -890,6 +1035,46 @@ fn set_size(w as *Window, cw as i64, ch as i64) as i32 {
     if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { return 0; }
     return cast(i32, u.SetWindowPos(w.hwnd, 0, 0, 0, r.right - r.left, r.bottom - r.top,
                                     cast(u32, t.SWP_NOMOVE | t.SWP_NOZORDER | t.SWP_NOACTIVATE)) != 0);
+}
+
+// The client's top left on the screen, and the work area of the monitor the
+// window is on — where a popup of it has room. 1 when both are known.
+fn popup_room(w as *Window, ox as *i64, oy as *i64, l as *i64, t_ as *i64, r as *i64, b as *i64) as i32 {
+    if (is_open(w) == 0) { return 0; }
+    let is t.POINT as p; p.x = 0; p.y = 0;
+    if (u.ClientToScreen(w.hwnd, &p) == 0) { return 0; }
+    let is t.MONITORINFO as monitor;
+    mem.memzero(cast(*u8, &monitor), sizeof(t.MONITORINFO));
+    monitor.cbSize = cast(u32, sizeof(t.MONITORINFO));
+    if (u.GetMonitorInfoW(u.MonitorFromWindow(w.hwnd, cast(u32, t.MONITOR_DEFAULTTONEAREST)), &monitor) == 0) { return 0; }
+    *ox = p.x; *oy = p.y;
+    *l = monitor.rcWork.left; *t_ = monitor.rcWork.top; *r = monitor.rcWork.right; *b = monitor.rcWork.bottom;
+    return 1;
+}
+
+fn popup_done(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    return n.popup_done;
+}
+
+// Whether the popup holds the capture's place in the grab stack.
+fn grabbing(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    return _grabbed(n);
+}
+
+// The client put at x, y of the screen and made cw by ch, the frame round it
+// as the window's style and DPI make it. 1 when moved.
+fn move_resize(w as *Window, x as i64, y as i64, cw as i64, ch as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || cw <= 0 || ch <= 0 || cw > 16384 || ch > 16384) { return 0; }
+    if (n.fixed == 1) { n.min_width = cw; n.max_width = cw; n.min_height = ch; n.max_height = ch; }
+    let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, cw); r.bottom = cast(i32, ch);
+    let is u32 as style = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE)));
+    let is u32 as ex = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_EXSTYLE)));
+    if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { return 0; }
+    return cast(i32, u.SetWindowPos(w.hwnd, 0, cast(i32, x) + r.left, cast(i32, y) + r.top, r.right - r.left, r.bottom - r.top,
+                                    cast(u32, t.SWP_NOZORDER | t.SWP_NOACTIVATE)) != 0);
 }
 
 fn position(w as *Window, x as *i64, y as *i64) as i32 {

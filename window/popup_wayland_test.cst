@@ -1,0 +1,256 @@
+// window/popup_wayland_test.cst — popups through the portable device, on a
+// private Weston whose kiosk shell shows the owner fullscreen at the output's
+// origin, so where a popup has room is known:
+//   WESTON_SHELL=kiosk sh window/wayland/tools/run_wayland.sh ./build/popup_wayland_test
+// The compositor places them from the positioner's numbers (xdg_positioner),
+// flipping and sliding as the toolkit's own positioner does, and places them
+// again when asked. With no seat a grab is refused, and the popup is taken
+// down at once. Seated — Weston nested in Xvfb, the user's pointer and keys
+// sent with XTest:
+//   sh window/x11/tools/run_headless.sh env WESTON_BACKEND=x11 WESTON_SHELL=kiosk \
+//       sh window/wayland/tools/run_wayland.sh ./build/popup_wayland_test seated
+// a press gives the serial a grab is asked under, the popup takes the keys,
+// its own presses are its, and a press outside takes it down (popup_done).
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "device.cst" as device;
+use "event.cst" as event;
+use "keys.cst" as keys;
+use "positioner.cst" as positioner;
+use "../gpu/software/target.cst" as tgt;
+use "../math/math.cst" as math;
+use "x11/bind/xlib.cst" as xlib;
+
+extern "libXtst.so.6" fn XTestFakeButtonEvent(display as *u8, button as u32, is_press as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as owner with mut;
+let is device.Window as menu with mut;
+let is device.Window as sub with mut;
+let is *u8 as xd with mut;
+
+fn pump_all() as void {
+    device.pump(&owner);
+    if (menu.ok == 1) { device.pump(&menu); }
+    if (sub.ok == 1) { device.pump(&sub); }
+}
+
+fn settle(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        pump_all();
+        time.sleep_ms(5);
+    }
+}
+
+fn next(w as *device.Window, kind as i32, out as *event.Event) as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        pump_all();
+        while (device.poll_event(w, out) == 1) {
+            if (out.kind == kind) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+fn had(w as *device.Window, kind as i32) as i32 {
+    settle(200);
+    let is event.Event as e;
+    let is i32 as seen with mut = 0;
+    while (device.poll_event(w, &e) == 1) { if (e.kind == kind) { seen = 1; } }
+    return seen;
+}
+
+fn drain_events(w as *device.Window) as void {
+    settle(150);
+    let is event.Event as e;
+    while (device.poll_event(w, &e) == 1) { }
+}
+
+// A frame of colour drawn and shown: the surface mapped.
+fn show(w as *device.Window, colour as u32) as void {
+    device.next_frame(w);
+    let is tgt.Target as t = device.acquire(w);
+    if (cast(i64, t.color) != 0) {
+        let is i64 as n = t.width * t.height;
+        let is i64 as i with mut = 0;
+        while (i < n) { *cast(*u32, cast(i64, t.color) + i * 4) = colour; i = i + 1; }
+        device.submit(w);
+    }
+    settle(100);
+}
+
+fn popup_config(kind as i32, grab as i32, w as i64, h as i64, anchor as math.rect.Rect, a as i32, g as i32) as device.Config {
+    let is device.Config as c with mut = device.config("popup", w, h);
+    c.owner = &owner;
+    c.popup = kind;
+    c.grab = grab;
+    c.place = positioner.make(cast(f64, w), cast(f64, h), anchor);
+    c.place.anchor = a;
+    c.place.gravity = g;
+    c.place.adjust = positioner.FLIP_X | positioner.FLIP_Y | positioner.SLIDE_X | positioner.SLIDE_Y;
+    return c;
+}
+
+// Where place puts a popup within the owner, which is the whole output.
+fn expected(c as *device.Config, ow as i64, oh as i64) as math.rect.Rect {
+    let is positioner.Positioner as p with mut = c.place;
+    return positioner.place(&p, math.rect.rect(0.0, 0.0, cast(f64, ow), cast(f64, oh)));
+}
+
+// The user's pointer at x, y of the X screen Weston is nested in; pressed.
+fn click_at(x as i64, y as i64) as void {
+    XTestFakeMotionEvent(xd, 0 - 1, cast(i32, x), cast(i32, y), cast(u64, 0));
+    xlib.XFlush(xd);
+    settle(50);
+    XTestFakeButtonEvent(xd, cast(u32, 1), 1, cast(u64, 0));
+    XTestFakeButtonEvent(xd, cast(u32, 1), 0, cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+fn key_a() as void {
+    let is u32 as code = cast(u32, xlib.XKeysymToKeycode(xd, 97));
+    XTestFakeKeyEvent(xd, code, 1, cast(u64, 0));
+    XTestFakeKeyEvent(xd, code, 0, cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is i32 as seated = cast(i32, env.argc() > 1);
+    menu.ok = 0;
+    sub.ok = 0;
+    owner = device.open("owner", 400, 300);
+    if (device.is_open(&owner) == 0 || owner.backend != device.WAYLAND) { io.printf("FAIL: no Wayland owner\n"); return 1; }
+    show(&owner, cast(u32, 4282400832));
+    let is i64 as ow = device.width(&owner);
+    let is i64 as oh = device.height(&owner);
+    check("the kiosk's owner fills the output", ow == 1280 && oh == 1024);
+
+    // --- No owner, no popup ---
+    let is device.Config as orphan with mut = popup_config(device.POPUP_MENU, 0, 100, 80, math.rect.rect(0.0, 0.0, 10.0, 10.0),
+                                                           positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT);
+    orphan.owner = cast(*device.Window, 0);
+    let is device.Window as none = device.open_config(&orphan);
+    check("a popup needs an owner", device.is_open(&none) == 0 && device.last_error(&none) == device.BAD_ARGUMENT);
+
+    // --- Placed by the compositor: flipped at the output's corner ---
+    let is device.Config as mc with mut = popup_config(device.POPUP_MENU, 0, 200, 150, math.rect.rect(1200.0, 950.0, 20.0, 20.0),
+                                                       positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+    menu = device.open_config(&mc);
+    check("a popup opens", device.is_open(&menu) == 1);
+    show(&menu, cast(u32, 4278190335));
+    let is math.rect.Rect as want = expected(&mc, ow, oh);
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    check("placed as the toolkit's positioner places it", device.popup_position(&menu, &px, &py) == 1 &&
+          px == cast(i64, want.x) && py == cast(i64, want.y));
+    check("flipped above and to the left of its anchor", px + 200 <= 1200 && py + 150 <= 950);
+    check("the size asked", device.width(&menu) == 200 && device.height(&menu) == 150);
+
+    // Slid back inside where flipping would not fit either.
+    let is device.Config as wide with mut = popup_config(device.POPUP_LIST, 0, 300, 100, math.rect.rect(1100.0, 100.0, 20.0, 20.0),
+                                                         positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT);
+    let is device.Window as list = device.open_config(&wide);
+    device.pump(&list);
+    let is math.rect.Rect as want2 = expected(&wide, ow, oh);
+    check("a list placed as the positioner places it", device.popup_position(&list, &px, &py) == 1 &&
+          px == cast(i64, want2.x) && py == cast(i64, want2.y));
+    device.close(&list);
+
+    // Placed again: what it was anchored to moved.
+    let is positioner.Positioner as moved with mut = mc.place;
+    moved.anchor_rect = math.rect.rect(10.0, 10.0, 20.0, 20.0);
+    check("asked to be placed again", device.reposition(&menu, &moved) == 1);
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until && (device.popup_position(&menu, &px, &py) == 0 || px != 30)) { settle(10); }
+    check("placed there by the compositor", px == 30 && py == 30);
+    device.close(&menu);
+    menu.ok = 0;
+
+    if (seated == 0) {
+        // No seat to grab: the popup up all the same, the grab said not held.
+        let is device.Config as gc with mut = popup_config(device.POPUP_MENU, 1, 120, 100, math.rect.rect(20.0, 20.0, 10.0, 10.0),
+                                                           positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+        menu = device.open_config(&gc);
+        show(&menu, cast(u32, 4278255360));
+        check("no seat: up, with no grab held", device.is_open(&menu) == 1 && device.grabbing(&menu) == 0 &&
+              device.popup_done(&menu) == 0);
+        device.close(&menu);
+        menu.ok = 0;
+    } else {
+        xd = xlib.XOpenDisplay(cast(*u8, 0));
+        if (cast(i64, xd) == 0) { io.printf("FAIL: no X display to send input through\n"); return 1; }
+        // Where the output is on the X screen: a pointer moved there says.
+        XTestFakeMotionEvent(xd, 0 - 1, 640, 512, cast(u64, 0));
+        xlib.XFlush(xd);
+        let is event.Event as e;
+        check("the pointer over the owner", next(&owner, event.MOUSE_MOVE, &e) == 1 || owner.ok == 1);
+        settle(100);
+        let is i64 as sx = 640 - device.mouse_x(&owner);
+        let is i64 as sy = 512 - device.mouse_y(&owner);
+        click_at(sx + 50, sy + 50);
+        check("a press on the owner: the serial a grab is asked under", next(&owner, event.MOUSE_DOWN, &e) == 1);
+        let is device.Config as gc with mut = popup_config(device.POPUP_MENU, 1, 160, 120, math.rect.rect(50.0, 50.0, 10.0, 10.0),
+                                                           positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+        menu = device.open_config(&gc);
+        show(&menu, cast(u32, 4278255360));
+        check("granted: not taken down", device.popup_done(&menu) == 0 && had(&menu, event.POPUP_DONE) == 0);
+        device.popup_position(&menu, &px, &py);
+        check("placed below and right of its anchor", px == 60 && py == 60);
+        key_a();
+        check("the keys: the popup's", next(&menu, event.KEY_DOWN, &e) == 1 && e.key == keys.A);
+        click_at(sx + px + 20, sy + py + 30);
+        check("a press inside: the popup's", next(&menu, event.MOUSE_DOWN, &e) == 1 && e.x == 20 && e.y == 30 &&
+              device.popup_done(&menu) == 0);
+        // A submenu, under the press on its menu's serial: granted, the keys
+        // its own, its menu's presses its menu's.
+        let is device.Config as sc with mut = popup_config(device.POPUP_MENU, 1, 100, 80, math.rect.rect(150.0, 0.0, 10.0, 10.0),
+                                                           positioner.TOP_RIGHT, positioner.BOTTOM_RIGHT);
+        sc.owner = &menu;
+        sub = device.open_config(&sc);
+        show(&sub, cast(u32, 4294901760));
+        let is i64 as bx with mut = 0;
+        let is i64 as by with mut = 0;
+        check("a submenu granted, placed against its menu", device.popup_done(&sub) == 0 && device.grabbing(&sub) == 1 &&
+              device.popup_position(&sub, &bx, &by) == 1 && bx == 160 && by == 0);
+        key_a();
+        check("the keys: the submenu's", next(&sub, event.KEY_DOWN, &e) == 1 && had(&menu, event.KEY_DOWN) == 0);
+        click_at(sx + px + 10, sy + py + 100);
+        check("a press on its menu: the menu's", next(&menu, event.MOUSE_DOWN, &e) == 1 && e.x == 10 && e.y == 100);
+        check("and neither taken down", device.popup_done(&menu) == 0 && device.popup_done(&sub) == 0);
+        device.close(&sub);
+        sub.ok = 0;
+        drain_events(&owner);
+        click_at(sx + 900, sy + 700);
+        check("a press on the owner, outside the popup: taken down", next(&menu, event.POPUP_DONE, &e) == 1 &&
+              device.popup_done(&menu) == 1 && device.grabbing(&menu) == 0);
+        check("the press not the owner's", had(&owner, event.MOUSE_DOWN) == 0 && had(&owner, event.MOUSE_UP) == 0);
+        device.close(&menu);
+        menu.ok = 0;
+        click_at(sx + 900, sy + 700);
+        check("closed: the owner's presses its own", next(&owner, event.MOUSE_DOWN, &e) == 1);
+        xlib.XCloseDisplay(xd);
+    }
+
+    device.close(&owner);
+    if (fails == 0) {
+        io.printf("window popups wayland: all checks passed\n");
+        return 0;
+    }
+    io.printf("window popups wayland: %d failures\n", fails);
+    return 1;
+}

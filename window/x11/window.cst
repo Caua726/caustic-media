@@ -125,6 +125,15 @@ struct Config {
     // The window manager's title bar and borders (frame.cst): 0 asks for none
     // before the window is first mapped, for one that draws its own.
     decorated     as i32;
+    // A popup (wm.set_popup's kinds: 1 menu, 2 list, 3 tooltip), 0 for none:
+    // no window manager placing or framing it (override-redirect), at x, y
+    // of the root, transient_for its owner. grab 1 takes the pointer and the
+    // keyboard while it is up, a press outside the program's popups then
+    // taking it down (popup_done, a POPUP_DONE event).
+    popup         as i32;
+    grab          as i32;
+    x             as i64;
+    y             as i64;
 }
 
 let is i64 as DEFAULT_RING with imut = 256;
@@ -145,6 +154,10 @@ fn config(title as *u8, width as i64, height as i64) as Config {
     c.dialog = 0;
     c.modal = 0;
     c.decorated = 1;
+    c.popup = 0;
+    c.grab = 0;
+    c.x = 0;
+    c.y = 0;
     return c;
 }
 
@@ -219,7 +232,9 @@ struct Window {
     ok     as i32;
     argb   as i32;      // a 32-bit visual with alpha, and a colormap of its own
     fixed  as i32;      // opened not resizable: its size is its floor and its ceiling
-    _pad1  as i32;
+    popup  as i32;      // a popup's kind, 0 for a window
+    grabbing as i32;    // holds the pointer and keyboard grab (top of the stack)
+    popup_done as i32;  // taken down by a press outside the program's popups
 }
 
 // One scratch event for the pump. The pump is not reentrant and neither is X11
@@ -227,6 +242,68 @@ struct Window {
 // stack on every drain.
 let is xev.XEvent as _scratch;
 let is [8]i64 as _protocols;
+
+// The popups holding the grab, innermost last: a submenu's grab replaces its
+// menu's, which takes it back when the submenu closes. done: taken down by
+// a press outside, noted: its POPUP_DONE queued (a window not yet pumped has
+// no ring here to queue it in; it is queued when the window registers).
+let is [16]i64 as _grab_xid with mut;
+let is [16]i32 as _grab_done with mut;
+let is [16]i32 as _grab_noted with mut;
+let is i64 as _ngrab with mut = 0;
+
+fn _grab_pointer(d as *u8, xid as i64) as i32 {
+    let is i32 as p = xlib.XGrabPointer(d, xid, 1,
+        cast(u32, x.ButtonPressMask | x.ButtonReleaseMask | x.PointerMotionMask | x.EnterWindowMask | x.LeaveWindowMask),
+        x.GrabModeAsync, x.GrabModeAsync, 0, 0, x.CurrentTime);
+    if (p != x.GrabSuccess) { return 0; }
+    // Every key to the popup, whichever window has the focus.
+    if (xlib.XGrabKeyboard(d, xid, 0, x.GrabModeAsync, x.GrabModeAsync, x.CurrentTime) != x.GrabSuccess) {
+        xlib.XUngrabPointer(d, x.CurrentTime);
+        return 0;
+    }
+    return 1;
+}
+
+fn _grab(w as *Window) as void {
+    if (_ngrab >= 16 || _grab_pointer(w.display, w.xid) == 0) { return; }
+    _grab_xid[_ngrab] = w.xid;
+    _grab_done[_ngrab] = 0;
+    _grab_noted[_ngrab] = 0;
+    _ngrab = _ngrab + 1;
+    w.grabbing = 1;
+}
+
+// Out of the stack; the grab given back to the popup under it when this one
+// held it.
+fn _ungrab(w as *Window) as void {
+    let is i64 as i with mut = 0;
+    while (i < _ngrab && _grab_xid[i] != w.xid) { i = i + 1; }
+    if (i == _ngrab) { return; }
+    let is i32 as top = cast(i32, i == _ngrab - 1);
+    while (i < _ngrab - 1) {
+        _grab_xid[i] = _grab_xid[i + 1];
+        _grab_done[i] = _grab_done[i + 1];
+        _grab_noted[i] = _grab_noted[i + 1];
+        i = i + 1;
+    }
+    _ngrab = _ngrab - 1;
+    w.grabbing = 0;
+    if (top == 0) { return; }
+    xlib.XUngrabKeyboard(w.display, x.CurrentTime);
+    xlib.XUngrabPointer(w.display, x.CurrentTime);
+    if (_ngrab > 0) { _grab_pointer(w.display, _grab_xid[_ngrab - 1]); }
+    xlib.XFlush(w.display);
+}
+
+fn _note_done(w as *Window) as void {
+    let is xev.XEvent as note;
+    xev.clear(&note);
+    xev.any(&note).kind = events.POPUP_NOTE;
+    xev.any(&note).window = w.xid;
+    w.popup_done = 1;
+    _ring_push(w, &note);
+}
 
 fn _slot(w as *Window, i as i64) as *xev.XEvent {
     return cast(*xev.XEvent, cast(i64, w.ring) + (i % w.ring_cap) * sizeof(xev.XEvent));
@@ -377,7 +454,13 @@ fn open_with(c as *Config) as Window {
     w.wm_delete = 0; w.wm_protocols = 0;
     w.ring = cast(*u8, 0); w.ring_cap = 0; w.ring_head = 0; w.ring_len = 0;
     w.dropped = 0; w.frames = 0; w.framed = 0; w.err = OK; w.ok = 0; w.argb = 0;
-    w.fixed = cast(i32, c.resizable == 0); w._pad1 = 0;
+    w.fixed = cast(i32, c.resizable == 0);
+    w.popup = c.popup; w.grabbing = 0; w.popup_done = 0;
+    // Where it is made: a popup at its place on the root, a window wherever the
+    // window manager puts it.
+    let is i32 as px with mut = 0;
+    let is i32 as py with mut = 0;
+    if (c.popup != 0) { px = cast(i32, c.x); py = cast(i32, c.y); }
     w.back.ok = 0;
 
     if (c.width <= 0 || c.height <= 0) { w.err = BAD_ARGUMENT; return w; }
@@ -404,17 +487,25 @@ fn open_with(c as *Config) as Window {
         at.colormap = w.colormap;
         at.border_pixel = 0;
         at.background_pixel = 0;
-        w.xid = xlib.XCreateWindow(d, root, 0, 0, cast(u32, c.width), cast(u32, c.height), 0, 32,
+        w.xid = xlib.XCreateWindow(d, root, px, py, cast(u32, c.width), cast(u32, c.height), 0, 32,
                                    cast(u32, x.InputOutput), w.visual, x.CWColormap | x.CWBorderPixel | x.CWBackPixel,
                                    cast(*u8, &at));
     } else {
-        w.xid = xlib.XCreateSimpleWindow(d, root, 0, 0,
+        w.xid = xlib.XCreateSimpleWindow(d, root, px, py,
                                          cast(u32, c.width), cast(u32, c.height), 0,
                                          black, black);
     }
     if (w.xid == 0) {
         _display_release(); w.display = cast(*u8, 0);
         w.err = NO_WINDOW; return w;
+    }
+    // A popup is no window manager's to place, frame or focus.
+    if (c.popup != 0) {
+        let is xlib.XSetWindowAttributes as pa;
+        mem.memset(cast(*u8, &pa), 0, sizeof(xlib.XSetWindowAttributes));
+        pa.override_redirect = 1;
+        pa.save_under = 1;
+        xlib.XChangeWindowAttributes(d, w.xid, x.CWOverrideRedirect | x.CWSaveUnder, cast(*u8, &pa));
     }
 
     // Titled once it is a window: set_title, in UTF-8.
@@ -475,7 +566,10 @@ fn open_with(c as *Config) as Window {
     w.wmst.ready = 0;
     w.frst.ready = 0;
     if (c.decorated == 0) { frame.set_decorated(&w.frst, d, w.xid, 0); }
-    if (c.transient_for != 0 || c.dialog == 1 || c.modal == 1) {
+    if (c.popup != 0) {
+        wm.init(&w.wmst, d);
+        wm.set_popup(&w.wmst, d, w.xid, c.transient_for, c.popup);
+    } else if (c.transient_for != 0 || c.dialog == 1 || c.modal == 1) {
         wm.init(&w.wmst, d);
         wm.set_dialog(&w.wmst, d, w.xid, c.transient_for, c.dialog, c.modal);
     }
@@ -490,6 +584,12 @@ fn open_with(c as *Config) as Window {
     w.err = OK;
     if (cast(i64, c.title) != 0) { set_title(&w, c.title); }
     xlib.XMapWindow(d, w.xid);
+    // A grab needs a window the server shows: mapped, and the server done
+    // with it, before the pointer and keyboard are asked for.
+    if (c.popup != 0 && c.grab == 1) {
+        xlib.XSync(d, 0);
+        _grab(&w);
+    }
     xlib.XFlush(d);
     return w;
 }
@@ -504,6 +604,7 @@ fn close(w as *Window) as void {
     // Out of the routing table first: an event that arrives between here and
     // the last release must not be handed to a window being torn down.
     _unregister(w);
+    _ungrab(w);
     text.close(&w.txt);
     dnd.close(&w.drop);
     framesync.close(&w.fsync, w.display);
@@ -641,6 +742,7 @@ fn _ensure_registered(w as *Window) as void {
     _reg_xid[_reg_count] = w.xid;
     _reg_win[_reg_count] = cast(i64, w);
     _reg_count = _reg_count + 1;
+    _noted_late(w);
 }
 
 fn _unregister(w as *Window) as void {
@@ -672,6 +774,56 @@ fn _owner(e as *xev.XEvent) as *Window {
         i = i + 1;
     }
     return cast(*Window, 0);
+}
+
+fn _window_of(xid as i64) as *Window {
+    let is i64 as i with mut = 0;
+    while (i < _reg_count) {
+        if (_reg_xid[i] == xid) { return cast(*Window, _reg_win[i]); }
+        i = i + 1;
+    }
+    return cast(*Window, 0);
+}
+
+// A popup taken down before it was ever pumped hears of it when it is.
+fn _noted_late(w as *Window) as void {
+    let is i64 as i with mut = 0;
+    while (i < _ngrab) {
+        if (_grab_xid[i] == w.xid && _grab_done[i] == 1 && _grab_noted[i] == 0) {
+            _note_done(w);
+            _grab_noted[i] = 1;
+        }
+        i = i + 1;
+    }
+}
+
+// While a popup holds the grab: whether a button event is outside the
+// program's popups — over another client, or over one of this program's
+// windows that is not a popup — and so delivered to no one. A press there
+// takes the innermost popup down, once. Inside any of its popups the press
+// is theirs, as a compositor gives it to the surfaces of a popup chain.
+fn _outside(e as *xev.XEvent) as i32 {
+    let is i32 as ty = xev.kind(e);
+    if (ty != x.ButtonPress && ty != x.ButtonRelease) { return 0; }
+    let is i64 as top = _grab_xid[_ngrab - 1];
+    let is *Window as ow = _owner(e);
+    if (xev.any(e).window == top) {
+        // Reported to the grabbing popup: inside it, or over another client.
+        if (cast(i64, ow) == 0) { return 0; }
+        let is *xev.XButtonEvent as b = xev.button(e);
+        if (b.x >= 0 && b.y >= 0 && cast(i64, b.x) < ow.st.width && cast(i64, b.y) < ow.st.height) { return 0; }
+    } else if (cast(i64, ow) != 0 && ow.popup != 0) {
+        return 0;
+    }
+    if (ty == x.ButtonPress && _grab_done[_ngrab - 1] == 0) {
+        _grab_done[_ngrab - 1] = 1;
+        let is *Window as tw = _window_of(top);
+        if (cast(i64, tw) != 0) {
+            _note_done(tw);
+            _grab_noted[_ngrab - 1] = 1;
+        }
+    }
+    return 1;
 }
 
 // Everything that used to be the body of the pump loop, for one window and one
@@ -792,6 +944,9 @@ fn _pump(w as *Window, block as i32) as void {
             xev.any(&note).kind = events.XSETTINGS_CHANGED;
             _ring_push(w, &note);
         }
+
+        // A popup holding the grab decides first where a press belongs.
+        if (_ngrab > 0 && _outside(&_scratch) == 1) { continue; }
 
         // Whose event is this? With one connection shared by every window, the
         // answer is usually but not always the window that called pump.
@@ -1321,6 +1476,28 @@ fn position(w as *Window, x_out as *i64, y_out as *i64) as i32 {
     if (w.ok == 0) { return 0; }
     return wm.position(w.display, w.xid, root(w), x_out, y_out);
 }
+
+// The screen's size in pixels: what a popup is kept inside.
+fn screen_size(w as *Window, width as *i64, height as *i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    *width = cast(i64, xlib.XDisplayWidth(w.display, w.screen));
+    *height = cast(i64, xlib.XDisplayHeight(w.display, w.screen));
+    return 1;
+}
+
+// A popup taken down by a press outside the program's popups.
+fn popup_done(w as *Window) as i32 {
+    if (w.popup_done == 1) { return 1; }
+    let is i64 as i with mut = 0;
+    while (i < _ngrab) {
+        if (_grab_xid[i] == w.xid && _grab_done[i] == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Whether the popup holds the pointer and the keyboard.
+fn grabbing(w as *Window) as i32 { return cast(i32, w.ok == 1 && w.grabbing == 1); }
 
 // ARGB, alpha in the high byte — NOT the 0xAABBGGRR the rasterizer packs, so a
 // program converting a rendered image has to swap red and blue first.

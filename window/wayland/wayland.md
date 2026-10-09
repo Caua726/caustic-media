@@ -180,6 +180,19 @@ The toolkit regression checks that dialogs fit their native buffer and stay
 below their client-side header. The headless Weston has no keyboard/pointer
 seat; it cannot prove desktop clipboard, DnD or IME interaction.
 
+Popups are `xdg_popup`s of their owner's `xdg_surface`: a positioner made
+from the toolkit's numbers (logical pixels, relative to the owner's window
+geometry), placed and placed again (`reposition`, xdg_popup 3) by the
+compositor, `popup_done` reported. A grab is asked under the owner's last
+press or key serial before the first commit; with no seat there is nothing to
+grab, and `grabbing` says so. The compositor gives a press on any surface of
+this client to that surface; one on a window that is not a popup takes the
+innermost grabbing popup down here and is dropped, press and release, as on
+X11 and Windows. `popup_wayland_test` runs on a kiosk Weston (the owner fills
+the output, so the flipped and slid places are known), headless and seated —
+Weston nested in Xvfb, XTest pointer and keys: the grab granted, the keys and
+presses of a popup chain, a submenu under its menu's serial, a press outside.
+
 A separate Weston/X11 software-rendering smoke uses a real compositor seat,
 with XTest keyboard and pointer input. The editor accepts typing and Ctrl+A,
 opens Preferences with Ctrl+, and resumes input after its dialog is closed.
