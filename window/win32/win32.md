@@ -160,16 +160,24 @@ prefix and X server; it cannot reuse another test's stale native desktop.
 
 `backend.cst` opens native windows with DPI-aware client geometry, a reentrant
 procedure, a nonblocking message pump and directly writable software frames.
-It handles close requests, resize, key state, UTF-16 character input, IMM32
-composition messages, pointer capture, accumulated wheel notches, modal owners,
+It handles close requests, resize, UTF-16 character input, IMM32 composition
+messages, pointer capture and wheel deltas — the input translated into
+`input/event.cst`'s cooked events as it arrives: a key's scan code as its
+place and bit 30 as the system's repeat, a `WM_CHAR` the key's only right
+after it went down, focus loss a `CANCEL` that lets the buttons and the
+capture go, a press a system move takes ending in `BUTTON_TAKEN` and a
+release of a button not held unsaid — plus modal owners,
 fullscreen restore, size constraints and native cursors. Unicode clipboard
 ownership and reads use `CF_UNICODETEXT`. `settings.cst` reads the desktop's
 locale, font, DPI, timings, high contrast, animation preference and available
 registry/DWM preferences.
 
 `backend_test.cst` exercises actual windows under Wine/Xvfb: presented pixels,
-Unicode surrogate pairs, control-character filtering, queue overflow ordering,
-pointer capture, partial wheel notches, modal ownership, clipboard transfer,
+keys with their place and the system's repeat, Unicode surrogate pairs, whose
+a character is, control-character filtering, a full input queue keeping what
+came first and counting what it refused, pointer capture, a release of a
+button not held, focus loss letting everything go, half and whole wheel
+notches, modal ownership, clipboard transfer,
 resize, fullscreen restore and a close request that can be declined. Desktop
 preference reads were also exercised in a native smoke. Real Windows, monitor
 transitions and interaction with an installed IME remain unverified.
@@ -187,14 +195,14 @@ Windows and `device.available(WIN32)` is 1. `device_win32_test.cst` drives the
 portable API in an isolated Wine, at 96 and at 144 dpi (`CAUSTIC_WINE_DPI`):
 per-monitor DPI awareness and the scale it gives, the class name as the
 process's AppUserModelID, presented pixels, UTF-8 titles past the BMP,
-show/hide, client position, key/text/pointer/wheel events, the resize, motion
-and wheel as per-frame edges, the synchronous clipboard (no PRIMARY), floor and
+show/hide, client position, key/text/pointer/wheel input, the motion of a
+frame as `input/state.cst` adds it up, the synchronous clipboard (no PRIMARY), floor and
 ceiling sizes, maximize/restore/fullscreen/minimize state events, activation
 from behind another window, text input and the IME candidate position, the
 desktop's settings, icons (size bounds, rows top-down as read back), the system
 cursor each portable shape shows, decorations, frame extents, an input region
 exact to its edges (HTTRANSPARENT outside), the command each move or resize
-edge gives the system, a system move from a real synthetic left-button drag,
+edge gives the system and the press it takes, a system move from a real synthetic left-button drag,
 the system menu's modal loop until Escape and with Close chosen, an owned modal
 dialog and close requests. It found that `WM_NCCREATE` skipped the default
 procedure, so creation titles were lost, and that `resized`, the motion and the

@@ -144,6 +144,14 @@ must remain stable until `close`. The portable device owns that storage.
 windows, configure/close/state events, double-buffered `wl_shm` presentation,
 frame pacing, output and fractional scale, constraints, decorations, dialogs,
 cursors, keyboard/pointer input, text selections, and file/text drag-and-drop.
+Input is translated as it arrives into `input/event.cst`'s cooked events, a
+queue per window (`poll_input`): keys with xkbcommon's keysym, their keycode
+as their place and `wl_keyboard` 10's repeated state as a repeat, the text
+they type (compose included; never a control character nor a command's),
+the pointer in buffer pixels, axis and axis_discrete gathered per frame into
+one `SCROLL`, text-input-v3's commit, preedit and delete-surrounding,
+keyboard focus leaving as a `CANCEL` that lets buttons go too, and a press
+`xdg_toplevel.move`/`resize` takes ending in `BUTTON_TAKEN`.
 The portable `window/device.cst` and `ui/host.cst` use it to open and paint
 toolkit windows.
 

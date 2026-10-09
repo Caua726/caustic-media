@@ -1,0 +1,266 @@
+// input/event.cst — cooked input: what a person did with the keyboard and
+// the pointer, as a window's native translator says it, and the explicitly
+// sized queue it arrives in.
+//
+// A window's lifecycle — resized, exposed, focused, closed, its settings and
+// state — stays in window/event.cst. What is here is input: keys, typed and
+// composed text, the pointer, scrolling, and CANCEL, which says that nothing
+// is held any more (the keyboard's focus left, or the queue overflowed).
+//
+// The queue owns what an event carries: the text of a TEXT or PREEDIT is
+// copied in when the event is pushed and handed out by next() from the
+// queue's own storage, valid until the next next() on the same queue — no
+// pointer into a platform's buffers outlives the translator that read them.
+// Its size is fixed. Motion waiting at the end absorbs newer motion; anything
+// else that does not fit is refused, counted, and followed — once what was
+// queued before it has been taken — by a CANCEL saying how many were lost, so
+// a lost key release is never silently a key held forever.
+use "std/mem.cst" as mem;
+
+let is i32 as NONE               with imut = 0;
+// A key went down (again, with repeat 1, while held) or up.
+let is i32 as KEY_DOWN           with imut = 1;
+let is i32 as KEY_UP             with imut = 2;
+// Text: committed UTF-8, typed (from_key 1, right after the KEY_DOWN that
+// typed it) or composed by an input method.
+let is i32 as TEXT               with imut = 3;
+// A composition in progress, replacing the last one; empty ends it. cursor is
+// its caret's byte offset, -1 when hidden.
+let is i32 as PREEDIT            with imut = 4;
+// The input method asks for bytes before and after the caret to be deleted.
+let is i32 as DELETE_SURROUNDING with imut = 5;
+// A pointer button went down or up, at x, y.
+let is i32 as BUTTON_DOWN        with imut = 6;
+let is i32 as BUTTON_UP          with imut = 7;
+// The pointer moved, to x, y.
+let is i32 as MOTION             with imut = 8;
+// The pointer came into the window, at x, y, or left it.
+let is i32 as ENTER              with imut = 9;
+let is i32 as LEAVE              with imut = 10;
+// Scrolled: dx, dy continuous, steps whole notches, value120 the high
+// resolution wheel's (120 a notch) where the platform says it.
+let is i32 as SCROLL             with imut = 11;
+// Everything held is let go: detail says why, count how many were lost.
+let is i32 as CANCEL             with imut = 12;
+
+// Why a CANCEL came.
+let is i32 as CANCEL_FOCUS with imut = 1;   // the keyboard's focus left the window
+let is i32 as CANCEL_LOST  with imut = 2;   // the queue was full: count events refused
+
+// A BUTTON_UP's detail when no release will come: the press was handed to
+// the window system — a move or resize it follows from there — and clicks
+// nothing.
+let is i32 as BUTTON_TAKEN with imut = 1;
+
+// Where a scroll came from.
+let is i32 as SCROLL_WHEEL      with imut = 1;   // a wheel's notches
+let is i32 as SCROLL_FINGER     with imut = 2;   // fingers on a touchpad: stop comes when they lift
+let is i32 as SCROLL_CONTINUOUS with imut = 3;   // a continuous device: a trackpoint, a ball
+let is i32 as SCROLL_TILT       with imut = 4;   // a wheel tilted sideways
+
+// stop's bits: the motion along that axis stopped (fingers lifted).
+let is i32 as STOP_X with imut = 1;
+let is i32 as STOP_Y with imut = 2;
+
+struct Event {
+    kind      as i32;
+    detail    as i32;   // CANCEL: CANCEL_*
+    modifiers as i32;   // keys.MOD_* held at the moment of the event
+    // Keys. key is what the key is in the user's layout (keys.*); shortcut
+    // the key a shortcut is matched against; physical the platform's code for
+    // the key's place, whatever the layout; repeat 1 for a platform's repeat.
+    key       as i32;
+    shortcut  as i32;
+    physical  as i32;
+    repeat    as i32;
+    // The pointer: physical pixels in the window. button 1 left, 2 middle,
+    // 3 right, 8 back, 9 forward.
+    button    as i32;
+    x         as i64;
+    y         as i64;
+    // Scrolling: positive dy is towards the end (down), positive dx towards
+    // the right, in lines; steps whole notches along each; value120 120 to a
+    // notch where the platform says finer.
+    dx        as f64;
+    dy        as f64;
+    steps_x   as i32;
+    steps_y   as i32;
+    value120_x as i32;
+    value120_y as i32;
+    source    as i32;   // SCROLL_*
+    stop      as i32;   // STOP_* bits
+    // Text.
+    from_key  as i32;   // TEXT: 1 when typed by the KEY_DOWN just before it
+    _pad0     as i32;
+    text      as *u8;   // TEXT, PREEDIT: UTF-8, the queue's until its next next()
+    text_len  as i64;
+    cursor    as i64;   // PREEDIT: caret byte offset, -1 hidden
+    delete_before as i64;
+    delete_after  as i64;
+    count     as i64;   // CANCEL_LOST: events refused
+    time_ms   as i64;   // the platform's timestamp, 0 when it gives none
+}
+
+fn clear(e as *Event) as void {
+    mem.memzero(cast(*u8, e), sizeof(Event));
+    e.cursor = 0 - 1;
+    e.text = "";
+}
+
+// --- The queue ---
+
+let is i64 as CAPACITY with imut = 256;     // events
+let is i64 as TEXT_BYTES with imut = 16384; // text of the events waiting
+let is i64 as TEXT_MAX with imut = 4096;    // one event's
+
+struct Queue {
+    events     as [256]Event;
+    offs       as [256]i64;    // where each waiting event's text is in text
+    head       as i64;
+    len        as i64;
+    text       as [16384]u8;
+    text_start as i64;         // the oldest waiting event's text
+    text_end   as i64;         // where the next one goes
+    current    as [4096]u8;    // the text of the event next() handed out last
+    lost       as i64;         // refused since the last CANCEL_LOST
+    cancel_due as i32;         // a CANCEL_LOST owed once what came before is taken
+    _pad0      as i32;
+}
+
+fn init(q as *Queue) as void {
+    q.head = 0;
+    q.len = 0;
+    q.text_start = 0;
+    q.text_end = 0;
+    q.lost = 0;
+    q.cancel_due = 0;
+}
+
+// A queue of its own on the heap — what a window's backend keeps for its
+// translator — or null.
+fn create() as *Queue {
+    let is *Queue as q = cast(*Queue, mem.core.mmap_anon(sizeof(Queue)));
+    if (cast(i64, q) == 0 || cast(i64, q) == 0 - 1) { return cast(*Queue, 0); }
+    init(q);
+    return q;
+}
+
+fn destroy(q as *Queue) as void {
+    if (cast(i64, q) != 0) { mem.core.munmap(cast(*u8, q), sizeof(Queue)); }
+}
+
+fn pending(q as *Queue) as i32 { return cast(i32, q.len > 0 || q.cancel_due == 1); }
+fn waiting(q as *Queue) as i64 { return q.len; }
+fn lost(q as *Queue) as i64 { return q.lost; }
+
+fn _slot(q as *Queue, i as i64) as i64 { return (q.head + i) % CAPACITY; }
+
+// Refused: counted, and nothing more taken until the CANCEL it owes is.
+fn _refuse(q as *Queue) as i32 {
+    q.lost = q.lost + 1;
+    q.cancel_due = 1;
+    return 0;
+}
+
+// e, its text n bytes of text (copied), at the end. 1 when queued; 0 when
+// refused — the queue full, or the text longer than TEXT_MAX — and a CANCEL
+// then owed.
+fn push(q as *Queue, e as *Event, text as *u8, n as i64) as i32 {
+    if (q.cancel_due == 1) {
+        q.lost = q.lost + 1;
+        return 0;
+    }
+    // Motion waiting at the end, with the same modifiers, takes the newer
+    // place: only where the pointer is now matters.
+    if (e.kind == MOTION && q.len > 0) {
+        let is *Event as last = &q.events[_slot(q, q.len - 1)];
+        if (last.kind == MOTION && last.modifiers == e.modifiers) {
+            last.x = e.x;
+            last.y = e.y;
+            last.time_ms = e.time_ms;
+            return 1;
+        }
+    }
+    if (n < 0 || n > TEXT_MAX || q.len == CAPACITY) { return _refuse(q); }
+    if (n > 0 && (q.text_end - q.text_start) + n > TEXT_BYTES) { return _refuse(q); }
+    if (n > 0 && q.text_end + n > TEXT_BYTES) {
+        // Room enough, though not after the last: what waits moved to the
+        // start, every waiting event's text with it.
+        let is i64 as shift = q.text_start;
+        mem.core.memmove(&q.text[0], &q.text[shift], q.text_end - shift);
+        let is i64 as i with mut = 0;
+        while (i < q.len) {
+            let is i64 as s = _slot(q, i);
+            if (q.events[s].text_len > 0) { q.offs[s] = q.offs[s] - shift; }
+            i = i + 1;
+        }
+        q.text_start = 0;
+        q.text_end = q.text_end - shift;
+    }
+    let is i64 as s = _slot(q, q.len);
+    q.events[s] = *e;
+    q.events[s].text = cast(*u8, 0);
+    q.events[s].text_len = n;
+    q.offs[s] = q.text_end;
+    if (n > 0) {
+        mem.memcpy(&q.text[q.text_end], text, n);
+        q.text_end = q.text_end + n;
+    }
+    q.len = q.len + 1;
+    return 1;
+}
+
+// A CANCEL for reason (CANCEL_FOCUS): everything held let go, in order.
+fn cancel(q as *Queue, reason as i32) as i32 {
+    let is Event as e;
+    clear(&e);
+    e.kind = CANCEL;
+    e.detail = reason;
+    return push(q, &e, cast(*u8, 0), 0);
+}
+
+// The oldest event into out: 1, or 0 when none waits. Its text is the
+// queue's, valid until the next next().
+fn next(q as *Queue, out as *Event) as i32 {
+    if (q.len == 0) {
+        if (q.cancel_due == 0) { return 0; }
+        clear(out);
+        out.kind = CANCEL;
+        out.detail = CANCEL_LOST;
+        out.count = q.lost;
+        q.lost = 0;
+        q.cancel_due = 0;
+        return 1;
+    }
+    let is i64 as s = q.head;
+    *out = q.events[s];
+    let is i64 as n = out.text_len;
+    if (n > 0) {
+        mem.memcpy(&q.current[0], &q.text[q.offs[s]], n);
+        q.text_start = q.offs[s] + n;
+    }
+    out.text = &q.current[0];
+    q.head = (q.head + 1) % CAPACITY;
+    q.len = q.len - 1;
+    if (q.len == 0) {
+        q.text_start = 0;
+        q.text_end = 0;
+    }
+    return 1;
+}
+
+fn kind_name(k as i32) as *u8 {
+    if (k == KEY_DOWN) { return "key down"; }
+    if (k == KEY_UP) { return "key up"; }
+    if (k == TEXT) { return "text"; }
+    if (k == PREEDIT) { return "preedit"; }
+    if (k == DELETE_SURROUNDING) { return "delete surrounding"; }
+    if (k == BUTTON_DOWN) { return "button down"; }
+    if (k == BUTTON_UP) { return "button up"; }
+    if (k == MOTION) { return "motion"; }
+    if (k == ENTER) { return "enter"; }
+    if (k == LEAVE) { return "leave"; }
+    if (k == SCROLL) { return "scroll"; }
+    if (k == CANCEL) { return "cancel"; }
+    return "none";
+}

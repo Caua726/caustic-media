@@ -27,7 +27,8 @@ window/
   display.cst     the screen a window is on: its scale, its monitor (monitor.cst),
                   its compositing manager followed
   monitor.cst     a monitor as a platform says it: place, work area, scale, name
-  event.cst       raw platform events and the queue they arrive in
+  event.cst       what happens to a window — resized, focused, closed, dropped on —
+                  and the queue it arrives in; input is input/event.cst's
   wait.cst        the loop's one place to sleep: events, descriptors, wake-ups, time
   positioner.cst  where a popup goes: xdg_positioner as geometry, the
                   toolkit's and the backends' that place popups themselves
@@ -56,11 +57,15 @@ Three placements worth their reasoning:
 `x11/backend.cst` is our abstraction implemented over it. Whoever touches one
 touches the other, and `x11/` as a whole is what you delete if you drop X11.
 
-**`window/` owns the raw event queue; `input/` interprets it.** `event.cst`
-delivers "key 38 pressed, pointer at (x, y)". Turning that into "the JUMP action
-is active", mapping a gamepad, or tracking held state is `input/`'s work. Without
-this line either `input/` has to speak to four platforms, or `window/` grows game
-logic.
+**`window/` translates; `input/` defines and interprets.** Each backend turns
+what its platform delivers into `input/event.cst`'s cooked events as they
+arrive — a key with its id, place and repeat, the text it typed, the pointer,
+scrolling, a `CANCEL` when the focus leaves — into a queue of its own, handed
+out by `poll_input`; `event.cst` keeps what happens to the window itself
+(`poll_event`). Held state is `input/state.cst`'s, fed by the program, and
+turning keys into "the JUMP action is active" or mapping a gamepad is
+`input/`'s work. Without this line either `input/` has to speak to four
+platforms, or `window/` grows game logic.
 
 **The swapchain is not here.** It belongs to `gpu/`, because when there is a GPU
 it is the swapchain that presents, not the window. This layer only hands over the
@@ -449,10 +454,17 @@ where said:
   HANDLEs signalled as "readable" (`wait_win32_test`, under Wine).
   `device.pump` hands every event read to the windows it belongs to, for a
   loop that sleeps by itself rather than in `next_frame`.
-- A key press carries the text it typed (`event.text`, UTF-8: XLookupString,
-  or the input method's); every key, button and wheel event the modifiers
-  held as `keys.MOD_*` name them, X's bits translated (they number them
-  otherwise: X's Control is the portable Caps Lock's bit); `STATE` says the
+- Input (`poll_input`, `input/event.cst`): a key down carries its key id,
+  its place (`physical`: X's keycode, the scan code on Windows) and whether
+  it is the platform's repeat (X11's detectable auto-repeat, Windows' bit 30,
+  `wl_keyboard` 10's repeated state); the text a key typed follows it as
+  `TEXT` (`from_key`), never a control character nor what a key held with
+  Control, Alt or Super types; an input method's text is `TEXT` too; every
+  event the modifiers held as `keys.MOD_*` name them, X's bits translated.
+  X's buttons 4–7 and Windows' wheel are `SCROLL`, 120 a notch. Focus leaving
+  is a `CANCEL`: everything held let go, a release after it unsaid. A press
+  handed to `begin_move_resize` ends in `BUTTON_UP` with `BUTTON_TAKEN`, and
+  the release the window manager keeps never arrives. `STATE` says the
   window manager's state of the window — maximized, full screen, minimized
   (`STATE_MINIMIZED`: X11's `_NET_WM_STATE_HIDDEN`, Windows' `SIZE_MINIMIZED`,
   Wayland's `suspended`, its size kept meanwhile), tiled sides;

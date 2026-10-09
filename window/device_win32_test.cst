@@ -11,7 +11,9 @@ use "std/env.cst" as env;
 use "std/time.cst" as time;
 use "device.cst" as device;
 use "event.cst" as event;
-use "keys.cst" as keys;
+use "../input/event.cst" as ie;
+use "../input/state.cst" as st;
+use "../input/keys.cst" as keys;
 use "cursor.cst" as cursor;
 use "settings.cst" as wsettings;
 use "display.cst" as display;
@@ -60,10 +62,49 @@ fn next(kind as i32, out as *event.Event) as i32 {
     return 0;
 }
 
+// The next input of kind, within a second, into out: 1 when there was one.
+fn next_input(kind as i32, out as *ie.Event) as i32 {
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, out) == 1) {
+            if (out.kind == kind) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+// Every input of w waiting now: how many of kind; of those, how many whose
+// detail is detail, into *matched.
+fn count_input(w as *device.Window, kind as i32, detail as i32, matched as *i64) as i64 {
+    let is ie.Event as e;
+    let is i64 as n with mut = 0;
+    *matched = 0;
+    device.pump(w);
+    while (device.poll_input(w, &e) == 1) {
+        if (e.kind == kind) {
+            n = n + 1;
+            if (e.detail == detail) { *matched = *matched + 1; }
+        }
+    }
+    return n;
+}
+
+// What the window's input adds up to, every input waiting fed to s. Not
+// pumped: what SendMessageW sent is queued already, and the system's own
+// motion from where the cursor really is stays out of it.
+fn feed_all(s as *st.State) as void {
+    let is ie.Event as e;
+    while (device.poll_input(&win, &e) == 1) { st.feed(s, &e); }
+}
+
 fn drain() as void {
     let is event.Event as e;
     device.pump(&win);
     while (device.poll_event(&win, &e) == 1) { }
+    let is ie.Event as in;
+    while (device.poll_input(&win, &in) == 1) { }
 }
 
 // The window's title as the system holds it, against UTF-8 want.
@@ -309,33 +350,44 @@ fn main() as i32 {
 
     // --- Keys, text and the pointer ---
     let is event.Event as e;
+    let is ie.Event as in;
+    let is st.State as held;
+    st.init(&held);
     drain();
     u.SendMessageW(hwnd, cast(u32, t.WM_KEYDOWN), 65, 1966081);
-    check("a key: its portable name", next(event.KEY_DOWN, &e) == 1 && e.key == keys.A && e.keycode == 30);
-    check("held", device.key_down(&win, keys.A) == 1);
+    check("a key: its portable name, its place", next_input(ie.KEY_DOWN, &in) == 1 && in.key == keys.A && in.physical == 30);
+    st.feed(&held, &in);
+    check("held", st.key_down(&held, keys.A) == 1);
     u.SendMessageW(hwnd, cast(u32, t.WM_KEYUP), 65, 3221225473 + 1966080);
-    check("released", next(event.KEY_UP, &e) == 1 && device.key_down(&win, keys.A) == 0);
+    check("released", next_input(ie.KEY_UP, &in) == 1 && in.physical == 30);
+    st.feed(&held, &in);
+    check("held no more", st.key_down(&held, keys.A) == 0);
     u.SendMessageW(hwnd, cast(u32, t.WM_CHAR), 233, 0);
-    check("the text it types, UTF-8", next(event.TEXT, &e) == 1 && same(e.text, e.text_len, "é") == 1);
+    check("the text it types, UTF-8", next_input(ie.TEXT, &in) == 1 && same(in.text, in.text_len, "é") == 1);
     u.SendMessageW(hwnd, cast(u32, t.WM_LBUTTONDOWN), 1, 1376270);
-    check("a press where it was", next(event.MOUSE_DOWN, &e) == 1 && e.button == 1 && e.x == 14 && e.y == 21);
-    check("the button held, the pointer there", device.button_down(&win, 1) == 1 &&
-          device.mouse_x(&win) == 14 && device.mouse_y(&win) == 21);
+    check("a press where it was", next_input(ie.BUTTON_DOWN, &in) == 1 && in.button == 1 && in.x == 14 && in.y == 21);
+    st.feed(&held, &in);
+    check("the button held, the pointer there", st.button_down(&held, 1) == 1 && held.x == 14 && held.y == 21);
     u.SendMessageW(hwnd, cast(u32, t.WM_LBUTTONUP), 0, 1376270);
-    check("released", next(event.MOUSE_UP, &e) == 1 && device.button_down(&win, 1) == 0);
+    check("released", next_input(ie.BUTTON_UP, &in) == 1 && in.button == 1);
+    st.feed(&held, &in);
+    check("held no more", st.button_down(&held, 1) == 0);
     u.SendMessageW(hwnd, cast(u32, t.WM_MOUSEWHEEL), cast(u64, 120 << 16), screen_point(5, 5));
-    check("a wheel notch", next(event.WHEEL, &e) == 1 && e.wheel == 1 && device.wheel(&win) == 1);
-    check("read twice, the same", device.wheel(&win) == 1);
+    check("a wheel notch away from the user: up a line", next_input(ie.SCROLL, &in) == 1 && in.dy == 0.0 - 1.0 &&
+          in.steps_y == 0 - 1 && in.x == 5 && in.y == 5);
 
-    // --- Per frame: the wheel, the pointer's motion and a resize are edges ---
-    check("the next frame: no wheel", device.next_frame(&win) == 1 && device.wheel(&win) == 0);
+    // --- Per frame: the pointer's motion adds up, a frame at a time ---
+    st.new_frame(&held);
     u.SendMessageW(hwnd, cast(u32, t.WM_MOUSEMOVE), 0, 10 | (10 << 16));
-    device.next_frame(&win);
+    feed_all(&held);
+    st.new_frame(&held);
     u.SendMessageW(hwnd, cast(u32, t.WM_MOUSEMOVE), 0, 13 | (17 << 16));
-    check("the pointer's motion this frame", device.mouse_dx(&win) == 3 && device.mouse_dy(&win) == 7);
-    check("read twice, the same motion", device.mouse_dx(&win) == 3 && device.mouse_dy(&win) == 7);
-    check("the next frame: no motion", device.next_frame(&win) == 1 && device.mouse_dx(&win) == 0 && device.mouse_dy(&win) == 0);
-    check("not resized", device.resized(&win) == 0);
+    feed_all(&held);
+    check("the pointer's motion this frame", held.dx == 3 && held.dy == 7);
+    st.new_frame(&held);
+    feed_all(&held);
+    check("the next frame: no motion", held.dx == 0 && held.dy == 0);
+    check("not resized", device.next_frame(&win) == 1 && device.resized(&win) == 0);
 
     // --- The clipboard: answered at once ---
     check("copied", device.clipboard_set(&win, device.CLIPBOARD, "olá", 4) == 1);
@@ -507,16 +559,20 @@ fn main() as i32 {
     check("nothing else", device.begin_move_resize(&win, 20, 40, 0 - 1, 1) == 0 &&
           device.begin_move_resize(&win, 20, 40, 9, 1) == 0);
     drain();
-    // The left button the system's from then; the others still held.
+    // The left button the system's from then — the input says it taken —
+    // the others still held, and let go as they are.
     u.SendMessageW(hwnd, cast(u32, t.WM_LBUTTONDOWN), 1, 20 | (40 << 16));
     u.SendMessageW(hwnd, cast(u32, t.WM_MBUTTONDOWN), cast(u64, 1 | t.MK_MBUTTON), 20 | (40 << 16));
     u.SendMessageW(hwnd, cast(u32, t.WM_RBUTTONDOWN), cast(u64, 1 | t.MK_MBUTTON | t.MK_RBUTTON), 20 | (40 << 16));
-    device.pump(&win);
-    check("held before", device.button_down(&win, 1) == 1 && device.button_down(&win, 2) == 1 && device.button_down(&win, 3) == 1);
-    check("the system's from then", posts(device.MOVE, t.SC_MOVE | t.HTCAPTION) == 1 && device.button_down(&win, 1) == 0);
-    check("the others still held", device.button_down(&win, 2) == 1 && device.button_down(&win, 3) == 1);
+    let is i64 as tk with mut = 0;
+    check("held before", count_input(&win, ie.BUTTON_DOWN, 0, &tk) == 3);
+    check("the system's from then", posts(device.MOVE, t.SC_MOVE | t.HTCAPTION) == 1 &&
+          count_input(&win, ie.BUTTON_UP, ie.BUTTON_TAKEN, &tk) == 1 && tk == 1);
+    u.SendMessageW(hwnd, cast(u32, t.WM_LBUTTONUP), 0, 20 | (40 << 16));
     u.SendMessageW(hwnd, cast(u32, t.WM_MBUTTONUP), cast(u64, t.MK_RBUTTON), 20 | (40 << 16));
     u.SendMessageW(hwnd, cast(u32, t.WM_RBUTTONUP), 0, 20 | (40 << 16));
+    check("the others let go as they are, the taken one not again",
+          count_input(&win, ie.BUTTON_UP, ie.BUTTON_TAKEN, &tk) == 2 && tk == 0);
     drain();
 
     // --- Moved by the system, from a press ---
@@ -527,7 +583,7 @@ fn main() as i32 {
     let is i64 as at = screen_point(20, 40);
     drag_x = at & 65535; drag_y = (at >> 16) & 65535;
     mouse(drag_x, drag_y, t.MOUSEEVENTF_LEFTDOWN);
-    check("pressed", next(event.MOUSE_DOWN, &e) == 1 && e.x == 20 && e.y == 40);
+    check("pressed", next_input(ie.BUTTON_DOWN, &in) == 1 && in.x == 20 && in.y == 40);
     timers = abi.open(3);
     abi.put(&timers, 0, fn_ptr(drag_step), cast(*u8, 0), 4, 0);
     abi.put(&timers, 1, fn_ptr(menu_escape), cast(*u8, 0), 4, 0);
@@ -537,11 +593,12 @@ fn main() as i32 {
     check("a move asked of the system", device.begin_move_resize(&win, 20, 40, device.MOVE, 1) == 1);
     let is i64 as until = time.now_ms() + 3000;
     while (timer_step < 3 && time.now_ms() < until) { device.pump(&win); time.sleep_ms(5); }
-    drain();
+    let is i64 as taken_n with mut = 0;
+    let is i64 as ups = count_input(&win, ie.BUTTON_UP, ie.BUTTON_TAKEN, &taken_n);
     let is t.RECT as after;
     u.GetWindowRect(hwnd, &after);
     check("moved as the pointer was", after.left - before.left == 50 && after.top - before.top == 40);
-    check("the press is not left held", device.button_down(&win, 1) == 0);
+    check("the press taken, its release the system's", ups == 1 && taken_n == 1);
     check("only the left button moves it", device.begin_move_resize(&win, 20, 40, device.MOVE, 3) == 0);
 
     // --- Its menu, the system's own, until dismissed ---
@@ -594,9 +651,8 @@ fn main() as i32 {
     mouse(drag_x, drag_y, t.MOUSEEVENTF_LEFTDOWN);
     let is i64 as resize_until = time.now_ms() + 3000;
     while (timer_step < 3 && time.now_ms() < resize_until) { device.pump(&csd); time.sleep_ms(5); }
-    device.pump(&csd);
     check("resized by the system from its edge", device.width(&csd) == 350 && device.height(&csd) == 200);
-    check("the press never the program's", device.button_down(&csd, 1) == 0);
+    check("the press never the program's", count_input(&csd, ie.BUTTON_DOWN, 0, &tk) == 0);
     device.close(&csd);
 
     // --- Seen through where its alpha says ---
@@ -675,7 +731,7 @@ fn main() as i32 {
     check("asked by the program", device.should_close(&win) == 1 && next(event.CLOSE, &e) == 1);
     device.close(&win);
     check("closed", device.is_open(&win) == 0 && u.IsWindow(hwnd) == 0);
-    check("closed: no motion, no wheel", device.mouse_dx(&win) == 0 && device.mouse_dy(&win) == 0 && device.wheel(&win) == 0);
+    check("closed: no input", device.poll_input(&win, &in) == 0);
     check("closed: no frame, no menu", w32.next_frame(&win.win32_win) == 0 && w32.show_window_menu(&win.win32_win, 1, 1) == 0);
     abi.close(&timers);
 

@@ -18,9 +18,10 @@ use "std/env.cst" as env;
 use "std/os/linux.cst" as linux;
 use "../math/math.cst" as math;
 use "../gpu/gpu.cst" as gpu;
-use "../window/keys.cst" as keys;
+use "../input/keys.cst" as keys;
 use "../window/device.cst" as device;
 use "../window/event.cst" as wevent;
+use "../input/event.cst" as ie;
 use "../window/x11/x11.cst" as x11;
 use "../window/x11/bind/xlib.cst" as xlib;
 use "../window/x11/bind/x.cst" as x;
@@ -494,12 +495,15 @@ fn close_button(h as i64) as void {
     xlib.XFlush(other);
 }
 
-// A widget that hears keys: how many presses, and whether the last repeats.
+// A widget that hears keys: how many presses, and whether the last repeats;
+// and the pointer: the last button pressed over it, its releases, cancels.
 struct Rec {
-    downs  as i64;
-    ups    as i64;
-    repeat as i32;
-    button as i32;   // the last pressed over it
+    downs    as i64;
+    ups      as i64;
+    repeat   as i32;
+    button   as i32;
+    released as i64;
+    cancels  as i64;
 }
 
 let is tree.Kind as rec_kind with mut;
@@ -519,6 +523,14 @@ fn rec_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
         d.button = e.button;
         return 1;
     }
+    if (e.kind == event.POINTER_UP) {
+        d.released = d.released + 1;
+        return 1;
+    }
+    if (e.kind == event.POINTER_CANCEL) {
+        d.cancels = d.cancels + 1;
+        return 1;
+    }
     return 0;
 }
 
@@ -529,6 +541,7 @@ fn rec_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, ou
     out.pref_h = 20.0;
 }
 
+// What happened to h's window, as the platform says it.
 fn feed(h as i64, kind as i32, px as i64, py as i64) as void {
     let is wevent.Event as ev;
     wevent.clear(&ev);
@@ -538,26 +551,74 @@ fn feed(h as i64, kind as i32, px as i64, py as i64) as void {
     host.feed(hs, h, &ev, time.now_ms());
 }
 
+// What a person did there, as the platform's translator says it.
+fn put(h as i64, e as *ie.Event) as void { host.feed_input(hs, h, e, time.now_ms()); }
+
+// The pointer: kind (ENTER, LEAVE, MOTION) at px, py.
+fn feed_at(h as i64, kind as i32, px as i64, py as i64) as void {
+    let is ie.Event as ev;
+    ie.clear(&ev);
+    ev.kind = kind;
+    ev.x = px;
+    ev.y = py;
+    put(h, &ev);
+}
+
 fn feed_button(h as i64, kind as i32, button as i32, px as i64, py as i64) as void {
-    let is wevent.Event as ev;
-    wevent.clear(&ev);
+    let is ie.Event as ev;
+    ie.clear(&ev);
     ev.kind = kind;
     ev.button = button;
     ev.x = px;
     ev.y = py;
-    host.feed(hs, h, &ev, time.now_ms());
+    put(h, &ev);
 }
 
-fn feed_key(h as i64, kind as i32, key as i32, code as i32, mods as i32, text as *u8, n as i64) as void {
-    let is wevent.Event as ev;
-    wevent.clear(&ev);
+// A wheel's notches, dx right and dy down, at px, py.
+fn feed_scroll(h as i64, dx as f64, dy as f64, px as i64, py as i64) as void {
+    let is ie.Event as ev;
+    ie.clear(&ev);
+    ev.kind = ie.SCROLL;
+    ev.source = ie.SCROLL_WHEEL;
+    ev.dx = dx;
+    ev.dy = dy;
+    ev.x = px;
+    ev.y = py;
+    put(h, &ev);
+}
+
+// A key (kind KEY_DOWN or KEY_UP), and for a press the text it typed after
+// it, n bytes, as a translator says it.
+fn feed_key(h as i64, kind as i32, key as i32, mods as i32, repeat as i32, text as *u8, n as i64) as void {
+    let is ie.Event as ev;
+    ie.clear(&ev);
     ev.kind = kind;
     ev.key = key;
-    ev.keycode = code;
+    ev.shortcut = key;
     ev.modifiers = mods;
+    ev.repeat = repeat;
+    put(h, &ev);
+    if (kind == ie.KEY_DOWN && n > 0) { feed_text(h, text, n, 1, mods); }
+}
+
+// Text, n bytes: from_key 1 typed by the key just before, 0 an input method's.
+fn feed_text(h as i64, text as *u8, n as i64, from_key as i32, mods as i32) as void {
+    let is ie.Event as ev;
+    ie.clear(&ev);
+    ev.kind = ie.TEXT;
     ev.text = text;
     ev.text_len = n;
-    host.feed(hs, h, &ev, time.now_ms());
+    ev.from_key = from_key;
+    ev.modifiers = mods;
+    put(h, &ev);
+}
+
+fn feed_cancel(h as i64) as void {
+    let is ie.Event as ev;
+    ie.clear(&ev);
+    ev.kind = ie.CANCEL;
+    ev.detail = ie.CANCEL_FOCUS;
+    put(h, &ev);
 }
 
 let is i64 as rounds with mut = 0;
@@ -670,12 +731,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     settle();
     check("keys typed: the entry's text", same(entry.text(t, e), entry.length(t, e), "ab") == 1);
     let is math.rect.Rect as er = layout.window_rect(t, e);
-    let is wevent.Event as mv;
-    wevent.clear(&mv);
-    mv.kind = wevent.MOUSE_MOVE;
-    mv.x = cast(i64, (er.x + 10.0) * s);
-    mv.y = cast(i64, (er.y + er.h / 2.0) * s);
-    host.feed(hs, main_w, &mv, time.now_ms());
+    feed_at(main_w, ie.MOTION, cast(i64, (er.x + 10.0) * s), cast(i64, (er.y + er.h / 2.0) * s));
     settle();
     check("over the entry: a text beam", host.pointer_shape(hs, main_w) == tree.SHAPE_TEXT);
     xlib.XResizeWindow(other, xid_of(main_w), cast(u32, 420), cast(u32, 260));
@@ -899,103 +955,121 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as sx = cast(i64, (scr.x + 20.0) * fs);
     let is i64 as sy = cast(i64, (scr.y + 20.0) * fs);
     // The pointer coming in and leaving.
-    feed(fw, wevent.ENTER, sx, sy);
+    feed_at(fw, ie.ENTER, sx, sy);
     check("entering: under the pointer", router.hover(rf) != 0);
-    feed(fw, wevent.LEAVE, sx, sy);
+    feed_at(fw, ie.LEAVE, sx, sy);
     check("leaving: nothing under it", router.hover(rf) == 0);
     // The modifiers held, as the pointer's events say them.
-    let is wevent.Event as pm;
-    wevent.clear(&pm);
-    pm.kind = wevent.MOUSE_MOVE;
+    let is ie.Event as pm;
+    ie.clear(&pm);
+    pm.kind = ie.MOTION;
     pm.x = sx;
     pm.y = sy;
     pm.modifiers = keys.MOD_CONTROL;
-    host.feed(hs, fw, &pm, time.now_ms());
+    put(fw, &pm);
     check("moved with Ctrl held: held", router.modifiers(rf) == keys.MOD_CONTROL);
     pm.modifiers = 0;
-    host.feed(hs, fw, &pm, time.now_ms());
+    put(fw, &pm);
     check("moved with nothing held: nothing", router.modifiers(rf) == 0);
-    pm.kind = wevent.ENTER;
+    pm.kind = ie.ENTER;
     pm.modifiers = keys.MOD_ALT;
-    host.feed(hs, fw, &pm, time.now_ms());
+    put(fw, &pm);
     let is i32 as entered_alt = cast(i32, router.modifiers(rf) == keys.MOD_ALT);
-    pm.kind = wevent.MOUSE_DOWN;
+    pm.kind = ie.BUTTON_DOWN;
     pm.button = 3;
     pm.modifiers = keys.MOD_CONTROL;
-    host.feed(hs, fw, &pm, time.now_ms());
+    put(fw, &pm);
     let is i32 as down_ctrl = cast(i32, router.modifiers(rf) == keys.MOD_CONTROL);
-    pm.kind = wevent.MOUSE_UP;
+    pm.kind = ie.BUTTON_UP;
     pm.modifiers = keys.MOD_SHIFT;
-    host.feed(hs, fw, &pm, time.now_ms());
+    put(fw, &pm);
     let is i32 as up_shift = cast(i32, router.modifiers(rf) == keys.MOD_SHIFT);
-    pm.kind = wevent.WHEEL;
-    pm.wheel = 0;
+    pm.kind = ie.SCROLL;
     pm.modifiers = keys.MOD_SUPER;
-    host.feed(hs, fw, &pm, time.now_ms());
-    check("entered, pressed, let go, a wheel: each as it says", entered_alt == 1 && down_ctrl == 1 && up_shift == 1 &&
+    put(fw, &pm);
+    check("entered, pressed, let go, a scroll: each as it says", entered_alt == 1 && down_ctrl == 1 && up_shift == 1 &&
           router.modifiers(rf) == keys.MOD_SUPER);
-    pm.kind = wevent.MOUSE_MOVE;
+    pm.kind = ie.MOTION;
     pm.modifiers = 0;
-    host.feed(hs, fw, &pm, time.now_ms());
-    feed(fw, wevent.LEAVE, sx, sy);
+    put(fw, &pm);
+    feed_at(fw, ie.LEAVE, sx, sy);
     // The wheel, down and sideways.
-    let is wevent.Event as wh;
-    wevent.clear(&wh);
-    wh.kind = wevent.WHEEL;
-    wh.wheel = 0 - 1;
-    wh.x = sx;
-    wh.y = sy;
-    host.feed(hs, fw, &wh, time.now_ms());
+    feed_scroll(fw, 0.0, 1.0, sx, sy);
     settle_long();
     check("the wheel turned down: scrolled down", scroll.offset_y(tf, sc) > 0.0);
-    wh.wheel = 1;
-    host.feed(hs, fw, &wh, time.now_ms());
+    feed_scroll(fw, 0.0, 0.0 - 1.0, sx, sy);
     settle_long();
     check("and back up", scroll.offset_y(tf, sc) == 0.0);
-    feed_button(fw, wevent.MOUSE_DOWN, 7, sx, sy);
-    feed_button(fw, wevent.MOUSE_UP, 7, sx, sy);
+    feed_scroll(fw, 1.0, 0.0, sx, sy);
     settle_long();
     let is f64 as across = scroll.offset_x(tf, sc);
-    feed_button(fw, wevent.MOUSE_DOWN, 7, sx, sy);
+    feed_scroll(fw, 1.0, 0.0, sx, sy);
     settle_long();
-    feed_button(fw, wevent.MOUSE_DOWN, 6, sx, sy);
+    feed_scroll(fw, 0.0 - 1.0, 0.0, sx, sy);
     settle_long();
     check("a sideways notch each way, as far", across > 0.0 && scroll.offset_x(tf, sc) == across);
-    feed_button(fw, wevent.MOUSE_DOWN, 6, sx, sy);
+    feed_scroll(fw, 0.0 - 1.0, 0.0, sx, sy);
     settle_long();
     check("and back", scroll.offset_x(tf, sc) == 0.0);
-    feed_button(fw, wevent.MOUSE_DOWN, 8, sx, sy);
-    feed_button(fw, wevent.MOUSE_UP, 8, sx, sy);
+    feed_button(fw, ie.BUTTON_DOWN, 8, sx, sy);
+    feed_button(fw, ie.BUTTON_UP, 8, sx, sy);
     check("another button: nothing", scroll.offset_x(tf, sc) == 0.0 && router.capture(rf) == 0);
     // Every button over what hears them: the third too.
     let is math.rect.Rect as recr = layout.window_rect(tf, rec);
-    feed_button(fw, wevent.MOUSE_DOWN, 3, cast(i64, (recr.x + 5.0) * fs), cast(i64, (recr.y + 5.0) * fs));
-    feed_button(fw, wevent.MOUSE_UP, 3, cast(i64, (recr.x + 5.0) * fs), cast(i64, (recr.y + 5.0) * fs));
-    check("the third button", cast(*Rec, tree.data(tf, rec)).button == 3);
+    let is i64 as rx = cast(i64, (recr.x + 5.0) * fs);
+    let is i64 as ry = cast(i64, (recr.y + 5.0) * fs);
+    let is *Rec as rd = cast(*Rec, tree.data(tf, rec));
+    feed_button(fw, ie.BUTTON_DOWN, 3, rx, ry);
+    feed_button(fw, ie.BUTTON_UP, 3, rx, ry);
+    check("the third button", rd.button == 3 && rd.released == 1);
+    // A press the platform took, to move the window from: no release comes,
+    // and it clicks nothing.
+    feed_button(fw, ie.BUTTON_DOWN, 1, rx, ry);
+    check("pressed: held", router.capture(rf) == rec);
+    let is ie.Event as taken;
+    ie.clear(&taken);
+    taken.kind = ie.BUTTON_UP;
+    taken.detail = ie.BUTTON_TAKEN;
+    taken.button = 1;
+    taken.x = rx;
+    taken.y = ry;
+    put(fw, &taken);
+    check("taken by the platform: let go, cancelled, not released", router.capture(rf) == 0 && rd.cancels == 1 &&
+          rd.released == 1);
+    // Everything let go: the press held too.
+    feed_button(fw, ie.BUTTON_DOWN, 1, rx, ry);
+    feed_cancel(fw);
+    check("a cancel: the press let go, clicking nothing", router.capture(rf) == 0 && rd.cancels == 2 && rd.released == 1);
     // Keys: held, let go, typed with a command's modifier.
     router.focus(tf, rf, rec, 1);
-    let is *Rec as rd = cast(*Rec, tree.data(tf, rec));
-    feed_key(fw, wevent.KEY_DOWN, keys.A, 38, 0, "a", 1);
+    feed_key(fw, ie.KEY_DOWN, keys.A, 0, 0, "a", 1);
     let is i32 as first_repeat = rd.repeat;
-    feed_key(fw, wevent.KEY_DOWN, keys.A, 38, 0, "a", 1);
-    check("a key held: its presses after the first repeat", rd.downs == 2 && first_repeat == 0 && rd.repeat == 1);
-    feed_key(fw, wevent.KEY_UP, keys.A, 38, 0, "", 0);
-    feed_key(fw, wevent.KEY_DOWN, keys.A, 38, 0, "a", 1);
-    check("let go, pressed again: not a repeat", rd.ups == 1 && rd.downs == 3 && rd.repeat == 0);
-    feed_key(fw, wevent.KEY_DOWN, keys.B, 56, 0, "b", 1);
+    feed_key(fw, ie.KEY_DOWN, keys.A, 0, 1, "a", 1);
+    check("a key held: the platform's repeats, repeats", rd.downs == 2 && first_repeat == 0 && rd.repeat == 1);
+    feed_key(fw, ie.KEY_UP, keys.A, 0, 0, "", 0);
+    check("let go", rd.ups == 1);
     feed(fw, wevent.FOCUS_OUT, 0, 0);
-    feed_key(fw, wevent.KEY_DOWN, keys.B, 56, 0, "b", 1);
-    check("the keyboard gone and back: nothing held", rd.repeat == 0 && app.is_active(&a, fw) == 0);
+    check("the keyboard gone: not active", app.is_active(&a, fw) == 0);
     feed(fw, wevent.FOCUS_IN, 0, 0);
     check("the keyboard here: active", app.is_active(&a, fw) == 1);
     router.focus(tf, rf, e3, 1);
     entry.set_text(tf, e3, "", 0);
-    feed_key(fw, wevent.KEY_DOWN, keys.C, 54, keys.MOD_CONTROL, "c", 1);
-    feed_key(fw, wevent.KEY_DOWN, keys.D, 40, keys.MOD_ALT, "d", 1);
-    feed_key(fw, wevent.KEY_DOWN, keys.E, 26, keys.MOD_SUPER, "e", 1);
-    check("with Control, Alt or Super: no text", entry.length(tf, e3) == 0);
-    feed_key(fw, wevent.KEY_DOWN, keys.F, 41, keys.MOD_SHIFT, "F", 1);
-    check("with Shift: its text", same(entry.text(tf, e3), entry.length(tf, e3), "F") == 1);
+    // A key a shortcut takes: what the platform says it typed is not typed.
+    router.add_shortcut(rf, keys.K, keys.MOD_SHIFT, fn_ptr(nothing), cast(*u8, 0));
+    feed_key(fw, ie.KEY_DOWN, keys.K, keys.MOD_SHIFT, 0, "K", 1);
+    check("a key taken: its text not typed", entry.length(tf, e3) == 0);
+    feed_key(fw, ie.KEY_DOWN, keys.F, keys.MOD_SHIFT, 0, "F", 1);
+    check("a key not taken: its text", same(entry.text(tf, e3), entry.length(tf, e3), "F") == 1);
+    feed_text(fw, "x", 1, 0, keys.MOD_CONTROL);
+    check("an input method's text, whatever is held: typed", same(entry.text(tf, e3), entry.length(tf, e3), "Fx") == 1);
+    feed_key(fw, ie.KEY_DOWN, keys.G, 0, 0, "", 0);
+    feed_cancel(fw);
+    feed_text(fw, "g", 1, 1, 0);
+    check("a key's text after a cancel: not its", same(entry.text(tf, e3), entry.length(tf, e3), "Fx") == 1);
+    // A dead key that did not compose: one key, two characters.
+    feed_key(fw, ie.KEY_DOWN, keys.H, 0, 0, "´", 2);
+    feed_text(fw, "h", 1, 1, 0);
+    check("one key's text, all of it", same(entry.text(tf, e3), entry.length(tf, e3), "Fx´h") == 1);
     // The window manager's state of it.
     let is wevent.Event as sev;
     wevent.clear(&sev);
@@ -1077,7 +1151,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     check("a DPI of 0: not taken", app.scale(&a, fw) == fs);
     // Nor by the host: the pointer still where it is, in logical pixels.
     let is math.rect.Rect as e3at = layout.window_rect(tf, e3);
-    feed(fw, wevent.MOUSE_MOVE, cast(i64, (e3at.x + 5.0) * fs), cast(i64, (e3at.y + e3at.h / 2.0) * fs));
+    feed_at(fw, ie.MOTION, cast(i64, (e3at.x + 5.0) * fs), cast(i64, (e3at.y + e3at.h / 2.0) * fs));
     check("a DPI of 0: the pointer where it is", router.hover(rf) == e3);
     feed(fw, wevent.SETTINGS, 0, 0);
     check("told they changed: read again, the DPI as the desktop says", app.scale(&a, fw) == fs);
@@ -1105,17 +1179,16 @@ fn main(argc as i64, argv as *u8) as i32 {
     check("closed by its button, nothing in it asked: hidden", app.is_shown(&a, bare) == 0 && xid_of(bare) == 0 &&
           app.window_valid(&a, bare) == 1);
     // Modal over its owner: the owner told nothing of the pointer or keys.
-    feed(fw, wevent.LEAVE, sx, sy);
+    feed_at(fw, ie.LEAVE, sx, sy);
     app.set_modal(&a, bare, 1);
     app.show(&a, bare);
     settle();
     let is i64 as downs_before = rd.downs;
     router.focus(tf, rf, rec, 1);
-    feed_key(fw, wevent.KEY_DOWN, keys.G, 42, 0, "g", 1);
-    feed(fw, wevent.ENTER, sx, sy);
-    wh.wheel = 0 - 1;
-    host.feed(hs, fw, &wh, time.now_ms());
-    feed_button(fw, wevent.MOUSE_DOWN, 1, sx, sy);
+    feed_key(fw, ie.KEY_DOWN, keys.G, 0, 0, "g", 1);
+    feed_at(fw, ie.ENTER, sx, sy);
+    feed_scroll(fw, 0.0, 1.0, sx, sy);
+    feed_button(fw, ie.BUTTON_DOWN, 1, sx, sy);
     close_button(fw);
     settle_long();
     check("blocked: no key", rd.downs == downs_before);
@@ -1299,8 +1372,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     settle();
     let is *router.Router as qr = app.router(&a, quit_after);
     router.add_shortcut(qr, keys.Q, keys.MOD_CONTROL, fn_ptr(on_quit_timer), cast(*u8, 0));
-    feed_key(quit_after, wevent.KEY_DOWN, keys.Q, 24, keys.MOD_CONTROL, "", 0);
-    feed_key(quit_after, wevent.KEY_UP, keys.Q, 24, keys.MOD_CONTROL, "", 0);
+    feed_key(quit_after, ie.KEY_DOWN, keys.Q, keys.MOD_CONTROL, 0, "", 0);
+    feed_key(quit_after, ie.KEY_UP, keys.Q, keys.MOD_CONTROL, 0, "", 0);
     settle();
     check("closed by its own shortcut: gone, nothing broken", app.window_valid(&a, quit_after) == 0 && xid_of(quit_after) == 0);
     // --- A frame of its own ---
@@ -1371,13 +1444,18 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is math.rect.Rect as hr = layout.window_rect(frt, decoration.header_of(frt, deco));
     let is i64 as hx = cast(i64, (hr.x + hr.w / 2.0) * frs);
     let is i64 as hy = cast(i64, (hr.y + hr.h / 2.0) * frs);
-    feed_button(framed, wevent.MOUSE_DOWN, 1, hx, hy);
-    feed(framed, wevent.MOUSE_MOVE, hx + 30, hy + 5);
+    // Pressed and dragged where X has it, so the window's translator holds
+    // the button.
+    button_event(framed, x.ButtonPress, hx, hy);
+    motion_event(framed, hx + 30, hy + 5);
+    settle();
     check("its header dragged: moved by the window manager", told_wm("_NET_WM_MOVERESIZE", frx) == 1 && wm_got[2] == device.MOVE);
     // The window manager has the pointer now, and the release goes to it:
-    // let go here.
-    check("let go: the press over", router.capture(app.router(&a, framed)) == 0);
-    feed_button(framed, wevent.MOUSE_UP, 1, hx + 30, hy + 5);
+    // the window says the press was taken, and it is let go here.
+    check("taken: the press over", router.capture(app.router(&a, framed)) == 0);
+    button_event(framed, x.ButtonRelease, hx + 30, hy + 5);
+    settle();
+    check("a release after it: nothing", router.capture(app.router(&a, framed)) == 0);
     // Moved from the keyboard, nothing pressed: nothing let go of either —
     // the close button where it was asked not clicked.
     let is i64 as close_btn = headerbar.button(frt, decoration.header_of(frt, deco), headerbar.CLOSE);
@@ -1388,8 +1466,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     router.add_shortcut(app.router(&a, framed), keys.M, keys.MOD_CONTROL, fn_ptr(on_move_key), cast(*u8, 0));
     asked_close = 0;
     refuse = 1;
-    feed_key(framed, wevent.KEY_DOWN, keys.M, 58, keys.MOD_CONTROL, "", 0);
-    feed_key(framed, wevent.KEY_UP, keys.M, 58, keys.MOD_CONTROL, "", 0);
+    feed_key(framed, ie.KEY_DOWN, keys.M, keys.MOD_CONTROL, 0, "", 0);
+    feed_key(framed, ie.KEY_UP, keys.M, keys.MOD_CONTROL, 0, "", 0);
     check("moved from the keyboard: asked, nothing let go of", close_btn != 0 && told_wm("_NET_WM_MOVERESIZE", frx) == 1 &&
           wm_got[2] == device.MOVE && asked_close == 0 && app.window_valid(&a, framed) == 1);
     refuse = 0;
@@ -1495,13 +1573,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     check("a window whose pixels move", tree.moves(st) == 1);
     let is i64 as notch with mut = 0;
     while (notch < 3) {
-        let is wevent.Event as wh;
-        wevent.clear(&wh);
-        wh.kind = wevent.WHEEL;
-        wh.wheel = 0 - 1;
-        wh.x = spw / 2;
-        wh.y = sph / 2;
-        host.feed(hs, sw, &wh, time.now_ms());
+        feed_scroll(sw, 0.0, 1.0, spw / 2, sph / 2);
         host.step(hs, 20);
         notch = notch + 1;
     }
@@ -1521,13 +1593,7 @@ fn main(argc as i64, argv as *u8) as i32 {
           scroll.offset_y(st, sarea) > 0.0 && sdiff == 0);
     // Back up a notch: moved the other way.
     let is f64 as down_at = scroll.offset_y(st, sarea);
-    let is wevent.Event as wu;
-    wevent.clear(&wu);
-    wu.kind = wevent.WHEEL;
-    wu.wheel = 1;
-    wu.x = spw / 2;
-    wu.y = sph / 2;
-    host.feed(hs, sw, &wu, time.now_ms());
+    feed_scroll(sw, 0.0, 0.0 - 1.0, spw / 2, sph / 2);
     quiet();
     got_a = shot(sw, spw, sph, cast(*i64, &shot_a));
     tree.invalidate_paint_subtree(st, tree.root(st));

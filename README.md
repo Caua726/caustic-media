@@ -33,7 +33,7 @@ window and drive the GPU itself.
 | `gpu/software/` | the software rasteriser | **done**, tested |
 | `window/` | window, display, platform | X11 tested; native Wayland socket backend and direct Win32 backend; see each backend's current state for verification and blockers |
 | `gpu/` (device) | the portable device, in the shape of wgpu | in progress; vk, gl, d3d designed |
-| `input/` | keyboard, mouse, touch, pen, gamepad, haptics, sensors | design note only |
+| `input/` | keyboard, mouse, touch, pen, gamepad, haptics, sensors | cooked events, their queue, key ids and fed state built and used by every window backend; devices of its own designed |
 | `render/` | the framework: meshes, sprites, materials, cameras, a frame | design note only |
 | `3d/` | models, meshes, skeletons, animation | design note only |
 | `image/` | pixels on the CPU: load, save, transform, generate, atlas | design note only |
@@ -235,7 +235,8 @@ windows, the desktop's settings, its own fonts and text, and accessibility.
 | `ui/` | the toolkit: widgets, layout, events, painting, themes, animations, dialogs, choosers, menus, lists, trees, tables, drag and drop, AT-SPI, two languages, the application's loop, icons, the tray, notifications, one instance |
 | `window/wayland` | direct socket backend, xkbcommon input, selections, DnD, text-input-v3; Weston backend/host smoke; three-example visual acceptance remains incomplete |
 | `window/win32` | generated SDK/COM declarations, Win64 ABI bridge and native software window backend exercised under Wine; portable toolkit integration blocked by `__caustic_chkstk` |
-| Vulkan, `input/` | a design note each, and the work it describes |
+| `input/` | cooked input every window backend translates into: keys with their place and repeat, text, the pointer, scrolling, cancels; sampled state as something fed |
+| Vulkan | a design note, and the work it describes |
 
 Each layer's note says what it holds now under its "Current state".
 

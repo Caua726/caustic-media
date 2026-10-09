@@ -2,7 +2,8 @@
 use "std/mem.cst" as mem;
 use "../../gpu/software/target.cst" as tgt;
 use "../event.cst" as event;
-use "../keys.cst" as keys;
+use "../../input/event.cst" as ie;
+use "../../input/keys.cst" as keys;
 use "bind/types.cst" as t;
 use "bind/user32.cst" as u;
 use "bind/gdi32.cst" as g;
@@ -33,11 +34,6 @@ struct DIBInfo {
     masks as [3]u32;
 }
 
-struct Queued {
-    e as event.Event;
-    text as [256]u8;
-    owned as *u8;
-}
 
 struct Native {
     hwnd as i64;
@@ -61,14 +57,13 @@ struct Native {
     restore_style as i64;
     resized as i32;
     state as i32;
-    key_down as [256]u8;
     focused as i32;
+    // The pointer as the translator last said it, and the buttons it holds:
+    // where a LEAVE is, and whether the capture is still wanted.
     mouse_x as i64;
     mouse_y as i64;
-    mouse_dx as i64;
-    mouse_dy as i64;
     buttons as i32;
-    wheel_y as i64;
+    // Wheel motion short of a notch, kept for the next message.
     wheel_remainder as i32;
     wheel_x_remainder as i32;
     entered as i32;
@@ -79,6 +74,7 @@ struct Native {
     caret_w as i64;
     caret_h as i64;
     high_surrogate as u16;
+    after_key as i32;       // a key went down, and nothing let it go since: a WM_CHAR now is its
     cursor as i64;
     icon as i64;            // given to the window for both icon sizes
     extent_left as i64;
@@ -104,11 +100,12 @@ struct Native {
     layer_width as i64;
     layer_height as i64;
     clip as clipboard.State;
+    // Cooked input, as this file's translator says it (input/event.cst).
+    input as *ie.Queue;
+    // The window's own events: resized, closed, its state.
     event_head as i64;
     event_len as i64;
-    last_text as *u8;
-    last_bytes as i64;
-    events as [128]Queued;
+    events as [128]event.Event;
 }
 
 struct Config {
@@ -222,32 +219,14 @@ fn _signed16(v as u64) as i64 {
     return n;
 }
 
-fn _release_text(q as *Queued) as void {
-    if (cast(i64, q.owned) != 0) { mem.core.munmap(q.owned, q.e.text_len + 1); q.owned = cast(*u8, 0); }
-}
-
-fn _reserve(n as *Native, e as *event.Event) as *Queued {
+// A window event at the end of its queue, the oldest let go when it is full.
+fn _enqueue(n as *Native, e as *event.Event) as void {
     if (n.event_len == MAX_EVENTS) {
-        _release_text(&n.events[n.event_head]);
         n.event_head = (n.event_head + 1) % MAX_EVENTS;
         n.event_len = n.event_len - 1;
     }
-    let is i64 as at = (n.event_head + n.event_len) % MAX_EVENTS;
-    let is *Queued as q = &n.events[at];
-    q.e = *e; q.owned = cast(*u8, 0); q.e.text = cast(*u8, &q.text[0]);
-    if (e.text_len > 255) {
-        q.owned = mem.core.mmap_anon(e.text_len + 1);
-        if (cast(i64, q.owned) == 0) { return cast(*Queued, 0); }
-        q.e.text = q.owned;
-    }
-    q.e.text[e.text_len] = cast(u8, 0);
+    n.events[(n.event_head + n.event_len) % MAX_EVENTS] = *e;
     n.event_len = n.event_len + 1;
-    return q;
-}
-
-fn _enqueue(n as *Native, e as *event.Event) as void {
-    let is *Queued as q = _reserve(n, e);
-    if (cast(i64, q) != 0 && e.text_len > 0) { mem.memcpy(q.e.text, e.text, e.text_len); }
 }
 
 fn _emit(n as *Native, kind as i32, raw as i32, x as i64, y as i64, value as i64) as void {
@@ -259,29 +238,50 @@ fn _emit(n as *Native, kind as i32, raw as i32, x as i64, y as i64, value as i64
     e.y = y;
     if (kind == event.RESIZE) { e.width = n.width; e.height = n.height; }
     if (kind == event.STATE) { e.state = cast(i32, value); }
-    if (kind == event.KEY_DOWN || kind == event.KEY_UP) {
-        let is i64 as vk = cast(i64, value & 65535);
-        e.key = _key(cast(u32, vk));
-        e.keycode = cast(i32, (value >> 16) & 255);
-        if (e.keycode == 0) { e.keycode = cast(i32, vk); }
-        e.modifiers = _mods();
-        if (vk >= 0 && vk < 256) {
-            if (kind == event.KEY_DOWN) { n.key_down[vk] = cast(u8, 1); }
-            else { n.key_down[vk] = cast(u8, 0); }
-        }
-    }
-    if (kind == event.MOUSE_DOWN || kind == event.MOUSE_UP) {
-        e.button = cast(i32, value);
-        e.modifiers = _mods();
-    }
-    if (kind == event.MOUSE_MOVE || kind == event.ENTER || kind == event.LEAVE || kind == event.WHEEL) {
-        e.modifiers = _mods();
-    }
-    if (kind == event.WHEEL) { e.wheel = cast(i32, value); }
     _enqueue(n, &e);
 }
 
-fn _utf8(n as *Native, code as i64, kind as i32, cursor as i64) as void {
+// --- The translator: messages as cooked input ---
+
+fn _input(kind as i32) as ie.Event {
+    let is ie.Event as e;
+    ie.clear(&e);
+    e.kind = kind;
+    e.modifiers = _mods();
+    e.time_ms = cast(i64, u.GetMessageTime()) & 4294967295;
+    return e;
+}
+
+fn _push(n as *Native, e as *ie.Event, text as *u8, len as i64) as void {
+    if (cast(i64, n.input) != 0) { ie.push(n.input, e, text, len); }
+}
+
+// A key down or up: vk the virtual key (sides told apart), lp the message's.
+fn _key_event(n as *Native, kind as i32, vk as i64, lp as i64) as void {
+    let is ie.Event as e = _input(kind);
+    e.key = _key(cast(u32, vk));
+    e.shortcut = e.key;
+    // The scan code, bit 7 the extended flag: the key's place.
+    e.physical = cast(i32, ((lp >> 16) & 255) | (((lp >> 24) & 1) << 7));
+    if (e.physical == 0) { e.physical = cast(i32, vk); }
+    // Bit 30: down before this message — the system's repeat.
+    if (kind == ie.KEY_DOWN) { e.repeat = cast(i32, ((lp >> 30) & 1) != 0); }
+    _push(n, &e, cast(*u8, 0), 0);
+}
+
+// A pointer event at x, y of the client.
+fn _pointer(n as *Native, kind as i32, x as i64, y as i64, button as i32) as void {
+    let is ie.Event as e = _input(kind);
+    e.x = x;
+    e.y = y;
+    e.button = button;
+    _push(n, &e, cast(*u8, 0), 0);
+}
+
+// What was typed: one code point, as UTF-8 — the key's when one just went
+// down (TranslateMessage posts its WM_CHAR before the next key's message),
+// another program's or an input method's otherwise.
+fn _typed(n as *Native, code as i64) as void {
     if (code <= 0) { return; }
     let is [4]u8 as b;
     let is i64 as count with mut = 0;
@@ -302,19 +302,14 @@ fn _utf8(n as *Native, code as i64, kind as i32, cursor as i64) as void {
         b[3] = cast(u8, 128 | (code & 63));
         count = 4;
     }
-    let is event.Event as e;
-    event.clear(&e);
-    e.kind = kind;
-    e.text = cast(*u8, &b[0]);
-    e.text_len = count;
-    e.cursor = cursor;
-    _enqueue(n, &e);
+    let is ie.Event as e = _input(ie.TEXT);
+    e.from_key = n.after_key;
+    _push(n, &e, &b[0], count);
 }
+
 fn _empty_preedit(n as *Native) as void {
-    let is event.Event as empty;
-    event.clear(&empty);
-    empty.kind = event.PREEDIT;
-    _enqueue(n, &empty);
+    let is ie.Event as e = _input(ie.PREEDIT);
+    _push(n, &e, cast(*u8, 0), 0);
 }
 
 
@@ -452,6 +447,8 @@ fn _edge(n as *Native, hx as i64, hy as i64) as i64 {
     return t.HTRIGHT;
 }
 
+// The composition string index says (GCS_RESULTSTR, GCS_COMPSTR) as kind
+// (TEXT, PREEDIT), UTF-8, the caret with a preedit.
 fn _ime_text(n as *Native, h as i64, index as i32, kind as i32) as void {
     let is i32 as bytes = ime.ImmGetCompositionStringW(h, cast(u32, index), cast(*u8, 0), 0);
     if (bytes < 0 || (bytes % 2) != 0) { return; }
@@ -466,29 +463,32 @@ fn _ime_text(n as *Native, h as i64, index as i32, kind as i32) as void {
         return;
     }
     let is *u16 as wide = cast(*u16, storage);
-    let is event.Event as e;
-    event.clear(&e); e.kind = kind;
+    let is ie.Event as e = _input(kind);
+    let is i64 as len with mut = 0;
     if (bytes > 0) {
-        e.text_len = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2,
-                                         cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0));
+        len = cast(i64, k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2,
+                                              cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0)));
     }
-    if (kind == event.PREEDIT) {
+    if (kind == ie.PREEDIT) {
         let is i32 as pos with mut = ime.ImmGetCompositionStringW(h, cast(u32, t.GCS_CURSORPOS), cast(*u8, 0), 0);
         if (pos < 0) { pos = 0; }
         if (pos > bytes / 2) { pos = bytes / 2; }
         if (pos > 0 && pos < bytes / 2 && wide[pos] >= 56320 && wide[pos] <= 57343) { pos = pos - 1; }
+        e.cursor = 0;
         if (pos > 0) {
-            e.cursor = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, pos,
-                                            cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0));
+            e.cursor = cast(i64, k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, pos,
+                                                       cast(*i8, 0), 0, cast(*i8, 0), cast(*i32, 0)));
         }
-        n.composition_on = cast(i32, e.text_len > 0);
+        n.composition_on = cast(i32, len > 0);
     }
-    if (e.text_len > 0 || kind == event.PREEDIT) {
-        let is *Queued as q = _reserve(n, &e);
-        if (cast(i64, q) != 0 && e.text_len > 0) {
-            k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2,
-                                 cast(*i8, q.e.text), cast(i32, e.text_len), cast(*i8, 0), cast(*i32, 0));
+    if (len > 0 || kind == ie.PREEDIT) {
+        // Longer than one event's text: the queue refuses it, and says so.
+        let is [4096]u8 as utf8;
+        if (len > 0 && len <= ie.TEXT_MAX) {
+            k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, bytes / 2, cast(*i8, &utf8[0]), cast(i32, len),
+                                  cast(*i8, 0), cast(*i32, 0));
         }
+        _push(n, &e, &utf8[0], len);
     }
     if (bytes > 512) { mem.core.munmap(storage, bytes); }
 }
@@ -497,10 +497,10 @@ fn _composition(n as *Native, flags as i64) as void {
     let is i64 as h = ime.ImmGetContext(n.hwnd);
     if (h == 0) { return; }
     if ((flags & t.GCS_RESULTSTR) != 0) {
-        _ime_text(n, h, cast(i32, t.GCS_RESULTSTR), event.TEXT);
+        _ime_text(n, h, cast(i32, t.GCS_RESULTSTR), ie.TEXT);
         n.composition_on = 0; _empty_preedit(n);
     }
-    if ((flags & t.GCS_COMPSTR) != 0) { _ime_text(n, h, cast(i32, t.GCS_COMPSTR), event.PREEDIT); }
+    if ((flags & t.GCS_COMPSTR) != 0) { _ime_text(n, h, cast(i32, t.GCS_COMPSTR), ie.PREEDIT); }
     ime.ImmReleaseContext(n.hwnd, h);
 }
 
@@ -720,22 +720,27 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
     if (cast(i64, msg) == t.WM_DWMCOMPOSITIONCHANGED) { _emit(n, event.COMPOSITOR, cast(i32, msg), 0, 0, 0); return 0; }
     if (cast(i64, msg) == t.WM_SETFOCUS) { n.focused = 1; _emit(n, event.FOCUS_IN, cast(i32, msg), 0, 0, 0); return 0; }
     if (cast(i64, msg) == t.WM_KILLFOCUS) {
-        n.focused = 0; n.high_surrogate = 0;
-        mem.memzero(cast(*u8, &n.key_down[0]), 256);
+        n.focused = 0; n.high_surrogate = 0; n.after_key = 0;
         if (n.composition_on == 1) { n.composition_on = 0; _empty_preedit(n); }
+        // A key let go while another window has the focus is never said
+        // here: everything held — keys and buttons — is let go now.
+        if (n.buttons != 0 && _ngrab == 0 && u.GetCapture() == hwnd) { u.ReleaseCapture(); }
+        n.buttons = 0;
+        if (cast(i64, n.input) != 0) { ie.cancel(n.input, ie.CANCEL_FOCUS); }
         _emit(n, event.FOCUS_OUT, cast(i32, msg), 0, 0, 0); return 0;
     }
     if (cast(i64, msg) == t.WM_KEYDOWN || cast(i64, msg) == t.WM_SYSKEYDOWN ||
         cast(i64, msg) == t.WM_KEYUP || cast(i64, msg) == t.WM_SYSKEYUP) {
-        let is i32 as key_kind with mut = event.KEY_DOWN;
-        if (cast(i64, msg) == t.WM_KEYUP || cast(i64, msg) == t.WM_SYSKEYUP) { key_kind = event.KEY_UP; }
+        let is i32 as key_kind with mut = ie.KEY_DOWN;
+        if (cast(i64, msg) == t.WM_KEYUP || cast(i64, msg) == t.WM_SYSKEYUP) { key_kind = ie.KEY_UP; }
         let is i64 as vk with mut = cast(i64, wp);
         let is i64 as scan = (lp >> 16) & 255;
         let is i64 as extended = (lp >> 24) & 1;
         if (vk == t.VK_SHIFT) { vk = cast(i64, u.MapVirtualKeyW(cast(u32, scan), cast(u32, t.MAPVK_VSC_TO_VK_EX))); }
         else if (vk == t.VK_CONTROL) { vk = t.VK_LCONTROL + extended; }
         else if (vk == t.VK_MENU) { vk = t.VK_LMENU + extended; }
-        _emit(n, key_kind, cast(i32, msg), 0, 0, vk | ((scan | (extended << 7)) << 16));
+        _key_event(n, key_kind, vk, lp);
+        n.after_key = cast(i32, key_kind == ie.KEY_DOWN);
         if (cast(i64, msg) == t.WM_SYSKEYDOWN || cast(i64, msg) == t.WM_SYSKEYUP) { return u.DefWindowProcW(hwnd, msg, wp, lp); }
         return 0;
     }
@@ -745,13 +750,13 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         if (unit >= 55296 && unit <= 56319) { n.high_surrogate = cast(u16, unit); return 0; }
         if (unit >= 56320 && unit <= 57343) {
             if (n.high_surrogate != 0) {
-                _utf8(n, 65536 + ((cast(i64, n.high_surrogate) - 55296) << 10) + unit - 56320, event.TEXT, 0);
+                _typed(n, 65536 + ((cast(i64, n.high_surrogate) - 55296) << 10) + unit - 56320);
                 n.high_surrogate = 0;
             }
             return 0;
         }
-        if (n.high_surrogate != 0) { _utf8(n, 65533, event.TEXT, 0); n.high_surrogate = 0; }
-        _utf8(n, unit, event.TEXT, 0);
+        if (n.high_surrogate != 0) { _typed(n, 65533); n.high_surrogate = 0; }
+        _typed(n, unit);
         return 0;
     }
     if (cast(i64, msg) == t.WM_IME_COMPOSITION) { _composition(n, lp); return 0; }
@@ -761,17 +766,16 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
     if (cast(i64, msg) == t.WM_MOUSEMOVE) {
         let is i64 as mx = _signed16(cast(u64, lp));
         let is i64 as my = _signed16(cast(u64, lp) >> 16);
-        n.mouse_dx = n.mouse_dx + mx - n.mouse_x; n.mouse_dy = n.mouse_dy + my - n.mouse_y;
         n.mouse_x = mx; n.mouse_y = my;
         if (n.entered == 0) {
-            n.entered = 1; _emit(n, event.ENTER, cast(i32, msg), mx, my, 0);
+            n.entered = 1; _pointer(n, ie.ENTER, mx, my, 0);
             let is t.TRACKMOUSEEVENT as track; mem.memset(cast(*u8, &track), 0, sizeof(t.TRACKMOUSEEVENT));
             track.cbSize = cast(u32, sizeof(t.TRACKMOUSEEVENT)); track.dwFlags = cast(u32, t.TME_LEAVE);
             track.hwndTrack = hwnd; u.TrackMouseEvent(&track);
         }
-        _emit(n, event.MOUSE_MOVE, cast(i32, msg), mx, my, 0); return 0;
+        _pointer(n, ie.MOTION, mx, my, 0); return 0;
     }
-    if (cast(i64, msg) == t.WM_MOUSELEAVE) { n.entered = 0; _emit(n, event.LEAVE, cast(i32, msg), n.mouse_x, n.mouse_y, 0); return 0; }
+    if (cast(i64, msg) == t.WM_MOUSELEAVE) { n.entered = 0; _pointer(n, ie.LEAVE, n.mouse_x, n.mouse_y, 0); return 0; }
     if (cast(i64, msg) == t.WM_LBUTTONDOWN || cast(i64, msg) == t.WM_LBUTTONUP ||
         cast(i64, msg) == t.WM_MBUTTONDOWN || cast(i64, msg) == t.WM_MBUTTONUP ||
         cast(i64, msg) == t.WM_RBUTTONDOWN || cast(i64, msg) == t.WM_RBUTTONUP) {
@@ -781,34 +785,42 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         if (cast(i64, msg) == t.WM_LBUTTONUP || cast(i64, msg) == t.WM_MBUTTONUP || cast(i64, msg) == t.WM_RBUTTONUP) { down = 0; }
         n.mouse_x = _signed16(cast(u64, lp)); n.mouse_y = _signed16(cast(u64, lp) >> 16);
         let is i32 as mask = cast(i32, 1 << (button - 1));
+        // A release of a button not held says nothing: its press was taken
+        // by the system to move or resize from, or let go by a CANCEL.
+        if (down == 0 && (n.buttons & mask) == 0) { return 0; }
         if (down == 1) { n.buttons = n.buttons | mask; if (_ngrab == 0) { u.SetCapture(hwnd); } }
         else { n.buttons = n.buttons & cast(i32, 0 - 1 - mask); if (n.buttons == 0 && _ngrab == 0) { u.ReleaseCapture(); } }
-        let is i32 as mouse_kind with mut = event.MOUSE_DOWN; if (down == 0) { mouse_kind = event.MOUSE_UP; }
-        _emit(n, mouse_kind, cast(i32, msg), n.mouse_x, n.mouse_y, button); return 0;
+        let is i32 as mouse_kind with mut = ie.BUTTON_DOWN; if (down == 0) { mouse_kind = ie.BUTTON_UP; }
+        _pointer(n, mouse_kind, n.mouse_x, n.mouse_y, button); return 0;
     }
     if (cast(i64, msg) == t.WM_MOUSEWHEEL || cast(i64, msg) == t.WM_MOUSEHWHEEL) {
         let is i64 as wx = _signed16(cast(u64, lp)); let is i64 as wy = _signed16(cast(u64, lp) >> 16);
         let is t.POINT as p; p.x = cast(i32, wx); p.y = cast(i32, wy); u.ScreenToClient(hwnd, &p);
         let is i32 as delta with mut = cast(i32, (wp >> 16) & 65535); if (delta >= 32768) { delta = delta - 65536; }
+        // As much as the wheel says, 120 a notch, finer where it is finer;
+        // whole notches counted from what is left over between messages.
+        let is ie.Event as e = _input(ie.SCROLL);
+        e.x = cast(i64, p.x);
+        e.y = cast(i64, p.y);
+        e.source = ie.SCROLL_WHEEL;
         if (cast(i64, msg) == t.WM_MOUSEHWHEEL) {
             n.wheel_x_remainder = n.wheel_x_remainder + delta;
             let is i32 as sideways = n.wheel_x_remainder / 120;
             n.wheel_x_remainder = n.wheel_x_remainder - sideways * 120;
-            let is i32 as side_button with mut = 7;
-            if (sideways < 0) { side_button = 6; }
-            let is i64 as steps with mut = cast(i64, sideways);
-            if (steps < 0) { steps = 0 - steps; }
-            while (steps > 0) {
-                _emit(n, event.MOUSE_DOWN, cast(i32, msg), p.x, p.y, side_button);
-                steps = steps - 1;
-            }
+            // Positive is to the right.
+            e.value120_x = delta;
+            e.dx = cast(f64, delta) / 120.0;
+            e.steps_x = sideways;
         } else {
             n.wheel_remainder = n.wheel_remainder + delta;
             let is i32 as notch = n.wheel_remainder / 120;
             n.wheel_remainder = n.wheel_remainder - notch * 120;
-            n.wheel_y = n.wheel_y + notch;
-            if (notch != 0) { _emit(n, event.WHEEL, cast(i32, msg), p.x, p.y, notch); }
+            // Positive is away from the user: up, so towards the start.
+            e.value120_y = 0 - delta;
+            e.dy = cast(f64, 0 - delta) / 120.0;
+            e.steps_y = 0 - notch;
         }
+        _push(n, &e, cast(*u8, 0), 0);
         return 0;
     }
     if (cast(i64, msg) == t.WM_NCDESTROY) {
@@ -863,6 +875,10 @@ fn open_config(c as *Config) as Window {
     n.decorated = c.decorated; n.dpi = cast(i32, u.GetDpiForSystem()); if (n.dpi < 96) { n.dpi = 96; }
     n.popup = c.popup;
     if (c.popup != 0 && c.owner == 0) { n.used = 0; return w; }
+    // Its input's queue, there before the window is: creating it already
+    // sends it messages.
+    n.input = ie.create();
+    if (cast(i64, n.input) == 0) { n.used = 0; w.err = NO_MEMORY; return w; }
     n.cursor = u.LoadCursorW(0, cast(*u16, t.IDC_ARROW));
     if (n.fixed == 1) {
         n.min_width = c.width; n.max_width = c.width;
@@ -898,11 +914,11 @@ fn open_config(c as *Config) as Window {
     if (c.popup != 0) { at_x = cast(i32, c.x) + r.left; at_y = cast(i32, c.y) + r.top; }
     let is i64 as hwnd = u.CreateWindowExW(ex, &_class_name[0], &title[0], style,
         at_x, at_y, outer_width, outer_height, c.owner, 0, _instance, cast(*u8, n));
-    if (hwnd == 0) { n.used = 0; w.err = NO_WINDOW; return w; }
+    if (hwnd == 0) { ie.destroy(n.input); n.input = cast(*ie.Queue, 0); n.used = 0; w.err = NO_WINDOW; return w; }
     n.hwnd = hwnd; n.alive = 1; n.dpi = cast(i32, u.GetDpiForWindow(hwnd)); if (n.dpi < 96) { n.dpi = 96; }
     let is t.RECT as client; u.GetClientRect(hwnd, &client);
     if (_dib(n, cast(i64, client.right - client.left), cast(i64, client.bottom - client.top)) == 0) {
-        u.DestroyWindow(hwnd); n.used = 0; w.err = NO_SURFACE; return w;
+        u.DestroyWindow(hwnd); ie.destroy(n.input); n.input = cast(*ie.Queue, 0); n.used = 0; w.err = NO_SURFACE; return w;
     }
     if (n.modal == 1 && n.owner != 0) { u.EnableWindow(n.owner, 0); }
     if (c.popup != 0) { u.ShowWindow(hwnd, cast(i32, t.SW_SHOWNOACTIVATE)); }
@@ -933,9 +949,8 @@ fn close(w as *Window) as void {
     _drop_layer(n);
     clipboard.clear(&n.clip);
     if (n.icon != 0) { u.DestroyIcon(n.icon); n.icon = 0; }
-    let is i64 as queued with mut = 0;
-    while (queued < MAX_EVENTS) { _release_text(&n.events[queued]); queued = queued + 1; }
-    if (cast(i64, n.last_text) != 0) { mem.core.munmap(n.last_text, n.last_bytes); n.last_text = cast(*u8, 0); }
+    ie.destroy(n.input);
+    n.input = cast(*ie.Queue, 0);
     n.pixels = cast(*u8, 0); n.used = 0; n.alive = 0; w.ok = 0;
 }
 
@@ -958,24 +973,29 @@ fn pump(w as *Window) as void {
         u.TranslateMessage(&msg); u.DispatchMessageW(&msg);
     }
 }
-// A frame begins: what the last one was told — resized, the pointer's motion,
-// the wheel — is an edge, not a level, and starts again from nothing.
+// A frame begins: resized is an edge, not a level, and starts again.
 fn next_frame(w as *Window) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || is_open(w) == 0) { return 0; }
-    n.resized = 0; n.mouse_dx = 0; n.mouse_dy = 0; n.wheel_y = 0;
+    n.resized = 0;
     pump(w);
     return 1;
 }
-fn pending(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.event_len > 0); }
+// Whether an event waits, of the window's own or of its input.
+fn pending(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    return cast(i32, n.event_len > 0 || ie.pending(n.input) == 1);
+}
 fn connection_fd(w as *Window) as i64 { return 0 - 1; }
 fn poll_event(w as *Window, out as *event.Event) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.event_len == 0) { return 0; }
-    if (cast(i64, n.last_text) != 0) { mem.core.munmap(n.last_text, n.last_bytes); }
-    let is *Queued as q = &n.events[n.event_head];
-    *out = q.e;
-    n.last_text = q.owned; n.last_bytes = q.e.text_len + 1; q.owned = cast(*u8, 0);
+    *out = n.events[n.event_head];
     n.event_head = (n.event_head + 1) % MAX_EVENTS; n.event_len = n.event_len - 1;
     return 1;
+}
+// Its cooked input, oldest first (input/event.cst): 1, or 0 when none waits.
+fn poll_input(w as *Window, out as *ie.Event) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    return ie.next(n.input, out);
 }
 fn acquire(w as *Window) as tgt.Target {
     let is *Native as n = _native(w); let is tgt.Target as out;
@@ -1001,60 +1021,6 @@ fn set_title(w as *Window, s as *u8, nbytes as i64) as void {
     }
     u.SetWindowTextW(w.hwnd, &wide[0]);
 }
-fn _vk(key as i32) as i32 {
-    if (key >= keys.A && key <= keys.Z) { return 65 + key - keys.A; }
-    if (key >= keys.NUM_0 && key <= keys.NUM_9) { return 48 + key - keys.NUM_0; }
-    if (key >= keys.F1 && key <= keys.F12) { return cast(i32, t.VK_F1) + key - keys.F1; }
-    let is i64 as v with mut = 0;
-    if (key == keys.SPACE) { v = t.VK_SPACE; }
-    else if (key == keys.BACKSPACE) { v = t.VK_BACK; }
-    else if (key == keys.TAB) { v = t.VK_TAB; }
-    else if (key == keys.RETURN) { v = t.VK_RETURN; }
-    else if (key == keys.ESCAPE) { v = t.VK_ESCAPE; }
-    else if (key == keys.PAUSE) { v = t.VK_PAUSE; }
-    else if (key == keys.LEFT) { v = t.VK_LEFT; }
-    else if (key == keys.UP) { v = t.VK_UP; }
-    else if (key == keys.RIGHT) { v = t.VK_RIGHT; }
-    else if (key == keys.DOWN) { v = t.VK_DOWN; }
-    else if (key == keys.HOME) { v = t.VK_HOME; }
-    else if (key == keys.END) { v = t.VK_END; }
-    else if (key == keys.PAGE_UP) { v = t.VK_PRIOR; }
-    else if (key == keys.PAGE_DOWN) { v = t.VK_NEXT; }
-    else if (key == keys.INSERT) { v = t.VK_INSERT; }
-    else if (key == keys.DELETE) { v = t.VK_DELETE; }
-    else if (key == keys.SHIFT_L) { v = t.VK_LSHIFT; }
-    else if (key == keys.SHIFT_R) { v = t.VK_RSHIFT; }
-    else if (key == keys.CONTROL_L) { v = t.VK_LCONTROL; }
-    else if (key == keys.CONTROL_R) { v = t.VK_RCONTROL; }
-    else if (key == keys.ALT_L) { v = t.VK_LMENU; }
-    else if (key == keys.ALT_R) { v = t.VK_RMENU; }
-    else if (key == keys.SUPER_L) { v = t.VK_LWIN; }
-    else if (key == keys.SUPER_R) { v = t.VK_RWIN; }
-    else if (key == keys.SEMICOLON) { v = t.VK_OEM_1; }
-    else if (key == keys.EQUAL) { v = t.VK_OEM_PLUS; }
-    else if (key == keys.COMMA) { v = t.VK_OEM_COMMA; }
-    else if (key == keys.MINUS) { v = t.VK_OEM_MINUS; }
-    else if (key == keys.PERIOD) { v = t.VK_OEM_PERIOD; }
-    else if (key == keys.SLASH) { v = t.VK_OEM_2; }
-    else if (key == keys.GRAVE) { v = t.VK_OEM_3; }
-    else if (key == keys.LEFT_BRACKET) { v = t.VK_OEM_4; }
-    else if (key == keys.BACKSLASH) { v = t.VK_OEM_5; }
-    else if (key == keys.RIGHT_BRACKET) { v = t.VK_OEM_6; }
-    else if (key == keys.APOSTROPHE) { v = t.VK_OEM_7; }
-    return cast(i32, v);
-}
-
-fn key_down(w as *Window, key as i32) as i32 {
-    let is *Native as n = _native(w); let is i32 as vk = _vk(key);
-    if (cast(i64, n) == 0 || vk <= 0 || vk >= 256) { return 0; }
-    return cast(i32, n.key_down[vk] != 0);
-}
-fn button_down(w as *Window, button as i32) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0 || button < 1 || button > 3) { return 0; } return (n.buttons >> (button - 1)) & 1; }
-fn mouse_x(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_x; }
-fn mouse_y(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_y; }
-fn mouse_dx(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_dx; }
-fn mouse_dy(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_dy; }
-fn wheel(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.wheel_y; }
 
 fn text_input_enable(w as *Window, on as i32) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } n.text_enabled = cast(i32, on != 0); return 1; }
 fn text_input_active(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.text_enabled == 1 && n.focused == 1); }
@@ -1361,10 +1327,22 @@ fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64
     else if (how == 7) { command = t.SC_SIZE | t.WMSZ_LEFT; }
     let is t.POINT as p; p.x = cast(i32, x); p.y = cast(i32, y);
     u.ClientToScreen(w.hwnd, &p);
+    let is i64 as at = (cast(i64, p.x) & 65535) | ((cast(i64, p.y) & 65535) << 16);
+    if (u.PostMessageW(w.hwnd, cast(u32, t.WM_SYSCOMMAND), cast(u64, command), at) == 0) { return 0; }
+    // The press is the system's from here: no release will come, so the
+    // input says the button is up, taken. The capture is let go before the
+    // posted command runs: the system's move takes the pointer itself.
+    if ((n.buttons & 1) != 0) {
+        let is ie.Event as up = _input(ie.BUTTON_UP);
+        up.button = 1;
+        up.detail = ie.BUTTON_TAKEN;
+        up.x = x;
+        up.y = y;
+        _push(n, &up, cast(*u8, 0), 0);
+    }
     n.buttons = n.buttons & cast(i32, 0 - 2);
     u.ReleaseCapture();
-    let is i64 as at = (cast(i64, p.x) & 65535) | ((cast(i64, p.y) & 65535) << 16);
-    return cast(i32, u.PostMessageW(w.hwnd, cast(u32, t.WM_SYSCOMMAND), cast(u64, command), at) != 0);
+    return 1;
 }
 
 // The system menu — restore, move, size, minimize, maximize, close — at x, y

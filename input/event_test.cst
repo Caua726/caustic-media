@@ -1,0 +1,161 @@
+// input/event_test.cst — the cooked-input queue: order, the text it owns,
+// motion folded, its bounds, and the CANCEL a loss is answered with.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "event.cst" as event;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    return cast(i32, n == k && mem.memcmp(a, b, n) == 0);
+}
+
+fn ev(kind as i32) as event.Event {
+    let is event.Event as e;
+    event.clear(&e);
+    e.kind = kind;
+    return e;
+}
+
+fn push(q as *event.Queue, kind as i32) as i32 {
+    let is event.Event as e = ev(kind);
+    return event.push(q, &e, cast(*u8, 0), 0);
+}
+
+fn push_text(q as *event.Queue, s as *u8, n as i64) as i32 {
+    let is event.Event as e = ev(event.TEXT);
+    return event.push(q, &e, s, n);
+}
+
+fn motion(q as *event.Queue, x as i64, y as i64, mods as i32) as i32 {
+    let is event.Event as e = ev(event.MOTION);
+    e.x = x;
+    e.y = y;
+    e.modifiers = mods;
+    return event.push(q, &e, cast(*u8, 0), 0);
+}
+
+let is [8192]u8 as big with mut;
+
+fn main() as i32 {
+    let is *event.Queue as q = event.create();
+    if (cast(i64, q) == 0) { io.printf("FAIL: no queue\n"); return 1; }
+    let is event.Event as out;
+
+    // --- Empty, then in order ---
+    check("empty: nothing", event.next(q, &out) == 0 && event.pending(q) == 0);
+    push(q, event.KEY_DOWN);
+    push(q, event.KEY_UP);
+    check("waiting: two", event.waiting(q) == 2 && event.pending(q) == 1);
+    check("in the order pushed", event.next(q, &out) == 1 && out.kind == event.KEY_DOWN &&
+          event.next(q, &out) == 1 && out.kind == event.KEY_UP && event.next(q, &out) == 0);
+
+    // --- Its text the queue's own ---
+    let is [8]u8 as typed;
+    typed[0] = cast(u8, 195); typed[1] = cast(u8, 169); typed[2] = cast(u8, 120);
+    push_text(q, &typed[0], 3);
+    typed[0] = cast(u8, 88);    // the translator's buffer, used again
+    push_text(q, "second", 6);
+    check("copied when pushed", event.next(q, &out) == 1 && out.kind == event.TEXT && same(out.text, out.text_len, "éx") == 1);
+    let is *u8 as first = out.text;
+    check("the next one's own", event.next(q, &out) == 1 && same(out.text, out.text_len, "second") == 1);
+    check("no text: empty, not null", push(q, event.KEY_DOWN) == 1 && event.next(q, &out) == 1 && out.text_len == 0 &&
+          cast(i64, out.text) != 0);
+    check("handed out from the queue", cast(i64, first) == cast(i64, out.text));
+
+    // --- Motion folded while it waits at the end ---
+    motion(q, 1, 1, 0);
+    motion(q, 5, 7, 0);
+    check("folded: one, where it is now", event.waiting(q) == 1 && event.next(q, &out) == 1 && out.x == 5 && out.y == 7);
+    motion(q, 1, 1, 0);
+    motion(q, 2, 2, 4);
+    check("other modifiers: kept apart", event.waiting(q) == 2);
+    push(q, event.BUTTON_DOWN);
+    motion(q, 3, 3, 4);
+    check("not across another event", event.waiting(q) == 4);
+    while (event.next(q, &out) == 1) { }
+
+    // --- Full: refused, counted, and a CANCEL after what was queued ---
+    let is i64 as i with mut = 0;
+    let is i32 as all_in with mut = 1;
+    while (i < event.CAPACITY) {
+        if (push(q, event.KEY_DOWN) == 0) { all_in = 0; }
+        i = i + 1;
+    }
+    check("as many as it holds", all_in == 1 && event.waiting(q) == event.CAPACITY);
+    check("one more refused", push(q, event.KEY_UP) == 0 && event.lost(q) == 1);
+    check("motion too, once it is full", motion(q, 9, 9, 0) == 0 && event.lost(q) == 2);
+    event.next(q, &out);
+    check("nothing taken after a loss, room or not", push(q, event.KEY_UP) == 0 && event.lost(q) == 3);
+    i = 1;
+    let is i32 as before_ok with mut = 1;
+    while (i < event.CAPACITY) {
+        if (event.next(q, &out) == 0 || out.kind != event.KEY_DOWN) { before_ok = 0; }
+        i = i + 1;
+    }
+    check("what came before, all of it", before_ok == 1);
+    check("then CANCEL, the loss counted", event.next(q, &out) == 1 && out.kind == event.CANCEL &&
+          out.detail == event.CANCEL_LOST && out.count == 3);
+    check("then nothing", event.next(q, &out) == 0 && event.pending(q) == 0 && event.lost(q) == 0);
+    check("and taken again", push(q, event.KEY_UP) == 1 && event.next(q, &out) == 1 && out.kind == event.KEY_UP);
+
+    // --- Text: its bounds ---
+    mem.memset(&big[0], 97, 8192);
+    check("as long as one may be", push_text(q, &big[0], event.TEXT_MAX) == 1);
+    check("one byte longer: refused", push_text(q, &big[0], event.TEXT_MAX + 1) == 0 && event.lost(q) == 1);
+    event.next(q, &out);
+    check("the long one whole", out.text_len == event.TEXT_MAX && out.text[0] == cast(u8, 97) &&
+          out.text[event.TEXT_MAX - 1] == cast(u8, 97));
+    check("its loss said", event.next(q, &out) == 1 && out.kind == event.CANCEL && out.count == 1);
+    i = 0;
+    all_in = 1;
+    while (i < event.TEXT_BYTES / event.TEXT_MAX) {
+        if (push_text(q, &big[0], event.TEXT_MAX) == 0) { all_in = 0; }
+        i = i + 1;
+    }
+    check("as much text as it holds", all_in == 1);
+    check("a byte more: refused", push_text(q, "b", 1) == 0);
+    while (event.next(q, &out) == 1) { }
+
+    // --- Text that would not fit after the last: moved, not lost ---
+    // Waiting text at the end of the store, the start free: the next is put
+    // after it moves.
+    push_text(q, &big[0], 4000);
+    push_text(q, &big[0], 4000);
+    push_text(q, &big[0], 4000);
+    event.next(q, &out);
+    event.next(q, &out);
+    mem.memset(&big[0], 98, 4000);
+    check("pushed where it fits", push_text(q, &big[0], 4000) == 1 && push_text(q, "tail", 4) == 1);
+    check("what waited before still whole", event.next(q, &out) == 1 && out.text_len == 4000 && out.text[0] == cast(u8, 97) &&
+          out.text[3999] == cast(u8, 97));
+    check("the moved one whole", event.next(q, &out) == 1 && out.text_len == 4000 && out.text[0] == cast(u8, 98) &&
+          out.text[3999] == cast(u8, 98));
+    check("and the last", event.next(q, &out) == 1 && same(out.text, out.text_len, "tail") == 1);
+
+    // --- A CANCEL for focus, in its place ---
+    push(q, event.KEY_DOWN);
+    event.cancel(q, event.CANCEL_FOCUS);
+    push(q, event.KEY_DOWN);
+    check("the key before it", event.next(q, &out) == 1 && out.kind == event.KEY_DOWN);
+    check("CANCEL for focus", event.next(q, &out) == 1 && out.kind == event.CANCEL && out.detail == event.CANCEL_FOCUS &&
+          out.count == 0);
+    check("the key after it", event.next(q, &out) == 1 && out.kind == event.KEY_DOWN && event.next(q, &out) == 0);
+
+    event.destroy(q);
+    if (fails == 0) {
+        io.printf("input event: all checks passed\n");
+        return 0;
+    }
+    io.printf("input event: %d failures\n", fails);
+    return 1;
+}

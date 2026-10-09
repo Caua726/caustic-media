@@ -52,6 +52,7 @@ use "../../gpu/swapchain.cst" as swapchain;
 use "bind/x.cst" as x;
 use "bind/xlib.cst" as xlib;
 use "bind/xutil.cst" as xutil;
+use "bind/xkblib.cst" as xkblib;
 use "bind/xevent.cst" as xev;
 use "surface.cst" as surface;
 use "keys.cst" as keys;
@@ -61,6 +62,7 @@ use "wm.cst" as wm;
 use "frame.cst" as frame;
 use "text.cst" as text;
 use "framesync.cst" as framesync;
+use "../../input/event.cst" as ie;
 use "dnd.cst" as dnd;
 use "xsettings.cst" as xsettings;
 use "../settings.cst" as settings;
@@ -241,6 +243,16 @@ struct Window {
     floor_h as i64;
     ceiling_w as i64;
     ceiling_h as i64;
+    // Cooked input, as this file's translator says it (input/event.cst), and
+    // what the translator keeps to say it: the keys it has seen go down (a
+    // press while held is the server's repeat), the buttons held and where
+    // the pointer was (a press handed to the window manager is let go there).
+    input as *ie.Queue;
+    held as [32]u8;
+    held_buttons as i32;
+    _pad1 as i32;
+    pointer_x as i64;
+    pointer_y as i64;
 }
 
 // One scratch event for the pump. The pump is not reentrant and neither is X11
@@ -602,6 +614,15 @@ fn open_with(c as *Config) as Window {
         w.display = cast(*u8, 0); w.err = NO_SURFACE; return w;
     }
 
+    w.input = ie.create();
+    if (cast(i64, w.input) == 0) {
+        surface.close(&w.back, d);
+        mem.core.munmap(w.ring, w.ring_cap * sizeof(xev.XEvent));
+        xlib.XFreeGC(d, w.gc); xlib.XDestroyWindow(d, w.xid); _display_release();
+        w.display = cast(*u8, 0); w.err = NO_MEMORY; return w;
+    }
+    mem.memzero(&w.held[0], 32);
+    w.held_buttons = 0; w.pointer_x = 0; w.pointer_y = 0;
     keys.init(&w.km, d);
     events.state_init(&w.st, c.width, c.height);
     // Clipboard is libX11 only, and the pump has to answer selection requests
@@ -661,6 +682,8 @@ fn close(w as *Window) as void {
         mem.core.munmap(w.ring, w.ring_cap * sizeof(xev.XEvent));
         w.ring = cast(*u8, 0);
     }
+    ie.destroy(w.input);
+    w.input = cast(*ie.Queue, 0);
     if (cast(i64, w.gc) != 0) { xlib.XFreeGC(w.display, w.gc); }
     if (w.xid != 0) { xlib.XDestroyWindow(w.display, w.xid); }
     if (w.argb == 1) { xlib.XFreeColormap(w.display, w.colormap); }
@@ -749,6 +772,11 @@ fn _display_acquire() as *u8 {
     if (_display_refs == 0) {
         _display = xlib.XOpenDisplay(cast(*u8, 0));
         if (cast(i64, _display) == 0) { return cast(*u8, 0); }
+        // A held key's repeats as presses only, no release between: the
+        // translator says a press of a key held is a repeat. A server
+        // without it keeps the pairs, and each is a press and a release.
+        let is i32 as supported with mut = 0;
+        xkblib.XkbSetDetectableAutoRepeat(_display, 1, cast(*u8, &supported));
     }
     _display_refs = _display_refs + 1;
     return _display;
@@ -835,6 +863,134 @@ fn _window_of(xid as i64) as *Window {
     return cast(*Window, 0);
 }
 
+// --- The translator: X's events as cooked input (input/event.cst) ---
+
+fn _cooked(kind as i32, state as u32, time as i64) as ie.Event {
+    let is ie.Event as e;
+    ie.clear(&e);
+    e.kind = kind;
+    e.modifiers = keys.modifiers_of(state);
+    e.time_ms = time;
+    return e;
+}
+
+fn _held(w as *Window, code as i64) as i32 {
+    if (code < 0 || code >= 256) { return 0; }
+    return cast(i32, (cast(i64, w.held[code >> 3]) & (1 << (code & 7))) != 0);
+}
+
+fn _hold(w as *Window, code as i64, on as i32) as void {
+    if (code < 0 || code >= 256) { return; }
+    let is i64 as bit = 1 << (code & 7);
+    let is i64 as cur = cast(i64, w.held[code >> 3]);
+    if (on == 1) { w.held[code >> 3] = cast(u8, cur | bit); }
+    else { w.held[code >> 3] = cast(u8, cur & (255 - bit)); }
+}
+
+fn _translate(w as *Window, e as *xev.XEvent) as void {
+    if (cast(i64, w.input) == 0) { return; }
+    let is i32 as ty = xev.kind(e);
+    if (ty == x.KeyPress || ty == x.KeyRelease) {
+        let is *xev.XKeyEvent as k = xev.key(e);
+        let is i64 as code = cast(i64, k.keycode);
+        if (code != 0) {
+            let is ie.Event as c = _cooked(ie.KEY_UP, k.state, k.time);
+            c.key = keys.id_of(&w.km, k.keycode);
+            c.shortcut = c.key;
+            c.physical = cast(i32, code);
+            if (ty == x.KeyPress) {
+                c.kind = ie.KEY_DOWN;
+                // Pressed while held: the server's repeat (detectable).
+                c.repeat = _held(w, code);
+            }
+            _hold(w, code, cast(i32, ty == x.KeyPress));
+            ie.push(w.input, &c, cast(*u8, 0), 0);
+        }
+        if (ty == x.KeyPress) {
+            // What it typed: from the key itself, or — keycode 0 — what an
+            // input method committed. Control characters are not text, and
+            // neither is what a key held with Control, Alt or Super types:
+            // that key is a command. Looked up all the same — an input
+            // method's state moves with each lookup.
+            let is i64 as n = text.lookup(&w.txt, e);
+            let is *u8 as s = text.text(&w.txt);
+            let is i32 as command = cast(i32, code != 0 &&
+                (keys.modifiers_of(k.state) & (keys.portable.MOD_CONTROL | keys.portable.MOD_ALT | keys.portable.MOD_SUPER)) != 0);
+            if (n > 0 && command == 0 && s[0] >= cast(u8, 32) && s[0] != cast(u8, 127)) {
+                let is ie.Event as t = _cooked(ie.TEXT, k.state, k.time);
+                t.from_key = cast(i32, code != 0);
+                ie.push(w.input, &t, s, n);
+            }
+        }
+        return;
+    }
+    if (ty == x.ButtonPress || ty == x.ButtonRelease) {
+        let is *xev.XButtonEvent as b = xev.button(e);
+        let is i64 as n = cast(i64, b.button);
+        w.pointer_x = cast(i64, b.x);
+        w.pointer_y = cast(i64, b.y);
+        if (n >= 4 && n <= 7) {
+            // X has no scroll event: a wheel's notch is buttons 4 (up) and 5
+            // (down), a tilt 6 (left) and 7 (right), each a press and a
+            // release. The press is the notch; the release says nothing.
+            if (ty == x.ButtonRelease) { return; }
+            let is ie.Event as s = _cooked(ie.SCROLL, b.state, b.time);
+            s.x = w.pointer_x;
+            s.y = w.pointer_y;
+            s.source = ie.SCROLL_WHEEL;
+            if (n == 4) { s.dy = 0.0 - 1.0; s.steps_y = 0 - 1; s.value120_y = 0 - 120; }
+            if (n == 5) { s.dy = 1.0; s.steps_y = 1; s.value120_y = 120; }
+            if (n == 6) { s.dx = 0.0 - 1.0; s.steps_x = 0 - 1; s.value120_x = 0 - 120; }
+            if (n == 7) { s.dx = 1.0; s.steps_x = 1; s.value120_x = 120; }
+            ie.push(w.input, &s, cast(*u8, 0), 0);
+            return;
+        }
+        let is ie.Event as c = _cooked(ie.BUTTON_DOWN, b.state, b.time);
+        if (ty == x.ButtonRelease) { c.kind = ie.BUTTON_UP; }
+        c.button = cast(i32, n);
+        c.x = w.pointer_x;
+        c.y = w.pointer_y;
+        if (n >= 1 && n <= 31) {
+            let is i32 as bit = cast(i32, 1 << (n - 1));
+            // A release of a button not held says nothing: its press was
+            // taken by the window manager, or let go by a CANCEL.
+            if (ty == x.ButtonRelease && (w.held_buttons & bit) == 0) { return; }
+            if (ty == x.ButtonPress) { w.held_buttons = w.held_buttons | bit; }
+            else { w.held_buttons = w.held_buttons & cast(i32, 0 - 1 - bit); }
+        }
+        ie.push(w.input, &c, cast(*u8, 0), 0);
+        return;
+    }
+    if (ty == x.MotionNotify) {
+        let is *xev.XMotionEvent as mo = xev.motion(e);
+        w.pointer_x = cast(i64, mo.x);
+        w.pointer_y = cast(i64, mo.y);
+        let is ie.Event as c = _cooked(ie.MOTION, mo.state, mo.time);
+        c.x = w.pointer_x;
+        c.y = w.pointer_y;
+        ie.push(w.input, &c, cast(*u8, 0), 0);
+        return;
+    }
+    if (ty == x.EnterNotify || ty == x.LeaveNotify) {
+        let is *xev.XCrossingEvent as cr = xev.crossing(e);
+        w.pointer_x = cast(i64, cr.x);
+        w.pointer_y = cast(i64, cr.y);
+        let is ie.Event as c = _cooked(ie.ENTER, cr.state, cr.time);
+        if (ty == x.LeaveNotify) { c.kind = ie.LEAVE; }
+        c.x = w.pointer_x;
+        c.y = w.pointer_y;
+        ie.push(w.input, &c, cast(*u8, 0), 0);
+        return;
+    }
+    if (ty == x.FocusOut) {
+        // A key let go while another window has the focus produces no
+        // KeyRelease here: everything held is let go now.
+        mem.memzero(&w.held[0], 32);
+        w.held_buttons = 0;
+        ie.cancel(w.input, ie.CANCEL_FOCUS);
+    }
+}
+
 // A popup taken down before it was ever pumped hears of it when it is.
 fn _noted_late(w as *Window) as void {
     let is i64 as i with mut = 0;
@@ -890,7 +1046,12 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
 
         // 1. Fold. Unconditional and before the ring, so a full ring never
         //    costs a resize, a close, or a held key.
-        events.fold(&w.st, e, &w.km, w.wm_delete);
+        events.fold(&w.st, e, w.wm_delete);
+
+        // 1b. What a person did, cooked as it arrives: the keyboard, the
+        //     pointer, the text a key typed (looked up now, once — an input
+        //     method's state moves with each lookup).
+        _translate(w, e);
 
         // 2. Follow the window's size. Both the mapping and the XImage have to
         //    be rebuilt together, and before the caller can draw: everything
@@ -1064,6 +1225,7 @@ fn pump(w as *Window) as void {
 fn pending(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
     if (w.ring_len > 0) { return 1; }
+    if (cast(i64, w.input) != 0 && ie.pending(w.input) == 1) { return 1; }
     return cast(i32, xlib.XPending(w.display) > 0);
 }
 
@@ -1174,9 +1336,7 @@ fn wait_xevent(w as *Window, out as *xev.XEvent) as i32 {
 fn poll_event(w as *Window, out as *events.Event) as i32 {
     let is xev.XEvent as raw;
     while (poll_xevent(w, &raw) == 1) {
-        if (events.decode(&raw, &w.km, out) == 1) {
-            // What the key typed, looked up while the press is at hand.
-            if (out.kind == events.KEY_DOWN) { text.lookup(&w.txt, &raw); }
+        if (events.decode(&raw, out) == 1) {
             // The window manager asking it to close: the close button.
             if (xev.kind(&raw) == x.ClientMessage && xev.client(&raw).data[0] == w.wm_delete) { out.kind = events.CLOSE; }
             // The window manager writing the window's state: a STATE event,
@@ -1189,6 +1349,13 @@ fn poll_event(w as *Window, out as *events.Event) as i32 {
         }
     }
     return 0;
+}
+
+// Its cooked input, oldest first (input/event.cst): 1, or 0 when none waits.
+// Like poll_event it reads what the pump queued; next_frame and pump fill it.
+fn poll_input(w as *Window, out as *ie.Event) as i32 {
+    if (w.ok == 0 || cast(i64, w.input) == 0) { return 0; }
+    return ie.next(w.input, out);
 }
 
 fn queue_len(w as *Window) as i64 { return w.ring_len; }
@@ -1206,16 +1373,6 @@ fn should_close(w as *Window) as i32 { return w.st.should_close; }
 fn request_close(w as *Window) as void { w.st.should_close = 1; }
 // Asked to close, and kept open: the program said no.
 fn keep_open(w as *Window) as void { w.st.should_close = 0; }
-
-fn key_down(w as *Window, key_id as i32) as i32 { return events.key_down(&w.st, &w.km, key_id); }
-fn keycode_down(w as *Window, keycode as i32) as i32 { return events.keycode_down(&w.st, keycode); }
-fn modifiers(w as *Window) as i32 { return w.st.modifiers; }
-fn mouse_x(w as *Window) as i64 { return w.st.mouse_x; }
-fn mouse_y(w as *Window) as i64 { return w.st.mouse_y; }
-fn mouse_dx(w as *Window) as i64 { return w.st.mouse_dx; }
-fn mouse_dy(w as *Window) as i64 { return w.st.mouse_dy; }
-fn wheel(w as *Window) as i64 { return w.st.wheel; }
-fn button_down(w as *Window, button as i32) as i32 { return events.button_down(&w.st, button); }
 
 // --- Changing the window ---
 
@@ -1693,7 +1850,21 @@ fn begin_move_resize(w as *Window, wx as i64, wy as i64, direction as i64, butto
     let is i64 as rx with mut = 0;
     let is i64 as ry with mut = 0;
     position(w, &rx, &ry);
-    return frame.begin_move_resize(&w.frst, w.display, root(w), w.xid, rx + wx, ry + wy, direction, button);
+    let is i32 as ok = frame.begin_move_resize(&w.frst, w.display, root(w), w.xid, rx + wx, ry + wy, direction, button);
+    // The window manager has the pointer from here: the release is its, so
+    // the input says the button is up, taken.
+    if (ok == 1 && button >= 1 && button <= 31 && (w.held_buttons & cast(i32, 1 << (button - 1))) != 0) {
+        w.held_buttons = w.held_buttons & cast(i32, 0 - 1 - (1 << (button - 1)));
+        let is ie.Event as up;
+        ie.clear(&up);
+        up.kind = ie.BUTTON_UP;
+        up.detail = ie.BUTTON_TAKEN;
+        up.button = cast(i32, button);
+        up.x = w.pointer_x;
+        up.y = w.pointer_y;
+        ie.push(w.input, &up, cast(*u8, 0), 0);
+    }
+    return ok;
 }
 
 // The window's own menu at wx, wy in the window.

@@ -6,9 +6,10 @@ use "std/env.cst" as env;
 use "../../sys/linux.cst" as sys;
 use "../../gpu/software/target.cst" as tgt;
 use "../event.cst" as event;
+use "../../input/event.cst" as ie;
 use "protocol.cst" as protocol;
 use "xkb.cst" as xkb;
-use "../keys.cst" as keys;
+use "../../input/keys.cst" as keys;
 use "../monitor.cst" as monitor;
 
 let is i32 as OK with imut = 0;
@@ -200,16 +201,21 @@ struct Window {
     keyboard_focus as i32;
     pointer_inside as i32;
     pointer_serial as u32;
+    // The pointer as the translator last said it, and the buttons it holds
+    // (one a press handed to the compositor is taken from).
     pointer_x as i64;
     pointer_y as i64;
-    pointer_dx as i64;
-    pointer_dy as i64;
-    wheel as i64;
     pointer_version as i32;
+    // A pointer frame's axis motion, wl_fixed, and its discrete steps,
+    // vertical and horizontal, said as one SCROLL when the frame ends.
     scroll_y as i64;
+    scroll_x as i64;
     scroll_discrete as i32;
+    scroll_discrete_x as i32;
     key_syms as [256]i32;
     pointer_buttons as [8]i32;
+    // Keys the compositor says are down: what xkb is told to let go of when
+    // the focus leaves.
     key_down as [256]i32;
     modifiers as i32;
     text_len as i32;
@@ -296,9 +302,11 @@ struct Window {
     buffers as [2]Buffer;
     retired as [4]BufferSet;
     current as i32;
+    // Cooked input, as this file's translator says it (input/event.cst).
+    input as *ie.Queue;
+    // The window's own events.
     event_head as i32;
     event_len as i32;
-    event_text as [16384]u8;
     events as [64]event.Event;
     state as i32;
     server_decorated as i32;
@@ -461,15 +469,37 @@ fn _queue(w as *Window, e as *event.Event) as void {
         w.event_head = (w.event_head + 1) % MAX_EVENTS;
         w.event_len = w.event_len - 1;
     }
-    let is i32 as at = (w.event_head + w.event_len) % MAX_EVENTS;
-    w.events[at] = *e;
-    if (e.text_len > 0 && e.text_len < 256) {
-        let is *u8 as text = cast(*u8, cast(i64, &w.event_text[0]) + at * 256);
-        mem.memcpy(text, e.text, e.text_len);
-        text[e.text_len] = 0;
-        w.events[at].text = text;
-    }
+    w.events[(w.event_head + w.event_len) % MAX_EVENTS] = *e;
     w.event_len = w.event_len + 1;
+}
+
+// Cooked input of kind, the modifiers held now on it.
+fn _input(w as *Window, kind as i32) as ie.Event {
+    let is ie.Event as e;
+    ie.clear(&e);
+    e.kind = kind;
+    e.modifiers = w.modifiers;
+    return e;
+}
+
+fn _push(w as *Window, e as *ie.Event, text as *u8, len as i64) as void {
+    if (cast(i64, w.input) != 0) { ie.push(w.input, e, text, len); }
+}
+
+// The pointer at x, y: kind (ENTER, MOTION, BUTTON_*), button for a press.
+fn _pointer_input(w as *Window, kind as i32, button as i32) as void {
+    let is ie.Event as e = _input(w, kind);
+    e.x = w.pointer_x;
+    e.y = w.pointer_y;
+    e.button = button;
+    _push(w, &e, cast(*u8, 0), 0);
+}
+
+// The keyboard's focus left: everything held — keys and buttons — is let go,
+// and a release that comes later says nothing.
+fn _cancel_input(w as *Window) as void {
+    mem.memzero(cast(*u8, &w.pointer_buttons[0]), 8 * 4);
+    if (cast(i64, w.input) != 0) { ie.cancel(w.input, ie.CANCEL_FOCUS); }
 }
 
 fn _event(w as *Window, kind as i32) as void {
@@ -1307,9 +1337,9 @@ fn _text_input_event(w as *Window, op as i32, p as *u8) as void {
         if (cast(i32, _word(p)) == w.surface && w.text_input_entered == 1) {
             w.text_input_entered = 0;
             w.ime_preedit_len = 0; w.ime_cursor = 0;
-            let is event.Event as e;
-            event.clear(&e); e.kind = event.PREEDIT; e.text = &w.ime_preedit[0];
-            _queue(w, &e);
+            let is ie.Event as e = _input(w, ie.PREEDIT);
+            e.cursor = 0;
+            _push(w, &e, cast(*u8, 0), 0);
         }
         return;
     }
@@ -1335,21 +1365,19 @@ fn _text_input_event(w as *Window, op as i32, p as *u8) as void {
         return;
     }
     if (op != 5 || _wire_size < 12) { return; }
-    let is event.Event as e;
     if (w.ime_delete_changed == 1) {
-        event.clear(&e); e.kind = event.DELETE_SURROUNDING;
+        let is ie.Event as e = _input(w, ie.DELETE_SURROUNDING);
         e.delete_before = w.ime_delete_before; e.delete_after = w.ime_delete_after;
-        _queue(w, &e);
+        _push(w, &e, cast(*u8, 0), 0);
     }
     if (w.ime_commit_changed == 1) {
-        event.clear(&e); e.kind = event.TEXT; e.text = &w.ime_commit[0];
-        e.text_len = w.ime_commit_len;
-        _queue(w, &e);
+        let is ie.Event as e = _input(w, ie.TEXT);
+        _push(w, &e, &w.ime_commit[0], w.ime_commit_len);
     }
     if (w.ime_preedit_changed == 1) {
-        event.clear(&e); e.kind = event.PREEDIT; e.text = &w.ime_preedit[0];
-        e.text_len = w.ime_preedit_len; e.cursor = w.ime_cursor;
-        _queue(w, &e);
+        let is ie.Event as e = _input(w, ie.PREEDIT);
+        e.cursor = w.ime_cursor;
+        _push(w, &e, &w.ime_preedit[0], w.ime_preedit_len);
     }
     w.ime_delete_changed = 0; w.ime_commit_changed = 0; w.ime_preedit_changed = 0;
     w.ime_delete_before = 0; w.ime_delete_after = 0;
@@ -1392,7 +1420,10 @@ fn _seat_capabilities(w as *Window, caps as u32) as void {
         _put(&body[0], cast(u32, w.keyboard));
         _send(w, w.seat, 1, &body[0], 4, 0 - 1);
     } else if ((caps & 2) == 0 && w.keyboard != 0) {
-        if (w.keyboard_focus == 1) { _event(w, event.FOCUS_OUT); }
+        if (w.keyboard_focus == 1) {
+            _event(w, event.FOCUS_OUT);
+            _cancel_input(w);
+        }
         if (w.seat_version >= 3) { _send(w, w.keyboard, 0, cast(*u8, 0), 0, 0 - 1); }
         if (w.keyboard != 0) { _objects[w.keyboard].owner = cast(*Window, 0); }
         w.keyboard = 0; w.keyboard_focus = 0;
@@ -1503,7 +1534,7 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
             }
         }
         let is event.Event as e;
-        event.clear(&e); e.kind = event.FOCUS_IN; e.modifiers = w.modifiers; e.raw_kind = op;
+        event.clear(&e); e.kind = event.FOCUS_IN; e.raw_kind = op;
         _queue(w, &e);
         return;
     }
@@ -1523,6 +1554,8 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
             let is event.Event as e;
             event.clear(&e); e.kind = event.FOCUS_OUT; e.raw_kind = op;
             _queue(w, &e);
+            // The keys it held are let go where this window cannot hear it.
+            _cancel_input(w);
         }
         return;
     }
@@ -1558,20 +1591,27 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
             w.key_down[code] = 0; w.key_syms[code] = 0;
         }
         w.modifiers = _xkb_modifiers(w);
-        let is event.Event as e;
-        event.clear(&e);
-        e.kind = event.KEY_UP;
-        if (down == 1) { e.kind = event.KEY_DOWN; }
-        e.key = id; e.keycode = code; e.modifiers = w.modifiers; e.raw_kind = op;
+        let is ie.Event as e = _input(w, ie.KEY_UP);
         if (down == 1) {
-            if (w.text_input_enabled == 1 && w.text_input_entered == 1) {
-                e.text_len = 0;
-            } else {
-                e.text_len = _key_text(w, sym, xcode);
-                if (e.text_len > 0) { e.text = &w.text_buf[0]; }
+            e.kind = ie.KEY_DOWN;
+            // The compositor's own repeat (wl_keyboard 10).
+            e.repeat = cast(i32, state == 2);
+        }
+        e.key = id; e.shortcut = id; e.physical = cast(i32, xcode);
+        _push(w, &e, cast(*u8, 0), 0);
+        // What it typed, unless the input method has the keys. Control
+        // characters are not text, and neither is what a key held with
+        // Control, Alt or Super types: that key is a command. Looked up all
+        // the same — a compose sequence moves with each key.
+        if (down == 1 && (w.text_input_enabled == 0 || w.text_input_entered == 0)) {
+            let is i32 as typed = _key_text(w, sym, xcode);
+            let is i32 as command = cast(i32, (w.modifiers & (keys.MOD_CONTROL | keys.MOD_ALT | keys.MOD_SUPER)) != 0);
+            if (typed > 0 && command == 0 && w.text_buf[0] >= cast(u8, 32) && w.text_buf[0] != cast(u8, 127)) {
+                let is ie.Event as t = _input(w, ie.TEXT);
+                t.from_key = 1;
+                _push(w, &t, &w.text_buf[0], cast(i64, typed));
             }
         }
-        _queue(w, &e);
         return;
     }
     if (op == 4 && cast(i64, w.xkb_state) != 0) {
@@ -1591,6 +1631,36 @@ fn _button_id(code as i32) as i32 {
     return 0;
 }
 
+// A pointer frame's scrolling, said as one SCROLL: lines continuous (15 of
+// the compositor's units to a line, a wheel's notch as libinput gives it),
+// whole notches where it said them.
+fn _scroll(w as *Window) as void {
+    if (w.scroll_x == 0 && w.scroll_y == 0 && w.scroll_discrete == 0 && w.scroll_discrete_x == 0) { return; }
+    let is ie.Event as e = _input(w, ie.SCROLL);
+    e.x = w.pointer_x;
+    e.y = w.pointer_y;
+    e.source = ie.SCROLL_CONTINUOUS;
+    e.dx = cast(f64, w.scroll_x) / 256.0 / 15.0;
+    e.dy = cast(f64, w.scroll_y) / 256.0 / 15.0;
+    if (w.scroll_discrete != 0 || w.scroll_discrete_x != 0) {
+        e.source = ie.SCROLL_WHEEL;
+        e.steps_x = w.scroll_discrete_x;
+        e.steps_y = w.scroll_discrete;
+        e.value120_x = w.scroll_discrete_x * 120;
+        e.value120_y = w.scroll_discrete * 120;
+        e.dx = cast(f64, w.scroll_discrete_x);
+        e.dy = cast(f64, w.scroll_discrete);
+    } else if (w.pointer_version < 5) {
+        // No frames, no steps: each axis event a notch, as old compositors
+        // sent a wheel's.
+        if (w.scroll_y > 0) { e.steps_y = 1; } else if (w.scroll_y < 0) { e.steps_y = 0 - 1; }
+        if (w.scroll_x > 0) { e.steps_x = 1; } else if (w.scroll_x < 0) { e.steps_x = 0 - 1; }
+        e.source = ie.SCROLL_WHEEL;
+    }
+    _push(w, &e, cast(*u8, 0), 0);
+    w.scroll_x = 0; w.scroll_y = 0; w.scroll_discrete = 0; w.scroll_discrete_x = 0;
+}
+
 fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
     if (op == 0) {
         if (_word(cast(*u8, cast(i64, p) + 4)) != cast(u32, w.surface)) { return; }
@@ -1598,27 +1668,19 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
         w.pointer_inside = 1;
         w.pointer_x = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
         w.pointer_y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 12))) / 256), w.scale120);
-        let is event.Event as e;
-        event.clear(&e); e.kind = event.ENTER; e.x = w.pointer_x; e.y = w.pointer_y; e.raw_kind = op;
-        _queue(w, &e);
+        _pointer_input(w, ie.ENTER, 0);
         return;
     }
     if (op == 1) {
         w.pointer_serial = _word(p); w.pointer_inside = 0;
-        let is event.Event as e;
-        event.clear(&e); e.kind = event.LEAVE; e.raw_kind = op;
-        _queue(w, &e);
+        _pointer_input(w, ie.LEAVE, 0);
         return;
     }
     if (w.pointer_inside == 0) { return; }
     if (op == 2) {
-        let is i64 as x = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 4))) / 256), w.scale120);
-        let is i64 as y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
-        w.pointer_dx = x - w.pointer_x; w.pointer_dy = y - w.pointer_y;
-        w.pointer_x = x; w.pointer_y = y;
-        let is event.Event as e;
-        event.clear(&e); e.kind = event.MOUSE_MOVE; e.x = x; e.y = y; e.modifiers = w.modifiers; e.raw_kind = op;
-        _queue(w, &e);
+        w.pointer_x = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 4))) / 256), w.scale120);
+        w.pointer_y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
+        _pointer_input(w, ie.MOTION, 0);
         return;
     }
     if (op == 3) {
@@ -1627,7 +1689,11 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
         let is i32 as button = _button_id(cast(i32, _word(cast(*u8, cast(i64, p) + 8))));
         if (button <= 0 || button >= 8) { return; }
         let is i32 as down = cast(i32, _word(cast(*u8, cast(i64, p) + 12)) == 1);
+        // A release of a button not held says nothing: its press was taken
+        // by the compositor to move or resize from, or let go by a CANCEL.
+        if (down == 0 && w.pointer_buttons[button] == 0 && (w.swallowed & cast(i32, 1 << button)) == 0) { return; }
         let is i32 as bit = cast(i32, 1 << button);
+        if (down == 1) { w.swallowed = w.swallowed & cast(i32, 0 - 1 - bit); }
         if (down == 1 && w.xdg_popup == 0 && _ngrabbers > 0) {
             let is *Window as top = _grabbers[_ngrabbers - 1];
             if (top.popup_done == 0) {
@@ -1642,40 +1708,24 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
             return;
         }
         w.pointer_buttons[button] = down;
-        let is event.Event as e;
-        event.clear(&e); e.kind = event.MOUSE_UP;
-        if (down == 1) { e.kind = event.MOUSE_DOWN; }
-        e.button = button; e.x = w.pointer_x; e.y = w.pointer_y; e.modifiers = w.modifiers; e.raw_kind = op;
-        _queue(w, &e);
+        if (down == 1) { _pointer_input(w, ie.BUTTON_DOWN, button); }
+        else { _pointer_input(w, ie.BUTTON_UP, button); }
         return;
     }
-    if (op == 4) {
-        if (_word(cast(*u8, cast(i64, p) + 4)) == 0) {
-            w.scroll_y = w.scroll_y + cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))));
-            if (w.pointer_version < 5) {
-                let is event.Event as e;
-                event.clear(&e); e.kind = event.WHEEL;
-                if (w.scroll_y < 0) { e.wheel = 1; } else if (w.scroll_y > 0) { e.wheel = 0 - 1; }
-                e.x = w.pointer_x; e.y = w.pointer_y; e.modifiers = w.modifiers; e.raw_kind = op;
-                w.wheel = e.wheel; _queue(w, &e); w.scroll_y = 0;
-            }
-        }
+    if (op == 4 && _wire_size >= 20) {
+        let is i64 as value = cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))));
+        if (_word(cast(*u8, cast(i64, p) + 4)) == 0) { w.scroll_y = w.scroll_y + value; }
+        else { w.scroll_x = w.scroll_x + value; }
+        if (w.pointer_version < 5) { _scroll(w); }
         return;
     }
-    if (op == 8) {
-        if (_word(p) == 0) { w.scroll_discrete = w.scroll_discrete + cast(i32, _word(cast(*u8, cast(i64, p) + 4))); }
+    if (op == 8 && _wire_size >= 16) {
+        let is i32 as steps = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
+        if (_word(p) == 0) { w.scroll_discrete = w.scroll_discrete + steps; }
+        else { w.scroll_discrete_x = w.scroll_discrete_x + steps; }
         return;
     }
-    if (op == 5 && w.pointer_version >= 5 && (w.scroll_discrete != 0 || w.scroll_y != 0)) {
-        let is event.Event as e;
-        event.clear(&e); e.kind = event.WHEEL;
-        if (w.scroll_discrete != 0) { e.wheel = 0 - w.scroll_discrete; }
-        else if (w.scroll_y < 0) { e.wheel = 1; }
-        else { e.wheel = 0 - 1; }
-        e.x = w.pointer_x; e.y = w.pointer_y; e.modifiers = w.modifiers; e.raw_kind = op;
-        w.wheel = e.wheel; _queue(w, &e);
-        w.scroll_discrete = 0; w.scroll_y = 0;
-    }
+    if (op == 5 && w.pointer_version >= 5) { _scroll(w); }
 }
 fn _reap_retired(w as *Window) as void {
     let is i32 as i with mut = 0;
@@ -2464,6 +2514,9 @@ fn open_config(w as *Window, title as *u8, width as i64, height as i64, options 
     if (width <= 0 || height <= 0) { w.err = NO_CONFIGURE; return 0; }
     if (_protocol_ready() == 0) { w.err = NO_PROTOCOL; return 0; }
     if (_runtime_socket(w) == 0) { w.err = NO_RUNTIME; return 0; }
+    // Its input's queue, there before the first event can come.
+    w.input = ie.create();
+    if (cast(i64, w.input) == 0) { w.err = NO_MEMORY; _discard(w); return 0; }
     if (_init_protocol(w, title, o.app_id) == 0) { w.err = NO_COMPOSITOR; _discard(w); return 0; }
     w.opened = 1;
     if (o.popup == 0 && o.parent != 0 && set_parent(w, o.parent) == 0) {
@@ -2641,41 +2694,6 @@ fn reposition(w as *Window, pos as *Options, pw as i64, ph as i64) as i32 {
     w.pos = *pos;
     return 1;
 }
-fn key_down(w as *Window, key as i32) as i32 {
-    let is i32 as i with mut = 0;
-    while (i < 256) {
-        if (w.key_down[i] == 1 && w.key_syms[i] == key) { return 1; }
-        i = i + 1;
-    }
-    return 0;
-}
-
-fn button_down(w as *Window, button as i32) as i32 {
-    if (button <= 0 || button >= 8) { return 0; }
-    return w.pointer_buttons[button];
-}
-
-fn mouse_x(w as *Window) as i64 { return w.pointer_x; }
-fn mouse_y(w as *Window) as i64 { return w.pointer_y; }
-
-fn mouse_dx(w as *Window) as i64 {
-    let is i64 as dx = w.pointer_dx;
-    w.pointer_dx = 0;
-    return dx;
-}
-
-fn mouse_dy(w as *Window) as i64 {
-    let is i64 as dy = w.pointer_dy;
-    w.pointer_dy = 0;
-    return dy;
-}
-
-fn wheel(w as *Window) as i64 {
-    let is i64 as value = w.wheel;
-    w.wheel = 0;
-    return value;
-}
-
 
 
 // Whether state is a normal window's — not maximized, full screen or tiled —
@@ -2748,6 +2766,7 @@ fn next_frame(w as *Window) as i32 {
 
 fn pending(w as *Window) as i32 {
     if (w.event_len > 0) { return 1; }
+    if (cast(i64, w.input) != 0 && ie.pending(w.input) == 1) { return 1; }
     if (w.fd < 0) { return 0; }
     if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { return 1; }
     return cast(i32, sys.wait_readable(w.fd, 0) > 0);
@@ -2919,6 +2938,12 @@ fn poll_event(w as *Window, out as *event.Event) as i32 {
     return 1;
 }
 
+// Its cooked input, oldest first (input/event.cst): 1, or 0 when none waits.
+fn poll_input(w as *Window, out as *ie.Event) as i32 {
+    if (cast(i64, w.input) == 0) { return 0; }
+    return ie.next(w.input, out);
+}
+
 fn set_title(w as *Window, title as *u8, n as i64) as void {
     if (w.opened == 0) { return; }
     _send_string_n(w, w.toplevel, 2, title, n);
@@ -3003,12 +3028,27 @@ fn input_region(w as *Window, x as *i64, y as *i64, width as *i64, height as *i6
 
 fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64) as i32 {
     if (w.opened == 0 || w.seat == 0 || w.pointer_serial == 0) { return 0; }
+    if (how < 0 || how > 8) { return 0; }
     let is [12]u8 as p;
     _put(&p[0], cast(u32, w.seat)); _put(&p[4], w.pointer_serial);
-    if (how == 8) { return _send(w, w.toplevel, 5, &p[0], 8, 0 - 1); }
-    if (how < 0 || how > 7) { return 0; }
-    _put(&p[8], cast(u32, how + 1));
-    return _send(w, w.toplevel, 6, &p[0], 12, 0 - 1);
+    let is i32 as sent with mut = 0;
+    if (how == 8) { sent = _send(w, w.toplevel, 5, &p[0], 8, 0 - 1); }
+    else {
+        _put(&p[8], cast(u32, how + 1));
+        sent = _send(w, w.toplevel, 6, &p[0], 12, 0 - 1);
+    }
+    // The compositor follows the pointer from the press on: its release is
+    // the compositor's, so the input says the button is up, taken.
+    if (sent == 1 && button >= 1 && button < 8 && w.pointer_buttons[button] == 1) {
+        w.pointer_buttons[button] = 0;
+        let is ie.Event as up = _input(w, ie.BUTTON_UP);
+        up.button = cast(i32, button);
+        up.detail = ie.BUTTON_TAKEN;
+        up.x = w.pointer_x;
+        up.y = w.pointer_y;
+        _push(w, &up, cast(*u8, 0), 0);
+    }
+    return sent;
 }
 
 fn show_window_menu(w as *Window, x as i64, y as i64) as i32 {
@@ -3104,9 +3144,9 @@ fn text_input_enable(w as *Window, on as i32) as i32 {
     if (enabled == 0) {
         w.text_input_entered = 0;
         w.ime_preedit_len = 0; w.ime_cursor = 0;
-        let is event.Event as e;
-        event.clear(&e); e.kind = event.PREEDIT; e.text = &w.ime_preedit[0];
-        _queue(w, &e);
+        let is ie.Event as e = _input(w, ie.PREEDIT);
+        e.cursor = 0;
+        _push(w, &e, cast(*u8, 0), 0);
     }
     return 1;
 }
@@ -3164,6 +3204,8 @@ fn close(w as *Window) as void {
     if (cast(i64, w.received_text) != 0) { mem.core.munmap(w.received_text, MAX_TEXT + 1); }
     if (cast(i64, w.drop_storage) != 0) { mem.core.munmap(w.drop_storage, DROP_STORAGE_BYTES); }
     w.received_text = cast(*u8, 0); w.drop_storage = cast(*u8, 0);
+    ie.destroy(w.input);
+    w.input = cast(*ie.Queue, 0);
     if (w.pointer != 0 && w.pointer_version >= 3) { _send(w, w.pointer, 1, &empty[0], 0, 0 - 1); }
     if (w.keyboard != 0 && w.seat_version >= 3) { _send(w, w.keyboard, 0, &empty[0], 0, 0 - 1); }
     if (w.seat != 0 && w.seat_version >= 5) { _send(w, w.seat, 3, &empty[0], 0, 0 - 1); }

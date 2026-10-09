@@ -7,7 +7,8 @@ platform offers, including the ones no window system delivers.
 input/
   input.cst     hub
   source.cst    our abstraction: open a source, drain it, ask what it can do
-  event.cst     the event types and the queue they arrive in
+  event.cst     cooked input and the explicitly sized queue it arrives in
+  keys.cst      key ids (the layout's keysyms) and modifier bits
   keyboard.cst  keys, scancodes and keysyms, modifiers, layout
   mouse.cst     buttons, position, wheel, relative motion
   touch.cst     fingers
@@ -17,7 +18,7 @@ input/
   haptic.cst    rumble and force feedback
   sensor.cst    accelerometer, gyroscope
   text.cst      text input and IME composition
-  state.cst     sampled state, derived from events
+  state.cst     sampled state, fed from events
   action.cst    action mapping, derived from events
   gesture.cst   tap, drag, pinch, hold — derived from touch
 
@@ -47,9 +48,10 @@ So `input/` has platform code of its own, and the split with `window/` is:
 | keyboard, mouse, touch | `window/` — the display server delivers it |
 | gamepad, joystick, haptics, sensors | **`input/`'s own backends** |
 
-`window/event.cst` hands over the platform event as it arrived — an `XEvent`, a
-Wayland callback, a `MSG`. `input/x11` knows how to read an `XEvent`;
-`window/x11` does not need to.
+`window/` translates what the display server delivers — an `XEvent`, a Wayland
+callback, a `MSG` — into `input/event.cst`'s cooked events as it arrives, one
+queue per window (`poll_input`); what happens to the window itself (resized,
+focused, closed, dropped on) stays `window/event.cst`'s (`poll_event`).
 
 ---
 
@@ -99,11 +101,13 @@ behind you, at a moment you did not choose. Two presses in one frame vanish
 silently, which is precisely a runtime surprise. `GetMouseDelta` implies someone
 kept last frame's position for you — hidden state.
 
-So the primitive is a queue you drain, and nothing is lost:
+So the primitive is a queue you drain, and nothing is lost — or, when the
+queue was full, a `CANCEL` says how much was:
 
 ```cst
-while (input.next(&source, &ev) == 1) {
-    // every event, in order, with its source
+let is ie.Event as ev;              // use "caustic-media/input/event.cst" as ie;
+while (window.poll_input(&win, &ev) == 1) {
+    // every event, in order
 }
 ```
 
@@ -115,9 +119,9 @@ allocation the same sentence forbids. The same rule the draw queue follows in
 the program creates and hands events to, then queries:
 
 ```cst
-input.state_feed(&st, &ev);
-...
-if (input.state_key_down(&st, KEY_SPACE) == 1) { ... }
+state.new_frame(&st);               // motion and scrolling are per frame
+while (window.poll_input(&win, &ev) == 1) { state.feed(&st, &ev); }
+if (state.key_down(&st, keys.SPACE) == 1) { ... }
 ```
 
 That is the ergonomics of `IsKeyDown` with the mechanism visible. You can see
@@ -246,11 +250,40 @@ raw path but also the gamepad path on Linux.
 
 ## Current state
 
-Nothing of this layer is built yet: this note is its design. The toolkit
-takes its input from `window/` meanwhile — keys with their keysym, keycode,
-modifiers and the text they type, the pointer, the wheel, a drag from
-another program, as `window/event.cst` carries them — and `ui/router.cst`
-cooks what it needs of that (the modifiers as the pointer's events say
-them, repeats, clicks counted). Gamepads, raw devices, text input beyond
-XIM's, scroll at high resolution and the action mapping above come with
-this layer, after the toolkit.
+Built: the cooked event model and its queue (`event.cst`), the key ids and
+modifier bits every backend names keys with (`keys.cst`), and sampled state as
+something fed (`state.cst`). Each window backend translates its platform's
+input into a queue of its own — X11 core events with XLookupString/XIM, Wayland
+`wl_keyboard`/`wl_pointer`/text-input-v3 with xkbcommon, Win32 messages and
+IMM — and `window.poll_input` hands it out; the backends keep no sampled input.
+
+What the queue promises:
+
+- **Kinds:** `KEY_DOWN`/`KEY_UP` (key id, shortcut, physical place, the
+  platform's repeat), `TEXT` (committed UTF-8, `from_key` when typed by the
+  key just before it), `PREEDIT`, `DELETE_SURROUNDING`, `BUTTON_DOWN`/`UP`,
+  `MOTION`, `ENTER`, `LEAVE`, `SCROLL` (lines, whole steps, 120ths of a notch)
+  and `CANCEL`.
+- **Text is the queue's**, copied in when pushed and valid until the next
+  `next()`: no pointer into a platform buffer outlives its translator.
+- **Fixed size.** Motion waiting at the end absorbs newer motion; anything else
+  that does not fit is refused and counted, and once what came before is taken
+  a `CANCEL` (`CANCEL_LOST`, with the count) says so — a lost release is never a
+  key held forever.
+- **Focus loss is a `CANCEL`** (`CANCEL_FOCUS`): everything held is let go,
+  keys and buttons, and a release that comes after says nothing.
+- **A press the window system takes** — a move or resize it follows from there
+  — ends in `BUTTON_UP` with detail `BUTTON_TAKEN`: it clicks nothing, and the
+  release the system keeps never arrives.
+- **Text is only text.** Control characters, and what a key held with
+  Control, Alt or Super types, are never `TEXT`; AltGr's characters are.
+
+`ui/host.cst` feeds a window's queue to its router: a key's `TEXT` is typed
+unless the router took that key; text an input method or another program sent
+is typed whatever is held.
+
+Still to come, in this order: keyboard repeat on Wayland compositors older
+than `wl_keyboard` 10 and shortcuts that work in non-Latin layouts; inline XIM
+on X11; Wayland and Win32 surrounding-text context; continuous scrolling (axis
+source, stop, value120 on Wayland); touch, pen and gestures; gamepads, raw
+devices and the action mapping.

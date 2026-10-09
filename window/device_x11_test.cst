@@ -11,11 +11,14 @@ use "std/time.cst" as time;
 use "window.cst" as window;
 use "device.cst" as device;
 use "event.cst" as event;
-use "keys.cst" as keys;
+use "../input/event.cst" as ie;
+use "../input/keys.cst" as keys;
 use "x11/x11.cst" as x11;
 use "x11/bind/xlib.cst" as xlib;
 use "x11/bind/x.cst" as x;
 use "x11/bind/xevent.cst" as xev;
+
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
 
 let is i32 as fails with mut = 0;
 
@@ -50,22 +53,49 @@ fn next(kind as i32, out as *event.Event) as i32 {
     return 0;
 }
 
+// The next input of kind, within a second, into out: 1 when there was one.
+fn input(kind as i32, out as *ie.Event) as i32 {
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, out) == 1) {
+            if (out.kind == kind) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+// The input that came right after, within 100 ms: its kind, NONE for none.
+fn then(out as *ie.Event) as i32 {
+    let is i64 as until = time.now_ms() + 100;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        if (device.poll_input(&win, out) == 1) { return out.kind; }
+        time.sleep_ms(5);
+    }
+    return ie.NONE;
+}
+
 fn drain() as void {
     let is i64 as until = time.now_ms() + 200;
     let is event.Event as e;
+    let is ie.Event as in;
     while (time.now_ms() < until) {
         device.pump(&win);
         while (device.poll_event(&win, &e) == 1) { }
+        while (device.poll_input(&win, &in) == 1) { }
         time.sleep_ms(5);
     }
 }
 
-// A key pressed by the user: keysym, with the modifier state.
-fn press(keysym as i64, state as u32) as void {
+// A key pressed (kind KeyPress) or let go (KeyRelease) by the user: keysym,
+// with the modifier state.
+fn key(kind as i32, keysym as i64, state as u32) as void {
     let is xev.XEvent as m;
     xev.clear(&m);
     let is *xev.XKeyEvent as k = xev.key(&m);
-    k.kind = x.KeyPress;
+    k.kind = kind;
     k.display = other;
     k.window = xid;
     k.root = xlib.XDefaultRootWindow(other);
@@ -73,26 +103,48 @@ fn press(keysym as i64, state as u32) as void {
     k.state = state;
     k.keycode = cast(u32, xlib.XKeysymToKeycode(other, keysym));
     k.same_screen = 1;
-    xlib.XSendEvent(other, xid, 0, x.KeyPressMask, cast(*u8, &m));
+    let is i64 as mask with mut = x.KeyPressMask;
+    if (kind == x.KeyRelease) { mask = x.KeyReleaseMask; }
+    xlib.XSendEvent(other, xid, 0, mask, cast(*u8, &m));
     xlib.XFlush(other);
 }
 
-// A button pressed by the user at 5, 5, with the modifier state.
-fn click(button as u32, state as u32) as void {
+fn press(keysym as i64, state as u32) as void { key(x.KeyPress, keysym, state); }
+
+// A button pressed (ButtonPress) or let go (ButtonRelease) by the user at
+// 5, 5, with the modifier state.
+fn button(kind as i32, b as u32, state as u32) as void {
     let is xev.XEvent as m;
     xev.clear(&m);
-    let is *xev.XButtonEvent as b = xev.button(&m);
-    b.kind = x.ButtonPress;
-    b.display = other;
-    b.window = xid;
-    b.root = xlib.XDefaultRootWindow(other);
-    b.x = 5; b.y = 5;
-    b.state = state;
-    b.button = button;
-    b.same_screen = 1;
-    xlib.XSendEvent(other, xid, 0, x.ButtonPressMask, cast(*u8, &m));
+    let is *xev.XButtonEvent as be = xev.button(&m);
+    be.kind = kind;
+    be.display = other;
+    be.window = xid;
+    be.root = xlib.XDefaultRootWindow(other);
+    be.x = 5; be.y = 5;
+    be.state = state;
+    be.button = b;
+    be.same_screen = 1;
+    let is i64 as mask with mut = x.ButtonPressMask;
+    if (kind == x.ButtonRelease) { mask = x.ButtonReleaseMask; }
+    xlib.XSendEvent(other, xid, 0, mask, cast(*u8, &m));
     xlib.XFlush(other);
 }
+
+fn click(b as u32, state as u32) as void { button(x.ButtonPress, b, state); }
+
+// The keyboard's focus leaving the window, as the server says it.
+fn focus_out() as void {
+    let is xev.XEvent as m;
+    xev.clear(&m);
+    let is *xev.XFocusChangeEvent as f = xev.focus(&m);
+    f.kind = x.FocusOut;
+    f.display = other;
+    f.window = xid;
+    xlib.XSendEvent(other, xid, 0, x.FocusChangeMask, cast(*u8, &m));
+    xlib.XFlush(other);
+}
+
 
 let is i64 as _type with mut = 0;
 let is i32 as _format with mut = 0;
@@ -195,35 +247,104 @@ fn main() as i32 {
     other = xlib.XOpenDisplay(cast(*u8, 0));
     drain();
 
-    // --- Text a key types ---
-    let is event.Event as e;
+    // --- Keys, and the text they type ---
+    let is ie.Event as e;
     press(97, cast(u32, 0));
-    check("a key press: the text it types", next(event.KEY_DOWN, &e) == 1 && same(e.text, e.text_len, "a") == 1);
+    check("a key press: which key, where", input(ie.KEY_DOWN, &e) == 1 && e.key == keys.A &&
+          e.physical == cast(i32, xlib.XKeysymToKeycode(other, 97)) && e.repeat == 0);
+    check("then the text it types, from the key", then(&e) == ie.TEXT && e.from_key == 1 &&
+          same(e.text, e.text_len, "a") == 1);
     press(97, cast(u32, 1));
-    check("shifted", next(event.KEY_DOWN, &e) == 1 && same(e.text, e.text_len, "A") == 1);
+    check("pressed again while held: the server's repeat", input(ie.KEY_DOWN, &e) == 1 && e.repeat == 1);
+    check("shifted", then(&e) == ie.TEXT && same(e.text, e.text_len, "A") == 1);
+    key(x.KeyRelease, 97, cast(u32, 0));
+    check("let go", input(ie.KEY_UP, &e) == 1 && e.key == keys.A);
+    press(97, cast(u32, 0));
+    check("pressed after it was let go: no repeat", input(ie.KEY_DOWN, &e) == 1 && e.repeat == 0);
     press(65361, cast(u32, 0));
-    check("an arrow: no text", next(event.KEY_DOWN, &e) == 1 && e.text_len == 0);
+    check("an arrow", input(ie.KEY_DOWN, &e) == 1 && e.key == keys.LEFT);
+    check("types nothing", then(&e) != ie.TEXT);
     press(233, cast(u32, 0));
-    check("é: its UTF-8", next(event.KEY_DOWN, &e) == 1 && (xlib.XKeysymToKeycode(other, 233) == 0 ||
-          same(e.text, e.text_len, "é") == 1));
+    check("é: its UTF-8", xlib.XKeysymToKeycode(other, 233) == 0 ||
+          (input(ie.TEXT, &e) == 1 && same(e.text, e.text_len, "é") == 1));
     // The modifiers held, as the portable keys name them, whatever X's bits.
-    press(97, cast(u32, x.ControlMask));
-    check("Control", next(event.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_CONTROL);
-    press(97, cast(u32, x.ControlMask | x.ShiftMask));
-    check("Control and Shift", next(event.KEY_DOWN, &e) == 1 && e.modifiers == (keys.MOD_CONTROL | keys.MOD_SHIFT));
-    press(97, cast(u32, x.Mod1Mask));
-    check("Alt", next(event.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_ALT);
-    press(97, cast(u32, x.Mod4Mask));
-    check("Super", next(event.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_SUPER);
-    press(97, cast(u32, x.LockMask));
-    check("Caps Lock", next(event.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_LOCK);
-    press(97, cast(u32, x.Mod2Mask));
-    check("Num Lock: none of them", next(event.KEY_DOWN, &e) == 1 && e.modifiers == 0);
+    press(98, cast(u32, x.ControlMask));
+    check("Control", input(ie.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_CONTROL);
+    check("Control and a letter: a command, no text", then(&e) != ie.TEXT);
+    press(98, cast(u32, x.ControlMask | x.ShiftMask));
+    check("Control and Shift", input(ie.KEY_DOWN, &e) == 1 && e.modifiers == (keys.MOD_CONTROL | keys.MOD_SHIFT));
+    press(98, cast(u32, x.Mod1Mask));
+    check("Alt", input(ie.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_ALT);
+    check("Alt and a letter: a command, no text", then(&e) != ie.TEXT);
+    press(98, cast(u32, x.Mod4Mask));
+    check("Super", input(ie.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_SUPER);
+    check("Super and a letter: a command, no text", then(&e) != ie.TEXT);
+    press(98, cast(u32, x.LockMask));
+    check("Caps Lock", input(ie.KEY_DOWN, &e) == 1 && e.modifiers == keys.MOD_LOCK);
+    check("Caps Lock and a letter: its capital", then(&e) == ie.TEXT && same(e.text, e.text_len, "B") == 1);
+    press(98, cast(u32, x.Mod2Mask));
+    check("Num Lock: none of them", input(ie.KEY_DOWN, &e) == 1 && e.modifiers == 0);
+
+    // --- The pointer ---
     click(cast(u32, 1), cast(u32, x.ControlMask | x.Mod1Mask));
-    check("a press, with Control and Alt", next(event.MOUSE_DOWN, &e) == 1 && e.modifiers == (keys.MOD_CONTROL | keys.MOD_ALT));
+    check("a press, with Control and Alt", input(ie.BUTTON_DOWN, &e) == 1 && e.button == 1 &&
+          e.x == 5 && e.y == 5 && e.modifiers == (keys.MOD_CONTROL | keys.MOD_ALT));
+    button(x.ButtonRelease, cast(u32, 1), cast(u32, 0));
+    check("its release", input(ie.BUTTON_UP, &e) == 1 && e.button == 1 && e.detail == 0);
+    button(x.ButtonRelease, cast(u32, 1), cast(u32, 0));
+    check("a release of a button not held: nothing", then(&e) == ie.NONE);
     click(cast(u32, 5), cast(u32, x.ShiftMask | x.Mod4Mask));
-    check("the wheel, with Shift and Super", next(event.WHEEL, &e) == 1 && e.wheel == 0 - 1 &&
+    check("the wheel down a notch, with Shift and Super", input(ie.SCROLL, &e) == 1 && e.dy == 1.0 &&
+          e.steps_y == 1 && e.value120_y == 120 && e.dx == 0.0 && e.source == ie.SCROLL_WHEEL &&
           e.modifiers == (keys.MOD_SHIFT | keys.MOD_SUPER));
+    button(x.ButtonRelease, cast(u32, 5), cast(u32, 0));
+    check("a notch's release says nothing", then(&e) == ie.NONE);
+    click(cast(u32, 4), cast(u32, 0));
+    check("up a notch", input(ie.SCROLL, &e) == 1 && e.dy == 0.0 - 1.0 && e.steps_y == 0 - 1);
+    click(cast(u32, 6), cast(u32, 0));
+    check("tilted left", input(ie.SCROLL, &e) == 1 && e.dx == 0.0 - 1.0 && e.steps_x == 0 - 1 && e.dy == 0.0);
+    click(cast(u32, 7), cast(u32, 0));
+    check("tilted right", input(ie.SCROLL, &e) == 1 && e.dx == 1.0 && e.value120_x == 120);
+
+    // --- The keyboard's focus leaving: everything held let go ---
+    click(cast(u32, 3), cast(u32, 0));
+    check("a press held", input(ie.BUTTON_DOWN, &e) == 1 && e.button == 3);
+    focus_out();
+    check("focus out: a cancel", input(ie.CANCEL, &e) == 1 && e.detail == ie.CANCEL_FOCUS);
+    button(x.ButtonRelease, cast(u32, 3), cast(u32, 0));
+    check("the release after it says nothing", then(&e) == ie.NONE);
+    press(98, cast(u32, 0));
+    check("a key held before it: pressed anew, no repeat", input(ie.KEY_DOWN, &e) == 1 && e.repeat == 0);
+    drain();
+
+    // --- A key held as a user holds it: the server's own repeats ---
+    // XTest's keyboard is the server's, so the server repeats it; with
+    // detectable auto-repeat on, as presses alone, each a repeat.
+    xlib.XSetInputFocus(other, xid, 1, 0);
+    xlib.XSync(other, 0);
+    drain();
+    let is u32 as held_kc = cast(u32, xlib.XKeysymToKeycode(other, 99));
+    XTestFakeKeyEvent(other, held_kc, 1, cast(u64, 0));
+    xlib.XFlush(other);
+    let is i64 as presses with mut = 0;
+    let is i64 as repeats with mut = 0;
+    let is i64 as lets_go with mut = 0;
+    let is i64 as held_until = time.now_ms() + 1200;
+    while (time.now_ms() < held_until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &e) == 1) {
+            if (e.kind == ie.KEY_DOWN && e.key == keys.C) {
+                presses = presses + 1;
+                repeats = repeats + cast(i64, e.repeat);
+            }
+            if (e.kind == ie.KEY_UP && e.key == keys.C) { lets_go = lets_go + 1; }
+        }
+        time.sleep_ms(5);
+    }
+    XTestFakeKeyEvent(other, held_kc, 0, cast(u64, 0));
+    xlib.XFlush(other);
+    check("held: pressed, then repeated, never let go between", presses > 2 && repeats == presses - 1 && lets_go == 0);
+    check("let go: once", input(ie.KEY_UP, &e) == 1 && e.key == keys.C && then(&e) == ie.NONE);
 
     // --- Its title, in UTF-8 ---
     check("titled as it was opened", prop_is("_NET_WM_NAME", "UTF8_STRING", "devices", 7) == 1 &&
@@ -388,7 +509,8 @@ fn main() as i32 {
     xev.client(&del).data[0] = xlib.XInternAtom(other, "WM_DELETE_WINDOW", 0);
     xlib.XSendEvent(other, xid, 0, 0, cast(*u8, &del));
     xlib.XFlush(other);
-    check("asked to close: told", next(event.CLOSE, &e) == 1 && device.should_close(&win) == 1);
+    let is event.Event as le;
+    check("asked to close: told", next(event.CLOSE, &le) == 1 && device.should_close(&win) == 1);
     device.keep_open(&win);
     check("kept open", device.should_close(&win) == 0 && device.next_frame(&win) == 1);
     device.keep_open(&bad);
@@ -400,12 +522,12 @@ fn main() as i32 {
     st[1] = xlib.XInternAtom(other, "_NET_WM_STATE_MAXIMIZED_HORZ", 0);
     xlib.XChangeProperty(other, xid, xlib.XInternAtom(other, "_NET_WM_STATE", 0), 4, 32, 0, cast(*u8, &st), 2);
     xlib.XFlush(other);
-    check("maximized by the window manager: told", next(event.STATE, &e) == 1 && (e.state & event.STATE_MAXIMIZED) != 0 &&
-          (e.state & event.STATE_FULLSCREEN) == 0);
+    check("maximized by the window manager: told", next(event.STATE, &le) == 1 && (le.state & event.STATE_MAXIMIZED) != 0 &&
+          (le.state & event.STATE_FULLSCREEN) == 0);
     st[0] = xlib.XInternAtom(other, "_NET_WM_STATE_FULLSCREEN", 0);
     xlib.XChangeProperty(other, xid, xlib.XInternAtom(other, "_NET_WM_STATE", 0), 4, 32, 0, cast(*u8, &st), 1);
     xlib.XFlush(other);
-    check("full screen", next(event.STATE, &e) == 1 && e.state == event.STATE_FULLSCREEN);
+    check("full screen", next(event.STATE, &le) == 1 && le.state == event.STATE_FULLSCREEN);
 
     // --- A frame of the program's own ---
     // Opened without the window manager's decoration: told before it is

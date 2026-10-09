@@ -2,7 +2,8 @@ use "std/io.cst" as io;
 use "std/mem.cst" as mem;
 use "../../gpu/software/target.cst" as tgt;
 use "../event.cst" as event;
-use "../keys.cst" as keys;
+use "../../input/event.cst" as ie;
+use "../../input/keys.cst" as keys;
 use "bind/types.cst" as t;
 use "bind/user32.cst" as u;
 use "bind/gdi32.cst" as g;
@@ -16,6 +17,13 @@ fn check(name as *u8, ok as i32) as void {
 
 fn take(w as *win.Window, kind as i32, out as *event.Event) as i32 {
     while (win.poll_event(w, out) == 1) {
+        if (out.kind == kind) { return 1; }
+    }
+    return 0;
+}
+
+fn take_input(w as *win.Window, kind as i32, out as *ie.Event) as i32 {
+    while (win.poll_input(w, out) == 1) {
         if (out.kind == kind) { return 1; }
     }
     return 0;
@@ -41,41 +49,71 @@ fn main() as i32 {
         u.ReleaseDC(w.hwnd, dc);
     }
 
+    let is ie.Event as in;
     u.SendMessageW(w.hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, 65), 0);
-    check("virtual key maps to portable key", take(&w, event.KEY_DOWN, &e) == 1 && e.key == keys.A && e.keycode == 65);
+    check("virtual key maps to portable key", take_input(&w, ie.KEY_DOWN, &in) == 1 && in.key == keys.A &&
+          in.physical == 65 && in.repeat == 0);
+    // Bit 30: the key was down before — the system's repeat.
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, 65), 1 << 30);
+    check("the system's repeat: a repeat", take_input(&w, ie.KEY_DOWN, &in) == 1 && in.repeat == 1);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_KEYUP), cast(u64, 65), 0);
-    check("key release is routed", take(&w, event.KEY_UP, &e) == 1 && e.key == keys.A);
-    check("released key is not held", win.key_down(&w, keys.A) == 0);
+    check("key release is routed", take_input(&w, ie.KEY_UP, &in) == 1 && in.key == keys.A);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), 55357, 0);
-    check("surrogate lead emits no text", take(&w, event.TEXT, &e) == 0);
+    check("surrogate lead emits no text", take_input(&w, ie.TEXT, &in) == 0);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), 56832, 0);
-    check("surrogate pair becomes one UTF-8 scalar", take(&w, event.TEXT, &e) == 1 && e.text_len == 4 &&
-          e.text[0] == 240 && e.text[1] == 159 && e.text[2] == 152 && e.text[3] == 128);
+    check("surrogate pair becomes one UTF-8 scalar", take_input(&w, ie.TEXT, &in) == 1 && in.text_len == 4 &&
+          in.text[0] == 240 && in.text[1] == 159 && in.text[2] == 152 && in.text[3] == 128);
+    check("sent with no key down: not a key's", in.from_key == 0);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), 1, 0);
-    check("command characters do not enter the document", take(&w, event.TEXT, &e) == 0);
+    check("command characters do not enter the document", take_input(&w, ie.TEXT, &in) == 0);
+    // As TranslateMessage posts it: right after its key went down.
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, 65), 0);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), 97, 0);
+    check("a key's character: the key's", take_input(&w, ie.TEXT, &in) == 1 && in.from_key == 1 && in.text[0] == 97);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_KEYUP), cast(u64, 65), 0);
+    while (win.poll_input(&w, &in) == 1) { }
+    // More than the queue holds: what came first, in order, then a cancel
+    // counting what was refused.
     let is i64 as sent with mut = 0;
-    while (sent < 200) {
+    while (sent < 300) {
         u.SendMessageW(w.hwnd, cast(u32, t.WM_CHAR), cast(u64, 33 + sent % 90), 0);
         sent = sent + 1;
     }
     let is i64 as received with mut = 0;
     let is i32 as ordered with mut = 1;
-    while (win.poll_event(&w, &e) == 1) {
-        if (e.kind != event.TEXT || e.text_len != 1 || e.text[0] != cast(u8, 33 + (72 + received) % 90)) { ordered = 0; }
-        received = received + 1;
+    let is i64 as lost with mut = 0 - 1;
+    while (win.poll_input(&w, &in) == 1) {
+        if (in.kind == ie.CANCEL) {
+            if (in.detail == ie.CANCEL_LOST) { lost = in.count; }
+        } else {
+            if (in.kind != ie.TEXT || in.text_len != 1 || in.text[0] != cast(u8, 33 + received % 90)) { ordered = 0; }
+            received = received + 1;
+        }
     }
-    check("a full event queue retains the latest events in order", received == 128 && ordered == 1);
+    check("a full input queue keeps what came first, in order, and says what it lost",
+          received == 256 && ordered == 1 && lost == 44);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_MOUSEMOVE), 0, 1376270);
-    check("pointer coordinates", take(&w, event.MOUSE_MOVE, &e) == 1 && e.x == 14 && e.y == 21);
+    check("pointer coordinates", take_input(&w, ie.MOTION, &in) == 1 && in.x == 14 && in.y == 21);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_LBUTTONDOWN), 0, 1376270);
-    check("pointer capture starts on press", u.GetCapture() == w.hwnd && win.button_down(&w, 1) == 1);
+    check("pointer capture starts on press", u.GetCapture() == w.hwnd && take_input(&w, ie.BUTTON_DOWN, &in) == 1 &&
+          in.button == 1 && in.x == 14 && in.y == 21);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_LBUTTONUP), 0, 1376270);
-    check("pointer capture ends on release", u.GetCapture() != w.hwnd && win.button_down(&w, 1) == 0);
-    while (win.poll_event(&w, &e) == 1) { }
+    check("pointer capture ends on release", u.GetCapture() != w.hwnd && take_input(&w, ie.BUTTON_UP, &in) == 1 &&
+          in.detail == 0);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_LBUTTONUP), 0, 1376270);
+    check("a release of a button not held: nothing", take_input(&w, ie.BUTTON_UP, &in) == 0);
+    // The keyboard's focus leaving: everything held let go, the button too.
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_RBUTTONDOWN), 0, 1376270);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_KILLFOCUS), 0, 0);
+    check("focus lost: a cancel, the capture let go", take_input(&w, ie.CANCEL, &in) == 1 &&
+          in.detail == ie.CANCEL_FOCUS && u.GetCapture() != w.hwnd);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_RBUTTONUP), 0, 1376270);
+    check("the release after it: nothing", take_input(&w, ie.BUTTON_UP, &in) == 0);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_MOUSEWHEEL), cast(u64, 60 << 16), 0);
-    check("partial wheel notch is retained", take(&w, event.WHEEL, &e) == 0);
+    check("half a notch away from the user: up half a line, no whole step", take_input(&w, ie.SCROLL, &in) == 1 &&
+          in.dy == 0.0 - 0.5 && in.value120_y == 0 - 60 && in.steps_y == 0 && in.source == ie.SCROLL_WHEEL);
     u.SendMessageW(w.hwnd, cast(u32, t.WM_MOUSEWHEEL), cast(u64, 60 << 16), 0);
-    check("partial wheel notches accumulate", take(&w, event.WHEEL, &e) == 1 && e.wheel == 1 && win.wheel(&w) == 1);
+    check("the other half: a whole step", take_input(&w, ie.SCROLL, &in) == 1 && in.steps_y == 0 - 1);
     let is win.Config as modal_config = win.config("Modal child", 220, 140);
     modal_config.owner = w.hwnd; modal_config.dialog = 1; modal_config.modal = 1;
     let is win.Window as child = win.open_config(&modal_config);
