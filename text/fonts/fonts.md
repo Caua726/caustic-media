@@ -172,17 +172,32 @@ chain holds 64 faces; past that, what none of them has is drawn as missing.
 
 ## Current state
 
-Linux: the directories, the walk, the index and its file, matching and chains,
-the interface's chains. On Windows the directories and the index's place are
-known (`window/fonts.cst`, tested under wine); listing directories with
-`FindFirstFileW` and mapping files with `CreateFileMapping` come with the Win32
-backend's generated bindings, and until then a walk there finds nothing.
+Linux and Windows: the directories, the walk, the index and its file, matching
+and chains, the interface's chains. What each system is asked is in `file.cst`:
+Linux's `getdents64`, `stat` and `mmap`; Windows' `FindFirstFileW`, each path's
+file information (its volume serial and file index are the identity that keeps
+a file reached twice, or a directory by another spelling, from being walked
+again; a link or junction is followed to what it names) and a read-only view of
+a file mapping. Paths are UTF-8; Windows' are given to the W calls as UTF-16.
+The index file and its directories are written by std/io, whose Windows calls
+are still the ANSI ones, as is std/env's `getenv` that names the places: a
+profile path outside ASCII is not yet one this can keep its index under.
 
 Tested against fonts made for it ([`../testdata/fonts`](../testdata/README.md)):
 the walk's order, links, loops, depth and names; every face's description; the
 index kept, refused when forged, and kept up to date; CSS's matching at each of
 its turns; every rule of the chains, the pages learned, the bound on faces held;
 and, end to end, this machine's own fonts, the index kept in `/tmp`.
+
+On Windows `fonts_win32_test.cst` runs in an isolated Wine (`caustic-mk run
+test-win32`): the test fonts walked as Windows lists them, each size and time
+against what std/io reads by other calls, the same directory by another
+spelling not walked twice, the index kept and read back and made again for the
+one font that changed, chains mapping their faces, and a font installed in
+`%LOCALAPPDATA%\Microsoft\Windows\Fonts` found by the system's own discovery
+(a new Wine prefix's `C:\windows\Fonts` is empty: Wine draws its own fonts from
+elsewhere).
+
 Mutation-tested: every mutant killed but those that cannot be told apart — a
 hash's quality, a guard whose case the code before it already took — and two
 that only a fault would show: a file cut while it is read, and a count of files

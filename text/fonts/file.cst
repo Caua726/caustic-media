@@ -1,0 +1,235 @@
+// text/fonts/file.cst — what the font system asks of files, on each system:
+// a file mapped read-only, what a path is (kind, size, modification time and
+// an identity every name of the same file shares), the names in a directory.
+//
+// Paths are UTF-8. Linux answers with open, fstat, mmap, stat (links
+// followed) and getdents64. Windows with the W calls, a path turned UTF-16
+// for each: CreateFileW and a read-only view of a file mapping; the handle's
+// file information, whose volume serial and file index are its identity (a
+// link or junction opened is its target); FindFirstFileW for the names.
+use "std/os.cst" as os;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../window/win32/bind/types.cst" as t;
+use "../../window/win32/bind/kernel32.cst" as k;
+use "pool.cst" as pool;
+
+// What separates a directory from a name in a path.
+fn sep() as u8 with imut {
+    if (os.current() == os.OS_WINDOWS) { return cast(u8, 92); }
+    return cast(u8, 47);
+}
+
+// The longest path, in bytes, with its NUL.
+let is i64 as PATH_MAX with imut = 512;
+
+let is i32 as NONE with imut = 0;
+let is i32 as FILE with imut = 1;
+let is i32 as DIR  with imut = 2;
+
+struct Mapped {
+    data as *u8;    // null when the file could not be mapped
+    size as i64;
+}
+
+struct Info {
+    kind  as i32;   // NONE, FILE or DIR (anything else is NONE)
+    _pad  as i32;
+    size  as i64;
+    mtime as i64;   // nanoseconds since 1970
+    dev   as i64;   // with ino, the same for every name of one file
+    ino   as i64;
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (*cast(*u8, cast(i64, s) + n) != 0) { n = n + 1; }
+    return n;
+}
+
+// path in UTF-16 into out, cap units: 1, or 0 when it does not fit.
+fn _wide(path as *u8, out as *u16, cap as i32) as i32 {
+    return cast(i32, k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, path), cast(i32, 0 - 1), out, cap) > 0);
+}
+
+// --- Mapping ---
+
+// The file at path mapped read-only: data null when it cannot be — missing,
+// unreadable, or empty, which nothing maps.
+fn map(path as *u8) as Mapped {
+    let is Mapped as m;
+    m.data = cast(*u8, 0);
+    m.size = 0;
+    if (os.current() == os.OS_WINDOWS) { _map_windows(path, &m); }
+    if (os.current() == os.OS_LINUX) { _map_linux(path, &m); }
+    return m;
+}
+
+fn unmap(m as *Mapped) as void {
+    if (cast(i64, m.data) == 0) { return; }
+    if (os.current() == os.OS_WINDOWS) { k.UnmapViewOfFile(m.data); }
+    if (os.current() == os.OS_LINUX) { linux.munmap(m.data, m.size); }
+    m.data = cast(*u8, 0);
+    m.size = 0;
+}
+
+fn _map_linux(path as *u8, m as *Mapped) as void {
+    let is i64 as fd = linux.open(path, 524288, 0);   // O_RDONLY|O_CLOEXEC
+    if (fd < 0) { return; }
+    let is [144]u8 as st;
+    let is i64 as size with mut = 0;
+    if (linux.fstat(fd, cast(*u8, &st)) == 0) { size = *cast(*i64, cast(i64, &st) + 48); }
+    if (size <= 0) {
+        linux.close(fd);
+        return;
+    }
+    let is *u8 as data = linux.mmap(cast(*u8, 0), size, 1, 2, fd, 0);   // PROT_READ, MAP_PRIVATE
+    linux.close(fd);
+    let is i64 as v = cast(i64, data);
+    if (v < 0 && v > 0 - 4096) { return; }
+    m.data = data;
+    m.size = size;
+}
+
+fn _map_windows(path as *u8, m as *Mapped) as void {
+    let is [512]u16 as wide;
+    if (_wide(path, &wide[0], 512) == 0) { return; }
+    let is i64 as h = k.CreateFileW(&wide[0], cast(u32, t.GENERIC_READ), cast(u32, t.FILE_SHARE_READ | t.FILE_SHARE_DELETE),
+                                    cast(*u8, 0), cast(u32, t.OPEN_EXISTING), 0, 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return; }
+    let is i64 as size with mut = 0;
+    if (k.GetFileSizeEx(h, cast(*u8, &size)) == 0 || size <= 0) {
+        k.CloseHandle(h);
+        return;
+    }
+    let is i64 as mapping = k.CreateFileMappingW(h, cast(*u8, 0), cast(u32, t.PAGE_READONLY), 0, 0, cast(*u16, 0));
+    k.CloseHandle(h);
+    if (mapping == 0) { return; }
+    // The view keeps the mapping, and the mapping the file.
+    let is *u8 as data = k.MapViewOfFile(mapping, cast(u32, t.FILE_MAP_READ), 0, 0, 0);
+    k.CloseHandle(mapping);
+    if (cast(i64, data) == 0) { return; }
+    m.data = data;
+    m.size = size;
+}
+
+// --- What a path is ---
+
+// What the path is, links followed, into out: 1, or 0 when it is not there
+// (out.kind NONE).
+fn stat(path as *u8, out as *Info) as i32 {
+    mem.memzero(cast(*u8, out), sizeof(Info));
+    if (os.current() == os.OS_WINDOWS) { return _stat_windows(path, out); }
+    if (os.current() == os.OS_LINUX) { return _stat_linux(path, out); }
+    return 0;
+}
+
+fn _mode(st as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return cast(i64, *cast(*u32, cast(i64, st) + 16)); }
+    return cast(i64, *cast(*u32, cast(i64, st) + 24));
+}
+
+fn _stat_linux(path as *u8, out as *Info) as i32 {
+    let is [144]u8 as st;
+    if (linux.stat(path, cast(*u8, &st)) != 0) { return 0; }
+    let is i64 as kind = _mode(cast(*u8, &st)) & 61440;   // S_IFMT
+    if (kind == 16384) { out.kind = DIR; }                 // S_IFDIR
+    if (kind == 32768) { out.kind = FILE; }                // S_IFREG
+    out.dev = *cast(*i64, cast(i64, &st));
+    out.ino = *cast(*i64, cast(i64, &st) + 8);
+    out.size = *cast(*i64, cast(i64, &st) + 48);
+    out.mtime = *cast(*i64, cast(i64, &st) + 88) * 1000000000 + *cast(*i64, cast(i64, &st) + 96);
+    return 1;
+}
+
+fn _stat_windows(path as *u8, out as *Info) as i32 {
+    let is [512]u16 as wide;
+    if (_wide(path, &wide[0], 512) == 0) { return 0; }
+    // No access asked, only what it is; BACKUP_SEMANTICS opens a directory.
+    let is i64 as h = k.CreateFileW(&wide[0], 0, cast(u32, t.FILE_SHARE_READ | t.FILE_SHARE_WRITE | t.FILE_SHARE_DELETE),
+                                    cast(*u8, 0), cast(u32, t.OPEN_EXISTING), cast(u32, t.FILE_FLAG_BACKUP_SEMANTICS), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    let is t.BY_HANDLE_FILE_INFORMATION as fi;
+    let is i32 as ok = k.GetFileInformationByHandle(h, &fi);
+    k.CloseHandle(h);
+    if (ok == 0) { return 0; }
+    if ((cast(i64, fi.dwFileAttributes) & t.FILE_ATTRIBUTE_DIRECTORY) != 0) { out.kind = DIR; } else { out.kind = FILE; }
+    out.dev = cast(i64, fi.dwVolumeSerialNumber);
+    out.ino = (cast(i64, fi.nFileIndexHigh) << 32) | cast(i64, fi.nFileIndexLow);
+    out.size = (cast(i64, fi.nFileSizeHigh) << 32) | cast(i64, fi.nFileSizeLow);
+    // 100-nanosecond intervals since 1601.
+    let is i64 as ticks = (cast(i64, fi.ftLastWriteTime.dwHighDateTime) << 32) | cast(i64, fi.ftLastWriteTime.dwLowDateTime);
+    out.mtime = (ticks - 116444736000000000) * 100;
+    return 1;
+}
+
+// --- The names in a directory ---
+
+// The names in the directory at path, each NUL-terminated into names, its
+// offset there added to offs as an i64 — "." and ".." left out: 1, or 0
+// when it could not be read or the memory was refused (what was added
+// stays).
+fn list(path as *u8, names as *pool.Pool, offs as *pool.Pool) as i32 {
+    if (os.current() == os.OS_WINDOWS) { return _list_windows(path, names, offs); }
+    if (os.current() == os.OS_LINUX) { return _list_linux(path, names, offs); }
+    return 0;
+}
+
+fn _dots(name as *u8) as i32 {
+    if (name[0] != cast(u8, 46)) { return 0; }
+    if (name[1] == cast(u8, 0)) { return 1; }
+    return cast(i32, name[1] == cast(u8, 46) && name[2] == cast(u8, 0));
+}
+
+fn _add(name as *u8, names as *pool.Pool, offs as *pool.Pool) as i32 {
+    if (_dots(name) == 1) { return 1; }
+    let is i64 as at = pool.add(names, name, _len(name) + 1);
+    return cast(i32, at >= 0 && pool.add_i64(offs, at) >= 0);
+}
+
+fn _list_linux(path as *u8, names as *pool.Pool, offs as *pool.Pool) as i32 {
+    let is i64 as fd = linux.open(path, 65536 + 524288, 0);   // O_DIRECTORY|O_CLOEXEC
+    if (fd < 0) { return 0; }
+    let is [8192]u8 as buf;
+    let is i32 as ok with mut = 1;
+    let is i64 as got with mut = linux.getdents64(fd, cast(*u8, &buf), 8192);
+    while (got > 0 && ok == 1) {
+        let is i64 as pos with mut = 0;
+        while (pos < got && ok == 1) {
+            let is i64 as e = cast(i64, &buf) + pos;
+            ok = _add(cast(*u8, e + 19), names, offs);
+            pos = pos + (cast(i64, *cast(*u8, e + 16)) | (cast(i64, *cast(*u8, e + 17)) << 8));
+        }
+        got = linux.getdents64(fd, cast(*u8, &buf), 8192);
+    }
+    linux.close(fd);
+    return ok;
+}
+
+fn _list_windows(path as *u8, names as *pool.Pool, offs as *pool.Pool) as i32 {
+    let is i64 as n = _len(path);
+    if (n + 3 > PATH_MAX) { return 0; }
+    let is [512]u8 as pattern;
+    mem.memcpy(cast(*u8, &pattern), path, n);
+    pattern[n] = cast(u8, 92);
+    pattern[n + 1] = cast(u8, 42);   // "*"
+    pattern[n + 2] = cast(u8, 0);
+    let is [512]u16 as wide;
+    if (_wide(cast(*u8, &pattern), &wide[0], 512) == 0) { return 0; }
+    let is t.WIN32_FIND_DATAW as fd;
+    let is i64 as h = k.FindFirstFileW(&wide[0], &fd);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    let is i32 as ok with mut = 1;
+    let is i32 as more with mut = 1;
+    while (more != 0 && ok == 1) {
+        // A name no longer than MAX_PATH units is at most 3 bytes a unit.
+        let is [784]u8 as name;
+        if (k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, &fd.cFileName[0], cast(i32, 0 - 1), cast(*i8, &name), 784,
+                                  cast(*i8, 0), cast(*i32, 0)) > 0) {
+            ok = _add(cast(*u8, &name), names, offs);
+        }
+        more = k.FindNextFileW(h, &fd);
+    }
+    k.FindClose(h);
+    return ok;
+}

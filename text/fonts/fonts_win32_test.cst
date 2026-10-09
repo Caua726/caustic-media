@@ -1,0 +1,236 @@
+// text/fonts/fonts_win32_test.cst — the font system on Windows (here: an
+// isolated Wine, whose drive Z: is this machine's root):
+//   sh window/win32/tools/run_native.sh build/fonts_win32_test.exe
+// Run from the repository's root. The test fonts are walked as Windows
+// lists them, each size and time against what std/io reads by other calls;
+// the same directory by another spelling is not walked twice; the index is
+// kept, read back and made again when a font changes; chains map their
+// faces; and a font installed for the user is found where Windows keeps it.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" as mem;
+use "../../window/settings.cst" as settings;
+use "../../window/fonts.cst" as places;
+use "fonts.cst" as fonts;
+use "scan.cst" as scan;
+use "file.cst" as file;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (*cast(*u8, cast(i64, s) + n) != 0) { n = n + 1; }
+    return n;
+}
+
+fn ends(a as *u8, b as *u8) as i32 {
+    let is i64 as na = len(a);
+    let is i64 as nb = len(b);
+    if (na < nb || mem.memcmp(cast(*u8, cast(i64, a) + na - nb), b, nb) != 0) { return 0; }
+    return 1;
+}
+
+// std/io's modification time — GetFileAttributesExA's FILETIME — in
+// nanoseconds since 1970.
+fn mtime(path as *u8) as i64 {
+    let is i64 as ft = io.mtime(path);
+    if (ft == 0) { return 0 - 1; }
+    return (ft - 116444736000000000) * 100;
+}
+
+// a and b joined into out.
+fn join(out as *u8, a as *u8, b as *u8) as *u8 {
+    let is i64 as na = len(a);
+    let is i64 as nb = len(b);
+    mem.memcpy(out, a, na);
+    mem.memcpy(cast(*u8, cast(i64, out) + na), b, nb + 1);
+    return out;
+}
+
+// The file at from written whole to to.
+fn copy(from as *u8, to as *u8) as i32 {
+    let is file.Mapped as m with mut = file.map(from);
+    if (cast(i64, m.data) == 0) { return 0; }
+    let is i32 as ok = cast(i32, io.write_file_atomic(to, m.data, m.size) == 0);
+    file.unmap(&m);
+    return ok;
+}
+
+let is *u8 as TESTS with imut = "text\\testdata\\fonts";
+
+// --- Walking ---
+
+fn walking() as void {
+    let is scan.Scan as s with mut = scan.open();
+    let is i64 as n = scan.walk(&s, TESTS);
+    check("the test fonts, as Windows lists them", n == 31 && scan.count(&s) == 31);
+    check("in the order of their names", ends(scan.path(&s, 0), "\\cjk\\TestCJK.ttc") == 1);
+    check("a name's case kept, its extension's ignored", ends(scan.path(&s, 15), "\\sans\\TestSans-Black.ttf") == 1
+          && ends(scan.path(&s, 16), "\\sans\\TestSans-Bold.TTF") == 1);
+    let is i64 as i with mut = 0;
+    let is i32 as sized with mut = 1;
+    let is i32 as timed with mut = 1;
+    while (i < scan.count(&s)) {
+        let is *u8 as p = scan.path(&s, i);
+        if (scan.file(&s, i).size != io.file_size(p)) { sized = 0; io.printf("  size of %s\n", p); }
+        if (scan.file(&s, i).mtime != mtime(p)) { timed = 0; io.printf("  time of %s\n", p); }
+        i = i + 1;
+    }
+    check("each size as std/io reads it", sized == 1);
+    check("each time as std/io reads it", timed == 1);
+    check("the same directory: not again", scan.walk(&s, TESTS) == 0);
+    check("nor by another spelling", scan.walk(&s, "text/testdata/fonts/") == 0 && scan.walk(&s, "TEXT\\TESTDATA\\FONTS") == 0);
+    check("nor a directory inside it", scan.walk(&s, "text\\testdata\\fonts\\sans") == 0);
+    check("not a directory: nothing", scan.walk(&s, "text\\testdata\\fonts\\mono\\TestMono.ttf") == 0
+          && scan.walk(&s, "text\\testdata\\nowhere") == 0);
+    scan.close(&s);
+}
+
+// --- Mapping ---
+
+fn mapping() as void {
+    let is file.Mapped as m with mut = file.map("text\\testdata\\fonts\\mono\\TestMono.ttf");
+    check("a font mapped", cast(i64, m.data) != 0 && m.size == io.file_size("text\\testdata\\fonts\\mono\\TestMono.ttf"));
+    // sfnt version 1.0 or 'true'
+    check("its first bytes the file's", cast(i64, m.data) != 0 && ((m.data[0] == cast(u8, 0) && m.data[1] == cast(u8, 1))
+          || m.data[0] == cast(u8, 116)));
+    file.unmap(&m);
+    check("unmapped", cast(i64, m.data) == 0 && m.size == 0);
+    let is file.Mapped as none = file.map("text\\testdata\\fonts\\odd\\empty.otf");
+    check("an empty file: nothing to map", cast(i64, none.data) == 0);
+    let is file.Mapped as missing = file.map("text\\testdata\\fonts\\nowhere.ttf");
+    check("a missing one: nothing", cast(i64, missing.data) == 0);
+    let is file.Info as st;
+    check("a directory is one", file.stat(TESTS, &st) == 1 && st.kind == file.DIR);
+    check("a file is one", file.stat("text\\testdata\\fonts\\mono\\TestMono.ttf", &st) == 1 && st.kind == file.FILE
+          && st.size == io.file_size("text\\testdata\\fonts\\mono\\TestMono.ttf"));
+}
+
+// --- Kept between runs ---
+
+let is *u8 as CACHE with imut = "build\\fonts-win32\\deep\\fonts.index";
+
+fn kept() as void {
+    io.unlink(CACHE);
+    let is places.Dirs as d;
+    d.n = 1;
+    mem.memcpy(places.dir(&d, 0), TESTS, len(TESTS) + 1);
+    let is fonts.index.Index as ix with mut;
+    check("made", fonts.refresh(&d, CACHE, &ix) == 1);
+    check("every file read", ix.reads == 31 && fonts.index.face_count(&ix) == 30);
+    let is i64 as t = mtime(CACHE);
+    check("kept, the directories above made", t > 0);
+    fonts.index.close(&ix);
+    check("made again", fonts.refresh(&d, CACHE, &ix) == 1);
+    check("from the file: nothing read", ix.reads == 0 && fonts.index.face_count(&ix) == 30);
+    check("nor written", mtime(CACHE) == t);
+    fonts.index.close(&ix);
+    io.unlink(CACHE);
+}
+
+// A font that changes is read again, and only it.
+fn changing() as void {
+    let is *u8 as dir = "build\\fonts-win32\\tree";
+    let is *u8 as one = "build\\fonts-win32\\tree\\One.ttf";
+    let is *u8 as two = "build\\fonts-win32\\tree\\Two.ttf";
+    let is *u8 as cache = "build\\fonts-win32\\tree.index";
+    io.mkdir("build\\fonts-win32");
+    io.mkdir(dir);
+    io.unlink(cache);
+    check("two fonts put there", copy("text\\testdata\\fonts\\sans\\TestSans-Regular.ttf", one) == 1
+          && copy("text\\testdata\\fonts\\mono\\TestMono.ttf", two) == 1);
+    let is places.Dirs as d;
+    d.n = 1;
+    mem.memcpy(places.dir(&d, 0), dir, len(dir) + 1);
+    let is fonts.index.Index as ix with mut;
+    check("both read", fonts.refresh(&d, cache, &ix) == 1 && ix.reads == 2 && fonts.index.face_count(&ix) == 2);
+    fonts.index.close(&ix);
+    check("then neither", fonts.refresh(&d, cache, &ix) == 1 && ix.reads == 0);
+    fonts.index.close(&ix);
+    check("one replaced by another font", copy("text\\testdata\\fonts\\more\\TestSansGreek-Bold.ttf", one) == 1);
+    check("it alone read again", fonts.refresh(&d, cache, &ix) == 1 && ix.reads == 1 && fonts.index.face_count(&ix) == 2);
+    fonts.index.close(&ix);
+    io.unlink(one);
+    io.unlink(two);
+    io.unlink(cache);
+}
+
+// --- Chains map their faces ---
+
+fn chains() as void {
+    let is places.Dirs as d;
+    d.n = 1;
+    mem.memcpy(places.dir(&d, 0), TESTS, len(TESTS) + 1);
+    let is fonts.index.Index as ix with mut;
+    fonts.refresh(&d, "", &ix);
+    let is fonts.chain.Prefs as p with mut = fonts.chain.defaults();
+    p.ui = "Caustic Test Var";
+    p.mono = "Caustic Test Mono";
+    let is settings.Settings as s with mut = settings.defaults();
+    mem.memcpy(cast(*u8, &s.font), "Caustic Test Sans", 18);
+    s.known = settings.K_FONT;
+    let is fonts.chain.Chain as c with mut;
+    check("the desktop's font, its chain", fonts.ui(&c, &ix, &s, &p) == 1
+          && ends(fonts.index.path_of(&ix, fonts.chain.member(&c, 0).face), "\\TestSans-Regular.ttf") == 1);
+    check("its face mapped and read", fonts.chain.find(&c, 65) >= 0 && cast(i64, fonts.chain.face(&c, 0)) != 0);
+    fonts.chain.close(&c);
+    check("the monospace one", fonts.mono(&c, &ix, &s, &p) == 1 && fonts.chain.find(&c, 65) >= 0
+          && ends(fonts.index.path_of(&ix, fonts.chain.member(&c, 0).face), "\\TestMono.ttf") == 1);
+    fonts.chain.close(&c);
+    fonts.index.close(&ix);
+}
+
+// --- Where Windows keeps them ---
+
+// A font installed for the user, as Windows does without an administrator:
+// in %LOCALAPPDATA%\Microsoft\Windows\Fonts.
+fn system() as void {
+    let is *u8 as local = env.getenv("LOCALAPPDATA");
+    check("a user's local application data", cast(i64, local) != 0 && len(local) > 0 && len(local) < 300);
+    if (cast(i64, local) == 0 || len(local) >= 300) { return; }
+    let is [512]u8 as p;
+    let is [512]u8 as q;
+    // getenv's scratch is overwritten by the next getenv: copied first.
+    let is [320]u8 as base;
+    mem.memcpy(cast(*u8, &base), local, len(local) + 1);
+    io.mkdir(join(cast(*u8, &p), cast(*u8, &base), "\\Microsoft"));
+    io.mkdir(join(cast(*u8, &p), cast(*u8, &base), "\\Microsoft\\Windows"));
+    io.mkdir(join(cast(*u8, &p), cast(*u8, &base), "\\Microsoft\\Windows\\Fonts"));
+    check("a font installed for the user", copy("text\\testdata\\fonts\\sans\\TestSans-Regular.ttf",
+          join(cast(*u8, &q), cast(*u8, &base), "\\Microsoft\\Windows\\Fonts\\TestSans-Regular.ttf")) == 1);
+    let is fonts.index.Index as ix with mut;
+    check("this system's fonts", fonts.system(&ix) == 1);
+    let is fonts.index.Run as r = fonts.index.family(&ix, "Caustic Test Sans");
+    check("the installed one among them", r.n >= 1);
+    let is i64 as n = places.index_path(cast(*u8, &p), 512);
+    check("kept where Windows keeps a user's data", n > 0 && ends(cast(*u8, &p), "\\caustic-media\\fonts.index") == 1
+          && mtime(cast(*u8, &p)) > 0);
+    let is fonts.chain.Prefs as pr = fonts.prefs();
+    let is fonts.chain.Chain as c with mut;
+    check("a chain of them", fonts.chain.open(&c, &ix, "sans-serif", 400.0, 100.0, 0, &pr) == 1 && fonts.chain.find(&c, 65) >= 0);
+    fonts.chain.close(&c);
+    fonts.index.close(&ix);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    walking();
+    mapping();
+    kept();
+    changing();
+    chains();
+    system();
+    if (fails > 0) {
+        io.printf("fonts win32: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("fonts win32: all checks passed\n");
+    return 0;
+}
