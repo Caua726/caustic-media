@@ -31,9 +31,12 @@
 // screen, tiled — the frame follows. Every window is kept from being made
 // smaller than its content can be laid out in (layout.min_size), told the
 // platform again whenever that changes. Where nothing behind the window shows
-// through — X with no compositing manager — the frame is drawn flat. An
-// input method's candidates are placed by the platform, not here, until the
-// X input method's spot is (F1/F2).
+// through — X with no compositing manager — the frame is drawn flat. While a
+// text field has the keyboard the platform's input method composes for it:
+// told where the caret is (its candidates go there), its composition shown in
+// the field as it draws it, and abandoned when the field with the keyboard
+// changes.
+use "std/os.cst" as os;
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
 use "std/sync.cst" as sync;
@@ -48,6 +51,7 @@ use "../window/wait.cst" as wait;
 use "../window/cursor.cst" as cursor;
 use "../window/display.cst" as display;
 use "../window/settings.cst" as wsettings;
+use "../window/x11/locale.cst" as xlocale;
 use "app.cst" as app;
 use "tree.cst" as tree;
 use "router.cst" as router;
@@ -98,6 +102,7 @@ struct Native {
     title_len as i32;
     deco      as i64;            // the frame of its own it was opened for; 0: the platform's
     typed     as i32;            // the text the last key pressed typed is the program's: the key was not taken
+    texting   as i64;            // the text field text input was last enabled for; 0: none
     told_ext  as [4]i64;         // the frame's extents as last told, physical pixels
     told_in   as [4]i64;         // and the input region
     told_min  as [2]i64;         // the smallest it may be made, as last told, physical pixels
@@ -150,6 +155,10 @@ fn open(a as *app.App, dv as *gpu.device.Device, svc as *u8) as *Host {
     hs.dv = dv;
     hs.svc = svc;
     hs.wt = wait.open();
+    // Text in the user's locale (LC_CTYPE): what X11's input methods compose
+    // in — Xlib takes it from the C library, and in "C" an input method can
+    // commit nothing past ASCII.
+    if (os.current() == os.OS_LINUX) { xlocale.use_environment(); }
     hs.desktop = wsettings.defaults();
     let is draw2d.Limits as dl = draw2d.limits_default();
     hs.canvas = draw2d.open(dv, &dl);
@@ -448,6 +457,7 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.icon_gen = 0;
     n.deco = deco;
     n.typed = 0;
+    n.texting = 0;
     n.frame_layout_len = 0 - 1;
     // Nothing told yet (-1 each, all bits set): told with its first frame.
     mem.memset(cast(*u8, &n.told_ext), 255, 32);
@@ -481,12 +491,20 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     tree.set_clipboard(t, fn_ptr(_copy), cast(*u8, n));
     tree.set_paste(t, fn_ptr(_paste), cast(*u8, n));
     tree.set_window_ops(t, fn_ptr(_window_op), cast(*u8, n));
+    tree.set_ime_reset(t, fn_ptr(_ime_reset), cast(*u8, n));
     // Its texture keeps what it holds: a scroll area's pixels are moved.
     tree.set_moves(t, 1);
     // Its shadow only where what is behind shows through it.
     decoration.set_flat(t, deco, cast(i32, device.transparent(&n.win) == 0 || device.composited(&n.win) == 0));
     tree.invalidate_paint_subtree(t, tree.root(t));
     return 1;
+}
+
+// A widget gave its composition up: the platform's input method gives it up
+// too, or what it commits next is what the widget no longer shows.
+fn _ime_reset(user as *u8, w as i64) as void {
+    let is *Native as n = cast(*Native, user);
+    device.text_input_reset(&n.win);
 }
 
 fn _put_away(hs as *Host, i as i64) as void {
@@ -496,6 +514,7 @@ fn _put_away(hs as *Host, i as i64) as void {
         tree.set_clipboard(t, cast(tree.ClipboardFn, 0), cast(*u8, 0));
         tree.set_paste(t, cast(tree.PasteFn, 0), cast(*u8, 0));
         tree.set_window_ops(t, cast(tree.WindowOpFn, 0), cast(*u8, 0));
+        tree.set_ime_reset(t, cast(tree.ImeResetFn, 0), cast(*u8, 0));
     }
     if (n.tex != 0) { gpu.texture.destroy(hs.dv, n.tex); }
     cursor.close(&n.cur, &n.win);
@@ -930,7 +949,7 @@ fn _input_one(hs as *Host, n as *Native, e as *ie.Event, now as i64) as void {
         return;
     }
     if (k == ie.PREEDIT) {
-        if (input == 1) { router.preedit(t, r, e.text, e.text_len, e.cursor, now); }
+        if (input == 1) { router.preedit_segment(t, r, e.text, e.text_len, e.cursor, e.hl_start, e.hl_end, now); }
         return;
     }
     if (k == ie.DELETE_SURROUNDING) {
@@ -1098,9 +1117,14 @@ fn _text_inputs(hs as *Host) as void {
     let is i64 as i with mut = 0;
     while (i < MAX_WINDOWS) {
         let is *Native as n = _native(hs, i);
-        if (n.h != 0 && n.win.backend == device.WAYLAND) {
+        if (n.h != 0 && (n.win.backend == device.WAYLAND || n.win.backend == device.X11)) {
             let is *tree.Tree as t = app.tree(hs.a, n.h);
-            let is i32 as active = cast(i32, app.blocked(hs.a, n.h) == 0 && tree.text_area(t) != 0);
+            let is i64 as area = tree.text_area(t);
+            let is i32 as active = cast(i32, app.blocked(hs.a, n.h) == 0 && area != 0);
+            // Another field: what was composing for the last one is not this one's.
+            if (active == 1 && n.texting != 0 && n.texting != area) { device.text_input_reset(&n.win); }
+            n.texting = 0;
+            if (active == 1) { n.texting = area; }
             if (device.text_input_enable(&n.win, active) == 1 && active == 1) {
                 let is math.rect.Rect as r = tree.text_area_rect(t);
                 let is i64 as x = _round(r.x * n.scale);

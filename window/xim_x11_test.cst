@@ -1,0 +1,276 @@
+// window/xim_x11_test.cst — text input through a real X input method, keys
+// sent with XTest, through the portable device as the toolkit drives it.
+//
+//   env X_LAYOUTS=us X_VARIANTS=intl sh window/x11/tools/run_headless.sh \
+//       ./build/xim_x11_test local
+//     No server: Xlib's own method, from the locale's Compose file —
+//     PreeditNothing, and a dead key composing (é from ´ then e), which
+//     XLookupString alone does not do.
+//
+//   sh window/x11/tools/run_headless.sh sh window/x11/tools/run_fcitx.sh \
+//       ./build/xim_x11_test on-the-spot
+//     The installed Fcitx5, on the spot (UseOnTheSpot): its composition — Quick
+//     Phrase's, Super+` then letters — drawn by the program from the
+//     callbacks, committed as text, its panel put at the caret the program
+//     says, the composition abandoned when the program resets it, and the
+//     method's focus taken away while no text field has the keyboard.
+//
+//   env FCITX_ON_THE_SPOT=0 sh window/x11/tools/run_headless.sh sh \
+//       window/x11/tools/run_fcitx.sh ./build/xim_x11_test over-the-spot
+//     The same method over the spot: it draws the composition itself, at the
+//     caret; the program hears only what is committed.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/mem.cst" as mem;
+use "device.cst" as device;
+use "../input/event.cst" as ie;
+use "../input/keys.cst" as keys;
+use "x11/x11.cst" as x11;
+use "x11/text.cst" as xtext;
+use "x11/locale.cst" as xlocale;
+use "x11/bind/xlib.cst" as xlib;
+
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is *u8 as xd with mut;
+
+// What came as text and as compositions, in order, while pumping ms.
+let is [512]u8 as texts;
+let is i64 as ntexts with mut = 0;
+let is [64]u8 as pre;
+let is i64 as npre with mut = 0 - 1;     // the last composition said, -1 none since cleared
+let is i64 as pre_cursor with mut = 0;
+let is i64 as compositions with mut = 0;  // how many PREEDITs
+let is i64 as keys_down with mut = 0;
+
+fn heard() as void { ntexts = 0; npre = 0 - 1; compositions = 0; keys_down = 0; }
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    let is ie.Event as e;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &e) == 1) {
+            if (e.kind == ie.TEXT) {
+                let is i64 as i with mut = 0;
+                while (i < e.text_len && ntexts < 511) { texts[ntexts] = e.text[i]; ntexts = ntexts + 1; i = i + 1; }
+            }
+            if (e.kind == ie.PREEDIT) {
+                compositions = compositions + 1;
+                npre = e.text_len;
+                if (npre > 63) { npre = 63; }
+                mem.memcpy(&pre[0], e.text, npre);
+                pre_cursor = e.cursor;
+            }
+            if (e.kind == ie.KEY_DOWN) { keys_down = keys_down + 1; }
+        }
+        time.sleep_ms(5);
+    }
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+fn code(keysym as i64) as u32 { return cast(u32, xlib.XKeysymToKeycode(xd, keysym)); }
+
+// Pumps until the last composition said is n bytes, three seconds at most:
+// on a loaded machine the method answers late.
+fn until_composed(n as i64) as void {
+    let is i64 as until = time.now_ms() + 3000;
+    while (npre != n && time.now_ms() < until) { pump(20); }
+}
+
+// Pumps until n bytes of text came, three seconds at most.
+fn until_typed(n as i64) as void {
+    let is i64 as until = time.now_ms() + 3000;
+    while (ntexts < n && time.now_ms() < until) { pump(20); }
+}
+
+fn tap(keysym as i64) as void {
+    let is u32 as kc = code(keysym);
+    XTestFakeKeyEvent(xd, kc, 1, cast(u64, 0));
+    XTestFakeKeyEvent(xd, kc, 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    pump(150);
+}
+
+// Quick Phrase's trigger: Super and the grave accent.
+fn quick_phrase() as void {
+    let is u32 as sup = code(65515);
+    XTestFakeKeyEvent(xd, sup, 1, cast(u64, 0));
+    tap(96);
+    XTestFakeKeyEvent(xd, sup, 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    pump(200);
+}
+
+// The input method's panel — a mapped override-redirect window not ours —
+// its root position into *x, *y: 1 when there is one.
+fn panel(x as *i64, y as *i64) as i32 {
+    let is i64 as root = xlib.XDefaultRootWindow(xd);
+    let is i64 as r with mut = 0;
+    let is i64 as parent with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is u32 as n with mut = cast(u32, 0);
+    if (xlib.XQueryTree(xd, root, cast(*u8, &r), cast(*u8, &parent), cast(*u8, &kids), cast(*u8, &n)) == 0) { return 0; }
+    let is i32 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, n)) {
+        let is xlib.XWindowAttributes as at;
+        if (kids[i] != x11.xid(&win.x11_win) && xlib.XGetWindowAttributes(xd, kids[i], cast(*u8, &at)) != 0 &&
+            at.override_redirect != 0 && at.map_state == 2 && at.width > 1 && at.height > 1) {
+            *x = cast(i64, at.x);
+            *y = cast(i64, at.y);
+            found = 1;
+        }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+// The window's top left on the root.
+fn origin(x as *i64, y as *i64) as void {
+    let is i32 as rx with mut = 0;
+    let is i32 as ry with mut = 0;
+    let is i64 as child with mut = 0;
+    xlib.XTranslateCoordinates(xd, x11.xid(&win.x11_win), xlib.XDefaultRootWindow(xd), 0, 0,
+                               cast(*u8, &rx), cast(*u8, &ry), cast(*u8, &child));
+    *x = cast(i64, rx);
+    *y = cast(i64, ry);
+}
+
+fn local() as void {
+    check("Xlib's own method, drawing nothing of the composition",
+          device.text_input_enable(&win, 1) == 1 &&
+          xtext.style(&win.x11_win.txt) == (xtext.PREEDIT_NOTHING | xtext.STATUS_NOTHING));
+    let is u32 as dead = code(65105);
+    check("US international: the acute a dead key", dead != 0);
+    heard();
+    tap(65105);
+    check("a dead key: nothing typed yet", ntexts == 0);
+    tap(101);
+    check("then e: é", same(&texts[0], ntexts, "é") == 1);
+    heard();
+    tap(65105);
+    tap(32);
+    check("the acute and space: the acute itself", same(&texts[0], ntexts, "'") == 1 || same(&texts[0], ntexts, "´") == 1);
+    heard();
+    tap(97);
+    check("a plain key: itself", same(&texts[0], ntexts, "a") == 1);
+}
+
+fn on_the_spot() as void {
+    check("Fcitx5 on the spot: the program draws the composition",
+          device.text_input_enable(&win, 1) == 1 && xtext.on_the_spot(&win.x11_win.txt) == 1);
+    device.text_input_rect(&win, 40, 30, 1, 20);
+    pump(200);
+    heard();
+    quick_phrase();
+    tap(97);
+    tap(98);
+    until_composed(2);
+    check("composing: the composition said as it is drawn", npre == 2 && same(&pre[0], npre, "ab") == 1 && pre_cursor == 2 &&
+          ntexts == 0);
+    let is i64 as wx with mut = 0;
+    let is i64 as wy with mut = 0;
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    origin(&wx, &wy);
+    let is i32 as shown = panel(&px, &py);
+    io.printf("  panel %d at %d,%d; window at %d,%d; caret at %d,%d\n", cast(i64, shown), px, py, wx, wy, wx + 40, wy + 50);
+    check("its panel at the caret", shown == 1 && px >= wx + 40 - 2 && px <= wx + 40 + 24 && py >= wy + 50 - 2 && py <= wy + 50 + 24);
+    tap(99);
+    tap(65293);
+    until_typed(3);
+    until_composed(0);
+    check("committed: the text, and the composition over", same(&texts[0], ntexts, "abc") == 1 && npre == 0);
+    // Abandoned by the program: empty, and what follows is plain typing.
+    heard();
+    quick_phrase();
+    tap(120);
+    until_composed(1);
+    check("composing again", npre == 1 && same(&pre[0], npre, "x") == 1);
+    device.text_input_reset(&win);
+    pump(200);
+    check("reset: the composition gone, nothing committed", npre == 0 && ntexts == 0);
+    tap(121);
+    until_typed(1);
+    check("what is typed after it: itself", same(&texts[0], ntexts, "y") == 1);
+    // No text field with the keyboard: the method no longer has it.
+    check("off", device.text_input_enable(&win, 0) == 1 && device.text_input_active(&win) == 0);
+    heard();
+    quick_phrase();
+    tap(122);
+    check("its keys plain keys, no composition", compositions == 0 && keys_down >= 1);
+    check("on again", device.text_input_enable(&win, 1) == 1 && device.text_input_active(&win) == 1);
+}
+
+fn over_the_spot() as void {
+    check("Fcitx5 over the spot: the method draws the composition",
+          device.text_input_enable(&win, 1) == 1 &&
+          (xtext.style(&win.x11_win.txt) & xtext.PREEDIT_POSITION) != 0);
+    device.text_input_rect(&win, 60, 20, 1, 20);
+    pump(200);
+    heard();
+    quick_phrase();
+    tap(97);
+    tap(98);
+    check("composing: none of it the program's to draw", compositions == 0 && ntexts == 0);
+    let is i64 as wx with mut = 0;
+    let is i64 as wy with mut = 0;
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    origin(&wx, &wy);
+    let is i32 as shown = panel(&px, &py);
+    io.printf("  panel %d at %d,%d; caret at %d,%d\n", cast(i64, shown), px, py, wx + 60, wy + 40);
+    check("its panel at the caret", shown == 1 && px >= wx + 60 - 2 && px <= wx + 60 + 24 && py >= wy + 40 - 2 && py <= wy + 40 + 24);
+    tap(65293);
+    until_typed(2);
+    check("committed: the text", same(&texts[0], ntexts, "ab") == 1);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() < 2) {
+        io.printf("usage: xim_x11_test local|on-the-spot|over-the-spot\n");
+        return 2;
+    }
+    let is *u8 as mode = env.argv(1);
+    xlocale.use_environment();
+    win = device.open("text input", 320, 120);
+    if (device.is_open(&win) == 0 || win.backend != device.X11) {
+        io.printf("FAIL: no X11 window\n");
+        return 1;
+    }
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    xlib.XSetInputFocus(xd, x11.xid(&win.x11_win), 1, 0);
+    xlib.XSync(xd, 0);
+    pump(300);
+    if (mode[0] == cast(u8, 108)) { local(); }
+    else if (mode[1] == cast(u8, 110)) { on_the_spot(); }
+    else { over_the_spot(); }
+    device.close(&win);
+    xlib.XCloseDisplay(xd);
+    if (fails == 0) {
+        io.printf("xim x11 %s: all checks passed\n", mode);
+        return 0;
+    }
+    io.printf("xim x11 %s: %d failures\n", mode, fails);
+    return 1;
+}

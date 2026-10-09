@@ -473,6 +473,13 @@ where said:
   Wayland's `suspended`, its size kept meanwhile), tiled sides;
   `COMPOSITOR` that a compositing manager started or stopped; `CLOSE` its
   close button — `keep_open` when the program says no.
+- Text input (`text_input_enable`, `text_input_rect`, `text_input_reset`):
+  while a text field has the keyboard the platform's input method composes
+  for it — on X11 the display's XIM, on the spot where offered (`PREEDIT`
+  with the part being converted), over the spot, or Xlib's local method —
+  told where the caret is (its panel and candidates go there) and told to
+  give the composition up when the field does; with no field, it no longer
+  has the keyboard. On Wayland text-input-v3, on Windows IMM32.
 - `device.set_title` in UTF-8: `_NET_WM_NAME`, and `WM_NAME` in Latin-1 for
   an old window manager, each sequence whole or a `?`; `show`, `hide`,
   `activate`, `position` on the screen, `set_icon`; `clipboard_set`,

@@ -793,9 +793,31 @@ fn _display_release() as void {
         // Followed on that connection only: the next one is followed anew.
         _cm_event = 0;
         _cm_selection = 0;
+        // The input method is the connection's: closed with it.
+        text.close_display(_display);
         xlib.XCloseDisplay(_display);
         _display = cast(*u8, 0);
     }
+}
+
+// The composition as the input method last drew it (on the spot), said as
+// cooked input once it changed: its text, caret and the part being
+// converted (input/event.cst's PREEDIT).
+let is [1024]u8 as _preedit;
+
+fn _preedit_said(w as *Window) as void {
+    if (text.preedit_changed(&w.txt) == 0 || cast(i64, w.input) == 0) { return; }
+    let is i64 as cursor with mut = 0;
+    let is i64 as hl_start with mut = 0;
+    let is i64 as hl_end with mut = 0;
+    let is i64 as n = text.preedit_utf8(&w.txt, &_preedit[0], 1024, &cursor, &hl_start, &hl_end);
+    let is ie.Event as e;
+    ie.clear(&e);
+    e.kind = ie.PREEDIT;
+    e.cursor = cursor;
+    e.hl_start = hl_start;
+    e.hl_end = hl_end;
+    ie.push(w.input, &e, &_preedit[0], n);
 }
 
 // Registered from the PUMP rather than from open_with, and that is not a
@@ -1044,7 +1066,11 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
         //    own that mean nothing here.
         //
         //    Always 0 when no input method is open, so this costs a branch.
-        if (text.filter(&w.txt, e) == 1) { return; }
+        //    The composition's callbacks run inside it: what they drew is
+        //    said right after.
+        let is i32 as eaten = text.filter(&w.txt, e);
+        _preedit_said(w);
+        if (eaten == 1) { return; }
 
         // 1. Fold. Unconditional and before the ring, so a full ring never
         //    costs a resize, a close, or a held key.
@@ -1069,7 +1095,7 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
 
         // 2b. The input method's candidate window follows our focus, or it
         //     draws itself next to a window that no longer has the keyboard.
-        if (xev.kind(e) == x.FocusIn)  { text.focus_in(&w.txt); }
+        if (xev.kind(e) == x.FocusIn && text.wanted(&w.txt) == 1) { text.focus_in(&w.txt); }
         if (xev.kind(e) == x.FocusOut) { text.focus_out(&w.txt); }
 
         // 3. A layout switch invalidates every keycode this program has cached.
@@ -1204,13 +1230,35 @@ fn _pump(w as *Window, block as i32) as void {
             // a ConfigureNotify for a window that just closed resizing
             // whichever window happened to be pumping — which is exactly what
             // multi_test.cst caught.
-            if (target != 0) { continue; }
+            // Except to the input method: its messages come to a window of
+            // its own on this connection (the XIM transport), and are its to
+            // read — a composition's callbacks run then, for whichever of
+            // our windows it composes in.
+            if (target != 0) {
+                if (text.filter(&w.txt, &_scratch) == 1) { _preedits_said(); }
+                continue;
+            }
             // No target at all: MappingNotify, and a GenericEvent whose payload
             // names its own window. The pumping window is the only sensible
             // owner for something the server sent to nobody in particular.
             owner = w;
         }
         _deliver(owner, &_scratch);
+    }
+    // Xlib reads the input method's messages inside its own calls too — a
+    // synchronous XSetICValues waiting for its reply runs the composition's
+    // callbacks meanwhile — so what they drew is said here, not only after
+    // a filtered event.
+    _preedits_said();
+}
+
+// Every window's composition, said where it changed: an input method's
+// message may draw in any window's.
+fn _preedits_said() as void {
+    let is i64 as i with mut = 0;
+    while (i < _reg_count) {
+        _preedit_said(cast(*Window, _reg_win[i]));
+        i = i + 1;
     }
 }
 
@@ -1786,9 +1834,63 @@ fn text_dropped(w as *Window) as i64 { return text.dropped(&w.txt); }
 // lives in its own file because it is libc; see locale.cst.
 fn open_input_method(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    return text.open_method(&w.txt, w.display, w.xid);
+    let is i32 as got = text.open_method(&w.txt, w.display, w.xid);
+    if (got == 1 && w.st.focused == 1) { text.focus_in(&w.txt); }
+    return got;
 }
 fn has_input_method(w as *Window) as i32 { return text.has_method(&w.txt); }
+
+// --- Text input, as the toolkit asks for it ---
+//
+// A text field has the keyboard (on 1) or none has (0). On, the first time:
+// the display's input method opened, on the spot where it lets the program
+// draw the composition, else over the spot, else its own (text.cst); the
+// context has the method's focus while the window has the keyboard. The
+// caller sets the user's locale first (locale.use_environment, the one libc
+// call, which device.cst makes; here it would cost every X11 program libc).
+// Off: the composition, if any, abandoned — what it had composed dropped, the
+// field it was for no longer the one with the keyboard — and the method's
+// focus taken away, so it no longer eats keys meant for something else. 1
+// when a method is there (without one, keys still type through
+// XLookupString, and the method is tried again when one appears).
+fn text_input_enable(w as *Window, on as i32) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (on == 1) {
+        if (text.wanted(&w.txt) == 1) { return text.has_method(&w.txt); }
+        if (text.has_method(&w.txt) == 0) { text.open_method(&w.txt, w.display, w.xid); }
+        text.set_wanted(&w.txt, 1);
+        if (w.st.focused == 1) { text.focus_in(&w.txt); }
+        return text.has_method(&w.txt);
+    }
+    if (text.wanted(&w.txt) == 0) { return 1; }
+    text.set_wanted(&w.txt, 0);
+    text_input_reset(w);
+    text.focus_out(&w.txt);
+    return 1;
+}
+
+// Whether a method composes for the window now.
+fn text_input_active(w as *Window) as i32 {
+    return cast(i32, w.ok == 1 && text.wanted(&w.txt) == 1 && text.has_method(&w.txt) == 1);
+}
+
+// The caret, x, y, width, height in the window: the method's spot its
+// bottom left — where an over-the-spot method writes and candidates go.
+fn text_input_rect(w as *Window, x as i64, y as i64, width as i64, height as i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    text.set_spot(&w.txt, x, y + height);
+    _preedits_said();
+    return 1;
+}
+
+// The composition abandoned — the caret moved by a click, the text changed
+// under it — and what the method had composed dropped: the program decides
+// what is typed, not a composition the user no longer sees.
+fn text_input_reset(w as *Window) as void {
+    if (w.ok == 0) { return; }
+    text.reset(&w.txt);
+    _preedit_said(w);
+}
 
 // Whether _NET_WM_SYNC_REQUEST is in place: the extension exists, the counter
 // was created, and the protocol is advertised. A compositor that never sends a

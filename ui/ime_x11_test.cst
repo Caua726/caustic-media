@@ -1,0 +1,238 @@
+// ui/ime_x11_test.cst — an entry typed into through the installed Fcitx5, on
+// the spot, the toolkit's loop doing what a program's does:
+//   sh window/x11/tools/run_headless.sh sh window/x11/tools/run_fcitx.sh ./build/ime_x11_test
+// The user's keys (XTest) start a composition (Quick Phrase: Super+` then
+// letters): the entry shows it at its caret, underlined, its text unchanged;
+// the method's panel sits by the entry's caret; Enter commits it into the
+// text. Another field focused mid-composition: the composition given up in
+// both — the method's and the entry's — and what is typed next is plain.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../window/device.cst" as device;
+use "../window/x11/x11.cst" as x11;
+use "../window/x11/bind/xlib.cst" as xlib;
+use "../text/sfnt/sfnt.cst" as sfnt;
+use "../text/sfnt/table.cst" as table;
+use "../text/layout/font.cst" as font;
+use "tree.cst" as tree;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "style.cst" as style;
+use "router.cst" as router;
+use "text.cst" as text;
+use "app.cst" as app;
+use "host.cst" as host;
+use "widgets/entry.cst" as entry;
+
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as loaded with mut = 0;
+
+fn load(path as *u8) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    loaded = 0;
+    if (fd < 0) { return cast(*u8, 0); }
+    let is [144]u8 as st;
+    linux.fstat(fd, cast(*u8, &st));
+    let is i64 as size = *cast(*i64, cast(i64, &st) + 48);
+    let is *u8 as p = mem.core.mmap_anon(size + 4096);
+    let is i64 as n with mut = 0;
+    let is i64 as r with mut = 1;
+    while (r > 0 && n < size) {
+        r = linux.read(fd, cast(*u8, cast(i64, p) + n), size - n);
+        if (r > 0) { n = n + r; }
+    }
+    linux.close(fd);
+    loaded = n;
+    return p;
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+let is table.Face as face with mut;
+let is font.List as list with mut;
+let is font.Font as plain_font with mut;
+
+fn resolve(user as *u8, family as *u8, weight as i64, italic as i32) as *font.Font { return &plain_font; }
+
+let is style.Theme as theme with mut;
+let is gpu.device.Device as dv with mut;
+let is app.App as a with mut;
+let is *host.Host as hs with mut;
+let is *u8 as xd with mut;
+
+fn rounds(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) { host.step(hs, 10); }
+}
+
+// Rounds until entry w shows a composition of n bytes, three seconds at most:
+// on a loaded machine the method answers late.
+fn composed(t as *tree.Tree, w as i64, n as i64) as void {
+    let is i64 as a with mut = 0;
+    let is i64 as b with mut = 0;
+    let is i64 as until = time.now_ms() + 3000;
+    while (entry.composition(t, w, &a, &b) != n && time.now_ms() < until) { host.step(hs, 10); }
+}
+
+// Rounds until entry w holds s, three seconds at most.
+fn holds(t as *tree.Tree, w as i64, s as *u8) as void {
+    let is i64 as until = time.now_ms() + 3000;
+    while (same(entry.text(t, w), entry.length(t, w), s) == 0 && time.now_ms() < until) { host.step(hs, 10); }
+}
+
+fn tap(keysym as i64) as void {
+    let is u32 as kc = cast(u32, xlib.XKeysymToKeycode(xd, keysym));
+    XTestFakeKeyEvent(xd, kc, 1, cast(u64, 0));
+    XTestFakeKeyEvent(xd, kc, 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    rounds(150);
+}
+
+fn quick_phrase() as void {
+    let is u32 as sup = cast(u32, xlib.XKeysymToKeycode(xd, 65515));
+    XTestFakeKeyEvent(xd, sup, 1, cast(u64, 0));
+    tap(96);
+    XTestFakeKeyEvent(xd, sup, 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    rounds(200);
+}
+
+// The input method's panel on the root: 1 with its top left.
+fn panel(skip as i64, x as *i64, y as *i64) as i32 {
+    let is i64 as root = xlib.XDefaultRootWindow(xd);
+    let is i64 as r with mut = 0;
+    let is i64 as parent with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is u32 as n with mut = cast(u32, 0);
+    if (xlib.XQueryTree(xd, root, cast(*u8, &r), cast(*u8, &parent), cast(*u8, &kids), cast(*u8, &n)) == 0) { return 0; }
+    let is i32 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, n)) {
+        let is xlib.XWindowAttributes as at;
+        if (kids[i] != skip && xlib.XGetWindowAttributes(xd, kids[i], cast(*u8, &at)) != 0 &&
+            at.override_redirect != 0 && at.map_state == 2 && at.width > 1 && at.height > 1) {
+            *x = cast(i64, at.x);
+            *y = cast(i64, at.y);
+            found = 1;
+        }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as d = load("text/testdata/shape-plain.ttf");
+    if (cast(i64, d) == 0) {
+        io.printf("FAIL: cannot read the test font\n");
+        return 1;
+    }
+    face = sfnt.open(d, loaded, 0);
+    list.faces = &face;
+    list.n = 1;
+    plain_font = font.of_list(&list);
+    theme = style.light();
+    theme.fonts.body.size = 16.0;
+    dv = gpu.open_headless(64, 64, gpu.SOFTWARE);
+    let is text.Limits as lim = text.limits_default();
+    let is *text.Service as svc = text.open(&dv, &lim, fn_ptr(resolve), cast(*u8, 0), theme.fonts.family);
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+
+    let is app.Limits as al = app.limits_default();
+    a = app.open(&al);
+    app.set_theme(&a, &theme);
+    app.set_text_service(&a, cast(*u8, svc));
+    let is i64 as w = app.window_open(&a, 320.0, 160.0);
+    let is *tree.Tree as t = app.tree(&a, w);
+    let is *router.Router as r = app.router(&a, w);
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    layout.set_align(t, col, layout.START, layout.START);
+    let is i64 as e = entry.create(t, col);
+    layout.set_min_size(t, e, 200.0, 0.0);
+    let is i64 as e2 = entry.create(t, col);
+    layout.set_min_size(t, e2, 200.0, 0.0);
+    hs = host.open(&a, &dv, cast(*u8, svc));
+    rounds(300);
+    let is *device.Window as nw = host.native(hs, w);
+    let is i64 as xid = x11.xid(&nw.x11_win);
+    xlib.XSetInputFocus(xd, xid, 1, 0);
+    xlib.XSync(xd, 0);
+    router.focus(t, r, e, 1);
+    rounds(300);
+    check("a text field focused: the method composes for it, on the spot", device.text_input_active(nw) == 1 &&
+          x11.text.on_the_spot(&nw.x11_win.txt) == 1);
+
+    // --- Composing, shown in the entry ---
+    quick_phrase();
+    tap(97);
+    tap(98);
+    let is i64 as sa with mut = 0;
+    let is i64 as sb with mut = 0;
+    composed(t, e, 2);
+    let is i64 as got = entry.composition(t, e, &sa, &sb);
+    if (got != 2) {
+        io.printf("  composition %d, text %d bytes, shown %d bytes\n", got, entry.length(t, e), entry.shown_length(t, e));
+    }
+    check("composing: shown at the caret, the text unchanged", got == 2 &&
+          same(entry.shown(t, e), entry.shown_length(t, e), "ab") == 1 && entry.length(t, e) == 0);
+    let is i32 as rx with mut = 0;
+    let is i32 as ry with mut = 0;
+    let is i64 as child with mut = 0;
+    xlib.XTranslateCoordinates(xd, xid, xlib.XDefaultRootWindow(xd), 0, 0, cast(*u8, &rx), cast(*u8, &ry), cast(*u8, &child));
+    let is f64 as sc = app.scale(&a, w);
+    let is math.rect.Rect as care = tree.text_area_rect(t);
+    let is i64 as cx = cast(i64, rx) + cast(i64, care.x * sc + 0.5);
+    let is i64 as cy = cast(i64, ry) + cast(i64, (care.y + care.h) * sc + 0.5);
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    let is i32 as shown = panel(xid, &px, &py);
+    io.printf("  panel %d at %d,%d; the entry's caret bottom at %d,%d\n", cast(i64, shown), px, py, cx, cy);
+    check("the method's panel by the entry's caret", shown == 1 && px >= cx - 2 && px <= cx + 24 && py >= cy - 2 && py <= cy + 24);
+    tap(65293);
+    holds(t, e, "ab");
+    check("Enter: committed into the text, the composition over", same(entry.text(t, e), entry.length(t, e), "ab") == 1 &&
+          entry.composition(t, e, &sa, &sb) == 0);
+
+    // --- Another field focused mid-composition ---
+    quick_phrase();
+    tap(120);
+    composed(t, e, 1);
+    check("composing again", entry.composition(t, e, &sa, &sb) == 1);
+    router.focus(t, r, e2, 1);
+    rounds(200);
+    tap(121);
+    holds(t, e2, "y");
+    check("given up in both: the first keeps its text, the next field types plainly",
+          entry.composition(t, e, &sa, &sb) == 0 && same(entry.text(t, e), entry.length(t, e), "ab") == 1 &&
+          entry.composition(t, e2, &sa, &sb) == 0 && same(entry.text(t, e2), entry.length(t, e2), "y") == 1);
+
+    host.close(hs);
+    xlib.XCloseDisplay(xd);
+    if (fails == 0) {
+        io.printf("ime x11: all checks passed\n");
+        return 0;
+    }
+    io.printf("ime x11: %d failures\n", fails);
+    return 1;
+}

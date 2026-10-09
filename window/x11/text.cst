@@ -9,27 +9,52 @@
 //
 // XLookupString is in libX11, needs no locale, no input method and no extra
 // library. It applies the modifier state and the server's own keysym
-// translation, so shift and AltGr work and so do dead keys on a keymap that
-// defines them. What it returns is Latin-1, which this file widens to UTF-8 —
-// two lines, because Latin-1 IS the first 256 code points.
+// translation, so shift and AltGr work. What it returns is Latin-1, which this
+// file widens to UTF-8 — two lines, because Latin-1 IS the first 256 code
+// points. It composes nothing: a dead key types nothing and the key after it
+// types itself.
 //
 // That covers every Latin keyboard and it is the default: `init()` opens
 // nothing.
 //
-// An input method covers the rest — CJK, and any compose that needs state
-// across keystrokes. `open_method()` opens one, and everything it calls is
-// still libX11, so this file remains safe for the hub to forward.
+// An input method covers the rest — any layout's text, dead keys and compose
+// (Xlib's own local method, from the locale's Compose file, when no server is
+// running), CJK with its candidates when one is (Fcitx5, IBus).
+// `open_method()` opens one, and everything it calls is still libX11, so this
+// file remains safe for the hub to forward.
 //
 // The one thing an input method also needs is a C locale that is not "C", and
 // setting that is a libc call. It is deliberately NOT here: see locale.cst for
 // why one function got its own file. A program that wants an input method
 // calls locale.use_environment() first; one that does not pays nothing.
 //
-// open_method() reports honestly when it cannot open one — a machine with no
-// input method running is the common case, and the answer there is to keep
-// using the first tier rather than to fail.
+// open_method() reports honestly when it cannot open one, and the first tier
+// goes on working.
 //
-// --- The three calls an input method needs from the event loop ---
+// --- One method a connection, a context a window ---
+//
+// XOpenIM is per display, and the windows of a program share one (window.cst
+// shares the connection): the method is opened by the first window that asks,
+// closed with the last. Each window has its own input context (XIC).
+//
+// --- How the composition is shown ---
+//
+// The method says which input styles it supports and the first this file can
+// use is taken:
+//
+//   on the spot     (PreeditCallbacks) the method tells the program the
+//                   composition — start, draw, caret, done — and the program
+//                   draws it in its own text, as the toolkit's entry does: the
+//                   callbacks below keep it as code points with what is
+//                   highlighted, handed out as UTF-8 (preedit_utf8)
+//   over the spot   (PreeditPosition) the method draws the composition in a
+//                   window of its own at the spot the program says (set_spot)
+//   root window     (PreeditNothing) the method draws it wherever it draws
+//                   it — Xlib's local method, which composes without showing
+//
+// Status is never drawn by the program (StatusNothing, else StatusNone).
+//
+// --- The calls an input method needs from the event loop ---
 //
 // An IM is not a function you call on a key press. It is a participant in the
 // event loop, and skipping any of these produces an input method that half
@@ -37,13 +62,18 @@
 //
 //   filter()     BEFORE anything else looks at an event. The IM eats the
 //                keystrokes that are building a character and returns 1; those
-//                must not also be handled as keys.
+//                must not also be handled as keys. The composition's callbacks
+//                run inside it.
 //   focus_in()   and focus_out(), so the candidate window follows the window.
-//   lookup()     on a KeyPress the filter did not eat.
+//   lookup()     on a KeyPress the filter did not eat; a committed string
+//                arrives as a KeyPress of keycode 0.
+//   reset()      when the composition is abandoned — the focus gone, the
+//                caret moved — and what the method had composed is given back.
 use "bind/x.cst" as x;
 use "bind/xlib.cst" as xlib;
 use "bind/xutil.cst" as xutil;
 use "bind/xevent.cst" as xev;
+use "std/mem.cst" as mem;
 
 // XLookupString's status_in_out / Xutf8LookupString's status_return.
 let is i32 as BUFFER_OVERFLOW with imut = cast(i32, 0 - 1);
@@ -52,104 +82,517 @@ let is i32 as LOOKUP_CHARS    with imut = 2;
 let is i32 as LOOKUP_KEYSYM   with imut = 3;
 let is i32 as LOOKUP_BOTH     with imut = 4;
 
-// The one input style that needs no drawing from us: the input method owns its
-// own preedit and status windows. Anything else means rendering the composition
-// in progress ourselves, which is render/'s and text/'s business rather than
-// this layer's.
-let is i64 as PREEDIT_NOTHING with imut = 8;      // 0x0008
-let is i64 as STATUS_NOTHING  with imut = 1024;   // 0x0400
+// XIMStyle bits (Xlib.h).
+let is i64 as PREEDIT_AREA      with imut = 1;      // 0x0001
+let is i64 as PREEDIT_CALLBACKS with imut = 2;      // 0x0002
+let is i64 as PREEDIT_POSITION  with imut = 4;      // 0x0004
+let is i64 as PREEDIT_NOTHING   with imut = 8;      // 0x0008
+let is i64 as PREEDIT_NONE      with imut = 16;     // 0x0010
+let is i64 as STATUS_AREA       with imut = 256;    // 0x0100
+let is i64 as STATUS_CALLBACKS  with imut = 512;    // 0x0200
+let is i64 as STATUS_NOTHING    with imut = 1024;   // 0x0400
+let is i64 as STATUS_NONE       with imut = 2048;   // 0x0800
+
+// XIMFeedback bits that mark the part of a composition being converted.
+let is i64 as FEEDBACK_REVERSE   with imut = 1;
+let is i64 as FEEDBACK_UNDERLINE with imut = 2;
+let is i64 as FEEDBACK_HIGHLIGHT with imut = 4;
+
+// XIMCaretDirection.
+let is i32 as CARET_FORWARD    with imut = 0;
+let is i32 as CARET_BACKWARD   with imut = 1;
+let is i32 as CARET_LINE_START with imut = 8;
+let is i32 as CARET_LINE_END   with imut = 9;
+let is i32 as CARET_ABSOLUTE   with imut = 10;
 
 // 256 bytes is four times the longest composition any input method produces
 // for one keystroke. Overflow is reported rather than grown: a key press that
 // needs more than this is not text, it is a bug somewhere upstream.
 let is i64 as BUF_BYTES with imut = 256;
+// The longest composition kept, in code points: past it, the rest is cut.
+let is i64 as MAX_PREEDIT with imut = 256;
 
 struct Input {
-    im       as *u8;    // XIM, or null when there is no input method
     ic       as *u8;    // XIC, or null
     have_im  as i32;    // the method opened and the context was created
-    _pad0    as i32;
+    want     as i32;    // the program wants one: opened again when a method appears
     keysym   as i64;    // the keysym of the last lookup, 0 if none
     len      as i64;    // bytes of UTF-8 in buf, 0 if the key produced no text
     overflow as i64;    // how many lookups were dropped for being too long
     buf      as [256]u8;
+    style    as i64;    // the context's input style, 0 for none
+    xid      as i64;    // the window it is for
+    display  as *u8;
+    // The composition as the method last drew it (on the spot): its code
+    // points, which of them are being converted, its caret, a code point
+    // index; changed since preedit_utf8 last handed it out.
+    pre      as [256]u32;
+    hl       as [256]u8;
+    npre     as i64;
+    caret    as i64;
+    changed  as i32;
+    tried    as i32;    // the method's generation last tried, so a failure is not retried every event
+    spot     as xlib.XPoint;
+    spot_set as i32;
 }
 
 // The first tier. Opens nothing, needs nothing, and works everywhere.
 fn init(in as *Input) as void {
-    in.im = cast(*u8, 0);
+    mem.memzero(cast(*u8, in), sizeof(Input));
     in.ic = cast(*u8, 0);
-    in.have_im = 0;
-    in.keysym = 0;
-    in.len = 0;
-    in.overflow = 0;
-    in.buf[0] = cast(u8, 0);
+    in.display = cast(*u8, 0);
+    in.tried = 0 - 1;
+}
+
+// --- The method, one a connection ---
+
+let is *u8 as _im with mut;
+let is *u8 as _im_display with mut;
+let is i64 as _im_users with mut = 0;
+// Bumped when a method appears (XRegisterIMInstantiateCallback) or goes:
+// what a context that wants one and has none tries again on.
+let is i32 as _generation with mut = 0;
+let is i32 as _watching with mut = 0;
+// The composition's callbacks, and the method's destruction, as Xlib keeps
+// them: addresses that outlive every call, so module storage.
+let is [5]xlib.XIMCallback as _cbs;
+let is *u8 as _fontset with mut;
+
+// Which Input a context is, for the callbacks: updated with the Input's
+// address every time it is filtered, so a Window copied or moved is found
+// where it is now (window.cst registers windows the same way).
+let is i64 as MAX_CONTEXTS with imut = 32;
+let is [32]i64 as _ctx_ic;
+let is [32]i64 as _ctx_in;
+let is i64 as _nctx with mut = 0;
+
+fn _note(in as *Input) as void {
+    if (cast(i64, in.ic) == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < _nctx) {
+        if (_ctx_ic[i] == cast(i64, in.ic)) { _ctx_in[i] = cast(i64, in); return; }
+        i = i + 1;
+    }
+    if (_nctx >= MAX_CONTEXTS) { return; }
+    _ctx_ic[_nctx] = cast(i64, in.ic);
+    _ctx_in[_nctx] = cast(i64, in);
+    _nctx = _nctx + 1;
+}
+
+fn _forget(ic as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < _nctx) {
+        if (_ctx_ic[i] == cast(i64, ic)) {
+            _nctx = _nctx - 1;
+            _ctx_ic[i] = _ctx_ic[_nctx];
+            _ctx_in[i] = _ctx_in[_nctx];
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn _input_of(ic as *u8) as *Input {
+    let is i64 as i with mut = 0;
+    while (i < _nctx) {
+        if (_ctx_ic[i] == cast(i64, ic)) { return cast(*Input, _ctx_in[i]); }
+        i = i + 1;
+    }
+    return cast(*Input, 0);
+}
+
+// --- The composition's callbacks (on the spot) ---
+
+// Started: no composition yet, no limit on its length.
+fn _on_start(ic as *u8, client as *u8, info as *u8) as i32 {
+    let is *Input as in = _input_of(ic);
+    if (cast(i64, in) != 0) {
+        in.npre = 0;
+        in.caret = 0;
+        in.changed = 1;
+    }
+    return 0 - 1;
+}
+
+// Done: the composition is over, whatever was committed arrives as text.
+fn _on_done(ic as *u8, client as *u8, info as *u8) as void {
+    let is *Input as in = _input_of(ic);
+    if (cast(i64, in) == 0) { return; }
+    in.npre = 0;
+    in.caret = 0;
+    in.changed = 1;
+}
+
+// One UTF-8 sequence at s (n bytes left) as a code point into *cp: its
+// length, 1 for a byte that starts none (taken as U+FFFD).
+fn _utf8(s as *u8, n as i64, cp as *u32) as i64 {
+    let is i64 as b0 = cast(i64, s[0]) & 255;
+    if (b0 < 128) { *cp = cast(u32, b0); return 1; }
+    let is i64 as need with mut = 0;
+    let is i64 as v with mut = 0;
+    if ((b0 & 224) == 192) { need = 1; v = b0 & 31; }
+    else if ((b0 & 240) == 224) { need = 2; v = b0 & 15; }
+    else if ((b0 & 248) == 240) { need = 3; v = b0 & 7; }
+    else { *cp = cast(u32, 65533); return 1; }
+    if (need >= n) { *cp = cast(u32, 65533); return 1; }
+    let is i64 as i with mut = 1;
+    while (i <= need) {
+        let is i64 as b = cast(i64, s[i]) & 255;
+        if ((b & 192) != 128) { *cp = cast(u32, 65533); return 1; }
+        v = (v << 6) | (b & 63);
+        i = i + 1;
+    }
+    *cp = cast(u32, v);
+    return need + 1;
+}
+
+// Drawn: chg_length code points from chg_first replaced by the text it
+// carries (none: deleted), the caret put at caret.
+fn _on_draw(ic as *u8, client as *u8, info as *xlib.XIMPreeditDrawCallbackStruct) as void {
+    let is *Input as in = _input_of(ic);
+    if (cast(i64, in) == 0 || cast(i64, info) == 0) { return; }
+    let is i64 as first with mut = cast(i64, info.chg_first);
+    let is i64 as gone with mut = cast(i64, info.chg_length);
+    if (first < 0) { first = 0; }
+    if (first > in.npre) { first = in.npre; }
+    if (gone < 0) { gone = 0; }
+    if (first + gone > in.npre) { gone = in.npre - first; }
+    // The new text, decoded, with which of it is being converted.
+    let is [256]u32 as add;
+    let is [256]u8 as add_hl;
+    let is i64 as nadd with mut = 0;
+    let is *xlib.XIMText as t = cast(*xlib.XIMText, info.text);
+    if (cast(i64, t) != 0 && cast(i64, t.string) != 0) {
+        let is i64 as count = cast(i64, t.length);
+        let is *i64 as fb = cast(*i64, t.feedback);
+        if (t.encoding_is_wchar != 0) {
+            let is *u32 as ws = cast(*u32, t.string);
+            while (nadd < count && nadd < MAX_PREEDIT) {
+                add[nadd] = ws[nadd];
+                nadd = nadd + 1;
+            }
+        } else {
+            // In the locale's encoding, which a method used for text input
+            // is UTF-8 in.
+            let is *u8 as s = t.string;
+            let is i64 as bytes with mut = 0;
+            while (s[bytes] != 0) { bytes = bytes + 1; }
+            let is i64 as at with mut = 0;
+            while (nadd < count && nadd < MAX_PREEDIT && at < bytes) {
+                at = at + _utf8(cast(*u8, cast(i64, s) + at), bytes - at, &add[nadd]);
+                nadd = nadd + 1;
+            }
+        }
+        let is i64 as k with mut = 0;
+        while (k < nadd) {
+            add_hl[k] = cast(u8, 0);
+            if (cast(i64, fb) != 0 && (fb[k] & (FEEDBACK_REVERSE | FEEDBACK_HIGHLIGHT)) != 0) { add_hl[k] = cast(u8, 1); }
+            k = k + 1;
+        }
+    }
+    // What follows the replaced part, moved to after the new text.
+    let is i64 as tail = in.npre - first - gone;
+    let is i64 as room with mut = MAX_PREEDIT - first - nadd;
+    if (room < 0) { room = 0; }
+    let is i64 as keep with mut = tail;
+    if (keep > room) { keep = room; }
+    let is i64 as from = first + gone;
+    let is i64 as to = first + nadd;
+    if (to > from) {
+        let is i64 as j with mut = keep - 1;
+        while (j >= 0) {
+            in.pre[to + j] = in.pre[from + j];
+            in.hl[to + j] = in.hl[from + j];
+            j = j - 1;
+        }
+    } else if (to < from) {
+        let is i64 as j with mut = 0;
+        while (j < keep) {
+            in.pre[to + j] = in.pre[from + j];
+            in.hl[to + j] = in.hl[from + j];
+            j = j + 1;
+        }
+    }
+    let is i64 as k2 with mut = 0;
+    while (k2 < nadd && first + k2 < MAX_PREEDIT) {
+        in.pre[first + k2] = add[k2];
+        in.hl[first + k2] = add_hl[k2];
+        k2 = k2 + 1;
+    }
+    in.npre = first + k2 + keep;
+    in.caret = cast(i64, info.caret);
+    if (in.caret < 0) { in.caret = 0; }
+    if (in.caret > in.npre) { in.caret = in.npre; }
+    in.changed = 1;
+}
+
+// The caret moved, as direction says: where it is now told back.
+fn _on_caret(ic as *u8, client as *u8, info as *xlib.XIMPreeditCaretCallbackStruct) as void {
+    let is *Input as in = _input_of(ic);
+    if (cast(i64, in) == 0 || cast(i64, info) == 0) { return; }
+    let is i32 as d = info.direction;
+    if (d == CARET_ABSOLUTE) { in.caret = cast(i64, info.position); }
+    else if (d == CARET_FORWARD) { in.caret = in.caret + 1; }
+    else if (d == CARET_BACKWARD) { in.caret = in.caret - 1; }
+    else if (d == CARET_LINE_START) { in.caret = 0; }
+    else if (d == CARET_LINE_END) { in.caret = in.npre; }
+    if (in.caret < 0) { in.caret = 0; }
+    if (in.caret > in.npre) { in.caret = in.npre; }
+    info.position = cast(i32, in.caret);
+    in.changed = 1;
+}
+
+// The method went away (its server quit): every context with it is gone
+// without being destroyed, and the first tier takes over until one appears.
+fn _on_destroyed(im as *u8, client as *u8, info as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < _nctx) {
+        let is *Input as in = cast(*Input, _ctx_in[i]);
+        in.ic = cast(*u8, 0);
+        in.have_im = 0;
+        in.style = 0;
+        if (in.npre > 0) { in.npre = 0; in.changed = 1; }
+        i = i + 1;
+    }
+    _nctx = 0;
+    _im = cast(*u8, 0);
+    _im_users = 0;
+    _generation = _generation + 1;
+}
+
+// A method appeared on the display: whoever wants one tries again.
+fn _on_instantiated(d as *u8, client as *u8, info as *u8) as void {
+    _generation = _generation + 1;
+}
+
+// The first style of this file's, in its order, the method supports: 0 for
+// none.
+fn _style_of(im as *u8) as i64 {
+    let is *xlib.XIMStyles as styles with mut = cast(*xlib.XIMStyles, 0);
+    if (cast(i64, xlib.XGetIMValues(im, "queryInputStyle", cast(*u8, &styles),
+                                    cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                    cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                    cast(*u8, 0))) != 0) { return 0; }
+    if (cast(i64, styles) == 0) { return 0; }
+    let is [8]i64 as want;
+    want[0] = PREEDIT_CALLBACKS | STATUS_NOTHING;
+    want[1] = PREEDIT_CALLBACKS | STATUS_NONE;
+    want[2] = PREEDIT_POSITION | STATUS_NOTHING;
+    want[3] = PREEDIT_POSITION | STATUS_NONE;
+    want[4] = PREEDIT_NOTHING | STATUS_NOTHING;
+    want[5] = PREEDIT_NOTHING | STATUS_NONE;
+    want[6] = PREEDIT_NONE | STATUS_NOTHING;
+    want[7] = PREEDIT_NONE | STATUS_NONE;
+    let is *i64 as have = cast(*i64, styles.supported_styles);
+    let is i64 as n = cast(i64, styles.count_styles);
+    let is i64 as best with mut = 0;
+    let is i64 as w with mut = 0;
+    while (w < 8 && best == 0) {
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            if (have[i] == want[w]) { best = want[w]; }
+            i = i + 1;
+        }
+        w = w + 1;
+    }
+    xlib.XFree(cast(*u8, styles));
+    return best;
+}
+
+fn _open_im(d as *u8) as *u8 {
+    if (cast(i64, _im) != 0 && _im_display == d) { return _im; }
+    // Tells Xlib to consult XMODIFIERS, which is where a desktop names the
+    // input method it is running. Without it XOpenIM finds nothing even when
+    // ibus or fcitx is up. Harmless with no locale set.
+    xlib.XSetLocaleModifiers("");
+    // Xlib cannot do multibyte input in a locale it does not implement, and
+    // says so here rather than failing later in a way that looks like a bug.
+    if (xlib.XSupportsLocale() == 0) { return cast(*u8, 0); }
+    if (_watching == 0) {
+        // Told when a method appears — started after the program, or again
+        // after it quit.
+        xlib.XRegisterIMInstantiateCallback(d, cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                            fn_ptr(_on_instantiated), cast(*u8, 0));
+        _watching = 1;
+    }
+    _im = xlib.XOpenIM(d, cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+    if (cast(i64, _im) == 0) { return cast(*u8, 0); }
+    _im_display = d;
+    _cbs[4].client_data = cast(*u8, 0);
+    _cbs[4].callback = fn_ptr(_on_destroyed);
+    xlib.XSetIMValues(_im, "destroyCallback", cast(*u8, &_cbs[4]),
+                      cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                      cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                      cast(*u8, 0));
+    return _im;
+}
+
+// A context of style for window xid: null when the method refuses it.
+fn _create(in as *Input, im as *u8, style as i64, xid as i64) as *u8 {
+    let is *u8 as nested with mut = cast(*u8, 0);
+    if ((style & PREEDIT_CALLBACKS) != 0) {
+        _cbs[0].client_data = cast(*u8, 0); _cbs[0].callback = fn_ptr(_on_start);
+        _cbs[1].client_data = cast(*u8, 0); _cbs[1].callback = fn_ptr(_on_done);
+        _cbs[2].client_data = cast(*u8, 0); _cbs[2].callback = fn_ptr(_on_draw);
+        _cbs[3].client_data = cast(*u8, 0); _cbs[3].callback = fn_ptr(_on_caret);
+        nested = xlib.XVaCreateNestedList(0, "preeditStartCallback", cast(*u8, &_cbs[0]),
+                                          "preeditDoneCallback", cast(*u8, &_cbs[1]),
+                                          "preeditDrawCallback", cast(*u8, &_cbs[2]),
+                                          "preeditCaretCallback", cast(*u8, &_cbs[3]),
+                                          "spotLocation", cast(*u8, &in.spot),
+                                          cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+    } else if ((style & PREEDIT_POSITION) != 0) {
+        // Over the spot the method draws in a font set of the program's.
+        if (cast(i64, _fontset) == 0) {
+            let is *u8 as missing with mut = cast(*u8, 0);
+            let is i32 as nmissing with mut = 0;
+            let is *u8 as def with mut = cast(*u8, 0);
+            _fontset = xlib.XCreateFontSet(in.display, "-*-*-medium-r-normal--*-*-*-*-*-*-*-*,*",
+                                           cast(*u8, &missing), cast(*u8, &nmissing), cast(*u8, &def));
+            if (cast(i64, missing) != 0) { xlib.XFreeStringList(missing); }
+        }
+        if (cast(i64, _fontset) != 0) {
+            nested = xlib.XVaCreateNestedList(0, "spotLocation", cast(*u8, &in.spot), "fontSet", _fontset,
+                                              cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                              cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+        } else {
+            nested = xlib.XVaCreateNestedList(0, "spotLocation", cast(*u8, &in.spot),
+                                              cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                              cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                              cast(*u8, 0));
+        }
+    }
+    let is *u8 as ic with mut = cast(*u8, 0);
+    if (cast(i64, nested) != 0) {
+        ic = xlib.XCreateIC(im, "inputStyle", cast(*u8, style), "clientWindow", cast(*u8, xid),
+                            "focusWindow", cast(*u8, xid), "preeditAttributes", nested,
+                            cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+        xlib.XFree(nested);
+    } else {
+        ic = xlib.XCreateIC(im, "inputStyle", cast(*u8, style), "clientWindow", cast(*u8, xid),
+                            "focusWindow", cast(*u8, xid),
+                            cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                            cast(*u8, 0), cast(*u8, 0));
+    }
+    return ic;
 }
 
 // --- The second tier ---
 
-// Opens an input method and a context for this window. Returns 1 on success.
+// Opens an input method (the display's, shared) and a context for this
+// window. Returns 1 on success.
 //
-// Zero is the normal answer on a machine with no input method running, and it
-// is not a failure: lookup() keeps working through XLookupString. The caller
-// decides whether to care.
+// Zero is the normal answer on a machine with no method and a locale Xlib
+// cannot implement, and it is not a failure: lookup() keeps working through
+// XLookupString. The caller decides whether to care.
 //
 // Call locale.use_environment() BEFORE this if the program wants an input
 // method to be findable. In the default "C" locale XOpenIM finds nothing, and
 // this returns 0 — correctly, and with no way to tell from here whether the
 // cause was the locale or an absent method.
 fn open_method(in as *Input, d as *u8, xid as i64) as i32 {
+    in.want = 1;
+    in.display = d;
+    in.xid = xid;
     if (in.have_im == 1) { return 1; }
-
-    // Tells Xlib to consult XMODIFIERS, which is where a desktop names the
-    // input method it is running. Without it XOpenIM finds nothing even when
-    // ibus or fcitx is up. Harmless with no locale set.
-    xlib.XSetLocaleModifiers("");
-
-    // Xlib cannot do multibyte input in a locale it does not implement, and
-    // says so here rather than failing later in a way that looks like a bug.
-    if (xlib.XSupportsLocale() == 0) { return 0; }
-
-    in.im = xlib.XOpenIM(d, cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
-    if (cast(i64, in.im) == 0) { return 0; }
-
-    // Variadic, at the fixed arity xlib.cst declares, with the tail zeroed —
-    // the callee stops at the first null. Style is preedit-nothing and
-    // status-nothing so the input method draws its own windows.
-    in.ic = xlib.XCreateIC(in.im,
-                           "inputStyle", cast(*u8, PREEDIT_NOTHING | STATUS_NOTHING),
-                           "clientWindow", cast(*u8, xid),
-                           "focusWindow", cast(*u8, xid),
-                           cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
-                           cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
-    if (cast(i64, in.ic) == 0) {
-        xlib.XCloseIM(in.im);
-        in.im = cast(*u8, 0);
+    in.tried = _generation;
+    let is *u8 as im = _open_im(d);
+    if (cast(i64, im) == 0) { return 0; }
+    // The style the method says it supports first; and should it then refuse
+    // the context, the ones after it.
+    let is i64 as style with mut = _style_of(im);
+    let is *u8 as ic with mut = cast(*u8, 0);
+    if (style != 0) { ic = _create(in, im, style, xid); }
+    if (cast(i64, ic) == 0 && (style & PREEDIT_CALLBACKS) != 0) {
+        style = PREEDIT_NOTHING | STATUS_NOTHING;
+        ic = _create(in, im, style, xid);
+    }
+    if (cast(i64, ic) == 0) {
+        style = PREEDIT_NOTHING | STATUS_NOTHING;
+        ic = _create(in, im, style, xid);
+    }
+    if (cast(i64, ic) == 0) {
+        if (_im_users == 0) {
+            xlib.XCloseIM(im);
+            _im = cast(*u8, 0);
+        }
         return 0;
     }
+    in.ic = ic;
+    in.style = style;
     in.have_im = 1;
+    in.npre = 0;
+    in.caret = 0;
+    _im_users = _im_users + 1;
+    _note(in);
     return 1;
 }
 
 fn has_method(in as *Input) as i32 { return in.have_im; }
+fn style(in as *Input) as i64 { return in.style; }
+fn on_the_spot(in as *Input) as i32 { return cast(i32, in.have_im == 1 && (in.style & PREEDIT_CALLBACKS) != 0); }
+// Whether the program wants text input now — a text field has the focus:
+// the context has the method's focus only then (window.cst).
+fn wanted(in as *Input) as i32 { return in.want; }
+fn set_wanted(in as *Input, on as i32) as void { in.want = on; }
 
 fn close(in as *Input) as void {
-    if (cast(i64, in.ic) != 0) { xlib.XDestroyIC(in.ic); in.ic = cast(*u8, 0); }
-    if (cast(i64, in.im) != 0) { xlib.XCloseIM(in.im); in.im = cast(*u8, 0); }
+    in.want = 0;
+    if (cast(i64, in.ic) != 0) {
+        _forget(in.ic);
+        xlib.XDestroyIC(in.ic);
+        in.ic = cast(*u8, 0);
+        _im_users = _im_users - 1;
+        if (_im_users <= 0 && cast(i64, _im) != 0) {
+            xlib.XCloseIM(_im);
+            _im = cast(*u8, 0);
+            _im_users = 0;
+        }
+    }
     in.have_im = 0;
+    in.style = 0;
+    in.npre = 0;
 }
 
-// --- The event loop's three obligations ---
+// The display is closing: the method with it, whoever still had a context.
+fn close_display(d as *u8) as void {
+    if (cast(i64, _fontset) != 0 && _im_display == d) {
+        xlib.XFreeFontSet(d, _fontset);
+        _fontset = cast(*u8, 0);
+    }
+    if (_watching == 1) {
+        xlib.XUnregisterIMInstantiateCallback(d, cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                              fn_ptr(_on_instantiated), cast(*u8, 0));
+        _watching = 0;
+    }
+    if (cast(i64, _im) != 0 && _im_display == d) {
+        xlib.XCloseIM(_im);
+        _im = cast(*u8, 0);
+        _im_users = 0;
+        _nctx = 0;
+    }
+}
+
+// --- The event loop's obligations ---
 
 // 1 when the input method consumed the event and nothing else should see it.
 //
 // This has to run on EVERY event, not just key presses, and before anything
 // else looks at it: an input method uses key releases and client messages of
-// its own, and a loop that only filters KeyPress leaves it half fed.
+// its own, and a loop that only filters KeyPress leaves it half fed. The
+// composition's callbacks run inside it (preedit_changed says).
 //
-// Always 0 when there is no input method, so a loop can call it unconditionally.
+// A context that wants a method and lost or never found one tries again once
+// one has appeared since it last tried.
+//
+// With no context, the method's own messages are still filtered: another
+// window of the program may have one.
 fn filter(in as *Input, e as *xev.XEvent) as i32 {
-    if (in.have_im == 0) { return 0; }
+    if (in.want == 1 && in.have_im == 0 && in.tried != _generation && cast(i64, in.display) != 0) {
+        open_method(in, in.display, in.xid);
+    }
+    _note(in);
+    if (cast(i64, _im) == 0) { return 0; }
     return xlib.XFilterEvent(cast(*u8, e), 0);
 }
 
@@ -161,6 +604,109 @@ fn focus_in(in as *Input) as void {
 fn focus_out(in as *Input) as void {
     if (in.have_im == 0) { return; }
     xlib.XUnsetICFocus(in.ic);
+}
+
+// Where the caret is, in the window: the spot an over-the-spot method draws
+// the composition at and a method puts its candidates by. Told the method
+// only when it moved.
+fn set_spot(in as *Input, x as i64, y as i64) as void {
+    let is i16 as sx = cast(i16, x);
+    let is i16 as sy = cast(i16, y);
+    if (in.spot_set == 1 && in.spot.x == sx && in.spot.y == sy) { return; }
+    in.spot.x = sx;
+    in.spot.y = sy;
+    in.spot_set = 1;
+    if (in.have_im == 0 || (in.style & (PREEDIT_CALLBACKS | PREEDIT_POSITION)) == 0) { return; }
+    let is *u8 as nested = xlib.XVaCreateNestedList(0, "spotLocation", cast(*u8, &in.spot),
+                                                    cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                                    cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                                                    cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+    if (cast(i64, nested) == 0) { return; }
+    _note(in);
+    xlib.XSetICValues(in.ic, "preeditAttributes", nested,
+                      cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0),
+                      cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0), cast(*u8, 0));
+    xlib.XFree(nested);
+}
+
+fn spot_x(in as *Input) as i64 { return cast(i64, in.spot.x); }
+fn spot_y(in as *Input) as i64 { return cast(i64, in.spot.y); }
+
+// The composition abandoned: what the method had composed into buf (text()),
+// its length — 0 for none — and the composition empty (preedit_changed).
+fn reset(in as *Input) as i64 {
+    in.len = 0;
+    in.buf[0] = cast(u8, 0);
+    if (in.have_im == 0) { return 0; }
+    _note(in);
+    let is *u8 as s = xlib.Xutf8ResetIC(in.ic);
+    if (cast(i64, s) != 0) {
+        let is i64 as n with mut = 0;
+        while (s[n] != 0 && n < BUF_BYTES - 1) {
+            in.buf[n] = s[n];
+            n = n + 1;
+        }
+        in.buf[n] = cast(u8, 0);
+        in.len = n;
+        xlib.XFree(s);
+    }
+    if (in.npre > 0) {
+        in.npre = 0;
+        in.caret = 0;
+        in.changed = 1;
+    }
+    return in.len;
+}
+
+// --- The composition, as the program shows it ---
+
+// 1 when the composition changed since it was last handed out.
+fn preedit_changed(in as *Input) as i32 { return in.changed; }
+
+// The composition as UTF-8 into out (cap bytes; what does not fit is cut on a
+// character), its caret into *cursor and the part being converted into
+// *hl_start, *hl_end — byte offsets in it, equal for none. Its length; taken
+// (preedit_changed 0 after).
+fn preedit_utf8(in as *Input, out as *u8, cap as i64, cursor as *i64, hl_start as *i64, hl_end as *i64) as i64 {
+    in.changed = 0;
+    *cursor = 0;
+    *hl_start = 0;
+    *hl_end = 0;
+    let is i64 as n with mut = 0;
+    let is i32 as in_hl with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < in.npre) {
+        if (i == in.caret) { *cursor = n; }
+        if (in.hl[i] == cast(u8, 1) && in_hl == 0) {
+            if (*hl_end == 0) { *hl_start = n; in_hl = 1; }
+        }
+        if (in.hl[i] == cast(u8, 0) && in_hl == 1) { *hl_end = n; in_hl = 2; }
+        let is i64 as c = cast(i64, in.pre[i]);
+        let is i64 as w with mut = 1;
+        if (c >= 128) { w = 2; }
+        if (c >= 2048) { w = 3; }
+        if (c >= 65536) { w = 4; }
+        if (n + w > cap) { break; }
+        if (w == 1) { out[n] = cast(u8, c); }
+        else if (w == 2) {
+            out[n] = cast(u8, 192 | (c >> 6));
+            out[n + 1] = cast(u8, 128 | (c & 63));
+        } else if (w == 3) {
+            out[n] = cast(u8, 224 | (c >> 12));
+            out[n + 1] = cast(u8, 128 | ((c >> 6) & 63));
+            out[n + 2] = cast(u8, 128 | (c & 63));
+        } else {
+            out[n] = cast(u8, 240 | (c >> 18));
+            out[n + 1] = cast(u8, 128 | ((c >> 12) & 63));
+            out[n + 2] = cast(u8, 128 | ((c >> 6) & 63));
+            out[n + 3] = cast(u8, 128 | (c & 63));
+        }
+        n = n + w;
+        i = i + 1;
+    }
+    if (in.caret >= in.npre || in.caret >= i) { *cursor = n; }
+    if (in_hl == 1) { *hl_end = n; }
+    return n;
 }
 
 // --- Latin-1 to UTF-8 ---
@@ -214,6 +760,7 @@ fn lookup(in as *Input, e as *xev.XEvent) as i64 {
     _status = 0;
 
     if (in.have_im == 1) {
+        _note(in);
         // Already UTF-8: Xutf8LookupString is the whole reason to open an input
         // method, and it is also what handles a compose that spans keystrokes.
         let is i32 as n = xlib.Xutf8LookupString(in.ic, cast(*u8, e),

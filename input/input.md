@@ -306,11 +306,21 @@ repeat, Caps Lock, Alt, Ctrl+C with a Russian layout loaded) and
 `host_x11_test` (Ctrl+A selecting an entry with the Russian group in use).
 Wine translates SendInput's keys to text through its X keymap whatever layout
 is loaded, so a Russian or German layout's text on Windows awaits real
-Windows. X11 types only Latin-1, and composes no dead key, without an input
-method (XLookupString), so Cyrillic text and dead keys there come with the
-toolkit's input method (below).
+Windows. X11 without an input method types only Latin-1 and composes no dead
+key (XLookupString); the toolkit opens one whenever a text field has the
+keyboard, so there any layout's text and dead keys come through it.
 
-Still to come, in this order: inline XIM on X11 (opened by the toolkit, so
-any layout's text and compose); Wayland and Win32 surrounding-text context;
-continuous scrolling (axis source, stop, value120 on Wayland); touch, pen and
-gestures; gamepads, raw devices and the action mapping.
+Input methods: on X11 the display's XIM — on the spot where the method
+offers it (the composition as `PREEDIT`, with `hl_start..hl_end` the part
+being converted, which the entry and text view show as selected), over the
+spot otherwise, Xlib's own local method with no server — told the caret as
+its spot, reset when the field gives the composition up. Proved with the
+installed Fcitx5 (`xim_x11_test` on and over the spot, `ime_x11_test` an
+entry composing and committing, its panel at the entry's caret, the
+composition given up when the focus moves) and with Xlib's local method (a
+dead key composing é). On Wayland text-input-v3 carries commit, preedit and
+delete-surrounding; on Windows IMM32 the composition.
+
+Still to come, in this order: Wayland and Win32 surrounding-text context and
+resets; continuous scrolling (axis source, stop, value120 on Wayland); touch,
+pen and gestures; gamepads, raw devices and the action mapping.
