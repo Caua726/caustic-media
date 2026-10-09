@@ -194,6 +194,7 @@ static const char *const symbols[][2] = {
     {"kernel32.dll", "ReleaseMutex"},
     {"kernel32.dll", "MultiByteToWideChar"},
     {"kernel32.dll", "WideCharToMultiByte"},
+    {"kernel32.dll", "GetProcessTimes"},
     {"imm32.dll", "ImmGetContext"},
     {"imm32.dll", "ImmReleaseContext"},
     {"imm32.dll", "ImmGetCompositionStringW"},
