@@ -82,6 +82,10 @@ int main(void) {
     printf("DISPPARAMS %zu\n", sizeof(DISPPARAMS));
     _Static_assert(sizeof(EXCEPINFO) == 64, "EXCEPINFO");
     printf("EXCEPINFO %zu\n", sizeof(EXCEPINFO));
+    _Static_assert(sizeof(MOUSEINPUT) == 32, "MOUSEINPUT");
+    printf("MOUSEINPUT %zu\n", sizeof(MOUSEINPUT));
+    _Static_assert(sizeof(KEYBDINPUT) == 24, "KEYBDINPUT");
+    printf("KEYBDINPUT %zu\n", sizeof(KEYBDINPUT));
     _Static_assert(sizeof(INPUT) == 40, "INPUT");
     printf("INPUT %zu\n", sizeof(INPUT));
     _Static_assert(sizeof(MARGINS) == 16, "MARGINS");
@@ -437,6 +441,17 @@ int main(void) {
     _Static_assert(offsetof(EXCEPINFO, pvReserved) == 40, "EXCEPINFO.pvReserved");
     _Static_assert(offsetof(EXCEPINFO, pfnDeferredFillIn) == 48, "EXCEPINFO.pfnDeferredFillIn");
     _Static_assert(offsetof(EXCEPINFO, scode) == 56, "EXCEPINFO.scode");
+    _Static_assert(offsetof(MOUSEINPUT, dx) == 0, "MOUSEINPUT.dx");
+    _Static_assert(offsetof(MOUSEINPUT, dy) == 4, "MOUSEINPUT.dy");
+    _Static_assert(offsetof(MOUSEINPUT, mouseData) == 8, "MOUSEINPUT.mouseData");
+    _Static_assert(offsetof(MOUSEINPUT, dwFlags) == 12, "MOUSEINPUT.dwFlags");
+    _Static_assert(offsetof(MOUSEINPUT, time) == 16, "MOUSEINPUT.time");
+    _Static_assert(offsetof(MOUSEINPUT, dwExtraInfo) == 24, "MOUSEINPUT.dwExtraInfo");
+    _Static_assert(offsetof(KEYBDINPUT, wVk) == 0, "KEYBDINPUT.wVk");
+    _Static_assert(offsetof(KEYBDINPUT, wScan) == 2, "KEYBDINPUT.wScan");
+    _Static_assert(offsetof(KEYBDINPUT, dwFlags) == 4, "KEYBDINPUT.dwFlags");
+    _Static_assert(offsetof(KEYBDINPUT, time) == 8, "KEYBDINPUT.time");
+    _Static_assert(offsetof(KEYBDINPUT, dwExtraInfo) == 16, "KEYBDINPUT.dwExtraInfo");
     _Static_assert(offsetof(INPUT, type) == 0, "INPUT.type");
     _Static_assert(offsetof(MARGINS, cxLeftWidth) == 0, "MARGINS.cxLeftWidth");
     _Static_assert(offsetof(MARGINS, cxRightWidth) == 4, "MARGINS.cxRightWidth");
@@ -1368,11 +1383,18 @@ int main(void) {
     if ((long long)(IMN_SETOPENSTATUS) != 8LL) { printf("FAIL constant IMN_SETOPENSTATUS\n"); failures++; }
     if ((long long)(IMN_SETSENTENCEMODE) != 7LL) { printf("FAIL constant IMN_SETSENTENCEMODE\n"); failures++; }
     if ((long long)(IMN_SETSTATUSWINDOWPOS) != 12LL) { printf("FAIL constant IMN_SETSTATUSWINDOWPOS\n"); failures++; }
+    if ((long long)(INPUT_HARDWARE) != 2LL) { printf("FAIL constant INPUT_HARDWARE\n"); failures++; }
+    if ((long long)(INPUT_KEYBOARD) != 1LL) { printf("FAIL constant INPUT_KEYBOARD\n"); failures++; }
+    if ((long long)(INPUT_MOUSE) != 0LL) { printf("FAIL constant INPUT_MOUSE\n"); failures++; }
     if ((long long)(ISC_SHOWUIALL) != 3221225487LL) { printf("FAIL constant ISC_SHOWUIALL\n"); failures++; }
     if ((long long)(ISC_SHOWUIALLCANDIDATEWINDOW) != 15LL) { printf("FAIL constant ISC_SHOWUIALLCANDIDATEWINDOW\n"); failures++; }
     if ((long long)(ISC_SHOWUICANDIDATEWINDOW) != 1LL) { printf("FAIL constant ISC_SHOWUICANDIDATEWINDOW\n"); failures++; }
     if ((long long)(ISC_SHOWUICOMPOSITIONWINDOW) != 2147483648LL) { printf("FAIL constant ISC_SHOWUICOMPOSITIONWINDOW\n"); failures++; }
     if ((long long)(ISC_SHOWUIGUIDELINE) != 1073741824LL) { printf("FAIL constant ISC_SHOWUIGUIDELINE\n"); failures++; }
+    if ((long long)(KEYEVENTF_EXTENDEDKEY) != 1LL) { printf("FAIL constant KEYEVENTF_EXTENDEDKEY\n"); failures++; }
+    if ((long long)(KEYEVENTF_KEYUP) != 2LL) { printf("FAIL constant KEYEVENTF_KEYUP\n"); failures++; }
+    if ((long long)(KEYEVENTF_SCANCODE) != 8LL) { printf("FAIL constant KEYEVENTF_SCANCODE\n"); failures++; }
+    if ((long long)(KEYEVENTF_UNICODE) != 4LL) { printf("FAIL constant KEYEVENTF_UNICODE\n"); failures++; }
     if ((long long)(KF_ALTDOWN) != 8192LL) { printf("FAIL constant KF_ALTDOWN\n"); failures++; }
     if ((long long)(KF_CATEGORY_COMMON) != 3LL) { printf("FAIL constant KF_CATEGORY_COMMON\n"); failures++; }
     if ((long long)(KF_CATEGORY_FIXED) != 2LL) { printf("FAIL constant KF_CATEGORY_FIXED\n"); failures++; }
@@ -1519,6 +1541,20 @@ int main(void) {
     if ((long long)(MONITOR_DEFAULTTONEAREST) != 2LL) { printf("FAIL constant MONITOR_DEFAULTTONEAREST\n"); failures++; }
     if ((long long)(MONITOR_DEFAULTTONULL) != 0LL) { printf("FAIL constant MONITOR_DEFAULTTONULL\n"); failures++; }
     if ((long long)(MONITOR_DEFAULTTOPRIMARY) != 1LL) { printf("FAIL constant MONITOR_DEFAULTTOPRIMARY\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_ABSOLUTE) != 32768LL) { printf("FAIL constant MOUSEEVENTF_ABSOLUTE\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_HWHEEL) != 4096LL) { printf("FAIL constant MOUSEEVENTF_HWHEEL\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_LEFTDOWN) != 2LL) { printf("FAIL constant MOUSEEVENTF_LEFTDOWN\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_LEFTUP) != 4LL) { printf("FAIL constant MOUSEEVENTF_LEFTUP\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_MIDDLEDOWN) != 32LL) { printf("FAIL constant MOUSEEVENTF_MIDDLEDOWN\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_MIDDLEUP) != 64LL) { printf("FAIL constant MOUSEEVENTF_MIDDLEUP\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_MOVE) != 1LL) { printf("FAIL constant MOUSEEVENTF_MOVE\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_MOVE_NOCOALESCE) != 8192LL) { printf("FAIL constant MOUSEEVENTF_MOVE_NOCOALESCE\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_RIGHTDOWN) != 8LL) { printf("FAIL constant MOUSEEVENTF_RIGHTDOWN\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_RIGHTUP) != 16LL) { printf("FAIL constant MOUSEEVENTF_RIGHTUP\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_VIRTUALDESK) != 16384LL) { printf("FAIL constant MOUSEEVENTF_VIRTUALDESK\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_WHEEL) != 2048LL) { printf("FAIL constant MOUSEEVENTF_WHEEL\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_XDOWN) != 128LL) { printf("FAIL constant MOUSEEVENTF_XDOWN\n"); failures++; }
+    if ((long long)(MOUSEEVENTF_XUP) != 256LL) { printf("FAIL constant MOUSEEVENTF_XUP\n"); failures++; }
     if ((long long)(MOVEFILE_COPY_ALLOWED) != 2LL) { printf("FAIL constant MOVEFILE_COPY_ALLOWED\n"); failures++; }
     if ((long long)(MOVEFILE_CREATE_HARDLINK) != 16LL) { printf("FAIL constant MOVEFILE_CREATE_HARDLINK\n"); failures++; }
     if ((long long)(MOVEFILE_DELAY_UNTIL_REBOOT) != 4LL) { printf("FAIL constant MOVEFILE_DELAY_UNTIL_REBOOT\n"); failures++; }
@@ -2869,6 +2905,14 @@ int main(void) {
     if ((long long)(WA_ACTIVE) != 1LL) { printf("FAIL constant WA_ACTIVE\n"); failures++; }
     if ((long long)(WA_CLICKACTIVE) != 2LL) { printf("FAIL constant WA_CLICKACTIVE\n"); failures++; }
     if ((long long)(WA_INACTIVE) != 0LL) { printf("FAIL constant WA_INACTIVE\n"); failures++; }
+    if ((long long)(WMSZ_BOTTOM) != 6LL) { printf("FAIL constant WMSZ_BOTTOM\n"); failures++; }
+    if ((long long)(WMSZ_BOTTOMLEFT) != 7LL) { printf("FAIL constant WMSZ_BOTTOMLEFT\n"); failures++; }
+    if ((long long)(WMSZ_BOTTOMRIGHT) != 8LL) { printf("FAIL constant WMSZ_BOTTOMRIGHT\n"); failures++; }
+    if ((long long)(WMSZ_LEFT) != 1LL) { printf("FAIL constant WMSZ_LEFT\n"); failures++; }
+    if ((long long)(WMSZ_RIGHT) != 2LL) { printf("FAIL constant WMSZ_RIGHT\n"); failures++; }
+    if ((long long)(WMSZ_TOP) != 3LL) { printf("FAIL constant WMSZ_TOP\n"); failures++; }
+    if ((long long)(WMSZ_TOPLEFT) != 4LL) { printf("FAIL constant WMSZ_TOPLEFT\n"); failures++; }
+    if ((long long)(WMSZ_TOPRIGHT) != 5LL) { printf("FAIL constant WMSZ_TOPRIGHT\n"); failures++; }
     if ((long long)(WM_ACTIVATE) != 6LL) { printf("FAIL constant WM_ACTIVATE\n"); failures++; }
     if ((long long)(WM_ACTIVATEAPP) != 28LL) { printf("FAIL constant WM_ACTIVATEAPP\n"); failures++; }
     if ((long long)(WM_AFXFIRST) != 864LL) { printf("FAIL constant WM_AFXFIRST\n"); failures++; }
@@ -3210,6 +3254,6 @@ int main(void) {
     if ((long long)(WVR_VALIDRECTS) != 1024LL) { printf("FAIL constant WVR_VALIDRECTS\n"); failures++; }
     if ((long long)(WVR_VREDRAW) != 512LL) { printf("FAIL constant WVR_VREDRAW\n"); failures++; }
     if (failures != 0) return 1;
-    printf("win32 constants: 2425 checked\n");
+    printf("win32 constants: 2454 checked\n");
     return 0;
 }

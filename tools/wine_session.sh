@@ -8,7 +8,8 @@
 # The X server comes from window/x11/tools/run_headless.sh, which waits for it
 # to answer. Shutdown is bounded: a prefix whose wineserver does not stop in
 # 10 s is kept, named, and the run fails rather than deleting files a live
-# process still uses.
+# process still uses. CAUSTIC_WINE_DPI=144 runs at that system DPI (the
+# prefix's LogPixels, read when its wineserver starts).
 set -eu
 [ $# -gt 0 ] || { echo "usage: wine_session.sh command [args...]" >&2; exit 2; }
 . "$(dirname "$0")/child.sh"
@@ -16,6 +17,10 @@ if [ "${1:-}" = "--inside" ]; then
     shift
     unset WAYLAND_DISPLAY
     export CAUSTIC_WINE_SESSION="$WINEPREFIX"
+    if [ -n "${CAUSTIC_WINE_DPI:-}" ]; then
+        wine reg add 'HKCU\Control Panel\Desktop' /v LogPixels /t REG_DWORD /d "$CAUSTIC_WINE_DPI" /f >/dev/null 2>&1
+        timeout 10 wineserver -w 2>/dev/null || { echo "wine_session: wineserver did not settle" >&2; exit 1; }
+    fi
     status=0
     run_child "$@" || status=$?
     # Wine's processes leave while their X server still answers.

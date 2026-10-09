@@ -2,9 +2,9 @@
 //
 // Backends:
 //   X11      Linux / BSD via libX11 and MIT-SHM
-//   WAYLAND  Linux native (designed)
+//   WAYLAND  Linux, the compositor's socket spoken directly
 //   KMS      Linux console / DRM direct (designed)
-//   WIN32    Windows user32 / gdi32 (designed)
+//   WIN32    Windows user32 / gdi32
 //
 // The interface is pull:
 //
@@ -16,11 +16,17 @@
 //       window.submit(&w);
 //   }
 //   window.close(&w);
+//
+// Every operation dispatches on the target's operating system first — a
+// constant the compiler folds — and only then on the window's backend, so a
+// Linux program carries no Win32 import and a Windows one no libX11 or
+// Linux system call.
 
 use "../gpu/software/target.cst" as tgt;
 use "../gpu/swapchain.cst" as swapchain;
 use "x11/x11.cst" as x11;
 use "wayland/backend.cst" as wayland;
+use "win32/backend.cst" as win32;
 use "std/os.cst" as os;
 use "std/env.cst" as env;
 use "std/mem.cst" as mem;
@@ -49,6 +55,7 @@ fn backend_name(id as i32) as *u8 {
 
 fn available(id as i32) as i32 {
     if (os.current() == os.OS_LINUX && (id == X11 || id == WAYLAND)) { return 1; }
+    if (os.current() == os.OS_WINDOWS && id == WIN32) { return 1; }
     return 0;
 }
 
@@ -83,6 +90,8 @@ fn error_name(code as i32) as *u8 {
 
 struct Config {
     title      as *u8;
+    // The application's identity: WM_CLASS on X11, app_id on Wayland, the
+    // process's AppUserModelID on Windows.
     class_name as *u8;
     width      as i64;
     height     as i64;
@@ -134,21 +143,46 @@ struct Window {
     transparent as i32;
     x11_win     as x11.window.Window;
     wayland_win as *wayland.Window;
+    win32_win   as win32.Window;
 }
 
 // --- Opening and Lifecycle ---
+
+fn _open_win32(w as *Window, c as *Config) as void {
+    let is win32.Config as wc with mut = win32.config(c.title, c.width, c.height);
+    wc.resizable = c.resizable;
+    wc.dialog = c.dialog;
+    wc.modal = c.modal;
+    wc.decorated = c.decorated;
+    wc.app_id = c.class_name;
+    if (cast(i64, c.owner) != 0 && c.owner.backend == WIN32 && c.owner.ok == 1) {
+        wc.owner = win32.hwnd(&c.owner.win32_win);
+    }
+    w.win32_win = win32.open_config(&wc);
+    w.ok = w.win32_win.ok;
+    let is i32 as e = w.win32_win.err;
+    if (e == win32.OK) { w.err = OK; }
+    else if (e == win32.NO_MEMORY) { w.err = NO_MEMORY; }
+    else if (e == win32.NO_SURFACE) { w.err = NO_SURFACE; }
+    else if (e == win32.BAD_ARGUMENT) { w.err = BAD_ARGUMENT; }
+    else { w.err = NO_WINDOW; }
+}
 
 fn open_config(c as *Config) as Window {
     let is Window as w;
     w.backend = c.backend;
     w.transparent = c.transparent;
+    w.wayland_win = cast(*wayland.Window, 0);
     if (w.backend == AUTO) {
-        let is *u8 as display = env.getenv("WAYLAND_DISPLAY");
-        if (cast(i64, display) != 0 && display[0] != 0) { w.backend = WAYLAND; }
-        else { w.backend = X11; }
+        if (os.current() == os.OS_WINDOWS) {
+            w.backend = WIN32;
+        } else {
+            let is *u8 as display = env.getenv("WAYLAND_DISPLAY");
+            if (cast(i64, display) != 0 && display[0] != 0) { w.backend = WAYLAND; }
+            else { w.backend = X11; }
+        }
     }
-    if (os.current() == os.OS_LINUX) {
-    if (w.backend == X11) {
+    if (os.current() == os.OS_LINUX && w.backend == X11) {
         let is x11.window.Config as xc with mut;
         if (c.resizable == 0) {
             xc = x11.config_fixed(c.title, c.width, c.height);
@@ -168,10 +202,8 @@ fn open_config(c as *Config) as Window {
         w.err = x11.last_error(&w.x11_win);
         return w;
     }
-    }
 
-    if (os.current() == os.OS_LINUX) {
-    if (w.backend == WAYLAND) {
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) {
         let is *u8 as title with mut = c.title;
         if (cast(i64, title) == 0) { title = ""; }
         let is wayland.Options as wo with mut = wayland.options();
@@ -203,6 +235,10 @@ fn open_config(c as *Config) as Window {
         }
         return w;
     }
+
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) {
+        _open_win32(&w, c);
+        return w;
     }
 
     w.ok = 0;
@@ -230,6 +266,7 @@ fn close(w as *Window) as void {
             w.wayland_win = cast(*wayland.Window, 0);
         }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.close(&w.win32_win); }
     w.ok = 0;
 }
 
@@ -240,6 +277,7 @@ fn set_modal(w as *Window, on as i32) as i32 {
         if (w.backend == X11) { return x11.set_modal(&w.x11_win, on); }
         if (w.backend == WAYLAND) { return wayland.set_modal(w.wayland_win, on); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_modal(&w.win32_win, on); }
     return 0;
 }
 
@@ -249,6 +287,7 @@ fn is_open(w as *Window) as i32 {
         if (w.backend == X11) { return x11.is_open(&w.x11_win); }
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.is_open(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.is_open(&w.win32_win); }
     return 0;
 }
 
@@ -264,6 +303,7 @@ fn next_frame(w as *Window) as i32 {
         if (w.backend == X11) { return x11.next_frame(&w.x11_win); }
         if (w.backend == WAYLAND) { return wayland.next_frame(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.next_frame(&w.win32_win); }
     return 0;
 }
 
@@ -277,6 +317,7 @@ fn pump(w as *Window) as void {
         if (w.backend == X11) { x11.pump(&w.x11_win); }
         if (w.backend == WAYLAND && w.ok == 1) { wayland.pump(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.pump(&w.win32_win); }
 }
 
 // Whether an event is there to be read, so sleeping now would miss it.
@@ -286,11 +327,13 @@ fn pending(w as *Window) as i32 {
         if (w.backend == X11) { return x11.pending(&w.x11_win); }
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.pending(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.pending(&w.win32_win); }
     return 0;
 }
 
 // The descriptor the platform's events arrive on, -1 for none: every window
-// of the program shares it.
+// of the program shares it. Windows has none: its messages arrive in the
+// thread's queue.
 fn connection_fd(w as *Window) as i64 {
     if (w.ok == 0) { return 0 - 1; }
     if (os.current() == os.OS_LINUX) {
@@ -300,11 +343,7 @@ fn connection_fd(w as *Window) as i64 {
     return 0 - 1;
 }
 
-fn acquire(w as *Window) as tgt.Target {
-    if (os.current() == os.OS_LINUX) {
-        if (w.backend == X11) { return x11.acquire(&w.x11_win); }
-        if (w.backend == WAYLAND && w.ok == 1) { return wayland.acquire(w.wayland_win); }
-    }
+fn _no_target() as tgt.Target {
     let is tgt.Target as t;
     t.width = 0; t.height = 0;
     t.color = cast(*u8, 0);
@@ -312,36 +351,58 @@ fn acquire(w as *Window) as tgt.Target {
     return t;
 }
 
+fn acquire(w as *Window) as tgt.Target {
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.acquire(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.acquire(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.acquire(&w.win32_win); }
+    return _no_target();
+}
+
 fn submit(w as *Window) as void {
     if (os.current() == os.OS_LINUX) {
         if (w.backend == X11) { x11.submit(&w.x11_win); }
         if (w.backend == WAYLAND && w.ok == 1) { wayland.submit(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.submit(&w.win32_win); }
 }
 
 // --- Geometry and State ---
 
 fn width(w as *Window) as i64 {
-    if (w.backend == X11) { return x11.width(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.width(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.width(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.width(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.width(&w.win32_win); }
     return 0;
 }
 
 fn height(w as *Window) as i64 {
-    if (w.backend == X11) { return x11.height(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.height(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.height(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.height(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.height(&w.win32_win); }
     return 0;
 }
 
 fn resized(w as *Window) as i32 {
-    if (w.backend == X11) { return x11.resized(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.resized(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.resized(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.resized(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.resized(&w.win32_win); }
     return 0;
 }
 
 fn should_close(w as *Window) as i32 {
-    if (w.backend == X11) { return x11.should_close(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.should_close(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.should_close(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.should_close(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.should_close(&w.win32_win); }
     return 1;
 }
 
@@ -349,62 +410,92 @@ fn should_close(w as *Window) as i32 {
 // program said no, as a dialog asking first does. next_frame goes on.
 fn keep_open(w as *Window) as void {
     if (w.ok == 0) { return; }
-    if (w.backend == X11) { x11.keep_open(&w.x11_win); }
-    if (w.backend == WAYLAND) { wayland.keep_open(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { x11.keep_open(&w.x11_win); }
+        if (w.backend == WAYLAND) { wayland.keep_open(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.keep_open(&w.win32_win); }
 }
 
 fn request_close(w as *Window) as void {
-    if (w.backend == X11) { x11.request_close(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { wayland.request_close(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { x11.request_close(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { wayland.request_close(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.request_close(&w.win32_win); }
 }
 
 fn transport_name(w as *Window) as *u8 {
-    if (w.backend == X11) { return x11.transport_name(&w.x11_win); }
-    if (w.backend == WAYLAND) { return "wayland"; }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.transport_name(&w.x11_win); }
+        if (w.backend == WAYLAND) { return "wayland"; }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.transport_name(&w.win32_win); }
     return backend_name(w.backend);
 }
 
 // --- Sampled Input ---
 
 fn key_down(w as *Window, key as i32) as i32 {
-    if (w.backend == X11) { return x11.key_down(&w.x11_win, key); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.key_down(w.wayland_win, key); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.key_down(&w.x11_win, key); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.key_down(w.wayland_win, key); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.key_down(&w.win32_win, key); }
     return 0;
 }
 
 fn button_down(w as *Window, button as i32) as i32 {
-    if (w.backend == X11) { return x11.button_down(&w.x11_win, button); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.button_down(w.wayland_win, button); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.button_down(&w.x11_win, button); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.button_down(w.wayland_win, button); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.button_down(&w.win32_win, button); }
     return 0;
 }
 
 fn mouse_x(w as *Window) as i64 {
-    if (w.backend == X11) { return x11.mouse_x(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_x(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.mouse_x(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_x(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.mouse_x(&w.win32_win); }
     return 0;
 }
 
 fn mouse_y(w as *Window) as i64 {
-    if (w.backend == X11) { return x11.mouse_y(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_y(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.mouse_y(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_y(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.mouse_y(&w.win32_win); }
     return 0;
 }
 
 fn mouse_dx(w as *Window) as i64 {
-    if (w.backend == X11) { return x11.mouse_dx(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_dx(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.mouse_dx(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_dx(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.mouse_dx(&w.win32_win); }
     return 0;
 }
 
 fn mouse_dy(w as *Window) as i64 {
-    if (w.backend == X11) { return x11.mouse_dy(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_dy(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.mouse_dy(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.mouse_dy(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.mouse_dy(&w.win32_win); }
     return 0;
 }
 
 fn wheel(w as *Window) as i64 {
-    if (w.backend == X11) { return x11.wheel(&w.x11_win); }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.wheel(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.wheel(&w.x11_win); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.wheel(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.wheel(&w.win32_win); }
     return 0;
 }
 
@@ -422,33 +513,38 @@ fn _x11_modifiers(m as i32) as i32 {
     return out;
 }
 
-fn poll_event(w as *Window, out as *event.Event) as i32 {
-    if (w.backend == X11) {
-        let is x11.events.Event as xev;
-        let is i32 as got = x11.poll_event(&w.x11_win, &xev);
-        if (got == 0) { return 0; }
-        out.kind = xev.kind;
-        out.key = xev.key;
-        out.keycode = xev.keycode;
-        out.modifiers = _x11_modifiers(xev.modifiers);
-        out.button = xev.button;
-        out.wheel = xev.wheel;
-        out.x = xev.x;
-        out.y = xev.y;
-        out.width = xev.width;
-        out.height = xev.height;
-        out.raw_kind = xev.xkind;
-        out.drop = xev.drop;
-        out.state = xev.state;
-        out.text = "";
-        out.text_len = 0;
-        if (xev.kind == event.KEY_DOWN) {
-            out.text = x11.text_buffer(&w.x11_win);
-            out.text_len = x11.text_len(&w.x11_win);
-        }
-        return 1;
+fn _x11_event(w as *Window, out as *event.Event) as i32 {
+    let is x11.events.Event as xev;
+    let is i32 as got = x11.poll_event(&w.x11_win, &xev);
+    if (got == 0) { return 0; }
+    out.kind = xev.kind;
+    out.key = xev.key;
+    out.keycode = xev.keycode;
+    out.modifiers = _x11_modifiers(xev.modifiers);
+    out.button = xev.button;
+    out.wheel = xev.wheel;
+    out.x = xev.x;
+    out.y = xev.y;
+    out.width = xev.width;
+    out.height = xev.height;
+    out.raw_kind = xev.xkind;
+    out.drop = xev.drop;
+    out.state = xev.state;
+    out.text = "";
+    out.text_len = 0;
+    if (xev.kind == event.KEY_DOWN) {
+        out.text = x11.text_buffer(&w.x11_win);
+        out.text_len = x11.text_len(&w.x11_win);
     }
-    if (w.backend == WAYLAND && w.ok == 1) { return wayland.poll_event(w.wayland_win, out); }
+    return 1;
+}
+
+fn poll_event(w as *Window, out as *event.Event) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return _x11_event(w, out); }
+        if (w.backend == WAYLAND && w.ok == 1) { return wayland.poll_event(w.wayland_win, out); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.poll_event(&w.win32_win, out); }
     return 0;
 }
 
@@ -457,21 +553,29 @@ fn poll_event(w as *Window, out as *event.Event) as i32 {
 // Its title, n bytes of UTF-8.
 fn set_title(w as *Window, s as *u8, n as i64) as void {
     if (w.ok == 0) { return; }
-    if (w.backend == X11) { x11.set_title_utf8(&w.x11_win, s, n); }
-    if (w.backend == WAYLAND) { wayland.set_title(w.wayland_win, s, n); }
-
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { x11.set_title_utf8(&w.x11_win, s, n); }
+        if (w.backend == WAYLAND) { wayland.set_title(w.wayland_win, s, n); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.set_title(&w.win32_win, s, n); }
 }
 
 fn show(w as *Window) as void {
     if (w.ok == 0) { return; }
-    if (w.backend == X11) { x11.show(&w.x11_win); }
-    if (w.backend == WAYLAND) { wayland.show(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { x11.show(&w.x11_win); }
+        if (w.backend == WAYLAND) { wayland.show(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.show(&w.win32_win); }
 }
 
 fn hide(w as *Window) as void {
     if (w.ok == 0) { return; }
-    if (w.backend == X11) { x11.hide(&w.x11_win); }
-    if (w.backend == WAYLAND) { wayland.hide(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { x11.hide(&w.x11_win); }
+        if (w.backend == WAYLAND) { wayland.hide(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.hide(&w.win32_win); }
 }
 
 // --- A frame of the program's own ---
@@ -482,7 +586,9 @@ fn hide(w as *Window) as void {
 // hands it the moving and resizing a press begins, its menu, minimizing and
 // maximizing. What the platform says of its state comes back as STATE events
 // and state(). On X11: Motif's hints, _GTK_FRAME_EXTENTS, the SHAPE input
-// region, _NET_WM_MOVERESIZE, _GTK_SHOW_WINDOW_MENU (x11/frame.cst).
+// region, _NET_WM_MOVERESIZE, _GTK_SHOW_WINDOW_MENU (x11/frame.cst). On
+// Windows: the window style, hit-testing and the system's own move, size and
+// menu loops.
 
 // How a press moves or resizes it (begin_move_resize): from an edge or a
 // corner, numbered as EWMH numbers them, or moved whole.
@@ -500,31 +606,43 @@ let is i64 as MOVE      with imut = 8;
 // granted).
 fn transparent(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.transparent(&w.x11_win); }
-    if (w.backend == WAYLAND) { return 1; }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.transparent(&w.x11_win); }
+        if (w.backend == WAYLAND) { return 1; }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.transparent(&w.win32_win); }
     return 0;
 }
 
 // Wayland compositors always composite surfaces.
 fn composited(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.composited(&w.x11_win); }
-    if (w.backend == WAYLAND) { return 1; }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.composited(&w.x11_win); }
+        if (w.backend == WAYLAND) { return 1; }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.composited(&w.win32_win); }
     return 0;
 }
 
 // The platform's own decoration on it (1) or not (0): 1 when told.
 fn set_decorated(w as *Window, on as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.set_decorated(&w.x11_win, on); }
-    if (w.backend == WAYLAND) { return wayland.set_decorated(w.wayland_win, on); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.set_decorated(&w.x11_win, on); }
+        if (w.backend == WAYLAND) { return wayland.set_decorated(w.wayland_win, on); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_decorated(&w.win32_win, on); }
     return 0;
 }
 
 fn decorated(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.decorated(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.decorated(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.decorated(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.decorated(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.decorated(&w.win32_win); }
     return 0;
 }
 
@@ -532,16 +650,22 @@ fn decorated(w as *Window) as i32 {
 // the desktop counts it is inside it. 1 when told.
 fn set_frame_extents(w as *Window, left as i64, right as i64, top as i64, bottom as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.set_client_extents(&w.x11_win, left, right, top, bottom); }
-    if (w.backend == WAYLAND) { return wayland.set_frame_extents(w.wayland_win, left, right, top, bottom); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.set_client_extents(&w.x11_win, left, right, top, bottom); }
+        if (w.backend == WAYLAND) { return wayland.set_frame_extents(w.wayland_win, left, right, top, bottom); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_frame_extents(&w.win32_win, left, right, top, bottom); }
     return 0;
 }
 
 // Where it takes the pointer, in physical pixels: 1 when told.
 fn set_input_region(w as *Window, x as i64, y as i64, rw as i64, rh as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.set_input_region(&w.x11_win, x, y, rw, rh); }
-    if (w.backend == WAYLAND) { return wayland.set_input_region(w.wayland_win, x, y, rw, rh); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.set_input_region(&w.x11_win, x, y, rw, rh); }
+        if (w.backend == WAYLAND) { return wayland.set_input_region(w.wayland_win, x, y, rw, rh); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_input_region(&w.win32_win, x, y, rw, rh); }
     return 0;
 }
 
@@ -549,18 +673,24 @@ fn set_input_region(w as *Window, x as i64, y as i64, rw as i64, rh as i64) as i
 fn input_region(w as *Window, x as *i64, y as *i64, rw as *i64, rh as *i64) as i32 {
     if (w.ok == 0) { return 0; }
     *x = 0; *y = 0; *rw = 0; *rh = 0;
-    if (w.backend == X11) { return x11.input_region(&w.x11_win, x, y, rw, rh); }
-    if (w.backend == WAYLAND) { return wayland.input_region(w.wayland_win, x, y, rw, rh); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.input_region(&w.x11_win, x, y, rw, rh); }
+        if (w.backend == WAYLAND) { return wayland.input_region(w.wayland_win, x, y, rw, rh); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.input_region(&w.win32_win, x, y, rw, rh); }
     return 0;
 }
 
 // Moved (MOVE) or resized from an edge (RESIZE_*) by the platform from a
 // press of button at x, y in the window, following the pointer from there.
-// 1 when asked.
+// 1 when asked. Windows' own loop follows the left button only.
 fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.begin_move_resize(&w.x11_win, x, y, how, button); }
-    if (w.backend == WAYLAND) { return wayland.begin_move_resize(w.wayland_win, x, y, how, button); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.begin_move_resize(&w.x11_win, x, y, how, button); }
+        if (w.backend == WAYLAND) { return wayland.begin_move_resize(w.wayland_win, x, y, how, button); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.begin_move_resize(&w.win32_win, x, y, how, button); }
     return 0;
 }
 
@@ -568,98 +698,134 @@ fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64
 // window: 1 when asked.
 fn show_window_menu(w as *Window, x as i64, y as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.show_window_menu(&w.x11_win, x, y); }
-    if (w.backend == WAYLAND) { return wayland.show_window_menu(w.wayland_win, x, y); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.show_window_menu(&w.x11_win, x, y); }
+        if (w.backend == WAYLAND) { return wayland.show_window_menu(w.wayland_win, x, y); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.show_window_menu(&w.win32_win, x, y); }
     return 0;
 }
 
 // Minimized, as its title bar's button would: 1 when asked.
 fn minimize(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.minimize(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.minimize(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.minimize(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.minimize(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.minimize(&w.win32_win); }
     return 0;
 }
 
-// Maximized, or back from it: 1 when asked.
+// The client asked to be width by height physical pixels: 1 when asked. The
+// window system decides, and the size arrives as a RESIZE. A Wayland client
+// sizes itself as it draws: 0 there, as anywhere it cannot be asked.
+fn set_size(w as *Window, width as i64, height as i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.set_size(&w.x11_win, width, height); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_size(&w.win32_win, width, height); }
+    return 0;
+}
+
 // The smallest the window may be made, physical pixels — what its content
 // cannot be laid out in less of — 0 by 0 for no floor; asked of the window
 // manager again whenever it changes. A fixed window keeps its size: 0. 1
 // when asked.
 fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.set_min_size(&w.x11_win, width, height); }
-    if (w.backend == WAYLAND) { return wayland.set_min_size(w.wayland_win, width, height); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.set_min_size(&w.x11_win, width, height); }
+        if (w.backend == WAYLAND) { return wayland.set_min_size(w.wayland_win, width, height); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_min_size(&w.win32_win, width, height); }
     return 0;
 }
 
 fn min_size(w as *Window, width as *i64, height as *i64) as i32 {
     *width = 0; *height = 0;
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.min_size(&w.x11_win, width, height); }
-    if (w.backend == WAYLAND) { return wayland.min_size(w.wayland_win, width, height); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.min_size(&w.x11_win, width, height); }
+        if (w.backend == WAYLAND) { return wayland.min_size(w.wayland_win, width, height); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.min_size(&w.win32_win, width, height); }
     return 0;
 }
 
 fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == WAYLAND) { return wayland.set_max_size(w.wayland_win, width, height); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.set_max_size(w.wayland_win, width, height); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_max_size(&w.win32_win, width, height); }
     return 0;
 }
 
-
+// Maximized, or back from it: 1 when asked.
 fn set_maximized(w as *Window, on as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.set_maximized(&w.x11_win, on); }
-    if (w.backend == WAYLAND) { return wayland.set_maximized(w.wayland_win, on); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.set_maximized(&w.x11_win, on); }
+        if (w.backend == WAYLAND) { return wayland.set_maximized(w.wayland_win, on); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_maximized(&w.win32_win, on); }
     return 0;
 }
 
 fn set_fullscreen(w as *Window, on as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.set_fullscreen(&w.x11_win, on); }
-    if (w.backend == WAYLAND) { return wayland.set_fullscreen(w.wayland_win, on); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.set_fullscreen(&w.x11_win, on); }
+        if (w.backend == WAYLAND) { return wayland.set_fullscreen(w.wayland_win, on); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_fullscreen(&w.win32_win, on); }
     return 0;
 }
-
 
 // Its state as the platform keeps it: event.STATE_* bits.
 fn state(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.state(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.state(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.state(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.state(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.state(&w.win32_win); }
     return 0;
 }
 
 // The keyboard asked for it — granted or not as the window manager decides.
 fn activate(w as *Window) as void {
     if (w.ok == 0) { return; }
-    if (w.backend == X11) { x11.activate(&w.x11_win); }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { x11.activate(&w.x11_win); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.activate(&w.win32_win); }
 }
 
 // Where its inside's top left is on the screen, in physical pixels: 1, or 0
 // where the platform does not say (Wayland never does).
 fn position(w as *Window, x as *i64, y as *i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.position(&w.x11_win, x, y); }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.position(&w.x11_win, x, y); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.position(&w.win32_win, x, y); }
     return 0;
 }
 
 // Its icon: argb, iw by ih, 0xAARRGGBB a pixel.
 fn set_icon(w as *Window, argb as *u8, iw as i64, ih as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.set_icon(&w.x11_win, argb, iw, ih); }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.set_icon(&w.x11_win, argb, iw, ih); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_icon(&w.win32_win, argb, iw, ih); }
     return 0;
 }
+
 fn cursor_set(w as *Window, shape as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == WAYLAND) { return wayland.set_cursor(w.wayland_win, shape); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.set_cursor(w.wayland_win, shape); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_cursor(&w.win32_win, shape); }
     return 0;
 }
 
 fn scale_120(w as *Window) as i32 {
     if (w.ok == 0) { return 120; }
-    if (w.backend == WAYLAND) { return wayland.scale(w.wayland_win); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.scale(w.wayland_win); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.scale_120(&w.win32_win); }
     return 120;
 }
 
@@ -667,42 +833,52 @@ fn scale_120(w as *Window) as i32 {
 // the backend converts them to its surface's logical coordinate system.
 fn text_input_enable(w as *Window, on as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == WAYLAND) { return wayland.text_input_enable(w.wayland_win, on); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.text_input_enable(w.wayland_win, on); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.text_input_enable(&w.win32_win, on); }
     return 0;
 }
 
 fn text_input_active(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == WAYLAND) { return wayland.text_input_active(w.wayland_win); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.text_input_active(w.wayland_win); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.text_input_active(&w.win32_win); }
     return 0;
 }
 
 fn text_input_rect(w as *Window, x as i64, y as i64, width as i64, height as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == WAYLAND) { return wayland.text_input_rect(w.wayland_win, x, y, width, height); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.text_input_rect(w.wayland_win, x, y, width, height); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.text_input_rect(&w.win32_win, x, y, width, height); }
     return 0;
 }
 
 // --- The clipboard ---
 //
 // CLIPBOARD, what copying fills, and PRIMARY, what selecting fills where the
-// platform has one (X11, Wayland). Text set is served by the window while it
-// lives; text asked for arrives as the events are pumped: ready, then read.
+// platform has one (X11, Wayland; not Windows). Text set is served by the
+// window while it lives; text asked for arrives as the events are pumped:
+// ready, then read. Windows answers at once.
 
 let is i32 as CLIPBOARD with imut = 0;
 let is i32 as PRIMARY   with imut = 1;
 
 fn clipboard_set(w as *Window, which as i32, s as *u8, n as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.selection_set_text(&w.x11_win, which, s, n); }
-    if (w.backend == WAYLAND) { return wayland.clipboard_set(w.wayland_win, which, s, n); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.selection_set_text(&w.x11_win, which, s, n); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_set(w.wayland_win, which, s, n); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_set(&w.win32_win, which, s, n); }
     return 0;
 }
 
 fn clipboard_request(w as *Window, which as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.selection_request_text(&w.x11_win, which); }
-    if (w.backend == WAYLAND) { return wayland.clipboard_request(w.wayland_win, which); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.selection_request_text(&w.x11_win, which); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_request(w.wayland_win, which); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_request(&w.win32_win, which); }
     return 0;
 }
 
@@ -710,23 +886,32 @@ fn clipboard_request(w as *Window, which as i32) as i32 {
 // there was none to have).
 fn clipboard_ready(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.selection_ready(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.clipboard_ready(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.selection_ready(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_ready(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_ready(&w.win32_win); }
     return 0;
 }
 
 // Whether an answer is still awaited.
 fn clipboard_pending(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.selection_pending(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.clipboard_pending(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.selection_pending(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_pending(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_pending(&w.win32_win); }
     return 0;
 }
 
 fn clipboard_text(w as *Window, buf as *u8, cap as i64) as i64 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.clipboard_text(&w.x11_win, buf, cap); }
-    if (w.backend == WAYLAND) { return wayland.clipboard_text(w.wayland_win, buf, cap); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.clipboard_text(&w.x11_win, buf, cap); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_text(w.wayland_win, buf, cap); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_text(&w.win32_win, buf, cap); }
     return 0;
 }
 
@@ -739,56 +924,72 @@ fn clipboard_text(w as *Window, buf as *u8, cap as i64) as i64 {
 
 fn drop_answer(w as *Window, takes as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.drop_answer(&w.x11_win, takes); }
-    if (w.backend == WAYLAND) { return wayland.drop_answer(w.wayland_win, takes); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.drop_answer(&w.x11_win, takes); }
+        if (w.backend == WAYLAND) { return wayland.drop_answer(w.wayland_win, takes); }
+    }
     return 0;
 }
 
 fn dropped_files(w as *Window) as i64 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.dropped_files(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.dropped_files(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.dropped_files(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.dropped_files(w.wayland_win); }
+    }
     return 0;
 }
 
 // The i-th path, zero-terminated; null for none.
 fn dropped_file(w as *Window, i as i64) as *u8 {
     if (w.ok == 0) { return cast(*u8, 0); }
-    if (w.backend == X11) { return x11.dropped_file(&w.x11_win, i); }
-    if (w.backend == WAYLAND) { return wayland.dropped_file(w.wayland_win, i); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.dropped_file(&w.x11_win, i); }
+        if (w.backend == WAYLAND) { return wayland.dropped_file(w.wayland_win, i); }
+    }
     return cast(*u8, 0);
 }
 
 // The text dropped, UTF-8, dropped_text_length bytes, not terminated.
 fn dropped_text(w as *Window) as *u8 {
     if (w.ok == 0) { return cast(*u8, 0); }
-    if (w.backend == X11) { return x11.dropped_text(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.dropped_text(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.dropped_text(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.dropped_text(w.wayland_win); }
+    }
     return cast(*u8, 0);
 }
 
 fn dropped_text_length(w as *Window) as i64 {
     if (w.ok == 0) { return 0; }
-    if (w.backend == X11) { return x11.dropped_text_length(&w.x11_win); }
-    if (w.backend == WAYLAND) { return wayland.dropped_text_length(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.dropped_text_length(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.dropped_text_length(w.wayland_win); }
+    }
     return 0;
 }
 
 fn clear_drop(w as *Window) as void {
     if (w.ok == 0) { return; }
-    if (w.backend == X11) { x11.clear_drop(&w.x11_win); }
-    if (w.backend == WAYLAND) { wayland.clear_drop(w.wayland_win); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { x11.clear_drop(&w.x11_win); }
+        if (w.backend == WAYLAND) { wayland.clear_drop(w.wayland_win); }
+    }
 }
 
 // --- The desktop's settings ---
 
-// What this backend can read of them, into out: GTK's settings.ini and the
-// language from the environment, then XSETTINGS on X11 — after which a
-// SETTINGS event says they changed. The
-// portal needs a D-Bus connection and is linux/portal.cst's, for whoever holds
-// one. How many sources answered.
+// What this backend can read of them, into out. On Linux: GTK's settings.ini
+// and the language from the environment, then XSETTINGS on X11 — after which
+// a SETTINGS event says they changed; the portal needs a D-Bus connection and
+// is linux/portal.cst's, for whoever holds one. On Windows: the registry and
+// SystemParametersInfo. How many sources answered.
 fn read_settings(w as *Window, out as *settings.Settings) as i32 {
     *out = settings.defaults();
+    if (os.current() == os.OS_WINDOWS) {
+        if (w.backend == WIN32) { return win32.read_settings(&w.win32_win, out); }
+        return 0;
+    }
     let is settings.Settings as files with mut = settings.defaults();
     let is i32 as n with mut = gtk_ini.read_user(&files);
     settings.merge(out, &files);
@@ -800,14 +1001,14 @@ fn read_settings(w as *Window, out as *settings.Settings) as i32 {
 // --- GPU Presentation surfaces ---
 
 fn surface_for_gpu(w as *Window, present as *u8, user as *u8) as swapchain.Surface {
-    if (w.backend == X11) {
+    if (os.current() == os.OS_LINUX && w.backend == X11) {
         return x11.surface_for_gpu(&w.x11_win, present, user);
     }
     return swapchain.surface_headless();
 }
 
 fn surface_for_gpu_shared(w as *Window) as swapchain.Surface {
-    if (w.backend == X11) {
+    if (os.current() == os.OS_LINUX && w.backend == X11) {
         return x11.surface_for_gpu_shared(&w.x11_win);
     }
     return swapchain.surface_headless();

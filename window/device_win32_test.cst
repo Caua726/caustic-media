@@ -1,0 +1,536 @@
+// window/device_win32_test.cst — what the toolkit's loop asks of a window,
+// through the portable device, on Windows (here: an isolated Wine):
+//   sh window/win32/tools/run_native.sh build/device_win32_test.exe
+// The window is observed and driven the way another program or the user
+// would: its title, visibility and owner read back through user32, key and
+// pointer messages and synthetic input sent to it, its pixels read from the
+// screen DC.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "device.cst" as device;
+use "event.cst" as event;
+use "keys.cst" as keys;
+use "cursor.cst" as cursor;
+use "settings.cst" as wsettings;
+use "../gpu/software/target.cst" as tgt;
+use "win32/abi.cst" as abi;
+use "win32/backend.cst" as w32;
+use "win32/bind/types.cst" as t;
+use "win32/bind/user32.cst" as u;
+use "win32/bind/gdi32.cst" as g;
+use "win32/bind/kernel32.cst" as k;
+use "win32/bind/shell32.cst" as shell;
+use "win32/bind/ole32.cst" as ole;
+use "win32/bind/imm32.cst" as ime;
+use "win32/bind/dwmapi.cst" as dwm;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    return cast(i32, mem.memcmp(a, b, n) == 0);
+}
+
+let is device.Window as win with mut;
+let is i64 as hwnd with mut = 0;
+
+// The next event of kind, within a second, into out: 1 when there was one.
+fn next(kind as i32, out as *event.Event) as i32 {
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_event(&win, out) == 1) {
+            if (out.kind == kind) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+fn drain() as void {
+    let is event.Event as e;
+    device.pump(&win);
+    while (device.poll_event(&win, &e) == 1) { }
+}
+
+// The window's title as the system holds it, against UTF-8 want.
+fn title_is(want as *u8) as i32 {
+    let is [128]u16 as got;
+    let is [128]u16 as expected;
+    let is i32 as n = u.GetWindowTextW(hwnd, &got[0], 128);
+    let is i32 as m = k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, want), cast(i32, 0 - 1), &expected[0], 128);
+    if (m <= 0 || n != m - 1) { return 0; }
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (got[i] != expected[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn screen_point(x as i64, y as i64) as i64 {
+    let is t.POINT as p; p.x = cast(i32, x); p.y = cast(i32, y);
+    u.ClientToScreen(hwnd, &p);
+    return (cast(i64, p.x) & 65535) | ((cast(i64, p.y) & 65535) << 16);
+}
+
+// What hit-testing answers at x, y in the window.
+fn hit(x as i64, y as i64) as i64 { return u.SendMessageW(hwnd, cast(u32, t.WM_NCHITTEST), 0, screen_point(x, y)); }
+
+// The system cursor shape shows once the pointer is over the client: idc,
+// or none at all for 0.
+fn shows(shape as i32, idc as i64) as i32 {
+    if (device.cursor_set(&win, shape) != 1) { return 0; }
+    u.SendMessageW(hwnd, cast(u32, t.WM_SETCURSOR), cast(u64, hwnd), t.HTCLIENT | (t.WM_MOUSEMOVE << 16));
+    let is i64 as want with mut = 0;
+    if (idc != 0) { want = u.LoadCursorW(0, cast(*u16, idc)); }
+    return cast(i32, u.GetCursor() == want);
+}
+
+// The command a move or resize from x 20, y 40 posts, taken off the queue
+// before the system's loop could start: want, at that point on the screen.
+fn posts(how as i64, want as i64) as i32 {
+    let is t.MSG as m;
+    if (device.begin_move_resize(&win, 20, 40, how, 1) != 1) { return 0; }
+    if (u.PeekMessageW(&m, hwnd, cast(u32, t.WM_SYSCOMMAND), cast(u32, t.WM_SYSCOMMAND), cast(u32, t.PM_REMOVE)) == 0) { return 0; }
+    return cast(i32, cast(i64, m.wParam) == want && m.lParam == screen_point(20, 40));
+}
+
+// The window's big icon, row y, column x, as 0xRRGGBB.
+fn icon_pixel(x as i64, y as i64) as i64 {
+    let is i64 as icon = u.SendMessageW(hwnd, cast(u32, t.WM_GETICON), cast(u64, t.ICON_BIG), 0);
+    let is t.ICONINFO as info;
+    if (icon == 0 || u.GetIconInfo(icon, &info) == 0) { return 0 - 1; }
+    let is t.BITMAPINFO as bmi;
+    mem.memzero(cast(*u8, &bmi), sizeof(t.BITMAPINFO));
+    bmi.bmiHeader.biSize = cast(u32, sizeof(t.BITMAPINFOHEADER));
+    bmi.bmiHeader.biWidth = 16;
+    bmi.bmiHeader.biHeight = 0 - 16;
+    bmi.bmiHeader.biPlanes = cast(u16, 1);
+    bmi.bmiHeader.biBitCount = cast(u16, 32);
+    bmi.bmiHeader.biCompression = cast(u32, t.BI_RGB);
+    let is [256]u32 as px;
+    let is i64 as dc = u.GetDC(0);
+    let is i32 as rows = g.GetDIBits(dc, info.hbmColor, 0, 16, cast(*u8, &px), &bmi, cast(u32, t.DIB_RGB_COLORS));
+    u.ReleaseDC(0, dc);
+    g.DeleteObject(info.hbmColor);
+    g.DeleteObject(info.hbmMask);
+    if (rows != 16) { return 0 - 1; }
+    return cast(i64, px[y * 16 + x]) & 16777215;
+}
+
+let is [65536]u32 as big_icon with mut;
+
+// --- Synthetic input, delivered while a system loop runs ---
+
+let is abi.Callbacks as timers with mut;
+let is i32 as timer_step with mut = 0;
+let is i64 as drag_x with mut = 0;
+let is i64 as drag_y with mut = 0;
+
+fn mouse(x as i64, y as i64, flags as i64) as void {
+    let is t.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(t.INPUT));
+    in.c_type = cast(u32, t.INPUT_MOUSE);
+    let is *t.MOUSEINPUT as m = cast(*t.MOUSEINPUT, &in._anon1);
+    let is i64 as sw = cast(i64, u.GetSystemMetrics(cast(i32, t.SM_CXSCREEN)));
+    let is i64 as sh = cast(i64, u.GetSystemMetrics(cast(i32, t.SM_CYSCREEN)));
+    m.dx = cast(i32, (x * 65536 + sw / 2) / sw);
+    m.dy = cast(i32, (y * 65536 + sh / 2) / sh);
+    m.dwFlags = cast(u32, flags | t.MOUSEEVENTF_ABSOLUTE | t.MOUSEEVENTF_MOVE);
+    u.SendInput(1, &in, cast(i32, sizeof(t.INPUT)));
+}
+
+// While the system's move loop runs: the pointer moved, then released.
+fn drag_step(ctx as *u8, args as *u64) as i64 {
+    timer_step = timer_step + 1;
+    if (timer_step == 1) { mouse(drag_x + 50, drag_y + 40, 0); }
+    if (timer_step == 3) {
+        mouse(drag_x + 50, drag_y + 40, t.MOUSEEVENTF_LEFTUP);
+        u.KillTimer(0, args[2]);
+    }
+    return 0;
+}
+
+// While the system menu's loop runs: Escape, as the user would press it.
+fn menu_escape(ctx as *u8, args as *u64) as i64 {
+    u.PostMessageW(hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, t.VK_ESCAPE), 1);
+    u.KillTimer(0, args[2]);
+    return 0;
+}
+
+// While the system menu's loop runs: down to Close — found by its command,
+// since its text is the prefix's language and Wine adds About Wine after it —
+// chosen with Enter's character (a menu acts on the character), then Escape,
+// which ends the menu if nothing was chosen so the check fails, not waits.
+fn menu_close(ctx as *u8, args as *u64) as i64 {
+    let is i64 as menu = u.GetSystemMenu(hwnd, 0);
+    let is i32 as n = u.GetMenuItemCount(menu);
+    let is i32 as i with mut = 0;
+    let is i32 as found with mut = 0;
+    while (i < n && found == 0) {
+        let is i64 as id = cast(i64, u.GetMenuItemID(menu, i));
+        // A separator has no command and is passed over by the arrows.
+        if (id != 0) { u.PostMessageW(hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, t.VK_DOWN), 1); }
+        if (id == t.SC_CLOSE) { found = 1; }
+        i = i + 1;
+    }
+    if (found == 1) { u.PostMessageW(hwnd, cast(u32, t.WM_CHAR), 13, 1); }
+    u.PostMessageW(hwnd, cast(u32, t.WM_KEYDOWN), cast(u64, t.VK_ESCAPE), 1);
+    u.KillTimer(0, args[2]);
+    return 0;
+}
+
+fn main() as i32 {
+    // --- The backend, chosen by itself ---
+    check("Win32 is available on Windows", device.available(device.WIN32) == 1);
+    check("X11 and Wayland are not", device.available(device.X11) == 0 && device.available(device.WAYLAND) == 0);
+    let is device.Config as c = device.config("devices", 200, 100);
+    c.class_name = "Caustic.Media.DeviceTest";
+    win = device.open_config(&c);
+    if (device.is_open(&win) == 0) {
+        io.printf("FAIL: no window (%s)\n", device.error_name(device.last_error(&win)));
+        return 1;
+    }
+    hwnd = win.win32_win.hwnd;
+    check("opened: no error", device.last_error(&win) == device.OK);
+    let is device.Config as none = device.config("none", 0, 100);
+    let is device.Window as refused = device.open_config(&none);
+    check("no width: refused, and said why", device.is_open(&refused) == 0 && device.last_error(&refused) == device.BAD_ARGUMENT);
+    check("AUTO chooses Win32", win.backend == device.WIN32 && same(device.transport_name(&win), 5, "win32") == 1);
+    check("named win32", same(device.backend_name(device.WIN32), 5, "win32") == 1);
+    check("no descriptor to poll", device.connection_fd(&win) == 0 - 1);
+    let is *u16 as app with mut = cast(*u16, 0);
+    let is i32 as app_ok = cast(i32, shell.GetCurrentProcessExplicitAppUserModelID(&app) == 0 && cast(i64, app) != 0);
+    check("its class name is the process's AppUserModelID", app_ok == 1 && app[0] == cast(u16, 67) && app[7] == cast(u16, 46));
+    if (cast(i64, app) != 0) { ole.CoTaskMemFree(cast(*u8, app)); }
+    check("the client is the size asked", device.width(&win) == 200 && device.height(&win) == 100);
+    check("aware of each monitor's DPI", u.AreDpiAwarenessContextsEqual(u.GetThreadDpiAwarenessContext(),
+          t.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 1);
+    check("its scale is its DPI's", device.scale_120(&win) == cast(i64, u.GetDpiForWindow(hwnd)) * 120 / 96);
+    // A session at another DPI (tools/wine_session.sh) says which: the window
+    // is there, at that scale.
+    let is *u8 as asked = env.getenv("CAUSTIC_WINE_DPI");
+    if (cast(i64, asked) != 0) {
+        let is i64 as dpi with mut = 0;
+        let is i64 as k with mut = 0;
+        while (asked[k] >= 48 && asked[k] <= 57) { dpi = dpi * 10 + cast(i64, asked[k]) - 48; k = k + 1; }
+        check("at the session's DPI", cast(i64, u.GetDpiForWindow(hwnd)) == dpi && device.scale_120(&win) == dpi * 120 / 96);
+    }
+    let is i32 as dwm_on with mut = 0;
+    check("composited as DWM says", dwm.DwmIsCompositionEnabled(&dwm_on) == 0 && device.composited(&win) == cast(i32, dwm_on != 0));
+    check("decorated at first", device.decorated(&win) == 1);
+    let is i64 as rx with mut = 0; let is i64 as ry with mut = 0;
+    let is i64 as rw with mut = 0; let is i64 as rh with mut = 0;
+    check("no input region at first", device.input_region(&win, &rx, &ry, &rw, &rh) == 0);
+    drain();
+
+    // --- Its pixels ---
+    check("a frame", device.next_frame(&win) == 1);
+    let is tgt.Target as frame = device.acquire(&win);
+    check("the frame covers the client", frame.width == 200 && frame.height == 100 && cast(i64, frame.color) != 0);
+    if (cast(i64, frame.color) != 0) {
+        tgt.put(&frame, 3, 4, 4278190335);
+        device.submit(&win);
+        let is i64 as dc = u.GetDC(hwnd);
+        check("presented: red where it was drawn", g.GetPixel(dc, 3, 4) == cast(u32, 255));
+        u.ReleaseDC(hwnd, dc);
+    }
+
+    // --- Its title, UTF-8 to the system's UTF-16 ---
+    check("titled as opened", title_is("devices") == 1);
+    device.set_title(&win, "Área de trabalho", 17);
+    check("a UTF-8 title", title_is("Área de trabalho") == 1);
+    device.set_title(&win, "", 0);
+    check("an empty title", title_is("") == 1);
+    device.set_title(&win, "日本 😀", 11);
+    check("past the BMP", title_is("日本 😀") == 1);
+
+    // --- Shown, hidden ---
+    check("shown at first", u.IsWindowVisible(hwnd) == 1);
+    device.hide(&win);
+    check("hidden", u.IsWindowVisible(hwnd) == 0);
+    device.show(&win);
+    check("shown again", u.IsWindowVisible(hwnd) == 1);
+
+    // --- Where it is ---
+    u.SetWindowPos(hwnd, 0, 40, 30, 0, 0, cast(u32, t.SWP_NOSIZE | t.SWP_NOZORDER));
+    let is t.RECT as border; border.left = 0; border.top = 0; border.right = 0; border.bottom = 0;
+    u.AdjustWindowRectEx(&border, cast(u32, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWL_STYLE))), 0, 0);
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    check("its client's place on the screen", device.position(&win, &px, &py) == 1 &&
+          px == 40 - cast(i64, border.left) && py == 30 - cast(i64, border.top));
+
+    // --- Keys, text and the pointer ---
+    let is event.Event as e;
+    drain();
+    u.SendMessageW(hwnd, cast(u32, t.WM_KEYDOWN), 65, 1966081);
+    check("a key: its portable name", next(event.KEY_DOWN, &e) == 1 && e.key == keys.A && e.keycode == 30);
+    check("held", device.key_down(&win, keys.A) == 1);
+    u.SendMessageW(hwnd, cast(u32, t.WM_KEYUP), 65, 3221225473 + 1966080);
+    check("released", next(event.KEY_UP, &e) == 1 && device.key_down(&win, keys.A) == 0);
+    u.SendMessageW(hwnd, cast(u32, t.WM_CHAR), 233, 0);
+    check("the text it types, UTF-8", next(event.TEXT, &e) == 1 && same(e.text, e.text_len, "é") == 1);
+    u.SendMessageW(hwnd, cast(u32, t.WM_LBUTTONDOWN), 1, 1376270);
+    check("a press where it was", next(event.MOUSE_DOWN, &e) == 1 && e.button == 1 && e.x == 14 && e.y == 21);
+    check("the button held, the pointer there", device.button_down(&win, 1) == 1 &&
+          device.mouse_x(&win) == 14 && device.mouse_y(&win) == 21);
+    u.SendMessageW(hwnd, cast(u32, t.WM_LBUTTONUP), 0, 1376270);
+    check("released", next(event.MOUSE_UP, &e) == 1 && device.button_down(&win, 1) == 0);
+    u.SendMessageW(hwnd, cast(u32, t.WM_MOUSEWHEEL), cast(u64, 120 << 16), screen_point(5, 5));
+    check("a wheel notch", next(event.WHEEL, &e) == 1 && e.wheel == 1 && device.wheel(&win) == 1);
+    check("read twice, the same", device.wheel(&win) == 1);
+
+    // --- Per frame: the wheel, the pointer's motion and a resize are edges ---
+    check("the next frame: no wheel", device.next_frame(&win) == 1 && device.wheel(&win) == 0);
+    u.SendMessageW(hwnd, cast(u32, t.WM_MOUSEMOVE), 0, 10 | (10 << 16));
+    device.next_frame(&win);
+    u.SendMessageW(hwnd, cast(u32, t.WM_MOUSEMOVE), 0, 13 | (17 << 16));
+    check("the pointer's motion this frame", device.mouse_dx(&win) == 3 && device.mouse_dy(&win) == 7);
+    check("read twice, the same motion", device.mouse_dx(&win) == 3 && device.mouse_dy(&win) == 7);
+    check("the next frame: no motion", device.next_frame(&win) == 1 && device.mouse_dx(&win) == 0 && device.mouse_dy(&win) == 0);
+    check("not resized", device.resized(&win) == 0);
+
+    // --- The clipboard: answered at once ---
+    check("copied", device.clipboard_set(&win, device.CLIPBOARD, "olá", 4) == 1);
+    check("asked for, nothing awaited", device.clipboard_request(&win, device.CLIPBOARD) == 1 &&
+          device.clipboard_pending(&win) == 0 && device.clipboard_ready(&win) == 1);
+    let is [16]u8 as got;
+    let is i64 as gn = device.clipboard_text(&win, cast(*u8, &got), 16);
+    check("and there", same(cast(*u8, &got), gn, "olá") == 1);
+    check("no primary selection on Windows", device.clipboard_set(&win, device.PRIMARY, "sel", 3) == 0 &&
+          device.clipboard_request(&win, device.PRIMARY) == 0);
+
+    // --- Sizes it may take ---
+    check("a floor", device.set_min_size(&win, 120, 90) == 1);
+    check("a ceiling", device.set_max_size(&win, 300, 200) == 1);
+    u.SetWindowPos(hwnd, 0, 0, 0, 10, 10, cast(u32, t.SWP_NOMOVE | t.SWP_NOZORDER));
+    drain();
+    check("not smaller than its floor", device.width(&win) >= 120 && device.height(&win) >= 90);
+    u.SetWindowPos(hwnd, 0, 0, 0, 2000, 2000, cast(u32, t.SWP_NOMOVE | t.SWP_NOZORDER));
+    drain();
+    check("not larger than its ceiling", device.width(&win) <= 300 && device.height(&win) <= 200);
+    check("resized this frame", device.resized(&win) == 1);
+    check("the next frame: not resized", device.next_frame(&win) == 1 && device.resized(&win) == 0);
+    let is i64 as mw with mut = 0;
+    let is i64 as mh with mut = 0;
+    check("the floor read back", device.min_size(&win, &mw, &mh) == 1 && mw == 120 && mh == 90);
+    device.set_max_size(&win, 0, 0);
+    check("a size asked", device.set_size(&win, 260, 150) == 1 && next(event.RESIZE, &e) == 1 &&
+          device.width(&win) == 260 && device.height(&win) == 150);
+    check("no size: refused", device.set_size(&win, 0, 150) == 0 && device.set_size(&win, 260, 0) == 0 &&
+          device.set_size(&win, 0 - 5, 150) == 0 && device.width(&win) == 260);
+    check("larger than a window may be: refused", device.set_size(&win, 16385, 150) == 0 && device.set_size(&win, 260, 16385) == 0);
+    drain();
+
+    // --- Its state ---
+    check("maximized", device.set_maximized(&win, 1) == 1 && next(event.STATE, &e) == 1 &&
+          (e.state & event.STATE_MAXIMIZED) != 0 && (device.state(&win) & event.STATE_MAXIMIZED) != 0);
+    check("restored", device.set_maximized(&win, 0) == 1 && next(event.STATE, &e) == 1 &&
+          (device.state(&win) & event.STATE_MAXIMIZED) == 0);
+    check("fullscreen", device.set_fullscreen(&win, 1) == 1 && next(event.STATE, &e) == 1 &&
+          (device.state(&win) & event.STATE_FULLSCREEN) != 0);
+    check("and back", device.set_fullscreen(&win, 0) == 1 && (device.state(&win) & event.STATE_FULLSCREEN) == 0);
+    check("minimized", device.minimize(&win) == 1 && u.IsIconic(hwnd) == 1);
+    u.ShowWindow(hwnd, cast(i32, t.SW_RESTORE));
+    drain();
+    let is device.Window as other = device.open("other", 120, 60);
+    check("another window in front", device.is_open(&other) == 1 && u.GetForegroundWindow() == other.win32_win.hwnd);
+    device.activate(&win);
+    check("activated", u.GetForegroundWindow() == hwnd);
+    device.close(&other);
+
+    // --- Text input: on, where its caret is, off ---
+    check("text input on", device.text_input_enable(&win, 1) == 1 && device.text_input_active(&win) == 1);
+    check("its caret told", device.text_input_rect(&win, 10, 20, 2, 16) == 1);
+    let is i64 as himc = ime.ImmGetContext(hwnd);
+    let is t.CANDIDATEFORM as cand;
+    mem.memzero(cast(*u8, &cand), sizeof(t.CANDIDATEFORM));
+    check("the candidates below the caret", himc != 0 && ime.ImmGetCandidateWindow(himc, 0, &cand) != 0 &&
+          cand.ptCurrentPos.x == 10 && cand.ptCurrentPos.y == 36);
+    if (himc != 0) { ime.ImmReleaseContext(hwnd, himc); }
+    check("text input off", device.text_input_enable(&win, 0) == 1 && device.text_input_active(&win) == 0);
+
+    // --- The desktop's settings, the system's own ---
+    let is wsettings.Settings as ds = wsettings.defaults();
+    check("the desktop's settings read", device.read_settings(&win, &ds) == 1 &&
+          ds.double_click_ms == cast(i64, u.GetDoubleClickTime()));
+
+    // --- What it looks like ---
+    let is [256]u32 as icon;
+    let is i64 as ip with mut = 0;
+    while (ip < 256) { icon[ip] = cast(u32, 4278255360); ip = ip + 1; }
+    ip = 0;
+    while (ip < 16) { icon[ip] = cast(u32, 4294901760); ip = ip + 1; }
+    check("an icon", device.set_icon(&win, cast(*u8, &icon), 16, 16) == 1 &&
+          u.SendMessageW(hwnd, cast(u32, t.WM_GETICON), cast(u64, t.ICON_BIG), 0) != 0 &&
+          u.SendMessageW(hwnd, cast(u32, t.WM_GETICON), cast(u64, t.ICON_SMALL), 0) != 0);
+    check("its first row at the top", icon_pixel(3, 0) == 16711680 && icon_pixel(3, 15) == 65280);
+    check("as large as an icon is", device.set_icon(&win, cast(*u8, &big_icon), 256, 256) == 1);
+    check("no larger", device.set_icon(&win, cast(*u8, &big_icon), 257, 16) == 0 &&
+          device.set_icon(&win, cast(*u8, &big_icon), 16, 257) == 0);
+    check("not empty", device.set_icon(&win, cast(*u8, &icon), 0, 16) == 0 &&
+          device.set_icon(&win, cast(*u8, &icon), 16, 0) == 0 &&
+          device.set_icon(&win, cast(*u8, 0), 16, 16) == 0);
+
+    // Each portable pointer shape, the system cursor it shows.
+    check("arrow", shows(cursor.DEFAULT, t.IDC_ARROW) == 1 && shows(cursor.CONTEXT_MENU, t.IDC_ARROW) == 1 &&
+          shows(cursor.ALIAS, t.IDC_ARROW) == 1 && shows(cursor.COPY, t.IDC_ARROW) == 1 &&
+          shows(cursor.ZOOM_IN, t.IDC_ARROW) == 1 && shows(cursor.ZOOM_OUT, t.IDC_ARROW) == 1);
+    check("help", shows(cursor.HELP, t.IDC_HELP) == 1);
+    check("hand", shows(cursor.POINTER, t.IDC_HAND) == 1 && shows(cursor.GRAB, t.IDC_HAND) == 1 &&
+          shows(cursor.GRABBING, t.IDC_HAND) == 1);
+    check("busy", shows(cursor.PROGRESS, t.IDC_APPSTARTING) == 1 && shows(cursor.WAIT, t.IDC_WAIT) == 1);
+    check("cross", shows(cursor.CELL, t.IDC_CROSS) == 1 && shows(cursor.CROSSHAIR, t.IDC_CROSS) == 1);
+    check("text", shows(cursor.TEXT, t.IDC_IBEAM) == 1 && shows(cursor.VERTICAL_TEXT, t.IDC_IBEAM) == 1);
+    check("move", shows(cursor.MOVE, t.IDC_SIZEALL) == 1 && shows(cursor.ALL_SCROLL, t.IDC_SIZEALL) == 1);
+    check("no", shows(cursor.NO_DROP, t.IDC_NO) == 1 && shows(cursor.NOT_ALLOWED, t.IDC_NO) == 1);
+    check("west-east", shows(cursor.E_RESIZE, t.IDC_SIZEWE) == 1 && shows(cursor.W_RESIZE, t.IDC_SIZEWE) == 1 &&
+          shows(cursor.EW_RESIZE, t.IDC_SIZEWE) == 1 && shows(cursor.COL_RESIZE, t.IDC_SIZEWE) == 1);
+    check("north-south", shows(cursor.N_RESIZE, t.IDC_SIZENS) == 1 && shows(cursor.S_RESIZE, t.IDC_SIZENS) == 1 &&
+          shows(cursor.NS_RESIZE, t.IDC_SIZENS) == 1 && shows(cursor.ROW_RESIZE, t.IDC_SIZENS) == 1);
+    check("north-east to south-west", shows(cursor.NE_RESIZE, t.IDC_SIZENESW) == 1 &&
+          shows(cursor.SW_RESIZE, t.IDC_SIZENESW) == 1 && shows(cursor.NESW_RESIZE, t.IDC_SIZENESW) == 1);
+    check("north-west to south-east", shows(cursor.NW_RESIZE, t.IDC_SIZENWSE) == 1 &&
+          shows(cursor.SE_RESIZE, t.IDC_SIZENWSE) == 1 && shows(cursor.NWSE_RESIZE, t.IDC_SIZENWSE) == 1);
+    check("none: hidden", shows(cursor.NONE, 0) == 1);
+    check("no shape outside them", device.cursor_set(&win, 0) == 0 && device.cursor_set(&win, 36) == 0);
+    shows(cursor.DEFAULT, t.IDC_ARROW);
+    check("undecorated", device.set_decorated(&win, 0) == 1 && device.decorated(&win) == 0 &&
+          (u.GetWindowLongPtrW(hwnd, cast(i32, t.GWL_STYLE)) & t.WS_CAPTION) == 0);
+    check("decorated again", device.set_decorated(&win, 1) == 1 &&
+          (u.GetWindowLongPtrW(hwnd, cast(i32, t.GWL_STYLE)) & t.WS_CAPTION) == t.WS_CAPTION);
+    check("frame extents", device.set_frame_extents(&win, 4, 4, 24, 4) == 1);
+    check("none at all", device.set_frame_extents(&win, 0, 0, 0, 0) == 1);
+    check("never negative", device.set_frame_extents(&win, 0 - 1, 0, 0, 0) == 0 && device.set_frame_extents(&win, 0, 0 - 1, 0, 0) == 0 &&
+          device.set_frame_extents(&win, 0, 0, 0 - 1, 0) == 0 && device.set_frame_extents(&win, 0, 0, 0, 0 - 1) == 0);
+    check("an input region", device.set_input_region(&win, 10, 24, 100, 50) == 1);
+    check("read back", device.input_region(&win, &rx, &ry, &rw, &rh) == 1 && rx == 10 && ry == 24 && rw == 100 && rh == 50);
+    check("its left edge takes presses", hit(10, 30) == t.HTCLIENT && hit(9, 30) == t.HTTRANSPARENT);
+    check("its right edge", hit(109, 30) == t.HTCLIENT && hit(110, 30) == t.HTTRANSPARENT);
+    check("its top edge", hit(20, 24) == t.HTCLIENT && hit(20, 23) == t.HTTRANSPARENT);
+    check("its bottom edge", hit(20, 73) == t.HTCLIENT && hit(20, 74) == t.HTTRANSPARENT);
+    check("an empty region takes nothing", device.set_input_region(&win, 0, 0, 0, 0) == 1 && hit(5, 5) == t.HTTRANSPARENT);
+    check("never a negative size", device.set_input_region(&win, 0, 0, 0 - 1, 10) == 0 &&
+          device.set_input_region(&win, 0, 0, 10, 0 - 1) == 0);
+    device.set_input_region(&win, 0, 0, 4096, 4096);
+
+    // --- Moved or resized from an edge: the command the system is given ---
+    check("from the north-west corner", posts(device.RESIZE_NW, t.SC_SIZE | t.WMSZ_TOPLEFT) == 1);
+    check("from the top", posts(device.RESIZE_N, t.SC_SIZE | t.WMSZ_TOP) == 1);
+    check("from the north-east", posts(device.RESIZE_NE, t.SC_SIZE | t.WMSZ_TOPRIGHT) == 1);
+    check("from the right", posts(device.RESIZE_E, t.SC_SIZE | t.WMSZ_RIGHT) == 1);
+    check("from the south-east", posts(device.RESIZE_SE, t.SC_SIZE | t.WMSZ_BOTTOMRIGHT) == 1);
+    check("from the bottom", posts(device.RESIZE_S, t.SC_SIZE | t.WMSZ_BOTTOM) == 1);
+    check("from the south-west", posts(device.RESIZE_SW, t.SC_SIZE | t.WMSZ_BOTTOMLEFT) == 1);
+    check("from the left", posts(device.RESIZE_W, t.SC_SIZE | t.WMSZ_LEFT) == 1);
+    check("moved", posts(device.MOVE, t.SC_MOVE | t.HTCAPTION) == 1);
+    check("nothing else", device.begin_move_resize(&win, 20, 40, 0 - 1, 1) == 0 &&
+          device.begin_move_resize(&win, 20, 40, 9, 1) == 0);
+    drain();
+    // The left button the system's from then; the others still held.
+    u.SendMessageW(hwnd, cast(u32, t.WM_LBUTTONDOWN), 1, 20 | (40 << 16));
+    u.SendMessageW(hwnd, cast(u32, t.WM_MBUTTONDOWN), cast(u64, 1 | t.MK_MBUTTON), 20 | (40 << 16));
+    u.SendMessageW(hwnd, cast(u32, t.WM_RBUTTONDOWN), cast(u64, 1 | t.MK_MBUTTON | t.MK_RBUTTON), 20 | (40 << 16));
+    device.pump(&win);
+    check("held before", device.button_down(&win, 1) == 1 && device.button_down(&win, 2) == 1 && device.button_down(&win, 3) == 1);
+    check("the system's from then", posts(device.MOVE, t.SC_MOVE | t.HTCAPTION) == 1 && device.button_down(&win, 1) == 0);
+    check("the others still held", device.button_down(&win, 2) == 1 && device.button_down(&win, 3) == 1);
+    u.SendMessageW(hwnd, cast(u32, t.WM_MBUTTONUP), cast(u64, t.MK_RBUTTON), 20 | (40 << 16));
+    u.SendMessageW(hwnd, cast(u32, t.WM_RBUTTONUP), 0, 20 | (40 << 16));
+    drain();
+
+    // --- Moved by the system, from a press ---
+    u.SetWindowPos(hwnd, 0, 100, 100, 0, 0, cast(u32, t.SWP_NOSIZE | t.SWP_NOZORDER));
+    drain();
+    let is t.RECT as before;
+    u.GetWindowRect(hwnd, &before);
+    let is i64 as at = screen_point(20, 40);
+    drag_x = at & 65535; drag_y = (at >> 16) & 65535;
+    mouse(drag_x, drag_y, t.MOUSEEVENTF_LEFTDOWN);
+    check("pressed", next(event.MOUSE_DOWN, &e) == 1 && e.x == 20 && e.y == 40);
+    timers = abi.open(3);
+    abi.put(&timers, 0, fn_ptr(drag_step), cast(*u8, 0), 4, 0);
+    abi.put(&timers, 1, fn_ptr(menu_escape), cast(*u8, 0), 4, 0);
+    abi.put(&timers, 2, fn_ptr(menu_close), cast(*u8, 0), 4, 0);
+    abi.seal(&timers);
+    u.SetTimer(0, 0, 60, abi.address(&timers, 0));
+    check("a move asked of the system", device.begin_move_resize(&win, 20, 40, device.MOVE, 1) == 1);
+    let is i64 as until = time.now_ms() + 3000;
+    while (timer_step < 3 && time.now_ms() < until) { device.pump(&win); time.sleep_ms(5); }
+    drain();
+    let is t.RECT as after;
+    u.GetWindowRect(hwnd, &after);
+    check("moved as the pointer was", after.left - before.left == 50 && after.top - before.top == 40);
+    check("the press is not left held", device.button_down(&win, 1) == 0);
+    check("only the left button moves it", device.begin_move_resize(&win, 20, 40, device.MOVE, 3) == 0);
+
+    // --- Its menu, the system's own, until dismissed ---
+    u.SetTimer(0, 0, 250, abi.address(&timers, 1));
+    let is i64 as menu_start = time.now_ms();
+    check("its menu asked for", device.show_window_menu(&win, 10, 10) == 1);
+    device.pump(&win);
+    let is i64 as shown_for = time.now_ms() - menu_start;
+    check("the menu held the loop until Escape", shown_for >= 200 && shown_for < 3000);
+    check("and the window is still there", device.is_open(&win) == 1 && device.should_close(&win) == 0);
+    drain();
+    u.SetTimer(0, 0, 250, abi.address(&timers, 2));
+    check("its menu again", device.show_window_menu(&win, 10, 10) == 1);
+    device.pump(&win);
+    check("Close chosen: asked to close", next(event.CLOSE, &e) == 1 && device.should_close(&win) == 1);
+    device.keep_open(&win);
+
+    // --- An owned, modal dialog ---
+    let is device.Config as dc = device.config("dialog", 160, 80);
+    dc.owner = &win;
+    dc.dialog = 1;
+    dc.modal = 1;
+    dc.resizable = 0;
+    let is device.Window as dialog = device.open_config(&dc);
+    check("a dialog opens", device.is_open(&dialog) == 1);
+    check("not resizable, yet sized as asked", device.set_size(&dialog, 190, 90) == 1 &&
+          device.width(&dialog) == 190 && device.height(&dialog) == 90);
+    let is i64 as fw with mut = 0; let is i64 as fh with mut = 0;
+    check("and fixed there", device.min_size(&dialog, &fw, &fh) == 1 && fw == 190 && fh == 90);
+    check("owned by its window", u.GetWindow(dialog.win32_win.hwnd, cast(u32, t.GW_OWNER)) == hwnd);
+    check("which takes no input meanwhile", u.IsWindowEnabled(hwnd) == 0);
+    device.set_modal(&dialog, 0);
+    check("not modal any more", u.IsWindowEnabled(hwnd) == 1);
+    device.set_modal(&dialog, 1);
+    device.close(&dialog);
+    check("closed: its owner takes input again", device.is_open(&dialog) == 0 && u.IsWindowEnabled(hwnd) == 1);
+    check("no menu for a closed window", device.show_window_menu(&dialog, 10, 10) == 0);
+
+    // --- Asked to close ---
+    drain();
+    u.SendMessageW(hwnd, cast(u32, t.WM_CLOSE), 0, 0);
+    check("asked to close", device.should_close(&win) == 1 && next(event.CLOSE, &e) == 1);
+    device.keep_open(&win);
+    check("and kept open", device.should_close(&win) == 0 && device.is_open(&win) == 1);
+    device.request_close(&win);
+    check("asked by the program", device.should_close(&win) == 1 && next(event.CLOSE, &e) == 1);
+    device.close(&win);
+    check("closed", device.is_open(&win) == 0 && u.IsWindow(hwnd) == 0);
+    check("closed: no motion, no wheel", device.mouse_dx(&win) == 0 && device.mouse_dy(&win) == 0 && device.wheel(&win) == 0);
+    check("closed: no frame, no menu", w32.next_frame(&win.win32_win) == 0 && w32.show_window_menu(&win.win32_win, 1, 1) == 0);
+    abi.close(&timers);
+
+    if (fails == 0) {
+        io.printf("device win32: all checks passed\n");
+        return 0;
+    }
+    io.printf("device win32: %d failures\n", fails);
+    return 1;
+}

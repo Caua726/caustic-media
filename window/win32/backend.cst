@@ -11,6 +11,7 @@ use "bind/imm32.cst" as ime;
 use "abi.cst" as abi;
 use "clipboard.cst" as clipboard;
 use "bind/dwmapi.cst" as dwm;
+use "bind/shell32.cst" as shell;
 use "settings.cst" as desktop_settings;
 
 let is i32 as OK with imut = 0;
@@ -20,6 +21,10 @@ let is i32 as NO_SURFACE with imut = 3;
 let is i32 as BAD_ARGUMENT with imut = 4;
 let is i64 as MAX_WINDOWS with imut = 32;
 let is i64 as MAX_EVENTS with imut = 128;
+
+// Asks the window's own thread to show the system menu: TrackPopupMenu runs
+// its modal loop from the window procedure, not from the caller.
+let is i64 as _WM_WINDOW_MENU with imut = t.WM_APP + 256;
 
 struct DIBInfo {
     header as t.BITMAPINFOHEADER;
@@ -71,6 +76,16 @@ struct Native {
     caret_h as i64;
     high_surrogate as u16;
     cursor as i64;
+    icon as i64;            // given to the window for both icon sizes
+    extent_left as i64;
+    extent_right as i64;
+    extent_top as i64;
+    extent_bottom as i64;
+    region_on as i32;
+    region_x as i64;
+    region_y as i64;
+    region_w as i64;
+    region_h as i64;
     hdc as i64;
     bitmap as i64;
     pixels as *u8;
@@ -92,6 +107,9 @@ struct Config {
     dialog as i32;
     modal as i32;
     decorated as i32;
+    // The application's identity for the taskbar (AppUserModelID), UTF-8;
+    // null for none. Windows keeps it per process.
+    app_id as *u8;
 }
 
 struct Window {
@@ -392,10 +410,21 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         let is *Native as n = cast(*Native, cs.lpCreateParams);
         n.hwnd = hwnd; n.alive = 1;
         u.SetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA), cast(i64, n));
-        return 1;
+        // The default procedure is what stores the creation title.
+        return u.DefWindowProcW(hwnd, msg, wp, lp);
     }
     let is *Native as n = cast(*Native, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA)));
     if (cast(i64, n) == 0) { return u.DefWindowProcW(hwnd, msg, wp, lp); }
+    if (cast(i64, msg) == t.WM_NCHITTEST && n.region_on == 1) {
+        let is t.POINT as hit;
+        hit.x = cast(i32, _signed16(cast(u64, lp))); hit.y = cast(i32, _signed16(cast(u64, lp) >> 16));
+        u.ScreenToClient(hwnd, &hit);
+        let is i64 as hx = cast(i64, hit.x); let is i64 as hy = cast(i64, hit.y);
+        if (hx < n.region_x || hy < n.region_y || hx >= n.region_x + n.region_w || hy >= n.region_y + n.region_h) {
+            return t.HTTRANSPARENT;
+        }
+    }
+    if (cast(i64, msg) == _WM_WINDOW_MENU) { _window_menu(n, lp); return 0; }
     if (cast(i64, msg) == t.WM_SETCURSOR && (lp & 65535) == t.HTCLIENT) {
         u.SetCursor(n.cursor); return 1;
     }
@@ -544,7 +573,7 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
 
 fn _ensure_class() as i32 {
     if (_class_ready == 1) { return 1; }
-    if (_dpi_ready == 0) { u.SetProcessDpiAwarenessContext(0 - 4); _dpi_ready = 1; }
+    if (_dpi_ready == 0) { u.SetProcessDpiAwarenessContext(t.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); _dpi_ready = 1; }
     _instance = k.GetModuleHandleW(cast(*u16, 0));
     k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, "CausticMediaWindow"), cast(i32, 0 - 1), &_class_name[0], 32);
     _callbacks = abi.open(1);
@@ -556,14 +585,14 @@ fn _ensure_class() as i32 {
     wc.cbSize = cast(u32, sizeof(t.WNDCLASSEXW));
     wc.style = cast(u32, t.CS_HREDRAW | t.CS_VREDRAW | t.CS_DBLCLKS);
     wc.lpfnWndProc = abi.address(&_callbacks, 0); wc.hInstance = _instance; wc.lpszClassName = &_class_name[0];
-    wc.hCursor = u.LoadCursorW(0, cast(*u16, 32512));
+    wc.hCursor = u.LoadCursorW(0, cast(*u16, t.IDC_ARROW));
     if (u.RegisterClassExW(&wc) == 0) { abi.close(&_callbacks); return 0; }
     _class_ready = 1; return 1;
 }
 
 fn config(title as *u8, width as i64, height as i64) as Config {
     let is Config as c; c.title = title; c.width = width; c.height = height;
-    c.resizable = 1; c.owner = 0; c.dialog = 0; c.modal = 0; c.decorated = 1; return c;
+    c.resizable = 1; c.owner = 0; c.dialog = 0; c.modal = 0; c.decorated = 1; c.app_id = cast(*u8, 0); return c;
 }
 
 fn open_config(c as *Config) as Window {
@@ -571,13 +600,19 @@ fn open_config(c as *Config) as Window {
     w.slot = 0 - 1; w.err = BAD_ARGUMENT;
     if (c.width <= 0 || c.height <= 0 || c.width > 16384 || c.height > 16384) { return w; }
     if (_ensure_class() == 0) { w.err = NO_WINDOW; return w; }
+    if (cast(i64, c.app_id) != 0 && c.app_id[0] != 0) {
+        let is [256]u16 as app;
+        if (k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, c.app_id), cast(i32, 0 - 1), &app[0], 256) > 0) {
+            shell.SetCurrentProcessExplicitAppUserModelID(&app[0]);
+        }
+    }
     let is i64 as slot with mut = 0 - 1; let is i64 as i with mut = 0;
     while (i < MAX_WINDOWS) { if (_windows[i].used == 0) { slot = i; break; } i = i + 1; }
     if (slot < 0) { w.err = NO_MEMORY; return w; }
     let is *Native as n = &_windows[slot]; mem.memset(cast(*u8, n), 0, sizeof(Native));
     n.used = 1; n.owner = c.owner; n.fixed = cast(i32, c.resizable == 0); n.modal = c.modal;
     n.decorated = c.decorated; n.dpi = cast(i32, u.GetDpiForSystem()); if (n.dpi < 96) { n.dpi = 96; }
-    n.cursor = u.LoadCursorW(0, cast(*u16, 32512));
+    n.cursor = u.LoadCursorW(0, cast(*u16, t.IDC_ARROW));
     if (n.fixed == 1) {
         n.min_width = c.width; n.max_width = c.width;
         n.min_height = c.height; n.max_height = c.height;
@@ -623,6 +658,7 @@ fn close(w as *Window) as void {
     if (n.hdc != 0) { g.DeleteDC(n.hdc); n.hdc = 0; }
     if (n.bitmap != 0) { g.DeleteObject(n.bitmap); n.bitmap = 0; }
     clipboard.clear(&n.clip);
+    if (n.icon != 0) { u.DestroyIcon(n.icon); n.icon = 0; }
     let is i64 as queued with mut = 0;
     while (queued < MAX_EVENTS) { _release_text(&n.events[queued]); queued = queued + 1; }
     if (cast(i64, n.last_text) != 0) { mem.core.munmap(n.last_text, n.last_bytes); n.last_text = cast(*u8, 0); }
@@ -648,7 +684,14 @@ fn pump(w as *Window) as void {
         u.TranslateMessage(&msg); u.DispatchMessageW(&msg);
     }
 }
-fn next_frame(w as *Window) as i32 { if (is_open(w) == 0) { return 0; } pump(w); return 1; }
+// A frame begins: what the last one was told — resized, the pointer's motion,
+// the wheel — is an edge, not a level, and starts again from nothing.
+fn next_frame(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || is_open(w) == 0) { return 0; }
+    n.resized = 0; n.mouse_dx = 0; n.mouse_dy = 0; n.wheel_y = 0;
+    pump(w);
+    return 1;
+}
 fn pending(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.event_len > 0); }
 fn connection_fd(w as *Window) as i64 { return 0 - 1; }
 fn poll_event(w as *Window, out as *event.Event) as i32 {
@@ -732,12 +775,9 @@ fn key_down(w as *Window, key as i32) as i32 {
 fn button_down(w as *Window, button as i32) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0 || button < 1 || button > 3) { return 0; } return (n.buttons >> (button - 1)) & 1; }
 fn mouse_x(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_x; }
 fn mouse_y(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_y; }
-fn mouse_dx(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } let is i64 as d = n.mouse_dx; n.mouse_dx = 0; return d; }
-fn mouse_dy(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } let is i64 as d = n.mouse_dy; n.mouse_dy = 0; return d; }
-fn wheel(w as *Window) as i64 {
-    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
-    let is i64 as value = n.wheel_y; n.wheel_y = 0; return value;
-}
+fn mouse_dx(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_dx; }
+fn mouse_dy(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.mouse_dy; }
+fn wheel(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.wheel_y; }
 
 fn text_input_enable(w as *Window, on as i32) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } n.text_enabled = cast(i32, on != 0); return 1; }
 fn text_input_active(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return cast(i32, n.text_enabled == 1 && n.focused == 1); }
@@ -773,7 +813,7 @@ fn set_fullscreen(w as *Window, on as i32) as i32 {
         let is t.MONITORINFO as monitor;
         mem.memzero(cast(*u8, &monitor), sizeof(t.MONITORINFO));
         monitor.cbSize = cast(u32, sizeof(t.MONITORINFO));
-        if (u.GetMonitorInfoW(u.MonitorFromWindow(w.hwnd, 2), &monitor) == 0 ||
+        if (u.GetMonitorInfoW(u.MonitorFromWindow(w.hwnd, cast(u32, t.MONITOR_DEFAULTTONEAREST)), &monitor) == 0 ||
             u.GetWindowRect(w.hwnd, &n.restore_rect) == 0) { return 0; }
         n.restore_style = u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE));
         u.SetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE), n.restore_style & (0 - 13565953));
@@ -802,19 +842,19 @@ fn transparent(w as *Window) as i32 { return 0; }
 
 fn set_cursor(w as *Window, shape as i32) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || shape < 1 || shape > 35) { return 0; }
-    let is i64 as id with mut = 32512;
-    if (shape == 3) { id = 32651; }
-    else if (shape == 4 || shape == 16 || shape == 17) { id = 32649; }
-    else if (shape == 5) { id = 32650; }
-    else if (shape == 6) { id = 32514; }
-    else if (shape == 7 || shape == 8) { id = 32515; }
-    else if (shape == 9 || shape == 10) { id = 32513; }
-    else if (shape == 13 || shape == 32) { id = 32646; }
-    else if (shape == 14 || shape == 15) { id = 32648; }
-    else if (shape == 18 || shape == 25 || shape == 26 || shape == 30) { id = 32644; }
-    else if (shape == 19 || shape == 22 || shape == 27 || shape == 31) { id = 32645; }
-    else if (shape == 20 || shape == 24 || shape == 28) { id = 32643; }
-    else if (shape == 21 || shape == 23 || shape == 29) { id = 32642; }
+    let is i64 as id with mut = t.IDC_ARROW;
+    if (shape == 3) { id = t.IDC_HELP; }
+    else if (shape == 4 || shape == 16 || shape == 17) { id = t.IDC_HAND; }
+    else if (shape == 5) { id = t.IDC_APPSTARTING; }
+    else if (shape == 6) { id = t.IDC_WAIT; }
+    else if (shape == 7 || shape == 8) { id = t.IDC_CROSS; }
+    else if (shape == 9 || shape == 10) { id = t.IDC_IBEAM; }
+    else if (shape == 13 || shape == 32) { id = t.IDC_SIZEALL; }
+    else if (shape == 14 || shape == 15) { id = t.IDC_NO; }
+    else if (shape == 18 || shape == 25 || shape == 26 || shape == 30) { id = t.IDC_SIZEWE; }
+    else if (shape == 19 || shape == 22 || shape == 27 || shape == 31) { id = t.IDC_SIZENS; }
+    else if (shape == 20 || shape == 24 || shape == 28) { id = t.IDC_SIZENESW; }
+    else if (shape == 21 || shape == 23 || shape == 29) { id = t.IDC_SIZENWSE; }
     let is i64 as cursor with mut = 0;
     if (shape != 35) { cursor = u.LoadCursorW(0, cast(*u16, id)); if (cursor == 0) { return 0; } }
     n.cursor = cursor;
@@ -837,6 +877,21 @@ fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
     n.max_width = width; n.max_height = height; return 1;
 }
 
+// The client asked to be cw by ch physical pixels, the frame round it as the
+// window's style and DPI make it; a window of fixed size is fixed at that
+// size from now. 1 when asked: the size arrives as a RESIZE.
+fn set_size(w as *Window, cw as i64, ch as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || cw <= 0 || ch <= 0 || cw > 16384 || ch > 16384) { return 0; }
+    if (n.fixed == 1) { n.min_width = cw; n.max_width = cw; n.min_height = ch; n.max_height = ch; }
+    let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, cw); r.bottom = cast(i32, ch);
+    let is u32 as style = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE)));
+    let is u32 as ex = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_EXSTYLE)));
+    if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { return 0; }
+    return cast(i32, u.SetWindowPos(w.hwnd, 0, 0, 0, r.right - r.left, r.bottom - r.top,
+                                    cast(u32, t.SWP_NOMOVE | t.SWP_NOZORDER | t.SWP_NOACTIVATE)) != 0);
+}
+
 fn position(w as *Window, x as *i64, y as *i64) as i32 {
     if (is_open(w) == 0) { return 0; }
     let is t.POINT as p; p.x = 0; p.y = 0;
@@ -857,6 +912,114 @@ fn clipboard_ready(w as *Window) as i32 {
 }
 fn clipboard_text(w as *Window, out as *u8, cap as i64) as i64 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return clipboard.read(&n.clip, out, cap);
+}
+// The Windows clipboard answers request() at once: nothing is ever awaited.
+fn clipboard_pending(w as *Window) as i32 { return 0; }
+
+fn transport_name(w as *Window) as *u8 { return "win32"; }
+
+// Its icon: argb, iw by ih, 0xAARRGGBB a pixel — the byte order a top-down
+// 32-bit DIB keeps in memory — given for both icon sizes. 1 when set.
+fn set_icon(w as *Window, argb as *u8, iw as i64, ih as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || cast(i64, argb) == 0 || iw <= 0 || ih <= 0 || iw > 256 || ih > 256) { return 0; }
+    let is t.BITMAPINFO as bmi;
+    mem.memzero(cast(*u8, &bmi), sizeof(t.BITMAPINFO));
+    bmi.bmiHeader.biSize = cast(u32, sizeof(t.BITMAPINFOHEADER));
+    bmi.bmiHeader.biWidth = cast(i32, iw);
+    bmi.bmiHeader.biHeight = cast(i32, 0 - ih);
+    bmi.bmiHeader.biPlanes = cast(u16, 1);
+    bmi.bmiHeader.biBitCount = cast(u16, 32);
+    bmi.bmiHeader.biCompression = cast(u32, t.BI_RGB);
+    let is *u8 as bits with mut = cast(*u8, 0);
+    let is i64 as color = g.CreateDIBSection(0, &bmi, cast(u32, t.DIB_RGB_COLORS), &bits, 0, 0);
+    if (color == 0 || cast(i64, bits) == 0) { if (color != 0) { g.DeleteObject(color); } return 0; }
+    mem.memcpy(bits, argb, iw * ih * 4);
+    // The mask is unused where the colour bitmap has alpha; it must exist.
+    let is i64 as mask = g.CreateBitmap(cast(i32, iw), cast(i32, ih), 1, 1, cast(*u8, 0));
+    let is t.ICONINFO as info;
+    mem.memzero(cast(*u8, &info), sizeof(t.ICONINFO));
+    info.fIcon = 1;
+    info.hbmMask = mask;
+    info.hbmColor = color;
+    let is i64 as icon = u.CreateIconIndirect(&info);
+    g.DeleteObject(color);
+    if (mask != 0) { g.DeleteObject(mask); }
+    if (icon == 0) { return 0; }
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_SETICON), cast(u64, t.ICON_BIG), icon);
+    u.SendMessageW(w.hwnd, cast(u32, t.WM_SETICON), cast(u64, t.ICON_SMALL), icon);
+    if (n.icon != 0) { u.DestroyIcon(n.icon); }
+    n.icon = icon;
+    return 1;
+}
+
+// The shadow round a frame of the program's own, physical pixels each side:
+// what the window really is lies inside it. 1 when told.
+fn set_frame_extents(w as *Window, left as i64, right as i64, top as i64, bottom as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || left < 0 || right < 0 || top < 0 || bottom < 0) { return 0; }
+    n.extent_left = left; n.extent_right = right; n.extent_top = top; n.extent_bottom = bottom;
+    return 1;
+}
+
+// Where it takes the pointer, client pixels: elsewhere hit-testing answers
+// HTTRANSPARENT and the press goes to what lies beneath. 1 when told.
+fn set_input_region(w as *Window, x as i64, y as i64, rw as i64, rh as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || rw < 0 || rh < 0) { return 0; }
+    n.region_on = 1; n.region_x = x; n.region_y = y; n.region_w = rw; n.region_h = rh;
+    return 1;
+}
+
+fn input_region(w as *Window, x as *i64, y as *i64, rw as *i64, rh as *i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || n.region_on == 0) { return 0; }
+    *x = n.region_x; *y = n.region_y; *rw = n.region_w; *rh = n.region_h;
+    return 1;
+}
+
+// Moved (8) or resized from an edge (0 NW … 7 W, numbered as EWMH numbers
+// them) by the system's own loop, from a left-button press at x, y in the
+// window. The press is the system's from here: the button is no longer held
+// for the program. 1 when asked.
+fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || button != 1 || how < 0 || how > 8) { return 0; }
+    let is i64 as command with mut = t.SC_MOVE | t.HTCAPTION;
+    if (how == 0) { command = t.SC_SIZE | t.WMSZ_TOPLEFT; }
+    else if (how == 1) { command = t.SC_SIZE | t.WMSZ_TOP; }
+    else if (how == 2) { command = t.SC_SIZE | t.WMSZ_TOPRIGHT; }
+    else if (how == 3) { command = t.SC_SIZE | t.WMSZ_RIGHT; }
+    else if (how == 4) { command = t.SC_SIZE | t.WMSZ_BOTTOMRIGHT; }
+    else if (how == 5) { command = t.SC_SIZE | t.WMSZ_BOTTOM; }
+    else if (how == 6) { command = t.SC_SIZE | t.WMSZ_BOTTOMLEFT; }
+    else if (how == 7) { command = t.SC_SIZE | t.WMSZ_LEFT; }
+    let is t.POINT as p; p.x = cast(i32, x); p.y = cast(i32, y);
+    u.ClientToScreen(w.hwnd, &p);
+    n.buttons = n.buttons & cast(i32, 0 - 2);
+    u.ReleaseCapture();
+    let is i64 as at = (cast(i64, p.x) & 65535) | ((cast(i64, p.y) & 65535) << 16);
+    return cast(i32, u.PostMessageW(w.hwnd, cast(u32, t.WM_SYSCOMMAND), cast(u64, command), at) != 0);
+}
+
+// The system menu — restore, move, size, minimize, maximize, close — at x, y
+// in the window, shown from its own thread's next dispatch. 1 when asked.
+fn show_window_menu(w as *Window, x as i64, y as i64) as i32 {
+    if (is_open(w) == 0) { return 0; }
+    let is t.POINT as p; p.x = cast(i32, x); p.y = cast(i32, y);
+    u.ClientToScreen(w.hwnd, &p);
+    let is i64 as at = (cast(i64, p.x) & 65535) | ((cast(i64, p.y) & 65535) << 16);
+    return cast(i32, u.PostMessageW(w.hwnd, cast(u32, _WM_WINDOW_MENU), 0, at) != 0);
+}
+
+fn _window_menu(n as *Native, at as i64) as void {
+    let is i64 as menu = u.GetSystemMenu(n.hwnd, 0);
+    if (menu == 0) { return; }
+    u.SetForegroundWindow(n.hwnd);
+    let is i32 as chosen = u.TrackPopupMenu(menu, cast(u32, t.TPM_RETURNCMD | t.TPM_RIGHTBUTTON),
+                                           cast(i32, _signed16(cast(u64, at))), cast(i32, _signed16(cast(u64, at) >> 16)),
+                                           0, n.hwnd, cast(*t.RECT, 0));
+    if (chosen != 0) { u.PostMessageW(n.hwnd, cast(u32, t.WM_SYSCOMMAND), cast(u64, chosen), 0); }
 }
 
 fn read_settings(w as *Window, out as *desktop_settings.settings.Settings) as i32 {
