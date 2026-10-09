@@ -193,6 +193,20 @@ the output, so the flipped and slid places are known), headless and seated —
 Weston nested in Xvfb, XTest pointer and keys: the grab granted, the keys and
 presses of a popup chain, a submenu under its menu's serial, a press outside.
 
+Subsurfaces (`wl_subcompositor`) are windows of the same connection with no
+shell role: `open_subsurface` makes one of a given logical size at a place in
+its parent, at the parent's scale and taking the parent's scale changes; it
+has no window geometry. Its place (`sub_set_position`) and order among
+siblings (`sub_place_above`, `sub_place_below`) take effect with the parent's
+next commit (`commit`), as do its own commits while it is synchronized
+(`sub_set_sync`, the default); desynchronized, a commit is shown at once. A
+closed child is gone, its role destroyed with it; a parent closed first
+leaves its child inert until it is closed. `subsurface_test` reads the screen
+back from the X server Weston is nested in, at scales 1 and 2, then on two
+outputs of scales 1 and 2 (`testdata/two-scales.ini`): the parent dragged by
+an XTest pointer from one to the other, parent and child both take the new
+scale and are shown at it.
+
 A separate Weston/X11 software-rendering smoke uses a real compositor seat,
 with XTest keyboard and pointer input. The editor accepts typing and Ctrl+A,
 opens Preferences with Ctrl+, and resumes input after its dialog is closed.

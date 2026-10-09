@@ -1,0 +1,347 @@
+// window/wayland/subsurface_test.cst — subsurfaces as the compositor shows
+// them: Weston nested in Xvfb, a kiosk shell filling the output with the
+// parent, the screen read back from the X server:
+//   sh window/x11/tools/run_headless.sh env WESTON_BACKEND=x11 WESTON_SHELL=kiosk \
+//       sh window/wayland/tools/run_wayland.sh ./build/wayland_subsurface_test
+// (and with WESTON_SCALE=2). Synchronized commits wait for the parent's, a
+// desynchronized one is shown at once; a place and the order among siblings
+// are taken with the parent's commit; a closed child is gone; a parent closed
+// first leaves its child inert, and the connection serves the next window.
+// With "scales", on two outputs at scales 1 and 2 (testdata/two-scales.ini,
+// WESTON_OUTPUTS=2, the desktop shell), the parent is dragged by the user's
+// pointer (XTest, xdg_toplevel.move) from the first to the second: it and its
+// subsurface each take the new scale, and are shown at it.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "backend.cst" as wayland;
+use "../../gpu/software/target.cst" as tgt;
+use "../x11/bind/xlib.cst" as xlib;
+
+extern "libXtst.so.6" fn XTestFakeButtonEvent(display as *u8, button as u32, is_press as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is wayland.Window as parent with mut;
+let is wayland.Window as a with mut;
+let is wayland.Window as b with mut;
+let is wayland.Window as later with mut;
+let is *u8 as xd with mut;
+
+// Colours as the software target packs them (RGBA bytes) and as the X
+// screen shows them (0xRRGGBB).
+let is u32 as BLUE   with imut = 4294901760;
+let is u32 as RED    with imut = 4278190335;
+let is u32 as GREEN  with imut = 4278255360;
+let is u32 as YELLOW with imut = 4278255615;
+let is i64 as X_BLUE   with imut = 255;
+let is i64 as X_RED    with imut = 16711680;
+let is i64 as X_GREEN  with imut = 65280;
+let is i64 as X_YELLOW with imut = 16776960;
+
+let is i64 as s with mut = 1;   // physical pixels per logical one
+
+fn fill(w as *wayland.Window, colour as u32) as i32 {
+    wayland.pump(w);
+    let is tgt.Target as t = wayland.acquire(w);
+    if (cast(i64, t.color) == 0) { return 0; }
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) { *cast(*u32, cast(i64, t.color) + i * 4) = colour; i = i + 1; }
+    wayland.submit(w);
+    return 1;
+}
+
+fn pixel(x as i64, y as i64) as i64 {
+    let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, x), cast(i32, y), cast(u32, 1), cast(u32, 1), 0 - 1, 2);
+    if (cast(i64, img) == 0) { return 0 - 1; }
+    let is i64 as v = xlib.XGetPixel(img, 0, 0) & 16777215;
+    xlib.XDestroyImage(img);
+    return v;
+}
+
+// Whether the screen shows colour at x, y (logical) within two seconds,
+// the connection pumped meanwhile.
+fn shows(x as i64, y as i64, colour as i64) as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        wayland.pump(&parent);
+        if (pixel(x * s, y * s) == colour) { return 1; }
+        time.sleep_ms(10);
+    }
+    io.printf("  at %d,%d: %x, want %x\n", x, y, pixel(x * s, y * s), colour);
+    return 0;
+}
+
+// Whether it still shows colour at x, y after a while: what must not change.
+fn stays(x as i64, y as i64, colour as i64) as i32 {
+    let is i64 as until = time.now_ms() + 300;
+    while (time.now_ms() < until) {
+        wayland.pump(&parent);
+        if (pixel(x * s, y * s) != colour) { return 0; }
+        time.sleep_ms(10);
+    }
+    return 1;
+}
+
+// The X window Weston shows the output named name in.
+fn output_window(name as *u8) as i64 {
+    let is i64 as root_ret with mut = 0;
+    let is i64 as parent_ret with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is i32 as n with mut = 0;
+    xlib.XQueryTree(xd, xlib.XDefaultRootWindow(xd), cast(*u8, &root_ret), cast(*u8, &parent_ret), cast(*u8, &kids), cast(*u8, &n));
+    let is i64 as found with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n && found == 0) {
+        // Weston names its output windows in _NET_WM_NAME only.
+        let is *u8 as title with mut = cast(*u8, 0);
+        let is i64 as ty with mut = 0;
+        let is i32 as fmt with mut = 0;
+        let is i64 as k with mut = 0;
+        let is i64 as after with mut = 0;
+        xlib.XGetWindowProperty(xd, kids[i], xlib.XInternAtom(xd, "_NET_WM_NAME", 0), 0, 64, 0, 0, cast(*u8, &ty),
+                                cast(*u8, &fmt), cast(*u8, &k), cast(*u8, &after), cast(*u8, &title));
+        if (cast(i64, title) != 0) {
+            let is i64 as m with mut = 0;
+            while (name[m] != 0) { m = m + 1; }
+            if (k >= m && title[k - m] == name[0] && title[k - 1] == name[m - 1]) { found = kids[i]; }
+            xlib.XFree(title);
+        }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+// Whether parent and child both reach scale120 within three seconds, the
+// child child_width physical pixels wide.
+fn pump_until(scale120 as i32, child_width as i64) as i32 {
+    let is i64 as until = time.now_ms() + 3000;
+    while (time.now_ms() < until) {
+        wayland.pump(&parent);
+        if (wayland.scale(&parent) == scale120 && wayland.scale(&a) == scale120 && wayland.width(&a) == child_width) { return 1; }
+        time.sleep_ms(10);
+    }
+    io.printf("  scales %d and %d, child %d wide\n", wayland.scale(&parent), wayland.scale(&a), wayland.width(&a));
+    return 0;
+}
+
+// Whether the X screen shows colour at x, y within two seconds.
+fn root_shows(x as i64, y as i64, colour as i64) as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        wayland.pump(&parent);
+        if (pixel(x, y) == colour) { return 1; }
+        time.sleep_ms(10);
+    }
+    io.printf("  root %d,%d: %x, want %x\n", x, y, pixel(x, y), colour);
+    return 0;
+}
+
+fn scales() as void {
+    // The second output's X window beside the first's, as an X server with a
+    // window manager would have put it.
+    let is i64 as x2 = output_window("X2");
+    check("the second output's window", x2 != 0 && output_window("X1") != 0);
+    xlib.XMoveWindow(xd, x2, 640, 0);
+    xlib.XSync(xd, 0);
+    // The shell opens a window on the output under the pointer: the pointer
+    // put on the first, and the window opened again if the nested server had
+    // not yet told the compositor where it is.
+    let is i32 as tries with mut = 0;
+    let is i32 as placed with mut = 0;
+    while (tries < 3 && placed == 0) {
+        XTestFakeMotionEvent(xd, 0 - 1, 320, 240, cast(u64, 0));
+        xlib.XFlush(xd);
+        time.sleep_ms(200);
+        if (wayland.open(&parent, "parent", 300, 200) == 0) { io.printf("FAIL: no parent\n"); fails = fails + 1; return; }
+        fill(&parent, BLUE);
+        let is i64 as t1 = time.now_ms();
+        while (time.now_ms() - t1 < 500) { wayland.pump(&parent); time.sleep_ms(10); }
+        if (wayland.scale(&parent) == 120) { placed = 1; } else { wayland.close(&parent); }
+        tries = tries + 1;
+    }
+    check("the parent on the first output", placed == 1);
+    if (placed == 0) { return; }
+    check("a subsurface", wayland.open_subsurface(&a, &parent, 50, 40, 100, 80) == 1);
+    fill(&a, RED);
+    wayland.commit(&parent);
+    check("both at the first output's scale", pump_until(120, 100) == 1);
+    // Where the shell put the parent: its top left, BLUE, on the first output.
+    let is i64 as px with mut = 0 - 1;
+    let is i64 as py with mut = 0 - 1;
+    let is i64 as until = time.now_ms() + 2000;
+    while (px < 0 && time.now_ms() < until) {
+        wayland.pump(&parent);
+        let is i64 as y with mut = 0;
+        while (y < 480 && px < 0) {
+            let is i64 as x with mut = 0;
+            while (x < 640 && px < 0) {
+                if (pixel(x, y) == X_BLUE) { px = x; py = y; }
+                x = x + 8;
+            }
+            y = y + 8;
+        }
+        time.sleep_ms(20);
+    }
+    while (px > 0 && pixel(px - 1, py) == X_BLUE) { px = px - 1; }
+    while (py > 0 && pixel(px, py - 1) == X_BLUE) { py = py - 1; }
+    check("the parent shown on the first output", px >= 0 && root_shows(px + 60, py + 50, X_RED) == 1);
+    // The user presses on it and the program asks the compositor to move it;
+    // the pointer goes to the second output, logical 700, 100.
+    XTestFakeMotionEvent(xd, 0 - 1, cast(i32, px + 10), cast(i32, py + 10), cast(u64, 0));
+    xlib.XFlush(xd);
+    let is i64 as t0 with mut = time.now_ms();
+    while (time.now_ms() - t0 < 200) { wayland.pump(&parent); time.sleep_ms(10); }
+    XTestFakeButtonEvent(xd, cast(u32, 1), 1, cast(u64, 0));
+    xlib.XFlush(xd);
+    t0 = time.now_ms();
+    while (wayland.button_down(&parent, 1) == 0 && time.now_ms() - t0 < 2000) { wayland.pump(&parent); time.sleep_ms(10); }
+    check("pressed", wayland.button_down(&parent, 1) == 1);
+    check("a move asked", wayland.begin_move_resize(&parent, 10, 10, 8, 1) == 1);
+    let is i64 as step with mut = 1;
+    while (step <= 10) {
+        // From where it was pressed to root 760, 200 — the second output's
+        // window pixel 120, 200: logical 700, 100.
+        let is i64 as tx = px + 10 + (760 - (px + 10)) * step / 10;
+        let is i64 as ty = py + 10 + (200 - (py + 10)) * step / 10;
+        XTestFakeMotionEvent(xd, 0 - 1, cast(i32, tx), cast(i32, ty), cast(u64, 0));
+        xlib.XFlush(xd);
+        t0 = time.now_ms();
+        while (time.now_ms() - t0 < 30) { wayland.pump(&parent); time.sleep_ms(5); }
+        step = step + 1;
+    }
+    XTestFakeButtonEvent(xd, cast(u32, 1), 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    check("moved to the second output: both at its scale", pump_until(240, 200) == 1);
+    check("the parent's buffer at it", wayland.width(&parent) == 600 && wayland.height(&parent) == 400);
+    fill(&parent, BLUE);
+    fill(&a, GREEN);
+    wayland.commit(&parent);
+    // Where the drop leaves the parent is the compositor's to say — a nested
+    // Weston's pointer stays with the output pressed on — so the subsurface
+    // is found on the second output's window, and measured: 100 by 80
+    // logical pixels are 200 by 160 of a scale-2 output, inside its parent.
+    let is i64 as gl with mut = 0 - 1;
+    let is i64 as gt with mut = 0 - 1;
+    let is i64 as wait_until = time.now_ms() + 2000;
+    while (gl < 0 && time.now_ms() < wait_until) {
+        wayland.pump(&parent);
+        let is i64 as y with mut = 0;
+        while (y < 960 && gl < 0) {
+            let is i64 as x with mut = 640;
+            while (x < 1280 && gl < 0) {
+                if (pixel(x, y) == X_GREEN) { gl = x; gt = y; }
+                x = x + 4;
+            }
+            y = y + 4;
+        }
+        time.sleep_ms(20);
+    }
+    while (gl > 640 && pixel(gl - 1, gt) == X_GREEN) { gl = gl - 1; }
+    while (gt > 0 && pixel(gl, gt - 1) == X_GREEN) { gt = gt - 1; }
+    let is i64 as gr with mut = gl;
+    while (gr < 1279 && pixel(gr + 1, gt) == X_GREEN) { gr = gr + 1; }
+    let is i64 as gb with mut = gt;
+    while (gb < 959 && pixel(gl, gb + 1) == X_GREEN) { gb = gb + 1; }
+    check("the subsurface shown on the second output", gl >= 640);
+    check("at its scale: 200 by 160 pixels", gr - gl + 1 == 200 && gb - gt + 1 == 160);
+    check("inside its parent, shown at the same scale", gl >= 640 && pixel(gl - 2, gt + 2) == X_BLUE &&
+          pixel(gl + 2, gt - 2) == X_BLUE && pixel(gr + 2, gt + 2) == X_BLUE && pixel(gl + 2, gb + 2) == X_BLUE);
+    wayland.close(&a);
+    wayland.close(&parent);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, xd) == 0) { io.printf("FAIL: no X screen to read back\n"); return 1; }
+    if (env.argc() > 1) {
+        scales();
+        xlib.XCloseDisplay(xd);
+        if (fails == 0) { io.printf("wayland subsurfaces across scales: all checks passed\n"); return 0; }
+        io.printf("wayland subsurfaces across scales: %d failures\n", fails);
+        return 1;
+    }
+    if (wayland.open(&parent, "parent", 400, 300) == 0) { io.printf("FAIL: no parent\n"); return 1; }
+    fill(&parent, BLUE);
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until && wayland.scale(&parent) == 120 && pixel(10, 10) != X_BLUE) { wayland.pump(&parent); time.sleep_ms(10); }
+    s = cast(i64, wayland.scale(&parent)) / 120;
+    if (s < 1) { s = 1; }
+    fill(&parent, BLUE);
+    check("the parent shown", shows(10, 10, X_BLUE) == 1);
+
+    // --- Synchronized: shown with the parent's commit ---
+    check("a subsurface opens", wayland.open_subsurface(&a, &parent, 50, 40, 100, 80) == 1 && wayland.is_subsurface(&a) == 1);
+    check("at the parent's scale", wayland.width(&a) == 100 * s && wayland.height(&a) == 80 * s);
+    check("synchronized at first", wayland.sub_sync(&a) == 1);
+    fill(&a, RED);
+    check("its commit waits for the parent's", stays(60, 50, X_BLUE) == 1);
+    wayland.commit(&parent);
+    check("the parent's commit shows it", shows(60, 50, X_RED) == 1);
+    check("from its place", shows(50, 40, X_RED) == 1 && shows(49, 50, X_BLUE) == 1 && shows(60, 39, X_BLUE) == 1);
+    check("to its size", shows(149, 119, X_RED) == 1 && shows(150, 100, X_BLUE) == 1 && shows(100, 120, X_BLUE) == 1);
+
+    // --- Desynchronized: shown as it comes ---
+    check("desynchronized", wayland.sub_set_sync(&a, 0) == 1 && wayland.sub_sync(&a) == 0);
+    fill(&a, GREEN);
+    check("its commit shown at once", shows(60, 50, X_GREEN) == 1);
+
+    // --- Its place, with the parent's commit ---
+    check("a new place asked", wayland.sub_set_position(&a, 300, 200) == 1);
+    check("not taken before the parent commits", stays(60, 50, X_GREEN) == 1 && stays(310, 210, X_BLUE) == 1);
+    wayland.commit(&parent);
+    check("taken with it", shows(310, 210, X_GREEN) == 1 && shows(60, 50, X_BLUE) == 1);
+
+    // --- Order among siblings ---
+    check("a sibling opens over part of it", wayland.open_subsurface(&b, &parent, 330, 220, 100, 80) == 1);
+    fill(&b, YELLOW);
+    wayland.commit(&parent);
+    check("the newer above", shows(350, 230, X_YELLOW) == 1 && shows(310, 210, X_GREEN) == 1);
+    check("put above its sibling", wayland.sub_place_above(&a, &b) == 1);
+    check("not before the parent commits", stays(350, 230, X_YELLOW) == 1);
+    wayland.commit(&parent);
+    check("then above it", shows(350, 230, X_GREEN) == 1 && shows(420, 290, X_YELLOW) == 1);
+    check("put below the parent", wayland.sub_place_below(&a, &parent) == 1);
+    wayland.commit(&parent);
+    check("then hidden by it", shows(310, 210, X_BLUE) == 1 && shows(350, 230, X_YELLOW) == 1);
+    wayland.sub_place_above(&a, &parent);
+    wayland.commit(&parent);
+    check("and above it again", shows(310, 210, X_GREEN) == 1);
+
+    // --- A child closed: gone ---
+    wayland.close(&b);
+    wayland.commit(&parent);
+    check("a closed child gone", shows(420, 290, X_BLUE) == 1 && shows(350, 230, X_GREEN) == 1);
+
+    // --- The parent closed first: the child inert, the connection whole ---
+    wayland.close(&parent);
+    check("the child still open, its role gone with the parent's surface", wayland.is_open(&a) == 1);
+    check("another window opens on the same connection", wayland.open(&later, "later", 300, 200) == 1);
+    fill(&later, BLUE);
+    check("and is shown", shows(310, 210, X_BLUE) == 1);
+    wayland.close(&a);
+    let is i64 as t0 = time.now_ms();
+    while (time.now_ms() - t0 < 300) { wayland.pump(&later); time.sleep_ms(10); }
+    check("the inert child closed: no protocol error", wayland.is_open(&later) == 1 && wayland.error(&later) == wayland.OK);
+    check("no subsurface on a closed parent", wayland.open_subsurface(&b, &parent, 0, 0, 10, 10) == 0);
+    wayland.close(&later);
+
+    xlib.XCloseDisplay(xd);
+    if (fails == 0) {
+        io.printf("wayland subsurfaces: all checks passed (scale %d)\n", s);
+        return 0;
+    }
+    io.printf("wayland subsurfaces: %d failures\n", fails);
+    return 1;
+}

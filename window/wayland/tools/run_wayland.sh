@@ -8,7 +8,9 @@
 # inside window/x11/tools/run_headless.sh — and its keyboard and pointer
 # become a real Wayland seat that XTest (xdotool) drives. WESTON_SCALE sets
 # the output scale; WESTON_SHELL=kiosk shows every toplevel fullscreen at the
-# output's origin, so where a popup has room is known.
+# output's origin, so where a popup has room is known. WESTON_CONFIG names a
+# weston.ini to read instead of none (outputs of their own scales, a shell's
+# options); WESTON_OUTPUTS asks the X11 backend for that many outputs.
 set -eu
 [ $# -gt 0 ] || { echo "usage: run_wayland.sh <program> [args...]" >&2; exit 2; }
 command -v weston >/dev/null 2>&1 || { echo "run_wayland: weston not found" >&2; exit 127; }
@@ -40,8 +42,21 @@ case "$shell" in
     desktop|kiosk) ;;
     *) echo "run_wayland: unknown WESTON_SHELL $shell" >&2; exit 2 ;;
 esac
+# A config file defines its outputs: no size or scale of ours over them.
+# Weston looks a relative name up in its config directories, so it is given
+# the file's absolute path.
+config="--no-config"
+size="--width=1280 --height=1024 --scale=${WESTON_SCALE:-1}"
+if [ -n "${WESTON_CONFIG:-}" ]; then
+    [ -f "$WESTON_CONFIG" ] || { echo "run_wayland: no config $WESTON_CONFIG" >&2; exit 2; }
+    config="--config=$(cd "$(dirname "$WESTON_CONFIG")" && pwd)/$(basename "$WESTON_CONFIG")"
+    size=""
+fi
+outputs=""
+if [ -n "${WESTON_OUTPUTS:-}" ]; then outputs="--output-count=$WESTON_OUTPUTS"; fi
+# shellcheck disable=SC2086
 weston --backend="$backend" --renderer=pixman --socket="$WAYLAND_DISPLAY" --idle-time=0 \
-    --width=1280 --height=1024 --scale="${WESTON_SCALE:-1}" --shell="$shell" --no-config \
+    $size --shell="$shell" "$config" $outputs \
     --log="$run/weston.log" >/dev/null 2>&1 &
 weston_pid=$!
 # Ready once a client's registry round trip is answered; the socket file alone
