@@ -1470,6 +1470,14 @@ int main(void) {
     if ((long long)(KF_REDIRECT_WITH_UI) != 32LL) { printf("FAIL constant KF_REDIRECT_WITH_UI\n"); failures++; }
     if ((long long)(KF_REPEAT) != 16384LL) { printf("FAIL constant KF_REPEAT\n"); failures++; }
     if ((long long)(KF_UP) != 32768LL) { printf("FAIL constant KF_UP\n"); failures++; }
+    if ((long long)(KLF_ACTIVATE) != 1LL) { printf("FAIL constant KLF_ACTIVATE\n"); failures++; }
+    if ((long long)(KLF_NOTELLSHELL) != 128LL) { printf("FAIL constant KLF_NOTELLSHELL\n"); failures++; }
+    if ((long long)(KLF_REORDER) != 8LL) { printf("FAIL constant KLF_REORDER\n"); failures++; }
+    if ((long long)(KLF_REPLACELANG) != 16LL) { printf("FAIL constant KLF_REPLACELANG\n"); failures++; }
+    if ((long long)(KLF_RESET) != 1073741824LL) { printf("FAIL constant KLF_RESET\n"); failures++; }
+    if ((long long)(KLF_SETFORPROCESS) != 256LL) { printf("FAIL constant KLF_SETFORPROCESS\n"); failures++; }
+    if ((long long)(KLF_SHIFTLOCK) != 65536LL) { printf("FAIL constant KLF_SHIFTLOCK\n"); failures++; }
+    if ((long long)(KLF_SUBSTITUTE_OK) != 2LL) { printf("FAIL constant KLF_SUBSTITUTE_OK\n"); failures++; }
     if ((long long)(LR_COLOR) != 2LL) { printf("FAIL constant LR_COLOR\n"); failures++; }
     if ((long long)(LR_COPYDELETEORG) != 8LL) { printf("FAIL constant LR_COPYDELETEORG\n"); failures++; }
     if ((long long)(LR_COPYFROMRESOURCE) != 16384LL) { printf("FAIL constant LR_COPYFROMRESOURCE\n"); failures++; }
@@ -3286,6 +3294,6 @@ int main(void) {
     if ((long long)(WVR_VALIDRECTS) != 1024LL) { printf("FAIL constant WVR_VALIDRECTS\n"); failures++; }
     if ((long long)(WVR_VREDRAW) != 512LL) { printf("FAIL constant WVR_VREDRAW\n"); failures++; }
     if (failures != 0) return 1;
-    printf("win32 constants: 2456 checked\n");
+    printf("win32 constants: 2464 checked\n");
     return 0;
 }

@@ -14,12 +14,16 @@
 //
 // --- What a key id is here ---
 //
-// The keysym at the unshifted level, unchanged. That means:
+// The keysym at the unshifted level of the group (layout) the event's state
+// says is in use, unchanged. That means:
 //
 //   letters and digits are their ASCII codes, lowercase — `a` is 97 whether or
 //   not shift was held, so a keybinding does not need to know about case
 //   special keys are the 0xff.. range keysymdef.h assigns them, exposed below
 //   as named constants
+//   in a Cyrillic group the key is the Cyrillic keysym — and the key a
+//   shortcut is matched against (shortcut_of) is the same key's Latin letter
+//   in another group, so Ctrl+C is Ctrl+C whatever layout is in use
 //
 // Two things it deliberately is NOT. It is not a physical position: a program
 // that wants WASD-as-position rather than WASD-as-letters wants scancodes, and
@@ -33,17 +37,22 @@
 // active". Nothing here knows what an action is.
 use "bind/x.cst" as x;
 use "bind/xlib.cst" as xlib;
+use "bind/xkblib.cst" as xkblib;
 use "../../input/keys.cst" as portable;
 
 // X keycodes are one byte, and the server reports a usable range inside it
-// (8..255 on every Linux server in practice). Caching the whole byte costs 2 KB
-// and removes the bounds question entirely.
+// (8..255 on every Linux server in practice). Caching the whole byte for each
+// group costs 8 KB and removes the bounds question entirely.
 let is i64 as KEYCODE_COUNT with imut = 256;
+// XKB's groups, each a layout: four at most.
+let is i64 as GROUPS with imut = 4;
 
 struct Map {
-    // keycode -> keysym at the unshifted level. 0 where the key produces
-    // nothing, which is most of the range on most keyboards.
-    sym   as [256]i64;
+    // keycode -> keysym at the unshifted level, in each group (group * 256 +
+    // keycode). 0 where the key produces nothing in that group, which is
+    // most of the range on most keyboards, and every key of a group the
+    // keymap does not have.
+    sym   as [1024]i64;
     min   as i32;
     max   as i32;
     ready as i32;
@@ -189,15 +198,18 @@ fn refresh(m as *Map, d as *u8) as i32 {
     m.max = hi;
 
     let is i64 as i with mut = 0;
-    while (i < KEYCODE_COUNT) { m.sym[i] = 0; i = i + 1; }
+    while (i < KEYCODE_COUNT * GROUPS) { m.sym[i] = 0; i = i + 1; }
 
-    // Index 0 is the unshifted level. XKeycodeToKeysym is deprecated in favour
-    // of XkbKeycodeToKeysym, which lives in XKBlib.h and arrives with
-    // bind/xkblib.cst; the two agree for level 0, which is all this wants.
-    let is i64 as kc with mut = cast(i64, lo);
-    while (kc <= cast(i64, hi)) {
-        m.sym[kc] = xlib.XKeycodeToKeysym(d, cast(u8, kc), 0);
-        kc = kc + 1;
+    // Each group's unshifted level, from the keymap Xlib keeps (XKB; no
+    // round trip per key).
+    let is i64 as g with mut = 0;
+    while (g < GROUPS) {
+        let is i64 as kc with mut = cast(i64, lo);
+        while (kc <= cast(i64, hi)) {
+            m.sym[g * KEYCODE_COUNT + kc] = xkblib.XkbKeycodeToKeysym(d, cast(u8, kc), cast(i32, g), 0);
+            kc = kc + 1;
+        }
+        g = g + 1;
     }
     m.ready = 1;
     return 1;
@@ -208,19 +220,45 @@ fn init(m as *Map, d as *u8) as i32 {
     return refresh(m, d);
 }
 
-// A keycode from an event to a key id. Out-of-range and unmapped keys are
-// UNKNOWN rather than an error: a keyboard with a key this server has no keysym
-// for is a real thing, and a program should be able to ignore it without
-// checking first.
-fn id_of(m as *Map, keycode as u32) as i32 {
-    let is i64 as kc = cast(i64, keycode);
-    if (kc < 0 || kc >= KEYCODE_COUNT) { return UNKNOWN; }
-    let is i64 as s = m.sym[kc];
-    if (s == 0) { return UNKNOWN; }
+// The group an event's state says is in use: XKB's bits 13 and 14.
+fn group_of(state as u32) as i64 { return (cast(i64, state) >> 13) & 3; }
+
+fn _id(s as i64) as i32 {
     // Keysyms above 32 bits do not exist; anything that would not fit is not
     // a key this layer can name.
-    if (s < 0 || s > 2147483647) { return UNKNOWN; }
+    if (s <= 0 || s > 2147483647) { return UNKNOWN; }
     return cast(i32, s);
+}
+
+// A keycode from an event, in the group its state says, to a key id. A key
+// the group does not define is the first group's, as XKB wraps it.
+// Out-of-range and unmapped keys are UNKNOWN rather than an error: a keyboard
+// with a key this server has no keysym for is a real thing, and a program
+// should be able to ignore it without checking first.
+fn id_of(m as *Map, keycode as u32, state as u32) as i32 {
+    let is i64 as kc = cast(i64, keycode);
+    if (kc < 0 || kc >= KEYCODE_COUNT) { return UNKNOWN; }
+    let is i64 as s with mut = m.sym[group_of(state) * KEYCODE_COUNT + kc];
+    if (s == 0) { s = m.sym[kc]; }
+    return _id(s);
+}
+
+// The key a shortcut is matched against: the key itself where it is Latin
+// (or a function key), else its Latin letter in the first group that has
+// one — read off the keymap, nothing guessed; a key no group gives a Latin
+// letter keeps its own.
+fn shortcut_of(m as *Map, keycode as u32, state as u32) as i32 {
+    let is i32 as id = id_of(m, keycode, state);
+    if ((id >= 32 && id <= 126) || (id >= 65280 && id <= 65535)) { return id; }
+    let is i64 as kc = cast(i64, keycode);
+    if (kc < 0 || kc >= KEYCODE_COUNT) { return id; }
+    let is i64 as g with mut = 0;
+    while (g < GROUPS) {
+        let is i64 as s = m.sym[g * KEYCODE_COUNT + kc];
+        if (s >= 32 && s <= 126) { return cast(i32, s); }
+        g = g + 1;
+    }
+    return id;
 }
 
 // For logging and for tests. Returns a static string, never null.

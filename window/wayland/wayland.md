@@ -145,13 +145,19 @@ windows, configure/close/state events, double-buffered `wl_shm` presentation,
 frame pacing, output and fractional scale, constraints, decorations, dialogs,
 cursors, keyboard/pointer input, text selections, and file/text drag-and-drop.
 Input is translated as it arrives into `input/event.cst`'s cooked events, a
-queue per window (`poll_input`): keys with xkbcommon's keysym, their keycode
-as their place and `wl_keyboard` 10's repeated state as a repeat, the text
+queue per window (`poll_input`): keys as the layout in use has them at their
+first level, the key a shortcut is matched against (its Latin letter in
+another layout: Ctrl+C in Russian), their keycode as their place, the text
 they type (compose included; never a control character nor a command's),
+repeats this client makes itself at `repeat_info`'s rate and delay — the seat
+is bound at version 7, which sends none — cancelled on release, focus loss,
+keyboard loss and keymap replacement, with `input_due` for the loop's sleep,
 the pointer in buffer pixels, axis and axis_discrete gathered per frame into
 one `SCROLL`, text-input-v3's commit, preedit and delete-surrounding,
 keyboard focus leaving as a `CANCEL` that lets buttons go too, and a press
-`xdg_toplevel.move`/`resize` takes ending in `BUTTON_TAKEN`.
+`xdg_toplevel.move`/`resize` takes ending in `BUTTON_TAKEN`. `input_test`
+checks it on xkbcommon keymaps (us; us,ru; de: Caps Lock, AltGr, repeat timing)
+and `../keyboard_wayland_test.cst` through Weston nested in Xvfb with XTest.
 The portable `window/device.cst` and `ui/host.cst` use it to open and paint
 toolkit windows.
 

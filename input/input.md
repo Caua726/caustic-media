@@ -277,13 +277,37 @@ What the queue promises:
   release the system keeps never arrives.
 - **Text is only text.** Control characters, and what a key held with
   Control, Alt or Super types, are never `TEXT`; AltGr's characters are.
+- **Keys across layouts.** `key` is the key in the layout in use, at its first
+  level (`a`, not `A`; Cyrillic es in Russian); `shortcut` is the key a
+  shortcut is matched against — the same where it is Latin or a function key,
+  else the same key's Latin letter read off another layout of the keymap
+  (X11's XKB groups, Wayland's xkbcommon layouts; on Windows the virtual key's
+  letter, which no layout changes). Nothing is guessed from keycodes: a key no
+  layout makes Latin keeps its own.
+- **Repeat is said by every platform**: X11's detectable auto-repeat, Windows'
+  bit 30, and on Wayland the client's own timer at the compositor's
+  `repeat_info` rate and delay, cancelled when the key is let go, the focus
+  leaves, the keyboard goes or the keymap is replaced; `window/wait.cst` and
+  the host sleep no longer than the next repeat (`device.input_due`).
 
 `ui/host.cst` feeds a window's queue to its router: a key's `TEXT` is typed
 unless the router took that key; text an input method or another program sent
-is typed whatever is held.
+is typed whatever is held. With Control or Super held the router is told the
+key's `shortcut`, so Ctrl+C, Ctrl+A and Ctrl+V work in a Cyrillic layout; with
+Alt alone, the layout's key, which mnemonics mean.
 
-Still to come, in this order: keyboard repeat on Wayland compositors older
-than `wl_keyboard` 10 and shortcuts that work in non-Latin layouts; inline XIM
-on X11; Wayland and Win32 surrounding-text context; continuous scrolling (axis
-source, stop, value120 on Wayland); touch, pen and gestures; gamepads, raw
-devices and the action mapping.
+Proved with real platform input: `keyboard_x11_test` (XTest, us/ru/de groups:
+keys, Ctrl+C in Russian, Caps Lock, AltGr), `keyboard_wayland_test` (XTest
+through Weston nested in Xvfb with us/ru: Ctrl+C in Russian, Cyrillic text,
+the client's repeat), `keyboard_win32_test` (SendInput under Wine: scan codes,
+repeat, Caps Lock, Alt, Ctrl+C with a Russian layout loaded) and
+`host_x11_test` (Ctrl+A selecting an entry with the Russian group in use).
+Wine translates SendInput's keys to text through its X keymap whatever layout
+is loaded, so a Russian or German layout's text on Windows awaits real
+Windows. X11 types only Latin-1 without an input method (XLookupString), so
+Cyrillic text there comes with the toolkit's input method (below).
+
+Still to come, in this order: inline XIM on X11 (opened by the toolkit, so
+any layout's text and compose); Wayland and Win32 surrounding-text context;
+continuous scrolling (axis source, stop, value120 on Wayland); touch, pen and
+gestures; gamepads, raw devices and the action mapping.

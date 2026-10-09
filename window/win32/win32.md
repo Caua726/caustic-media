@@ -182,6 +182,16 @@ resize, fullscreen restore and a close request that can be declined. Desktop
 preference reads were also exercised in a native smoke. Real Windows, monitor
 transitions and interaction with an installed IME remain unverified.
 
+`../keyboard_win32_test.cst` sends keys as a keyboard does (SendInput): the
+key a virtual key names and its scan code, a key down again while down as the
+system's repeat, Caps Lock, Alt as `WM_SYSKEYDOWN`, Control's letter as a
+command with no text, and a Russian layout loaded and in use
+(`LoadKeyboardLayoutW`, `ActivateKeyboardLayout`): the key and its shortcut
+stay the virtual key's Latin letter, so Ctrl+C is Ctrl+C. Wine translates
+SendInput's keys to characters through its X keymap whatever layout is
+loaded, so the text a Russian or German layout (AltGr's included) types is
+left to real Windows.
+
 The compiler resolves the real `__caustic_chkstk` definition before PE
 validation/relocation (8192-byte recursive locals pass at `-O0/-O1/-O2` and
 through separate object linking), and the installed toolchain was validated

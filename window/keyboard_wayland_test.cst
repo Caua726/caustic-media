@@ -1,0 +1,189 @@
+// window/keyboard_wayland_test.cst — keys as a user presses them, on a
+// Weston nested in Xvfb, the user's keyboard XTest's:
+//   env X_LAYOUTS=us,ru sh window/x11/tools/run_headless.sh env WESTON_BACKEND=x11 \
+//       WESTON_SHELL=kiosk sh window/wayland/tools/run_wayland.sh ./build/keyboard_wayland_test
+// Weston takes the keymap and the layout in use from the X server it is
+// nested in, and tells them on: the key in the layout in use, the Latin
+// shortcut in the Russian one (Ctrl+C is Ctrl+C), and a key held repeated by
+// this client at the rate and delay the compositor says (repeat_info), no
+// release between and one at the end.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "device.cst" as device;
+use "../input/event.cst" as ie;
+use "../input/keys.cst" as keys;
+use "../gpu/software/target.cst" as tgt;
+use "x11/bind/xlib.cst" as xlib;
+use "x11/bind/xkblib.cst" as xkblib;
+
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is *u8 as xd with mut;
+
+fn settle(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        time.sleep_ms(5);
+    }
+}
+
+// The next input that is not a modifier key's, within two seconds: its kind,
+// NONE for none.
+fn next(out as *ie.Event) as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, out) == 1) {
+            let is i32 as k = out.key;
+            if (out.kind != ie.KEY_DOWN && out.kind != ie.KEY_UP && out.kind != ie.TEXT) { continue; }
+            if ((out.kind == ie.KEY_DOWN || out.kind == ie.KEY_UP) && (k == keys.CONTROL_L || k == keys.SHIFT_L)) { continue; }
+            return out.kind;
+        }
+        time.sleep_ms(5);
+    }
+    return ie.NONE;
+}
+
+// Nothing but releases within 200 ms: 1.
+fn quiet() as i32 {
+    let is ie.Event as e;
+    let is i64 as until = time.now_ms() + 200;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &e) == 1) {
+            if (e.kind == ie.KEY_DOWN && e.key != keys.CONTROL_L) { return 0; }
+            if (e.kind == ie.TEXT) { return 0; }
+        }
+        time.sleep_ms(5);
+    }
+    return 1;
+}
+
+fn drain() as void {
+    let is ie.Event as e;
+    let is i64 as until = time.now_ms() + 200;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &e) == 1) { }
+        time.sleep_ms(5);
+    }
+}
+
+fn code(keysym as i64) as u32 { return cast(u32, xlib.XKeysymToKeycode(xd, keysym)); }
+
+fn key(kc as u32, down as i32) as void {
+    XTestFakeKeyEvent(xd, kc, down, cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+fn same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (b[k] != 0) { k = k + 1; }
+    if (n != k) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    win = device.open("keyboard", 400, 300);
+    if (device.is_open(&win) == 0 || win.backend != device.WAYLAND) {
+        io.printf("FAIL: no Wayland window (backend %d, error %s)\n", win.backend, device.error_name(device.last_error(&win)));
+        return 1;
+    }
+    device.next_frame(&win);
+    let is tgt.Target as t = device.acquire(&win);
+    if (cast(i64, t.color) != 0) { device.submit(&win); }
+    settle(200);
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, xd) == 0) { io.printf("FAIL: no X display to send input through\n"); return 1; }
+    // The keys go where the pointer is: Weston's window, the whole screen.
+    XTestFakeMotionEvent(xd, 0 - 1, 640, 512, cast(u64, 0));
+    xlib.XFlush(xd);
+    settle(200);
+    drain();
+    let is u32 as c = code(99);
+    let is u32 as a = code(97);
+    check("two layouts loaded (X_LAYOUTS=us,ru)", xkblib.XkbKeycodeToKeysym(xd, cast(u8, c), 1, 0) == 1747);
+    let is ie.Event as e;
+
+    // --- US ---
+    key(c, 1);
+    check("c in US: the key c", next(&e) == ie.KEY_DOWN && e.key == keys.C && e.shortcut == keys.C && e.repeat == 0);
+    check("typing c", next(&e) == ie.TEXT && e.from_key == 1 && same(e.text, e.text_len, "c") == 1);
+    key(c, 0);
+    check("let go", next(&e) == ie.KEY_UP && e.key == keys.C);
+
+    // --- Russian, as the X server's locked group says and Weston passes on ---
+    xkblib.XkbLockGroup(xd, cast(u32, 256), cast(u32, 1));
+    xlib.XSync(xd, 0);
+    settle(200);
+    drain();
+    key(c, 1);
+    check("c's key in Russian: Cyrillic es, its shortcut c", next(&e) == ie.KEY_DOWN && e.key == 1747 && e.shortcut == keys.C);
+    check("typing с", next(&e) == ie.TEXT && e.text_len == 2 && e.text[0] == 209 && e.text[1] == 129);
+    key(c, 0);
+    drain();
+    let is u32 as ctrl = code(65507);
+    key(ctrl, 1);
+    key(c, 1);
+    check("Control and it: Ctrl+C", next(&e) == ie.KEY_DOWN && e.key == 1747 && e.shortcut == keys.C &&
+          (e.modifiers & keys.MOD_CONTROL) != 0);
+    key(c, 0);
+    key(ctrl, 0);
+    check("a command: no text", quiet() == 1);
+    xkblib.XkbLockGroup(xd, cast(u32, 256), cast(u32, 0));
+    xlib.XSync(xd, 0);
+    settle(200);
+    drain();
+
+    // --- Held: repeated here, as the compositor says how ---
+    key(a, 1);
+    let is i64 as presses with mut = 0;
+    let is i64 as repeats with mut = 0;
+    let is i64 as texts with mut = 0;
+    let is i64 as lets_go with mut = 0;
+    let is i64 as until = time.now_ms() + 1500;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &e) == 1) {
+            if (e.kind == ie.KEY_DOWN && e.key == keys.A) {
+                presses = presses + 1;
+                repeats = repeats + cast(i64, e.repeat);
+            }
+            if (e.kind == ie.KEY_UP && e.key == keys.A) { lets_go = lets_go + 1; }
+            if (e.kind == ie.TEXT) { texts = texts + 1; }
+        }
+        time.sleep_ms(2);
+    }
+    key(a, 0);
+    check("held: pressed, then repeated, never let go between", presses > 2 && repeats == presses - 1 && lets_go == 0 &&
+          texts == presses);
+    check("let go: once, and no repeat after", next(&e) == ie.KEY_UP && e.key == keys.A && quiet() == 1);
+
+    device.close(&win);
+    xlib.XCloseDisplay(xd);
+    if (fails == 0) {
+        io.printf("keyboard wayland: all checks passed\n");
+        return 0;
+    }
+    io.printf("keyboard wayland: %d failures\n", fails);
+    return 1;
+}

@@ -93,4 +93,9 @@ fi
 unset WAYLAND_DISPLAY
 export XDG_SESSION_TYPE=x11
 export DISPLAY=":$num"
+# X_LAYOUTS=us,ru,de: the keyboard's layouts, each an XKB group, loaded before
+# the program starts, as a user's desktop would have them.
+if [ -n "${X_LAYOUTS:-}" ]; then
+    setxkbmap -layout "$X_LAYOUTS" || { echo "run_headless: setxkbmap -layout $X_LAYOUTS falhou" >&2; exit 1; }
+fi
 run_child "$@"

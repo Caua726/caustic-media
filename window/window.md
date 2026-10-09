@@ -454,10 +454,13 @@ where said:
   HANDLEs signalled as "readable" (`wait_win32_test`, under Wine).
   `device.pump` hands every event read to the windows it belongs to, for a
   loop that sleeps by itself rather than in `next_frame`.
-- Input (`poll_input`, `input/event.cst`): a key down carries its key id,
-  its place (`physical`: X's keycode, the scan code on Windows) and whether
-  it is the platform's repeat (X11's detectable auto-repeat, Windows' bit 30,
-  `wl_keyboard` 10's repeated state); the text a key typed follows it as
+- Input (`poll_input`, `input/event.cst`): a key down carries its key id in
+  the layout in use, the key a shortcut is matched against (the same key's
+  Latin letter in another layout, so Ctrl+C works in Russian), its place
+  (`physical`: X's keycode, the scan code on Windows) and whether it is a
+  repeat (X11's detectable auto-repeat, Windows' bit 30, on Wayland this
+  client's own at `repeat_info`'s rate — `input_due` says when the next is
+  due, and `wait.cst` sleeps no longer); the text a key typed follows it as
   `TEXT` (`from_key`), never a control character nor what a key held with
   Control, Alt or Super types; an input method's text is `TEXT` too; every
   event the modifiers held as `keys.MOD_*` name them, X's bits translated.

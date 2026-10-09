@@ -3,6 +3,7 @@
 use "std/mem.cst" as mem;
 use "std/os/linux.cst" as linux;
 use "std/env.cst" as env;
+use "std/time.cst" as time;
 use "../../sys/linux.cst" as sys;
 use "../../gpu/software/target.cst" as tgt;
 use "../event.cst" as event;
@@ -212,12 +213,23 @@ struct Window {
     scroll_x as i64;
     scroll_discrete as i32;
     scroll_discrete_x as i32;
+    // Each held key as its press said it: which key, and the key a shortcut
+    // is matched against (input/event.cst's key and shortcut).
     key_syms as [256]i32;
+    key_cuts as [256]i32;
     pointer_buttons as [8]i32;
     // Keys the compositor says are down: what xkb is told to let go of when
     // the focus leaves.
     key_down as [256]i32;
     modifiers as i32;
+    // A held key repeated here, as the compositor's repeat_info asks (this
+    // seat's wl_keyboard sends no repeats of its own): so many a second,
+    // after so many milliseconds; the code repeating (-1: none) and when
+    // its next repeat is due, on the monotonic clock in milliseconds.
+    repeat_rate as i32;
+    repeat_delay as i32;
+    repeat_code as i32;
+    repeat_next as i64;
     text_len as i32;
     text_buf as [256]u8;
     input_serial as u32;
@@ -445,6 +457,7 @@ fn _disconnect(w as *Window) as void {
 fn _zero(w as *Window) as void {
     mem.memzero(cast(*u8, w), sizeof(Window));
     w.fd = 0 - 1; w.memfd = 0 - 1; w.connection_slot = 0 - 1;
+    w.repeat_code = 0 - 1;
     w.registry = 0; w.compositor = 0; w.shm = 0; w.wm_base = 0;
     w.surface = 0; w.xdg_surface = 0; w.toplevel = 0; w.pool = 0;
     w.callback = 0;
@@ -496,9 +509,10 @@ fn _pointer_input(w as *Window, kind as i32, button as i32) as void {
 }
 
 // The keyboard's focus left: everything held — keys and buttons — is let go,
-// and a release that comes later says nothing.
+// a release that comes later says nothing, and no key repeats.
 fn _cancel_input(w as *Window) as void {
     mem.memzero(cast(*u8, &w.pointer_buttons[0]), 8 * 4);
+    w.repeat_code = 0 - 1;
     if (cast(i64, w.input) != 0) { ie.cancel(w.input, ie.CANCEL_FOCUS); }
 }
 
@@ -1429,14 +1443,110 @@ fn _seat_capabilities(w as *Window, caps as u32) as void {
         w.keyboard = 0; w.keyboard_focus = 0;
         mem.memzero(cast(*u8, &w.key_down[0]), 256 * 4);
         mem.memzero(cast(*u8, &w.key_syms[0]), 256 * 4);
+        mem.memzero(cast(*u8, &w.key_cuts[0]), 256 * 4);
+        w.repeat_code = 0 - 1;
     }
 }
 
+// A keysym as input/keys.cst names keys: what the keysym is, a Latin
+// capital as its small letter.
 fn _key_id(sym as u32) as i32 {
     if (sym >= 65 && sym <= 90) { return cast(i32, sym + 32); }
-    if ((sym >= 32 && sym <= 126) || (sym >= 160 && sym <= 255) ||
-        (sym >= 65280 && sym <= 65535)) { return cast(i32, sym); }
-    return keys.UNKNOWN;
+    if (sym == 0 || sym > 2147483647) { return keys.UNKNOWN; }
+    return cast(i32, sym);
+}
+
+// Whether key id is the same key whatever the layout says: a Latin letter,
+// digit or punctuation, or a function key's (the 0xff.. keysyms).
+fn _latin(id as i32) as i32 {
+    return cast(i32, (id >= 32 && id <= 126) || (id >= 65280 && id <= 65535));
+}
+
+// The keysym at key xcode's first level in layout: 0 for none.
+fn _level_sym(w as *Window, xcode as u32, layout as u32) as u32 {
+    if (cast(i64, w.xkb_keymap) == 0) { return 0; }
+    let is *u32 as syms with mut = cast(*u32, 0);
+    let is i32 as n = xkb.xkb_keymap_key_get_syms_by_level(w.xkb_keymap, xcode, layout, 0, cast(*u8, &syms));
+    if (n < 1 || cast(i64, syms) == 0) { return 0; }
+    return syms[0];
+}
+
+// Which key xcode is in the layout in use, at its first level — a, not A —
+// into *key; and the key a shortcut is matched against into *shortcut: the
+// same where it is Latin, else the key's Latin letter in the first layout
+// that has one, so Ctrl+C is Ctrl+C in a Cyrillic layout. Nothing guessed:
+// a key no layout gives a Latin letter keeps its own.
+fn _key_ids(w as *Window, xcode as u32, key as *i32, shortcut as *i32) as void {
+    *key = keys.UNKNOWN;
+    *shortcut = keys.UNKNOWN;
+    if (cast(i64, w.xkb_state) == 0) { return; }
+    let is u32 as sym with mut = 0;
+    if (cast(i64, w.xkb_keymap) != 0) {
+        sym = _level_sym(w, xcode, xkb.xkb_state_key_get_layout(w.xkb_state, xcode));
+    }
+    if (sym == 0) { sym = xkb.xkb_state_key_get_one_sym(w.xkb_state, xcode); }
+    *key = _key_id(sym);
+    *shortcut = *key;
+    if (_latin(*key) == 1 || cast(i64, w.xkb_keymap) == 0) { return; }
+    let is u32 as layouts = xkb.xkb_keymap_num_layouts_for_key(w.xkb_keymap, xcode);
+    let is u32 as l with mut = 0;
+    while (l < layouts) {
+        let is i32 as other = _key_id(_level_sym(w, xcode, l));
+        if (other >= 32 && other <= 126) {
+            *shortcut = other;
+            return;
+        }
+        l = l + 1;
+    }
+}
+
+// Key code (evdev's) went down or up: the key, as its press said it, and the
+// text it typed — repeat 1 for a repeat of a held key.
+fn _key_input(w as *Window, down as i32, code as i32, repeat as i32) as void {
+    let is u32 as xcode = cast(u32, code + 8);
+    let is ie.Event as e = _input(w, ie.KEY_UP);
+    if (down == 1) {
+        e.kind = ie.KEY_DOWN;
+        e.repeat = repeat;
+    }
+    e.key = w.key_syms[code];
+    e.shortcut = w.key_cuts[code];
+    e.physical = cast(i32, xcode);
+    _push(w, &e, cast(*u8, 0), 0);
+    // What it typed, unless the input method has the keys. Control
+    // characters are not text, and neither is what a key held with
+    // Control, Alt or Super types: that key is a command. Looked up all
+    // the same — a compose sequence moves with each key.
+    if (down == 0 || cast(i64, w.xkb_state) == 0) { return; }
+    if (w.text_input_enabled == 1 && w.text_input_entered == 1) { return; }
+    let is i32 as typed = _key_text(w, xkb.xkb_state_key_get_one_sym(w.xkb_state, xcode), xcode);
+    let is i32 as command = cast(i32, (w.modifiers & (keys.MOD_CONTROL | keys.MOD_ALT | keys.MOD_SUPER)) != 0);
+    if (typed > 0 && command == 0 && w.text_buf[0] >= cast(u8, 32) && w.text_buf[0] != cast(u8, 127)) {
+        let is ie.Event as t = _input(w, ie.TEXT);
+        t.from_key = 1;
+        _push(w, &t, &w.text_buf[0], cast(i64, typed));
+    }
+}
+
+// The held key repeating, as of now (the monotonic clock, ms): its repeat
+// when one is due — one at most, so a loop late to pump catches up rather
+// than flooding — the next due a period after.
+fn _repeat_keys(w as *Window, now as i64) as void {
+    if (w.repeat_code < 0 || w.repeat_rate <= 0 || w.keyboard_focus == 0) { return; }
+    if (now < w.repeat_next) { return; }
+    _key_input(w, 1, w.repeat_code, 1);
+    let is i64 as period with mut = 1000 / cast(i64, w.repeat_rate);
+    if (period < 1) { period = 1; }
+    w.repeat_next = w.repeat_next + period;
+    if (w.repeat_next <= now) { w.repeat_next = now + period; }
+}
+
+// Milliseconds until the held key's next repeat, 0 when due; -1 for none.
+fn input_due(w as *Window) as i64 {
+    if (w.opened == 0 || w.repeat_code < 0 || w.repeat_rate <= 0 || w.keyboard_focus == 0) { return 0 - 1; }
+    let is i64 as left = w.repeat_next - time.now_ms();
+    if (left < 0) { return 0; }
+    return left;
 }
 
 fn _load_keymap(w as *Window, fd as i64, size as i64) as void {
@@ -1467,6 +1577,8 @@ fn _load_keymap(w as *Window, fd as i64, size as i64) as void {
     if (cast(i64, w.compose_table) != 0) { xkb.xkb_compose_table_unref(w.compose_table); }
     w.xkb_keymap = keymap; w.xkb_state = state;
     w.compose_table = table; w.compose_state = compose;
+    // A key repeating under the old keymap is not the new one's.
+    w.repeat_code = 0 - 1;
     linux.munmap(map, size);
 }
 
@@ -1528,7 +1640,7 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
                     let is u32 as xcode = cast(u32, code + 8);
                     xkb.xkb_state_update_key(w.xkb_state, xcode, 1);
                     w.key_down[code] = 1;
-                    w.key_syms[code] = _key_id(xkb.xkb_state_key_get_one_sym(w.xkb_state, xcode));
+                    _key_ids(w, xcode, &w.key_syms[code], &w.key_cuts[code]);
                 }
                 i = i + 1;
             }
@@ -1550,6 +1662,7 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
             w.keyboard_focus = 0; w.modifiers = 0;
             mem.memzero(cast(*u8, &w.key_down[0]), 256 * 4);
             mem.memzero(cast(*u8, &w.key_syms[0]), 256 * 4);
+            mem.memzero(cast(*u8, &w.key_cuts[0]), 256 * 4);
             if (cast(i64, w.compose_state) != 0) { xkb.xkb_compose_state_reset(w.compose_state); }
             let is event.Event as e;
             event.clear(&e); e.kind = event.FOCUS_OUT; e.raw_kind = op;
@@ -1570,48 +1683,32 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
         let is i32 as down = cast(i32, state != 0);
         if (code < 0 || code >= 256) { return; }
         let is u32 as xcode = cast(u32, code + 8);
-        let is u32 as sym with mut = 0;
-        let is i32 as id with mut = 0;
         if (down == 1) {
-            if (state == 1 && cast(i64, w.xkb_state) != 0) {
-                xkb.xkb_state_update_key(w.xkb_state, xcode, 1);
-                sym = xkb.xkb_state_key_get_one_sym(w.xkb_state, xcode);
-                id = _key_id(sym);
-                w.key_syms[code] = id; w.key_down[code] = 1;
-            } else {
-                id = w.key_syms[code];
-                if (cast(i64, w.xkb_state) != 0) { sym = xkb.xkb_state_key_get_one_sym(w.xkb_state, xcode); }
+            if (cast(i64, w.xkb_state) != 0) { xkb.xkb_state_update_key(w.xkb_state, xcode, 1); }
+            _key_ids(w, xcode, &w.key_syms[code], &w.key_cuts[code]);
+            w.key_down[code] = 1;
+            // The key held repeats, from here, if the keymap says it does.
+            if (w.repeat_rate > 0 && cast(i64, w.xkb_keymap) != 0 &&
+                xkb.xkb_keymap_key_repeats(w.xkb_keymap, xcode) == 1) {
+                w.repeat_code = code;
+                w.repeat_next = time.now_ms() + cast(i64, w.repeat_delay);
             }
         } else {
-            id = w.key_syms[code];
-            if (cast(i64, w.xkb_state) != 0) {
-                sym = xkb.xkb_state_key_get_one_sym(w.xkb_state, xcode);
-                xkb.xkb_state_update_key(w.xkb_state, xcode, 0);
-            }
-            w.key_down[code] = 0; w.key_syms[code] = 0;
+            if (cast(i64, w.xkb_state) != 0) { xkb.xkb_state_update_key(w.xkb_state, xcode, 0); }
+            w.key_down[code] = 0;
+            if (code == w.repeat_code) { w.repeat_code = 0 - 1; }
         }
         w.modifiers = _xkb_modifiers(w);
-        let is ie.Event as e = _input(w, ie.KEY_UP);
-        if (down == 1) {
-            e.kind = ie.KEY_DOWN;
-            // The compositor's own repeat (wl_keyboard 10).
-            e.repeat = cast(i32, state == 2);
-        }
-        e.key = id; e.shortcut = id; e.physical = cast(i32, xcode);
-        _push(w, &e, cast(*u8, 0), 0);
-        // What it typed, unless the input method has the keys. Control
-        // characters are not text, and neither is what a key held with
-        // Control, Alt or Super types: that key is a command. Looked up all
-        // the same — a compose sequence moves with each key.
-        if (down == 1 && (w.text_input_enabled == 0 || w.text_input_entered == 0)) {
-            let is i32 as typed = _key_text(w, sym, xcode);
-            let is i32 as command = cast(i32, (w.modifiers & (keys.MOD_CONTROL | keys.MOD_ALT | keys.MOD_SUPER)) != 0);
-            if (typed > 0 && command == 0 && w.text_buf[0] >= cast(u8, 32) && w.text_buf[0] != cast(u8, 127)) {
-                let is ie.Event as t = _input(w, ie.TEXT);
-                t.from_key = 1;
-                _push(w, &t, &w.text_buf[0], cast(i64, typed));
-            }
-        }
+        _key_input(w, down, code, 0);
+        if (down == 0) { w.key_syms[code] = 0; w.key_cuts[code] = 0; }
+        return;
+    }
+    if (op == 5 && _wire_size >= 16) {
+        // repeat_info: so many repeats a second (0: none), after so many ms.
+        w.repeat_rate = cast(i32, _word(p));
+        w.repeat_delay = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
+        if (w.repeat_rate <= 0) { w.repeat_rate = 0; w.repeat_code = 0 - 1; }
+        if (w.repeat_delay < 0) { w.repeat_delay = 0; }
         return;
     }
     if (op == 4 && cast(i64, w.xkb_state) != 0) {
@@ -2750,6 +2847,7 @@ fn resized(w as *Window) as i32 { return w.resized; }
 
 fn next_frame(w as *Window) as i32 {
     if (w.opened == 0) { return 0; }
+    _repeat_keys(w, time.now_ms());
     if (w.mapped == 0) { w.mapped = 1; w.frame_ready = 1; return 1; }
     if (w.event_len > 0) { return 1; }
     if (w.frame_ready == 1) { w.resized = 0; return 1; }
@@ -2767,6 +2865,7 @@ fn next_frame(w as *Window) as i32 {
 fn pending(w as *Window) as i32 {
     if (w.event_len > 0) { return 1; }
     if (cast(i64, w.input) != 0 && ie.pending(w.input) == 1) { return 1; }
+    if (input_due(w) == 0) { return 1; }
     if (w.fd < 0) { return 0; }
     if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { return 1; }
     return cast(i32, sys.wait_readable(w.fd, 0) > 0);
@@ -2928,6 +3027,7 @@ fn pump(w as *Window) as void {
     while (_pump_one(w, 0) == 1) { }
     if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { _read_transfer(w); }
     _apply_configure(w);
+    _repeat_keys(w, time.now_ms());
 }
 
 fn poll_event(w as *Window, out as *event.Event) as i32 {
