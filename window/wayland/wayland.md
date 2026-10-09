@@ -93,8 +93,8 @@ The buffer itself is shared memory:
 
 `std/os/linux.cst` still has no `sendmsg`/`recvmsg` or `memfd_create` surface.
 The project-level `sys/linux.cst` already supplies `connect_unix`,
-`send_fds`/`recv_fds` (`SCM_RIGHTS`), `memfd_create`, `poll` and `eventfd`;
-Wayland can use that transport without libwayland-client or libffi.
+`send_fds`/`recv_fds` (`SCM_RIGHTS`), `memfd_create`, `poll`, `eventfd` and
+`timerfd`; Wayland can use that transport without libwayland-client or libffi.
 
 ---
 
@@ -193,5 +193,12 @@ explicit surface damage
 before the frame request and commit, including when a buffer is reused.
 
 Regenerate the protocol inventory from XML with
-`sh window/wayland/tools/check_protocols.sh`; it also validates the inputs
-against the independent `wayland-scanner`.
+`sh window/wayland/tools/check_protocols.sh`. It links wayland-scanner's
+private code with `tools/scanner_dump.c` and requires the generated catalog to
+match the scanner's interface versions, opcodes, since versions, signatures and
+argument interfaces exactly. The catalog covers core, xdg-shell, viewporter,
+xdg-decoration, text-input-v3, primary selection, fractional scale, cursor
+shape, activation, dialog, xdg-foreign-v2, toplevel icon, presentation time,
+single-pixel buffer, system bell, toplevel drag, tablet-v2 and pointer
+gestures. Metadata alone implements none of these protocols; each client
+behavior is tracked and exercised separately.
