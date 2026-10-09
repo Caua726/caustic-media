@@ -10,6 +10,10 @@
 # 10 s is kept, named, and the run fails rather than deleting files a live
 # process still uses. CAUSTIC_WINE_DPI=144 runs at that system DPI (the
 # prefix's LogPixels, read when its wineserver starts).
+# CAUSTIC_WINE_GRAPHICS=wayland has Wine present through its Wayland driver
+# to a Weston nested in that X server (window/wayland/tools/run_wayland.sh,
+# WESTON_CONFIG passed on), so a compositor blends what it shows and the X
+# screen can still be read back.
 set -eu
 [ $# -gt 0 ] || { echo "usage: wine_session.sh command [args...]" >&2; exit 2; }
 . "$(dirname "$0")/child.sh"
@@ -21,6 +25,15 @@ if [ "${1:-}" = "--inside" ]; then
         wine reg add 'HKCU\Control Panel\Desktop' /v LogPixels /t REG_DWORD /d "$CAUSTIC_WINE_DPI" /f >/dev/null 2>&1
         timeout 10 wineserver -w 2>/dev/null || { echo "wine_session: wineserver did not settle" >&2; exit 1; }
     fi
+    case "${CAUSTIC_WINE_GRAPHICS:-x11}" in
+        x11) ;;
+        wayland)
+            wine reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d wayland /f >/dev/null 2>&1
+            timeout 10 wineserver -w 2>/dev/null || { echo "wine_session: wineserver did not settle" >&2; exit 1; }
+            set -- env WESTON_BACKEND=x11 sh "$(dirname "$0")/../window/wayland/tools/run_wayland.sh" "$@"
+            ;;
+        *) echo "wine_session: unknown CAUSTIC_WINE_GRAPHICS ${CAUSTIC_WINE_GRAPHICS}" >&2; exit 2 ;;
+    esac
     status=0
     run_child "$@" || status=$?
     # Wine's processes leave while their X server still answers.

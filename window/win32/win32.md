@@ -83,6 +83,13 @@ The top-down DIB uses `BI_BITFIELDS` with RGBA byte masks matching the
 software target. `BitBlt` presents that memory without a channel-swapping
 copy. The native smoke checks the presented RGB values with GDI `GetPixel`.
 
+A window seen through (`Config.transparent`, only where the system draws no
+frame round it) is a layered window (`WS_EX_LAYERED`): each frame is given to
+the system with `UpdateLayeredWindow` from a second DIB, the frame's
+premultiplied RGBA as the premultiplied BGRA it blends — the whole window,
+since such a window has no frame of the system's. Framed by the system later
+(`set_decorated(1)`), it stops being layered.
+
 ---
 
 ## Native handles
@@ -103,6 +110,13 @@ wine on this machine.
 What wine does *not* prove: driver behaviour, DPI scaling across real monitors,
 and anything about D3D beyond what wine implements. Enough for the backend to be
 correct; not enough to call it tested on Windows.
+
+Wine's X11 driver on an X server with no compositing manager shows a layered
+window's alpha as all or nothing (0 shaped out, the rest unblended), so the
+blend is proven with its Wayland driver instead: `tools/wine_session.sh` with
+`CAUSTIC_WINE_GRAPHICS=wayland` runs the session's Wine against a Weston
+nested in its Xvfb (`WESTON_CONFIG` passed on), and the X screen still reads
+back what that compositor composed.
 
 ---
 
@@ -186,6 +200,31 @@ dialog and close requests. It found that `WM_NCCREATE` skipped the default
 procedure, so creation titles were lost, and that `resized`, the motion and the
 wheel were never per frame (a window looked resized every frame after its
 first); both are fixed.
+
+A window drawing its own frame answers hit-testing for its edges: between the
+window as the desktop counts it (inside the frame extents) and the input
+region's edge — its edges' reach beyond it — `WM_NCHITTEST` says `HTLEFT` …
+`HTBOTTOMRIGHT`, a corner taking twice that reach along each side as the
+toolkit's frame does, and the system's own sizing loop follows the press; not
+for a framed, fixed-size, maximized or full-screen window or a popup. A dialog
+drawing its own frame is no longer given the system's caption. A move to a
+monitor of another DPI (`WM_DPICHANGED`) takes the size the system suggests
+and says `RESIZE` then `SETTINGS`, so the toolkit lays out again at the new
+scale. Minimized is `STATE_MINIMIZED`, the window's size kept while it is
+not shown; `WM_DWMCOMPOSITIONCHANGED` is `COMPOSITOR`. `monitor_of` says the
+monitor it is most on: its rectangle and work area, the DPI there
+(`GetDpiForMonitor`), its refresh rate (`EnumDisplaySettingsW`, 0 where the
+system knows none, as Wine on Xvfb) and device name. `device_win32_test`
+checks the edges' answers and a real resize from the right edge by the
+system's loop (SendInput), a synthetic `WM_DPICHANGED` and back, minimized
+and restored, the monitor against `GetMonitorInfoW`, and a layered window:
+its opaque pixels exact on the screen, not layered once framed or when asked
+for with a frame. `../transparent_win32_test.cst` with `tools/alpha_check.cst`
+(`tools/run_alpha.sh`) shows a half-seen red blended over the blue desktop of
+the nested Weston as 0x80007f and the blue itself through the clear part.
+`../../ui/program_win32_test.cst` checks the toolkit following the DPI change:
+laid out and painted at the new scale — the host had kept the desktop's
+system DPI over the window's own, which only X11's screen-wide DPI should do.
 
 `../wait.cst` sleeps in `MsgWaitForMultipleObjectsEx` on Windows: the thread's
 queue (input already looked at included), an auto-reset event for `wake`, and

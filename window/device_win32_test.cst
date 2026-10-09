@@ -14,6 +14,8 @@ use "event.cst" as event;
 use "keys.cst" as keys;
 use "cursor.cst" as cursor;
 use "settings.cst" as wsettings;
+use "display.cst" as display;
+use "monitor.cst" as monitor;
 use "../gpu/software/target.cst" as tgt;
 use "win32/abi.cst" as abi;
 use "win32/backend.cst" as w32;
@@ -87,6 +89,15 @@ fn screen_point(x as i64, y as i64) as i64 {
 
 // What hit-testing answers at x, y in the window.
 fn hit(x as i64, y as i64) as i64 { return u.SendMessageW(hwnd, cast(u32, t.WM_NCHITTEST), 0, screen_point(x, y)); }
+
+fn screen_point_in(h as i64, x as i64, y as i64) as i64 {
+    let is t.POINT as p; p.x = cast(i32, x); p.y = cast(i32, y);
+    u.ClientToScreen(h, &p);
+    return (cast(i64, p.x) & 65535) | ((cast(i64, p.y) & 65535) << 16);
+}
+
+// What hit-testing answers at x, y in window h.
+fn hit_in(h as i64, x as i64, y as i64) as i64 { return u.SendMessageW(h, cast(u32, t.WM_NCHITTEST), 0, screen_point_in(h, x, y)); }
 
 // The system cursor shape shows once the pointer is over the client: idc,
 // or none at all for 0.
@@ -273,6 +284,29 @@ fn main() as i32 {
     check("its client's place on the screen", device.position(&win, &px, &py) == 1 &&
           px == 40 - cast(i64, border.left) && py == 30 - cast(i64, border.top));
 
+    // --- The monitor it is on, as the system has it ---
+    let is display.Display as disp = display.open(&win);
+    let is monitor.Monitor as mon;
+    let is t.MONITORINFO as mi;
+    mem.memzero(cast(*u8, &mi), sizeof(t.MONITORINFO));
+    mi.cbSize = cast(u32, sizeof(t.MONITORINFO));
+    u.GetMonitorInfoW(u.MonitorFromWindow(hwnd, cast(u32, t.MONITOR_DEFAULTTONEAREST)), &mi);
+    check("its monitor", display.monitor_of(&disp, &win, &mon) == 1 && mon.x == mi.rcMonitor.left && mon.y == mi.rcMonitor.top &&
+          mon.width == mi.rcMonitor.right - mi.rcMonitor.left && mon.height == mi.rcMonitor.bottom - mi.rcMonitor.top);
+    check("its work area", mon.work_x == mi.rcWork.left && mon.work_y == mi.rcWork.top &&
+          mon.work_width == mi.rcWork.right - mi.rcWork.left && mon.work_height == mi.rcWork.bottom - mi.rcWork.top);
+    check("the primary one, at the window's scale", mon.primary == 1 && mon.scale120 == device.scale_120(&win));
+    let is t.DEVMODEW as mode;
+    mem.memzero(cast(*u8, &mode), sizeof(t.DEVMODEW));
+    mode.dmSize = cast(u16, sizeof(t.DEVMODEW));
+    let is i32 as has_mode = u.EnumDisplaySettingsW(cast(*u16, 0), cast(u32, t.ENUM_CURRENT_SETTINGS), &mode);
+    // Its rate in millihertz, or 0 where the system knows none (Wine on
+    // Xvfb says 0 Hz).
+    let is i64 as hz with mut = cast(i64, mode.dmDisplayFrequency);
+    if (hz <= 1) { hz = 0; }
+    check("its refresh rate", has_mode != 0 && mon.refresh_mhz == hz * 1000);
+    check("its device's name", mon.name[0] == cast(u8, 92) && mon.name[1] == cast(u8, 92) && mon.name[4] == cast(u8, 68));
+
     // --- Keys, text and the pointer ---
     let is event.Event as e;
     drain();
@@ -343,14 +377,47 @@ fn main() as i32 {
     check("fullscreen", device.set_fullscreen(&win, 1) == 1 && next(event.STATE, &e) == 1 &&
           (device.state(&win) & event.STATE_FULLSCREEN) != 0);
     check("and back", device.set_fullscreen(&win, 0) == 1 && (device.state(&win) & event.STATE_FULLSCREEN) == 0);
+    drain();
+    let is i64 as shown_w = device.width(&win);
+    let is i64 as shown_h = device.height(&win);
     check("minimized", device.minimize(&win) == 1 && u.IsIconic(hwnd) == 1);
+    check("said: minimized", next(event.STATE, &e) == 1 && (e.state & event.STATE_MINIMIZED) != 0 &&
+          (device.state(&win) & event.STATE_MINIMIZED) != 0);
+    check("its size kept while it is not shown", device.width(&win) == shown_w && device.height(&win) == shown_h);
     u.ShowWindow(hwnd, cast(i32, t.SW_RESTORE));
+    check("restored: said", next(event.STATE, &e) == 1 && (e.state & event.STATE_MINIMIZED) == 0 &&
+          device.state(&win) == 0 && device.width(&win) == shown_w && device.height(&win) == shown_h);
     drain();
     let is device.Window as other = device.open("other", 120, 60);
     check("another window in front", device.is_open(&other) == 1 && u.GetForegroundWindow() == other.win32_win.hwnd);
     device.activate(&win);
     check("activated", u.GetForegroundWindow() == hwnd);
     device.close(&other);
+
+    // --- Its scale, as its monitor's: the message Windows sends a window
+    // moved to a monitor of another DPI (Wine has one monitor) ---
+    drain();
+    let is i64 as dpi0 = cast(i64, device.scale_120(&win)) * 96 / 120;
+    let is i64 as dpi1 = dpi0 * 3 / 2;
+    let is t.RECT as before_dpi;
+    u.GetWindowRect(hwnd, &before_dpi);
+    let is t.RECT as suggested;
+    suggested.left = before_dpi.left + 10;
+    suggested.top = before_dpi.top + 10;
+    suggested.right = suggested.left + (before_dpi.right - before_dpi.left) * 3 / 2;
+    suggested.bottom = suggested.top + (before_dpi.bottom - before_dpi.top) * 3 / 2;
+    u.SendMessageW(hwnd, cast(u32, t.WM_DPICHANGED), cast(u64, dpi1 | (dpi1 << 16)), cast(i64, &suggested));
+    let is t.RECT as at_dpi;
+    u.GetWindowRect(hwnd, &at_dpi);
+    check("the new monitor's scale", cast(i64, device.scale_120(&win)) == dpi1 * 120 / 96);
+    check("where and as large as the system suggests", at_dpi.left == suggested.left && at_dpi.top == suggested.top &&
+          at_dpi.right == suggested.right && at_dpi.bottom == suggested.bottom);
+    check("resized, then its settings to read again", next(event.RESIZE, &e) == 1 && next(event.SETTINGS, &e) == 1 &&
+          device.width(&win) > shown_w);
+    u.SendMessageW(hwnd, cast(u32, t.WM_DPICHANGED), cast(u64, dpi0 | (dpi0 << 16)), cast(i64, &before_dpi));
+    check("and back", cast(i64, device.scale_120(&win)) == dpi0 * 120 / 96 && device.width(&win) == shown_w &&
+          device.height(&win) == shown_h);
+    drain();
 
     // --- Text input: on, where its caret is, off ---
     check("text input on", device.text_input_enable(&win, 1) == 1 && device.text_input_active(&win) == 1);
@@ -491,6 +558,91 @@ fn main() as i32 {
     device.pump(&win);
     check("Close chosen: asked to close", next(event.CLOSE, &e) == 1 && device.should_close(&win) == 1);
     device.keep_open(&win);
+
+    // --- A frame of its own: its edges the system's to resize from ---
+    let is device.Config as cc = device.config("own frame", 300, 200);
+    cc.decorated = 0;
+    let is device.Window as csd = device.open_config(&cc);
+    let is i64 as ch = csd.win32_win.hwnd;
+    check("a window of its own frame", device.is_open(&csd) == 1 && device.width(&csd) == 300 && device.height(&csd) == 200);
+    // Its shadow 24 pixels each side, its edges reaching 8 into it.
+    device.set_frame_extents(&csd, 24, 24, 24, 24);
+    device.set_input_region(&csd, 16, 16, 268, 168);
+    check("its left edge, resized from", hit_in(ch, 16, 100) == t.HTLEFT && hit_in(ch, 23, 100) == t.HTLEFT);
+    check("the window itself the program's", hit_in(ch, 24, 100) == t.HTCLIENT && hit_in(ch, 150, 24) == t.HTCLIENT &&
+          hit_in(ch, 275, 100) == t.HTCLIENT && hit_in(ch, 150, 175) == t.HTCLIENT);
+    check("its right edge", hit_in(ch, 276, 100) == t.HTRIGHT && hit_in(ch, 283, 100) == t.HTRIGHT);
+    check("its top and bottom", hit_in(ch, 150, 16) == t.HTTOP && hit_in(ch, 150, 23) == t.HTTOP &&
+          hit_in(ch, 150, 176) == t.HTBOTTOM && hit_in(ch, 150, 183) == t.HTBOTTOM);
+    check("a corner, twice the reach along each side", hit_in(ch, 16, 16) == t.HTTOPLEFT && hit_in(ch, 16, 39) == t.HTTOPLEFT &&
+          hit_in(ch, 16, 40) == t.HTLEFT && hit_in(ch, 39, 16) == t.HTTOPLEFT && hit_in(ch, 40, 16) == t.HTTOP);
+    check("each corner", hit_in(ch, 283, 16) == t.HTTOPRIGHT && hit_in(ch, 16, 183) == t.HTBOTTOMLEFT &&
+          hit_in(ch, 283, 183) == t.HTBOTTOMRIGHT && hit_in(ch, 260, 183) == t.HTBOTTOMRIGHT && hit_in(ch, 259, 183) == t.HTBOTTOM);
+    check("its shadow beyond the reach: what lies beneath's", hit_in(ch, 15, 100) == t.HTTRANSPARENT &&
+          hit_in(ch, 284, 100) == t.HTTRANSPARENT);
+    check("maximized: no edges", device.set_maximized(&csd, 1) == 1 && hit_in(ch, 20, 100) == t.HTCLIENT);
+    device.set_maximized(&csd, 0);
+    // The user presses on its right edge and drags it 50 pixels out: the
+    // system's own loop resizes it.
+    let is i64 as edge_at = screen_point_in(ch, 280, 100);
+    drag_x = edge_at & 65535; drag_y = (edge_at >> 16) & 65535;
+    timer_step = 0;
+    mouse(drag_x, drag_y, 0);
+    let is i64 as settle = time.now_ms();
+    while (time.now_ms() - settle < 100) { device.pump(&csd); time.sleep_ms(5); }
+    u.SetTimer(0, 0, 60, abi.address(&timers, 0));
+    mouse(drag_x, drag_y, t.MOUSEEVENTF_LEFTDOWN);
+    let is i64 as resize_until = time.now_ms() + 3000;
+    while (timer_step < 3 && time.now_ms() < resize_until) { device.pump(&csd); time.sleep_ms(5); }
+    device.pump(&csd);
+    check("resized by the system from its edge", device.width(&csd) == 350 && device.height(&csd) == 200);
+    check("the press never the program's", device.button_down(&csd, 1) == 0);
+    device.close(&csd);
+
+    // --- Seen through where its alpha says ---
+    let is device.Config as gc = device.config("seen through", 120, 80);
+    gc.decorated = 0;
+    gc.transparent = 1;
+    let is device.Window as glass = device.open_config(&gc);
+    let is i64 as gh = glass.win32_win.hwnd;
+    check("a layered window", device.transparent(&glass) == 1 &&
+          (u.GetWindowLongPtrW(gh, cast(i32, t.GWL_EXSTYLE)) & t.WS_EX_LAYERED) != 0);
+    let is tgt.Target as pane = device.acquire(&glass);
+    if (cast(i64, pane.color) != 0) {
+        let is i64 as py2 with mut = 0;
+        while (py2 < 80) {
+            let is i64 as px2 with mut = 0;
+            while (px2 < 120) {
+                // Clear; an opaque red square; a half-seen green one, its
+                // colour premultiplied by its alpha.
+                let is u32 as v with mut = cast(u32, 0);
+                if (px2 >= 10 && px2 < 30 && py2 >= 10 && py2 < 30) { v = cast(u32, 4278190335); }
+                if (px2 >= 50 && px2 < 70 && py2 >= 10 && py2 < 30) { v = cast(u32, 2147516416); }
+                tgt.put(&pane, px2, py2, v);
+                px2 = px2 + 1;
+            }
+            py2 = py2 + 1;
+        }
+        device.submit(&glass);
+        // A layered window has no surface of its own to read back: the
+        // screen's is what the system shows. Its opaque square is exact
+        // there, red and not blue; how the half-seen one blends is the
+        // compositor's (transparent_win32_test, Wine on a Wayland one).
+        let is i64 as sdc = u.GetDC(0);
+        let is i64 as red_at = screen_point_in(gh, 15, 15);
+        check("given to the system in its colours",
+              g.GetPixel(sdc, cast(i32, red_at & 65535), cast(i32, red_at >> 16)) == cast(u32, 255));
+        u.ReleaseDC(0, sdc);
+    }
+    check("framed by the system, not seen through", device.set_decorated(&glass, 1) == 1 && device.transparent(&glass) == 0 &&
+          (u.GetWindowLongPtrW(gh, cast(i32, t.GWL_EXSTYLE)) & t.WS_EX_LAYERED) == 0);
+    device.close(&glass);
+    gc.decorated = 1;
+    let is device.Window as framed = device.open_config(&gc);
+    check("a framed window asked to be seen through is not", device.is_open(&framed) == 1 && device.transparent(&framed) == 0 &&
+          (u.GetWindowLongPtrW(framed.win32_win.hwnd, cast(i32, t.GWL_EXSTYLE)) & t.WS_EX_LAYERED) == 0);
+    device.close(&framed);
+    drain();
 
     // --- An owned, modal dialog ---
     let is device.Config as dc = device.config("dialog", 160, 80);

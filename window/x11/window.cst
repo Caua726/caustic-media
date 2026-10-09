@@ -235,6 +235,12 @@ struct Window {
     popup  as i32;      // a popup's kind, 0 for a window
     grabbing as i32;    // holds the pointer and keyboard grab (top of the stack)
     popup_done as i32;  // taken down by a press outside the program's popups
+    // The floor and ceiling asked since open, physical pixels, 0 for none:
+    // WM_NORMAL_HINTS carries both, so each is sent with the other.
+    floor_w as i64;
+    floor_h as i64;
+    ceiling_w as i64;
+    ceiling_h as i64;
 }
 
 // One scratch event for the pump. The pump is not reentrant and neither is X11
@@ -412,22 +418,47 @@ fn _set_size_hints(w as *Window, d as *u8, c as *Config) as void {
     xutil.XSetWMNormalHints(d, w.xid, cast(*u8, &h));
 }
 
-// The smallest the window manager is asked to let the window be, from now
-// on: width by height, 0 by 0 for no floor. What a layout cannot fit into
-// changes after the window is open, so it is asked again, as WM_NORMAL_HINTS
-// with only PMinSize — the size asked at open has been read by then. A
-// fixed window keeps its size as its floor: 0, nothing sent. 1 when sent.
-fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
-    if (w.ok == 0 || w.fixed == 1) { return 0; }
+// The floor and ceiling as asked, in one WM_NORMAL_HINTS — the size asked at
+// open has been read by then: PMinSize where there is a floor, PMaxSize where
+// there is a ceiling, an axis with none of it as large as X has.
+fn _send_bounds(w as *Window) as void {
     let is xutil.XSizeHints as h;
     mem.memset(cast(*u8, &h), 0, sizeof(xutil.XSizeHints));
-    if (width > 0 || height > 0) {
-        h.flags = xutil.PMinSize;
-        h.min_width = cast(i32, width);
-        h.min_height = cast(i32, height);
+    if (w.floor_w > 0 || w.floor_h > 0) {
+        h.flags = h.flags | xutil.PMinSize;
+        h.min_width = cast(i32, w.floor_w);
+        h.min_height = cast(i32, w.floor_h);
+    }
+    if (w.ceiling_w > 0 || w.ceiling_h > 0) {
+        h.flags = h.flags | xutil.PMaxSize;
+        h.max_width = 32767;
+        h.max_height = 32767;
+        if (w.ceiling_w > 0) { h.max_width = cast(i32, w.ceiling_w); }
+        if (w.ceiling_h > 0) { h.max_height = cast(i32, w.ceiling_h); }
     }
     xutil.XSetWMNormalHints(w.display, w.xid, cast(*u8, &h));
     xlib.XFlush(w.display);
+}
+
+// The smallest the window manager is asked to let the window be, from now
+// on: width by height, 0 by 0 for no floor. What a layout cannot fit into
+// changes after the window is open, so it is asked again. A fixed window
+// keeps its size as its floor: 0, nothing sent. 1 when sent.
+fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
+    if (w.ok == 0 || w.fixed == 1 || width < 0 || height < 0) { return 0; }
+    w.floor_w = width;
+    w.floor_h = height;
+    _send_bounds(w);
+    return 1;
+}
+
+// The largest, likewise: 0 by 0 for no ceiling, 0 on one axis for none
+// along it. A fixed window keeps its size as its ceiling: 0, nothing sent.
+fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
+    if (w.ok == 0 || w.fixed == 1 || width < 0 || height < 0) { return 0; }
+    w.ceiling_w = width;
+    w.ceiling_h = height;
+    _send_bounds(w);
     return 1;
 }
 
@@ -447,6 +478,21 @@ fn min_size(w as *Window, width as *i64, height as *i64) as i32 {
     return 1;
 }
 
+// The ceiling it says, likewise.
+fn max_size(w as *Window, width as *i64, height as *i64) as i32 {
+    *width = 0;
+    *height = 0;
+    if (w.ok == 0) { return 0; }
+    let is xutil.XSizeHints as h;
+    mem.memset(cast(*u8, &h), 0, sizeof(xutil.XSizeHints));
+    let is i64 as supplied with mut = 0;
+    if (xutil.XGetWMNormalHints(w.display, w.xid, cast(*u8, &h), cast(*u8, &supplied)) == 0) { return 0; }
+    if ((h.flags & xutil.PMaxSize) == 0) { return 0; }
+    *width = cast(i64, h.max_width);
+    *height = cast(i64, h.max_height);
+    return 1;
+}
+
 fn open_with(c as *Config) as Window {
     let is Window as w;
     w.display = cast(*u8, 0); w.xid = 0; w.gc = cast(*u8, 0);
@@ -456,6 +502,7 @@ fn open_with(c as *Config) as Window {
     w.dropped = 0; w.frames = 0; w.framed = 0; w.err = OK; w.ok = 0; w.argb = 0;
     w.fixed = cast(i32, c.resizable == 0);
     w.popup = c.popup; w.grabbing = 0; w.popup_done = 0;
+    w.floor_w = c.min_width; w.floor_h = c.min_height; w.ceiling_w = 0; w.ceiling_h = 0;
     // Where it is made: a popup at its place on the root, a window wherever the
     // window manager puts it.
     let is i32 as px with mut = 0;
@@ -715,6 +762,9 @@ fn _display_release() as void {
     _display_refs = _display_refs - 1;
     if (_display_refs == 0 && cast(i64, _display) != 0) {
         _xs_on = 0;
+        // Followed on that connection only: the next one is followed anew.
+        _cm_event = 0;
+        _cm_selection = 0;
         xlib.XCloseDisplay(_display);
         _display = cast(*u8, 0);
     }
@@ -928,6 +978,29 @@ fn read_settings(w as *Window, out as *settings.Settings) as i32 {
     return 1;
 }
 
+// A compositing manager starting or stopping, as XFixes reports it — once a
+// module that links libXfixes asked for it (compositor.cst, which the
+// toolkit's display.cst uses): the event type and selection to know it by.
+// This file never calls XFixes itself, so a window program that does not
+// follow the compositor never needs the library.
+let is i32 as _cm_event with mut = 0;
+let is i64 as _cm_selection with mut = 0;
+
+fn follow_compositor(event_type as i32, selection as i64) as void {
+    _cm_event = event_type;
+    _cm_selection = selection;
+}
+
+// Whether the connection's compositing manager is followed already.
+fn following_compositor() as i32 { return cast(i32, _cm_event != 0); }
+
+// XFixesSelectionNotifyEvent's selection, after type, serial, send_event,
+// display, window, subtype and owner.
+fn _cm_changed(e as *xev.XEvent) as i32 {
+    if (_cm_event == 0 || xev.kind(e) != _cm_event) { return 0; }
+    return cast(i32, *cast(*i64, cast(i64, e) + 56) == _cm_selection);
+}
+
 fn _pump(w as *Window, block as i32) as void {
     _ensure_registered(w);
     let is i32 as first with mut = block;
@@ -943,6 +1016,15 @@ fn _pump(w as *Window, block as i32) as void {
             xev.clear(&note);
             xev.any(&note).kind = events.XSETTINGS_CHANGED;
             _ring_push(w, &note);
+        }
+        // The compositing manager's selection changing hands: the screen's,
+        // told to the one pumping, as the settings are.
+        if (_cm_changed(&_scratch) == 1) {
+            let is xev.XEvent as cm;
+            xev.clear(&cm);
+            xev.any(&cm).kind = events.COMPOSITOR_NOTE;
+            _ring_push(w, &cm);
+            continue;
         }
 
         // A popup holding the grab decides first where a press belongs.
@@ -1628,11 +1710,12 @@ fn tiled(w as *Window) as i32 { return frame.tiled(&w.frst, w.display, w.xid); }
 // transparent.
 fn composited(w as *Window) as i32 { return frame.composited(w.display, w.screen); }
 
-// Its state as the window manager has it: maximized, full screen, tiled
-// sides (frame.STATE_* bits).
+// Its state as the window manager has it: maximized, full screen, minimized,
+// tiled sides (frame.STATE_* bits).
 fn state(w as *Window) as i32 {
     let is i32 as s with mut = tiled(w);
     if (maximized(w) == 1) { s = s | frame.STATE_MAXIMIZED; }
     if (fullscreen(w) == 1) { s = s | frame.STATE_FULLSCREEN; }
+    if (minimized(w) == 1) { s = s | frame.STATE_MINIMIZED; }
     return s;
 }

@@ -24,7 +24,9 @@ window/
   window.cst      hub
   device.cst      our portable window: open, next_frame, acquire, submit, close;
                   title, shown, its place, its icon, the clipboard
-  display.cst     the screen's DPI: a window's scale
+  display.cst     the screen a window is on: its scale, its monitor (monitor.cst),
+                  its compositing manager followed
+  monitor.cst     a monitor as a platform says it: place, work area, scale, name
   event.cst       raw platform events and the queue they arrive in
   wait.cst        the loop's one place to sleep: events, descriptors, wake-ups, time
   positioner.cst  where a popup goes: xdg_positioner as geometry, the
@@ -451,8 +453,11 @@ where said:
   or the input method's); every key, button and wheel event the modifiers
   held as `keys.MOD_*` name them, X's bits translated (they number them
   otherwise: X's Control is the portable Caps Lock's bit); `STATE` says the
-  window manager's state of the
-  window; `CLOSE` its close button — `keep_open` when the program says no.
+  window manager's state of the window — maximized, full screen, minimized
+  (`STATE_MINIMIZED`: X11's `_NET_WM_STATE_HIDDEN`, Windows' `SIZE_MINIMIZED`,
+  Wayland's `suspended`, its size kept meanwhile), tiled sides;
+  `COMPOSITOR` that a compositing manager started or stopped; `CLOSE` its
+  close button — `keep_open` when the program says no.
 - `device.set_title` in UTF-8: `_NET_WM_NAME`, and `WM_NAME` in Latin-1 for
   an old window manager, each sequence whole or a `?`; `show`, `hide`,
   `activate`, `position` on the screen, `set_icon`; `clipboard_set`,
@@ -486,7 +491,14 @@ where said:
   the toolkit's `tree.SHAPE_*` — from the user's theme by the freedesktop
   cursor spec's names, which are CSS's, or the X cursor font's nearest glyph;
   NONE hides the pointer. `display.cst`: the DPI — Xft.dpi, else the primary
-  monitor's size, else 96 — over 96 is a window's scale (`pointer_x11_test`).
+  monitor's size, else 96 — over 96 is a window's scale (`pointer_x11_test`);
+  the monitor a window is on (`monitor_of`, `monitor.cst`: its place and work
+  area, the window's scale there, refresh rate, name, primary) — X11's RandR
+  monitor showing most of it, its work area the window manager's
+  `_NET_WORKAREA` within it (`display_x11_test`), Wayland's output the
+  surface entered as `wl_output` describes it (`subsurface_test scales`, two
+  outputs), Windows' `MonitorFromWindow`, `GetDpiForMonitor`,
+  `EnumDisplaySettingsW` (`device_win32_test`).
   Neither is imported by `device.cst`: they link libXcursor, libXfixes, libXi
   and libXrandr, which a program that sets no cursor does not need.
 - A frame of the program's own (`device.cst`, `x11/frame.cst`): a window
@@ -501,15 +513,21 @@ where said:
   `_NET_WM_STATE`); its state with the tiled sides (`state`); and whether a
   compositing manager shows what is behind it (`composited`,
   `_NET_WM_CM_S<screen>`'s owner), without which the frame is drawn flat.
+  Its starting or stopping is heard as it happens once `display.follow` was
+  told of a window (`x11/compositor.cst`: XFixes, followed anew on a
+  connection opened again), a `COMPOSITOR` event; the toolkit then draws the
+  frame flat or with its shadow, the platform's window grown or shrunk by the
+  shadow so the window keeps its size (`host_x11_test`).
   Tested by `device_x11_test` and `x11/frame_test`, a second client holding
   the map and playing the window manager and the compositing manager.
-  Wayland's `xdg-decoration` and Windows' `WM_NCCALCSIZE` come with their
-  backends.
-- The smallest a window may be made (`set_min_size`, `min_size`): asked again
-  whenever it changes — what a layout cannot fit into changes after the
-  window is open — as `WM_NORMAL_HINTS` with only `PMinSize`, read back from
-  the server; a fixed window keeps its size as its floor. Tested by
-  `x11/wm_test` and `device_x11_test`.
+  Wayland's `xdg-decoration` and Windows' layered windows and hit-testing come
+  with their backends.
+- The smallest and largest a window may be made (`set_min_size`, `min_size`,
+  `set_max_size`): asked again whenever they change — what a layout cannot
+  fit into changes after the window is open — as `WM_NORMAL_HINTS`, floor and
+  ceiling kept together so neither request erases the other, read back from
+  the server; a fixed window keeps its size as both. Tested by `x11/wm_test`
+  and `device_x11_test`.
 
 **Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
 the system's and the user's font directories, and where the font index is

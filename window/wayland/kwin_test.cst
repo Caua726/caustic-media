@@ -1,0 +1,194 @@
+// window/wayland/kwin_test.cst — a window on KWin, a compositor that
+// decorates windows itself, tiles them and scales by fractions:
+//   sh window/wayland/tools/run_kwin.sh ./build/wayland_kwin_test
+// asks for its decoration (xdg-decoration: the server's, then its own, then
+// the server's again); is tiled to the left half by a KWin script, as
+// Meta+Left would, then taken out of its tile, back to the size it had; and
+// is minimized and shown again (xdg_toplevel's suspended);
+//   sh window/x11/tools/run_headless.sh env KWIN_BACKEND=x11 KWIN_SCALE=1.5 \
+//       sh window/wayland/tools/run_kwin.sh ./build/wayland_kwin_test fractional
+// opens at the output's fractional scale (wp_fractional_scale, wp_viewport):
+// its buffer in physical pixels, shown at its logical size — the screen read
+// back from the X server KWin is nested in.
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/process.cst" as process;
+use "backend.cst" as wayland;
+use "../event.cst" as event;
+use "../monitor.cst" as monitor;
+use "../../gpu/software/target.cst" as tgt;
+use "../x11/bind/xlib.cst" as xlib;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is wayland.Window as w with mut;
+
+fn fill(colour as u32) as void {
+    wayland.pump(&w);
+    let is tgt.Target as t = wayland.acquire(&w);
+    if (cast(i64, t.color) == 0) { return; }
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) { *cast(*u32, cast(i64, t.color) + i * 4) = colour; i = i + 1; }
+    wayland.submit(&w);
+}
+
+// Pumped for ms, drawn each time it was resized.
+fn settle(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        wayland.pump(&w);
+        if (wayland.resized(&w) == 1) { fill(cast(u32, 4278190335)); }
+        time.sleep_ms(10);
+    }
+}
+
+// The last STATE said within ms, or -1.
+fn state_within(ms as i64, want as i32) as i32 {
+    let is i64 as until = time.now_ms() + ms;
+    let is event.Event as e;
+    let is i32 as last with mut = 0 - 1;
+    while (time.now_ms() < until) {
+        wayland.pump(&w);
+        while (wayland.poll_event(&w, &e) == 1) {
+            if (e.kind == event.STATE) { last = e.state; }
+            if (e.kind == event.RESIZE) { fill(cast(u32, 4278190335)); }
+        }
+        if (last == want) { return last; }
+        time.sleep_ms(10);
+    }
+    return last;
+}
+
+fn kwin_script(file as *u8) as i32 {
+    let is [4]*u8 as argv;
+    argv[0] = "sh";
+    argv[1] = "window/wayland/tools/kwin_script.sh";
+    argv[2] = file;
+    argv[3] = cast(*u8, 0);
+    let is i64 as pid = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (pid <= 0) { return 0; }
+    return cast(i32, process.wait_pid(pid) == 0);
+}
+
+fn decorations_and_tiling() as void {
+    check("a window", wayland.open(&w, "kwin", 300, 200) == 1);
+    fill(cast(u32, 4278190335));
+    settle(500);
+    // --- Its decoration: asked, as the compositor grants it ---
+    check("the server's decoration, asked for: granted", wayland.decorated(&w) == 1);
+    check("its own asked for", wayland.set_decorated(&w, 0) == 1);
+    settle(300);
+    check("granted: its own frame to draw", wayland.decorated(&w) == 0);
+    wayland.set_decorated(&w, 1);
+    settle(300);
+    check("the server's again", wayland.decorated(&w) == 1);
+
+    // --- Tiled to the left half by the compositor, and back ---
+    // With a frame of its own, as a tiled window's frame changes with it:
+    // the tile is all of the window then.
+    wayland.set_decorated(&w, 0);
+    settle(300);
+    let is i64 as normal_w = wayland.width(&w);
+    let is i64 as normal_h = wayland.height(&w);
+    let is monitor.Monitor as out;
+    check("its output", wayland.monitor_of(&w, &out) == 1 && out.width > 0);
+    check("tiled by a script, as Meta+Left does", kwin_script("window/wayland/testdata/kwin/quick-tile-left.js") == 1);
+    let is i32 as tiled = state_within(2000, event.STATE_TILED_LEFT | event.STATE_TILED_TOP | event.STATE_TILED_BOTTOM);
+    check("said: tiled at the left, top and bottom",
+          tiled == (event.STATE_TILED_LEFT | event.STATE_TILED_TOP | event.STATE_TILED_BOTTOM));
+    settle(300);
+    check("the left half of the output", wayland.width(&w) == out.width / 2 && wayland.height(&w) == out.height);
+    check("taken out of its tile", kwin_script("window/wayland/testdata/kwin/untile.js") == 1);
+    check("said: no side tiled", state_within(2000, 0) == 0);
+    settle(300);
+    check("as large as it was", wayland.width(&w) == normal_w && wayland.height(&w) == normal_h);
+
+    // --- Minimized and shown again: suspended, as xdg_toplevel 6 says it ---
+    check("minimized by a script", kwin_script("window/wayland/testdata/kwin/minimize.js") == 1);
+    check("said: minimized", state_within(2000, event.STATE_MINIMIZED) == event.STATE_MINIMIZED);
+    settle(200);
+    check("its size kept meanwhile", wayland.width(&w) == normal_w && wayland.height(&w) == normal_h);
+    check("shown again by a script", kwin_script("window/wayland/testdata/kwin/unminimize.js") == 1);
+    check("said: shown", state_within(2000, 0) == 0);
+    settle(200);
+    check("as large as it was still", wayland.width(&w) == normal_w && wayland.height(&w) == normal_h);
+    wayland.close(&w);
+}
+
+let is *u8 as xd with mut;
+
+fn pixel(x as i64, y as i64) as i64 {
+    let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, x), cast(i32, y), cast(u32, 1), cast(u32, 1), 0 - 1, 2);
+    if (cast(i64, img) == 0) { return 0 - 1; }
+    let is i64 as v = xlib.XGetPixel(img, 0, 0) & 16777215;
+    xlib.XDestroyImage(img);
+    return v;
+}
+
+fn fractional() as void {
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, xd) == 0) { io.printf("FAIL: no X screen to read back\n"); fails = fails + 1; return; }
+    let is wayland.Options as o with mut = wayland.options();
+    o.decorated = 0;
+    check("a window", wayland.open_config(&w, "fractional", 300, 200, &o) == 1);
+    settle(500);
+    check("at the output's scale, 1.5", wayland.scale(&w) == 180);
+    check("its buffer in physical pixels", wayland.width(&w) == 450 && wayland.height(&w) == 300);
+    // Green, then found on the screen and measured: as many pixels as its
+    // buffer has, not scaled again.
+    wayland.pump(&w);
+    let is tgt.Target as t = wayland.acquire(&w);
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) { *cast(*u32, cast(i64, t.color) + i * 4) = cast(u32, 4278255360); i = i + 1; }
+    wayland.submit(&w);
+    settle(500);
+    let is i64 as gx with mut = 0 - 1;
+    let is i64 as gy with mut = 0 - 1;
+    let is *u8 as shot = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), 0, 0, cast(u32, 1280), cast(u32, 1024), 0 - 1, 2);
+    if (cast(i64, shot) != 0) {
+        let is i64 as y with mut = 0;
+        while (y < 1024 && gx < 0) {
+            let is i64 as x with mut = 0;
+            while (x < 1280 && gx < 0) {
+                if ((xlib.XGetPixel(shot, cast(i32, x), cast(i32, y)) & 16777215) == 65280) { gx = x; gy = y; }
+                x = x + 2;
+            }
+            y = y + 2;
+        }
+        xlib.XDestroyImage(shot);
+    }
+    check("shown", gx >= 0);
+    if (gx >= 0) {
+        while (gx > 0 && pixel(gx - 1, gy) == 65280) { gx = gx - 1; }
+        while (gy > 0 && pixel(gx, gy - 1) == 65280) { gy = gy - 1; }
+        let is i64 as gw with mut = 0;
+        while (pixel(gx + gw, gy) == 65280) { gw = gw + 1; }
+        let is i64 as gh with mut = 0;
+        while (pixel(gx, gy + gh) == 65280) { gh = gh + 1; }
+        io.printf("  shown %d by %d at %d,%d\n", gw, gh, gx, gy);
+        check("its 300 by 200 logical pixels shown as 450 by 300", gw == 450 && gh == 300);
+    }
+    wayland.close(&w);
+    xlib.XCloseDisplay(xd);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() > 1) { fractional(); } else { decorations_and_tiling(); }
+    if (fails == 0) {
+        io.printf("wayland on kwin: all checks passed\n");
+        return 0;
+    }
+    io.printf("wayland on kwin: %d failures\n", fails);
+    return 1;
+}

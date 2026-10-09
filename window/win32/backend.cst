@@ -12,7 +12,9 @@ use "abi.cst" as abi;
 use "clipboard.cst" as clipboard;
 use "bind/dwmapi.cst" as dwm;
 use "bind/shell32.cst" as shell;
+use "bind/shcore.cst" as sh;
 use "settings.cst" as desktop_settings;
+use "../monitor.cst" as monitor;
 
 let is i32 as OK with imut = 0;
 let is i32 as NO_WINDOW with imut = 1;
@@ -92,6 +94,15 @@ struct Native {
     bitmap as i64;
     pixels as *u8;
     dib as DIBInfo;
+    // Seen through where its alpha says (WS_EX_LAYERED): each frame given to
+    // the system with UpdateLayeredWindow from a second DIB, the frame's
+    // premultiplied RGBA as the BGRA the system blends.
+    layered as i32;
+    layer_dc as i64;
+    layer_bitmap as i64;
+    layer_pixels as *u8;
+    layer_width as i64;
+    layer_height as i64;
     clip as clipboard.State;
     event_head as i64;
     event_len as i64;
@@ -120,6 +131,9 @@ struct Config {
     grab as i32;
     x as i64;
     y as i64;
+    // Seen through where its pixels' alpha is below 255 — the shadow round a
+    // frame of the program's own: an undecorated window or a popup only.
+    transparent as i32;
 }
 
 struct Window {
@@ -345,6 +359,99 @@ fn _paint(n as *Native) as void {
     u.EndPaint(n.hwnd, &ps);
 }
 
+fn _drop_layer(n as *Native) as void {
+    if (n.layer_dc != 0) { g.DeleteDC(n.layer_dc); n.layer_dc = 0; }
+    if (n.layer_bitmap != 0) { g.DeleteObject(n.layer_bitmap); n.layer_bitmap = 0; }
+    n.layer_pixels = cast(*u8, 0);
+    n.layer_width = 0;
+    n.layer_height = 0;
+}
+
+// The frame given to the system to blend over what is behind the window: its
+// premultiplied RGBA as the premultiplied BGRA UpdateLayeredWindow takes, the
+// whole window (a layered window here has no frame of the system's round it).
+// 1 when given.
+fn _present_layer(n as *Native) as i32 {
+    if (n.width <= 0 || n.height <= 0 || cast(i64, n.pixels) == 0) { return 0; }
+    if (n.layer_width != n.width || n.layer_height != n.height || cast(i64, n.layer_pixels) == 0) {
+        _drop_layer(n);
+        let is t.BITMAPINFO as bmi;
+        mem.memzero(cast(*u8, &bmi), sizeof(t.BITMAPINFO));
+        bmi.bmiHeader.biSize = cast(u32, sizeof(t.BITMAPINFOHEADER));
+        bmi.bmiHeader.biWidth = cast(i32, n.width);
+        bmi.bmiHeader.biHeight = cast(i32, 0 - n.height);
+        bmi.bmiHeader.biPlanes = cast(u16, 1);
+        bmi.bmiHeader.biBitCount = cast(u16, 32);
+        bmi.bmiHeader.biCompression = cast(u32, t.BI_RGB);
+        n.layer_bitmap = g.CreateDIBSection(0, &bmi, cast(u32, t.DIB_RGB_COLORS), &n.layer_pixels, 0, 0);
+        if (n.layer_bitmap == 0 || cast(i64, n.layer_pixels) == 0) { _drop_layer(n); return 0; }
+        n.layer_dc = g.CreateCompatibleDC(0);
+        if (n.layer_dc == 0) { _drop_layer(n); return 0; }
+        g.SelectObject(n.layer_dc, n.layer_bitmap);
+        n.layer_width = n.width;
+        n.layer_height = n.height;
+    }
+    let is *u32 as from = cast(*u32, n.pixels);
+    let is *u32 as to = cast(*u32, n.layer_pixels);
+    let is i64 as count = n.width * n.height;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is u32 as v = from[i];
+        // Alpha and green stay; red and blue change places.
+        to[i] = (v & cast(u32, 4278255360)) | ((v & cast(u32, 255)) << 16) | ((v >> 16) & cast(u32, 255));
+        i = i + 1;
+    }
+    let is [2]i32 as size;
+    size[0] = cast(i32, n.width);
+    size[1] = cast(i32, n.height);
+    let is t.POINT as origin;
+    origin.x = 0;
+    origin.y = 0;
+    let is t.BLENDFUNCTION as blend;
+    blend.BlendOp = cast(u8, t.AC_SRC_OVER);
+    blend.BlendFlags = cast(u8, 0);
+    blend.SourceConstantAlpha = cast(u8, 255);
+    blend.AlphaFormat = cast(u8, t.AC_SRC_ALPHA);
+    return cast(i32, u.UpdateLayeredWindow(n.hwnd, 0, cast(*t.POINT, 0), cast(*u8, &size), n.layer_dc, &origin,
+                                           cast(u32, 0), &blend, cast(u32, t.ULW_ALPHA)) != 0);
+}
+
+// What a press at hx, hy of the client resizes, as WM_NCHITTEST answers it,
+// for a frame of the program's own: between the window as the desktop counts
+// it (inside the frame extents) and the edge of the input region — its edges'
+// reach beyond it. A corner takes twice that reach along each side, as the
+// toolkit's frame does. 0 elsewhere, and for a window the system frames, a
+// popup, one of fixed size, or one maximized or full screen.
+fn _edge(n as *Native, hx as i64, hy as i64) as i64 {
+    if (n.decorated != 0 || n.popup != 0 || n.fixed == 1 ||
+        (n.state & (event.STATE_MAXIMIZED | event.STATE_FULLSCREEN)) != 0) { return 0; }
+    let is i64 as left = n.extent_left;
+    let is i64 as right = n.width - n.extent_right;
+    let is i64 as top = n.extent_top;
+    let is i64 as bottom = n.height - n.extent_bottom;
+    if (hx >= left && hx < right && hy >= top && hy < bottom) { return 0; }
+    let is i32 as west with mut = cast(i32, hx < left);
+    let is i32 as east with mut = cast(i32, hx >= right);
+    let is i32 as north with mut = cast(i32, hy < top);
+    let is i32 as south with mut = cast(i32, hy >= bottom);
+    if (west == 1 || east == 1) {
+        if (hy < top + 2 * (top - n.region_y)) { north = 1; }
+        if (hy >= bottom - 2 * (n.region_y + n.region_h - bottom)) { south = 1; }
+    }
+    if (north == 1 || south == 1) {
+        if (hx < left + 2 * (left - n.region_x)) { west = 1; }
+        if (hx >= right - 2 * (n.region_x + n.region_w - right)) { east = 1; }
+    }
+    if (north == 1 && west == 1) { return t.HTTOPLEFT; }
+    if (north == 1 && east == 1) { return t.HTTOPRIGHT; }
+    if (south == 1 && west == 1) { return t.HTBOTTOMLEFT; }
+    if (south == 1 && east == 1) { return t.HTBOTTOMRIGHT; }
+    if (north == 1) { return t.HTTOP; }
+    if (south == 1) { return t.HTBOTTOM; }
+    if (west == 1) { return t.HTLEFT; }
+    return t.HTRIGHT;
+}
+
 fn _ime_text(n as *Native, h as i64, index as i32, kind as i32) as void {
     let is i32 as bytes = ime.ImmGetCompositionStringW(h, cast(u32, index), cast(*u8, 0), 0);
     if (bytes < 0 || (bytes % 2) != 0) { return; }
@@ -526,6 +633,9 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         if (hx < n.region_x || hy < n.region_y || hx >= n.region_x + n.region_w || hy >= n.region_y + n.region_h) {
             return t.HTTRANSPARENT;
         }
+        // An edge of a frame of its own: the system's to resize from.
+        let is i64 as edge = _edge(n, hx, hy);
+        if (edge != 0) { return edge; }
     }
     if (cast(i64, msg) == _WM_WINDOW_MENU) { _window_menu(n, lp); return 0; }
     if (_ngrab > 0) {
@@ -573,18 +683,24 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
     if (cast(i64, msg) == t.WM_ERASEBKGND) { return 1; }
     if (cast(i64, msg) == t.WM_CLOSE) { n.asked = 1; _emit(n, event.CLOSE, cast(i32, msg), 0, 0, 0); return 0; }
     if (cast(i64, msg) == t.WM_SIZE) {
+        let is i32 as was = n.state;
+        if (wp == cast(u64, t.SIZE_MINIMIZED)) {
+            // Not shown: the size it says is no size, and is not taken.
+            n.state = n.state | event.STATE_MINIMIZED;
+            if (n.state != was) { _emit(n, event.STATE, cast(i32, msg), 0, 0, n.state); }
+            return 0;
+        }
         let is i64 as nw = cast(i64, lp & 65535);
         let is i64 as nh = cast(i64, (lp >> 16) & 65535);
         let is i64 as ow = n.width; let is i64 as oh = n.height;
         if (_dib(n, nw, nh) == 0) { n.width = 0; n.height = 0; }
         if (ow != n.width || oh != n.height) { n.resized = 1; _emit(n, event.RESIZE, cast(i32, msg), 0, 0, 0); }
         if (wp == cast(u64, t.SIZE_MAXIMIZED)) {
-            n.state = n.state | event.STATE_MAXIMIZED;
-            _emit(n, event.STATE, cast(i32, msg), 0, 0, n.state);
-        } else if (wp == 0) {
-            n.state = n.state & cast(i32, 0 - 2);
-            _emit(n, event.STATE, cast(i32, msg), 0, 0, n.state);
+            n.state = (n.state | event.STATE_MAXIMIZED) & cast(i32, 0 - 1 - event.STATE_MINIMIZED);
+        } else if (wp == cast(u64, t.SIZE_RESTORED)) {
+            n.state = n.state & cast(i32, 0 - 1 - event.STATE_MAXIMIZED - event.STATE_MINIMIZED);
         }
+        if (n.state != was) { _emit(n, event.STATE, cast(i32, msg), 0, 0, n.state); }
         return 0;
     }
     if (cast(i64, msg) == t.WM_DPICHANGED) {
@@ -595,9 +711,13 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         let is event.Event as e; event.clear(&e); e.kind = event.RESIZE; e.raw_kind = cast(i32, msg);
         e.width = n.width; e.height = n.height; _enqueue(n, &e);
         n.resized = 1;
+        // Its scale changed: what reads it is to read it again, as on Wayland.
+        _emit(n, event.SETTINGS, cast(i32, msg), 0, 0, 0);
         return 0;
     }
     if (cast(i64, msg) == t.WM_SETTINGCHANGE) { _emit(n, event.SETTINGS, cast(i32, msg), 0, 0, 0); return 0; }
+    // Desktop composition turned on or off (Windows 7; always on since 8).
+    if (cast(i64, msg) == t.WM_DWMCOMPOSITIONCHANGED) { _emit(n, event.COMPOSITOR, cast(i32, msg), 0, 0, 0); return 0; }
     if (cast(i64, msg) == t.WM_SETFOCUS) { n.focused = 1; _emit(n, event.FOCUS_IN, cast(i32, msg), 0, 0, 0); return 0; }
     if (cast(i64, msg) == t.WM_KILLFOCUS) {
         n.focused = 0; n.high_surrogate = 0;
@@ -720,7 +840,7 @@ fn _ensure_class() as i32 {
 fn config(title as *u8, width as i64, height as i64) as Config {
     let is Config as c; c.title = title; c.width = width; c.height = height;
     c.resizable = 1; c.owner = 0; c.dialog = 0; c.modal = 0; c.decorated = 1; c.app_id = cast(*u8, 0);
-    c.popup = 0; c.grab = 0; c.x = 0; c.y = 0;
+    c.popup = 0; c.grab = 0; c.x = 0; c.y = 0; c.transparent = 0;
     return c;
 }
 
@@ -751,13 +871,21 @@ fn open_config(c as *Config) as Window {
     let is u32 as style with mut = cast(u32, t.WS_OVERLAPPEDWINDOW);
     if (c.decorated == 0) { style = cast(u32, t.WS_POPUP | t.WS_VISIBLE); }
     if (c.resizable == 0) { style = cast(u32, cast(i64, style) & (0 - 262145)); }
-    if (c.dialog == 1) { style = cast(u32, t.WS_CAPTION | t.WS_SYSMENU | t.WS_VISIBLE); }
+    // A dialog the system frames: a caption and a close button, no more. One
+    // drawing its own frame is as frameless as any such window.
+    if (c.dialog == 1 && c.decorated != 0) { style = cast(u32, t.WS_CAPTION | t.WS_SYSMENU | t.WS_VISIBLE); }
     // A popup: no frame, no taskbar entry, never activated — the owner keeps
     // the focus, and its keys come to the popup while it holds the capture.
     let is u32 as ex with mut = 0;
     if (c.popup != 0) {
         style = cast(u32, t.WS_POPUP);
         ex = cast(u32, t.WS_EX_TOOLWINDOW | t.WS_EX_NOACTIVATE);
+    }
+    // Seen through where its alpha says: only where the system draws no frame
+    // round it, for a layered window is all its own pixels.
+    if (c.transparent == 1 && (cast(i64, style) & t.WS_CAPTION) == 0) {
+        ex = ex | cast(u32, t.WS_EX_LAYERED);
+        n.layered = 1;
     }
     let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, c.width); r.bottom = cast(i32, c.height);
     if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { u.AdjustWindowRectEx(&r, style, 0, ex); }
@@ -802,6 +930,7 @@ fn close(w as *Window) as void {
     if (n.hwnd != 0 && u.IsWindow(n.hwnd) == 1) { u.DestroyWindow(n.hwnd); }
     if (n.hdc != 0) { g.DeleteDC(n.hdc); n.hdc = 0; }
     if (n.bitmap != 0) { g.DeleteObject(n.bitmap); n.bitmap = 0; }
+    _drop_layer(n);
     clipboard.clear(&n.clip);
     if (n.icon != 0) { u.DestroyIcon(n.icon); n.icon = 0; }
     let is i64 as queued with mut = 0;
@@ -853,8 +982,11 @@ fn acquire(w as *Window) as tgt.Target {
     if (cast(i64, n) == 0 || is_open(w) == 0) { out.color = cast(*u8, 0); out.depth = cast(*u8, 0); out.width = 0; out.height = 0; return out; }
     out.color = n.pixels; out.depth = cast(*u8, 0); out.width = n.width; out.height = n.height; return out;
 }
+// The frame drawn into acquire's target shown: painted from the DIB, or, for
+// a layered window, given to the system to blend.
 fn submit(w as *Window) as void {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.used == 0 || n.hwnd == 0) { return; }
+    if (n.layered == 1) { _present_layer(n); return; }
     u.InvalidateRect(n.hwnd, cast(*t.RECT, 0), 0); u.UpdateWindow(n.hwnd);
 }
 fn show(w as *Window) as void { if (is_open(w) == 1) { u.ShowWindow(w.hwnd, cast(i32, t.SW_SHOW)); } }
@@ -944,6 +1076,14 @@ fn set_decorated(w as *Window, on as i32) as i32 {
     if (on == 0) { next = next & (0 - 12582913); }
     else { next = next | t.WS_CAPTION | t.WS_SYSMENU; }
     u.SetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE), next);
+    // Framed by the system, it is not seen through: its frame is not its own
+    // pixels. Shown as painted from its next frame on.
+    if (on != 0 && n.layered == 1) {
+        u.SetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_EXSTYLE),
+                            u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_EXSTYLE)) & (0 - 1 - t.WS_EX_LAYERED));
+        n.layered = 0;
+        _drop_layer(n);
+    }
     u.SetWindowPos(w.hwnd, 0, 0, 0, 0, 0, cast(u32, t.SWP_NOMOVE | t.SWP_NOSIZE | t.SWP_NOZORDER | t.SWP_FRAMECHANGED));
     n.decorated = cast(i32, on != 0); return 1;
 }
@@ -983,7 +1123,9 @@ fn composited(w as *Window) as i32 {
     if (is_open(w) == 0 || dwm.DwmIsCompositionEnabled(&enabled) != 0) { return 0; }
     return cast(i32, enabled != 0);
 }
-fn transparent(w as *Window) as i32 { return 0; }
+// Whether its pixels' alpha shows what is behind it: Config.transparent, on a
+// window the system draws no frame round.
+fn transparent(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.layered; }
 
 fn set_cursor(w as *Window, shape as i32) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || shape < 1 || shape > 35) { return 0; }
@@ -1049,6 +1191,44 @@ fn popup_room(w as *Window, ox as *i64, oy as *i64, l as *i64, t_ as *i64, r as 
     if (u.GetMonitorInfoW(u.MonitorFromWindow(w.hwnd, cast(u32, t.MONITOR_DEFAULTTONEAREST)), &monitor) == 0) { return 0; }
     *ox = p.x; *oy = p.y;
     *l = monitor.rcWork.left; *t_ = monitor.rcWork.top; *r = monitor.rcWork.right; *b = monitor.rcWork.bottom;
+    return 1;
+}
+
+// The monitor the window is most on: where it is on the virtual desktop, its
+// work area, its DPI (Per-Monitor V2: what the window is drawn at there), its
+// refresh rate and its device name. 1 when the system said.
+fn monitor_of(w as *Window, out as *monitor.Monitor) as i32 {
+    monitor.clear(out);
+    if (is_open(w) == 0) { return 0; }
+    let is i64 as hm = u.MonitorFromWindow(w.hwnd, cast(u32, t.MONITOR_DEFAULTTONEAREST));
+    let is t.MONITORINFOEXW as info;
+    mem.memzero(cast(*u8, &info), sizeof(t.MONITORINFOEXW));
+    info._anon0.cbSize = cast(u32, sizeof(t.MONITORINFOEXW));
+    if (hm == 0 || u.GetMonitorInfoW(hm, cast(*t.MONITORINFO, &info)) == 0) { return 0; }
+    out.x = info._anon0.rcMonitor.left;
+    out.y = info._anon0.rcMonitor.top;
+    out.width = info._anon0.rcMonitor.right - info._anon0.rcMonitor.left;
+    out.height = info._anon0.rcMonitor.bottom - info._anon0.rcMonitor.top;
+    out.work_x = info._anon0.rcWork.left;
+    out.work_y = info._anon0.rcWork.top;
+    out.work_width = info._anon0.rcWork.right - info._anon0.rcWork.left;
+    out.work_height = info._anon0.rcWork.bottom - info._anon0.rcWork.top;
+    out.primary = cast(i32, (cast(i64, info._anon0.dwFlags) & t.MONITORINFOF_PRIMARY) != 0);
+    let is u32 as dx with mut = cast(u32, 0);
+    let is u32 as dy with mut = cast(u32, 0);
+    if (sh.GetDpiForMonitor(hm, cast(u32, t.MDT_EFFECTIVE_DPI), &dx, &dy) == 0 && dx >= cast(u32, 96)) {
+        out.scale120 = cast(i32, cast(i64, dx) * 120 / 96);
+    }
+    let is [32]u8 as name;
+    let is i32 as bytes = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, &info.szDevice[0], cast(i32, 0 - 1), cast(*i8, &name[0]), 32,
+                                                cast(*i8, 0), cast(*i32, 0));
+    if (bytes > 0) { monitor.set_name(out, &name[0], cast(i64, bytes)); }
+    let is t.DEVMODEW as mode;
+    mem.memzero(cast(*u8, &mode), sizeof(t.DEVMODEW));
+    mode.dmSize = cast(u16, sizeof(t.DEVMODEW));
+    if (u.EnumDisplaySettingsW(&info.szDevice[0], cast(u32, t.ENUM_CURRENT_SETTINGS), &mode) != 0 && mode.dmDisplayFrequency > cast(u32, 1)) {
+        out.refresh_mhz = cast(i64, mode.dmDisplayFrequency) * 1000;
+    }
     return 1;
 }
 

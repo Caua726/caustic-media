@@ -180,6 +180,33 @@ The toolkit regression checks that dialogs fit their native buffer and stay
 below their client-side header. The headless Weston has no keyboard/pointer
 seat; it cannot prove desktop clipboard, DnD or IME interaction.
 
+KWin is the second compositor (`tools/run_kwin.sh`: its own runtime,
+configuration and bare session bus; `KWIN_BACKEND=x11` nests it in Xvfb,
+`KWIN_SCALE=1.5` sets its output's scale with kscreen-doctor), the one that
+has what Weston does not: server-side decorations, fractional scale, tiling
+and a script interface to drive it as a user's shortcut would
+(`tools/kwin_script.sh`, `testdata/kwin/*.js`). `kwin_test` asks for the
+server's decoration, then its own, then the server's again, each granted as
+asked (`zxdg_toplevel_decoration_v1.configure`); is quick-tiled to the left
+half — `STATE_TILED_LEFT | TOP | BOTTOM`, exactly half the output — then taken
+out of its tile, back to its size; is minimized and shown again
+(`xdg_toplevel` 6's `suspended` is `STATE_MINIMIZED`, its size kept); and at a
+1.5 output scale opens at a preferred scale of 180, its buffer 450 by 300 for
+300 by 200 logical pixels, read back from the X screen as 450 by 300. On
+Weston, with no decoration manager, `decorated` is 0 and the toolkit draws
+its own frame. KWin found two faults no Weston run could: the `xdg_surface`'s
+id was handed out before the viewport's and fractional scale's, which a
+server refuses ("not a valid new object id"), so fractional scale failed on
+every compositor offering it; and an output's integer scale, arriving after
+the surface's preferred fractional one, replaced it. Each new id is now taken
+where its request is sent, and a surface with a fractional scale ignores the
+output's integer one.
+
+`monitor_of` says the output the window entered as `wl_output` describes it:
+its place in the compositor's space (geometry), its current mode and refresh
+rate, the window's scale there and its name (version 4); Wayland has no work
+area, so it is the whole output.
+
 Popups are `xdg_popup`s of their owner's `xdg_surface`: a positioner made
 from the toolkit's numbers (logical pixels, relative to the owner's window
 geometry), placed and placed again (`reposition`, xdg_popup 3) by the

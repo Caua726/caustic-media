@@ -9,6 +9,7 @@ use "../event.cst" as event;
 use "protocol.cst" as protocol;
 use "xkb.cst" as xkb;
 use "../keys.cst" as keys;
+use "../monitor.cst" as monitor;
 
 let is i32 as OK with imut = 0;
 let is i32 as NO_RUNTIME with imut = 1;
@@ -49,6 +50,14 @@ struct Output {
     version as i32;
     scale as i32;
     entered as i32;
+    // As wl_output says it: its place in the compositor's space, its current
+    // mode (physical pixels, millihertz), its name (version 4).
+    x as i32;
+    y as i32;
+    mode_width as i32;
+    mode_height as i32;
+    refresh_mhz as i32;
+    name as [32]u8;
 }
 struct DataSource {
     object as i32;
@@ -866,7 +875,11 @@ fn _set_scale120(w as *Window, preferred as i32, buffer_scale as i32) as void {
     _queue(w, &e);
 }
 
+// The integer scale of the output the window is on — unless the compositor
+// says a fractional one for the surface (wp_fractional_scale), which is the
+// one its buffer is drawn at, whichever of the two arrives first.
 fn _set_scale(w as *Window, scale as i32) as void {
+    if (w.fractional_active == 1) { return; }
     let is i32 as factor with mut = scale;
     if (factor < 1) { factor = 1; }
     if (factor > 16) { factor = 16; }
@@ -896,18 +909,44 @@ fn _surface_output(w as *Window, object as i32, entering as i32) as void {
     }
 }
 
+// What a wl_output says of itself: its place (geometry), its current mode,
+// its scale, its name.
 fn _output_event(w as *Window, obj as i32, op as i32, p as *u8) as void {
-    if (op != 3) { return; }
-    let is i32 as scale = cast(i32, _word(p));
-    if (scale < 1) { return; }
     let is i32 as i with mut = 0;
-    while (i < w.output_count) {
-        if (w.outputs[i].object == obj) {
-            w.outputs[i].scale = scale;
-            if (w.active_output == i) { _set_scale(w, scale); }
-            return;
+    while (i < w.output_count && w.outputs[i].object != obj) { i = i + 1; }
+    if (i == w.output_count) { return; }
+    let is *Output as o = &w.outputs[i];
+    if (op == 0 && _wire_size >= 16) {
+        o.x = cast(i32, _word(p));
+        o.y = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
+        return;
+    }
+    if (op == 1 && _wire_size >= 24) {
+        if ((_word(p) & cast(u32, 1)) != cast(u32, 0)) {
+            o.mode_width = cast(i32, _word(cast(*u8, cast(i64, p) + 4)));
+            o.mode_height = cast(i32, _word(cast(*u8, cast(i64, p) + 8)));
+            o.refresh_mhz = cast(i32, _word(cast(*u8, cast(i64, p) + 12)));
         }
-        i = i + 1;
+        return;
+    }
+    if (op == 3 && _wire_size >= 12) {
+        let is i32 as scale = cast(i32, _word(p));
+        if (scale < 1) { return; }
+        o.scale = scale;
+        if (w.active_output == i) { _set_scale(w, scale); }
+        return;
+    }
+    if (op == 4 && _wire_size >= 12) {
+        let is i32 as len = cast(i32, _word(p));
+        let is i32 as padded = ((len + 3) / 4) * 4;
+        if (len < 1 || 12 + padded > _wire_size) { return; }
+        let is *u8 as s = cast(*u8, cast(i64, p) + 4);
+        let is i32 as k with mut = 0;
+        while (k < len - 1 && k < 31) {
+            o.name[k] = s[k];
+            k = k + 1;
+        }
+        o.name[k] = cast(u8, 0);
     }
 }
 fn _offer_index(w as *Window, object as i32, primary as i32, create as i32) as i32 {
@@ -1747,9 +1786,13 @@ fn _dispatch(w as *Window, obj as i32) as void {
                 if (s == 6) { state = state | event.STATE_TILED_RIGHT; }
                 if (s == 7) { state = state | event.STATE_TILED_TOP; }
                 if (s == 8) { state = state | event.STATE_TILED_BOTTOM; }
+                // xdg_toplevel 6: not shown — minimized, or as good as.
+                if (s == 9) { state = state | event.STATE_MINIMIZED; }
                 i = i + 1;
             }
-            if (w.state == 0 && state != 0) {
+            // The size it had as a normal window, kept while it is not one;
+            // shown or not is no part of that.
+            if (_floating(w.state) == 1 && _floating(state) == 0) {
                 w.normal_width = w.logical_width;
                 w.normal_height = w.logical_height;
             }
@@ -2234,6 +2277,13 @@ fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
         w.outputs[output_i].global = _globals.outputs[output_i].global;
         w.outputs[output_i].version = _globals.outputs[output_i].version;
         w.outputs[output_i].scale = 1;
+        w.outputs[output_i].entered = 0;
+        w.outputs[output_i].x = 0;
+        w.outputs[output_i].y = 0;
+        w.outputs[output_i].mode_width = 0;
+        w.outputs[output_i].mode_height = 0;
+        w.outputs[output_i].refresh_mhz = 0;
+        w.outputs[output_i].name[0] = cast(u8, 0);
         w.outputs[output_i].object = _id(w);
         if (_bind(w, cast(u32, w.outputs[output_i].global), "wl_output",
                     _bounded(w.outputs[output_i].version, 4), w.outputs[output_i].object) == 0) { return 0; }
@@ -2290,7 +2340,9 @@ fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
     w.surface = _id(w);
     _put(&idbody[0], cast(u32, w.surface));
     if (_send(w, w.compositor, 0, &idbody[0], 4, 0 - 1) == 0) { return 0; }
-    if (w.pos.subsurface_of == 0) { w.xdg_surface = _id(w); }
+    // Each new id is allocated where the request that creates it is sent:
+    // a server takes new ids in the order they were handed out (libwayland's
+    // "not a valid new object id"), so none may be held back past another.
     if (w.viewporter != 0 && w.fractional_manager != 0) {
         w.viewport = _id(w);
         _put(&idbody[0], cast(u32, w.viewport));
@@ -2303,6 +2355,7 @@ fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
         w.fractional_active = 1;
     }
     if (w.pos.subsurface_of != 0) { return _init_subsurface(w); }
+    w.xdg_surface = _id(w);
     _put(&idbody[0], cast(u32, w.xdg_surface));
     _put(cast(*u8, cast(i64, &idbody) + 4), cast(u32, w.surface));
     if (_send(w, w.wm_base, 2, &idbody[0], 8, 0 - 1) == 0) { return 0; }
@@ -2446,6 +2499,24 @@ fn width(w as *Window) as i64 { return w.width; }
 fn height(w as *Window) as i64 { return w.height; }
 fn scale(w as *Window) as i32 { return w.scale120; }
 fn state(w as *Window) as i32 { return w.state; }
+
+// The output the window is on, as wl_output says it: its place in the
+// compositor's space, its mode, the window's scale there, its name. No work
+// area on Wayland: the whole output. 1 once the window has entered one.
+fn monitor_of(w as *Window, out as *monitor.Monitor) as i32 {
+    monitor.clear(out);
+    if (w.opened == 0 || w.active_output < 0) { return 0; }
+    let is *Output as o = &w.outputs[w.active_output];
+    out.x = cast(i64, o.x);
+    out.y = cast(i64, o.y);
+    out.width = cast(i64, o.mode_width);
+    out.height = cast(i64, o.mode_height);
+    monitor.work_is_whole(out);
+    out.scale120 = w.scale120;
+    out.refresh_mhz = cast(i64, o.refresh_mhz);
+    monitor.set_name(out, &o.name[0], 32);
+    return 1;
+}
 fn native_fd(w as *Window) as i64 { return w.fd; }
 fn native_surface(w as *Window) as i32 { return w.surface; }
 fn native_toplevel(w as *Window) as i32 { return w.toplevel; }
@@ -2607,28 +2678,34 @@ fn wheel(w as *Window) as i64 {
 
 
 
+// Whether state is a normal window's — not maximized, full screen or tiled —
+// shown or not: its size its own, its shadow round it.
+fn _floating(state as i32) as i32 { return cast(i32, (state & cast(i32, 0 - 1 - event.STATE_MINIMIZED)) == 0); }
+
 fn _apply_configure(w as *Window) as void {
     let is i64 as logical_w with mut = w.logical_width;
     let is i64 as logical_h with mut = w.logical_height;
     let is i64 as shadow_w with mut = 0;
     let is i64 as shadow_h with mut = 0;
-    if (w.state == 0) {
+    let is i32 as floating = _floating(w.state);
+    let is i32 as restored = cast(i32, floating == 1 && _floating(w.old_state) == 0);
+    if (floating == 1) {
         shadow_w = _scale_down(w.ext_left + w.ext_right, w.scale120);
         shadow_h = _scale_down(w.ext_top + w.ext_bottom, w.scale120);
     }
     if (w.configured_width > 0) { logical_w = w.configured_width + shadow_w; }
-    else if (w.state == 0 && w.old_state != 0 && w.normal_width > 0) { logical_w = w.normal_width; }
+    else if (restored == 1 && w.normal_width > 0) { logical_w = w.normal_width; }
     if (w.configured_height > 0) { logical_h = w.configured_height + shadow_h; }
-    else if (w.state == 0 && w.old_state != 0 && w.normal_height > 0) { logical_h = w.normal_height; }
+    else if (restored == 1 && w.normal_height > 0) { logical_h = w.normal_height; }
     let is i64 as width with mut = _scale_up(logical_w, w.scale120);
     let is i64 as height with mut = _scale_up(logical_h, w.scale120);
     // A compositor may leave the size to the client, including after the
     // toolkit publishes a larger minimum for its client-side frame.
-    if (w.state == 0 && width < w.min_width) {
+    if (floating == 1 && width < w.min_width) {
         logical_w = (w.min_width * 120 + w.scale120 - 1) / w.scale120;
         width = _scale_up(logical_w, w.scale120);
     }
-    if (w.state == 0 && height < w.min_height) {
+    if (floating == 1 && height < w.min_height) {
         logical_h = (w.min_height * 120 + w.scale120 - 1) / w.scale120;
         height = _scale_up(logical_h, w.scale120);
     }
