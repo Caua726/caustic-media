@@ -202,3 +202,16 @@ the F0 assembler cutover additionally exercised it at O1. Its O2 native
 disassembly contains XMM values and stack spills. This is compiler/raster
 correctness evidence, not a performance measurement or an assertion that
 the previous ordinary raster test reproduced the missing SSE memory form.
+
+`reference.cst` is the shared visual-reference check for software frames.
+`compare(frame, png, tolerance, artifact_dir, name)` decodes the reference
+through caustic-image, checks its size, then every channel including alpha
+within an explicit per-channel tolerance (an RGB reference is opaque). It
+reports the status, differing pixel count, first differing pixel and the
+largest difference per channel. A mismatch writes `<name>.actual.png` and,
+for pixel differences, `<name>.diff.png` (amplified differences; magenta
+where only alpha differs) to the artifact directory; a later match removes
+them. References are versioned (`-vN`) under `testdata/reference/` with
+their producer and license in `REFERENCES.md`; the helper's own fixtures
+come from an independent Python PNG writer. raster's byte-level references
+are unchanged. `reference_test.cst` runs in the media `test` script.

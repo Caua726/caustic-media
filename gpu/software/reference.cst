@@ -1,0 +1,207 @@
+// gpu/software/reference.cst — a software frame against a reviewed PNG.
+//
+// The shared visual-reference check. A Target's pixels are compared with a
+// versioned PNG: its size first, then every channel, alpha included, within
+// an explicit per-channel tolerance. A frame that does not match leaves its
+// actual pixels — and, when only pixels differ, a difference image — in an
+// artifact directory, named for the reference, so whoever reads the failure
+// can look at both and decide whether the code or the reference is wrong. A
+// frame that matches removes what an earlier failure of the same name left.
+//
+// A reference without alpha is an opaque one: its alpha is 255. Gray
+// references are gray on all three colour channels.
+//
+// Opt-in, like image/load.cst: a program using it is built with
+// caustic-image and caustic-compact on its module path.
+use "std/io.cst" as io;
+use "target.cst" as tgt;
+use "../../image/load.cst" as load;
+use "../../image/buffer.cst" as buffer;
+use "caustic-image/encode.cst" as cencode;
+use "caustic-image/core/image.cst" as cimage;
+use "caustic-image/core/pixfmt.cst" as pixfmt;
+use "caustic-image/core/sniff.cst" as sniff;
+use "caustic-compact/core/bytes.cst" as cb;
+
+let is i32 as MATCH        with imut = 0;
+let is i32 as NO_REFERENCE with imut = 1;   // missing, or not an image
+let is i32 as SIZE         with imut = 2;   // its dimensions differ
+let is i32 as PIXELS       with imut = 3;   // a channel outside its tolerance
+
+// The largest difference allowed on each channel, 0..255.
+struct Tolerance {
+    r as i32;
+    g as i32;
+    b as i32;
+    a as i32;
+}
+
+struct Result {
+    status     as i32;
+    max_r      as i32;      // the largest difference seen on each channel
+    max_g      as i32;
+    max_b      as i32;
+    max_a      as i32;
+    artifacts  as i32;      // 1 when this mismatch's files were written
+    differing  as i64;      // pixels with any channel outside its tolerance
+    first_x    as i64;      // the first of them, row by row; -1 when none
+    first_y    as i64;
+    ref_width  as i64;      // the reference's size, 0 when it has none
+    ref_height as i64;
+}
+
+fn tolerance(r as i32, g as i32, b as i32, a as i32) as Tolerance {
+    let is Tolerance as t;
+    t.r = r; t.g = g; t.b = b; t.a = a;
+    return t;
+}
+
+fn exact() as Tolerance { return tolerance(0, 0, 0, 0); }
+
+fn _append(dst as *u8, at as i64, s as *u8) as i64 {
+    if (at < 0) { return at; }
+    let is i64 as n = io.strlen(s);
+    if (at + n >= 1024) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { dst[at + i] = s[i]; i = i + 1; }
+    dst[at + n] = cast(u8, 0);
+    return at + n;
+}
+
+// "<dir>/<name><suffix>" into dst: 1, or 0 when it does not fit.
+fn _artifact(dst as *u8, dir as *u8, name as *u8, suffix as *u8) as i32 {
+    let is i64 as at with mut = _append(dst, 0, dir);
+    at = _append(dst, at, "/");
+    at = _append(dst, at, name);
+    at = _append(dst, at, suffix);
+    return cast(i32, at >= 0);
+}
+
+// width*height RGBA8 pixels at px, written as a PNG: 1, or 0.
+fn _write_png(path as *u8, px as *u8, width as i64, height as i64) as i32 {
+    let is cimage.Image as img;
+    img.pixels = px;
+    img.width = width;
+    img.height = height;
+    img.stride = width * 4;
+    img.fmt = pixfmt.FMT_RGBA8;
+    img.owned = 0;
+    let is cb.Bytes as out = cb.bytes_new(width * height * 4 + 1024);
+    let is i32 as ok with mut = 0;
+    if (cencode.encode(&img, sniff.SNIFF_PNG, &out) > 0) {
+        ok = cast(i32, io.write_file_atomic(path, out.ptr, out.len) == 0);
+    }
+    cb.bytes_free(&out);
+    return ok;
+}
+
+fn _channel(ref as *buffer.Image, x as i64, y as i64, c as i64) as i64 {
+    let is *u8 as p = buffer.pixel_at(ref, x, y);
+    if (ref.format == buffer.R8) {
+        if (c == 3) { return 255; }
+        return cast(i64, p[0]);
+    }
+    if (ref.format == buffer.RGB8) {
+        if (c == 3) { return 255; }
+        return cast(i64, p[c]);
+    }
+    return cast(i64, p[c]);
+}
+
+fn _abs(v as i64) as i64 {
+    if (v < 0) { return 0 - v; }
+    return v;
+}
+
+// The difference shown four times larger, so a step of one is visible.
+fn _amplify(d as i64) as i64 {
+    if (d * 4 > 255) { return 255; }
+    return d * 4;
+}
+
+// frame against the PNG at reference, within tol. When it does not match and
+// artifacts is not null, <artifacts>/<name>.actual.png holds the frame and,
+// for differing pixels, <name>.diff.png their differences: black where every
+// channel is within tolerance, the amplified colour difference elsewhere, and
+// magenta where only alpha is outside it.
+fn compare(frame as *tgt.Target, reference as *u8, tol as Tolerance,
+           artifacts as *u8, name as *u8) as Result {
+    let is Result as r;
+    r.status = MATCH;
+    r.max_r = 0; r.max_g = 0; r.max_b = 0; r.max_a = 0; r.artifacts = 0;
+    r.differing = 0;
+    r.first_x = 0 - 1;
+    r.first_y = 0 - 1;
+    r.ref_width = 0;
+    r.ref_height = 0;
+    let is [1024]u8 as actual_path;
+    let is [1024]u8 as diff_path;
+    let is i32 as named with mut = 0;
+    if (cast(i64, artifacts) != 0) {
+        named = _artifact(cast(*u8, &actual_path), artifacts, name, ".actual.png") &
+                _artifact(cast(*u8, &diff_path), artifacts, name, ".diff.png");
+    }
+    let is buffer.Image as ref with mut = load.file(reference);
+    if (cast(i64, ref.pixels) == 0) {
+        r.status = NO_REFERENCE;
+    } else {
+        r.ref_width = ref.width;
+        r.ref_height = ref.height;
+        if (ref.width != frame.width || ref.height != frame.height) { r.status = SIZE; }
+    }
+    let is buffer.Image as diff_image with mut = buffer.from_memory(cast(*u8, 0), 0, 0, buffer.RGBA8);
+    if (r.status == MATCH) {
+        if (named == 1) { diff_image = buffer.create(frame.width, frame.height, buffer.RGBA8); }
+        let is *u8 as diff = diff_image.pixels;
+        let is i64 as y with mut = 0;
+        while (y < frame.height) {
+            let is i64 as x with mut = 0;
+            while (x < frame.width) {
+                let is i64 as got = tgt.get(frame, x, y);
+                let is i64 as dr = _abs((got & 255) - _channel(&ref, x, y, 0));
+                let is i64 as dg = _abs(((got >> 8) & 255) - _channel(&ref, x, y, 1));
+                let is i64 as db = _abs(((got >> 16) & 255) - _channel(&ref, x, y, 2));
+                let is i64 as da = _abs(((got >> 24) & 255) - _channel(&ref, x, y, 3));
+                if (dr > cast(i64, r.max_r)) { r.max_r = cast(i32, dr); }
+                if (dg > cast(i64, r.max_g)) { r.max_g = cast(i32, dg); }
+                if (db > cast(i64, r.max_b)) { r.max_b = cast(i32, db); }
+                if (da > cast(i64, r.max_a)) { r.max_a = cast(i32, da); }
+                let is i32 as outside = cast(i32, dr > cast(i64, tol.r) || dg > cast(i64, tol.g) ||
+                                                  db > cast(i64, tol.b) || da > cast(i64, tol.a));
+                if (outside == 1) {
+                    if (r.differing == 0) { r.first_x = x; r.first_y = y; }
+                    r.differing = r.differing + 1;
+                }
+                if (cast(i64, diff) != 0) {
+                    let is *u8 as d = cast(*u8, cast(i64, diff) + (y * frame.width + x) * 4);
+                    d[0] = cast(u8, 0); d[1] = cast(u8, 0); d[2] = cast(u8, 0); d[3] = cast(u8, 255);
+                    if (outside == 1) {
+                        d[0] = cast(u8, _amplify(dr));
+                        d[1] = cast(u8, _amplify(dg));
+                        d[2] = cast(u8, _amplify(db));
+                        if (dr + dg + db == 0) { d[0] = cast(u8, 255); d[2] = cast(u8, 255); }
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        if (r.differing > 0) { r.status = PIXELS; }
+    }
+    if (named == 1) {
+        if (r.status == MATCH) {
+            io.unlink(cast(*u8, &actual_path));
+            io.unlink(cast(*u8, &diff_path));
+        } else {
+            r.artifacts = _write_png(cast(*u8, &actual_path), frame.color, frame.width, frame.height);
+            if (r.status == PIXELS) {
+                r.artifacts = r.artifacts & _write_png(cast(*u8, &diff_path), diff_image.pixels, frame.width, frame.height);
+            } else {
+                io.unlink(cast(*u8, &diff_path));
+            }
+        }
+    }
+    buffer.destroy(&diff_image);
+    buffer.destroy(&ref);
+    return r;
+}
