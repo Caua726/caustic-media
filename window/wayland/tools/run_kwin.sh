@@ -13,7 +13,8 @@
 # desktop's services. KWIN_BACKEND=virtual (the default) draws nowhere;
 # KWIN_BACKEND=x11 nests it in the X server DISPLAY names, so the screen can
 # be read back. KWIN_SCALE=1.5 sets its output's scale (kscreen-doctor, in
-# process) before the program starts. KWIN_INPUT_METHOD=<program> is the
+# process) before the program starts. KWIN_XWAYLAND=1 starts Xwayland too,
+# the program's DISPLAY. KWIN_INPUT_METHOD=<program> is the
 # input method KWin starts for text fields (input-method-v1):
 # window/wayland/tools/kwin_fcitx.sh, an Fcitx5 of its own.
 set -eu
@@ -53,7 +54,16 @@ if [ -n "${KWIN_INPUT_METHOD:-}" ]; then
     case "$KWIN_INPUT_METHOD" in /*) ;; *) KWIN_INPUT_METHOD="$PWD/$KWIN_INPUT_METHOD" ;; esac
     im="--inputmethod=$KWIN_INPUT_METHOD"
 fi
-kwin_wayland "$where" --no-lockscreen --no-global-shortcuts --socket=wayland-k --width=1280 --height=1024 $im \
+# KWIN_XWAYLAND=1: KWin starts Xwayland, and the program is an X client of
+# it (DISPLAY its); KWin tells the display only to what it starts, so a
+# script it starts writes it down.
+xw=""
+if [ "${KWIN_XWAYLAND:-0}" = 1 ]; then
+    printf '#!/bin/sh\necho "$DISPLAY" > "%s/display"\n' "$run" > "$run/display.sh"
+    chmod +x "$run/display.sh"
+    xw="--xwayland $run/display.sh"
+fi
+kwin_wayland "$where" --no-lockscreen --no-global-shortcuts --socket=wayland-k --width=1280 --height=1024 $im $xw \
     >"$run/kwin.log" 2>&1 &
 kwin_pid=$!
 export WAYLAND_DISPLAY=wayland-k
@@ -83,6 +93,13 @@ fi
 # Clients must speak to this compositor, not an X server they might inherit,
 # unless it is nested there and they read the screen back.
 if [ "$backend" = virtual ]; then unset DISPLAY; fi
+if [ -n "$xw" ]; then
+    waited=0
+    while [ ! -s "$run/display" ] && [ "$waited" -lt 200 ]; do sleep 0.05; waited=$((waited + 1)); done
+    [ -s "$run/display" ] || { cat "$run/kwin.log" >&2; echo "run_kwin: Xwayland did not start" >&2; exit 1; }
+    DISPLAY=$(cat "$run/display")
+    export DISPLAY
+fi
 # The log, for a program that wants to read what a KWin script printed.
 export CAUSTIC_KWIN_LOG="$run/kwin.log"
 status=0

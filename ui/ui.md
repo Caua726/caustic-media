@@ -686,8 +686,13 @@ the settings ask — opens the context menu where the press was: the widget that
 captured the press hears `POINTER_CANCEL`, and the release that follows is no
 click. The router says when one is due and the application's loop ticks it,
 since nothing arrives while a finger is still (`longpress_test`); the touch and
-pen events themselves come from `input/`, which says which the pointer is with
-`router.set_source`. The router is fed by plain calls — `pointer_move`,
+pen events themselves come from `input/` through the host, which says which
+the pointer is with `router.set_source`: the first finger drives it (button 1
+from its down to its up; lifted, nothing hovered; a `TOUCH_CANCEL` clicks
+nothing), a pen too (its tip button 1, barrel buttons 3 and 2), and a
+touchpad's gestures go to the widget under the pointer as `GESTURE`
+(`router.gesture`) — a scroll area stops a fling when fingers rest on the
+touchpad. The router is fed by plain calls — `pointer_move`,
 `pointer_button`, `key` and `text` — which `input/` calls, `paste`, giving a
 widget the text it asked the clipboard for (`tree.request_paste`, answered by
 the program), `preedit`, the input method's composition with its caret, and

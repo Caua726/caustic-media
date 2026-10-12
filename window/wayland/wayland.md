@@ -155,7 +155,10 @@ release, focus loss, keyboard loss and keymap replacement, with `input_due`
 for the loop's sleep, the pointer in buffer pixels, a frame's `axis`,
 `axis_source`, `axis_value120` (`axis_discrete` before 8) and `axis_stop`
 one `SCROLL` (a wheel's 120ths, fingers' lines and lifting), text-input-v3's
-commit, preedit and delete-surrounding,
+commit, preedit and delete-surrounding, `wl_touch`'s points on this surface
+as `TOUCH_*`, tablet-v2's tools as `PEN_*` gathered to their frame (pads let
+go of), pointer-gestures' swipe, pinch and hold as `GESTURE_*` (`touch_test`;
+`../touch_kwin_test.cst` through KWin's fake input),
 keyboard focus leaving as a `CANCEL` that lets buttons go too, and a press
 `xdg_toplevel.move`/`resize` takes ending in `BUTTON_TAKEN`. `input_test`
 checks it on xkbcommon keymaps (us; us,ru; de: Caps Lock, AltGr, repeat timing)

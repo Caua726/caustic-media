@@ -1,0 +1,272 @@
+// window/wayland/touch_test.cst — wl_touch, tablet-v2 and pointer-gestures on
+// the wire: what the compositor sends, through the backend's dispatch, and
+// what it makes of it — as a socket pair sees the requests it answers with.
+//   ./build/wayland_touch_test
+// Fingers by their id, on this surface only, a cancel ending them all once;
+// a pen's events gathered until its frame and said in order — in range,
+// touching, its barrel buttons, lifted, out of range — with pressure, tilt
+// and distance scaled, its tool's kind, a tool removed in range said out of
+// it, a pad let go of; a touchpad's swipe, pinch and hold from begin to end,
+// cancelled when the compositor says so or the pointer goes, and nothing of
+// one that began elsewhere.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../sys/linux.cst" as sys;
+use "../../input/event.cst" as ie;
+use "backend.cst" as wayland;
+
+let is i32 as failures with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("  FAIL: %s\n", name);
+        failures = failures + 1;
+    }
+}
+
+fn word(p as *u8, offset as i64) as u32 { return *cast(*u32, cast(i64, p) + offset); }
+fn put(offset as i64, value as u32) as void { *cast(*u32, cast(i64, &wayland._wire[0]) + offset) = value; }
+fn fixed(v as f64) as u32 { return cast(u32, cast(i32, v * 256.0)); }
+
+let is wayland.Window as w with mut;
+let is i32 as peer with mut = 0 - 1;
+
+// A message from the compositor to object obj, its arguments the words
+// given (n of them), through the backend's dispatch.
+let is [8]u32 as args with mut;
+fn says(obj as i32, op as i32, n as i64) as void {
+    put(0, cast(u32, obj));
+    put(4, cast(u32, ((8 + n * 4) << 16) | op));
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        put(8 + i * 4, args[i]);
+        i = i + 1;
+    }
+    wayland._wire_size = cast(i32, 8 + n * 4);
+    wayland._dispatch(&w, obj);
+}
+
+fn a(i as i64, v as u32) as void { args[i] = v; }
+
+// The requests the window sent since last asked: how many, and the object
+// and opcode of the i-th.
+let is [4096]u8 as got;
+let is [32]i64 as at;
+let is i64 as nsent with mut = 0;
+fn sent() as i64 {
+    nsent = 0;
+    let is i64 as n with mut = 0;
+    while (sys.wait_readable(peer, 0) > 0 && n < 4096) {
+        let is i64 as r = linux.read(peer, cast(*u8, cast(i64, &got[0]) + n), 4096 - n);
+        if (r <= 0) { break; }
+        n = n + r;
+    }
+    let is i64 as o with mut = 0;
+    while (o + 8 <= n && nsent < 32) {
+        at[nsent] = o;
+        nsent = nsent + 1;
+        o = o + cast(i64, word(&got[0], o + 4) >> 16);
+    }
+    return nsent;
+}
+fn sent_to(i as i64) as u32 { return word(&got[0], at[i]); }
+fn sent_op(i as i64) as u32 { return word(&got[0], at[i] + 4) & cast(u32, 65535); }
+
+fn next(out as *ie.Event) as i32 {
+    if (wayland.poll_input(&w, out) == 1) { return out.kind; }
+    return ie.NONE;
+}
+
+fn near(x as f64, y as f64) as i32 { return cast(i32, x - y < 0.001 && y - x < 0.001); }
+
+let is i32 as TOUCH with imut = 30;
+let is i32 as TSEAT with imut = 31;
+let is i32 as SWIPE with imut = 32;
+let is i32 as PINCH with imut = 33;
+let is i32 as HOLD with imut = 34;
+let is i32 as TOOL with imut = 0 - 16777200;   // 0xff000010: the compositor's
+let is i32 as TABLET with imut = 0 - 16777199;
+let is i32 as PAD with imut = 0 - 16777198;
+
+fn main() as i32 {
+    let is [2]i32 as pair;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &pair[0]) < 0) {
+        io.printf("FAIL: socketpair\n");
+        return 1;
+    }
+    peer = pair[1];
+    wayland._zero(&w);
+    w.fd = pair[0]; w.opened = 1; w.surface = 77; w.scale120 = 240;
+    w.pointer = 29; w.touch = TOUCH; w.tablet_seat = TSEAT; w.seat_version = 9;
+    w.swipe = SWIPE; w.pinch = PINCH; w.hold = HOLD; w.gestures_version = 3;
+    w.pointer_x = 50; w.pointer_y = 60;
+    w.input = ie.create();
+    let is ie.Event as e;
+
+    // --- Fingers ---
+    a(0, 1); a(1, 1000); a(2, 77); a(3, 5); a(4, fixed(10.5)); a(5, fixed(20.0));
+    says(TOUCH, 0, 6);
+    check("a finger down: its id, where, in buffer pixels (whole surface units, as the pointer's)",
+          next(&e) == ie.TOUCH_DOWN && e.contact == 5 && e.x == 20 && e.y == 40 && e.time_ms == 1000);
+    a(0, 2); a(1, 1001); a(2, 99); a(3, 6); a(4, fixed(1.0)); a(5, fixed(1.0));
+    says(TOUCH, 0, 6);
+    check("on another surface: not this window's", next(&e) == ie.NONE);
+    a(0, 1002); a(1, 5); a(2, fixed(12.0)); a(3, fixed(22.0));
+    says(TOUCH, 2, 4);
+    check("it moved", next(&e) == ie.TOUCH_MOTION && e.contact == 5 && e.x == 24 && e.y == 44);
+    a(0, 1003); a(1, 6); a(2, fixed(5.0)); a(3, fixed(5.0));
+    says(TOUCH, 2, 4);
+    check("the other surface's finger moving: nothing", next(&e) == ie.NONE);
+    a(0, 3); a(1, 1004); a(2, 77); a(3, 7); a(4, fixed(30.0)); a(5, fixed(30.0));
+    says(TOUCH, 0, 6);
+    a(0, 4); a(1, 1005); a(2, 7);
+    says(TOUCH, 1, 3);
+    check("a second finger, down and up, by its own id",
+          next(&e) == ie.TOUCH_DOWN && e.contact == 7 && next(&e) == ie.TOUCH_UP && e.contact == 7 && e.x == 60);
+    says(TOUCH, 3, 0);
+    check("a frame: nothing of its own", next(&e) == ie.NONE);
+    says(TOUCH, 4, 0);
+    check("cancelled: every finger gone, said once", next(&e) == ie.TOUCH_CANCEL && next(&e) == ie.NONE);
+    a(0, 5); a(1, 1006); a(2, 5);
+    says(TOUCH, 1, 3);
+    check("the cancelled finger's up: nothing", next(&e) == ie.NONE);
+    says(TOUCH, 4, 0);
+    check("a cancel with none down: nothing", next(&e) == ie.NONE);
+    // Eleven at once: ten kept, the eleventh unsaid, its up too.
+    let is i64 as f with mut = 0;
+    while (f < 11) {
+        a(0, 10); a(1, 1100); a(2, 77); a(3, cast(u32, 100 + f)); a(4, fixed(1.0)); a(5, fixed(1.0));
+        says(TOUCH, 0, 6);
+        f = f + 1;
+    }
+    let is i64 as downs with mut = 0;
+    while (next(&e) == ie.TOUCH_DOWN) { downs = downs + 1; }
+    a(0, 11); a(1, 1101); a(2, 110);
+    says(TOUCH, 1, 3);
+    check("ten fingers kept, the eleventh unsaid", downs == 10 && next(&e) == ie.NONE);
+    says(TOUCH, 4, 0);
+    next(&e);
+
+    // --- A pen ---
+    a(0, cast(u32, TOOL));
+    says(TSEAT, 1, 1);
+    check("a tool added: kept", wayland._tool_index(&w, TOOL) == 0);
+    a(0, 320); says(TOOL, 0, 1);
+    a(0, 1); says(TOOL, 3, 1);
+    a(0, 2); says(TOOL, 3, 1);
+    says(TOOL, 4, 0);
+    a(0, 9); a(1, cast(u32, TABLET)); a(2, 77);
+    says(TOOL, 6, 3);
+    a(0, fixed(15.0)); a(1, fixed(25.0)); says(TOOL, 10, 2);
+    a(0, 2000); says(TOOL, 18, 1);
+    check("in range over it: a pen, where, at rest, its tilt and pressure said, its distance not",
+          next(&e) == ie.PEN_IN && e.detail == ie.TOOL_PEN && e.x == 30 && e.y == 50 && e.time_ms == 2000 &&
+          e.pressure == 0.0 && e.tilt_x == 0.0 && e.distance == 0.0 - 1.0 && e.contact == 1 && next(&e) == ie.NONE);
+    a(0, 10); says(TOOL, 8, 1);
+    a(0, 32768); says(TOOL, 11, 1);
+    a(0, fixed(10.0)); a(1, fixed(0.0 - 5.5)); says(TOOL, 13, 2);
+    a(0, 2001); says(TOOL, 18, 1);
+    check("touching: down, its pressure and tilt",
+          next(&e) == ie.PEN_DOWN && near(e.pressure, 0.5) == 1 && e.tilt_x == 10.0 && e.tilt_y == 0.0 - 5.5 &&
+          next(&e) == ie.NONE);
+    a(0, 11); a(1, 331); a(2, 1); says(TOOL, 17, 3);
+    a(0, fixed(16.0)); a(1, fixed(25.0)); says(TOOL, 10, 2);
+    a(0, 2002); says(TOOL, 18, 1);
+    check("moved with its barrel button pressed: the motion, then the button",
+          next(&e) == ie.PEN_MOTION && e.x == 32 && next(&e) == ie.PEN_BUTTON && e.button == 1 &&
+          e.detail == ie.PRESSED);
+    a(0, 12); a(1, 331); a(2, 0); says(TOOL, 17, 3);
+    says(TOOL, 9, 0);
+    says(TOOL, 7, 0);
+    a(0, 2003); says(TOOL, 18, 1);
+    check("the button let go, lifted, out of range: in that order",
+          next(&e) == ie.PEN_BUTTON && e.detail == ie.RELEASED && next(&e) == ie.PEN_UP && next(&e) == ie.PEN_OUT &&
+          next(&e) == ie.NONE);
+    a(0, fixed(1.0)); a(1, fixed(1.0)); says(TOOL, 10, 2);
+    a(0, 2004); says(TOOL, 18, 1);
+    check("out of range: its motion not this window's", next(&e) == ie.NONE);
+    a(0, 13); a(1, cast(u32, TABLET)); a(2, 99); says(TOOL, 6, 3);
+    a(0, 2005); says(TOOL, 18, 1);
+    check("in range over another surface: nothing", next(&e) == ie.NONE);
+    // Touching when it is taken away: lifted, out of range, the tool let go.
+    a(0, 14); a(1, cast(u32, TABLET)); a(2, 77); says(TOOL, 6, 3);
+    a(0, 15); says(TOOL, 8, 1);
+    a(0, 2006); says(TOOL, 18, 1);
+    next(&e); next(&e);
+    sent();
+    says(TOOL, 5, 0);
+    check("removed while touching: lifted and out, the tool destroyed",
+          next(&e) == ie.PEN_UP && next(&e) == ie.PEN_OUT && wayland._tool_index(&w, TOOL) < 0 &&
+          sent() == 1 && sent_to(0) == cast(u32, TOOL) && sent_op(0) == 1);
+    // An eraser.
+    a(0, cast(u32, TOOL)); says(TSEAT, 1, 1);
+    a(0, 321); says(TOOL, 0, 1);
+    says(TOOL, 4, 0);
+    a(0, 16); a(1, cast(u32, TABLET)); a(2, 77); says(TOOL, 6, 3);
+    a(0, 2007); says(TOOL, 18, 1);
+    check("an eraser, another contact, nothing it cannot say", next(&e) == ie.PEN_IN && e.detail == ie.TOOL_ERASER &&
+          e.contact == 2 && e.pressure == 0.0 - 1.0);
+    // A tablet and a pad.
+    a(0, cast(u32, TABLET)); says(TSEAT, 0, 1);
+    check("a tablet kept", wayland._tablet_index(&w, TABLET) == 0);
+    sent();
+    a(0, cast(u32, PAD)); says(TSEAT, 2, 1);
+    check("a pad: let go of at once", sent() == 1 && sent_to(0) == cast(u32, PAD) && sent_op(0) == 1);
+    says(TABLET, 4, 0);
+    check("the tablet removed: destroyed", wayland._tablet_index(&w, TABLET) < 0 && sent() == 1 &&
+          sent_to(0) == cast(u32, TABLET) && sent_op(0) == 0);
+
+    // --- Gestures ---
+    a(0, 20); a(1, 3000); a(2, 77); a(3, 3); says(SWIPE, 0, 4);
+    check("a three-finger swipe begun, at the pointer", next(&e) == ie.GESTURE_BEGIN && e.gesture == ie.SWIPE &&
+          e.fingers == 3 && e.x == 50 && e.y == 60);
+    a(0, 3001); a(1, fixed(2.5)); a(2, fixed(0.0 - 1.0)); says(SWIPE, 1, 3);
+    check("moving, in the window's pixels (scale 2)", next(&e) == ie.GESTURE_UPDATE && e.gesture == ie.SWIPE &&
+          e.dx == 5.0 && e.dy == 0.0 - 2.0);
+    a(0, 3002); a(1, fixed(1.0)); a(2, fixed(1.0)); a(3, fixed(1.5)); a(4, fixed(10.0)); says(PINCH, 1, 5);
+    check("a pinch's update while a swipe goes on: nothing", next(&e) == ie.NONE);
+    a(0, 21); a(1, 3003); a(2, 0); says(SWIPE, 2, 3);
+    check("ended, completed", next(&e) == ie.GESTURE_END && e.gesture == ie.SWIPE && e.detail == 0);
+    a(0, 22); a(1, 3004); a(2, 77); a(3, 2); says(PINCH, 0, 4);
+    a(0, 3005); a(1, fixed(0.5)); a(2, fixed(0.0)); a(3, fixed(1.5)); a(4, fixed(0.0 - 10.0)); says(PINCH, 1, 5);
+    a(0, 23); a(1, 3006); a(2, 1); says(PINCH, 2, 3);
+    check("a pinch: begun, its scale and rotation, cancelled",
+          next(&e) == ie.GESTURE_BEGIN && e.gesture == ie.PINCH && e.fingers == 2 &&
+          next(&e) == ie.GESTURE_UPDATE && e.scale == 1.5 && e.rotation == 0.0 - 10.0 && e.dx == 1.0 &&
+          next(&e) == ie.GESTURE_END && e.detail == ie.CANCELLED);
+    a(0, 24); a(1, 3007); a(2, 77); a(3, 2); says(HOLD, 0, 4);
+    a(0, 25); a(1, 3008); a(2, 0); says(HOLD, 1, 3);
+    check("a hold: begun and ended", next(&e) == ie.GESTURE_BEGIN && e.gesture == ie.HOLD &&
+          next(&e) == ie.GESTURE_END && e.gesture == ie.HOLD && e.detail == 0);
+    a(0, 26); a(1, 3009); a(2, 99); a(3, 4); says(SWIPE, 0, 4);
+    a(0, 3010); a(1, fixed(1.0)); a(2, fixed(1.0)); says(SWIPE, 1, 3);
+    a(0, 27); a(1, 3011); a(2, 0); says(SWIPE, 2, 3);
+    check("begun over another surface: none of it", next(&e) == ie.NONE);
+    // The pointer gone in the middle: cancelled, the objects let go of.
+    a(0, 28); a(1, 3012); a(2, 77); a(3, 3); says(SWIPE, 0, 4);
+    next(&e);
+    sent();
+    wayland._seat_capabilities(&w, cast(u32, 4));
+    check("the pointer gone mid-swipe: cancelled, the gestures let go of",
+          next(&e) == ie.GESTURE_END && e.detail == ie.CANCELLED && w.swipe == 0 && w.pinch == 0 && w.hold == 0 &&
+          sent() >= 3 && sent_to(0) == cast(u32, SWIPE) && sent_op(0) == 0);
+    // And the seat's touch gone with a finger down: cancelled, released.
+    a(0, 30); a(1, 4000); a(2, 77); a(3, 9); a(4, fixed(1.0)); a(5, fixed(1.0));
+    says(TOUCH, 0, 6);
+    next(&e);
+    sent();
+    wayland._seat_capabilities(&w, cast(u32, 0));
+    check("the touchscreen gone with a finger down: cancelled, released",
+          next(&e) == ie.TOUCH_CANCEL && w.touch == 0 && sent() >= 1 && sent_to(0) == cast(u32, TOUCH) &&
+          sent_op(0) == 0);
+
+    linux.close(pair[0]); linux.close(pair[1]);
+    ie.destroy(w.input);
+    if (failures != 0) {
+        io.printf("wayland touch, pen and gestures: %d failures\n", cast(i64, failures));
+        return 1;
+    }
+    io.printf("wayland touch, pen and gestures: all checks passed\n");
+    return 0;
+}

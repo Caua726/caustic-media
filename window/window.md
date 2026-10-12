@@ -468,7 +468,12 @@ where said:
   buttons 4–7, Windows' deltas, Wayland's `axis_value120`), fingers and
   continuous devices in lines of motion with `stop` when the fingers lift
   (Wayland's frames; X11's XI 2.1 valuators with `x11/xinput.cst`, its
-  emulated buttons dropped). Focus leaving
+  emulated buttons dropped). A touchscreen's fingers are `TOUCH_*` by
+  contact, a pen `PEN_*` with pressure and tilt, a touchpad's swipe, pinch
+  and hold `GESTURE_*` — Wayland's `wl_touch`, tablet-v2 and
+  pointer-gestures; X11's XI 2.2 touches, 2.4 gestures and pens by their
+  pressure valuator; Windows' `WM_POINTER*`, no mouse message made of them
+  said besides. Focus leaving
   is a `CANCEL`: everything held let go, a release after it unsaid. A press
   handed to `begin_move_resize` ends in `BUTTON_UP` with `BUTTON_TAKEN`, and
   the release the window manager keeps never arrives. `STATE` says the

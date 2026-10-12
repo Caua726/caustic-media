@@ -159,8 +159,38 @@ struct Globals {
     text_input_manager_global as i32;
     text_input_manager_version as i32;
     subcompositor_global as i32;
+    tablet_manager_global as i32;
+    gestures_global as i32;
+    gestures_version as i32;
     output_count as i32;
     outputs as [8]GlobalOutput;
+}
+
+// A tablet tool: the server's object (0 free), what it is (ie.TOOL_*), the
+// contact it is said as, what it can say (CAP_* bits), whether it is in
+// range over this window's surface and touching; its last place and
+// readings; and what its events said since the last frame.
+struct Tool {
+    object   as i32;
+    kind     as i32;
+    contact  as i32;
+    caps     as i32;
+    inside   as i32;
+    down     as i32;
+    x        as i64;
+    y        as i64;
+    pressure as f64;
+    tilt_x   as f64;
+    tilt_y   as f64;
+    distance as f64;
+    f_in     as i32;
+    f_out    as i32;
+    f_down   as i32;
+    f_up     as i32;
+    f_moved  as i32;
+    nbuttons as i32;
+    buttons  as [4]i32;    // button << 1 | pressed, in order
+    time     as i64;
 }
 
 struct Window {
@@ -226,6 +256,29 @@ struct Window {
     scroll_stop as i32;
     v120_rest_x as i32;
     v120_rest_y as i32;
+    // Touch (wl_touch): the points down on this surface, by the compositor's
+    // id, and where each last was.
+    touch as i32;
+    touch_ids as [10]i32;
+    touch_used as [10]i32;
+    touch_x as [10]i64;
+    touch_y as [10]i64;
+    // Tablets (tablet-v2): the seat's tablets (server objects, destroyed when
+    // removed) and tools, each a pen's state gathered until its frame.
+    tablet_manager as i32;
+    tablet_seat as i32;
+    tablets as [4]i32;
+    tools as [8]Tool;
+    tool_serial as i32;   // the last tool contact handed out
+    // Touchpad gestures (pointer-gestures): one object of each kind, the one
+    // going on now (ie.SWIPE, PINCH, HOLD; 0 none).
+    gestures as i32;
+    gestures_version as i32;
+    swipe as i32;
+    pinch as i32;
+    hold as i32;
+    gesture_kind as i32;
+    gesture_fingers as i32;
     // Each held key as its press said it: which key, and the key a shortcut
     // is matched against (input/event.cst's key and shortcut).
     key_syms as [256]i32;
@@ -928,6 +981,12 @@ fn _registry_global() as void {
     if (_same(text, len - 1, "wl_subcompositor") == 1 && _globals.subcompositor_global == 0) {
         _globals.subcompositor_global = cast(i32, name);
     }
+    if (_same(text, len - 1, "zwp_tablet_manager_v2") == 1 && _globals.tablet_manager_global == 0) {
+        _globals.tablet_manager_global = cast(i32, name);
+    }
+    if (_same(text, len - 1, "zwp_pointer_gestures_v1") == 1 && _globals.gestures_global == 0) {
+        _globals.gestures_global = cast(i32, name); _globals.gestures_version = version;
+    }
 }
 
 fn _scale_up(value as i64, factor as i32) as i64 {
@@ -1591,13 +1650,24 @@ fn _seat_capabilities(w as *Window, caps as u32) as void {
         _send(w, w.seat, 0, &body[0], 4, 0 - 1);
         w.pointer_version = w.seat_version;
         _cursor_shape_pointer(w);
+        _gesture_objects(w);
     } else if ((caps & 1) == 0 && w.pointer != 0) {
         if (w.cursor_shape_device != 0) {
             _send(w, w.cursor_shape_device, 0, cast(*u8, 0), 0, 0 - 1);
             w.cursor_shape_device = 0;
         }
+        _drop_gestures(w);
         if (w.pointer_version >= 3) { _send(w, w.pointer, 1, cast(*u8, 0), 0, 0 - 1); }
         w.pointer = 0; w.pointer_inside = 0; w.pointer_serial = 0;
+    }
+    if ((caps & 4) != 0 && w.touch == 0) {
+        w.touch = _id(w);
+        _put(&body[0], cast(u32, w.touch));
+        _send(w, w.seat, 2, &body[0], 4, 0 - 1);
+    } else if ((caps & 4) == 0 && w.touch != 0) {
+        _touch_cancel(w);
+        if (w.seat_version >= 3) { _send(w, w.touch, 0, cast(*u8, 0), 0, 0 - 1); }
+        w.touch = 0;
     }
     if ((caps & 2) != 0 && w.keyboard == 0) {
         w.keyboard = _id(w);
@@ -2051,6 +2121,406 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
     }
     if (op == 5 && w.pointer_version >= 5) { _scroll(w); }
 }
+
+// --- Touch (wl_touch) ---
+//
+// A point is this window's from its down on this surface to its up: the
+// compositor sends a client's every touch object the points on any of its
+// surfaces. Coordinates as the pointer's, buffer pixels.
+
+fn _touch_slot(w as *Window, id as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 10) {
+        if (w.touch_used[i] == 1 && w.touch_ids[i] == id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _touch_input(w as *Window, kind as i32, slot as i32, time as u32) as void {
+    let is ie.Event as e = _input(w, kind);
+    e.contact = w.touch_ids[slot];
+    e.x = w.touch_x[slot];
+    e.y = w.touch_y[slot];
+    e.time_ms = cast(i64, time);
+    _push(w, &e, cast(*u8, 0), 0);
+}
+
+// Every point this window had, gone without lifting: one TOUCH_CANCEL.
+fn _touch_cancel(w as *Window) as void {
+    let is i32 as had with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < 10) {
+        if (w.touch_used[i] == 1) { had = 1; }
+        w.touch_used[i] = 0;
+        i = i + 1;
+    }
+    if (had == 0) { return; }
+    let is ie.Event as e = _input(w, ie.TOUCH_CANCEL);
+    _push(w, &e, cast(*u8, 0), 0);
+}
+
+fn _touch_event(w as *Window, op as i32, p as *u8) as void {
+    if (op == 0 && _wire_size >= 32) {
+        // down: serial, time, surface, id, x, y
+        if (cast(i32, _word(cast(*u8, cast(i64, p) + 8))) != w.surface) { return; }
+        let is i32 as id = cast(i32, _word(cast(*u8, cast(i64, p) + 12)));
+        let is i32 as slot with mut = _touch_slot(w, id);
+        if (slot < 0) {
+            slot = 0;
+            // More fingers than kept: the eleventh is not said, nor its up.
+            while (slot < 10 && w.touch_used[slot] == 1) { slot = slot + 1; }
+            if (slot == 10) { return; }
+        }
+        w.touch_used[slot] = 1;
+        w.touch_ids[slot] = id;
+        w.touch_x[slot] = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 16)))) / 256, w.scale120);
+        w.touch_y[slot] = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 20)))) / 256, w.scale120);
+        _touch_input(w, ie.TOUCH_DOWN, slot, _word(cast(*u8, cast(i64, p) + 4)));
+        return;
+    }
+    if (op == 1 && _wire_size >= 20) {
+        // up: serial, time, id
+        let is i32 as slot = _touch_slot(w, cast(i32, _word(cast(*u8, cast(i64, p) + 8))));
+        if (slot < 0) { return; }
+        _touch_input(w, ie.TOUCH_UP, slot, _word(cast(*u8, cast(i64, p) + 4)));
+        w.touch_used[slot] = 0;
+        return;
+    }
+    if (op == 2 && _wire_size >= 24) {
+        // motion: time, id, x, y
+        let is i32 as slot = _touch_slot(w, cast(i32, _word(cast(*u8, cast(i64, p) + 4))));
+        if (slot < 0) { return; }
+        w.touch_x[slot] = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8)))) / 256, w.scale120);
+        w.touch_y[slot] = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 12)))) / 256, w.scale120);
+        _touch_input(w, ie.TOUCH_MOTION, slot, _word(p));
+        return;
+    }
+    if (op == 4) { _touch_cancel(w); }
+}
+
+// --- Pens (tablet-v2) ---
+//
+// The tablet seat says each tablet and tool as it comes, as an object of the
+// compositor's; a tool's events are gathered until its frame and said then,
+// in order: in range, down or moved, its buttons, up, out of range. A tool
+// is this window's from its proximity_in on this surface to its
+// proximity_out. Pads (a tablet's own buttons and rings) are not said.
+
+let is i32 as CAP_PRESSURE with imut = 2;
+let is i32 as CAP_DISTANCE with imut = 3;
+
+fn _tablet_index(w as *Window, obj as i32) as i32 {
+    if (obj == 0) { return 0 - 1; }
+    let is i32 as i with mut = 0;
+    while (i < 4) {
+        if (w.tablets[i] == obj) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _tool_index(w as *Window, obj as i32) as i32 {
+    if (obj == 0) { return 0 - 1; }
+    let is i32 as i with mut = 0;
+    while (i < 8) {
+        if (w.tools[i].object == obj) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _tablet_seat_event(w as *Window, op as i32, p as *u8) as void {
+    if (_wire_size < 12) { return; }
+    let is i32 as obj = cast(i32, _word(p));
+    if (op == 0) {
+        let is i32 as free with mut = 0;
+        while (free < 4 && w.tablets[free] != 0) { free = free + 1; }
+        if (free < 4) { w.tablets[free] = obj; } else { _send(w, obj, 0, cast(*u8, 0), 0, 0 - 1); }
+        return;
+    }
+    if (op == 1) {
+        let is i32 as free with mut = 0;
+        while (free < 8 && w.tools[free].object != 0) { free = free + 1; }
+        if (free == 8) {
+            _send(w, obj, 1, cast(*u8, 0), 0, 0 - 1);
+            return;
+        }
+        let is *Tool as t = &w.tools[free];
+        mem.memzero(cast(*u8, t), sizeof(Tool));
+        t.object = obj;
+        t.kind = ie.TOOL_PEN;
+        w.tool_serial = w.tool_serial + 1;
+        t.contact = w.tool_serial;
+        t.pressure = 0.0 - 1.0;
+        t.tilt_x = 0.0;
+        t.tilt_y = 0.0;
+        t.distance = 0.0 - 1.0;
+        return;
+    }
+    // A pad: its own buttons, not said here; let go of at once.
+    if (op == 2) { _send(w, obj, 1, cast(*u8, 0), 0, 0 - 1); }
+}
+
+fn _tablet_event(w as *Window, i as i32, op as i32) as void {
+    if (op != 4) { return; }
+    _send(w, w.tablets[i], 0, cast(*u8, 0), 0, 0 - 1);
+    w.tablets[i] = 0;
+}
+
+fn _pen(w as *Window, t as *Tool, kind as i32) as ie.Event {
+    let is ie.Event as e = _input(w, kind);
+    e.contact = t.contact;
+    e.x = t.x;
+    e.y = t.y;
+    e.pressure = t.pressure;
+    e.tilt_x = t.tilt_x;
+    e.tilt_y = t.tilt_y;
+    e.distance = t.distance;
+    e.time_ms = t.time;
+    return e;
+}
+
+fn _tool_frame(w as *Window, t as *Tool) as void {
+    if (t.f_in == 1) {
+        let is ie.Event as e = _pen(w, t, ie.PEN_IN);
+        e.detail = t.kind;
+        _push(w, &e, cast(*u8, 0), 0);
+    }
+    if (t.f_down == 1 && t.down == 0) {
+        t.down = 1;
+        let is ie.Event as e = _pen(w, t, ie.PEN_DOWN);
+        _push(w, &e, cast(*u8, 0), 0);
+    } else if (t.f_moved == 1 && t.f_in == 0) {
+        let is ie.Event as e = _pen(w, t, ie.PEN_MOTION);
+        _push(w, &e, cast(*u8, 0), 0);
+    }
+    let is i32 as b with mut = 0;
+    while (b < t.nbuttons) {
+        let is ie.Event as e = _pen(w, t, ie.PEN_BUTTON);
+        e.button = t.buttons[b] >> 1;
+        e.detail = t.buttons[b] & 1;
+        _push(w, &e, cast(*u8, 0), 0);
+        b = b + 1;
+    }
+    if ((t.f_up == 1 || t.f_out == 1) && t.down == 1) {
+        t.down = 0;
+        let is ie.Event as e = _pen(w, t, ie.PEN_UP);
+        _push(w, &e, cast(*u8, 0), 0);
+    }
+    if (t.f_out == 1) {
+        t.inside = 0;
+        let is ie.Event as e = _pen(w, t, ie.PEN_OUT);
+        _push(w, &e, cast(*u8, 0), 0);
+    }
+    t.f_in = 0; t.f_out = 0; t.f_down = 0; t.f_up = 0; t.f_moved = 0; t.nbuttons = 0;
+}
+
+fn _tool_event(w as *Window, i as i32, op as i32, p as *u8) as void {
+    let is *Tool as t = &w.tools[i];
+    if (op == 0 && _wire_size >= 12) {
+        // type: pen 0x140, eraser 0x141, pencil 0x143; brush, airbrush,
+        // finger, mouse and lens are other tools.
+        let is u32 as kind = _word(p);
+        t.kind = ie.TOOL_OTHER;
+        if (kind == cast(u32, 320) || kind == cast(u32, 323)) { t.kind = ie.TOOL_PEN; }
+        if (kind == cast(u32, 321)) { t.kind = ie.TOOL_ERASER; }
+        return;
+    }
+    if (op == 3 && _wire_size >= 12) {
+        let is u32 as cap = _word(p);
+        if (cap < cast(u32, 31)) { t.caps = t.caps | cast(i32, 1 << cap); }
+        return;
+    }
+    if (op == 4) {
+        // done: what it can say starts at rest.
+        if ((t.caps & (1 << CAP_PRESSURE)) != 0) { t.pressure = 0.0; }
+        if ((t.caps & (1 << CAP_DISTANCE)) != 0) { t.distance = 0.0; }
+        return;
+    }
+    if (op == 5) {
+        // removed: out of range first if it was in it.
+        if (t.inside == 1) {
+            t.f_out = 1;
+            _tool_frame(w, t);
+        }
+        _send(w, t.object, 1, cast(*u8, 0), 0, 0 - 1);
+        t.object = 0;
+        return;
+    }
+    if (op == 6 && _wire_size >= 20) {
+        // proximity_in: serial, tablet, surface
+        if (cast(i32, _word(cast(*u8, cast(i64, p) + 8))) == w.surface) {
+            t.inside = 1;
+            t.f_in = 1;
+            t.down = 0;
+        }
+        return;
+    }
+    if (t.inside == 0) { return; }
+    if (op == 7) { t.f_out = 1; return; }
+    if (op == 8) { t.f_down = 1; return; }
+    if (op == 9) { t.f_up = 1; return; }
+    if (op == 10 && _wire_size >= 16) {
+        t.x = _scale_up(cast(i64, cast(i32, _word(p))) / 256, w.scale120);
+        t.y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 4)))) / 256, w.scale120);
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 11 && _wire_size >= 12) {
+        t.pressure = cast(f64, _word(p)) / 65535.0;
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 12 && _wire_size >= 12) {
+        t.distance = cast(f64, _word(p)) / 65535.0;
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 13 && _wire_size >= 16) {
+        t.tilt_x = cast(f64, cast(i32, _word(p))) / 256.0;
+        t.tilt_y = cast(f64, cast(i32, _word(cast(*u8, cast(i64, p) + 4)))) / 256.0;
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 17 && _wire_size >= 20) {
+        // button: serial, button (BTN_STYLUS 0x14b, BTN_STYLUS2 0x14c,
+        // BTN_STYLUS3 0x149), state
+        let is u32 as code = _word(cast(*u8, cast(i64, p) + 4));
+        let is i32 as button with mut = 0;
+        if (code == cast(u32, 331)) { button = 1; }
+        if (code == cast(u32, 332)) { button = 2; }
+        if (code == cast(u32, 329)) { button = 3; }
+        if (button != 0 && t.nbuttons < 4) {
+            t.buttons[t.nbuttons] = (button << 1) | cast(i32, _word(cast(*u8, cast(i64, p) + 8)) != 0);
+            t.nbuttons = t.nbuttons + 1;
+        }
+        return;
+    }
+    if (op == 18 && _wire_size >= 12) {
+        t.time = cast(i64, _word(p));
+        _tool_frame(w, t);
+    }
+}
+
+// The tablets and tools let go of: a tool in range said out of it.
+fn _drop_tablets(w as *Window) as void {
+    let is i32 as i with mut = 0;
+    while (i < 8) {
+        let is *Tool as t = &w.tools[i];
+        if (t.object != 0) {
+            if (t.inside == 1) {
+                t.f_out = 1;
+                _tool_frame(w, t);
+            }
+            _send(w, t.object, 1, cast(*u8, 0), 0, 0 - 1);
+            t.object = 0;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        if (w.tablets[i] != 0) { _send(w, w.tablets[i], 0, cast(*u8, 0), 0, 0 - 1); }
+        w.tablets[i] = 0;
+        i = i + 1;
+    }
+    if (w.tablet_seat != 0) { _send(w, w.tablet_seat, 0, cast(*u8, 0), 0, 0 - 1); }
+    if (w.tablet_manager != 0) { _send(w, w.tablet_manager, 1, cast(*u8, 0), 0, 0 - 1); }
+    w.tablet_seat = 0;
+    w.tablet_manager = 0;
+}
+
+// --- Touchpad gestures (pointer-gestures) ---
+
+fn _gesture_objects(w as *Window) as void {
+    if (w.gestures == 0 || w.pointer == 0) { return; }
+    let is [8]u8 as b;
+    if (w.swipe == 0) {
+        w.swipe = _id(w);
+        _put(&b[0], cast(u32, w.swipe)); _put(&b[4], cast(u32, w.pointer));
+        _send(w, w.gestures, 0, &b[0], 8, 0 - 1);
+    }
+    if (w.pinch == 0) {
+        w.pinch = _id(w);
+        _put(&b[0], cast(u32, w.pinch)); _put(&b[4], cast(u32, w.pointer));
+        _send(w, w.gestures, 1, &b[0], 8, 0 - 1);
+    }
+    if (w.hold == 0 && w.gestures_version >= 3) {
+        w.hold = _id(w);
+        _put(&b[0], cast(u32, w.hold)); _put(&b[4], cast(u32, w.pointer));
+        _send(w, w.gestures, 3, &b[0], 8, 0 - 1);
+    }
+}
+
+// The gesture objects let go of with their pointer: one going on said
+// cancelled.
+fn _drop_gestures(w as *Window) as void {
+    if (w.gesture_kind != 0) {
+        let is ie.Event as e = _input(w, ie.GESTURE_END);
+        e.gesture = w.gesture_kind;
+        e.fingers = w.gesture_fingers;
+        e.detail = ie.CANCELLED;
+        _push(w, &e, cast(*u8, 0), 0);
+        w.gesture_kind = 0;
+    }
+    if (w.swipe != 0) { _send(w, w.swipe, 0, cast(*u8, 0), 0, 0 - 1); }
+    if (w.pinch != 0) { _send(w, w.pinch, 0, cast(*u8, 0), 0, 0 - 1); }
+    if (w.hold != 0) { _send(w, w.hold, 0, cast(*u8, 0), 0, 0 - 1); }
+    w.swipe = 0; w.pinch = 0; w.hold = 0;
+}
+
+// begin (serial, time, surface, fingers) on this surface starts one; its
+// updates — a swipe's motion, a pinch's motion, scale and rotation — and its
+// end (serial, time, cancelled) are said while it goes on.
+fn _gesture_event(w as *Window, obj as i32, op as i32, p as *u8) as void {
+    let is i32 as kind with mut = ie.SWIPE;
+    if (obj == w.pinch) { kind = ie.PINCH; }
+    if (obj == w.hold) { kind = ie.HOLD; }
+    if (op == 0) {
+        if (_wire_size < 24 || cast(i32, _word(cast(*u8, cast(i64, p) + 8))) != w.surface) { return; }
+        w.gesture_kind = kind;
+        w.gesture_fingers = cast(i32, _word(cast(*u8, cast(i64, p) + 12)));
+        let is ie.Event as e = _input(w, ie.GESTURE_BEGIN);
+        e.gesture = kind;
+        e.fingers = w.gesture_fingers;
+        e.x = w.pointer_x;
+        e.y = w.pointer_y;
+        e.time_ms = cast(i64, _word(cast(*u8, cast(i64, p) + 4)));
+        _push(w, &e, cast(*u8, 0), 0);
+        return;
+    }
+    if (w.gesture_kind != kind) { return; }
+    let is i32 as ending = cast(i32, (kind == ie.HOLD && op == 1) || (kind != ie.HOLD && op == 2));
+    if (ending == 1) {
+        if (_wire_size < 20) { return; }
+        let is ie.Event as e = _input(w, ie.GESTURE_END);
+        e.gesture = kind;
+        e.fingers = w.gesture_fingers;
+        e.x = w.pointer_x;
+        e.y = w.pointer_y;
+        e.time_ms = cast(i64, _word(cast(*u8, cast(i64, p) + 4)));
+        if (_word(cast(*u8, cast(i64, p) + 8)) != 0) { e.detail = ie.CANCELLED; }
+        _push(w, &e, cast(*u8, 0), 0);
+        w.gesture_kind = 0;
+        return;
+    }
+    if (op != 1 || kind == ie.HOLD) { return; }
+    if (_wire_size < 20 || (kind == ie.PINCH && _wire_size < 28)) { return; }
+    let is ie.Event as e = _input(w, ie.GESTURE_UPDATE);
+    e.gesture = kind;
+    e.fingers = w.gesture_fingers;
+    e.x = w.pointer_x;
+    e.y = w.pointer_y;
+    e.time_ms = cast(i64, _word(p));
+    // In the window's pixels, as positions are: the surface's units scaled.
+    e.dx = cast(f64, cast(i32, _word(cast(*u8, cast(i64, p) + 4)))) / 256.0 * cast(f64, w.scale120) / 120.0;
+    e.dy = cast(f64, cast(i32, _word(cast(*u8, cast(i64, p) + 8)))) / 256.0 * cast(f64, w.scale120) / 120.0;
+    if (kind == ie.PINCH) {
+        e.scale = cast(f64, cast(i32, _word(cast(*u8, cast(i64, p) + 12)))) / 256.0;
+        e.rotation = cast(f64, cast(i32, _word(cast(*u8, cast(i64, p) + 16)))) / 256.0;
+    }
+    _push(w, &e, cast(*u8, 0), 0);
+}
 fn _reap_retired(w as *Window) as void {
     let is i32 as i with mut = 0;
     let is [0]u8 as empty;
@@ -2127,6 +2597,11 @@ fn _dispatch(w as *Window, obj as i32) as void {
     if (obj == w.seat && op == 0) { _seat_capabilities(w, _word(p)); return; }
     if (obj == w.keyboard) { _keyboard_event(w, op, p); return; }
     if (obj == w.pointer) { _pointer_event(w, op, p); return; }
+    if (obj == w.touch) { _touch_event(w, op, p); return; }
+    if (obj == w.tablet_seat) { _tablet_seat_event(w, op, p); return; }
+    if (obj != 0 && (obj == w.swipe || obj == w.pinch || obj == w.hold)) { _gesture_event(w, obj, op, p); return; }
+    if (_tool_index(w, obj) >= 0) { _tool_event(w, _tool_index(w, obj), op, p); return; }
+    if (_tablet_index(w, obj) >= 0) { _tablet_event(w, _tablet_index(w, obj), op); return; }
     if (obj == w.registry_sync && op == 0) { w.registry_sync = 0; w.acked = 1; return; }
     if (obj == w.wm_base && op == 0) {
         let is [4]u8 as b;
@@ -2254,7 +2729,8 @@ fn _pump_one(w as *Window, wait as i32) as i32 {
         while (i < MAX_WINDOWS) {
             let is *Window as candidate = _windows[i];
             if (cast(i64, candidate) != 0 &&
-                (_offer_index(candidate, obj, 0, 0) >= 0 || _offer_index(candidate, obj, 1, 0) >= 0)) {
+                (_offer_index(candidate, obj, 0, 0) >= 0 || _offer_index(candidate, obj, 1, 0) >= 0 ||
+                 _tool_index(candidate, obj) >= 0 || _tablet_index(candidate, obj) >= 0)) {
                 target = candidate; break;
             }
             i = i + 1;
@@ -2711,6 +3187,23 @@ fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
         _put(&idbody[0], cast(u32, w.text_input));
         _put(cast(*u8, cast(i64, &idbody) + 4), cast(u32, w.seat));
         if (_send(w, w.text_input_manager, 1, &idbody[0], 8, 0 - 1) == 0) { return 0; }
+    }
+    // Pens: the seat's tablets and tools, said as they come (version 1:
+    // what pens say; later versions add pads' dials).
+    if (w.seat != 0 && _globals.tablet_manager_global != 0) {
+        w.tablet_manager = _binding(w, cast(u32, _globals.tablet_manager_global), "zwp_tablet_manager_v2", 1);
+        if (w.tablet_manager == 0) { return 0; }
+        w.tablet_seat = _id(w);
+        _put(&idbody[0], cast(u32, w.tablet_seat));
+        _put(cast(*u8, cast(i64, &idbody) + 4), cast(u32, w.seat));
+        if (_send(w, w.tablet_manager, 0, &idbody[0], 8, 0 - 1) == 0) { return 0; }
+    }
+    // Touchpad gestures: swipe and pinch (1), hold (3).
+    if (w.seat != 0 && _globals.gestures_global != 0) {
+        w.gestures_version = _bounded(_globals.gestures_version, 3);
+        w.gestures = _binding(w, cast(u32, _globals.gestures_global), "zwp_pointer_gestures_v1", w.gestures_version);
+        if (w.gestures == 0) { return 0; }
+        _gesture_objects(w);
     }
     while (_pump_one(w, 0) == 1) { }
     w.surface = _id(w);
@@ -3574,6 +4067,11 @@ fn close(w as *Window) as void {
     w.received_text = cast(*u8, 0); w.drop_storage = cast(*u8, 0);
     ie.destroy(w.input);
     w.input = cast(*ie.Queue, 0);
+    _touch_cancel(w);
+    if (w.touch != 0 && w.seat_version >= 3) { _send(w, w.touch, 0, &empty[0], 0, 0 - 1); }
+    _drop_gestures(w);
+    if (w.gestures != 0 && w.gestures_version >= 2) { _send(w, w.gestures, 2, &empty[0], 0, 0 - 1); }
+    _drop_tablets(w);
     if (w.pointer != 0 && w.pointer_version >= 3) { _send(w, w.pointer, 1, &empty[0], 0, 0 - 1); }
     if (w.keyboard != 0 && w.seat_version >= 3) { _send(w, w.keyboard, 0, &empty[0], 0, 0 - 1); }
     if (w.seat != 0 && w.seat_version >= 5) { _send(w, w.seat, 3, &empty[0], 0, 0 - 1); }

@@ -163,8 +163,12 @@ procedure, a nonblocking message pump and directly writable software frames.
 It handles close requests, resize, UTF-16 character input, IMM32 composition —
 an input context only while a text field that is not a password's has the
 keyboard, the target clause as the part converted, candidates excluded from
-the caret, the field's text for `IMR_DOCUMENTFEED` — pointer capture and wheel
-deltas — the input translated into
+the caret, the field's text for `IMR_DOCUMENTFEED` — pointer capture, wheel
+deltas, a touchscreen's fingers and a pen as `WM_POINTER*` (their type and
+place from `GetPointerInfo`, a pen's pressure and tilt from
+`GetPointerPenInfo`; handled, and any mouse message made of them anyway —
+the pen/touch signature, or while a finger is down — dropped;
+`touch_win32_test` on KWin's Xwayland) — the input translated into
 `input/event.cst`'s cooked events as it arrives: a key's scan code as its
 place and bit 30 as the system's repeat, a `WM_CHAR` the key's only right
 after it went down, focus loss a `CANCEL` that lets the buttons and the

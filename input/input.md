@@ -376,14 +376,57 @@ Scrolling proved: `wayland/input_test` (a version 9 frame: a fine wheel's
 half notches, fingers both ways and lifting, a tilt, a continuous device, the
 fraction forgotten on leaving), `scroll_wayland_test` (XTest's buttons 4–7
 through Weston, which offers the seat at 7 — notches — and KWin, at 10, bound
-at 9 — 120ths), `x11/smooth_test` (scroll valuators as the server reports
+at 9 — 120ths), `x11/xidev_test` (scroll valuators as the server reports
 them: baselines, packed values, increments either way, touchpad, emulation),
-`scroll_x11_test` (XI_Motion standing in for MotionNotify, XTest's wheel not
-taken for an emulation), `host_x11_test` (fingers move the content by their
-pixels at once and fling when lifted). Not proved here: a real touchpad's
-scroll valuators or Wayland finger frames — no such device reaches Xvfb or a
-nested compositor here, so their translation is proved from the protocol's
-bytes and structs.
+`scroll_x11_test` (XI_Motion and XI buttons standing in for the core events,
+a notch said once though the server says it twice), `host_x11_test`
+(fingers move the content by their pixels at once and fling when lifted, a
+hold stops the fling). Not proved here: a real touchpad's scroll valuators or
+Wayland finger frames — no such device reaches Xvfb or a nested compositor
+here, so their translation is proved from the protocol's bytes and structs.
 
-Still to come, in this order: touch, pen and gestures; gamepads, raw devices
-and the action mapping.
+Touch, pens and gestures. A touchscreen's fingers are `TOUCH_DOWN`,
+`TOUCH_MOTION`, `TOUCH_UP` by a `contact` stable from down to up, and
+`TOUCH_CANCEL` when the system takes them all; a pen is `PEN_IN`/`PEN_OUT`
+(its range; `detail` the tool: pen or eraser), `PEN_DOWN`/`PEN_UP`,
+`PEN_MOTION` and `PEN_BUTTON` (barrel button 1 or 2, pressed or released),
+each with its pressure (0 to 1), tilt (degrees) and distance where the
+platform says them; a touchpad's swipe, pinch and hold are
+`GESTURE_BEGIN`/`UPDATE`/`END` (fingers, motion in the window's pixels, a
+pinch's scale since it began and rotation, an end cancelled). Wayland:
+`wl_touch` (this surface's points only, ten at most), tablet-v2's tools
+gathered to their frame and said in order (pads let go of at once), and
+pointer-gestures' swipe, pinch and hold (3), cancelled when the pointer goes.
+X11, with XI2 on (`x11/xinput.cst`, 2.4 asked): XI 2.2 touches selected on
+the window — a client selecting them is sent no pointer emulation of them —
+XI 2.4 pinches and swipes, a pen known by its "Abs Pressure" valuator (XI2 has
+no proximity: its first report brings it in range, the pointer leaving the
+window takes it out), XI buttons the server made up (`XIPointerEmulated`)
+dropped. Windows: `WM_POINTER*` for fingers and pens, their type and place
+from `GetPointerInfo`, a pen's readings from `GetPointerPenInfo`, handled so
+Windows makes no mouse message of them; one it made anyway (the pen/touch
+signature in `GetMessageExtraInfo`, or while a finger is down — Wine sends
+them unsigned) dropped. The host drives the router's pointer with the first
+finger (button 1 from its down to its up, the router's long press a touch's;
+lifted, nothing hovered; cancelled, nothing clicked) and with a pen (tip
+button 1, first barrel button 3, second 2; out of range, nothing hovered),
+and hands gestures to the widget under the pointer (`router.gesture`); a
+scroll area stops a fling when fingers are held on the touchpad.
+
+Proved: `wayland/touch_test` on the wire (fingers by id and surface, eleven
+at once, cancel; a pen's in, down with pressure and tilt, barrel button, up,
+out, an eraser, a tool removed while touching, a pad let go of; swipe,
+pinch, hold, cancelled, begun elsewhere, the pointer gone mid-gesture),
+`touch_kwin_test` through KWin (its fake input's fingers on a Wayland window
+and, through Xwayland, as XI 2.2 touches on an X window, with no pointer
+button besides), `touch_win32_test` (Wine on KWin's Xwayland: the same
+fingers as `WM_POINTER`, no mouse button besides), `x11/xidev_test` (a
+pen's readings, and what a window makes of XI2 pen, touch, gesture and
+made-up button events), `host_x11_test` (a finger presses once, a second is
+not the pointer's, a cancel clicks nothing; a pen hovers, presses, its barrel
+the secondary button). Not proved here: a real pen or touchpad gesture on
+any platform — KWin's fake input has fingers only, and Xvfb no XI2 devices
+of those kinds — so pens and gestures are proved from the protocols' bytes
+and structs; X11 and Wine say no touch cancel (X has none to send).
+
+Still to come, in this order: gamepads, raw devices and the action mapping.

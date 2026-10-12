@@ -57,6 +57,7 @@ use "../window/x11/xinput.cst" as xinput;
 use "app.cst" as app;
 use "tree.cst" as tree;
 use "router.cst" as router;
+use "event.cst" as event;
 use "access.cst" as access;
 use "../input/text.cst" as itext;
 use "text.cst" as text;
@@ -107,6 +108,8 @@ struct Native {
     deco      as i64;            // the frame of its own it was opened for; 0: the platform's
     typed     as i32;            // the text the last key pressed typed is the program's: the key was not taken
     texting   as i64;            // the text field text input was last enabled for; 0: none
+    finger    as i32;            // the touch contact driving the pointer; -1: none
+    pen_in    as i32;            // a pen in range over it
     told_ext  as [4]i64;         // the frame's extents as last told, physical pixels
     told_in   as [4]i64;         // and the input region
     told_min  as [2]i64;         // the smallest it may be made, as last told, physical pixels
@@ -462,6 +465,8 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.deco = deco;
     n.typed = 0;
     n.texting = 0;
+    n.finger = 0 - 1;
+    n.pen_in = 0;
     n.frame_layout_len = 0 - 1;
     // Nothing told yet (-1 each, all bits set): told with its first frame.
     mem.memset(cast(*u8, &n.told_ext), 255, 32);
@@ -470,9 +475,10 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.told_min[0] = 0;
     n.told_min[1] = 0;
     n.cur = cursor.open(&n.win);
-    // X: a touchpad's and a fine wheel's scrolling as XI 2.1 reports it, not
-    // in whole notches.
-    if (os.current() == os.OS_LINUX && n.win.backend == device.X11) { xinput.smooth_scrolling(&n.win.x11_win); }
+    // X: the pointer as XInput 2 reports it — a touchpad's and a fine wheel's
+    // scrolling not in whole notches, a pen's pressure, a touchscreen's
+    // fingers, a touchpad's gestures.
+    if (os.current() == os.OS_LINUX && n.win.backend == device.X11) { xinput.enable(&n.win.x11_win); }
     // The screen, and the desktop's settings, with the first window there is.
     if (hs.disp_ok == 0) {
         hs.disp = display.open(&n.win);
@@ -918,7 +924,28 @@ fn _input_one(hs as *Host, n as *Native, e as *ie.Event, now as i64) as void {
     // The modifiers held, as a pointer's event says them: right at its
     // moment, where a key's says the state before it.
     if (input == 1 && (k == ie.MOTION || k == ie.ENTER || k == ie.BUTTON_DOWN || k == ie.BUTTON_UP ||
-                       k == ie.SCROLL)) { router.set_modifiers(r, e.modifiers); }
+                       k == ie.SCROLL || (k >= ie.TOUCH_DOWN && k <= ie.GESTURE_END))) {
+        router.set_modifiers(r, e.modifiers);
+    }
+    if (k >= ie.TOUCH_DOWN && k <= ie.TOUCH_CANCEL) {
+        _touch(t, r, n, e, x, y, input, now);
+        return;
+    }
+    if (k >= ie.PEN_IN && k <= ie.PEN_BUTTON) {
+        _pen(t, r, n, e, x, y, input, now);
+        return;
+    }
+    if (k >= ie.GESTURE_BEGIN && k <= ie.GESTURE_END) {
+        if (input == 0) { return; }
+        let is i32 as phase with mut = event.GESTURE_UPDATE;
+        if (k == ie.GESTURE_BEGIN) { phase = event.GESTURE_BEGIN; }
+        if (k == ie.GESTURE_END) { phase = event.GESTURE_END; }
+        router.gesture(t, r, x, y, e.gesture, phase, e.fingers, e.dx / s, e.dy / s, e.scale, e.rotation,
+                       cast(i32, e.detail == ie.CANCELLED), now);
+        return;
+    }
+    // The mouse's again, after a finger or a pen.
+    if (k == ie.MOTION || k == ie.ENTER || k == ie.BUTTON_DOWN) { router.set_source(r, router.MOUSE); }
     if (k == ie.BUTTON_UP && e.detail == ie.BUTTON_TAKEN) {
         // The platform took the press, to move or resize the window from:
         // it clicks nothing.
@@ -989,6 +1016,8 @@ fn _input_one(hs as *Host, n as *Native, e as *ie.Event, now as i64) as void {
         // Everything held is let go: a press held clicks nothing, and its
         // release will not come.
         n.typed = 0;
+        // A finger driving the pointer included: its up will not come.
+        n.finger = 0 - 1;
         _drag_back(hs, n, now);
         let is i32 as b with mut = 1;
         while (b <= 3) {
@@ -996,6 +1025,68 @@ fn _input_one(hs as *Host, n as *Native, e as *ie.Event, now as i64) as void {
             b = b + 1;
         }
     }
+}
+
+// A finger: the first down drives the pointer, a press of button 1 — the
+// router's long press is a touch's own — from its down to its up, and others
+// with it are not the pointer's (a gesture's, which the widget under them
+// does not hear). Lifted, the pointer is nowhere: nothing stays hovered.
+// Cancelled — the system took the touches — the press clicks nothing.
+fn _touch(t as *tree.Tree, r as *router.Router, n as *Native, e as *ie.Event, x as f64, y as f64,
+          input as i32, now as i64) as void {
+    let is i32 as k = e.kind;
+    if (k == ie.TOUCH_CANCEL) {
+        if (n.finger < 0) { return; }
+        n.finger = 0 - 1;
+        router.pointer_cancel(t, r, 1, now);
+        router.pointer_leave(t, r, now);
+        return;
+    }
+    if (k == ie.TOUCH_DOWN) {
+        if (n.finger >= 0 || input == 0) { return; }
+        n.finger = e.contact;
+        router.set_source(r, router.TOUCH);
+        router.pointer_move(t, r, x, y, now);
+        router.pointer_button(t, r, 1, 1, x, y, now);
+        return;
+    }
+    if (e.contact != n.finger) { return; }
+    if (k == ie.TOUCH_MOTION) {
+        router.pointer_move(t, r, x, y, now);
+        return;
+    }
+    n.finger = 0 - 1;
+    router.pointer_button(t, r, 1, 0, x, y, now);
+    router.pointer_leave(t, r, now);
+}
+
+// A pen: the pointer while it is in range — hovering moves it, touching is
+// button 1, its first barrel button the secondary (3), its second the
+// middle (2) — gone when it leaves the range.
+fn _pen(t as *tree.Tree, r as *router.Router, n as *Native, e as *ie.Event, x as f64, y as f64,
+        input as i32, now as i64) as void {
+    let is i32 as k = e.kind;
+    if (k == ie.PEN_OUT) {
+        if (n.pen_in == 0) { return; }
+        n.pen_in = 0;
+        router.pointer_leave(t, r, now);
+        return;
+    }
+    if (input == 0) { return; }
+    router.set_source(r, router.PEN);
+    n.pen_in = 1;
+    if (k == ie.PEN_IN || k == ie.PEN_MOTION) {
+        router.pointer_move(t, r, x, y, now);
+        return;
+    }
+    if (k == ie.PEN_DOWN || k == ie.PEN_UP) {
+        router.pointer_button(t, r, 1, cast(i32, k == ie.PEN_DOWN), x, y, now);
+        return;
+    }
+    let is i32 as b with mut = 0;
+    if (e.button == 1) { b = 3; }
+    if (e.button == 2) { b = 2; }
+    if (b != 0) { router.pointer_button(t, r, b, cast(i32, e.detail == ie.PRESSED), x, y, now); }
 }
 
 // The key the router is told: with Control or Super held a command's, so the

@@ -82,6 +82,11 @@ struct Native {
     ime_text_len as i64;
     ime_caret as i64;
     ime_text as [4000]u8;
+    // Pointers (WM_POINTER*): fingers down, the pen in range (its pointer
+    // id, 0 none) and its barrel button as last said.
+    touches as i32;
+    pen_id as u32;
+    pen_barrel as i32;
     high_surrogate as u16;
     after_key as i32;       // a key went down, and nothing let it go since: a WM_CHAR now is its
     cursor as i64;
@@ -285,6 +290,119 @@ fn _pointer(n as *Native, kind as i32, x as i64, y as i64, button as i32) as voi
     e.y = y;
     e.button = button;
     _push(n, &e, cast(*u8, 0), 0);
+}
+
+// --- Fingers and pens (WM_POINTER*) ---
+//
+// A touchscreen's fingers and a pen come as pointer messages, the mouse's
+// still as mouse messages. Handled here — the window procedure returns 0 —
+// Windows makes no mouse message of them: a tap is a touch, not a click
+// besides. Where the pointer is comes from GetPointerInfo; a pen's pressure
+// (0 to 1024), tilt (degrees) and buttons from GetPointerPenInfo.
+
+fn _touch(n as *Native, kind as i32, id as u32, x as i64, y as i64) as void {
+    let is ie.Event as e = _input(kind);
+    e.contact = cast(i32, id);
+    e.x = x;
+    e.y = y;
+    _push(n, &e, cast(*u8, 0), 0);
+}
+
+fn _pen_event(n as *Native, kind as i32, id as u32, x as i64, y as i64, pen as *t.POINTER_PEN_INFO) as void {
+    let is ie.Event as e = _input(kind);
+    e.contact = cast(i32, id);
+    e.x = x;
+    e.y = y;
+    if ((cast(i64, pen.penMask) & t.PEN_MASK_PRESSURE) != 0) { e.pressure = cast(f64, pen.pressure) / 1024.0; }
+    if ((cast(i64, pen.penMask) & t.PEN_MASK_TILT_X) != 0) { e.tilt_x = cast(f64, pen.tiltX); }
+    if ((cast(i64, pen.penMask) & t.PEN_MASK_TILT_Y) != 0) { e.tilt_y = cast(f64, pen.tiltY); }
+    if (kind == ie.PEN_IN) {
+        e.detail = ie.TOOL_PEN;
+        if ((cast(i64, pen.penFlags) & (t.PEN_FLAG_ERASER | t.PEN_FLAG_INVERTED)) != 0) { e.detail = ie.TOOL_ERASER; }
+    }
+    _push(n, &e, cast(*u8, 0), 0);
+}
+
+// A pointer message: 1 when it was a finger's or a pen's and said, 0 for the
+// mouse's (and anything not known), which go on to DefWindowProc.
+fn _pointer_message(n as *Native, msg as i64, wp as u64) as i32 {
+    let is u32 as id = cast(u32, wp & cast(u64, 65535));
+    let is i64 as flags = cast(i64, (wp >> 16) & cast(u64, 65535));
+    if (msg == t.WM_POINTERCAPTURECHANGED) {
+        // Every finger's capture gone: none of them clicks.
+        if (n.touches > 0) {
+            n.touches = 0;
+            let is ie.Event as e = _input(ie.TOUCH_CANCEL);
+            _push(n, &e, cast(*u8, 0), 0);
+        }
+        return 0;
+    }
+    // What the pointer is, as GetPointerInfo says it (Wine's GetPointerType
+    // answers a mouse for a finger); a pen's readings besides.
+    let is t.POINTER_PEN_INFO as pen;
+    mem.memzero(cast(*u8, &pen), sizeof(t.POINTER_PEN_INFO));
+    if (u.GetPointerInfo(id, &pen.pointerInfo) == 0) { return 0; }
+    let is i64 as kind = cast(i64, pen.pointerInfo.pointerType);
+    if (kind != t.PT_TOUCH && kind != t.PT_PEN) { return 0; }
+    if (kind == t.PT_PEN && u.GetPointerPenInfo(id, &pen) == 0) { return 0; }
+    let is t.POINT as at = pen.pointerInfo.ptPixelLocation;
+    u.ScreenToClient(n.hwnd, &at);
+    let is i64 as x = cast(i64, at.x);
+    let is i64 as y = cast(i64, at.y);
+    if (cast(i64, kind) == t.PT_TOUCH) {
+        if (msg == t.WM_POINTERDOWN) {
+            n.touches = n.touches + 1;
+            _touch(n, ie.TOUCH_DOWN, id, x, y);
+        } else if (msg == t.WM_POINTERUPDATE && (flags & t.POINTER_MESSAGE_FLAG_INCONTACT) != 0) {
+            _touch(n, ie.TOUCH_MOTION, id, x, y);
+        } else if (msg == t.WM_POINTERUP) {
+            if (n.touches > 0) { n.touches = n.touches - 1; }
+            if ((flags & t.POINTER_MESSAGE_FLAG_CANCELED) != 0) {
+                n.touches = 0;
+                let is ie.Event as e = _input(ie.TOUCH_CANCEL);
+                _push(n, &e, cast(*u8, 0), 0);
+            } else {
+                _touch(n, ie.TOUCH_UP, id, x, y);
+            }
+        }
+        return 1;
+    }
+    // A pen: in range on its first message, out of it when it leaves.
+    if (msg == t.WM_POINTERLEAVE) {
+        if (n.pen_id == id) {
+            _pen_event(n, ie.PEN_OUT, id, x, y, &pen);
+            n.pen_id = cast(u32, 0);
+        }
+        return 1;
+    }
+    if (n.pen_id != id) {
+        n.pen_id = id;
+        n.pen_barrel = 0;
+        _pen_event(n, ie.PEN_IN, id, x, y, &pen);
+    }
+    let is i32 as barrel = cast(i32, (cast(i64, pen.penFlags) & t.PEN_FLAG_BARREL) != 0);
+    if (msg == t.WM_POINTERDOWN) { _pen_event(n, ie.PEN_DOWN, id, x, y, &pen); }
+    else if (msg == t.WM_POINTERUP) { _pen_event(n, ie.PEN_UP, id, x, y, &pen); }
+    else if (msg == t.WM_POINTERUPDATE && barrel == n.pen_barrel) { _pen_event(n, ie.PEN_MOTION, id, x, y, &pen); }
+    if (barrel != n.pen_barrel) {
+        n.pen_barrel = barrel;
+        let is ie.Event as b = _input(ie.PEN_BUTTON);
+        b.contact = cast(i32, id);
+        b.x = x;
+        b.y = y;
+        b.button = 1;
+        b.detail = barrel;
+        _push(n, &b, cast(*u8, 0), 0);
+    }
+    return 1;
+}
+
+// Whether the mouse message being handled was made up from a finger or a
+// pen: MI_WP_SIGNATURE in GetMessageExtraInfo's top 24 bits, or a finger
+// down on the window (Wine makes them up without the signature).
+fn _promoted(n as *Native) as i32 {
+    let is i64 as info = u.GetMessageExtraInfo() & 4294967040;
+    return cast(i32, info == 4283520768 || n.touches > 0);
 }
 
 // What was typed: one code point, as UTF-8 — the key's when one just went
@@ -938,6 +1056,16 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         if (cast(i64, wp) == t.IMR_QUERYCHARPOSITION) { return _char_position(n, cast(*t.IMECHARPOSITION, lp)); }
         return 0;
     }
+    if (cast(i64, msg) >= t.WM_POINTERUPDATE && cast(i64, msg) <= t.WM_POINTERCAPTURECHANGED &&
+        cast(i64, msg) != t.WM_POINTERACTIVATE) {
+        if (_pointer_message(n, cast(i64, msg), wp) == 1) { return 0; }
+        return u.DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    // A mouse message Windows made from a finger or a pen (its extra info
+    // carries the pen/touch signature), or one while a finger is down: the
+    // finger's or the pen's, said already.
+    if ((cast(i64, msg) == t.WM_MOUSEMOVE || (cast(i64, msg) >= t.WM_LBUTTONDOWN && cast(i64, msg) <= t.WM_MBUTTONUP)) &&
+        _promoted(n) == 1) { return 0; }
     if (cast(i64, msg) == t.WM_MOUSEMOVE) {
         let is i64 as mx = _signed16(cast(u64, lp));
         let is i64 as my = _signed16(cast(u64, lp) >> 16);

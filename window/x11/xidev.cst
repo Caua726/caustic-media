@@ -1,4 +1,6 @@
-// window/x11/smooth.cst — smooth scrolling, as XInput 2.1 reports it.
+// window/x11/xidev.cst — what XInput 2 says of the devices behind the
+// pointer: their scroll valuators (smooth scrolling) and a pen's pressure and
+// tilt.
 //
 // X has no scroll event. A wheel's notch was buttons 4–7, a press and a
 // release, and that is all a touchpad's two fingers could be either, quantized
@@ -10,14 +12,20 @@
 // the master pointer switched, is only where the total stands now (the
 // baseline), never a jump.
 //
-// The server goes on sending buttons 4–7 for whoever asked for core events,
-// emulated from the same motion — the same scroll twice. They come with the
-// motion's own timestamp, right after it, so a press of 4–7 at the time
-// smooth scrolling moved that axis is the emulation's and is dropped.
+// The server says the same scroll both ways — buttons 4–7 emulated from
+// valuator motion, valuator motion emulated from a device's buttons — and
+// marks whichever it made up (XIPointerEmulated): that one is not said
+// again. Core buttons 4–7 carry no mark, so one at the moment a smooth scroll
+// moved its axis is the emulation's.
+//
+// A pen is a device with a pressure valuator ("Abs Pressure", as X's input
+// drivers and Xwayland label it): its pressure 0 to 1 over the valuator's
+// range, its tilt in degrees from its "Abs Tilt" valuators. XI2 events carry
+// only the valuators that changed: the rest are as last said.
 //
 // This file reads structs and calls nothing, so window.cst can carry it with
-// no libXi in a program that never turns smooth scrolling on: asking the
-// server (XISelectEvents, XIQueryDevice) is xinput.cst's.
+// no libXi in a program that never turns XI2 on: asking the server
+// (XISelectEvents, XIQueryDevice, the labels' atoms) is xinput.cst's.
 use "bind/xinput2.cst" as xi2;
 use "../../input/event.cst" as ie;
 
@@ -33,21 +41,38 @@ struct Axis {
     rest      as i32;   // 120ths of a notch short of a whole one
 }
 
+// A pen's valuator: which, its range, its value as last said; -1: none.
+struct Reading {
+    number as i32;
+    _pad0  as i32;
+    min    as f64;
+    max    as f64;
+    value  as f64;
+}
+
 struct Device {
     id       as i32;
     touchpad as i32;    // fingers: motion, not notches
     naxes    as i32;
+    pen      as i32;    // a pressure valuator: a pen
     axes     as [4]Axis;
+    pressure as Reading;
+    tilt_x   as Reading;
+    tilt_y   as Reading;
 }
 
 struct State {
     devices  as [16]Device;
     ndevices as i64;
-    // What the last smooth scroll moved and when: buttons 4–7 at that time
-    // are its emulation.
+    // What the last smooth scroll moved and when: core buttons 4–7 at that
+    // time are its emulation.
     moved_at as u64;
     moved_v  as i32;
     moved_h  as i32;
+    // The valuator labels a pen's are known by (atoms, 0 unknown).
+    label_pressure as i64;
+    label_tilt_x   as i64;
+    label_tilt_y   as i64;
 }
 
 fn init(s as *State) as void {
@@ -55,6 +80,17 @@ fn init(s as *State) as void {
     s.moved_at = cast(u64, 0);
     s.moved_v = 0;
     s.moved_h = 0;
+    s.label_pressure = 0;
+    s.label_tilt_x = 0;
+    s.label_tilt_y = 0;
+}
+
+// The atoms of "Abs Pressure", "Abs Tilt X" and "Abs Tilt Y" on this
+// connection: what a pen's valuators are known by.
+fn set_labels(s as *State, pressure as i64, tilt_x as i64, tilt_y as i64) as void {
+    s.label_pressure = pressure;
+    s.label_tilt_x = tilt_x;
+    s.label_tilt_y = tilt_y;
 }
 
 fn _device(s as *State, id as i32) as *Device {
@@ -69,14 +105,35 @@ fn _device(s as *State, id as i32) as *Device {
 // Whether device id has been learned (learn), scroll axes or none.
 fn knows(s as *State, id as i32) as i32 { return cast(i32, cast(i64, _device(s, id)) != 0); }
 
+// Whether device id is a pen.
+fn pen(s as *State, id as i32) as i32 {
+    let is *Device as d = _device(s, id);
+    return cast(i32, cast(i64, d) != 0 && d.pen == 1);
+}
+
+fn _none(r as *Reading) as void {
+    r.number = 0 - 1;
+    r.min = 0.0;
+    r.max = 0.0;
+    r.value = 0.0;
+}
+
+fn _reading(r as *Reading, vc as *xi2.XIValuatorClassInfo) as void {
+    r.number = vc.number;
+    r.min = vc.min;
+    r.max = vc.max;
+    r.value = vc.value;
+}
+
 // Device id as its classes say (XIDeviceInfo's or XIDeviceChangedEvent's,
-// n of them): its scroll axes, each based at its valuator's value now.
-// touchpad: its motion is fingers', not a wheel's. Learned again, replaced.
+// n of them): its scroll axes, each based at its valuator's value now, and
+// its pen valuators by their labels. touchpad: its motion is fingers', not a
+// wheel's. Learned again, replaced.
 fn learn(s as *State, id as i32, classes as **u8, n as i32, touchpad as i32) as void {
     let is *Device as d with mut = _device(s, id);
     if (cast(i64, d) == 0) {
         if (s.ndevices == MAX_DEVICES) {
-            // The oldest forgotten: learned again if it scrolls again.
+            // The oldest forgotten: learned again if it moves again.
             let is i64 as i with mut = 1;
             while (i < MAX_DEVICES) {
                 s.devices[i - 1] = s.devices[i];
@@ -90,6 +147,10 @@ fn learn(s as *State, id as i32, classes as **u8, n as i32, touchpad as i32) as 
     d.id = id;
     d.touchpad = touchpad;
     d.naxes = 0;
+    d.pen = 0;
+    _none(&d.pressure);
+    _none(&d.tilt_x);
+    _none(&d.tilt_y);
     let is i64 as k with mut = 0;
     while (k < cast(i64, n)) {
         let is *xi2.XIAnyClassInfo as any = cast(*xi2.XIAnyClassInfo, classes[k]);
@@ -108,7 +169,7 @@ fn learn(s as *State, id as i32, classes as **u8, n as i32, touchpad as i32) as 
         }
         k = k + 1;
     }
-    // The valuators' values now: the baselines.
+    // The valuators' values now: the scroll axes' baselines, a pen's readings.
     k = 0;
     while (k < cast(i64, n)) {
         let is *xi2.XIAnyClassInfo as any = cast(*xi2.XIAnyClassInfo, classes[k]);
@@ -122,6 +183,12 @@ fn learn(s as *State, id as i32, classes as **u8, n as i32, touchpad as i32) as 
                 }
                 j = j + 1;
             }
+            if (vc.label != 0 && vc.label == s.label_pressure && vc.max > vc.min) {
+                _reading(&d.pressure, vc);
+                d.pen = 1;
+            }
+            if (vc.label != 0 && vc.label == s.label_tilt_x) { _reading(&d.tilt_x, vc); }
+            if (vc.label != 0 && vc.label == s.label_tilt_y) { _reading(&d.tilt_y, vc); }
         }
         k = k + 1;
     }
@@ -144,7 +211,7 @@ fn rebase(s as *State) as void {
 }
 
 // Device id forgotten: its classes changed, or another device is behind the
-// master pointer now. Learned again when it scrolls.
+// master pointer now. Learned again when it moves.
 fn forget(s as *State, id as i32) as void {
     let is i64 as i with mut = 0;
     while (i < s.ndevices) {
@@ -177,8 +244,9 @@ fn _valuator(vs as *xi2.XIValuatorState, n as i32, v as *f64) as i32 {
 }
 
 // The scroll in an XI_Motion report, into out's scroll fields: 1 when its
-// device's axes moved, 0 when they did not (or it has none), -1 when its
-// device is not known yet (learn it, then ask again).
+// device's axes moved, 0 when they did not (or it has none, or the server
+// made the motion up from buttons — the baselines move all the same), -1
+// when its device is not known yet (learn it, then ask again).
 fn motion(s as *State, ev as *xi2.XIDeviceEvent, out as *ie.Event) as i32 {
     let is *Device as d = _device(s, ev.sourceid);
     if (cast(i64, d) == 0) { return 0 - 1; }
@@ -200,7 +268,7 @@ fn motion(s as *State, ev as *xi2.XIDeviceEvent, out as *ie.Event) as i32 {
         }
         j = j + 1;
     }
-    if (moved == 0) { return 0; }
+    if (moved == 0 || (ev.flags & xi2.XIPointerEmulated) != 0) { return 0; }
     out.kind = ie.SCROLL;
     out.dx = dx;
     out.dy = dy;
@@ -242,4 +310,30 @@ fn emulated(s as *State, time as u64, b as i64) as i32 {
     if ((b == 4 || b == 5) && s.moved_v == 1) { return 1; }
     if ((b == 6 || b == 7) && s.moved_h == 1) { return 1; }
     return 0;
+}
+
+// A pen's readings in a report (XI_Motion, XI_ButtonPress, XI_ButtonRelease)
+// into out: pressure 0 to 1, tilt in degrees, each kept as last said where
+// the report leaves it out, -1 where the pen has none. 0 when the device is
+// not a pen.
+fn pen_readings(s as *State, ev as *xi2.XIDeviceEvent, out as *ie.Event) as i32 {
+    let is *Device as d = _device(s, ev.sourceid);
+    if (cast(i64, d) == 0 || d.pen == 0) { return 0; }
+    _update(&d.pressure, &ev.valuators);
+    _update(&d.tilt_x, &ev.valuators);
+    _update(&d.tilt_y, &ev.valuators);
+    out.pressure = (d.pressure.value - d.pressure.min) / (d.pressure.max - d.pressure.min);
+    if (out.pressure < 0.0) { out.pressure = 0.0; }
+    if (out.pressure > 1.0) { out.pressure = 1.0; }
+    out.tilt_x = 0.0;
+    out.tilt_y = 0.0;
+    if (d.tilt_x.number >= 0) { out.tilt_x = d.tilt_x.value; }
+    if (d.tilt_y.number >= 0) { out.tilt_y = d.tilt_y.value; }
+    return 1;
+}
+
+fn _update(r as *Reading, vs as *xi2.XIValuatorState) as void {
+    if (r.number < 0) { return; }
+    let is f64 as v with mut = 0.0;
+    if (_valuator(vs, r.number, &v) == 1) { r.value = v; }
 }

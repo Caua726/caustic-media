@@ -1,0 +1,130 @@
+// window/touch_win32_test.cst — a touchscreen's fingers on Windows (here:
+// an isolated Wine on KWin's Xwayland, which hands it the touches KWin's fake
+// input sets down, as WM_POINTER messages):
+//   env CAUSTIC_WINE_X=kwin sh tools/wine_session.sh sh -c \
+//     'env WAYLAND_DISPLAY="$CAUSTIC_WAYLAND_DISPLAY" ./build/touch_kwin_test inject /tmp/zz-touch-ready & \
+//      env CAUSTIC_TOUCH_READY=/tmp/zz-touch-ready sh tools/run_wine.sh build/touch_win32_test.exe; wait'
+// Filling the screen it says it is ready (a file the injector waits for):
+// each finger then by its own contact from its down to its up, where it is,
+// moved; two at once; and no mouse message besides — a tap is a touch, not
+// a click too. A pen's messages need a pen Wine can be handed: real Windows.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "device.cst" as device;
+use "../input/event.cst" as ie;
+use "../gpu/software/target.cst" as tgt;
+use "win32/bind/types.cst" as t;
+use "win32/bind/kernel32.cst" as k;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is i32 as mice with mut = 0;
+
+fn next(out as *ie.Event) as i32 {
+    let is i64 as until = time.now_ms() + 3000;
+    while (time.now_ms() < until) {
+        device.pump(&win);
+        while (device.poll_input(&win, out) == 1) {
+            if (out.kind >= ie.TOUCH_DOWN && out.kind <= ie.TOUCH_CANCEL) { return out.kind; }
+            if (out.kind == ie.BUTTON_DOWN || out.kind == ie.BUTTON_UP) { mice = mice + 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return ie.NONE;
+}
+
+fn near(a as i64, b as i64) as i32 { return cast(i32, a - b <= 2 && b - a <= 2); }
+
+// The ready file, its Unix path as Wine's Z: drive has it.
+fn ready() as i32 {
+    let is [256]u16 as path;
+    let is *u8 as unix = env.getenv("CAUSTIC_TOUCH_READY");
+    if (cast(i64, unix) == 0) { return 0; }
+    path[0] = cast(u16, 90);
+    path[1] = cast(u16, 58);
+    let is i64 as i with mut = 0;
+    while (unix[i] != 0 && i < 250) {
+        let is u16 as c with mut = cast(u16, unix[i]);
+        if (c == cast(u16, 47)) { c = cast(u16, 92); }
+        path[2 + i] = c;
+        i = i + 1;
+    }
+    path[2 + i] = cast(u16, 0);
+    let is i64 as h = k.CreateFileW(&path[0], cast(u32, t.GENERIC_WRITE), 0, cast(*u8, 0), cast(u32, t.CREATE_ALWAYS),
+                                    cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    k.CloseHandle(h);
+    return 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    win = device.open("touch", 400, 300);
+    if (device.is_open(&win) == 0) {
+        io.printf("FAIL: no window\n");
+        return 1;
+    }
+    device.set_fullscreen(&win, 1);
+    let is i64 as until = time.now_ms() + 3000;
+    while (device.width(&win) < 1000 && time.now_ms() < until) {
+        device.next_frame(&win);
+        let is tgt.Target as tg = device.acquire(&win);
+        if (cast(i64, tg.color) != 0) { device.submit(&win); }
+        device.pump(&win);
+        time.sleep_ms(20);
+    }
+    check("filling the screen", device.width(&win) >= 1000);
+    device.next_frame(&win);
+    let is tgt.Target as full = device.acquire(&win);
+    if (cast(i64, full.color) != 0) { device.submit(&win); }
+    check("ready said", ready() == 1);
+    let is ie.Event as e;
+    check("a finger down: a touch, where it is", next(&e) == ie.TOUCH_DOWN && near(e.x, 100) == 1 && near(e.y, 120) == 1);
+    let is i32 as first = e.contact;
+    // Wine says a finger held still again and again: the motion is the one
+    // that moved.
+    let is i32 as moving with mut = next(&e);
+    while (moving == ie.TOUCH_MOTION && near(e.x, 140) == 0) { moving = next(&e); }
+    check("moved", moving == ie.TOUCH_MOTION && e.contact == first && near(e.x, 140) == 1 && near(e.y, 160) == 1);
+    let is i32 as kind with mut = next(&e);
+    while (kind == ie.TOUCH_MOTION) { kind = next(&e); }
+    check("a second, its own contact", kind == ie.TOUCH_DOWN && e.contact != first && near(e.x, 300) == 1);
+    let is i32 as second = e.contact;
+    kind = next(&e);
+    while (kind == ie.TOUCH_MOTION) { kind = next(&e); }
+    check("the second lifted", kind == ie.TOUCH_UP && e.contact == second);
+    kind = next(&e);
+    while (kind == ie.TOUCH_MOTION) { kind = next(&e); }
+    check("the first lifted", kind == ie.TOUCH_UP && e.contact == first);
+    kind = next(&e);
+    check("down again", kind == ie.TOUCH_DOWN);
+    kind = next(&e);
+    while (kind == ie.TOUCH_MOTION) { kind = next(&e); }
+    io.printf("  after the cancel: %s\n", ie.kind_name(kind));
+    let is ie.Event as rest;
+    let is i64 as quiet_until = time.now_ms() + 500;
+    while (time.now_ms() < quiet_until) {
+        device.pump(&win);
+        while (device.poll_input(&win, &rest) == 1) {
+            if (rest.kind == ie.BUTTON_DOWN || rest.kind == ie.BUTTON_UP) { mice = mice + 1; }
+        }
+        time.sleep_ms(5);
+    }
+    check("no mouse button besides", mice == 0);
+    device.close(&win);
+    if (fails != 0) {
+        io.printf("touch win32: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("touch win32: all checks passed\n");
+    return 0;
+}

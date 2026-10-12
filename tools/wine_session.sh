@@ -13,12 +13,15 @@
 # CAUSTIC_WINE_GRAPHICS=wayland has Wine present through its Wayland driver
 # to a Weston nested in that X server (window/wayland/tools/run_wayland.sh,
 # WESTON_CONFIG passed on), so a compositor blends what it shows and the X
-# screen can still be read back.
+# screen can still be read back. CAUSTIC_WINE_X=kwin has the X server be
+# KWin's Xwayland instead (run_kwin.sh, its fake input allowed), its Wayland
+# socket kept in CAUSTIC_WAYLAND_DISPLAY for a program that drives KWin.
 set -eu
 [ $# -gt 0 ] || { echo "usage: wine_session.sh command [args...]" >&2; exit 2; }
 . "$(dirname "$0")/child.sh"
 if [ "${1:-}" = "--inside" ]; then
     shift
+    export CAUSTIC_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
     unset WAYLAND_DISPLAY
     export CAUSTIC_WINE_SESSION="$WINEPREFIX"
     if [ -n "${CAUSTIC_WINE_DPI:-}" ]; then
@@ -60,4 +63,11 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT
-run_child sh "$(dirname "$0")/../window/x11/tools/run_headless.sh" sh "$0" --inside "$@"
+case "${CAUSTIC_WINE_X:-xvfb}" in
+    xvfb) run_child sh "$(dirname "$0")/../window/x11/tools/run_headless.sh" sh "$0" --inside "$@" ;;
+    kwin)
+        run_child env KWIN_XWAYLAND=1 KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
+            sh "$(dirname "$0")/../window/wayland/tools/run_kwin.sh" sh "$0" --inside "$@"
+        ;;
+    *) echo "wine_session: unknown CAUSTIC_WINE_X ${CAUSTIC_WINE_X}" >&2; exit 2 ;;
+esac
