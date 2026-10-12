@@ -1,0 +1,208 @@
+// window/present_frames.cst — the frames present_test and present_win32_test
+// show by parts and check whole: a reference frame (RGBA, what a whole-frame
+// submit would show) changed step by step — disjoint rectangles, a moved
+// region, single pixels, a frame drawn and then abandoned — each step's
+// changed rectangles said, so a test can present only those and compare what
+// the screen shows with the whole reference.
+
+use "std/mem.cst" as mem;
+use "damage.cst" as damage;
+
+let is i32 as FILL    with imut = 0;
+let is i32 as RECTS   with imut = 1;
+let is i32 as SCROLL  with imut = 2;
+let is i32 as SPECK   with imut = 3;
+let is i32 as ABANDON with imut = 4;
+
+struct Frames {
+    w      as i64;
+    h      as i64;
+    ref    as *u8;
+    tmp    as *u8;
+    bytes  as i64;
+    seed   as u64;
+    step   as i64;
+    alpha  as i32;   // colours with alpha below 255 too
+    _pad   as i32;
+}
+
+fn _random(f as *Frames, n as i64) as i64 {
+    f.seed = f.seed * 6364136223846793005 + 1442695040888963407;
+    return cast(i64, (f.seed >> 33) % cast(u64, n));
+}
+
+fn _put(f as *Frames, x as i64, y as i64, r as i64, g as i64, b as i64, a as i64) as void {
+    let is *u8 as p = cast(*u8, cast(i64, f.ref) + (y * f.w + x) * 4);
+    p[0] = cast(u8, r); p[1] = cast(u8, g); p[2] = cast(u8, b); p[3] = cast(u8, a);
+}
+
+fn _gradient(f as *Frames) as void {
+    let is i64 as y with mut = 0;
+    while (y < f.h) {
+        let is i64 as x with mut = 0;
+        while (x < f.w) {
+            _put(f, x, y, (x * 255) / f.w, (y * 255) / f.h, (x + y) & 255, 255);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn _alloc(f as *Frames, w as i64, h as i64) as i32 {
+    f.w = w; f.h = h; f.bytes = w * h * 4;
+    f.ref = mem.core.mmap_anon(f.bytes);
+    f.tmp = mem.core.mmap_anon(f.bytes);
+    return cast(i32, cast(i64, f.ref) != 0 && cast(i64, f.tmp) != 0);
+}
+
+fn _free(f as *Frames) as void {
+    if (cast(i64, f.ref) != 0) { mem.core.munmap(f.ref, f.bytes); }
+    if (cast(i64, f.tmp) != 0) { mem.core.munmap(f.tmp, f.bytes); }
+    f.ref = cast(*u8, 0); f.tmp = cast(*u8, 0);
+}
+
+fn open(f as *Frames, w as i64, h as i64, alpha as i32) as i32 {
+    mem.memzero(cast(*u8, f), sizeof(Frames));
+    f.seed = 20251012;
+    f.alpha = alpha;
+    if (_alloc(f, w, h) == 0) { return 0; }
+    _gradient(f);
+    return 1;
+}
+
+fn close(f as *Frames) as void { _free(f); }
+
+// The window made w by h: a new reference, all of it changed.
+fn resize(f as *Frames, w as i64, h as i64, l as *damage.List) as i32 {
+    _free(f);
+    if (_alloc(f, w, h) == 0) { return 0; }
+    _gradient(f);
+    damage.whole(l);
+    return 1;
+}
+
+fn _colour_rect(f as *Frames, x as i64, y as i64, w as i64, h as i64, l as *damage.List) as void {
+    let is i64 as r = _random(f, 256);
+    let is i64 as g = _random(f, 256);
+    let is i64 as b = _random(f, 256);
+    let is i64 as a with mut = 255;
+    if (f.alpha == 1) {
+        let is i64 as pick = _random(f, 3);
+        if (pick == 1) { a = 128; }
+        if (pick == 2) { a = 37; }
+    }
+    let is i64 as yy with mut = y;
+    while (yy < y + h) {
+        let is i64 as xx with mut = x;
+        while (xx < x + w) { _put(f, xx, yy, r, g, b, a); xx = xx + 1; }
+        yy = yy + 1;
+    }
+    damage.add(l, x, y, w, h, f.w, f.h);
+}
+
+// A rectangle somewhere inside, at least 1 by 1.
+fn _rect(f as *Frames, max as i64, x as *i64, y as *i64, w as *i64, h as *i64) as void {
+    *w = 1 + _random(f, max);
+    *h = 1 + _random(f, max);
+    if (*w > f.w) { *w = f.w; }
+    if (*h > f.h) { *h = f.h; }
+    *x = _random(f, f.w - *w + 1);
+    *y = _random(f, f.h - *h + 1);
+}
+
+// The region x, y, w, h moved by dx, dy (clipped): where it was and where it
+// went changed.
+fn _scroll(f as *Frames, l as *damage.List) as void {
+    let is i64 as x with mut = 0; let is i64 as y with mut = 0;
+    let is i64 as w with mut = 0; let is i64 as h with mut = 0;
+    _rect(f, f.w / 2, &x, &y, &w, &h);
+    let is i64 as dx = _random(f, 15) - 7;
+    let is i64 as dy = _random(f, 15) - 7;
+    mem.memcpy(f.tmp, f.ref, f.bytes);
+    let is i64 as yy with mut = y;
+    while (yy < y + h) {
+        let is i64 as xx with mut = x;
+        while (xx < x + w) {
+            let is i64 as tx = xx + dx;
+            let is i64 as ty = yy + dy;
+            if (tx >= 0 && ty >= 0 && tx < f.w && ty < f.h) {
+                let is *u32 as from = cast(*u32, cast(i64, f.tmp) + (yy * f.w + xx) * 4);
+                let is *u32 as to = cast(*u32, cast(i64, f.ref) + (ty * f.w + tx) * 4);
+                *to = *from;
+            }
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    damage.add(l, x, y, w, h, f.w, f.h);
+    damage.add(l, x + dx, y + dy, w, h, f.w, f.h);
+}
+
+// The next step applied to the reference, its changes into l (cleared
+// first): what kind of step it was.
+fn next(f as *Frames, l as *damage.List) as i32 {
+    damage.clear(l);
+    let is i64 as s = f.step;
+    f.step = f.step + 1;
+    if (s == 0) { damage.whole(l); return FILL; }
+    let is i64 as kind = s % 6;
+    let is i64 as x with mut = 0; let is i64 as y with mut = 0;
+    let is i64 as w with mut = 0; let is i64 as h with mut = 0;
+    if (kind == 1) { _scroll(f, l); return SCROLL; }
+    if (kind == 3) {
+        let is i64 as sx = _random(f, f.w);
+        let is i64 as sy = _random(f, f.h);
+        _put(f, sx, sy, _random(f, 256), _random(f, 256), _random(f, 256), 255);
+        damage.add(l, sx, sy, 1, 1, f.w, f.h);
+        return SPECK;
+    }
+    let is i64 as count with mut = 1 + _random(f, 3);
+    while (count > 0) {
+        _rect(f, f.w / 3, &x, &y, &w, &h);
+        _colour_rect(f, x, y, w, h, l);
+        count = count - 1;
+    }
+    if (kind == 4) { return ABANDON; }
+    return RECTS;
+}
+
+// The rectangles of l (all of it when whole) copied from the reference into
+// dst, rows stride bytes apart.
+fn copy(f as *Frames, dst as *u8, stride as i64, l as *damage.List) as void {
+    if (l.whole == 1) {
+        let is i64 as y with mut = 0;
+        while (y < f.h) {
+            mem.memcpy(cast(*u8, cast(i64, dst) + y * stride), cast(*u8, cast(i64, f.ref) + y * f.w * 4), f.w * 4);
+            y = y + 1;
+        }
+        return;
+    }
+    let is i32 as k with mut = 0;
+    while (k < l.n) {
+        let is *damage.Rect as r = &l.rects[k];
+        let is i64 as row with mut = 0;
+        while (row < cast(i64, r.h)) {
+            let is i64 as y = cast(i64, r.y) + row;
+            mem.memcpy(cast(*u8, cast(i64, dst) + y * stride + cast(i64, r.x) * 4),
+                       cast(*u8, cast(i64, f.ref) + (y * f.w + cast(i64, r.x)) * 4), cast(i64, r.w) * 4);
+            row = row + 1;
+        }
+        k = k + 1;
+    }
+}
+
+// What the screen shows at x, y: 0xAARRGGBB, the colour premultiplied by
+// its alpha (a compositor's convention; opaque pixels are themselves).
+fn expect(f as *Frames, x as i64, y as i64) as i64 {
+    let is *u8 as p = cast(*u8, cast(i64, f.ref) + (y * f.w + x) * 4);
+    let is i64 as a = cast(i64, p[3]);
+    let is i64 as r with mut = cast(i64, p[0]);
+    let is i64 as g with mut = cast(i64, p[1]);
+    let is i64 as b with mut = cast(i64, p[2]);
+    if (a < 255) {
+        r = (r * a + 127) / 255;
+        g = (g * a + 127) / 255;
+        b = (b * a + 127) / 255;
+    }
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}

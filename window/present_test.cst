@@ -1,0 +1,230 @@
+// window/present_test.cst — frames presented by their changed parts, the
+// screen read back after each and compared with the whole frame a full
+// submit would show (present_frames.cst's reference):
+//   sh window/x11/tools/run_headless.sh ./build/present_test                X11, read with XGetImage
+//   sh window/x11/tools/run_headless.sh ./build/present_test transparent    X11, a 32-bit window
+//   sh window/x11/tools/run_headless.sh env WESTON_BACKEND=x11 WESTON_SHELL=kiosk \
+//       sh window/wayland/tools/run_wayland.sh ./build/present_test wayland    Weston nested in Xvfb
+// Each frame copies into the platform's buffer only what that buffer lacks
+// for its age (damage.repair), then submit_region: disjoint rectangles, a
+// moved region (where it was and where it went), single pixels, a frame
+// abandoned after acquire, alpha premultiplied once and channels swapped once
+// however long a buffer is kept, alternating buffers (age 2: MIT-SHM, the
+// compositor's two), and on X11 a resize (age 0, all of it).
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "device.cst" as device;
+use "damage.cst" as damage;
+use "present_frames.cst" as frames;
+use "x11/x11.cst" as x11;
+use "x11/bind/xlib.cst" as xlib;
+use "../gpu/software/target.cst" as tgt;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is *u8 as xd with mut = cast(*u8, 0);
+let is i32 as wayland with mut = 0;
+let is i32 as alpha with mut = 0;
+
+// What the screen shows of the window against the reference: the pixels
+// that differ (32 bits for a window with alpha, else 24), or -1 unread; the
+// first of them printed when report.
+fn differing(f as *frames.Frames, report as i32) as i64 {
+    let is i64 as drawable with mut = xlib.XDefaultRootWindow(xd);
+    if (wayland == 0) { drawable = x11.xid(&win.x11_win); }
+    let is *u8 as im = xlib.XGetImage(xd, drawable, 0, 0, cast(u32, f.w), cast(u32, f.h), 0 - 1, 2);
+    if (cast(i64, im) == 0) { return 0 - 1; }
+    let is *xlib.XImage as img = cast(*xlib.XImage, im);
+    let is i64 as mask with mut = 16777215;
+    if (alpha == 1) { mask = 4294967295; }
+    let is i64 as bad with mut = 0;
+    let is i64 as y with mut = 0;
+    while (y < f.h) {
+        let is i64 as x with mut = 0;
+        while (x < f.w) {
+            let is *u32 as at = cast(*u32, cast(i64, img.data) + y * cast(i64, img.bytes_per_line) + x * 4);
+            if ((cast(i64, *at) & mask) != (frames.expect(f, x, y) & mask)) {
+                if (bad == 0 && report == 1) {
+                    io.printf("  first difference at %d,%d: shown %x, the whole frame %x\n", x, y,
+                              cast(i64, *at) & mask, frames.expect(f, x, y) & mask);
+                }
+                bad = bad + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    xlib.XDestroyImage(im);
+    return bad;
+}
+
+// The screen given time to show the frame: X11's own server synced; a
+// compositor's repaint waited for, up to a second.
+fn shown(f as *frames.Frames) as i64 {
+    if (wayland == 0) { xlib.XSync(x11.display(&win.x11_win), 0); }
+    let is i64 as until = time.now_ms() + 1000;
+    let is i64 as bad with mut = differing(f, 0);
+    while (bad != 0 && time.now_ms() < until) {
+        device.pump(&win);
+        time.sleep_ms(10);
+        bad = differing(f, 0);
+    }
+    if (bad != 0) { differing(f, 1); }
+    return bad;
+}
+
+// A frame to draw into, waited for: 1, or 0 after two seconds.
+fn frame() as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        if (device.next_frame(&win) == 1) { return 1; }
+        time.sleep_ms(2);
+    }
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as mode with mut = "x11";
+    if (env.argc() > 1) { mode = env.argv(1); }
+    if (mode[0] == 119) { wayland = 1; }
+    if (mode[0] == 116) { alpha = 1; }
+    let is device.Config as cfg with mut = device.config_fixed("present", 160, 120);
+    cfg.backend = device.X11;
+    if (wayland == 1) { cfg.backend = device.WAYLAND; }
+    if (alpha == 1) { cfg.transparent = 1; cfg.decorated = 0; }
+    win = device.open_config(&cfg);
+    if (device.is_open(&win) == 0) { io.printf("FAIL: no window (%s)\n", mode); return 1; }
+    if (alpha == 1 && device.transparent(&win) == 0) {
+        io.printf("FAIL: no window with alpha: the X server has no 32-bit visual\n");
+        return 1;
+    }
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, xd) == 0) { io.printf("FAIL: no X display to read the screen from\n"); return 1; }
+
+    let is i32 as ready = frame();
+    let is i64 as w with mut = device.width(&win);
+    let is i64 as h with mut = device.height(&win);
+    check("a window to draw into", ready == 1 && w > 0 && h > 0);
+    let is frames.Frames as f with mut;
+    if (frames.open(&f, w, h, alpha) == 0) { io.printf("FAIL: no memory\n"); return 1; }
+
+    let is damage.History as history with mut;
+    damage.history_clear(&history);
+    let is damage.List as pending with mut;
+    damage.clear(&pending);
+    let is damage.List as step with mut;
+    let is damage.List as fix with mut;
+    let is damage.List as all with mut;
+    damage.whole(&all);
+    let is [8]i64 as ages with mut;
+    let is i32 as a with mut = 0;
+    while (a < 8) { ages[a] = 0; a = a + 1; }
+    let is i64 as partial with mut = 0;
+    let is i64 as wrong with mut = 0;
+    let is i64 as abandoned with mut = 0;
+    let is i32 as resized_age with mut = 0 - 1;
+    let is i32 as resized with mut = 0;
+    let is i64 as steps = 48;
+    let is i64 as s with mut = 0;
+    while (s < steps && fails == 0) {
+        // Half way, on X11, the window made bigger: everything new.
+        if (wayland == 0 && s == steps / 2) {
+            device.set_size(&win, 200, 150);
+            let is i64 as until = time.now_ms() + 2000;
+            while (time.now_ms() < until && (device.width(&win) != 200 || device.height(&win) != 150)) {
+                device.pump(&win);
+                time.sleep_ms(5);
+            }
+            w = device.width(&win); h = device.height(&win);
+            check("made 200 by 150", w == 200 && h == 150);
+            frames.resize(&f, w, h, &step);
+            damage.whole(&pending);
+            resized = 1;
+        }
+        let is i32 as kind = frames.next(&f, &step);
+        damage.add_list(&pending, &step, w, h);
+        if (kind == frames.ABANDON) {
+            // A frame begun and dropped: acquired, never drawn nor shown.
+            if (frame() == 1) { device.acquire(&win); }
+            abandoned = abandoned + 1;
+            s = s + 1;
+            continue;
+        }
+        if (frame() == 0) { check("a frame to draw into, each step", 0); break; }
+        let is tgt.Target as out = device.acquire(&win);
+        if (out.width != w || out.height != h || cast(i64, out.color) == 0) { check("the buffer the window's size", 0); break; }
+        let is i32 as age = device.buffer_age(&win);
+        if (age >= 0 && age < 8) { ages[age] = ages[age] + 1; }
+        if (resized == 1) { resized_age = age; resized = 0; }
+        if (damage.repair(&history, &pending, age, w, h, &fix) == 0) {
+            frames.copy(&f, out.color, w * 4, &all);
+            device.submit(&win);
+        } else {
+            frames.copy(&f, out.color, w * 4, &fix);
+            device.submit_region(&win, &fix);
+            partial = partial + 1;
+        }
+        damage.push(&history, &pending);
+        damage.clear(&pending);
+        let is i64 as bad = shown(&f);
+        if (bad != 0) {
+            io.printf("  step %d (kind %d, age %d): %d pixels not the whole frame's\n", s, cast(i64, kind), cast(i64, age), bad);
+            wrong = wrong + 1;
+        }
+        s = s + 1;
+    }
+    let is *u8 as transport = device.transport_name(&win);
+    io.printf("  %s, %s: ages 0:%d 1:%d 2:%d, %d frames by parts, %d abandoned\n", mode, transport,
+              ages[0], ages[1], ages[2], partial, abandoned);
+    if (wayland == 0) { io.printf("  the first frame after the resize: age %d\n", cast(i64, resized_age)); }
+    check("every frame shown as the whole frame would be", wrong == 0);
+    check("frames presented by their parts", partial > steps / 2);
+    check("abandoned frames' changes shown with the next", abandoned > 0);
+    let is i32 as alternating = cast(i32, wayland == 1 || transport[0] == 109);
+    if (alternating == 1) { check("buffers alternating: one two frames old repaired", ages[2] > 0); }
+    if (wayland == 0) { check("after a resize the buffer is new: age 0, drawn whole", resized_age == 0); }
+    if (wayland == 1) {
+        // A compositor repaints what it was told changed, but may read all of
+        // the buffer at any time: covered by another window and uncovered,
+        // ours is repainted whole from the buffer it holds — which must be
+        // the whole frame, untouched pixels converted exactly once.
+        let is device.Window as cover with mut = device.open_with(device.WAYLAND, "cover", 160, 120);
+        let is i64 as until = time.now_ms() + 2000;
+        let is i32 as covered with mut = 0;
+        while (covered == 0 && time.now_ms() < until && device.is_open(&cover) == 1) {
+            if (device.next_frame(&cover) == 1) {
+                let is tgt.Target as c = device.acquire(&cover);
+                if (cast(i64, c.color) != 0) {
+                    let is i64 as i with mut = 0;
+                    while (i < c.width * c.height) { *cast(*u32, cast(i64, c.color) + i * 4) = cast(u32, 4278190335); i = i + 1; }
+                    device.submit(&cover);
+                    covered = 1;
+                }
+            }
+            device.pump(&win);
+            time.sleep_ms(5);
+        }
+        time.sleep_ms(200);
+        device.close(&cover);
+        check("uncovered: repainted whole from its buffer, the whole frame", covered == 1 && shown(&f) == 0);
+    }
+    frames.close(&f);
+    device.close(&win);
+    xlib.XCloseDisplay(xd);
+    if (fails == 0) {
+        io.printf("present %s: all checks passed\n", mode);
+        return 0;
+    }
+    io.printf("present %s: %d failures\n", mode, fails);
+    return 1;
+}

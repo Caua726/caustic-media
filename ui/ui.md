@@ -364,9 +364,14 @@ widget under it asks for; the scale is the screen's DPI, or the desktop's
 when its settings say one.
 
 Each window is painted into a texture of its own on the program's device —
-what changed, as the damage says — and that texture is copied whole to the
-platform's buffer to be shown: on X11 the buffer is converted in place as it
-is shown, so it cannot be painted on again. Between rounds the loop sleeps
+what changed, as the damage says — and shown from it by the parts that
+changed: the painted damage and a scroll's moved pixels (where they were and
+where they went), in physical pixels, are kept until a frame is shown —
+through a buffer the compositor still holds, a resize just read, an expose's
+lost area — and the platform's buffer gets what its age says it lacks
+(`window/damage.cst`), all of the texture when that is not known; X11 then
+puts, Wayland damages and Windows blits only those rectangles. Between rounds
+the loop sleeps
 (`window/wait.cst`) until a window has an event, a descriptor the program
 watches is readable (`watch`: the accessibility bridge's — `atspi/hosted.cst`
 — a portal's), another thread posts something to run (`post`), or a timer is

@@ -70,6 +70,7 @@ use "stack.cst" as stack;
 use "widgets/decoration.cst" as decoration;
 use "widgets/headerbar.cst" as headerbar;
 use "../gpu/software/target.cst" as tgt;
+use "../window/damage.cst" as damage;
 
 // The most windows on the screen at once: X11's table of them.
 let is i64 as MAX_WINDOWS with imut = 32;
@@ -116,6 +117,11 @@ struct Native {
     title     as [256]u8;        // as given to the platform, and a zero
     frame_layout as [96]u8;
     frame_layout_len as i32;
+    // What changed of it since it was last shown, physical pixels — kept
+    // until it is, whatever stops a frame — and what the frames shown last
+    // changed: a platform buffer's age says which of those it lacks.
+    pending   as damage.List;
+    shown     as damage.History;
 }
 
 struct Host {
@@ -459,6 +465,8 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.tw = 0;
     n.th = 0;
     n.present = 1;
+    damage.whole(&n.pending);
+    damage.history_clear(&n.shown);
     n.paste_on = 0;
     n.over = 0;
     n.icon_gen = 0;
@@ -849,6 +857,14 @@ fn _px_up(v as f64, s as f64) as i64 {
     return i;
 }
 
+// v at scale s, physical pixels, rounded down whatever its sign.
+fn _px_down(v as f64, s as f64) as i64 {
+    let is f64 as x = v * s;
+    let is i64 as i = cast(i64, x);
+    if (cast(f64, i) > x) { return i - 1; }
+    return i;
+}
+
 // The smallest its content can be laid out in, told the platform as the
 // window's floor when it changed.
 fn _tell_min(hs as *Host, n as *Native) as void {
@@ -1122,6 +1138,12 @@ fn _feed_one(hs as *Host, n as *Native, e as *wevent.Event, now as i64) as void 
         return;
     }
     if (k == wevent.EXPOSE) {
+        // The area the platform lost, shown again from the texture.
+        if (e.width > 0 && e.height > 0) {
+            damage.add(&n.pending, e.x, e.y, e.width, e.height, n.tw, n.th);
+        } else {
+            damage.whole(&n.pending);
+        }
         n.present = 1;
         return;
     }
@@ -1286,6 +1308,8 @@ fn _frame(hs as *Host, n as *Native, now as i64) as void {
         n.th = ph;
         if (n.tex == 0) { return; }
         tree.invalidate_paint_subtree(t, tree.root(t));
+        damage.whole(&n.pending);
+        damage.history_clear(&n.shown);
     }
     let is i64 as k = app.frame(a, n.h);
     _tell_frame(hs, n);
@@ -1295,14 +1319,17 @@ fn _frame(hs as *Host, n as *Native, now as i64) as void {
         app.paint(a, n.h, &hs.canvas, cast(*style.Theme, 0), now, cast(*paint.Stats, 0));
         gpu.command.begin(hs.dv, hs.cmd);
         // A scroll area's pixels that only moved, moved first: the damage
-        // painted over what they left (tree.shift).
+        // painted over what they left (tree.shift). Both where they were and
+        // where they went changed.
         let is math.rect.Rect as sr;
         let is f64 as sdx with mut = 0.0;
         let is f64 as sdy with mut = 0.0;
+        let is f64 as s = n.scale;
         if (made == 0 && tree.shift(t, &sr, &sdx, &sdy) == 1) {
-            let is f64 as s = n.scale;
             gpu.command.move_region(hs.dv, hs.cmd, n.tex, _px(sr.x, s), _px(sr.y, s), _px(sr.w, s), _px(sr.h, s),
                                     _round(sdx * s), _round(sdy * s));
+            _changed(n, sr.x, sr.y, sr.w, sr.h);
+            _changed(n, sr.x + sdx, sr.y + sdy, sr.w, sr.h);
         }
         let is gpu.command.Pass as ps = gpu.command.pass_load(n.tex, 0);
         gpu.command.begin_pass(hs.dv, hs.cmd, &ps);
@@ -1310,21 +1337,52 @@ fn _frame(hs as *Host, n as *Native, now as i64) as void {
         gpu.command.end_pass(hs.dv, hs.cmd);
         gpu.command.end(hs.dv, hs.cmd);
         gpu.command.submit(hs.dv, hs.cmd);
+        let is i64 as d with mut = 0;
+        while (d < tree.damage_count(t)) {
+            let is math.rect.Rect as r = tree.damage_at(t, d);
+            _changed(n, r.x, r.y, r.w, r.h);
+            d = d + 1;
+        }
         tree.damage_clear(t);
     }
     if (k == 0 && n.present == 0) { return; }
-    // Shown: the texture copied whole into the platform's buffer, when that
-    // is still the texture's size — a resize just read waits for the next
-    // round.
+    // Shown, when the platform's buffer is still the texture's size — a
+    // resize just read waits for the next round, and what changed waits with
+    // it. Into the buffer goes what it lacks for its age: what changed since
+    // it was last shown, all of it when that is not known.
     if (device.next_frame(&n.win) == 0) { return; }
     let is tgt.Target as out = device.acquire(&n.win);
     if (out.width != pw || out.height != ph || cast(i64, out.color) == 0) {
         n.present = 1;
         return;
     }
-    gpu.texture.read(hs.dv, n.tex, out.color, pw * ph * 4);
-    device.submit(&n.win);
+    let is damage.List as fix;
+    if (damage.repair(&n.shown, &n.pending, device.buffer_age(&n.win), pw, ph, &fix) == 0) {
+        gpu.texture.read(hs.dv, n.tex, out.color, pw * ph * 4);
+        device.submit(&n.win);
+    } else if (damage.empty(&fix) == 0) {
+        let is i32 as i with mut = 0;
+        while (i < fix.n) {
+            let is *damage.Rect as r = &fix.rects[i];
+            let is *u8 as at = cast(*u8, cast(i64, out.color) + (cast(i64, r.y) * pw + cast(i64, r.x)) * 4);
+            gpu.texture.read_region(hs.dv, n.tex, cast(i64, r.x), cast(i64, r.y), cast(i64, r.w), cast(i64, r.h), at, pw * 4);
+            i = i + 1;
+        }
+        device.submit_region(&n.win, &fix);
+    }
+    damage.push(&n.shown, &n.pending);
+    damage.clear(&n.pending);
     n.present = 0;
+}
+
+// A rectangle of the window, logical pixels, changed: what it covers in
+// physical ones, rounded out, kept until shown.
+fn _changed(n as *Native, x as f64, y as f64, w as f64, h as f64) as void {
+    let is i64 as x0 = _px_down(x, n.scale);
+    let is i64 as y0 = _px_down(y, n.scale);
+    let is i64 as x1 = _px_up(x + w, n.scale);
+    let is i64 as y1 = _px_up(y + h, n.scale);
+    damage.add(&n.pending, x0, y0, x1 - x0, y1 - y0, n.tw, n.th);
 }
 
 // Whether a window has something to paint or show.

@@ -1,0 +1,216 @@
+// window/present_win32_test.cst — present_test's frames on Windows (in Wine):
+// shown by their changed parts — copied into the DIB as its age asks,
+// invalidated and blitted — the window's pixels read back through its DC
+// after each and compared with the whole frame, then a resize (age 0, drawn
+// whole):
+//   sh window/win32/tools/run_native.sh build/present_win32_test.exe
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/mem.cst" as mem;
+use "device.cst" as device;
+use "damage.cst" as damage;
+use "present_frames.cst" as frames;
+use "../gpu/software/target.cst" as tgt;
+use "win32/backend.cst" as w32;
+use "win32/bind/types.cst" as t;
+use "win32/bind/user32.cst" as u;
+use "win32/bind/gdi32.cst" as g;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is device.Window as win with mut;
+let is i32 as layered with mut = 0;
+
+// What a layered window gives the system against the reference: its layer
+// DIB (BGRA, alpha kept) — the pixels that differ, the first printed when
+// report. Each frame's rectangles alone are converted into it, so a pixel
+// converted twice or not at all shows here.
+fn layer_differing(f as *frames.Frames, report as i32) as i64 {
+    let is *w32.Native as n = w32._native(&win.win32_win);
+    if (cast(i64, n) == 0 || cast(i64, n.layer_pixels) == 0) { return 0 - 1; }
+    let is i64 as bad with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < f.w * f.h) {
+        let is *u8 as p = cast(*u8, cast(i64, f.ref) + i * 4);
+        let is i64 as want = (cast(i64, p[3]) << 24) | (cast(i64, p[0]) << 16) | (cast(i64, p[1]) << 8) | cast(i64, p[2]);
+        let is i64 as got = cast(i64, *cast(*u32, cast(i64, n.layer_pixels) + i * 4));
+        if (got != want) {
+            if (bad == 0 && report == 1) { io.printf("  first difference at %d: layer %x, the frame %x\n", i, got, want); }
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+// The window's pixels against the reference: how many differ (24 bits), the
+// first printed when report.
+fn differing(f as *frames.Frames, report as i32) as i64 {
+    if (layered == 1) { return layer_differing(f, report); }
+    let is i64 as hwnd = w32.hwnd(&win.win32_win);
+    let is i64 as dc = u.GetDC(hwnd);
+    let is i64 as mdc = g.CreateCompatibleDC(dc);
+    let is t.BITMAPINFO as bmi;
+    mem.memzero(cast(*u8, &bmi), sizeof(t.BITMAPINFO));
+    bmi.bmiHeader.biSize = cast(u32, sizeof(t.BITMAPINFOHEADER));
+    bmi.bmiHeader.biWidth = cast(i32, f.w);
+    bmi.bmiHeader.biHeight = cast(i32, 0 - f.h);
+    bmi.bmiHeader.biPlanes = cast(u16, 1);
+    bmi.bmiHeader.biBitCount = cast(u16, 32);
+    bmi.bmiHeader.biCompression = cast(u32, t.BI_RGB);
+    let is *u8 as bits with mut = cast(*u8, 0);
+    let is i64 as bmp = g.CreateDIBSection(dc, &bmi, cast(u32, t.DIB_RGB_COLORS), &bits, 0, 0);
+    let is i64 as bad with mut = 0 - 1;
+    if (bmp != 0 && cast(i64, bits) != 0 && mdc != 0) {
+        let is i64 as old = g.SelectObject(mdc, bmp);
+        g.BitBlt(mdc, 0, 0, cast(i32, f.w), cast(i32, f.h), dc, 0, 0, cast(u32, t.SRCCOPY));
+        bad = 0;
+        let is i64 as y with mut = 0;
+        while (y < f.h) {
+            let is i64 as x with mut = 0;
+            while (x < f.w) {
+                let is i64 as got = cast(i64, *cast(*u32, cast(i64, bits) + (y * f.w + x) * 4)) & 16777215;
+                let is i64 as want = frames.expect(f, x, y) & 16777215;
+                if (got != want) {
+                    if (bad == 0 && report == 1) {
+                        io.printf("  first difference at %d,%d: shown %x, the whole frame %x\n", x, y, got, want);
+                    }
+                    bad = bad + 1;
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        g.SelectObject(mdc, old);
+    }
+    if (bmp != 0) { g.DeleteObject(bmp); }
+    if (mdc != 0) { g.DeleteDC(mdc); }
+    u.ReleaseDC(hwnd, dc);
+    return bad;
+}
+
+fn shown(f as *frames.Frames) as i64 {
+    let is i64 as until = time.now_ms() + 1000;
+    let is i64 as bad with mut = differing(f, 0);
+    while (bad != 0 && time.now_ms() < until) {
+        device.pump(&win);
+        time.sleep_ms(10);
+        bad = differing(f, 0);
+    }
+    if (bad != 0) { differing(f, 1); }
+    return bad;
+}
+
+fn frame() as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        if (device.next_frame(&win) == 1) { return 1; }
+        time.sleep_ms(2);
+    }
+    return 0;
+}
+
+// One window through the frames: opaque, read back through its DC, or
+// layered (transparent), its layer DIB compared.
+fn pass(seen_through as i32) as void {
+    layered = seen_through;
+    let is device.Config as cfg with mut = device.config_fixed("present", 160, 120);
+    if (layered == 1) { cfg.transparent = 1; cfg.decorated = 0; }
+    win = device.open_config(&cfg);
+    if (device.is_open(&win) == 0 || win.backend != device.WIN32) { check("a window", 0); return; }
+    if (layered == 1) { check("a layered window", device.transparent(&win) == 1); }
+    let is i32 as ready = frame();
+    let is i64 as w with mut = device.width(&win);
+    let is i64 as h with mut = device.height(&win);
+    check("a window to draw into", ready == 1 && w > 0 && h > 0);
+    let is frames.Frames as f with mut;
+    if (frames.open(&f, w, h, layered) == 0) { check("memory for the frames", 0); return; }
+    let is damage.History as history with mut;
+    damage.history_clear(&history);
+    let is damage.List as pending with mut;
+    damage.clear(&pending);
+    let is damage.List as step with mut;
+    let is damage.List as fix with mut;
+    let is damage.List as all with mut;
+    damage.whole(&all);
+    let is [4]i64 as ages with mut;
+    ages[0] = 0; ages[1] = 0; ages[2] = 0; ages[3] = 0;
+    let is i64 as partial with mut = 0;
+    let is i64 as wrong with mut = 0;
+    let is i64 as abandoned with mut = 0;
+    let is i32 as resized_age with mut = 0 - 1;
+    let is i32 as resized with mut = 0;
+    let is i64 as steps = 36;
+    let is i64 as s with mut = 0;
+    while (s < steps && fails == 0) {
+        if (s == steps / 2) {
+            device.set_size(&win, 200, 150);
+            let is i64 as until = time.now_ms() + 2000;
+            while (time.now_ms() < until && (device.width(&win) != 200 || device.height(&win) != 150)) {
+                device.pump(&win);
+                time.sleep_ms(5);
+            }
+            w = device.width(&win); h = device.height(&win);
+            check("made 200 by 150", w == 200 && h == 150);
+            frames.resize(&f, w, h, &step);
+            damage.whole(&pending);
+            resized = 1;
+        }
+        let is i32 as kind = frames.next(&f, &step);
+        damage.add_list(&pending, &step, w, h);
+        if (kind == frames.ABANDON) {
+            if (frame() == 1) { device.acquire(&win); }
+            abandoned = abandoned + 1;
+            s = s + 1;
+            continue;
+        }
+        if (frame() == 0) { check("a frame to draw into, each step", 0); break; }
+        let is tgt.Target as out = device.acquire(&win);
+        if (out.width != w || out.height != h || cast(i64, out.color) == 0) { check("the buffer the window's size", 0); break; }
+        let is i32 as age = device.buffer_age(&win);
+        if (age >= 0 && age < 4) { ages[age] = ages[age] + 1; }
+        if (resized == 1) { resized_age = age; resized = 0; }
+        if (damage.repair(&history, &pending, age, w, h, &fix) == 0) {
+            frames.copy(&f, out.color, w * 4, &all);
+            device.submit(&win);
+        } else {
+            frames.copy(&f, out.color, w * 4, &fix);
+            device.submit_region(&win, &fix);
+            partial = partial + 1;
+        }
+        damage.push(&history, &pending);
+        damage.clear(&pending);
+        let is i64 as bad = shown(&f);
+        if (bad != 0) {
+            io.printf("  step %d (kind %d, age %d): %d pixels not the whole frame's\n", s, cast(i64, kind), cast(i64, age), bad);
+            wrong = wrong + 1;
+        }
+        s = s + 1;
+    }
+    io.printf("  ages 0:%d 1:%d 2:%d, %d frames by parts, %d abandoned, after the resize age %d\n",
+              ages[0], ages[1], ages[2], partial, abandoned, cast(i64, resized_age));
+    check("every frame shown as the whole frame would be", wrong == 0);
+    check("frames presented by their parts, the DIB a frame old", partial > steps / 2 && ages[1] > 0);
+    check("abandoned frames' changes shown with the next", abandoned > 0);
+    check("after a resize the DIB is new: age 0, drawn whole", resized_age == 0);
+    frames.close(&f);
+    device.close(&win);
+}
+
+fn main() as i32 {
+    pass(0);
+    pass(1);
+    if (fails == 0) {
+        io.printf("present win32: all checks passed\n");
+        return 0;
+    }
+    io.printf("present win32: %d failures\n", fails);
+    return 1;
+}

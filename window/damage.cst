@@ -1,0 +1,161 @@
+// window/damage.cst — which pixels of a window changed, frame by frame, so a
+// frame can be presented by the parts of it that differ.
+//
+// A List is a frame's changed rectangles, physical pixels, clipped to the
+// window: rectangles that overlap or touch are merged into their bounds, the
+// rest kept apart — disjoint changes stay small — and once MAX_RECTS are held
+// a new one goes into whichever grows least. `whole` says all of it.
+//
+// A History is the lists of the frames presented last, newest first. A
+// platform buffer of age N (device.buffer_age: 1 holds the last frame
+// presented, 2 the one before) lacks what the N - 1 frames presented since
+// changed, plus what changed since the last presentation: repair() gives
+// that union, or says the whole frame is needed — age 0 (contents unknown)
+// or older than the history keeps.
+
+let is i32 as MAX_RECTS with imut = 16;
+let is i32 as HISTORY   with imut = 4;
+
+struct Rect {
+    x as i32;
+    y as i32;
+    w as i32;
+    h as i32;
+}
+
+struct List {
+    n     as i32;
+    whole as i32;
+    rects as [16]Rect;
+}
+
+struct History {
+    count  as i32;
+    _pad   as i32;
+    frames as [4]List;
+}
+
+fn clear(l as *List) as void { l.n = 0; l.whole = 0; }
+
+fn whole(l as *List) as void { l.n = 0; l.whole = 1; }
+
+fn empty(l as *List) as i32 { return cast(i32, l.whole == 0 && l.n == 0); }
+
+fn _max(a as i32, b as i32) as i32 {
+    if (a > b) { return a; }
+    return b;
+}
+
+fn _min(a as i32, b as i32) as i32 {
+    if (a < b) { return a; }
+    return b;
+}
+
+// a grown to cover b too.
+fn _merge(a as *Rect, b as *Rect) as void {
+    let is i32 as x0 = _min(a.x, b.x);
+    let is i32 as y0 = _min(a.y, b.y);
+    let is i32 as x1 = _max(a.x + a.w, b.x + b.w);
+    let is i32 as y1 = _max(a.y + a.h, b.y + b.h);
+    a.x = x0; a.y = y0; a.w = x1 - x0; a.h = y1 - y0;
+}
+
+fn _touch(a as *Rect, b as *Rect) as i32 {
+    return cast(i32, a.x <= b.x + b.w && b.x <= a.x + a.w && a.y <= b.y + b.h && b.y <= a.y + a.h);
+}
+
+fn _area(r as *Rect) as i64 { return cast(i64, r.w) * cast(i64, r.h); }
+
+// The rectangle x, y, w, h of a width by height window added: clipped; merged
+// with what it touches, and that with what it then touches.
+fn add(l as *List, x as i64, y as i64, w as i64, h as i64, width as i64, height as i64) as void {
+    if (l.whole == 1) { return; }
+    let is i64 as x0 with mut = x;
+    let is i64 as y0 with mut = y;
+    let is i64 as x1 with mut = x + w;
+    let is i64 as y1 with mut = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > width) { x1 = width; }
+    if (y1 > height) { y1 = height; }
+    if (x1 <= x0 || y1 <= y0) { return; }
+    if (x0 == 0 && y0 == 0 && x1 == width && y1 == height) { whole(l); return; }
+    let is Rect as r with mut;
+    r.x = cast(i32, x0); r.y = cast(i32, y0); r.w = cast(i32, x1 - x0); r.h = cast(i32, y1 - y0);
+    // Merged with every rectangle it touches, until it touches none.
+    let is i32 as merged with mut = 1;
+    while (merged == 1) {
+        merged = 0;
+        let is i32 as i with mut = 0;
+        while (i < l.n) {
+            if (_touch(&l.rects[i], &r) == 1) {
+                _merge(&r, &l.rects[i]);
+                l.n = l.n - 1;
+                l.rects[i] = l.rects[l.n];
+                merged = 1;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    if (l.n < MAX_RECTS) {
+        l.rects[l.n] = r;
+        l.n = l.n + 1;
+        return;
+    }
+    // Full: into the rectangle it grows least, then that one's neighbours.
+    let is i32 as best with mut = 0;
+    let is i64 as growth with mut = 0 - 1;
+    let is i32 as i with mut = 0;
+    while (i < l.n) {
+        let is Rect as m with mut = l.rects[i];
+        _merge(&m, &r);
+        let is i64 as g = _area(&m) - _area(&l.rects[i]);
+        if (growth < 0 || g < growth) { growth = g; best = i; }
+        i = i + 1;
+    }
+    let is Rect as m with mut = l.rects[best];
+    _merge(&m, &r);
+    l.n = l.n - 1;
+    l.rects[best] = l.rects[l.n];
+    add(l, cast(i64, m.x), cast(i64, m.y), cast(i64, m.w), cast(i64, m.h), width, height);
+}
+
+// What src holds added to dst.
+fn add_list(dst as *List, src as *List, width as i64, height as i64) as void {
+    if (src.whole == 1) { whole(dst); return; }
+    let is i32 as i with mut = 0;
+    while (i < src.n) {
+        let is *Rect as r = &src.rects[i];
+        add(dst, cast(i64, r.x), cast(i64, r.y), cast(i64, r.w), cast(i64, r.h), width, height);
+        i = i + 1;
+    }
+}
+
+fn history_clear(h as *History) as void { h.count = 0; }
+
+// A frame presented with these changes: the newest of the history.
+fn push(h as *History, l as *List) as void {
+    let is i32 as i with mut = HISTORY - 1;
+    while (i > 0) {
+        h.frames[i] = h.frames[i - 1];
+        i = i - 1;
+    }
+    h.frames[0] = *l;
+    if (h.count < HISTORY) { h.count = h.count + 1; }
+}
+
+// What a buffer of this age needs redrawn for the next frame — pending,
+// and what the age - 1 frames presented since changed — into out: 1, or 0
+// when it needs all of it (out then whole).
+fn repair(h as *History, pending as *List, age as i32, width as i64, height as i64, out as *List) as i32 {
+    clear(out);
+    if (age < 1 || age - 1 > h.count) { whole(out); return 0; }
+    add_list(out, pending, width, height);
+    let is i32 as i with mut = 0;
+    while (i < age - 1) {
+        add_list(out, &h.frames[i], width, height);
+        i = i + 1;
+    }
+    return cast(i32, out.whole == 0);
+}

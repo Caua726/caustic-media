@@ -17,6 +17,7 @@ use "bind/shell32.cst" as shell;
 use "bind/shcore.cst" as sh;
 use "settings.cst" as desktop_settings;
 use "../monitor.cst" as monitor;
+use "../damage.cst" as damage;
 
 let is i32 as OK with imut = 0;
 let is i32 as NO_WINDOW with imut = 1;
@@ -104,6 +105,8 @@ struct Native {
     bitmap as i64;
     pixels as *u8;
     dib as DIBInfo;
+    // The DIB holds a frame presented (buffer age 1); 0 once made again.
+    presented as i32;
     // Seen through where its alpha says (WS_EX_LAYERED): each frame given to
     // the system with UpdateLayeredWindow from a second DIB, the frame's
     // premultiplied RGBA as the BGRA the system blends.
@@ -451,7 +454,8 @@ fn _dib(n as *Native, width as i64, height as i64) as i32 {
     n.pixels = cast(*u8, 0);
     n.width = width;
     n.height = height;
-    if (width == 0 || height == 0) { return 1; }
+    n.pixels = cast(*u8, 0);
+    n.presented = 0;
     mem.memset(cast(*u8, &n.dib), 0, sizeof(DIBInfo));
     n.dib.header.biSize = cast(u32, sizeof(t.BITMAPINFOHEADER));
     n.dib.header.biWidth = cast(i32, width);
@@ -475,11 +479,14 @@ fn _dib(n as *Native, width as i64, height as i64) as i32 {
     return 1;
 }
 
+// The window's damaged part — what WM_PAINT asks for, after an expose or a
+// region presented — blitted from the DIB, which holds the whole frame.
 fn _paint(n as *Native) as void {
     let is t.PAINTSTRUCT as ps;
     let is i64 as dc = u.BeginPaint(n.hwnd, &ps);
     if (dc != 0 && n.hdc != 0 && n.width > 0 && n.height > 0) {
-        g.BitBlt(dc, 0, 0, cast(i32, n.width), cast(i32, n.height), n.hdc, 0, 0, cast(u32, t.SRCCOPY));
+        let is t.RECT as r = ps.rcPaint;
+        g.BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, n.hdc, r.left, r.top, cast(u32, t.SRCCOPY));
     }
     u.EndPaint(n.hwnd, &ps);
 }
@@ -495,10 +502,14 @@ fn _drop_layer(n as *Native) as void {
 // The frame given to the system to blend over what is behind the window: its
 // premultiplied RGBA as the premultiplied BGRA UpdateLayeredWindow takes, the
 // whole window (a layered window here has no frame of the system's round it).
-// 1 when given.
-fn _present_layer(n as *Native) as i32 {
+// Only l's rectangles are converted when the layer DIB holds the frame before
+// (l null: all of it). 1 when given.
+fn _present_layer(n as *Native, l as *damage.List) as i32 {
     if (n.width <= 0 || n.height <= 0 || cast(i64, n.pixels) == 0) { return 0; }
+    let is i32 as all with mut = cast(i32, cast(i64, l) == 0);
+    if (all == 0 && l.whole == 1) { all = 1; }
     if (n.layer_width != n.width || n.layer_height != n.height || cast(i64, n.layer_pixels) == 0) {
+        all = 1;
         _drop_layer(n);
         let is t.BITMAPINFO as bmi;
         mem.memzero(cast(*u8, &bmi), sizeof(t.BITMAPINFO));
@@ -516,15 +527,19 @@ fn _present_layer(n as *Native) as i32 {
         n.layer_width = n.width;
         n.layer_height = n.height;
     }
-    let is *u32 as from = cast(*u32, n.pixels);
-    let is *u32 as to = cast(*u32, n.layer_pixels);
-    let is i64 as count = n.width * n.height;
-    let is i64 as i with mut = 0;
-    while (i < count) {
-        let is u32 as v = from[i];
-        // Alpha and green stay; red and blue change places.
-        to[i] = (v & cast(u32, 4278255360)) | ((v & cast(u32, 255)) << 16) | ((v >> 16) & cast(u32, 255));
-        i = i + 1;
+    if (all == 1) {
+        _to_layer(n, 0, n.width * n.height);
+    } else {
+        let is i32 as k with mut = 0;
+        while (k < l.n) {
+            let is *damage.Rect as r = &l.rects[k];
+            let is i64 as row with mut = 0;
+            while (row < cast(i64, r.h)) {
+                _to_layer(n, (cast(i64, r.y) + row) * n.width + cast(i64, r.x), cast(i64, r.w));
+                row = row + 1;
+            }
+            k = k + 1;
+        }
     }
     let is [2]i32 as size;
     size[0] = cast(i32, n.width);
@@ -539,6 +554,19 @@ fn _present_layer(n as *Native) as i32 {
     blend.AlphaFormat = cast(u8, t.AC_SRC_ALPHA);
     return cast(i32, u.UpdateLayeredWindow(n.hwnd, 0, cast(*t.POINT, 0), cast(*u8, &size), n.layer_dc, &origin,
                                            cast(u32, 0), &blend, cast(u32, t.ULW_ALPHA)) != 0);
+}
+
+// count pixels from index first of the frame into the layer DIB: alpha and
+// green stay, red and blue change places.
+fn _to_layer(n as *Native, first as i64, count as i64) as void {
+    let is *u32 as from = cast(*u32, n.pixels);
+    let is *u32 as to = cast(*u32, n.layer_pixels);
+    let is i64 as i with mut = first;
+    while (i < first + count) {
+        let is u32 as v = from[i];
+        to[i] = (v & cast(u32, 4278255360)) | ((v & cast(u32, 255)) << 16) | ((v >> 16) & cast(u32, 255));
+        i = i + 1;
+    }
 }
 
 // What a press at hx, hy of the client resizes, as WM_NCHITTEST answers it,
@@ -1313,8 +1341,33 @@ fn acquire(w as *Window) as tgt.Target {
 // a layered window, given to the system to blend.
 fn submit(w as *Window) as void {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.used == 0 || n.hwnd == 0) { return; }
-    if (n.layered == 1) { _present_layer(n); return; }
+    n.presented = 1;
+    if (n.layered == 1) { _present_layer(n, cast(*damage.List, 0)); return; }
     u.InvalidateRect(n.hwnd, cast(*t.RECT, 0), 0); u.UpdateWindow(n.hwnd);
+}
+// The frame presented by the rectangles of l, the only ones drawn into the
+// DIB: those invalidated and painted (or, layered, converted), the window
+// keeping the rest.
+fn submit_region(w as *Window, l as *damage.List) as void {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.used == 0 || n.hwnd == 0) { return; }
+    if (l.whole == 1) { submit(w); return; }
+    n.presented = 1;
+    if (n.layered == 1) { _present_layer(n, l); return; }
+    let is i32 as k with mut = 0;
+    while (k < l.n) {
+        let is *damage.Rect as r = &l.rects[k];
+        let is t.RECT as rc;
+        rc.left = r.x; rc.top = r.y; rc.right = r.x + r.w; rc.bottom = r.y + r.h;
+        u.InvalidateRect(n.hwnd, &rc, 0);
+        k = k + 1;
+    }
+    u.UpdateWindow(n.hwnd);
+}
+// How old acquire's buffer is: the one DIB holds the frame presented last
+// (1) once one was, nothing known (0) since it was made.
+fn buffer_age(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || is_open(w) == 0) { return 0; }
+    return n.presented;
 }
 fn show(w as *Window) as void { if (is_open(w) == 1) { u.ShowWindow(w.hwnd, cast(i32, t.SW_SHOW)); } }
 fn hide(w as *Window) as void { if (is_open(w) == 1) { u.ShowWindow(w.hwnd, cast(i32, t.SW_HIDE)); } }

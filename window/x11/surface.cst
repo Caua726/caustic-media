@@ -48,6 +48,7 @@ use "bind/x.cst" as x;
 use "bind/xlib.cst" as xlib;
 use "bind/xevent.cst" as xev;
 use "bind/xshm.cst" as xshm;
+use "../damage.cst" as damage;
 
 // --- Transports ---
 
@@ -79,6 +80,9 @@ struct Buffer {
     seg     as xshm.XShmSegmentInfo;
     pending as i32;      // the server may still be reading this one
     _pad0   as i32;
+    // The presentation (Backing.presents) it was last put in, 0 for none
+    // since it was made: what its age is measured from.
+    at      as i64;
 }
 
 struct Backing {
@@ -96,6 +100,7 @@ struct Backing {
     _pad1      as i32;
     ok         as i32;
     _pad2      as i32;
+    presents   as i64;   // frames put since the buffers were made
     // MAX_BUFFERS Buffers, mapped rather than inline, and this is a
     // correctness requirement rather than a size one.
     //
@@ -127,12 +132,12 @@ fn _buf(b as *Backing, i as i64) as *Buffer {
 fn _zero(b as *Backing) as void {
     b.transport = SOCKET; b.count = 0; b.completion = 0;
     b.current = 0; b.width = 0; b.height = 0; b.stride = 0; b.bytes = 0;
-    b.visual = cast(*u8, 0); b.depth = 0; b.ok = 0;
+    b.visual = cast(*u8, 0); b.depth = 0; b.ok = 0; b.presents = 0;
     if (cast(i64, b.buf) == 0) { return; }
     let is i64 as i with mut = 0;
     while (i < MAX_BUFFERS) {
         let is *Buffer as bf = _buf(b, i);
-        bf.pixels = cast(*u8, 0); bf.image = cast(*u8, 0); bf.pending = 0;
+        bf.pixels = cast(*u8, 0); bf.image = cast(*u8, 0); bf.pending = 0; bf.at = 0;
         bf.seg.shmseg = 0; bf.seg.shmid = cast(i32, 0 - 1);
         bf.seg.shmaddr = cast(*u8, 0); bf.seg.readOnly = 0;
         i = i + 1;
@@ -334,8 +339,10 @@ fn open(b as *Backing, d as *u8, vis as *u8, depth as u32,
 // malloc. Clearing the pointer first is what keeps Xlib from calling free() on
 // a mapping it does not own — which is not a leak, it is a heap corruption.
 fn _free_buffer_at(b as *Backing, d as *u8, i as i64) as void {
-    if (b.transport == SHM) { _shm_free(b, d, i); return; }
     let is *Buffer as bf = _buf(b, i);
+    // A buffer made again holds nothing presented: its age starts over.
+    bf.at = 0;
+    if (b.transport == SHM) { _shm_free(b, d, i); return; }
     if (cast(i64, bf.image) != 0) {
         let is *xlib.XImage as img = cast(*xlib.XImage, bf.image);
         img.data = cast(*u8, 0);
@@ -428,17 +435,13 @@ fn outstanding(b as *Backing) as i32 {
     return n;
 }
 
-// 0xAABBGGRR -> 0xAARRGGBB, in place. See the header comment for why in place is
-// safe and why fixing it with XImage masks is not.
+// 0xAABBGGRR -> 0xAARRGGBB, in place, for the n pixels at base. See the header
+// comment for why in place is safe and why fixing it with XImage masks is not.
 // At 32 bits the window has alpha (window.cst, Config.transparent), and a
 // compositor reads it premultiplied: each colour times its alpha, rounded.
 // The rasterizer's colours are not, so it is done here, in the same pass.
-fn swap_channels(b as *Backing) as void {
-    let is *Buffer as bf = _buf(b, b.current);
-    if (cast(i64, bf.pixels) == 0) { return; }
-    let is i64 as base = cast(i64, bf.pixels);
-    let is i64 as n = b.width * b.height;
-    let is i32 as premultiply = cast(i32, b.depth == cast(u32, 32));
+// Neither is undone by doing it twice, so only pixels just drawn go through.
+fn _convert(base as i64, n as i64, premultiply as i32) as void {
     let is i64 as i with mut = 0;
     if (premultiply == 0) {
         // Two pixels a word: alpha and green stay, red and blue trade
@@ -469,6 +472,40 @@ fn swap_channels(b as *Backing) as void {
     }
 }
 
+// The whole of this frame's buffer converted: a frame drawn whole.
+fn swap_channels(b as *Backing) as void {
+    let is *Buffer as bf = _buf(b, b.current);
+    if (cast(i64, bf.pixels) == 0) { return; }
+    _convert(cast(i64, bf.pixels), b.width * b.height, cast(i32, b.depth == cast(u32, 32)));
+}
+
+// Only the rectangles drawn into this frame's buffer converted, row by row.
+fn swap_rects(b as *Backing, l as *damage.List) as void {
+    let is *Buffer as bf = _buf(b, b.current);
+    if (cast(i64, bf.pixels) == 0) { return; }
+    let is i32 as premultiply = cast(i32, b.depth == cast(u32, 32));
+    let is i32 as k with mut = 0;
+    while (k < l.n) {
+        let is *damage.Rect as r = &l.rects[k];
+        let is i64 as row with mut = 0;
+        while (row < cast(i64, r.h)) {
+            let is i64 as base = cast(i64, bf.pixels) + (cast(i64, r.y) + row) * b.stride + cast(i64, r.x) * 4;
+            _convert(base, cast(i64, r.w), premultiply);
+            row = row + 1;
+        }
+        k = k + 1;
+    }
+}
+
+// How old this frame's buffer is: 1 when it holds the frame put last, 2 the
+// one before; 0 when it holds none since it was made.
+fn age(b as *Backing) as i32 {
+    if (b.ok == 0) { return 0; }
+    let is *Buffer as bf = _buf(b, b.current);
+    if (bf.at == 0) { return 0; }
+    return cast(i32, b.presents - bf.at + 1);
+}
+
 fn _sock_put(b as *Backing, d as *u8, drawable as i64, gc as *u8) as void {
     let is *Buffer as bf = _buf(b, b.current);
     xlib.XPutImage(d, drawable, gc, bf.image, 0, 0, 0, 0,
@@ -479,10 +516,37 @@ fn _sock_put(b as *Backing, d as *u8, drawable as i64, gc as *u8) as void {
 // here and nowhere above.
 fn put(b as *Backing, d as *u8, drawable as i64, gc as *u8) as void {
     if (b.ok == 0) { return; }
+    b.presents = b.presents + 1;
+    _buf(b, b.current).at = b.presents;
     if (b.transport == SHM) { _shm_put(b, d, drawable, gc); return; }
     // On the socket path XPutImage has already copied, so the buffer is free
     // again the moment the call returns and there is nothing to rotate.
     _sock_put(b, d, drawable, gc);
+}
+
+// A frame presented by its rectangles: each sent where it is, the server
+// keeping the rest. On SHM only the last asks for the completion — the
+// server takes requests in order, so it is the buffer's.
+fn put_rects(b as *Backing, d as *u8, drawable as i64, gc as *u8, l as *damage.List) as void {
+    if (b.ok == 0 || l.n == 0) { return; }
+    let is *Buffer as bf = _buf(b, b.current);
+    b.presents = b.presents + 1;
+    bf.at = b.presents;
+    let is i32 as k with mut = 0;
+    while (k < l.n) {
+        let is *damage.Rect as r = &l.rects[k];
+        if (b.transport == SHM) {
+            xshm.XShmPutImage(d, drawable, gc, bf.image, r.x, r.y, r.x, r.y,
+                              cast(u32, r.w), cast(u32, r.h), cast(i32, k == l.n - 1));
+        } else {
+            xlib.XPutImage(d, drawable, gc, bf.image, r.x, r.y, r.x, r.y, cast(u32, r.w), cast(u32, r.h));
+        }
+        k = k + 1;
+    }
+    if (b.transport == SHM) {
+        bf.pending = 1;
+        b.current = (b.current + 1) % cast(i64, b.count);
+    }
 }
 
 // Whether an event was this layer's completion notice rather than the program's

@@ -82,13 +82,20 @@ out per frame, and `StretchDIBits` or `BitBlt` carries it to the window.
 The top-down DIB uses `BI_BITFIELDS` with RGBA byte masks matching the
 software target. `BitBlt` presents that memory without a channel-swapping
 copy. The native smoke checks the presented RGB values with GDI `GetPixel`.
+The DIB holds the whole frame between frames, so its `buffer_age` is 1 once a
+frame was presented (0 after it is made again), and `submit_region`
+invalidates the rectangles drawn; `WM_PAINT` blits its update rectangle —
+theirs, or what an expose lost — from the DIB.
 
 A window seen through (`Config.transparent`, only where the system draws no
 frame round it) is a layered window (`WS_EX_LAYERED`): each frame is given to
 the system with `UpdateLayeredWindow` from a second DIB, the frame's
 premultiplied RGBA as the premultiplied BGRA it blends — the whole window,
-since such a window has no frame of the system's. Framed by the system later
-(`set_decorated(1)`), it stops being layered.
+since such a window has no frame of the system's; after the first, only the
+rectangles `submit_region` names are converted into that DIB, which keeps the
+rest. Framed by the system later (`set_decorated(1)`), it stops being
+layered. `present_win32_test` checks both in Wine frame by frame against the
+whole frame: the window's pixels through its DC, the layer DIB's.
 
 ---
 

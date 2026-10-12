@@ -15,6 +15,7 @@ use "../../input/xkb/state.cst" as xkbstate;
 use "../../input/xkb/compose.cst" as xcompose;
 use "../../input/keys.cst" as keys;
 use "../monitor.cst" as monitor;
+use "../damage.cst" as damage;
 use "../../input/text.cst" as content;
 use "std/unicode/utf8.cst" as utf8;
 
@@ -51,7 +52,9 @@ let is i32 as FORMAT_ARGB8888 with imut = 0;
 struct Buffer {
     object as i32;
     busy as i32;
-    _pad as i32;
+    // The presentation (Window.presents) it was last committed in, 0 for
+    // none since it was made: what its age is measured from.
+    at as i64;
 }
 
 struct BufferSet {
@@ -420,6 +423,7 @@ struct Window {
     resize_detached as i32;
     pixels as *u8;
     buffers as [2]Buffer;
+    presents as i64;   // frames committed
     retired as [4]BufferSet;
     current as i32;
     // Cooked input, as this file's translator says it (input/event.cst).
@@ -3447,6 +3451,7 @@ fn _make_buffers(w as *Window) as i32 {
         _put(cast(*u8, cast(i64, &p[0]) + 20), FORMAT_ARGB8888);
         if (_send(w, w.pool, 0, &p[0], 24, 0 - 1) == 0) { return 0; }
         w.buffers[i].busy = 0;
+        w.buffers[i].at = 0;
         i = i + 1;
     }
     let is [0]u8 as empty;
@@ -3816,19 +3821,64 @@ fn _set_window_geometry(w as *Window, with_extents as i32) as i32 {
 }
 
 
-fn submit(w as *Window) as void {
+// How old acquire's buffer is: 1 when it holds the frame committed last, 2
+// the one before; 0 when it holds none since it was made.
+fn buffer_age(w as *Window) as i32 {
+    if (w.opened == 0 || w.current < 0) { return 0; }
+    let is i64 as at = w.buffers[w.current].at;
+    if (at == 0) { return 0; }
+    return cast(i32, w.presents - at + 1);
+}
+
+// n pixels at p from the software target's RGBA to WL_SHM_FORMAT_ARGB8888's
+// BGRA bytes (little-endian), premultiplied as the format is read.
+fn _to_argb(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *u8 as q = cast(*u8, cast(i64, p) + i * 4);
+        let is i64 as a = cast(i64, q[3]);
+        let is i64 as r with mut = cast(i64, q[0]);
+        let is i64 as g with mut = cast(i64, q[1]);
+        let is i64 as b with mut = cast(i64, q[2]);
+        if (a < 255) {
+            r = (r * a + 127) / 255;
+            g = (g * a + 127) / 255;
+            b = (b * a + 127) / 255;
+        }
+        q[0] = cast(u8, b); q[1] = cast(u8, g); q[2] = cast(u8, r);
+        i = i + 1;
+    }
+}
+
+fn submit(w as *Window) as void { _present(w, cast(*damage.List, 0)); }
+
+// The frame presented by the rectangles of l, the only ones drawn into the
+// buffer since its age: those converted and told the compositor as damage.
+fn submit_region(w as *Window, l as *damage.List) as void { _present(w, l); }
+
+fn _present(w as *Window, l as *damage.List) as void {
     if (w.opened == 0 || w.current < 0 || w.buffers[w.current].busy == 1) { return; }
     if (_set_window_geometry(w, cast(i32, (w.state & (event.STATE_MAXIMIZED | event.STATE_FULLSCREEN |
         event.STATE_TILED_LEFT | event.STATE_TILED_RIGHT | event.STATE_TILED_TOP |
         event.STATE_TILED_BOTTOM)) == 0)) == 0) { return; }
-    // Caustic's software target is RGBA bytes; WL_SHM_FORMAT_ARGB8888 uses
-    // BGRA bytes on little-endian hosts. Convert the owned back buffer in place.
-    let is i64 as count = w.width * w.height;
-    let is i64 as i with mut = 0;
-    while (i < count) {
-        let is *u8 as p = cast(*u8, cast(i64, w.pixels) + w.current * w.bytes + i * 4);
-        let is u8 as r = p[0]; p[0] = p[2]; p[2] = r;
-        i = i + 1;
+    let is i32 as whole = cast(i32, cast(i64, l) == 0 || l.whole == 1);
+    // Caustic's software target is RGBA bytes: converted in place, the whole
+    // buffer for a whole frame, else only the rectangles drawn — converting a
+    // pixel twice would undo it.
+    let is i64 as base = cast(i64, w.pixels) + w.current * w.bytes;
+    if (whole == 1) {
+        _to_argb(cast(*u8, base), w.width * w.height);
+    } else {
+        let is i32 as k with mut = 0;
+        while (k < l.n) {
+            let is *damage.Rect as r = &l.rects[k];
+            let is i64 as row with mut = 0;
+            while (row < cast(i64, r.h)) {
+                _to_argb(cast(*u8, base + (cast(i64, r.y) + row) * w.stride + cast(i64, r.x) * 4), cast(i64, r.w));
+                row = row + 1;
+            }
+            k = k + 1;
+        }
     }
     let is i32 as id = _id(w);
     let is [16]u8 as p;
@@ -3843,15 +3893,43 @@ fn submit(w as *Window) as void {
     _put(cast(*u8, cast(i64, &p) + 4), 0);
     _put(cast(*u8, cast(i64, &p) + 8), 0);
     _send(w, w.surface, 1, &p[0], 12, 0 - 1);
-    _put(&p[0], 0); _put(cast(*u8, cast(i64, &p) + 4), 0);
-    _put(cast(*u8, cast(i64, &p) + 8), cast(u32, w.logical_width));
-    _put(cast(*u8, cast(i64, &p) + 12), cast(u32, w.logical_height));
-    if (_send(w, w.surface, 2, &p[0], 16, 0 - 1) == 0) { return; }
+    if (whole == 1) {
+        _put(&p[0], 0); _put(cast(*u8, cast(i64, &p) + 4), 0);
+        _put(cast(*u8, cast(i64, &p) + 8), cast(u32, w.logical_width));
+        _put(cast(*u8, cast(i64, &p) + 12), cast(u32, w.logical_height));
+        if (_send(w, w.surface, 2, &p[0], 16, 0 - 1) == 0) { return; }
+    } else if (_bounded(_globals.compositor_version, 4) >= 4) {
+        // damage_buffer: the rectangles as they are, in the buffer's pixels.
+        let is i32 as k with mut = 0;
+        while (k < l.n) {
+            let is *damage.Rect as r = &l.rects[k];
+            _put(&p[0], cast(u32, r.x)); _put(&p[4], cast(u32, r.y));
+            _put(&p[8], cast(u32, r.w)); _put(&p[12], cast(u32, r.h));
+            if (_send(w, w.surface, 9, &p[0], 16, 0 - 1) == 0) { return; }
+            k = k + 1;
+        }
+    } else {
+        // damage, before wl_surface 4: in surface coordinates, rounded out.
+        let is i32 as k with mut = 0;
+        while (k < l.n) {
+            let is *damage.Rect as r = &l.rects[k];
+            let is i64 as x0 = (cast(i64, r.x) * 120) / w.scale120;
+            let is i64 as y0 = (cast(i64, r.y) * 120) / w.scale120;
+            let is i64 as x1 = ((cast(i64, r.x + r.w)) * 120 + w.scale120 - 1) / w.scale120;
+            let is i64 as y1 = ((cast(i64, r.y + r.h)) * 120 + w.scale120 - 1) / w.scale120;
+            _put(&p[0], cast(u32, x0)); _put(&p[4], cast(u32, y0));
+            _put(&p[8], cast(u32, x1 - x0)); _put(&p[12], cast(u32, y1 - y0));
+            if (_send(w, w.surface, 2, &p[0], 16, 0 - 1) == 0) { return; }
+            k = k + 1;
+        }
+    }
     _put(&p[0], cast(u32, id));
     _send(w, w.surface, 3, &p[0], 4, 0 - 1);
     _send(w, w.surface, 6, cast(*u8, 0), 0, 0 - 1);
     w.callback = id;
     w.buffers[w.current].busy = 1;
+    w.presents = w.presents + 1;
+    w.buffers[w.current].at = w.presents;
     w.last_buffer = w.current;
     w.visible = 1; w.resize_detached = 0;
     w.frame_ready = 0;

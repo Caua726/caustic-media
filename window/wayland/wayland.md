@@ -65,7 +65,14 @@ that way at all.
 
 `damage` is worth noting: the compositor only re-reads the region declared
 dirty. A backend that always damages the whole surface leaves real performance
-on the table for UI, which changes very little between frames.
+on the table for UI, which changes very little between frames. So
+`submit_region` tells only the rectangles drawn (`damage_buffer` from wl_surface
+4, else `damage` rounded out to surface coordinates) and converts only them —
+RGBA to ARGB8888's premultiplied BGRA — while `buffer_age` says which of the
+two buffers a frame gets and how many frames behind it is (each committed one
+stamped). The compositor may still read all of a buffer at any time:
+`present_test wayland` covers the window and uncovers it, and Weston, repainting
+it whole from the buffer it holds, must show the whole frame.
 
 ---
 

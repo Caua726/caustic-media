@@ -7,6 +7,9 @@
 #
 #   sh tools/run_headless.sh ./build/x11_test
 #
+# XVFB_ARGS adds to Xvfb's arguments — "-extension MIT-SHM" for a server
+# without shared memory, so frames go through XPutImage.
+#
 # 24-bit depth is not incidental. The backend requires a TrueColor visual at 24
 # or 32 bits and refuses to open otherwise; at 16 the test would fail for a
 # reason that has nothing to do with the code under test.
@@ -63,7 +66,8 @@ cleanup() {
 # its program or a program waited for indefinitely.
 trap cleanup EXIT
 . "$(dirname "$0")/../../../tools/child.sh"
-Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp -noreset 3>"$numfile" >/dev/null 2>&1 &
+# shellcheck disable=SC2086
+Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp -noreset ${XVFB_ARGS:-} 3>"$numfile" >/dev/null 2>&1 &
 xvfb_pid=$!
 
 # Wait for the number, a whole line of it, rather than sleeping a guess. 100

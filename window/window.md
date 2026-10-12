@@ -168,6 +168,23 @@ A caller that caches the Target across frames is writing into a buffer the
 compositor is scanning out. The API returns it per frame precisely so that
 mistake is hard to make.
 
+A frame need not be drawn whole. `buffer_age` says how old the acquired buffer
+is — 1 when it holds the frame presented last, 2 the one before (MIT-SHM's and
+Wayland's two buffers alternate), 0 when nothing is known (new, resized) — and
+`submit_region` presents only the rectangles drawn into it (`damage.cst`: a
+frame's changed rectangles, merged where they touch; `damage.repair` gives
+what a buffer of a given age lacks from the history of frames shown). Each
+platform converts and sends those alone: X11 converts them (red and blue
+swapped, premultiplied at 32 bits — never twice) and puts each, the server
+keeping the rest; Wayland converts them and tells them as `damage_buffer`
+(`damage`, in surface coordinates, before wl_surface 4), the compositor free
+to read all of the buffer; Windows invalidates them and `WM_PAINT` blits the
+update rectangle from the DIB, a layered window converting only them into
+its layer. `present_test` (Xvfb with and without MIT-SHM, a 32-bit window,
+Weston) and `present_win32_test` (Wine, opaque and layered) read the screen
+back after every frame — disjoint rectangles, moved regions, single pixels,
+abandoned frames, a resize — and compare it with the whole frame.
+
 ---
 
 ## Where the GPU enters
