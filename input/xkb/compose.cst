@@ -1,0 +1,742 @@
+// input/xkb/compose.cst — dead keys and the Compose key: X11 Compose files
+// read into a table of sequences, and a state fed keysyms that says when one
+// is under way, done or broken.
+//
+// The file is the one libxkbcommon picks for a locale — $XCOMPOSEFILE,
+// $XDG_CONFIG_HOME/XCompose (~/.config/XCompose), ~/.XCompose, else the
+// locale's from $XLOCALEDIR's compose.dir (/usr/share/X11/locale), its name
+// first through locale.alias — read line by line as libxkbcommon reads it:
+// include "%L" / "%H" / "%S", modifiers on the left read and not used, a
+// string and a keysym on the right, a sequence written later winning over
+// one it begins or that begins it, ten broken lines failing the file. One
+// difference: a locale compose.dir lacks falls back to en_US.UTF-8 without
+// asking whether the system has that locale (libxkbcommon asks libc).
+
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "std/env.cst" as env;
+use "keysym.cst" as keysym;
+use "grow.cst" as grow;
+
+let is i32 as NOTHING   with imut = 0;
+let is i32 as COMPOSING with imut = 1;
+let is i32 as COMPOSED  with imut = 2;
+let is i32 as CANCELLED with imut = 3;
+
+let is i32 as FEED_IGNORED  with imut = 0;
+let is i32 as FEED_ACCEPTED with imut = 1;
+
+let is i32 as MAX_LHS     with imut = 10;
+let is i64 as MAX_STRING  with imut = 256;
+let is i32 as MAX_INCLUDE with imut = 5;
+
+// A node of the ternary search tree: lo and hi the siblings below and above
+// its keysym; eq, for an inner node, the next keysym's level.
+struct Node {
+    sym    as u32;
+    leaf   as i32;
+    lo     as i32;
+    hi     as i32;
+    eq     as i32;
+    result as u32;   // a leaf's keysym, 0 for none
+    utf8   as i32;   // a leaf's string's offset, 0 for none
+    _pad   as i32;
+}
+
+struct Table {
+    nodes   as grow.Grow;
+    strings as grow.Grow;
+    locale  as [256]u8;   // the locale, resolved through locale.alias
+}
+
+struct State {
+    table as *Table;
+    prev  as i32;
+    ctx   as i32;
+}
+
+fn node(t as *Table, i as i64) as *Node { return cast(*Node, grow.at(&t.nodes, i * sizeof(Node))); }
+fn num_nodes(t as *Table) as i64 { return t.nodes.len / sizeof(Node); }
+
+fn free_table(t as *Table) as void {
+    if (cast(i64, t) == 0) { return; }
+    grow.free(&t.nodes);
+    grow.free(&t.strings);
+    mem.core.munmap(cast(*u8, t), sizeof(Table));
+}
+
+fn _new_table(locale as *u8) as *Table {
+    let is *Table as t = cast(*Table, mem.core.mmap_anon(sizeof(Table)));
+    if (cast(i64, t) == 0) { return t; }
+    // Node 0: a leaf of nothing, the state's place before and after a
+    // sequence; string 0: none.
+    if (grow.add(&t.nodes, sizeof(Node)) < 0 || grow.add(&t.strings, 1) < 0) { free_table(t); return cast(*Table, 0); }
+    node(t, 0).leaf = 1;
+    let is i64 as i with mut = 0;
+    while (i < 255 && locale[i] != 0) { t.locale[i] = locale[i]; i = i + 1; }
+    return t;
+}
+
+// --- Files ---
+
+struct File {
+    data as *u8;
+    size as i64;
+}
+
+fn _open(path as *u8, f as *File) as i32 {
+    f.data = cast(*u8, 0); f.size = 0;
+    if (cast(i64, path) == 0 || path[0] == 0) { return 0; }
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as size = linux.lseek(fd, 0, linux.SEEK_END);
+    if (size < 0) { linux.close(fd); return 0; }
+    if (size > 0) {
+        let is *u8 as m = linux.mmap(cast(*u8, 0), size, linux.PROT_READ, linux.MAP_PRIVATE, fd, 0);
+        if (cast(i64, m) == linux.MAP_FAILED) { linux.close(fd); return 0; }
+        f.data = m;
+    }
+    f.size = size;
+    linux.close(fd);
+    return 1;
+}
+
+fn _close(f as *File) as void {
+    if (f.size > 0) { linux.munmap(f.data, f.size); }
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// s1 then s2 then s3 into out (size bytes, NUL-terminated); 0 when too long.
+fn _join(out as *u8, size as i64, s1 as *u8, s2 as *u8, s3 as *u8) as i32 {
+    let is i64 as a = _len(s1);
+    let is i64 as b = _len(s2);
+    let is i64 as c = _len(s3);
+    if (a + b + c + 1 > size) { return 0; }
+    mem.memcpy(out, s1, a);
+    mem.memcpy(cast(*u8, cast(i64, out) + a), s2, b);
+    mem.memcpy(cast(*u8, cast(i64, out) + a + b), s3, c);
+    out[a + b + c] = 0;
+    return 1;
+}
+
+fn _xlocaledir() as *u8 {
+    let is *u8 as dir = env.getenv("XLOCALEDIR");
+    if (cast(i64, dir) == 0) { return "/usr/share/X11/locale"; }
+    return dir;
+}
+
+fn _blank(c as i32) as i32 { return cast(i32, c == 32 || (c >= 9 && c <= 13)); }
+
+// A "left: right" registry under the X locale directory: the other side of
+// the first line whose one side is name (right_to_left 1: whose right is),
+// into out; 0 for none.
+fn _resolve(file as *u8, right_to_left as i32, name as *u8, out as *u8, size as i64) as i32 {
+    let is [512]u8 as path with mut;
+    if (_join(&path[0], 512, _xlocaledir(), "/", file) == 0) { return 0; }
+    let is File as f with mut;
+    if (_open(&path[0], &f) == 0) { return 0; }
+    let is i64 as n = _len(name);
+    let is *u8 as s = f.data;
+    let is i64 as pos with mut = 0;
+    let is i32 as found with mut = 0;
+    while (pos < f.size && found == 0) {
+        while (pos < f.size && _blank(cast(i32, s[pos])) == 1) { pos = pos + 1; }
+        if (pos < f.size && s[pos] == 35) {
+            while (pos < f.size && s[pos] != 10) { pos = pos + 1; }
+            continue;
+        }
+        let is i64 as left = pos;
+        while (pos < f.size && _blank(cast(i32, s[pos])) == 0 && s[pos] != 58) { pos = pos + 1; }
+        let is i64 as left_len = pos - left;
+        if (pos < f.size && s[pos] == 58) { pos = pos + 1; }
+        while (pos < f.size && _blank(cast(i32, s[pos])) == 1) { pos = pos + 1; }
+        let is i64 as right = pos;
+        while (pos < f.size && _blank(cast(i32, s[pos])) == 0) { pos = pos + 1; }
+        let is i64 as right_len = pos - right;
+        while (pos < f.size && s[pos] != 10) { pos = pos + 1; }
+        let is i64 as key_at with mut = left;
+        let is i64 as key_len with mut = left_len;
+        let is i64 as val_at with mut = right;
+        let is i64 as val_len with mut = right_len;
+        if (right_to_left == 1) { key_at = right; key_len = right_len; val_at = left; val_len = left_len; }
+        if (key_len == n && mem.memcmp(cast(*u8, cast(i64, s) + key_at), name, n) == 0 && val_len + 1 <= size) {
+            mem.memcpy(out, cast(*u8, cast(i64, s) + val_at), val_len);
+            out[val_len] = 0;
+            found = 1;
+        }
+    }
+    _close(&f);
+    return found;
+}
+
+// The system Compose file of a resolved locale, into out.
+fn locale_file(locale as *u8, out as *u8, size as i64) as i32 {
+    let is *u8 as name with mut = locale;
+    if (name[0] == 67 && name[1] == 0) { name = "en_US.UTF-8"; }
+    let is [512]u8 as rel with mut;
+    if (_resolve("compose.dir", 1, name, &rel[0], 512) == 0 &&
+        _resolve("compose.dir", 1, "en_US.UTF-8", &rel[0], 512) == 0) {
+        return 0;
+    }
+    if (rel[0] == 47) { return _join(out, size, &rel[0], "", ""); }
+    return _join(out, size, _xlocaledir(), "/", &rel[0]);
+}
+
+// --- Parsing ---
+
+let is i32 as T_EOL     with imut = 1;
+let is i32 as T_EOF     with imut = 2;
+let is i32 as T_KEYSYM  with imut = 3;
+let is i32 as T_COLON   with imut = 4;
+let is i32 as T_BANG    with imut = 5;
+let is i32 as T_TILDE   with imut = 6;
+let is i32 as T_STRING  with imut = 7;
+let is i32 as T_IDENT   with imut = 8;
+let is i32 as T_INCLUDE with imut = 9;
+let is i32 as T_ERROR   with imut = 10;
+
+struct Scan {
+    s       as *u8;
+    n       as i64;
+    pos     as i64;
+    at      as i64;      // a keysym's or identifier's bytes
+    len     as i64;
+    buf_len as i64;      // a string's bytes in buf
+    buf     as [1024]u8;
+}
+
+fn _peek(sc as *Scan) as i32 {
+    if (sc.pos >= sc.n) { return 0; }
+    return cast(i32, sc.s[sc.pos]);
+}
+
+fn _eol(sc as *Scan) as i32 { return cast(i32, sc.pos < sc.n && sc.s[sc.pos] == 10); }
+
+fn _to_eol(sc as *Scan) as void {
+    while (sc.pos < sc.n && sc.s[sc.pos] != 10) { sc.pos = sc.pos + 1; }
+}
+
+fn _append(sc as *Scan, c as i32) as void {
+    if (sc.buf_len < 1023) { sc.buf[sc.buf_len] = cast(u8, c); sc.buf_len = sc.buf_len + 1; }
+}
+
+fn _ident_char(c as i32, first as i32) as i32 {
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) { return 1; }
+    return cast(i32, first == 0 && c >= 48 && c <= 57);
+}
+
+fn _valid_utf8(s as *u8, n as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i32 as c = cast(i32, s[i]);
+        let is i64 as extra with mut = 0;
+        let is i32 as cp with mut = 0;
+        if (c < 0x80) { i = i + 1; continue; }
+        if (c >= 0xc2 && c <= 0xdf) { extra = 1; cp = c & 31; }
+        else if (c >= 0xe0 && c <= 0xef) { extra = 2; cp = c & 15; }
+        else if (c >= 0xf0 && c <= 0xf4) { extra = 3; cp = c & 7; }
+        else { return 0; }
+        if (i + extra >= n + 0 && i + extra > n - 1) { return 0; }
+        let is i64 as j with mut = 1;
+        while (j <= extra) {
+            let is i32 as d = cast(i32, s[i + j]);
+            if ((d & 0xc0) != 0x80) { return 0; }
+            cp = (cp << 6) | (d & 63);
+            j = j + 1;
+        }
+        if ((extra == 2 && (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))) || (extra == 3 && (cp < 0x10000 || cp > 0x10ffff))) {
+            return 0;
+        }
+        i = i + 1 + extra;
+    }
+    return 1;
+}
+
+fn _lex(sc as *Scan) as i32 {
+    while (1 == 1) {
+        while (sc.pos < sc.n && _blank(_peek(sc)) == 1) {
+            let is i32 as c = _peek(sc);
+            sc.pos = sc.pos + 1;
+            if (c == 10) { return T_EOL; }
+        }
+        if (_peek(sc) == 35 && sc.pos < sc.n) { _to_eol(sc); continue; }
+        break;
+    }
+    if (sc.pos >= sc.n) { return T_EOF; }
+    sc.buf_len = 0;
+    let is i32 as c = _peek(sc);
+    if (c == 60) {
+        sc.pos = sc.pos + 1;
+        sc.at = sc.pos;
+        while (sc.pos < sc.n && _peek(sc) != 62 && _eol(sc) == 0) { sc.pos = sc.pos + 1; }
+        if (_peek(sc) != 62 || sc.pos >= sc.n) { return T_ERROR; }
+        sc.len = sc.pos - sc.at;
+        sc.pos = sc.pos + 1;
+        return T_KEYSYM;
+    }
+    if (c == 58) { sc.pos = sc.pos + 1; return T_COLON; }
+    if (c == 33) { sc.pos = sc.pos + 1; return T_BANG; }
+    if (c == 126) { sc.pos = sc.pos + 1; return T_TILDE; }
+    if (c == 34) {
+        sc.pos = sc.pos + 1;
+        while (sc.pos < sc.n && _eol(sc) == 0 && _peek(sc) != 34) {
+            if (_peek(sc) == 92) {
+                sc.pos = sc.pos + 1;
+                let is i32 as e = _peek(sc);
+                if (e == 92 || e == 34) {
+                    _append(sc, e);
+                    sc.pos = sc.pos + 1;
+                } else if (e == 120 || e == 88) {
+                    sc.pos = sc.pos + 1;
+                    let is i32 as v with mut = 0;
+                    let is i32 as digits with mut = 0;
+                    while (digits < 2 && sc.pos < sc.n) {
+                        let is i32 as h = _peek(sc);
+                        let is i32 as d with mut = 0 - 1;
+                        if (h >= 48 && h <= 57) { d = h - 48; }
+                        if (h >= 97 && h <= 102) { d = h - 87; }
+                        if (h >= 65 && h <= 70) { d = h - 55; }
+                        if (d < 0) { break; }
+                        v = v * 16 + d;
+                        sc.pos = sc.pos + 1;
+                        digits = digits + 1;
+                    }
+                    if (digits > 0 && v != 0) { _append(sc, v); }
+                } else if (e >= 48 && e <= 55) {
+                    // Up to four octal digits, past 0o377 refused.
+                    let is i32 as v with mut = 0;
+                    let is i32 as digits with mut = 0;
+                    let is i32 as bad with mut = 0;
+                    while (digits < 4 && _peek(sc) >= 48 && _peek(sc) <= 55 && sc.pos < sc.n) {
+                        if (v < 32) { v = v * 8 + (_peek(sc) - 48); }
+                        else { bad = 1; sc.pos = sc.pos + 1; break; }
+                        sc.pos = sc.pos + 1;
+                        digits = digits + 1;
+                    }
+                    if (bad == 0 && v != 0) { _append(sc, v); }
+                }
+                // Any other escape: the backslash dropped.
+            } else {
+                _append(sc, _peek(sc));
+                sc.pos = sc.pos + 1;
+            }
+        }
+        if (_peek(sc) != 34 || sc.pos >= sc.n) { return T_ERROR; }
+        sc.pos = sc.pos + 1;
+        if (_valid_utf8(&sc.buf[0], sc.buf_len) == 0) { return T_ERROR; }
+        return T_STRING;
+    }
+    if (_ident_char(c, 1) == 1) {
+        sc.at = sc.pos;
+        while (sc.pos < sc.n && _ident_char(_peek(sc), 0) == 1) { sc.pos = sc.pos + 1; }
+        sc.len = sc.pos - sc.at;
+        if (sc.len == 7 && mem.memcmp(cast(*u8, cast(i64, sc.s) + sc.at), "include", 7) == 0) { return T_INCLUDE; }
+        return T_IDENT;
+    }
+    _to_eol(sc);
+    return T_ERROR;
+}
+
+// include "path": %% %H %L %S expanded, into buf.
+fn _lex_include(t as *Table, sc as *Scan) as i32 {
+    while (sc.pos < sc.n && _blank(_peek(sc)) == 1) {
+        let is i32 as c = _peek(sc);
+        sc.pos = sc.pos + 1;
+        if (c == 10) { return T_EOL; }
+    }
+    sc.buf_len = 0;
+    if (_peek(sc) != 34 || sc.pos >= sc.n) { return T_ERROR; }
+    sc.pos = sc.pos + 1;
+    while (sc.pos < sc.n && _eol(sc) == 0 && _peek(sc) != 34) {
+        if (_peek(sc) == 37) {
+            sc.pos = sc.pos + 1;
+            let is i32 as e = _peek(sc);
+            let is *u8 as add with mut = cast(*u8, 0);
+            let is [512]u8 as path with mut;
+            if (e == 37) { _append(sc, 37); }
+            else if (e == 72) {
+                add = env.getenv("HOME");
+                if (cast(i64, add) == 0) { return T_ERROR; }
+            } else if (e == 76) {
+                if (locale_file(&t.locale[0], &path[0], 512) == 0) { return T_ERROR; }
+                add = &path[0];
+            } else if (e == 83) {
+                add = _xlocaledir();
+            } else {
+                return T_ERROR;
+            }
+            sc.pos = sc.pos + 1;
+            if (cast(i64, add) != 0) {
+                let is i64 as i with mut = 0;
+                while (add[i] != 0) { _append(sc, cast(i32, add[i])); i = i + 1; }
+            }
+        } else {
+            _append(sc, _peek(sc));
+            sc.pos = sc.pos + 1;
+        }
+    }
+    if (_peek(sc) != 34 || sc.pos >= sc.n) { return T_ERROR; }
+    sc.pos = sc.pos + 1;
+    return T_STRING;
+}
+
+struct Production {
+    lhs        as [10]u32;
+    len        as i32;
+    has_sym    as i32;
+    sym        as u32;
+    has_string as i32;
+    string_len as i64;
+    string     as [256]u8;
+}
+
+fn _add_string(t as *Table, p as *Production) as i32 {
+    let is i64 as off = grow.add(&t.strings, p.string_len + 1);
+    if (off < 0) { return 0 - 1; }
+    mem.memcpy(grow.at(&t.strings, off), &p.string[0], p.string_len);
+    return cast(i32, off);
+}
+
+fn _string_at(t as *Table, off as i32) as *u8 { return grow.at(&t.strings, cast(i64, off)); }
+
+// The sequence into the tree, a later one overriding what it collides with.
+fn _add(t as *Table, p as *Production) as i32 {
+    let is i64 as curr with mut = 1;
+    if (num_nodes(t) == 1) { curr = 0; }
+    // Where the parent keeps the node to come: node, field (0 lo, 1 hi, 2 eq).
+    let is i64 as parent with mut = 0 - 1;
+    let is i32 as field with mut = 0;
+    let is i32 as pos with mut = 0;
+    while (1 == 1) {
+        let is u32 as sym = p.lhs[pos];
+        let is i32 as last = cast(i32, pos + 1 == p.len);
+        if (curr == 0) {
+            let is i64 as off = grow.add(&t.nodes, sizeof(Node));
+            if (off < 0) { return 0; }
+            curr = off / sizeof(Node);
+            node(t, curr).sym = sym;
+            if (parent >= 0) {
+                let is *Node as up = node(t, parent);
+                if (field == 0) { up.lo = cast(i32, curr); }
+                if (field == 1) { up.hi = cast(i32, curr); }
+                if (field == 2) { up.eq = cast(i32, curr); }
+            }
+        }
+        let is *Node as nd = node(t, curr);
+        if (sym < nd.sym) {
+            parent = curr; field = 0; curr = cast(i64, nd.lo);
+        } else if (sym > nd.sym) {
+            parent = curr; field = 1; curr = cast(i64, nd.hi);
+        } else if (last == 0) {
+            if (nd.leaf == 1) {
+                // A sequence that began this one: overridden.
+                nd.leaf = 0; nd.eq = 0; nd.result = 0; nd.utf8 = 0;
+            }
+            pos = pos + 1;
+            parent = curr; field = 2; curr = cast(i64, nd.eq);
+        } else {
+            if (nd.leaf == 1) {
+                let is i32 as same_string with mut = 0;
+                if (nd.utf8 == 0 && p.has_string == 0) { same_string = 1; }
+                if (nd.utf8 != 0 && p.has_string == 1) {
+                    let is *u8 as old = _string_at(t, nd.utf8);
+                    if (_len(old) == p.string_len && mem.memcmp(old, &p.string[0], p.string_len) == 0) { same_string = 1; }
+                }
+                let is i32 as same_sym with mut = 0;
+                if (nd.result == 0 && p.has_sym == 0) { same_sym = 1; }
+                if (nd.result != 0 && p.has_sym == 1 && nd.result == p.sym) { same_sym = 1; }
+                if (same_string == 1 && same_sym == 1) { return 1; }
+            } else {
+                // One this sequence begins: overridden.
+                nd.eq = 0;
+            }
+            if (p.has_string == 1) {
+                let is i32 as off = _add_string(t, p);
+                if (off < 0) { return 0; }
+                nd.utf8 = off;
+            } else {
+                nd.utf8 = 0;
+            }
+            if (p.has_sym == 1) { nd.result = p.sym; } else { nd.result = 0; }
+            nd.leaf = 1;
+            return 1;
+        }
+    }
+    return 1;
+}
+
+fn _modifier(sc as *Scan) as i32 {
+    let is *u8 as s = cast(*u8, cast(i64, sc.s) + sc.at);
+    let is i64 as n = sc.len;
+    if ((n == 5 && mem.memcmp(s, "Shift", 5) == 0) || (n == 4 && mem.memcmp(s, "Ctrl", 4) == 0) ||
+        (n == 3 && mem.memcmp(s, "Alt", 3) == 0) || (n == 4 && mem.memcmp(s, "Meta", 4) == 0) ||
+        (n == 4 && mem.memcmp(s, "Lock", 4) == 0) || (n == 4 && mem.memcmp(s, "Caps", 4) == 0)) {
+        return 1;
+    }
+    return 0;
+}
+
+let is i32 as S_INITIAL  with imut = 0;
+let is i32 as S_LHS      with imut = 1;
+let is i32 as S_LHS_TOK  with imut = 2;
+let is i32 as S_KEYSYM   with imut = 3;
+let is i32 as S_KEYSYM_T with imut = 4;
+let is i32 as S_MODS     with imut = 5;
+let is i32 as S_MODS_TOK with imut = 6;
+let is i32 as S_RHS      with imut = 7;
+let is i32 as S_ERROR    with imut = 8;
+let is i32 as S_SKIP     with imut = 9;
+let is i32 as S_INCLUDE  with imut = 10;
+let is i32 as S_DONE     with imut = 11;
+let is i32 as S_FAIL     with imut = 12;
+
+fn _parse(t as *Table, text as *u8, n as i64, depth as i32) as i32 {
+    let is *Scan as sc = cast(*Scan, mem.core.mmap_anon(sizeof(Scan)));
+    if (cast(i64, sc) == 0) { return 0; }
+    sc.s = text; sc.n = n;
+    let is *Production as p = cast(*Production, mem.core.mmap_anon(sizeof(Production)));
+    if (cast(i64, p) == 0) { mem.core.munmap(cast(*u8, sc), sizeof(Scan)); return 0; }
+    // The file's first character the grammar cares for is ASCII.
+    let is i64 as first with mut = 0;
+    while (first < n && _blank(cast(i32, text[first])) == 1) { first = first + 1; }
+    let is i32 as ok with mut = 1;
+    if (first < n && cast(i32, text[first]) >= 128) { ok = 0; }
+    let is i32 as errors with mut = 0;
+    let is i32 as tok with mut = 0;
+    let is i32 as st with mut = S_INITIAL;
+    if (ok == 0) { st = S_FAIL; }
+    while (st != S_DONE && st != S_FAIL) {
+        if (st == S_INITIAL) {
+            p.len = 0; p.has_sym = 0; p.has_string = 0; p.string_len = 0;
+            tok = _lex(sc);
+            while (tok == T_EOL) { tok = _lex(sc); }
+            if (tok == T_EOF) { st = S_DONE; }
+            else if (tok == T_INCLUDE) { st = S_INCLUDE; }
+            else { st = S_LHS_TOK; }
+        } else if (st == S_INCLUDE) {
+            tok = _lex_include(t, sc);
+            if (tok != T_STRING) { st = S_ERROR; }
+            else {
+                let is [1024]u8 as path with mut;
+                mem.memcpy(&path[0], &sc.buf[0], sc.buf_len);
+                path[sc.buf_len] = 0;
+                tok = _lex(sc);
+                if (tok != T_EOL) { st = S_ERROR; }
+                else if (depth >= MAX_INCLUDE || _include(t, &path[0], depth) == 0) { st = S_FAIL; }
+                else { st = S_INITIAL; }
+            }
+        } else if (st == S_LHS) {
+            tok = _lex(sc);
+            st = S_LHS_TOK;
+        } else if (st == S_LHS_TOK) {
+            if (tok == T_COLON) {
+                if (p.len <= 0) { st = S_SKIP; } else { st = S_RHS; }
+            } else if (tok == T_IDENT) {
+                if (sc.len == 4 && mem.memcmp(cast(*u8, cast(i64, sc.s) + sc.at), "None", 4) == 0) { st = S_KEYSYM; }
+                else { st = S_MODS_TOK; }
+            } else if (tok == T_TILDE) {
+                st = S_MODS_TOK;
+            } else if (tok == T_BANG) {
+                st = S_MODS;
+            } else {
+                st = S_KEYSYM_T;
+            }
+        } else if (st == S_KEYSYM) {
+            tok = _lex(sc);
+            st = S_KEYSYM_T;
+        } else if (st == S_KEYSYM_T) {
+            if (tok != T_KEYSYM) { st = S_ERROR; }
+            else {
+                let is u32 as sym = keysym.from_name(cast(*u8, cast(i64, sc.s) + sc.at), sc.len);
+                if (sym == keysym.NO_SYMBOL) { st = S_ERROR; }
+                else if (p.len + 1 > MAX_LHS) { st = S_SKIP; }
+                else {
+                    p.lhs[p.len] = sym;
+                    p.len = p.len + 1;
+                    st = S_LHS;
+                }
+            }
+        } else if (st == S_MODS) {
+            tok = _lex(sc);
+            st = S_MODS_TOK;
+        } else if (st == S_MODS_TOK) {
+            if (tok != T_TILDE && tok != T_IDENT) { st = S_KEYSYM_T; }
+            else {
+                if (tok == T_TILDE) { tok = _lex(sc); }
+                if (tok != T_IDENT) { st = S_ERROR; }
+                else if (_modifier(sc) == 0) { st = S_ERROR; }
+                else { st = S_MODS; }
+            }
+        } else if (st == S_RHS) {
+            tok = _lex(sc);
+            if (tok == T_STRING) {
+                if (p.has_string == 1 || sc.buf_len + 1 > MAX_STRING) { st = S_SKIP; }
+                else {
+                    mem.memcpy(&p.string[0], &sc.buf[0], sc.buf_len);
+                    p.string_len = sc.buf_len;
+                    p.has_string = 1;
+                }
+            } else if (tok == T_IDENT || tok == T_EOL) {
+                let is i32 as fine with mut = 1;
+                if (tok == T_IDENT) {
+                    let is u32 as sym = keysym.from_name(cast(*u8, cast(i64, sc.s) + sc.at), sc.len);
+                    if (sym == keysym.NO_SYMBOL) { st = S_ERROR; fine = 0; }
+                    else if (p.has_sym == 1) { st = S_SKIP; fine = 0; }
+                    else { p.sym = sym; p.has_sym = 1; }
+                }
+                if (fine == 1) {
+                    if (p.has_string == 0 && p.has_sym == 0) { st = S_SKIP; }
+                    else if (_add(t, p) == 0) { st = S_FAIL; }
+                    else { st = S_INITIAL; }
+                }
+            } else {
+                st = S_ERROR;
+            }
+        } else if (st == S_ERROR) {
+            errors = errors + 1;
+            if (errors > 10) { st = S_FAIL; } else { st = S_SKIP; }
+        } else if (st == S_SKIP) {
+            while (tok != T_EOL && tok != T_EOF) { tok = _lex(sc); }
+            st = S_INITIAL;
+        }
+    }
+    let is i32 as result = cast(i32, st == S_DONE);
+    mem.core.munmap(cast(*u8, p), sizeof(Production));
+    mem.core.munmap(cast(*u8, sc), sizeof(Scan));
+    return result;
+}
+
+fn _include(t as *Table, path as *u8, depth as i32) as i32 {
+    let is File as f with mut;
+    if (_open(path, &f) == 0) { return 0; }
+    let is i32 as ok = _parse(t, f.data, f.size, depth + 1);
+    _close(&f);
+    return ok;
+}
+
+// --- Tables ---
+
+// The table of a Compose file's text, for a locale (what %L names).
+fn table_from_text(text as *u8, n as i64, locale as *u8) as *Table {
+    let is *Table as t = _new_table(locale);
+    if (cast(i64, t) == 0) { return t; }
+    if (_parse(t, text, n, 0) == 0) { free_table(t); return cast(*Table, 0); }
+    return t;
+}
+
+fn table_from_file(path as *u8, locale as *u8) as *Table {
+    let is File as f with mut;
+    if (_open(path, &f) == 0) { return cast(*Table, 0); }
+    let is *Table as t = table_from_text(f.data, f.size, locale);
+    _close(&f);
+    return t;
+}
+
+// The table libxkbcommon would build for this locale, null when there is
+// no file or it does not read.
+fn table_from_locale(locale as *u8) as *Table {
+    let is [256]u8 as resolved with mut;
+    if (_resolve("locale.alias", 0, locale, &resolved[0], 256) == 0) {
+        if (_join(&resolved[0], 256, locale, "", "") == 0) { return cast(*Table, 0); }
+    }
+    let is [1024]u8 as path with mut;
+    let is *u8 as file = env.getenv("XCOMPOSEFILE");
+    let is File as probe with mut;
+    if (cast(i64, file) != 0 && _open(file, &probe) == 1) {
+        _close(&probe);
+        return table_from_file(file, &resolved[0]);
+    }
+    let is *u8 as home = env.getenv("HOME");
+    let is *u8 as config = env.getenv("XDG_CONFIG_HOME");
+    let is i32 as have with mut = 0;
+    if (cast(i64, config) != 0 && config[0] == 47) { have = _join(&path[0], 1024, config, "/XCompose", ""); }
+    else if (cast(i64, home) != 0) { have = _join(&path[0], 1024, home, "/.config/XCompose", ""); }
+    if (have == 1 && _open(&path[0], &probe) == 1) {
+        _close(&probe);
+        return table_from_file(&path[0], &resolved[0]);
+    }
+    if (cast(i64, home) != 0 && _join(&path[0], 1024, home, "/.XCompose", "") == 1 && _open(&path[0], &probe) == 1) {
+        _close(&probe);
+        return table_from_file(&path[0], &resolved[0]);
+    }
+    if (locale_file(&resolved[0], &path[0], 1024) == 0) { return cast(*Table, 0); }
+    return table_from_file(&path[0], &resolved[0]);
+}
+
+// --- State ---
+
+fn state_new(t as *Table) as *State {
+    let is *State as s = cast(*State, mem.core.mmap_anon(sizeof(State)));
+    if (cast(i64, s) != 0) { s.table = t; }
+    return s;
+}
+
+fn state_free(s as *State) as void {
+    if (cast(i64, s) != 0) { mem.core.munmap(cast(*u8, s), sizeof(State)); }
+}
+
+fn reset(s as *State) as void { s.prev = 0; s.ctx = 0; }
+
+// A keysym typed: modifier keysyms ignored, any other the next of the
+// sequence — or no sequence at all.
+fn feed(s as *State, sym as u32) as i32 {
+    if (keysym.is_modifier(sym) == 1) { return FEED_IGNORED; }
+    let is *Table as t = s.table;
+    let is *Node as nd = node(t, cast(i64, s.ctx));
+    let is i64 as ctx with mut = 1;
+    if (nd.leaf == 0) { ctx = cast(i64, nd.eq); }
+    if (ctx == 1 && num_nodes(t) == 1) { ctx = 0; }
+    while (ctx != 0) {
+        let is *Node as c = node(t, ctx);
+        if (sym < c.sym) { ctx = cast(i64, c.lo); }
+        else if (sym > c.sym) { ctx = cast(i64, c.hi); }
+        else { break; }
+    }
+    s.prev = s.ctx;
+    s.ctx = cast(i32, ctx);
+    return FEED_ACCEPTED;
+}
+
+fn status(s as *State) as i32 {
+    let is *Node as prev = node(s.table, cast(i64, s.prev));
+    let is *Node as nd = node(s.table, cast(i64, s.ctx));
+    if (s.ctx == 0 && prev.leaf == 0) { return CANCELLED; }
+    if (s.ctx == 0) { return NOTHING; }
+    if (nd.leaf == 0) { return COMPOSING; }
+    return COMPOSED;
+}
+
+// What the sequence composed: its string, else its keysym's character, into
+// out (size bytes, NUL-terminated); the length.
+fn utf8(s as *State, out as *u8, size as i64) as i64 {
+    let is *Node as nd = node(s.table, cast(i64, s.ctx));
+    if (size > 0) { out[0] = 0; }
+    if (nd.leaf == 0) { return 0; }
+    let is [4]u8 as tmp with mut;
+    let is *u8 as src with mut = cast(*u8, 0);
+    let is i64 as n with mut = 0;
+    if (nd.utf8 == 0 && nd.result != 0) {
+        n = keysym.to_utf8(nd.result, &tmp[0]);
+        src = &tmp[0];
+    } else {
+        src = _string_at(s.table, nd.utf8);
+        n = _len(src);
+    }
+    if (size <= 0) { return n; }
+    let is i64 as copy with mut = n;
+    if (copy > size - 1) { copy = size - 1; }
+    mem.memcpy(out, src, copy);
+    out[copy] = 0;
+    return n;
+}
+
+fn one_sym(s as *State) as u32 {
+    let is *Node as nd = node(s.table, cast(i64, s.ctx));
+    if (nd.leaf == 0) { return keysym.NO_SYMBOL; }
+    return nd.result;
+}

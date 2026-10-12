@@ -1,0 +1,539 @@
+// input/xkb/state.cst — a keyboard's state under a keymap: which modifiers
+// and group are depressed, latched and locked, so which level of which key
+// says what.
+//
+// Keys go down and up through update_key: each key's actions at its level —
+// set, latch or lock a modifier or a group — start a filter that holds them
+// while the key is down and decides, as later keys arrive, whether a latch
+// becomes a lock, is broken or lasts one key, as libxkbcommon's state does
+// for a keymap of the v1 format. update_mask takes what a compositor says
+// instead. A key's keysyms are its level's in the layout its group falls in,
+// Caps Lock making them upper case where the key's type does not use it;
+// its text the keysyms' characters, Control making a control character of a
+// lone ASCII one (any layout's ASCII keysym of the key, when its own is not).
+
+use "std/mem.cst" as mem;
+use "keymap.cst" as keymap;
+use "keysym.cst" as keysym;
+
+// Which components: libxkbcommon's xkb_state_component bits.
+let is i32 as MODS_DEPRESSED   with imut = 1;
+let is i32 as MODS_LATCHED     with imut = 2;
+let is i32 as MODS_LOCKED      with imut = 4;
+let is i32 as MODS_EFFECTIVE   with imut = 8;
+let is i32 as LAYOUT_DEPRESSED with imut = 16;
+let is i32 as LAYOUT_LATCHED   with imut = 32;
+let is i32 as LAYOUT_LOCKED    with imut = 64;
+let is i32 as LAYOUT_EFFECTIVE with imut = 128;
+
+let is i32 as MAX_FILTERS with imut = 64;
+
+let is i32 as NO_LATCH       with imut = 0;
+let is i32 as LATCH_KEY_DOWN with imut = 1;
+let is i32 as LATCH_PENDING  with imut = 2;
+
+struct Filter {
+    func   as i32;   // the action kind it runs; 0 for a free slot
+    refcnt as i32;
+    kc     as i64;
+    priv   as i32;
+    delta  as i32;   // a group latch's
+    action as keymap.Action;
+}
+
+struct State {
+    km            as *keymap.Keymap;
+    base_group    as i32;
+    latched_group as i32;
+    locked_group  as i32;
+    group         as i32;
+    base_mods     as u32;
+    latched_mods  as u32;
+    locked_mods   as u32;
+    mods          as u32;
+    set_mods      as u32;
+    clear_mods    as u32;
+    mod_key_count as [32]i32;
+    num_filters   as i32;
+    _pad          as i32;
+    filters       as [64]Filter;
+}
+
+fn new(km as *keymap.Keymap) as *State {
+    let is *State as s = cast(*State, mem.core.mmap_anon(sizeof(State)));
+    if (cast(i64, s) != 0) { s.km = km; }
+    return s;
+}
+
+fn free(s as *State) as void {
+    if (cast(i64, s) != 0) { mem.core.munmap(cast(*u8, s), sizeof(State)); }
+}
+
+// --- Keys, levels, layouts ---
+
+fn key_layout(s as *State, kc as i64) as i32 {
+    let is *keymap.Key as k = keymap.key(s.km, kc);
+    if (cast(i64, k) == 0) { return 0 - 1; }
+    return keymap.wrap_group(s.group, k.num_groups, k.range, k.redirect);
+}
+
+// The entry of a key's type the modifiers select, null for none.
+fn _entry(s as *State, k as *keymap.Key, layout as i32) as *keymap.Entry {
+    let is *keymap.Type as t = keymap.type_at(s.km, cast(i64, k.groups[layout].kind));
+    let is u32 as active = s.mods & t.mask;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, t.num_entries)) {
+        let is *keymap.Entry as e = keymap.entry_at(s.km, cast(i64, t.first_entry) + i);
+        if ((e.mods == 0 || e.mask != 0) && e.mask == active) { return e; }
+        i = i + 1;
+    }
+    return cast(*keymap.Entry, 0);
+}
+
+fn key_level(s as *State, kc as i64, layout as i32) as i32 {
+    let is *keymap.Key as k = keymap.key(s.km, kc);
+    if (cast(i64, k) == 0 || layout < 0 || layout >= k.num_groups) { return 0 - 1; }
+    let is *keymap.Entry as e = _entry(s, k, layout);
+    if (cast(i64, e) == 0) { return 0; }
+    return e.level;
+}
+
+// The modifiers the key's type uses to pick its level, less those it
+// preserves.
+fn key_consumed(s as *State, kc as i64) as u32 {
+    let is *keymap.Key as k = keymap.key(s.km, kc);
+    if (cast(i64, k) == 0) { return 0; }
+    let is i32 as layout = key_layout(s, kc);
+    if (layout < 0) { return 0; }
+    let is u32 as preserve with mut = 0;
+    let is *keymap.Entry as e = _entry(s, k, layout);
+    if (cast(i64, e) != 0) { preserve = e.pmask; }
+    return keymap.type_at(s.km, cast(i64, k.groups[layout].kind)).mask & (~preserve);
+}
+
+fn serialize_mods(s as *State, which as i32) as u32 {
+    if ((which & MODS_EFFECTIVE) != 0) { return s.mods; }
+    let is u32 as out with mut = 0;
+    if ((which & MODS_DEPRESSED) != 0) { out = out | s.base_mods; }
+    if ((which & MODS_LATCHED) != 0) { out = out | s.latched_mods; }
+    if ((which & MODS_LOCKED) != 0) { out = out | s.locked_mods; }
+    return out;
+}
+
+fn serialize_layout(s as *State, which as i32) as i32 {
+    if ((which & LAYOUT_EFFECTIVE) != 0) { return s.group; }
+    let is i32 as out with mut = 0;
+    if ((which & LAYOUT_DEPRESSED) != 0) { out = out + s.base_group; }
+    if ((which & LAYOUT_LATCHED) != 0) { out = out + s.latched_group; }
+    if ((which & LAYOUT_LOCKED) != 0) { out = out + s.locked_group; }
+    return out;
+}
+
+fn _mapping(s as *State, idx as i32) as u32 {
+    if (idx < 8) { return cast(u32, 1) << cast(u32, idx); }
+    return s.km.mapping[idx];
+}
+
+// 1 when the modifier is active in those components, 0 when not, -1 when the
+// keymap has no such modifier.
+fn mod_active(s as *State, idx as i32, which as i32) as i32 {
+    if (idx < 0 || idx >= s.km.num_mods) { return 0 - 1; }
+    let is u32 as m = _mapping(s, idx);
+    if (m == 0) { return 0; }
+    return cast(i32, (serialize_mods(s, which) & m) == m);
+}
+
+fn mod_consumed(s as *State, kc as i64, idx as i32) as i32 {
+    if (cast(i64, keymap.key(s.km, kc)) == 0 || idx < 0 || idx >= s.km.num_mods) { return 0 - 1; }
+    let is u32 as m = _mapping(s, idx);
+    if (m == 0) { return 0; }
+    return cast(i32, (m & key_consumed(s, kc)) == m);
+}
+
+fn _caps(s as *State, kc as i64) as i32 {
+    return cast(i32, mod_active(s, keymap.MOD_LOCK, MODS_EFFECTIVE) > 0 && mod_consumed(s, kc, keymap.MOD_LOCK) == 0);
+}
+
+fn _ctrl(s as *State, kc as i64) as i32 {
+    return cast(i32, mod_active(s, keymap.MOD_CONTROL, MODS_EFFECTIVE) > 0 && mod_consumed(s, kc, keymap.MOD_CONTROL) == 0);
+}
+
+// The keysyms of the key's level now: their count, *out the first of them.
+// Caps Lock's upper case is not applied here — key_sym is.
+fn _level_syms(s as *State, kc as i64, out as **u32) as i32 {
+    let is i32 as layout = key_layout(s, kc);
+    if (layout < 0) { *out = cast(*u32, 0); return 0; }
+    return keymap.key_syms(s.km, kc, layout, key_level(s, kc, layout), out);
+}
+
+fn key_num_syms(s as *State, kc as i64) as i32 {
+    let is *u32 as syms with mut = cast(*u32, 0);
+    return _level_syms(s, kc, &syms);
+}
+
+// Keysym i of the key's level now, upper case under Caps Lock.
+fn key_sym(s as *State, kc as i64, i as i32) as u32 {
+    let is *u32 as syms with mut = cast(*u32, 0);
+    let is i32 as n = _level_syms(s, kc, &syms);
+    if (i < 0 || i >= n) { return keysym.NO_SYMBOL; }
+    if (_caps(s, kc) == 1) { return keysym.to_upper(syms[i]); }
+    return syms[i];
+}
+
+// The key's keysym when its level has exactly one.
+fn key_one_sym(s as *State, kc as i64) as u32 {
+    if (key_num_syms(s, kc) != 1) { return keysym.NO_SYMBOL; }
+    return key_sym(s, kc, 0);
+}
+
+fn _sym_for_text(s as *State, kc as i64) as u32 {
+    let is i32 as layout = key_layout(s, kc);
+    let is i32 as layouts = keymap.num_layouts_for_key(s.km, kc);
+    let is i32 as level = key_level(s, kc, layout);
+    if (layout < 0 || layouts == 0 || level < 0) { return keysym.NO_SYMBOL; }
+    let is *u32 as syms with mut = cast(*u32, 0);
+    if (keymap.key_syms(s.km, kc, layout, level, &syms) != 1) { return keysym.NO_SYMBOL; }
+    let is u32 as sym with mut = syms[0];
+    if (_ctrl(s, kc) == 1 && sym > 127) {
+        let is i32 as i with mut = 0;
+        while (i < layouts) {
+            let is i32 as l = key_level(s, kc, i);
+            if (l >= 0 && keymap.key_syms(s.km, kc, i, l, &syms) == 1 && syms[0] <= 127) {
+                sym = syms[0];
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    if (_caps(s, kc) == 1) { sym = keysym.to_upper(sym); }
+    return sym;
+}
+
+// libX11's control character of an ASCII one.
+fn _to_control(c as i32) as i32 {
+    if ((c >= 64 && c < 127) || c == 32) { return c & 31; }
+    if (c == 50) { return 0; }
+    if (c >= 51 && c <= 55) { return c - 24; }
+    if (c == 56) { return 127; }
+    if (c == 47) { return 31; }
+    return c;
+}
+
+// The text the key types now, UTF-8 into out (size bytes, NUL after when it
+// fits); its length — 0 when a keysym of it is no character.
+fn key_utf8(s as *State, kc as i64, out as *u8, size as i64) as i64 {
+    let is [4]u8 as tmp with mut;
+    let is i64 as off with mut = 0;
+    let is u32 as one = _sym_for_text(s, kc);
+    let is i32 as n with mut = 1;
+    if (one == keysym.NO_SYMBOL) { n = key_num_syms(s, kc); }
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is u32 as sym with mut = one;
+        if (one == keysym.NO_SYMBOL) { sym = key_sym(s, kc, i); }
+        let is i64 as b = keysym.to_utf8(sym, &tmp[0]);
+        if (b <= 0) {
+            if (size > 0) { out[0] = 0; }
+            return 0;
+        }
+        if (off + b <= size) { mem.memcpy(cast(*u8, cast(i64, out) + off), &tmp[0], b); }
+        off = off + b;
+        i = i + 1;
+    }
+    if (off >= size) {
+        if (size > 0) { out[size - 1] = 0; }
+        return off;
+    }
+    out[off] = 0;
+    if (off == 1 && cast(i32, out[0]) <= 127 && _ctrl(s, kc) == 1) { out[0] = cast(u8, _to_control(cast(i32, out[0]))); }
+    return off;
+}
+
+// --- Filters ---
+
+fn _breaks_latch(a as *keymap.Action) as i32 {
+    let is i32 as k = a.kind;
+    return cast(i32, k == keymap.ACT_NONE || k == keymap.ACT_VOID || k == keymap.ACT_PTR_BUTTON ||
+                     k == keymap.ACT_PTR_LOCK || k == keymap.ACT_CTRL_SET || k == keymap.ACT_CTRL_LOCK ||
+                     k == keymap.ACT_SWITCH_VT || k == keymap.ACT_TERMINATE);
+}
+
+let is keymap.Action as _no_action with mut;
+
+// The actions of the key's level now: their count, *first the first's
+// index; a level without one has one NoAction (*first -1).
+fn _key_actions(s as *State, kc as i64, first as *i64) as i32 {
+    *first = 0 - 1;
+    let is *keymap.Key as k = keymap.key(s.km, kc);
+    if (cast(i64, k) == 0) { return 1; }
+    let is i32 as layout = key_layout(s, kc);
+    let is i32 as level = key_level(s, kc, layout);
+    if (layout < 0 || level < 0 || level >= k.groups[layout].num_levels) { return 1; }
+    let is *keymap.Level as lv = keymap.level_at(s.km, cast(i64, k.groups[layout].first_level + level));
+    if (lv.num_actions == 0) { return 1; }
+    *first = cast(i64, lv.first_action);
+    return lv.num_actions;
+}
+
+fn _action_n(s as *State, first as i64, i as i32) as *keymap.Action {
+    if (first < 0) { _no_action.kind = keymap.ACT_NONE; return &_no_action; }
+    return keymap.action_at(s.km, first + cast(i64, i));
+}
+
+fn _group_delta(s as *State, f as *Filter, component as *i32) as void {
+    if ((f.action.flags & keymap.FLAG_ABSOLUTE) != 0) { *component = f.action.group; }
+    else { *component = *component + f.action.group; }
+}
+
+fn _new_filter(s as *State, f as *Filter) as void {
+    let is i32 as kind = f.action.kind;
+    let is u32 as mask = f.action.mask;
+    if (kind == keymap.ACT_MOD_SET) {
+        f.priv = cast(i32, mask);
+        s.set_mods = s.set_mods | mask;
+    } else if (kind == keymap.ACT_MOD_LATCH) {
+        f.priv = LATCH_KEY_DOWN;
+        s.set_mods = s.set_mods | mask;
+    } else if (kind == keymap.ACT_MOD_LOCK) {
+        f.priv = cast(i32, s.locked_mods & mask);
+        s.set_mods = s.set_mods | mask;
+        if ((f.action.flags & keymap.FLAG_NO_LOCK) == 0) { s.locked_mods = s.locked_mods | mask; }
+    } else if (kind == keymap.ACT_GROUP_SET) {
+        f.priv = s.base_group;
+        _group_delta(s, f, &s.base_group);
+    } else if (kind == keymap.ACT_GROUP_LATCH) {
+        f.priv = LATCH_KEY_DOWN;
+        if ((f.action.flags & keymap.FLAG_ABSOLUTE) != 0) { f.delta = f.action.group - s.base_group; }
+        else { f.delta = f.action.group; }
+        _group_delta(s, f, &s.base_group);
+    } else if (kind == keymap.ACT_GROUP_LOCK) {
+        _group_delta(s, f, &s.locked_group);
+    }
+}
+
+// A filter's own key going down again or up: 1 when that consumes it.
+fn _held(f as *Filter, down as i32) as i32 {
+    if (down == 1) { f.refcnt = f.refcnt + 1; return 1; }
+    f.refcnt = f.refcnt - 1;
+    return cast(i32, f.refcnt > 0);
+}
+
+// The filter told of key kc going down or up: 1 when it consumes the event.
+fn _run(s as *State, f as *Filter, kc as i64, down as i32) as i32 {
+    let is i32 as kind = f.func;
+    let is u32 as mask = f.action.mask;
+    if (kind == keymap.ACT_MOD_SET || kind == keymap.ACT_GROUP_SET) {
+        if (kc != f.kc) {
+            f.action.flags = f.action.flags & (~keymap.FLAG_CLEAR_LOCKS);
+            return 0;
+        }
+        if (_held(f, down) == 1) { return 1; }
+        if (kind == keymap.ACT_MOD_SET) {
+            s.clear_mods = s.clear_mods | cast(u32, f.priv);
+            if ((f.action.flags & keymap.FLAG_CLEAR_LOCKS) != 0) { s.locked_mods = s.locked_mods & (~mask); }
+        } else {
+            s.base_group = f.priv;
+            if ((f.action.flags & keymap.FLAG_CLEAR_LOCKS) != 0) { s.locked_group = 0; }
+        }
+        f.func = 0;
+        return 0;
+    }
+    if (kind == keymap.ACT_MOD_LOCK || kind == keymap.ACT_GROUP_LOCK) {
+        if (kc != f.kc) { return 0; }
+        if (_held(f, down) == 1) { return 1; }
+        if (kind == keymap.ACT_MOD_LOCK) {
+            s.clear_mods = s.clear_mods | mask;
+            if ((f.action.flags & keymap.FLAG_NO_UNLOCK) == 0) { s.locked_mods = s.locked_mods & (~cast(u32, f.priv)); }
+        }
+        f.func = 0;
+        return 0;
+    }
+    if (kind == keymap.ACT_MOD_LATCH) { return _run_mod_latch(s, f, kc, down); }
+    if (kind == keymap.ACT_GROUP_LATCH) { return _run_group_latch(s, f, kc, down); }
+    return 0;
+}
+
+fn _run_mod_latch(s as *State, f as *Filter, kc as i64, down as i32) as i32 {
+    let is i32 as latch with mut = f.priv;
+    let is u32 as mask = f.action.mask;
+    if (down == 1) {
+        let is i64 as first with mut = 0;
+        let is i32 as count = _key_actions(s, kc, &first);
+        if (latch == LATCH_KEY_DOWN) {
+            // Another key while the latching one is held: no latch.
+            latch = NO_LATCH;
+        } else if (latch == LATCH_PENDING) {
+            let is i32 as i with mut = 0;
+            while (i < count) {
+                let is *keymap.Action as a = _action_n(s, first, i);
+                if (a.kind == keymap.ACT_MOD_LATCH && a.flags == f.action.flags && a.mask == mask) {
+                    // The same latch again: a lock with latchToLock, else held.
+                    mem.memcpy(cast(*u8, &f.action), cast(*u8, a), sizeof(keymap.Action));
+                    if ((f.action.flags & keymap.FLAG_LATCH_TO_LOCK) != 0) {
+                        f.action.kind = keymap.ACT_MOD_LOCK;
+                    } else {
+                        f.action.kind = keymap.ACT_MOD_SET;
+                    }
+                    f.func = f.action.kind;
+                    _new_filter(s, f);
+                    f.kc = kc;
+                    s.latched_mods = s.latched_mods & (~mask);
+                    return 1;
+                }
+                if (_breaks_latch(a) == 1) {
+                    s.latched_mods = s.latched_mods & (~mask);
+                    f.func = 0;
+                    return 0;
+                }
+                i = i + 1;
+            }
+        }
+    } else if (kc == f.kc) {
+        if ((f.action.flags & keymap.FLAG_CLEAR_LOCKS) != 0 && (s.locked_mods & mask) == mask) {
+            if (latch == LATCH_PENDING) { s.latched_mods = s.latched_mods & (~mask); }
+            else { s.clear_mods = s.clear_mods | mask; }
+            s.locked_mods = s.locked_mods & (~mask);
+            f.func = 0;
+        } else if (latch == NO_LATCH) {
+            s.clear_mods = s.clear_mods | mask;
+            f.func = 0;
+        } else {
+            latch = LATCH_PENDING;
+            s.clear_mods = s.clear_mods | mask;
+            s.latched_mods = s.latched_mods | mask;
+        }
+    }
+    f.priv = latch;
+    return 0;
+}
+
+fn _run_group_latch(s as *State, f as *Filter, kc as i64, down as i32) as i32 {
+    let is i32 as latch with mut = f.priv;
+    if (down == 1) {
+        let is i64 as first with mut = 0;
+        let is i32 as count = _key_actions(s, kc, &first);
+        if (latch == LATCH_KEY_DOWN) {
+            latch = NO_LATCH;
+        } else if (latch == LATCH_PENDING) {
+            let is i32 as i with mut = 0;
+            while (i < count) {
+                let is *keymap.Action as a = _action_n(s, first, i);
+                if (a.kind == keymap.ACT_GROUP_LATCH && a.group == f.action.group && a.flags == f.action.flags) {
+                    mem.memcpy(cast(*u8, &f.action), cast(*u8, a), sizeof(keymap.Action));
+                    if ((f.action.flags & keymap.FLAG_LATCH_TO_LOCK) != 0 && f.action.group != 0) {
+                        f.action.kind = keymap.ACT_GROUP_LOCK;
+                        f.func = keymap.ACT_GROUP_LOCK;
+                        _new_filter(s, f);
+                        s.latched_group = s.latched_group - f.delta;
+                        f.kc = kc;
+                        return 1;
+                    }
+                } else if (_breaks_latch(a) == 1) {
+                    s.latched_group = s.latched_group - f.delta;
+                    f.func = 0;
+                    return 0;
+                }
+                i = i + 1;
+            }
+        }
+    } else if (kc == f.kc) {
+        if ((f.action.flags & keymap.FLAG_CLEAR_LOCKS) != 0 && s.locked_group != 0) {
+            if (latch == LATCH_PENDING) { s.latched_group = s.latched_group - f.delta; }
+            else { s.base_group = s.base_group - f.delta; }
+            s.locked_group = 0;
+            f.func = 0;
+        } else if (latch == NO_LATCH) {
+            s.base_group = s.base_group - f.delta;
+            f.func = 0;
+        } else if (latch == LATCH_KEY_DOWN) {
+            latch = LATCH_PENDING;
+            s.base_group = s.base_group - f.delta;
+            s.latched_group = s.latched_group + f.delta;
+        }
+    }
+    f.priv = latch;
+    return 0;
+}
+
+fn _apply_all(s as *State, kc as i64, down as i32) as void {
+    let is i32 as consumed with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < s.num_filters) {
+        let is *Filter as f = &s.filters[i];
+        if (f.func != 0 && _run(s, f, kc, down) == 1) { consumed = 1; }
+        i = i + 1;
+    }
+    if (consumed == 1 || down == 0) { return; }
+    let is i64 as first with mut = 0;
+    let is i32 as count = _key_actions(s, kc, &first);
+    let is i32 as k with mut = 0;
+    while (k < count) {
+        let is *keymap.Action as a = _action_n(s, first, k);
+        if (a.kind >= keymap.ACT_MOD_SET && a.kind <= keymap.ACT_GROUP_LOCK) {
+            // The first free slot, else a new one.
+            let is i32 as slot with mut = 0;
+            while (slot < s.num_filters && s.filters[slot].func != 0) { slot = slot + 1; }
+            if (slot < MAX_FILTERS) {
+                if (slot == s.num_filters) { s.num_filters = s.num_filters + 1; }
+                let is *Filter as f = &s.filters[slot];
+                mem.memzero(cast(*u8, f), sizeof(Filter));
+                f.refcnt = 1;
+                f.kc = kc;
+                f.func = a.kind;
+                mem.memcpy(cast(*u8, &f.action), cast(*u8, a), sizeof(keymap.Action));
+                _new_filter(s, f);
+            }
+        }
+        k = k + 1;
+    }
+}
+
+fn _derived(s as *State) as void {
+    s.mods = s.base_mods | s.latched_mods | s.locked_mods;
+    let is i32 as locked = keymap.wrap_group(s.locked_group, s.km.num_groups, keymap.RANGE_WRAP, 0);
+    if (locked < 0) { s.locked_group = 0; } else { s.locked_group = locked; }
+    let is i32 as g = keymap.wrap_group(s.base_group + s.latched_group + s.locked_group, s.km.num_groups, keymap.RANGE_WRAP, 0);
+    if (g < 0) { s.group = 0; } else { s.group = g; }
+}
+
+// Key kc went down (down 1) or up.
+fn update_key(s as *State, kc as i64, down as i32) as void {
+    if (cast(i64, keymap.key(s.km, kc)) == 0) { return; }
+    s.set_mods = 0;
+    s.clear_mods = 0;
+    _apply_all(s, kc, down);
+    let is i32 as i with mut = 0;
+    while (i < 32) {
+        let is u32 as bit = cast(u32, 1) << cast(u32, i);
+        if ((s.set_mods & bit) != 0) {
+            s.mod_key_count[i] = s.mod_key_count[i] + 1;
+            s.base_mods = s.base_mods | bit;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 32) {
+        let is u32 as bit = cast(u32, 1) << cast(u32, i);
+        if ((s.clear_mods & bit) != 0) {
+            s.mod_key_count[i] = s.mod_key_count[i] - 1;
+            if (s.mod_key_count[i] <= 0) {
+                s.base_mods = s.base_mods & (~bit);
+                s.mod_key_count[i] = 0;
+            }
+        }
+        i = i + 1;
+    }
+    _derived(s);
+}
+
+// The state a compositor says: its masks and groups as they are.
+fn update_mask(s as *State, depressed as u32, latched as u32, locked as u32,
+               depressed_group as i32, latched_group as i32, locked_group as i32) as void {
+    s.base_mods = keymap.canonical_mods(s.km, depressed);
+    s.latched_mods = keymap.canonical_mods(s.km, latched);
+    s.locked_mods = keymap.canonical_mods(s.km, locked);
+    s.base_group = depressed_group;
+    s.latched_group = latched_group;
+    s.locked_group = locked_group;
+    _derived(s);
+}

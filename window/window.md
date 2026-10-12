@@ -464,6 +464,10 @@ where said:
   `TEXT` (`from_key`), never a control character nor what a key held with
   Control, Alt or Super types; an input method's text is `TEXT` too; every
   event the modifiers held as `keys.MOD_*` name them, X's bits translated.
+  On Wayland the compositor's keymap is read by libxkbcommon, or by the own
+  interpreter `input/xkb` when `Config.keymap` is `KEYMAP_CAUSTIC`;
+  `keymap_refused` says where the chosen one refused a keymap (the other
+  never stands in).
   `SCROLL` says where it came from: a wheel in notches and 120ths (X's
   buttons 4–7, Windows' deltas, Wayland's `axis_value120`), fingers and
   continuous devices in lines of motion with `stop` when the fingers lift

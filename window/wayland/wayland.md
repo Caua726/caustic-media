@@ -163,6 +163,11 @@ keyboard focus leaving as a `CANCEL` that lets buttons go too, and a press
 `xdg_toplevel.move`/`resize` takes ending in `BUTTON_TAKEN`. `input_test`
 checks it on xkbcommon keymaps (us; us,ru; de: Caps Lock, AltGr, repeat timing)
 and `../keyboard_wayland_test.cst` through Weston nested in Xvfb with XTest.
+The keymap is libxkbcommon's to read unless `Options.keymap` is
+`KEYMAP_CAUSTIC`: then `input/xkb` reads it, keeps the state and composes,
+behind the same `_kb_*` questions; a keymap the chosen reader refuses leaves
+the keyboard without one (`keymap_refused`), never read by the other
+(`../keyboard_wayland_test.cst caustic` makes every check with it).
 The portable `window/device.cst` and `ui/host.cst` use it to open and paint
 toolkit windows.
 

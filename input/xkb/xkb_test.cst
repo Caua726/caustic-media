@@ -1,0 +1,479 @@
+// The own XKB interpreter against libxkbcommon, the reference: keysyms —
+// every name, character and case — then each keymap of testdata/ read by
+// both, key by key, and driven by both through the same key presses and
+// compositor masks, every key's layout, level, keysym, text and consumed
+// modifiers compared after each; then the locale's Compose table, every
+// sequence of it fed to both, and a Compose text of the cases its parser
+// must get right. Run with no XCompose of the user's in the way:
+//   env -u XCOMPOSEFILE HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent ./build/xkb_test
+
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../window/wayland/xkb.cst" as xkb;
+use "keysym.cst" as keysym;
+use "keysyms.cst" as tab;
+use "keymap.cst" as keymap;
+use "state.cst" as state;
+use "compose.cst" as compose;
+
+extern "libxkbcommon.so.0" fn xkb_keymap_min_keycode(keymap as *u8) as u32;
+extern "libxkbcommon.so.0" fn xkb_keymap_max_keycode(keymap as *u8) as u32;
+extern "libxkbcommon.so.0" fn xkb_keymap_num_levels_for_key(keymap as *u8, key as u32, layout as u32) as u32;
+extern "libxkbcommon.so.0" fn xkb_keymap_num_mods(keymap as *u8) as u32;
+extern "libxkbcommon.so.0" fn xkb_keymap_mod_get_name(keymap as *u8, idx as u32) as *u8;
+extern "libxkbcommon.so.0" fn xkb_state_serialize_mods(state as *u8, components as i32) as u32;
+extern "libxkbcommon.so.0" fn xkb_state_serialize_layout(state as *u8, components as i32) as u32;
+extern "libxkbcommon.so.0" fn xkb_state_key_get_level(state as *u8, key as u32, layout as u32) as u32;
+extern "libxkbcommon.so.0" fn xkb_state_key_get_consumed_mods2(state as *u8, key as u32, mode as i32) as u32;
+extern "libxkbcommon.so.0" fn xkb_state_mod_index_is_active(state as *u8, idx as u32, components as i32) as i32;
+extern "libxkbcommon.so.0" fn xkb_keysym_to_utf32(sym as u32) as u32;
+extern "libxkbcommon.so.0" fn xkb_keysym_from_name(name as *u8, flags as i32) as u32;
+extern "libxkbcommon.so.0" fn xkb_keysym_to_upper(sym as u32) as u32;
+extern "libxkbcommon.so.0" fn xkb_keysym_to_lower(sym as u32) as u32;
+extern "libxkbcommon.so.0" fn xkb_compose_table_new_from_buffer(context as *u8, buffer as *u8, length as u64, locale as *u8, format as i32, flags as i32) as *u8;
+extern "libxkbcommon.so.0" fn xkb_compose_table_iterator_new(table as *u8) as *u8;
+extern "libxkbcommon.so.0" fn xkb_compose_table_iterator_next(iter as *u8) as *u8;
+extern "libxkbcommon.so.0" fn xkb_compose_table_iterator_free(iter as *u8) as void;
+extern "libxkbcommon.so.0" fn xkb_compose_table_entry_sequence(entry as *u8, length as *u64) as *u32;
+extern "libxkbcommon.so.0" fn xkb_compose_table_entry_keysym(entry as *u8) as u32;
+extern "libxkbcommon.so.0" fn xkb_compose_table_entry_utf8(entry as *u8) as *u8;
+extern "libxkbcommon.so.0" fn xkb_compose_state_get_one_sym(state as *u8) as u32;
+
+let is i32 as fails with mut = 0;
+let is i32 as shown with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+// A difference, printed for the first few.
+fn differ(what as *u8, where as *u8, a as i64, b as i64, own as i64, ref as i64) as void {
+    fails = fails + 1;
+    if (shown < 40) {
+        io.printf("DIFF %s %s %d %d: own %x, libxkbcommon %x\n", what, where, a, b, own, ref);
+        shown = shown + 1;
+    }
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// --- Keysyms ---
+
+fn same_sym(what as *u8, ks as u32) as void {
+    let is u32 as a = keysym.to_utf32(ks);
+    let is u32 as b = xkb_keysym_to_utf32(ks);
+    if (a != b) { differ("utf32", what, cast(i64, ks), 0, cast(i64, a), cast(i64, b)); }
+    let is u32 as c = keysym.to_upper(ks);
+    let is u32 as d = xkb_keysym_to_upper(ks);
+    if (c != d) { differ("upper", what, cast(i64, ks), 0, cast(i64, c), cast(i64, d)); }
+    let is u32 as e = keysym.to_lower(ks);
+    let is u32 as f = xkb_keysym_to_lower(ks);
+    if (e != f) { differ("lower", what, cast(i64, ks), 0, cast(i64, e), cast(i64, f)); }
+}
+
+fn same_name(name as *u8) as void {
+    let is u32 as a = keysym.from_name(name, _len(name));
+    let is u32 as b = xkb_keysym_from_name(name, 0);
+    if (a != b) { differ("name", name, 0, 0, cast(i64, a), cast(i64, b)); }
+}
+
+fn keysyms() as void {
+    let is i32 as before = fails;
+    let is i64 as i with mut = 0;
+    while (i < tab.N_NAMES) {
+        let is i64 as off = cast(i64, keysym._u32(tab.NAME_INDEX, i * 8));
+        let is *u8 as name = cast(*u8, cast(i64, tab.NAMES) + off);
+        same_name(name);
+        same_sym("named", keysym._u32(tab.NAME_INDEX, i * 8 + 4));
+        i = i + 1;
+    }
+    let is u32 as ks with mut = 0;
+    while (ks < 0x10000) { same_sym("legacy", ks); ks = ks + 1; }
+    ks = 0x1000000;
+    while (ks <= 0x110ffff) { same_sym("unicode", ks); ks = ks + 1; }
+    same_name("U20AC"); same_name("U00E9"); same_name("U0041"); same_name("u20ac"); same_name("U0000");
+    same_name("U110000"); same_name("U+20AC"); same_name("U123456789"); same_name("Uzz"); same_name("0x1008FF12");
+    same_name("0x20000000"); same_name("0xffffffff"); same_name("XF86_AudioMute"); same_name("XF86_Nonsense");
+    same_name("NoSymbol"); same_name("VoidSymbol"); same_name("Cyrillic_ef"); same_name("cyrillic_ef"); same_name("");
+    same_name("U8"); same_name("U1b"); same_name("U7f"); same_name("U85");
+    check("every keysym's name, character and case as libxkbcommon's", cast(i32, fails == before));
+}
+
+// --- Keymaps ---
+
+fn read_file(path as *u8, out as *u8, cap as i64) as i64 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as n with mut = 0;
+    while (n < cap - 1) {
+        let is i64 as got = linux.read(fd, cast(*u8, cast(i64, out) + n), cap - 1 - n);
+        if (got <= 0) { break; }
+        n = n + got;
+    }
+    linux.close(fd);
+    out[n] = 0;
+    return n;
+}
+
+fn same_structure(name as *u8, own as *keymap.Keymap, ref as *u8) as void {
+    let is i32 as before = fails;
+    let is i64 as lo = cast(i64, xkb_keymap_min_keycode(ref));
+    let is i64 as hi = cast(i64, xkb_keymap_max_keycode(ref));
+    if (lo != cast(i64, own.min_key) || hi != cast(i64, own.max_key)) {
+        differ("keycodes", name, lo, hi, cast(i64, own.min_key), cast(i64, own.max_key));
+    }
+    let is u32 as nm = xkb_keymap_num_mods(ref);
+    if (cast(i32, nm) != own.num_mods) { differ("mods", name, 0, 0, cast(i64, own.num_mods), cast(i64, nm)); }
+    let is i32 as m with mut = 0;
+    while (m < own.num_mods && cast(u32, m) < nm) {
+        let is *u8 as rn = xkb_keymap_mod_get_name(ref, cast(u32, m));
+        if (_len(rn) != own.mod_len[m] || mem.memcmp(rn, cast(*u8, cast(i64, own.text) + own.mod_at[m]), own.mod_len[m]) != 0) {
+            differ("mod name", rn, cast(i64, m), 0, 0, 0);
+        }
+        m = m + 1;
+    }
+    let is i64 as kc with mut = lo;
+    while (kc <= hi) {
+        let is u32 as k = cast(u32, kc);
+        let is i32 as nl = keymap.num_layouts_for_key(own, kc);
+        let is u32 as rl = xkb.xkb_keymap_num_layouts_for_key(ref, k);
+        if (cast(u32, nl) != rl) { differ("layouts", name, kc, 0, cast(i64, nl), cast(i64, rl)); }
+        let is i32 as rep = keymap.key_repeats(own, kc);
+        let is i32 as rrep = xkb.xkb_keymap_key_repeats(ref, k);
+        if (rep != rrep) { differ("repeats", name, kc, 0, cast(i64, rep), cast(i64, rrep)); }
+        let is i32 as l with mut = 0;
+        while (cast(u32, l) < rl && l < nl) {
+            let is i32 as levels = keymap.num_levels_for_key(own, kc, l);
+            let is u32 as rlevels = xkb_keymap_num_levels_for_key(ref, k, cast(u32, l));
+            if (cast(u32, levels) != rlevels) { differ("levels", name, kc, cast(i64, l), cast(i64, levels), cast(i64, rlevels)); }
+            let is i32 as v with mut = 0;
+            while (v < levels) {
+                let is *u32 as syms with mut = cast(*u32, 0);
+                let is *u32 as rsyms with mut = cast(*u32, 0);
+                let is i32 as n = keymap.key_syms(own, kc, l, v, &syms);
+                let is i32 as rn = xkb.xkb_keymap_key_get_syms_by_level(ref, k, cast(u32, l), cast(u32, v), cast(*u8, &rsyms));
+                if (n != rn) { differ("syms", name, kc, cast(i64, l * 100 + v), cast(i64, n), cast(i64, rn)); }
+                else {
+                    let is i32 as s with mut = 0;
+                    while (s < n) {
+                        if (syms[s] != rsyms[s]) { differ("sym", name, kc, cast(i64, l * 100 + v), cast(i64, syms[s]), cast(i64, rsyms[s])); }
+                        s = s + 1;
+                    }
+                }
+                v = v + 1;
+            }
+            l = l + 1;
+        }
+        kc = kc + 1;
+    }
+    io.printf("  %s: keys %d..%d, %d modifiers, %d layouts\n", name, lo, hi, cast(i64, own.num_mods), cast(i64, own.num_groups));
+    check("a keymap's keys, layouts, levels and keysyms as libxkbcommon reads them", cast(i32, fails == before));
+}
+
+let is [64]u8 as own_text with mut;
+let is [64]u8 as ref_text with mut;
+
+// Every component of both states, and every key's view of them.
+fn same_state(name as *u8, step as i64, own as *state.State, ref as *u8, lo as i64, hi as i64) as void {
+    let is i32 as c with mut = 1;
+    while (c <= 8) {
+        let is u32 as a = state.serialize_mods(own, c);
+        let is u32 as b = xkb_state_serialize_mods(ref, c);
+        if (a != b) { differ("mods", name, step, cast(i64, c), cast(i64, a), cast(i64, b)); }
+        let is u32 as g = cast(u32, state.serialize_layout(own, c * 16));
+        let is u32 as rg = xkb_state_serialize_layout(ref, c * 16);
+        if (g != rg) { differ("layout", name, step, cast(i64, c * 16), cast(i64, g), cast(i64, rg)); }
+        c = c * 2;
+    }
+    let is i32 as m with mut = 0;
+    while (m < own.km.num_mods) {
+        let is i32 as a = state.mod_active(own, m, state.MODS_EFFECTIVE);
+        let is i32 as b = xkb_state_mod_index_is_active(ref, cast(u32, m), state.MODS_EFFECTIVE);
+        if (a != b) { differ("mod active", name, step, cast(i64, m), cast(i64, a), cast(i64, b)); }
+        m = m + 1;
+    }
+    let is i64 as kc with mut = lo;
+    while (kc <= hi) {
+        let is u32 as k = cast(u32, kc);
+        let is i32 as layout = state.key_layout(own, kc);
+        let is u32 as rlayout = xkb.xkb_state_key_get_layout(ref, k);
+        if (cast(u32, layout) != rlayout) { differ("key layout", name, step, kc, cast(i64, layout), cast(i64, rlayout)); }
+        let is i32 as level = state.key_level(own, kc, layout);
+        let is u32 as rlevel = xkb_state_key_get_level(ref, k, rlayout);
+        if (cast(u32, level) != rlevel) { differ("key level", name, step, kc, cast(i64, level), cast(i64, rlevel)); }
+        let is u32 as sym = state.key_one_sym(own, kc);
+        let is u32 as rsym = xkb.xkb_state_key_get_one_sym(ref, k);
+        if (sym != rsym) { differ("one sym", name, step, kc, cast(i64, sym), cast(i64, rsym)); }
+        let is u32 as used = state.key_consumed(own, kc);
+        let is u32 as rused = xkb_state_key_get_consumed_mods2(ref, k, 0);
+        if (used != rused) { differ("consumed", name, step, kc, cast(i64, used), cast(i64, rused)); }
+        let is i64 as n = state.key_utf8(own, kc, &own_text[0], 64);
+        let is i32 as rn = xkb.xkb_state_key_get_utf8(ref, k, &ref_text[0], 64);
+        if (n != cast(i64, rn) || mem.memcmp(&own_text[0], &ref_text[0], n) != 0) {
+            differ("utf8", name, step, kc, n, cast(i64, rn));
+        }
+        kc = kc + 1;
+    }
+}
+
+fn _number(s as *u8, i as *i64) as i64 {
+    let is i64 as v with mut = 0;
+    while (s[*i] >= 48 && s[*i] <= 57) { v = v * 10 + cast(i64, s[*i] - 48); *i = *i + 1; }
+    return v;
+}
+
+// Steps: "+kc" a press, "-kc" a release, "m d,la,lo,g" the compositor's
+// masks and locked group.
+fn run(name as *u8, own as *state.State, ref as *u8, lo as i64, hi as i64, steps as *u8) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as step with mut = 0;
+    while (steps[i] != 0) {
+        let is u8 as c = steps[i];
+        if (c == 43 || c == 45) {
+            i = i + 1;
+            let is i64 as kc = _number(steps, &i);
+            let is i32 as down = cast(i32, c == 43);
+            state.update_key(own, kc, down);
+            xkb.xkb_state_update_key(ref, cast(u32, kc), down);
+            step = step + 1;
+            same_state(name, step, own, ref, lo, hi);
+        } else if (c == 109) {
+            i = i + 2;
+            let is i64 as d = _number(steps, &i); i = i + 1;
+            let is i64 as la = _number(steps, &i); i = i + 1;
+            let is i64 as lk = _number(steps, &i); i = i + 1;
+            let is i64 as g = _number(steps, &i);
+            state.update_mask(own, cast(u32, d), cast(u32, la), cast(u32, lk), 0, 0, cast(i32, g));
+            xkb.xkb_state_update_mask(ref, cast(u32, d), cast(u32, la), cast(u32, lk), 0, 0, cast(u32, g));
+            step = step + 1;
+            same_state(name, step, own, ref, lo, hi);
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+let is u64 as seed with mut = 12345;
+fn random(n as i64) as i64 {
+    seed = seed * 6364136223846793005 + 1442695040888963407;
+    return cast(i64, (seed >> 33) % cast(u64, n));
+}
+
+// Presses and releases of the keys in pool, at random, none pressed twice.
+fn wander(name as *u8, own as *state.State, ref as *u8, lo as i64, hi as i64, pool as *u8, count as i64) as void {
+    let is [32]i64 as keys with mut;
+    let is [32]i32 as held with mut;
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (pool[i] != 0 && n < 32) {
+        if (pool[i] >= 48 && pool[i] <= 57) { keys[n] = _number(pool, &i); held[n] = 0; n = n + 1; }
+        else { i = i + 1; }
+    }
+    let is i64 as step with mut = 0;
+    while (step < count) {
+        let is i64 as k = random(n);
+        let is i32 as down = 1 - held[k];
+        held[k] = down;
+        state.update_key(own, keys[k], down);
+        xkb.xkb_state_update_key(ref, cast(u32, keys[k]), down);
+        step = step + 1;
+        same_state(name, 1000 + step, own, ref, lo, hi);
+    }
+    // Everything let go.
+    i = 0;
+    while (i < n) {
+        if (held[i] == 1) {
+            state.update_key(own, keys[i], 0);
+            xkb.xkb_state_update_key(ref, cast(u32, keys[i]), 0);
+        }
+        i = i + 1;
+    }
+    same_state(name, 9999, own, ref, lo, hi);
+}
+
+let is [262144]u8 as text with mut;
+
+fn keymap_case(ctx as *u8, file as *u8, name as *u8, steps as *u8, pool as *u8) as void {
+    let is i64 as n = read_file(file, &text[0], 262144);
+    check(file, cast(i32, n > 0));
+    if (n <= 0) { return; }
+    let is i64 as where with mut = 0;
+    let is *keymap.Keymap as own = keymap.parse(&text[0], n, &where);
+    let is *u8 as ref = xkb.xkb_keymap_new_from_string(ctx, &text[0], 1, 0);
+    if (cast(i64, own) == 0) { io.printf("  %s: refused at byte %d: %.40s\n", name, where, cast(*u8, cast(i64, &text[0]) + where)); }
+    check("the own interpreter reads the keymap", cast(i32, cast(i64, own) != 0));
+    check("libxkbcommon reads the keymap", cast(i32, cast(i64, ref) != 0));
+    if (cast(i64, own) == 0 || cast(i64, ref) == 0) { return; }
+    same_structure(name, own, ref);
+    let is i32 as before = fails;
+    let is *state.State as os = state.new(own);
+    let is *u8 as rs = xkb.xkb_state_new(ref);
+    let is i64 as lo = cast(i64, own.min_key);
+    let is i64 as hi = cast(i64, own.max_key);
+    same_state(name, 0, os, rs, lo, hi);
+    run(name, os, rs, lo, hi, steps);
+    wander(name, os, rs, lo, hi, pool, 400);
+    check("a state through presses, releases and masks as libxkbcommon's", cast(i32, fails == before));
+    state.free(os);
+    xkb.xkb_state_unref(rs);
+    keymap.free(own);
+    xkb.xkb_keymap_unref(ref);
+}
+
+// --- Compose ---
+
+// The leaves reachable in the own table: its sequences.
+fn _leaves(t as *compose.Table, i as i64) as i64 {
+    if (i == 0) { return 0; }
+    let is *compose.Node as nd = compose.node(t, i);
+    let is i64 as n with mut = _leaves(t, cast(i64, nd.lo)) + _leaves(t, cast(i64, nd.hi));
+    if (nd.leaf == 1) { return n + 1; }
+    return n + _leaves(t, cast(i64, nd.eq));
+}
+
+let is [256]u8 as cbuf with mut;
+let is [256]u8 as rbuf with mut;
+
+// Every sequence of libxkbcommon's table fed to both states.
+fn same_tables(what as *u8, own as *compose.Table, ref as *u8) as void {
+    let is i32 as before = fails;
+    let is *compose.State as os = compose.state_new(own);
+    let is *u8 as rs = xkb.xkb_compose_state_new(ref, 0);
+    let is *u8 as it = xkb_compose_table_iterator_new(ref);
+    let is i64 as entries with mut = 0;
+    let is *u8 as e with mut = xkb_compose_table_iterator_next(it);
+    while (cast(i64, e) != 0) {
+        let is u64 as len with mut = 0;
+        let is *u32 as seq = xkb_compose_table_entry_sequence(e, &len);
+        compose.reset(os);
+        xkb.xkb_compose_state_reset(rs);
+        let is u64 as j with mut = 0;
+        while (j < len) {
+            let is i32 as a = compose.feed(os, seq[j]);
+            let is i32 as b = xkb.xkb_compose_state_feed(rs, seq[j]);
+            let is i32 as sa = compose.status(os);
+            let is i32 as sb = xkb.xkb_compose_state_get_status(rs);
+            if (a != b || sa != sb) { differ("compose status", what, entries, cast(i64, j), cast(i64, sa), cast(i64, sb)); }
+            j = j + 1;
+        }
+        let is i64 as n = compose.utf8(os, &cbuf[0], 256);
+        let is i32 as rn = xkb.xkb_compose_state_get_utf8(rs, &rbuf[0], 256);
+        if (n != cast(i64, rn) || mem.memcmp(&cbuf[0], &rbuf[0], n) != 0) { differ("compose utf8", what, entries, 0, n, cast(i64, rn)); }
+        let is u32 as sym = compose.one_sym(os);
+        let is u32 as rsym = xkb_compose_state_get_one_sym(rs);
+        if (sym != rsym || rsym != xkb_compose_table_entry_keysym(e)) { differ("compose keysym", what, entries, 0, cast(i64, sym), cast(i64, rsym)); }
+        entries = entries + 1;
+        e = xkb_compose_table_iterator_next(it);
+    }
+    xkb_compose_table_iterator_free(it);
+    let is i64 as leaves with mut = 0;
+    if (compose.num_nodes(own) > 1) { leaves = _leaves(own, 1); }
+    if (leaves != entries) { differ("compose entries", what, 0, 0, leaves, entries); }
+    io.printf("  %s: %d sequences\n", what, entries);
+    compose.state_free(os);
+    xkb.xkb_compose_state_unref(rs);
+    check("a Compose table's every sequence as libxkbcommon composes it", cast(i32, fails == before));
+}
+
+// Keysyms fed one by one to both: status, text and keysym after each.
+fn same_feeds(what as *u8, own as *compose.Table, ref as *u8, syms as *u8) as void {
+    let is i32 as before = fails;
+    let is *compose.State as os = compose.state_new(own);
+    let is *u8 as rs = xkb.xkb_compose_state_new(ref, 0);
+    let is i64 as i with mut = 0;
+    let is i64 as step with mut = 0;
+    while (syms[i] != 0) {
+        if (syms[i] == 32) { i = i + 1; continue; }
+        let is i64 as start = i;
+        while (syms[i] != 0 && syms[i] != 32) { i = i + 1; }
+        let is u32 as sym = keysym.from_name(cast(*u8, cast(i64, syms) + start), i - start);
+        let is i32 as a = compose.feed(os, sym);
+        let is i32 as b = xkb.xkb_compose_state_feed(rs, sym);
+        let is i32 as sa = compose.status(os);
+        let is i32 as sb = xkb.xkb_compose_state_get_status(rs);
+        let is i64 as n = compose.utf8(os, &cbuf[0], 256);
+        let is i32 as rn = xkb.xkb_compose_state_get_utf8(rs, &rbuf[0], 256);
+        if (a != b || sa != sb || n != cast(i64, rn) || mem.memcmp(&cbuf[0], &rbuf[0], n) != 0 ||
+            compose.one_sym(os) != xkb_compose_state_get_one_sym(rs)) {
+            differ("feed", what, step, cast(i64, sym), cast(i64, sa), cast(i64, sb));
+        }
+        step = step + 1;
+    }
+    compose.state_free(os);
+    xkb.xkb_compose_state_unref(rs);
+    check("Compose sequences fed keysym by keysym as libxkbcommon's", cast(i32, fails == before));
+}
+
+fn compose_cases(ctx as *u8) as void {
+    let is *compose.Table as own = compose.table_from_locale("en_US.UTF-8");
+    let is *u8 as ref = xkb.xkb_compose_table_new_from_locale(ctx, "en_US.UTF-8", 0);
+    check("both read the en_US.UTF-8 Compose file", cast(i32, cast(i64, own) != 0 && cast(i64, ref) != 0));
+    if (cast(i64, own) != 0 && cast(i64, ref) != 0) {
+        same_tables("en_US.UTF-8", own, ref);
+        same_feeds("en_US.UTF-8", own, ref,
+                   "dead_acute a dead_acute dead_acute dead_acute Shift_L e Multi_key o c Multi_key x x a Multi_key Multi_key Shift_R quotedbl o dead_circumflex dead_grave dead_tilde Control_L n Multi_key minus minus minus");
+        compose.free_table(own);
+        xkb.xkb_compose_table_unref(ref);
+    }
+    // A locale by alias and one compose.dir lacks.
+    let is *compose.Table as alias = compose.table_from_locale("C.UTF-8");
+    let is *u8 as ralias = xkb.xkb_compose_table_new_from_locale(ctx, "C.UTF-8", 0);
+    check("C.UTF-8 through locale.alias", cast(i32, cast(i64, alias) != 0 && cast(i64, ralias) != 0));
+    if (cast(i64, alias) != 0 && cast(i64, ralias) != 0) {
+        same_feeds("C.UTF-8", alias, ralias, "dead_diaeresis u Multi_key slash o");
+        compose.free_table(alias);
+        xkb.xkb_compose_table_unref(ralias);
+    }
+    // The parser's cases: overrides either way, escapes, modifiers, broken
+    // lines, a keysym before a string, an include.
+    let is *u8 as src = "# Compose cases\n<a> <b> : \"ab\" X\n<a> <b> <c> : \"abc\"\n<d> : \"d\"\n<d> <e> : \"de\" E\n<f> <g> : \"fg\"\n<f> : \"f\"\n<h> : \"\\x41\\101\\\"\\\\\\q\"\n!Ctrl <i> : \"i\"\nNone <j> : j\n~Shift <k> : \"k\" k\n<l> : l \"after\"\n<m> <nonsense> : \"m\"\n<n> : \"one\"\n<n> : \"two\"\n<o> : \"\" \n<p> : \"p\" P\n<p> : \"p\" P\n<q> <r> <s> <t> <u> <v> <w> <x> <y> <z> <a> : \"long\"\n<Multi_key> <space> : \"\\xe2\\x82\\xac\"\ninclude \"%S/en_US.UTF-8/Compose\"\n<dead_acute> <a> : \"mine\"\n";
+    let is i64 as n = _len(src);
+    let is *compose.Table as cases = compose.table_from_text(src, n, "en_US.UTF-8");
+    let is *u8 as rcases = xkb_compose_table_new_from_buffer(ctx, src, cast(u64, n), "en_US.UTF-8", 1, 0);
+    check("both read the cases' Compose text", cast(i32, cast(i64, cases) != 0 && cast(i64, rcases) != 0));
+    if (cast(i64, cases) != 0 && cast(i64, rcases) != 0) {
+        same_tables("cases", cases, rcases);
+        same_feeds("cases", cases, rcases, "a b a b c d e f g f h i j k l m n o p Multi_key space dead_acute a");
+        compose.free_table(cases);
+        xkb.xkb_compose_table_unref(rcases);
+    }
+}
+
+fn main() as i32 {
+    keysyms();
+    let is *u8 as ctx = xkb.xkb_context_new(0);
+    check("a libxkbcommon context", cast(i32, cast(i64, ctx) != 0));
+    if (cast(i64, ctx) == 0) { return 1; }
+    // LFSH 50, RTSH 62, LCTL 37, LALT 64, CAPS 66, RALT 108, LWIN 133, NMLK 77,
+    // SCLK 78, LSGT 94; letters, digits, keypad.
+    let is *u8 as common = "+38 -38 +50 +38 -38 -50 +66 -66 +38 +66 -66 +108 +24 -24 -108 +37 +38 -38 -37 +77 -77 +79 -79 +77 -77 m 1,0,0,0 m 0,0,2,0 m 0,0,0,1 m 0,0,0,0 m 128,0,0,1 m 0,0,0,2 m 0,0,0,3 m 8,0,16,0 m 0,0,0,0";
+    let is *u8 as pool = "50 62 37 64 66 108 133 77 78 94 38 24 10 49 79 87 90 52 26 25 67 68 69 70 71 72 74 135";
+    keymap_case(ctx, "input/xkb/testdata/us-hex.xkb", "us-hex", common, pool);
+    keymap_case(ctx, "input/xkb/testdata/kwin-us.xkb", "kwin-us", common, pool);
+    keymap_case(ctx, "input/xkb/testdata/weston-us-intl-ru.xkb", "weston-us-intl-ru", common, pool);
+    keymap_case(ctx, "input/xkb/testdata/us-intl-ru.xkb", "us-intl-ru",
+                "+50 +64 -64 -50 +38 -38 +64 +50 -50 -64 +38 -38 +66 -66 +38 -38 +50 +38 -38 -50 +66 -66 +108 +38 -38 -108 m 0,0,0,1 +24 -24", pool);
+    keymap_case(ctx, "input/xkb/testdata/us-intl-ru-old.xkb", "us-intl-ru-old", common, pool);
+    keymap_case(ctx, "input/xkb/testdata/de-il-gr.xkb", "de-il-gr",
+                "+78 -78 +38 -38 +78 -78 +38 -38 +78 -78 +66 -66 +38 -38 +66 +108 -108 -66 +38 -38 +108 +38 -38 -108 +66 +66 -66 -66 +38 -38", pool);
+    keymap_case(ctx, "input/xkb/testdata/ara-us.xkb", "ara-us", "+64 +38 -38 -64 +38 -38 +105 -105", pool);
+    keymap_case(ctx, "input/xkb/testdata/actions.xkb", "actions",
+                "+62 -62 +38 -38 +62 -62 +62 -62 +38 -38 +62 -62 +62 -62 +67 -67 +24 -24 +67 -67 +67 -67 +24 -24 +68 -68 +24 +25 +26 -26 -25 -24 +68 -68 +68 -68 +69 +24 -24 -69 +70 -70 +24 -24 +70 +38 -38 -70 +71 -71 +71 -71 +72 -72 +24 -24 +74 -74 +74 -74 +37 +11 -11 -37 +133 -133 +87 -87 +50 +87 -87 -50 +39 -39 +108 +39 -39 -108 m 0,0,2,0 +38 -38",
+                "62 67 68 69 70 71 72 74 50 37 64 66 108 133 135 24 25 26 38 39 52 11 87");
+    compose_cases(ctx);
+    xkb.xkb_context_unref(ctx);
+    if (fails != 0) {
+        io.printf("xkb: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("xkb: all checks passed\n");
+    return 0;
+}

@@ -107,5 +107,10 @@ Alongside the Wayland window backend, which shares the connection.
 
 ## Current state
 
-Not built: the design for `input/` on Wayland, which comes with the Wayland
-window backend (`window/wayland`).
+The Wayland input lives in the window backend (`window/wayland/backend.cst`),
+which shares the connection: seat, keyboard, pointer, touch, tablets,
+gestures and text-input-v3. The keymap is read by libxkbcommon, or — chosen
+when the window opens (`device.Config.keymap = KEYMAP_CAUSTIC`) — by our own
+interpreter, `../xkb/`, compared against libxkbcommon keysym by keysym, key by
+key and state by state ([`../input.md`](../input.md)). Relative pointer and
+pointer constraints are not built yet.
