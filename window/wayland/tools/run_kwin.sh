@@ -83,12 +83,7 @@ while :; do
     sleep 0.05
 done
 if [ -n "${KWIN_SCALE:-}" ]; then
-    # Its listing is coloured even into a pipe: the codes taken out first.
-    output=$(QT_QPA_PLATFORM=wayland KSCREEN_BACKEND_INPROCESS=1 timeout 10 kscreen-doctor -o 2>/dev/null |
-        tr -d '\033' | sed 's/\[[0-9;]*m//g' | sed -n 's/^Output: [0-9]* \([^ ]*\) .*/\1/p' | sed -n 1p)
-    [ -n "$output" ] || { echo "run_kwin: no output to scale" >&2; exit 1; }
-    QT_QPA_PLATFORM=wayland KSCREEN_BACKEND_INPROCESS=1 timeout 10 kscreen-doctor "output.$output.scale.$KWIN_SCALE" >/dev/null 2>&1 ||
-        { echo "run_kwin: kscreen-doctor did not scale $output" >&2; exit 1; }
+    sh "$(dirname "$0")/kwin_scale.sh" "$KWIN_SCALE" || { echo "run_kwin: the output not scaled" >&2; exit 1; }
 fi
 # Clients must speak to this compositor, not an X server they might inherit,
 # unless it is nested there and they read the screen back.

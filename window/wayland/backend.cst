@@ -16,6 +16,7 @@ use "../../input/xkb/compose.cst" as xcompose;
 use "../../input/keys.cst" as keys;
 use "../monitor.cst" as monitor;
 use "../damage.cst" as damage;
+use "../xcursor.cst" as xcursor;
 use "../../input/text.cst" as content;
 use "std/unicode/utf8.cst" as utf8;
 
@@ -209,6 +210,18 @@ struct Tool {
     time     as i64;
 }
 
+// A shape's images as drawn on the pointer's surface (cursor-shape-v1 not
+// there): the theme's, at a scale, in shm buffers of their own.
+struct CursorSlot {
+    shape   as i32;      // 0: none here
+    scale   as i32;
+    used    as i64;      // when last used, in Window.cursor_uses' count
+    images  as xcursor.Cursor;
+    map     as *u8;
+    map_bytes as i64;
+    buffers as [64]i32;
+}
+
 struct Window {
     fd as i64;
     memfd as i64;
@@ -222,6 +235,22 @@ struct Window {
     dialog_manager as i32;
     cursor_shape_manager as i32;
     cursor_shape_device as i32;
+    // The pointer's shape as last asked (1..35), set again at each enter. Without
+    // cursor-shape-v1 the client draws it: the theme's images (window/xcursor)
+    // on a surface of its own, one buffer a frame, animated by their delays;
+    // the shapes last drawn kept, a pointer going over text and back drawing
+    // from them again rather than reading the theme's file.
+    cursor_want as i32;
+    cursor_size as i32;          // logical pixels; 0: XCURSOR_SIZE, else 24
+    cursor_theme as [64]u8;      // empty: XCURSOR_THEME, else "default"
+    cursor_surface as i32;
+    cursor_slots as [4]CursorSlot;
+    cursor_slot as i32;          // the one shown, -1 for none
+    cursor_uses as i64;          // counted, the least recently used slot the one to go
+    cursor_frame as i32;
+    cursor_set_scale as i32;     // the buffer scale the surface was given
+    cursor_started as i64;       // when the animation began, ms
+    cursor_next as i64;          // its next frame due, ms; -1 for none
     viewporter as i32;
     viewport as i32;
     fractional_manager as i32;
@@ -571,6 +600,8 @@ fn _zero(w as *Window) as void {
     w.fd = 0 - 1; w.memfd = 0 - 1; w.connection_slot = 0 - 1;
     w.repeat_code = 0 - 1;
     w.keymap_refused_at = 0 - 1;
+    w.cursor_next = 0 - 1;
+    w.cursor_slot = 0 - 1;
     w.registry = 0; w.compositor = 0; w.shm = 0; w.wm_base = 0;
     w.surface = 0; w.xdg_surface = 0; w.toplevel = 0; w.pool = 0;
     w.callback = 0;
@@ -975,8 +1006,10 @@ fn _registry_global() as void {
     if (_same(text, len - 1, "xdg_wm_dialog_v1") == 1 && _globals.dialog_global == 0) {
         _globals.dialog_global = cast(i32, name); _globals.dialog_version = version;
     }
+    // CAUSTIC_WAYLAND_CURSOR_SHAPE=0: the client draws the pointer itself,
+    // as with a compositor without cursor-shape-v1.
     if (_same(text, len - 1, "wp_cursor_shape_manager_v1") == 1 &&
-        _globals.cursor_shape_global == 0) {
+        _globals.cursor_shape_global == 0 && _cursor_shape_wanted() == 1) {
         _globals.cursor_shape_global = cast(i32, name); _globals.cursor_shape_version = version;
     }
     if (_same(text, len - 1, "wl_output") == 1 && _globals.output_count < 8) {
@@ -1934,12 +1967,22 @@ fn _repeat_keys(w as *Window, now as i64) as void {
     if (w.repeat_next <= now) { w.repeat_next = now + period; }
 }
 
-// Milliseconds until the held key's next repeat, 0 when due; -1 for none.
+// Milliseconds until the input layer wants a turn — the held key's next
+// repeat, the drawn pointer's next frame — 0 when due; -1 for none.
 fn input_due(w as *Window) as i64 {
-    if (w.opened == 0 || w.repeat_code < 0 || w.repeat_rate <= 0 || w.keyboard_focus == 0) { return 0 - 1; }
-    let is i64 as left = w.repeat_next - time.now_ms();
-    if (left < 0) { return 0; }
-    return left;
+    if (w.opened == 0) { return 0 - 1; }
+    let is i64 as now = time.now_ms();
+    let is i64 as due with mut = 0 - 1;
+    if (w.repeat_code >= 0 && w.repeat_rate > 0 && w.keyboard_focus == 1) {
+        due = w.repeat_next - now;
+        if (due < 0) { due = 0; }
+    }
+    if (w.pointer_inside == 1 && w.cursor_next >= 0) {
+        let is i64 as c with mut = w.cursor_next - now;
+        if (c < 0) { c = 0; }
+        if (due < 0 || c < due) { due = c; }
+    }
+    return due;
 }
 
 // The locale whose Compose file a keymap's keyboard composes with.
@@ -2202,6 +2245,8 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
         w.pointer_x = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
         w.pointer_y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 12))) / 256), w.scale120);
         _pointer_input(w, ie.ENTER, 0);
+        // Each enter is a new serial the pointer's shape is set under.
+        _cursor_apply(w);
         return;
     }
     if (op == 1) {
@@ -3732,6 +3777,7 @@ fn resized(w as *Window) as i32 { return w.resized; }
 fn next_frame(w as *Window) as i32 {
     if (w.opened == 0) { return 0; }
     _repeat_keys(w, time.now_ms());
+    _cursor_tick(w, time.now_ms());
     if (w.mapped == 0) { w.mapped = 1; w.frame_ready = 1; return 1; }
     if (w.event_len > 0) { return 1; }
     if (w.frame_ready == 1) { w.resized = 0; return 1; }
@@ -3985,6 +4031,7 @@ fn pump(w as *Window) as void {
     if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { _read_transfer(w); }
     _apply_configure(w);
     _repeat_keys(w, time.now_ms());
+    _cursor_tick(w, time.now_ms());
 }
 
 fn poll_event(w as *Window, out as *event.Event) as i32 {
@@ -4117,18 +4164,204 @@ fn show_window_menu(w as *Window, x as i64, y as i64) as i32 {
     return _send(w, w.toplevel, 4, &p[0], 16, 0 - 1);
 }
 
+fn _cursor_shape_wanted() as i32 {
+    let is *u8 as v = env.getenv("CAUSTIC_WAYLAND_CURSOR_SHAPE");
+    return cast(i32, cast(i64, v) == 0 || v[0] != 48);
+}
+
+// The pointer over the window in shape (1..35, 35 hiding it) from now on, set
+// now when the pointer is in and at each enter: 1, or 0 for a shape neither
+// the compositor nor the theme has.
 fn set_cursor(w as *Window, shape as i32) as i32 {
-    if (w.opened == 0 || w.pointer == 0 || w.pointer_inside == 0 ||
-        w.pointer_serial == 0 || shape < 1 || shape > 35) { return 0; }
-    let is [16]u8 as p;
-    if (shape == 35) {
-        _put(&p[0], w.pointer_serial); _put(&p[4], 0);
-        _put(&p[8], 0); _put(&p[12], 0);
-        return _send(w, w.pointer, 0, &p[0], 16, 0 - 1);
+    if (w.opened == 0 || shape < 1 || shape > 35) { return 0; }
+    if (shape != 35 && w.cursor_shape_device == 0 && w.cursor_shape_manager != 0) { return 0; }
+    if (shape != 35 && w.cursor_shape_manager == 0 && _cursor_load(w, shape) == 0) { return 0; }
+    w.cursor_want = shape;
+    _cursor_apply(w);
+    return 1;
+}
+
+// The theme and size the client draws the pointer from (theme empty or null:
+// XCURSOR_THEME's; size 0: XCURSOR_SIZE's): drawn again when it is in.
+fn cursor_theme(w as *Window, theme as *u8, size as i64) as void {
+    mem.memzero(cast(*u8, &w.cursor_theme[0]), 64);
+    if (cast(i64, theme) != 0) {
+        let is i64 as i with mut = 0;
+        while (i < 63 && theme[i] != 0) { w.cursor_theme[i] = theme[i]; i = i + 1; }
     }
-    if (w.cursor_shape_device == 0) { return 0; }
-    _put(&p[0], w.pointer_serial); _put(&p[4], cast(u32, shape));
-    return _send(w, w.cursor_shape_device, 1, &p[0], 8, 0 - 1);
+    w.cursor_size = cast(i32, size);
+    _cursor_unload(w);
+    if (w.cursor_want != 0 && w.cursor_want != 35) { _cursor_apply(w); }
+}
+
+fn _cursor_scale(w as *Window) as i32 { return (w.scale120 + 119) / 120; }
+
+fn _cursor_free_slot(w as *Window, k as i32) as void {
+    let is *CursorSlot as s = &w.cursor_slots[k];
+    if (s.shape == 0) { return; }
+    let is i32 as i with mut = 0;
+    while (i < s.images.count) {
+        if (s.buffers[i] != 0) { _send(w, s.buffers[i], 0, cast(*u8, 0), 0, 0 - 1); s.buffers[i] = 0; }
+        i = i + 1;
+    }
+    xcursor.free(&s.images);
+    if (cast(i64, s.map) != 0) { linux.munmap(s.map, s.map_bytes); }
+    s.map = cast(*u8, 0); s.map_bytes = 0;
+    s.shape = 0; s.scale = 0;
+    if (w.cursor_slot == k) { w.cursor_slot = 0 - 1; w.cursor_next = 0 - 1; }
+}
+
+fn _cursor_unload(w as *Window) as void {
+    let is i32 as k with mut = 0;
+    while (k < 4) { _cursor_free_slot(w, k); k = k + 1; }
+}
+
+// The shape's images, from the theme at the size times the surface's scale,
+// in shm buffers of their own — kept from before, or read into the slot
+// least recently used: 1, the slot the one shown, or 0 when the theme has no
+// such cursor.
+fn _cursor_load(w as *Window, shape as i32) as i32 {
+    let is i32 as scale = _cursor_scale(w);
+    w.cursor_uses = w.cursor_uses + 1;
+    let is i32 as k with mut = 0;
+    while (k < 4) {
+        if (w.cursor_slots[k].shape == shape && w.cursor_slots[k].scale == scale) {
+            w.cursor_slots[k].used = w.cursor_uses;
+            w.cursor_slot = k;
+            return 1;
+        }
+        k = k + 1;
+    }
+    let is i64 as size with mut = cast(i64, w.cursor_size);
+    if (size <= 0) {
+        let is *u8 as env_size = env.getenv("XCURSOR_SIZE");
+        size = 0;
+        if (cast(i64, env_size) != 0) {
+            let is i64 as i with mut = 0;
+            while (env_size[i] >= 48 && env_size[i] <= 57) { size = size * 10 + cast(i64, env_size[i] - 48); i = i + 1; }
+        }
+        if (size <= 0) { size = 24; }
+    }
+    let is *u8 as theme with mut = &w.cursor_theme[0];
+    if (theme[0] == 0) { theme = env.getenv("XCURSOR_THEME"); }
+    let is xcursor.Cursor as c with mut;
+    if (xcursor.load_shape(theme, shape, cast(i32, size) * scale, &c) == 0) { return 0; }
+    // The slot: an empty one, else the least recently used.
+    let is i32 as v with mut = 0;
+    k = 1;
+    while (k < 4) {
+        if (w.cursor_slots[v].shape != 0 && (w.cursor_slots[k].shape == 0 || w.cursor_slots[k].used < w.cursor_slots[v].used)) { v = k; }
+        k = k + 1;
+    }
+    _cursor_free_slot(w, v);
+    let is *CursorSlot as s = &w.cursor_slots[v];
+    // One pool for every frame's pixels, a buffer for each.
+    let is i64 as bytes = c.bytes;
+    let is i64 as fd = sys.memfd_create("caustic-wayland-cursor", 1);
+    if (fd < 0) { xcursor.free(&c); return 0; }
+    if (linux.ftruncate(fd, bytes) != 0) { linux.close(fd); xcursor.free(&c); return 0; }
+    let is *u8 as map = linux.mmap(cast(*u8, 0), bytes, linux.PROT_READ | linux.PROT_WRITE, linux.MAP_SHARED, fd, 0);
+    if (cast(i64, map) == linux.MAP_FAILED) { linux.close(fd); xcursor.free(&c); return 0; }
+    mem.memcpy(map, c.data, bytes);
+    let is i32 as pool = _id(w);
+    let is [24]u8 as p;
+    _put(&p[0], cast(u32, pool)); _put(&p[4], cast(u32, bytes));
+    let is i32 as sent = _send(w, w.shm, 0, &p[0], 8, fd);
+    linux.close(fd);
+    if (sent == 0) { linux.munmap(map, bytes); xcursor.free(&c); return 0; }
+    s.images = c;
+    s.map = map; s.map_bytes = bytes;
+    let is i32 as i with mut = 0;
+    while (i < c.count) {
+        let is *xcursor.Frame as f = &s.images.frames[i];
+        s.buffers[i] = _id(w);
+        _put(&p[0], cast(u32, s.buffers[i]));
+        _put(&p[4], cast(u32, cast(i64, f.pixels) - cast(i64, s.images.data)));
+        _put(&p[8], cast(u32, f.width)); _put(&p[12], cast(u32, f.height));
+        _put(&p[16], cast(u32, f.width * 4)); _put(&p[20], FORMAT_ARGB8888);
+        _send(w, pool, 0, &p[0], 24, 0 - 1);
+        i = i + 1;
+    }
+    _send(w, pool, 1, cast(*u8, 0), 0, 0 - 1);
+    if (w.cursor_surface == 0) {
+        w.cursor_surface = _id(w);
+        _put(&p[0], cast(u32, w.cursor_surface));
+        _send(w, w.compositor, 0, &p[0], 4, 0 - 1);
+    }
+    s.shape = shape;
+    s.scale = scale;
+    s.used = w.cursor_uses;
+    w.cursor_slot = v;
+    return 1;
+}
+
+// Frame i of the slot shown on the cursor surface, the pointer told its hot
+// spot when told to or when it moved.
+fn _cursor_show(w as *Window, i as i32, tell as i32) as void {
+    let is *CursorSlot as s = &w.cursor_slots[w.cursor_slot];
+    let is *xcursor.Frame as f = &s.images.frames[i];
+    let is i32 as scale = s.scale;
+    let is [16]u8 as p;
+    if (tell == 1 || f.xhot != s.images.frames[w.cursor_frame].xhot || f.yhot != s.images.frames[w.cursor_frame].yhot) {
+        _put(&p[0], w.pointer_serial); _put(&p[4], cast(u32, w.cursor_surface));
+        _put(&p[8], cast(u32, f.xhot / scale)); _put(&p[12], cast(u32, f.yhot / scale));
+        _send(w, w.pointer, 0, &p[0], 16, 0 - 1);
+    }
+    if (w.cursor_set_scale != scale && _bounded(_globals.compositor_version, 4) >= 3) {
+        _put(&p[0], cast(u32, scale));
+        _send(w, w.cursor_surface, 8, &p[0], 4, 0 - 1);
+        w.cursor_set_scale = scale;
+    }
+    _put(&p[0], cast(u32, s.buffers[i])); _put(&p[4], 0); _put(&p[8], 0);
+    _send(w, w.cursor_surface, 1, &p[0], 12, 0 - 1);
+    _put(&p[0], 0); _put(&p[4], 0); _put(&p[8], cast(u32, f.width)); _put(&p[12], cast(u32, f.height));
+    if (_bounded(_globals.compositor_version, 4) >= 4) { _send(w, w.cursor_surface, 9, &p[0], 16, 0 - 1); }
+    else { _send(w, w.cursor_surface, 2, &p[0], 16, 0 - 1); }
+    _send(w, w.cursor_surface, 6, cast(*u8, 0), 0, 0 - 1);
+    w.cursor_frame = i;
+}
+
+// The shape asked for, set over the window now that the pointer is in.
+fn _cursor_apply(w as *Window) as void {
+    if (w.pointer == 0 || w.pointer_inside == 0 || w.pointer_serial == 0 || w.cursor_want == 0) { return; }
+    let is [16]u8 as p;
+    w.cursor_next = 0 - 1;
+    if (w.cursor_want == 35) {
+        _put(&p[0], w.pointer_serial); _put(&p[4], 0); _put(&p[8], 0); _put(&p[12], 0);
+        _send(w, w.pointer, 0, &p[0], 16, 0 - 1);
+        return;
+    }
+    if (w.cursor_shape_device != 0) {
+        _put(&p[0], w.pointer_serial); _put(&p[4], cast(u32, w.cursor_want));
+        _send(w, w.cursor_shape_device, 1, &p[0], 8, 0 - 1);
+        return;
+    }
+    if (w.cursor_shape_manager != 0 || _cursor_load(w, w.cursor_want) == 0) { return; }
+    let is *CursorSlot as s = &w.cursor_slots[w.cursor_slot];
+    w.cursor_started = time.now_ms();
+    _cursor_show(w, 0, 1);
+    if (s.images.count > 1) { w.cursor_next = w.cursor_started + cast(i64, s.images.frames[0].delay); }
+}
+
+// The drawn pointer as of now: its next frame when one is due, its images
+// again at a scale the window moved to.
+fn _cursor_tick(w as *Window, now as i64) as void {
+    if (w.pointer_inside == 0 || w.cursor_slot < 0 || w.cursor_shape_manager != 0 || w.cursor_want == 35) { return; }
+    let is *CursorSlot as s = &w.cursor_slots[w.cursor_slot];
+    if (s.scale != _cursor_scale(w)) { _cursor_apply(w); return; }
+    if (w.cursor_next < 0 || now < w.cursor_next) { return; }
+    let is i32 as i = xcursor.frame_at(&s.images, now - w.cursor_started);
+    if (i != w.cursor_frame) { _cursor_show(w, i, 0); }
+    // The next change: the end of this frame in its cycle.
+    let is i64 as cycle with mut = 0;
+    let is i32 as k with mut = 0;
+    while (k < s.images.count) { cycle = cycle + cast(i64, s.images.frames[k].delay); k = k + 1; }
+    if (cycle <= 0) { w.cursor_next = 0 - 1; return; }
+    let is i64 as into = (now - w.cursor_started) % cycle;
+    let is i64 as end with mut = 0;
+    k = 0;
+    while (k <= i) { end = end + cast(i64, s.images.frames[k].delay); k = k + 1; }
+    w.cursor_next = now + (end - into);
 }
 
 fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
@@ -4325,6 +4558,8 @@ fn close(w as *Window) as void {
     w.compose_state = cast(*u8, 0); w.compose_table = cast(*u8, 0);
     w.xkb_state = cast(*u8, 0); w.xkb_keymap = cast(*u8, 0); w.xkb_context = cast(*u8, 0);
     _kb_free_own(w);
+    _cursor_unload(w);
+    if (w.cursor_surface != 0) { _send(w, w.cursor_surface, 0, cast(*u8, 0), 0, 0 - 1); w.cursor_surface = 0; }
     let is i32 as i with mut = 0;
     while (i < RETIRED_COUNT) {
         if (cast(i64, w.retired[i].pixels) != 0) {

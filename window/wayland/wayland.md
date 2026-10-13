@@ -193,8 +193,18 @@ remains compositor-controlled.
 Optional globals degrade independently. Clipboard and DnD require
 `wl_data_device_manager`; primary selection requires
 `zwp_primary_selection_device_manager_v1`; fractional scaling requires both
-`wp_viewporter` and `wp_fractional_scale_manager_v1`; server decorations,
-dialog roles and cursor shapes use their corresponding optional protocols.
+`wp_viewporter` and `wp_fractional_scale_manager_v1`; server decorations and
+dialog roles use their corresponding optional protocols. The pointer's shape
+is `wp_cursor_shape_manager_v1`'s where the compositor has it; without it
+(Weston), or with `CAUSTIC_WAYLAND_CURSOR_SHAPE=0` keeping it unbound, the
+client draws the shape from the cursor theme (`../xcursor.cst`; the
+desktop's theme and size through `device.cursor_theme`, else XCURSOR_THEME
+and XCURSOR_SIZE, else "default" at 24): a `wl_surface` of buffer scale
+the window's rounded up, its frames in shm buffers, the hot spot in logical
+pixels, set again at each enter (a new serial), animated by its frames'
+delays (`input_due` counts the next one) and drawn again when the window's
+scale changes; the four shapes last drawn are kept. A shape neither the
+compositor nor the theme has is refused (`set_cursor` 0).
 When `zwp_text_input_manager_v3` and a seat are present, the text widget with
 the keyboard enables text input after each `enter`, publishes its caret
 rectangle, its text around the caret with the selection, and its purpose and

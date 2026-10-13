@@ -1,0 +1,508 @@
+// window/wayland/cursor_test.cst — the pointer a client draws itself, as a
+// compositor without cursor-shape-v1 leaves it to (Weston has none; KWin's
+// is not bound with CAUSTIC_WAYLAND_CURSOR_SHAPE=0): the compositor nested in
+// Xvfb, the pointer XTest's, the screen read back from the X server:
+//   sh window/x11/tools/run_headless.sh env WESTON_BACKEND=x11 WESTON_SHELL=kiosk \
+//       sh window/wayland/tools/run_wayland.sh env XCURSOR_PATH=$PWD/build/cursor-themes \
+//       ./build/wayland_cursor_test
+// (and with WESTON_SCALE=2). Two themes are written under XCURSOR_PATH, their
+// images of colours of their own: the shape's image of the theme is shown
+// where the pointer is, its hot spot there, at the size times the scale; an
+// animated one's frames in turn; a shape the theme has not got refused and
+// the one shown kept; hidden; the theme and the size changed live; a shape
+// missing in a theme found in the one it inherits; the shape set again when
+// the pointer comes back into the window. With "scales", on two outputs at
+// scales 1 and 2 (testdata/two-scales.ini, WESTON_OUTPUTS=2, the desktop
+// shell), the window dragged from the first to the second: drawn again at
+// the scale it moved to.
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+use "backend.cst" as wayland;
+use "../cursor_files.cst" as files;
+use "../../input/event.cst" as ie;
+use "../../gpu/software/target.cst" as tgt;
+use "../x11/bind/xlib.cst" as xlib;
+use "../x11/bind/xfixes.cst" as xfixes;
+
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeButtonEvent(display as *u8, button as u32, is_press as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is wayland.Window as win with mut;
+let is wayland.Window as over with mut;
+let is *u8 as xd with mut;
+
+// The cursors' colours, ARGB as a cursor file has them, 0xRRGGBB as the X
+// screen shows them.
+let is i64 as MAGENTA with imut = 16711935;
+let is i64 as CYAN    with imut = 65535;
+let is i64 as RED     with imut = 16711680;
+let is i64 as GREEN   with imut = 65280;
+let is i64 as YELLOW  with imut = 16776960;
+let is i64 as ORANGE  with imut = 16744448;
+let is i64 as BLUE    with imut = 255;
+let is i64 as WHITE   with imut = 16777215;
+let is i64 as PURPLE  with imut = 8388736;
+let is i64 as GREY    with imut = 8421504;
+
+// Where the pointer is put, on the X screen, and the square read back round it.
+let is i64 as px with mut = 400;
+let is i64 as py with mut = 300;
+let is i64 as AROUND with imut = 80;
+
+let is i64 as s with mut = 1;   // physical pixels per logical one
+
+// --- Themes ---
+
+fn image(nominal as i32, side as i32, xhot as i32, yhot as i32, delay as i32, colour as i64) as void {
+    files.image(nominal, side, xhot, yhot, delay, cast(u32, 4278190080 | colour));
+}
+
+// A cursor of one colour, at 24 (hot 3, 5) and 48 (hot 6, 10), as caustic-a's.
+fn plain(root as *u8, rel as *u8, colour as i64) as void {
+    image(24, 24, 3, 5, 0, colour);
+    image(48, 48, 6, 10, 0, colour);
+    files.save(files.under(root, rel));
+}
+
+// caustic-a: "default" magenta at 24 (hot 3, 5) and cyan at 48 (hot 6, 10);
+// "progress" red then green, 150 ms each, at both; "pointer" blue, "help"
+// white, "crosshair" purple. caustic-b inherits it: "default" yellow at 24
+// (hot 10, 2) and orange at 48 (hot 20, 4), no "progress". Neither has
+// "text", nor is there a "default" theme.
+fn write_themes(root as *u8) as void {
+    files.theme_dirs(root, "caustic-a");
+    files.theme_dirs(root, "caustic-b");
+    image(24, 24, 3, 5, 0, MAGENTA);
+    image(48, 48, 6, 10, 0, CYAN);
+    files.save(files.under(root, "caustic-a/cursors/default"));
+    image(24, 24, 3, 5, 150, RED);
+    image(24, 24, 3, 5, 150, GREEN);
+    image(48, 48, 6, 10, 150, RED);
+    image(48, 48, 6, 10, 150, GREEN);
+    files.save(files.under(root, "caustic-a/cursors/progress"));
+    plain(root, "caustic-a/cursors/pointer", BLUE);
+    plain(root, "caustic-a/cursors/help", WHITE);
+    plain(root, "caustic-a/cursors/crosshair", PURPLE);
+    image(24, 24, 10, 2, 0, YELLOW);
+    image(48, 48, 20, 4, 0, ORANGE);
+    files.save(files.under(root, "caustic-b/cursors/default"));
+    files.write_text(files.under(root, "caustic-b/index.theme"), "[Icon Theme]\nName=caustic-b\nInherits=caustic-a\n");
+}
+
+// --- The screen ---
+
+fn fill(w as *wayland.Window, colour as u32) as i32 {
+    wayland.pump(w);
+    let is tgt.Target as t = wayland.acquire(w);
+    if (cast(i64, t.color) == 0) { return 0; }
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) { *cast(*u32, cast(i64, t.color) + i * 4) = colour; i = i + 1; }
+    wayland.submit(w);
+    return 1;
+}
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        wayland.pump(&win);
+        if (wayland.is_open(&over) == 1) { wayland.pump(&over); }
+        time.sleep_ms(5);
+    }
+}
+
+// What is shown round the pointer in colour: its box, from the pointer, in
+// physical pixels; 0 when none of it is there.
+struct Box {
+    left   as i64;
+    top    as i64;
+    width  as i64;
+    height as i64;
+}
+
+// Where the compositor shows its pointer: drawn into the screen (Weston), or
+// as the X server's cursor over its window (KWin, "kwin").
+let is i32 as server_cursor with mut = 0;
+
+fn look(colour as i64, out as *Box) as i32 {
+    if (server_cursor == 1) { return _look_cursor(colour, out); }
+    let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, px - AROUND), cast(i32, py - AROUND),
+                                       cast(u32, AROUND * 2), cast(u32, AROUND * 2), 0 - 1, 2);
+    if (cast(i64, img) == 0) { return 0; }
+    let is i64 as l with mut = AROUND * 2;
+    let is i64 as t with mut = AROUND * 2;
+    let is i64 as r with mut = 0 - 1;
+    let is i64 as b with mut = 0 - 1;
+    let is i64 as y with mut = 0;
+    while (y < AROUND * 2) {
+        let is i64 as x with mut = 0;
+        while (x < AROUND * 2) {
+            if ((xlib.XGetPixel(img, cast(i32, x), cast(i32, y)) & 16777215) == colour) {
+                if (x < l) { l = x; }
+                if (y < t) { t = y; }
+                if (x > r) { r = x; }
+                if (y > b) { b = y; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    xlib.XDestroyImage(img);
+    if (r < 0) { return 0; }
+    out.left = l - AROUND; out.top = t - AROUND; out.width = r - l + 1; out.height = b - t + 1;
+    return 1;
+}
+
+// The X server's cursor (XFixes): its pixels of colour, from its hot spot.
+fn _look_cursor(colour as i64, out as *Box) as i32 {
+    xlib.XSync(xd, 0);
+    let is *u8 as im = xfixes.XFixesGetCursorImage(xd);
+    if (cast(i64, im) == 0) { return 0; }
+    let is i64 as w = cast(i64, *cast(*u16, cast(i64, im) + 4));
+    let is i64 as h = cast(i64, *cast(*u16, cast(i64, im) + 6));
+    let is i64 as hx = cast(i64, *cast(*u16, cast(i64, im) + 8));
+    let is i64 as hy = cast(i64, *cast(*u16, cast(i64, im) + 10));
+    let is *i64 as pixels = *cast(**i64, cast(i64, im) + 24);
+    let is i64 as l with mut = w;
+    let is i64 as t with mut = h;
+    let is i64 as r with mut = 0 - 1;
+    let is i64 as b with mut = 0 - 1;
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w) {
+            let is i64 as p = pixels[y * w + x];
+            if (((p >> 24) & 255) == 255 && (p & 16777215) == colour) {
+                if (x < l) { l = x; }
+                if (y < t) { t = y; }
+                if (x > r) { r = x; }
+                if (y > b) { b = y; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    xlib.XFree(im);
+    if (r < 0) { return 0; }
+    out.left = l - hx; out.top = t - hy; out.width = r - l + 1; out.height = b - t + 1;
+    return 1;
+}
+
+fn _is(b as *Box, left as i64, top as i64, side as i64) as i32 {
+    return cast(i32, b.left == left && b.top == top && b.width == side && b.height == side);
+}
+
+// Whether, within two seconds, the screen shows colour round the pointer
+// as a square of side from left, top (physical pixels from the pointer).
+fn shows(colour as i64, left as i64, top as i64, side as i64) as i32 {
+    let is Box as b;
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        pump(10);
+        if (look(colour, &b) == 1 && _is(&b, left, top, side) == 1) { return 1; }
+    }
+    if (look(colour, &b) == 1) {
+        io.printf("  %x: %d by %d at %d, %d; want %d at %d, %d\n", colour, b.width, b.height, b.left, b.top, side, left, top);
+    } else {
+        io.printf("  %x: not shown\n", colour);
+    }
+    return 0;
+}
+
+// Whether none of the themes' colours is there, a while.
+fn none_shown() as i32 {
+    let is Box as b;
+    let is i64 as until = time.now_ms() + 2000;
+    let is i64 as clear_since with mut = 0 - 1;
+    while (time.now_ms() < until) {
+        pump(10);
+        let is i32 as any = look(MAGENTA, &b) + look(CYAN, &b) + look(RED, &b) + look(GREEN, &b) + look(YELLOW, &b) + look(ORANGE, &b);
+        if (any == 0 && clear_since < 0) { clear_since = time.now_ms(); }
+        if (any != 0) { clear_since = 0 - 1; }
+        if (clear_since >= 0 && time.now_ms() - clear_since >= 300) { return 1; }
+    }
+    return 0;
+}
+
+// Whether, over a second and a half, the frames are shown in turn: red,
+// then green, then red again, each where the image is.
+fn animates(left as i64, top as i64, side as i64) as i32 {
+    let is Box as b;
+    let is i64 as last with mut = 0;
+    let is i32 as turns with mut = 0;
+    let is i32 as misplaced with mut = 0;
+    let is i64 as until = time.now_ms() + 1500;
+    while (time.now_ms() < until) {
+        pump(10);
+        let is i64 as now with mut = 0;
+        if (look(RED, &b) == 1) { now = RED; if (_is(&b, left, top, side) == 0) { misplaced = misplaced + 1; } }
+        else if (look(GREEN, &b) == 1) { now = GREEN; if (_is(&b, left, top, side) == 0) { misplaced = misplaced + 1; } }
+        if (now != 0 && now != last) {
+            if (last != 0) { turns = turns + 1; }
+            last = now;
+        }
+    }
+    if (turns < 3 || misplaced > 0) { io.printf("  %d turns, %d looks misplaced\n", turns, misplaced); }
+    return cast(i32, turns >= 3 && misplaced == 0);
+}
+
+fn move_to(x as i64, y as i64) as void {
+    px = x; py = y;
+    XTestFakeMotionEvent(xd, 0 - 1, cast(i32, x), cast(i32, y), cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+fn pixel(x as i64, y as i64) as i64 {
+    let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, x), cast(i32, y), cast(u32, 1), cast(u32, 1), 0 - 1, 2);
+    if (cast(i64, img) == 0) { return 0 - 1; }
+    let is i64 as v = xlib.XGetPixel(img, 0, 0) & 16777215;
+    xlib.XDestroyImage(img);
+    return v;
+}
+
+// The X window Weston shows the output named name in.
+fn output_window(name as *u8) as i64 {
+    let is i64 as root_ret with mut = 0;
+    let is i64 as parent_ret with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is i32 as n with mut = 0;
+    xlib.XQueryTree(xd, xlib.XDefaultRootWindow(xd), cast(*u8, &root_ret), cast(*u8, &parent_ret), cast(*u8, &kids), cast(*u8, &n));
+    let is i64 as found with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n && found == 0) {
+        // Weston names its output windows in _NET_WM_NAME only.
+        let is *u8 as title with mut = cast(*u8, 0);
+        let is i64 as ty with mut = 0;
+        let is i32 as fmt with mut = 0;
+        let is i64 as k with mut = 0;
+        let is i64 as after with mut = 0;
+        xlib.XGetWindowProperty(xd, kids[i], xlib.XInternAtom(xd, "_NET_WM_NAME", 0), 0, 64, 0, 0, cast(*u8, &ty),
+                                cast(*u8, &fmt), cast(*u8, &k), cast(*u8, &after), cast(*u8, &title));
+        if (cast(i64, title) != 0) {
+            let is i64 as m with mut = 0;
+            while (name[m] != 0) { m = m + 1; }
+            if (k >= m && title[k - m] == name[0] && title[k - 1] == name[m - 1]) { found = kids[i]; }
+            xlib.XFree(title);
+        }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+// The window's grey's top left on the X screen between x0 and x1, y below
+// y1, within two seconds: 1, into *x, *y.
+fn find_grey(x0 as i64, x1 as i64, y1 as i64, x as *i64, y as *i64) as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        pump(20);
+        let is i64 as yy with mut = 0;
+        while (yy < y1) {
+            let is i64 as xx with mut = x0;
+            while (xx < x1) {
+                if (pixel(xx, yy) == GREY) {
+                    while (xx > x0 && pixel(xx - 1, yy) == GREY) { xx = xx - 1; }
+                    while (yy > 0 && pixel(xx, yy - 1) == GREY) { yy = yy - 1; }
+                    *x = xx; *y = yy;
+                    return 1;
+                }
+                xx = xx + 8;
+            }
+            yy = yy + 8;
+        }
+    }
+    return 0;
+}
+
+// On two outputs at scales 1 and 2 (testdata/two-scales.ini), the window
+// dragged from the first to the second: the pointer drawn again at the
+// scale it moved to.
+fn scales() as void {
+    let is i64 as x2 = output_window("X2");
+    check("the second output's window", x2 != 0);
+    xlib.XMoveWindow(xd, x2, 640, 0);
+    xlib.XSync(xd, 0);
+    // The shell opens a window on the output under the pointer.
+    let is i32 as tries with mut = 0;
+    let is i32 as placed with mut = 0;
+    while (tries < 3 && placed == 0) {
+        move_to(320, 240);
+        time.sleep_ms(200);
+        if (wayland.open(&win, "cursor", 300, 200) == 0) { io.printf("FAIL: no window\n"); fails = fails + 1; return; }
+        fill(&win, cast(u32, 4286611584));
+        pump(500);
+        if (wayland.scale(&win) == 120) { placed = 1; } else { wayland.close(&win); }
+        tries = tries + 1;
+    }
+    check("the window on the first output", placed == 1);
+    if (placed == 0) { return; }
+    fill(&win, cast(u32, 4286611584));
+    let is i64 as wx with mut = 0;
+    let is i64 as wy with mut = 0;
+    check("the window shown on the first output", find_grey(0, 640, 480, &wx, &wy) == 1);
+    wayland.cursor_theme(&win, "caustic-a", 24);
+    wayland.set_cursor(&win, 1);
+    move_to(wx + 100, wy + 100);
+    check("at scale 1: the image of nominal 24", shows(MAGENTA, 0 - 3, 0 - 5, 24) == 1);
+    // The user presses on it and the program asks the compositor to move it,
+    // to root 760, 200: the second output.
+    XTestFakeButtonEvent(xd, cast(u32, 1), 1, cast(u64, 0));
+    xlib.XFlush(xd);
+    let is i64 as t0 with mut = time.now_ms();
+    let is ie.Event as in;
+    let is i32 as pressed with mut = 0;
+    while (pressed == 0 && time.now_ms() - t0 < 2000) {
+        pump(10);
+        while (wayland.poll_input(&win, &in) == 1) {
+            if (in.kind == ie.BUTTON_DOWN && in.button == 1) { pressed = 1; }
+        }
+    }
+    check("pressed", pressed == 1 && wayland.begin_move_resize(&win, 100, 100, 8, 1) == 1);
+    let is i64 as step with mut = 1;
+    while (step <= 10) {
+        XTestFakeMotionEvent(xd, 0 - 1, cast(i32, px + (760 - px) * step / 10), cast(i32, py + (200 - py) * step / 10), cast(u64, 0));
+        xlib.XFlush(xd);
+        pump(30);
+        step = step + 1;
+    }
+    XTestFakeButtonEvent(xd, cast(u32, 1), 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    t0 = time.now_ms();
+    while (wayland.scale(&win) != 240 && time.now_ms() - t0 < 3000) { pump(10); }
+    check("moved to the second output: its scale", wayland.scale(&win) == 240);
+    fill(&win, cast(u32, 4286611584));
+    // Put where the second output's window shows it, an even number of its
+    // pixels in: a whole logical one, the pointer drawn where X has it.
+    check("the window shown on the second output", find_grey(640, 1280, 960, &wx, &wy) == 1);
+    move_to(wx + 100, wy + 100);
+    check("at scale 2: the image of nominal 48, its hot spot halved",
+          shows(CYAN, 0 - 6, 0 - 10, 48) == 1);
+    wayland.close(&win);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as root = env.getenv("XCURSOR_PATH");
+    if (cast(i64, root) == 0 || root[0] != 47) { io.printf("FAIL: XCURSOR_PATH: one absolute directory for the themes\n"); return 1; }
+    write_themes(root);
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, xd) == 0) { io.printf("FAIL: no X screen to read back\n"); return 1; }
+    // "scales": the two-output run; "kwin": KWin's pointer is the X server's
+    // cursor over its window.
+    let is *u8 as mode with mut = "";
+    if (env.argc() > 1) { mode = env.argv(1); }
+    if (mode[0] == 115) {
+        scales();
+        xlib.XCloseDisplay(xd);
+        if (fails == 0) { io.printf("wayland cursor across scales: all checks passed\n"); return 0; }
+        io.printf("wayland cursor across scales: %d failures\n", fails);
+        return 1;
+    }
+    if (mode[0] == 107) { server_cursor = 1; }
+    // The pointer away from where it is looked at: nothing of the client's
+    // there before it is set.
+    move_to(1000, 900);
+    if (wayland.open(&win, "cursor", 400, 300) == 0) { io.printf("FAIL: no window\n"); return 1; }
+    fill(&win, cast(u32, 4286611584));
+    pump(300);
+    s = cast(i64, wayland.scale(&win)) / 120;
+    if (s < 1) { s = 1; }
+    fill(&win, cast(u32, 4286611584));
+    pump(200);
+    // Where the compositor put it: the pointer goes to its middle.
+    let is i64 as wx with mut = 0;
+    let is i64 as wy with mut = 0;
+    check("the window shown", find_grey(0, 1280, 1024, &wx, &wy) == 1);
+
+    // Set before the pointer is in: shown when it comes.
+    wayland.cursor_theme(&win, "caustic-a", 24);
+    check("a shape the theme has: taken", wayland.set_cursor(&win, 1) == 1);
+    move_to(wx + 200, wy + 150);
+    // Size 24 at scale s: the image of nominal 24 s, its hot spot at the
+    // pointer — 3, 5 logical either way.
+    let is i64 as first with mut = MAGENTA;
+    if (s >= 2) { first = CYAN; }
+    check("the theme's image at the pointer, its hot spot there, at the scale", shows(first, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    check("a shape the theme has not got: refused", wayland.set_cursor(&win, 9) == 0);
+    pump(200);
+    check("and the one shown kept", shows(first, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+
+    // Animated: the frames in turn, by their delays.
+    check("an animated shape: taken", wayland.set_cursor(&win, 5) == 1);
+    check("its frames in turn", animates(0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+
+    // Hidden, and shown again. KWin hides the X server's cursor over its
+    // window, which XFixes reads back as it was: seen on Weston only.
+    check("hidden", wayland.set_cursor(&win, 35) == 1 && (server_cursor == 1 || none_shown() == 1));
+    check("shown again", wayland.set_cursor(&win, 1) == 1 && shows(first, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    // More shapes than the window keeps drawn, and back: each its own.
+    check("pointer", wayland.set_cursor(&win, 4) == 1 && shows(BLUE, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    check("help", wayland.set_cursor(&win, 3) == 1 && shows(WHITE, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    check("crosshair", wayland.set_cursor(&win, 8) == 1 && shows(PURPLE, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    check("progress again", wayland.set_cursor(&win, 5) == 1 && animates(0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    check("default again", wayland.set_cursor(&win, 1) == 1 && shows(first, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    check("pointer again", wayland.set_cursor(&win, 4) == 1 && shows(BLUE, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    check("crosshair again, kept", wayland.set_cursor(&win, 8) == 1 && shows(PURPLE, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    wayland.set_cursor(&win, 1);
+
+    // The theme changed live: its image, its hot spot.
+    wayland.cursor_theme(&win, "caustic-b", 24);
+    let is i64 as second with mut = YELLOW;
+    if (s >= 2) { second = ORANGE; }
+    check("another theme, live: its image and hot spot", shows(second, 0 - 10 * s, 0 - 2 * s, 24 * s) == 1);
+    check("a shape it has not got, from the theme it inherits", wayland.set_cursor(&win, 5) == 1 &&
+          animates(0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+    wayland.set_cursor(&win, 1);
+    // The size changed live: 48 logical, the image of nominal 48 (the
+    // largest there is, at any scale), hot spot 20, 4 of its pixels.
+    wayland.cursor_theme(&win, "caustic-b", 48);
+    check("another size, live", shows(ORANGE, 0 - 20, 0 - 4, 48) == 1);
+    wayland.cursor_theme(&win, "caustic-b", 24);
+    check("and back", shows(second, 0 - 10 * s, 0 - 2 * s, 24 * s) == 1);
+
+    // Another window over it takes the pointer, and is closed: the pointer
+    // comes back in, its shape set again.
+    if (wayland.open(&over, "over", 1240, 960) == 1) {
+        fill(&over, cast(u32, 4294901760));   // blue
+        pump(500);
+        // Its own pointer, the first theme's: this one's replaced.
+        wayland.cursor_theme(&over, "caustic-a", 24);
+        check("another window's pointer: not this one's", wayland.set_cursor(&over, 1) == 1 &&
+              shows(first, 0 - 3 * s, 0 - 5 * s, 24 * s) == 1);
+        wayland.close(&over);
+        check("back in: this window's shape again", shows(second, 0 - 10 * s, 0 - 2 * s, 24 * s) == 1);
+    } else {
+        check("a second window", 0);
+    }
+
+    // With a file named after "kwin": it made, the output's scale is set to 2
+    // (tools/kwin_scale.sh) with the pointer where it is — no leave, no enter:
+    // the pointer drawn again at the scale the window is now at.
+    if (env.argc() > 2) {
+        let is i64 as fd = linux.open(env.argv(2), 577, 420);
+        if (fd >= 0) { linux.close(fd); }
+        let is i64 as t0 = time.now_ms();
+        while (wayland.scale(&win) != 240 && time.now_ms() - t0 < 15000) { pump(10); }
+        check("the output's scale, live: the window's", wayland.scale(&win) == 240);
+        let is i32 as entered = win.pointer_inside;
+        check("its image at it, without the pointer moved", shows(ORANGE, 0 - 20, 0 - 4, 48) == 1);
+        check("the pointer kept in", entered == 1);
+    }
+
+    wayland.close(&win);
+    xlib.XCloseDisplay(xd);
+    if (fails == 0) { io.printf("wayland cursor: all checks passed\n"); return 0; }
+    io.printf("wayland cursor: %d failures\n", fails);
+    return 1;
+}

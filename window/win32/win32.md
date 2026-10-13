@@ -224,7 +224,9 @@ frame as `input/state.cst` adds it up, the synchronous clipboard (no PRIMARY), f
 ceiling sizes, maximize/restore/fullscreen/minimize state events, activation
 from behind another window, text input and the IME candidate position, the
 desktop's settings, icons (size bounds, rows top-down as read back), the system
-cursor each portable shape shows, decorations, frame extents, an input region
+cursor each portable shape shows and the shapes Windows has none for refused
+(context-menu, cell, vertical-text, alias, copy, grab, grabbing, zoom-in,
+zoom-out: `set_cursor` 0, the cursor shown kept), decorations, frame extents, an input region
 exact to its edges (HTTRANSPARENT outside), the command each move or resize
 edge gives the system and the press it takes, a system move from a real synthetic left-button drag,
 the system menu's modal loop until Escape and with Close chosen, an owned modal

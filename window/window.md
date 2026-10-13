@@ -33,6 +33,7 @@ window/
   positioner.cst  where a popup goes: xdg_positioner as geometry, the
                   toolkit's and the backends' that place popups themselves
   cursor.cst      the pointer's shape: CSS's, by the theme's names
+  xcursor.cst     an Xcursor theme's images read without libXcursor (Wayland draws them)
   settings.cst    the desktop's settings: dark, accent, fonts, timings, language
   locale.cst      the language the user reads, as a BCP 47 tag
   fonts.cst       where the platform keeps fonts, and the font index
@@ -550,9 +551,32 @@ where said:
   headless and seated with XTest) and `popup_win32_test` (SendInput, isolated
   Wine, 96 and 144 dpi).
 - `cursor.cst`: every CSS cursor, numbered as Wayland's cursor-shape-v1 —
-  the toolkit's `tree.SHAPE_*` — from the user's theme by the freedesktop
-  cursor spec's names, which are CSS's, or the X cursor font's nearest glyph;
-  NONE hides the pointer. `display.cst`: the DPI — Xft.dpi, else the primary
+  the toolkit's `tree.SHAPE_*` — or NONE, hiding the pointer. `set` answers
+  0 for a shape the platform has not got, and puts nothing in its place:
+  the toolkit's host then shows the default pointer. A theme's cursor is
+  looked for by the freedesktop cursor spec's name, which is CSS's, then by
+  the older X name meaning the same (left_ptr_watch, crossed_circle, …).
+  X11: through libXcursor, else the X cursor font's glyph that is the shape
+  (none for progress, vertical-text, alias, copy, no-drop, not-allowed,
+  grab, grabbing, the diagonal two-way resizes, zoom). Wayland: cursor-shape-v1 where the
+  compositor has it; else the client draws the theme's images itself
+  (`xcursor.cst`: XCURSOR_PATH, `index.theme` inheritance depth first, then
+  "default"; the nominal size nearest the size times the scale; every frame
+  of an animation by its delay) on a cursor surface of buffer scale the
+  window's, its hot spot in logical pixels, set again at each enter and
+  drawn again when the window's scale changes, the four shapes last drawn
+  kept. Windows: the system cursor that is the shape (IDC_*), none for
+  context-menu, cell, vertical-text, alias, copy, grab, grabbing, zoom-in,
+  zoom-out. `set_theme` follows the desktop's cursor theme and size
+  (`settings.cst`'s, which the host gives as they change): X11 makes its
+  cursors again through libXcursor, null and 0 going back to the
+  environment's; Wayland draws from it; Windows' cursors are the system's.
+  Tested by `pointer_x11_test`, `xcursor_test` (the own reader against
+  libXcursor 1.2.3 over every installed theme, 34 shapes and their X names, 7
+  sizes), `wayland/cursor_test` (Weston, which has no cursor-shape, at scales
+  1 and 2 and dragged across two outputs; KWin with its cursor-shape not
+  bound, `CAUSTIC_WAYLAND_CURSOR_SHAPE=0`, its output's scale changed live)
+  and `device_win32_test`. `display.cst`: the DPI — Xft.dpi, else the primary
   monitor's size, else 96 — over 96 is a window's scale (`pointer_x11_test`);
   the monitor a window is on (`monitor_of`, `monitor.cst`: its place and work
   area, the window's scale there, refresh rate, name, primary) — X11's RandR

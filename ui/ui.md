@@ -732,7 +732,10 @@ frame's time (`caret_off`), which widgets hear as `S_CARET_OFF`.
 
 The pointer's shape (`pointer_shape_test`) is CSS's cursors, numbered as
 Wayland's cursor-shape-v1 has them (`tree.SHAPE_*`), so the window layer maps
-each to an X cursor, a Wayland shape or a Windows IDC_. A kind may say, for a
+each to an X cursor, a Wayland shape (or the theme's images the client
+draws) or a Windows IDC_; a shape the platform has not got is shown as the
+default pointer, chosen by the host, and the desktop's cursor theme and size
+are followed as they change. A kind may say, for a
 point of a widget, which one the pointer takes there or that its parent
 decides (`Kind.shape`); `router.pointer_shape` asks the widget holding a
 press, wherever the pointer went, or else the deepest one under it, and up —

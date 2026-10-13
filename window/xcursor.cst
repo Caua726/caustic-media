@@ -1,0 +1,385 @@
+// window/xcursor.cst — the pointer images of an Xcursor theme, read without
+// libXcursor: what a Wayland client draws when the compositor does not draw
+// named shapes for it (no cursor-shape-v1).
+//
+// A theme is a directory named for it under one of XCURSOR_PATH's (else
+// ~/.local/share/icons, ~/.icons, /usr/share/icons, /usr/share/pixmaps), its
+// cursors in cursors/, a name missing there looked for in the themes its
+// index.theme Inherits, depth first, then in the theme "default" — as
+// libXcursor scans. A cursor file holds images at nominal sizes; the size
+// nearest the one asked for is taken, all its images in the file's order: the
+// frames of an animation, each with its delay. Pixels are ARGB, premultiplied.
+// The names asked for are CSS's (shape_name) and, where a theme has not got
+// that, the X core cursor names older themes use (legacy_name).
+
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/os/linux.cst" as linux;
+
+let is i32 as MAX_FRAMES  with imut = 64;
+let is i32 as MAX_INHERIT with imut = 32;
+
+let is u32 as FILE_MAGIC with imut = 0x72756358;   // "Xcur"
+let is u32 as IMAGE_TYPE with imut = 0xfffd0002;
+
+struct Frame {
+    width  as i32;
+    height as i32;
+    xhot   as i32;
+    yhot   as i32;
+    delay  as i32;
+    size   as i32;   // nominal
+    pixels as *u32;  // width * height, premultiplied ARGB
+}
+
+struct Cursor {
+    count  as i32;
+    size   as i32;   // the nominal size taken
+    frames as [64]Frame;
+    data   as *u8;   // every frame's pixels
+    bytes  as i64;
+}
+
+fn free(c as *Cursor) as void {
+    if (cast(i64, c.data) != 0) { mem.core.munmap(c.data, c.bytes); }
+    c.data = cast(*u8, 0); c.bytes = 0; c.count = 0;
+}
+
+// --- Names ---
+
+// CSS's name for a pointer shape, numbered as window/cursor.cst and Wayland's
+// cursor-shape-v1 number them (1 default .. 34 zoom-out).
+fn shape_name(shape as i32) as *u8 {
+    if (shape == 2) { return "context-menu"; }
+    if (shape == 3) { return "help"; }
+    if (shape == 4) { return "pointer"; }
+    if (shape == 5) { return "progress"; }
+    if (shape == 6) { return "wait"; }
+    if (shape == 7) { return "cell"; }
+    if (shape == 8) { return "crosshair"; }
+    if (shape == 9) { return "text"; }
+    if (shape == 10) { return "vertical-text"; }
+    if (shape == 11) { return "alias"; }
+    if (shape == 12) { return "copy"; }
+    if (shape == 13) { return "move"; }
+    if (shape == 14) { return "no-drop"; }
+    if (shape == 15) { return "not-allowed"; }
+    if (shape == 16) { return "grab"; }
+    if (shape == 17) { return "grabbing"; }
+    if (shape == 18) { return "e-resize"; }
+    if (shape == 19) { return "n-resize"; }
+    if (shape == 20) { return "ne-resize"; }
+    if (shape == 21) { return "nw-resize"; }
+    if (shape == 22) { return "s-resize"; }
+    if (shape == 23) { return "se-resize"; }
+    if (shape == 24) { return "sw-resize"; }
+    if (shape == 25) { return "w-resize"; }
+    if (shape == 26) { return "ew-resize"; }
+    if (shape == 27) { return "ns-resize"; }
+    if (shape == 28) { return "nesw-resize"; }
+    if (shape == 29) { return "nwse-resize"; }
+    if (shape == 30) { return "col-resize"; }
+    if (shape == 31) { return "row-resize"; }
+    if (shape == 32) { return "all-scroll"; }
+    if (shape == 33) { return "zoom-in"; }
+    if (shape == 34) { return "zoom-out"; }
+    return "default";
+}
+
+// The X core cursor name older themes give the shape, null for none that
+// means the same thing.
+fn legacy_name(shape as i32) as *u8 {
+    if (shape == 1) { return "left_ptr"; }
+    if (shape == 3) { return "question_arrow"; }
+    if (shape == 4) { return "hand2"; }
+    if (shape == 5) { return "left_ptr_watch"; }
+    if (shape == 6) { return "watch"; }
+    if (shape == 7) { return "plus"; }
+    if (shape == 8) { return "cross"; }
+    if (shape == 9) { return "xterm"; }
+    if (shape == 13 || shape == 32) { return "fleur"; }
+    if (shape == 14 || shape == 15) { return "crossed_circle"; }
+    if (shape == 18) { return "right_side"; }
+    if (shape == 19) { return "top_side"; }
+    if (shape == 20) { return "top_right_corner"; }
+    if (shape == 21) { return "top_left_corner"; }
+    if (shape == 22) { return "bottom_side"; }
+    if (shape == 23) { return "bottom_right_corner"; }
+    if (shape == 24) { return "bottom_left_corner"; }
+    if (shape == 25) { return "left_side"; }
+    if (shape == 26 || shape == 30) { return "sb_h_double_arrow"; }
+    if (shape == 27 || shape == 31) { return "sb_v_double_arrow"; }
+    return cast(*u8, 0);
+}
+
+// --- Paths ---
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// n bytes of s appended to out at *at (room for cap), NUL after: 0 when too long.
+fn _cat(out as *u8, cap as i64, at as *i64, s as *u8, n as i64) as i32 {
+    if (*at + n + 1 > cap) { return 0; }
+    mem.memcpy(cast(*u8, cast(i64, out) + *at), s, n);
+    *at = *at + n;
+    out[*at] = 0;
+    return 1;
+}
+
+// The length of the entry at s up to ':' or the end.
+fn _entry(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0 && s[n] != 58) { n = n + 1; }
+    return n;
+}
+
+fn _next(s as *u8) as *u8 {
+    let is i64 as n = _entry(s);
+    if (s[n] == 0) { return cast(*u8, 0); }
+    return cast(*u8, cast(i64, s) + n + 1);
+}
+
+fn _path() as *u8 {
+    let is *u8 as p = env.getenv("XCURSOR_PATH");
+    if (cast(i64, p) != 0) { return p; }
+    return "~/.local/share/icons:~/.icons:/usr/share/icons:/usr/share/pixmaps";
+}
+
+// The directory of the theme (to ':') under the path entry dir (to ':'),
+// '~' at its start the home directory, a '/' before an entry with none (as
+// libXcursor builds it): into out.
+fn _theme_dir(dir as *u8, theme as *u8, out as *u8, cap as i64) as i32 {
+    let is i64 as at with mut = 0;
+    let is *u8 as d with mut = dir;
+    let is i64 as dn with mut = _entry(dir);
+    out[0] = 0;
+    if (d[0] == 126) {
+        let is *u8 as home = env.getenv("HOME");
+        if (cast(i64, home) == 0) { return 0; }
+        if (_cat(out, cap, &at, home, _len(home)) == 0) { return 0; }
+        d = cast(*u8, cast(i64, d) + 1);
+        dn = dn - 1;
+    } else if (d[0] != 47) {
+        if (_cat(out, cap, &at, "/", 1) == 0) { return 0; }
+    }
+    if (_cat(out, cap, &at, d, dn) == 0 || _cat(out, cap, &at, "/", 1) == 0) { return 0; }
+    return _cat(out, cap, &at, theme, _entry(theme));
+}
+
+fn _exists(path as *u8) as i32 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    linux.close(fd);
+    return 1;
+}
+
+// A theme's Inherits= line, its themes ':'-separated, into out; 0 for none.
+fn _inherits(index as *u8, out as *u8, cap as i64) as i32 {
+    let is i64 as fd = linux.open(index, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is [8192]u8 as buf with mut;
+    let is i64 as n = linux.read(fd, &buf[0], 8191);
+    linux.close(fd);
+    if (n <= 0) { return 0; }
+    buf[n] = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        // A line beginning "Inherits", then '=' past spaces.
+        if (i + 8 <= n && mem.memcmp(cast(*u8, cast(i64, &buf[0]) + i), "Inherits", 8) == 0) {
+            let is i64 as l with mut = i + 8;
+            while (buf[l] == 32) { l = l + 1; }
+            if (buf[l] == 61) {
+                l = l + 1;
+                let is i64 as r with mut = 0;
+                while (buf[l] != 0 && buf[l] != 10) {
+                    while (buf[l] == 59 || buf[l] == 44 || buf[l] == 32 || buf[l] == 9) { l = l + 1; }
+                    if (buf[l] == 0 || buf[l] == 10) { break; }
+                    if (r > 0) {
+                        if (r + 1 >= cap) { return 0; }
+                        out[r] = 58; r = r + 1;
+                    }
+                    while (buf[l] != 0 && buf[l] != 10 && buf[l] != 59 && buf[l] != 44 && buf[l] != 32 && buf[l] != 9) {
+                        if (r + 1 >= cap) { return 0; }
+                        out[r] = buf[l]; r = r + 1; l = l + 1;
+                    }
+                }
+                out[r] = 0;
+                return 1;
+            }
+        }
+        while (i < n && buf[i] != 10) { i = i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The file of name in the theme (to ':') or what it inherits, into out.
+fn _scan(theme as *u8, name as *u8, out as *u8, cap as i64, depth as i32) as i32 {
+    let is [1024]u8 as dir with mut;
+    let is [8192]u8 as parents with mut;
+    let is i32 as have_parents with mut = 0;
+    let is *u8 as p with mut = _path();
+    while (cast(i64, p) != 0) {
+        if (_theme_dir(p, theme, &dir[0], 1024) == 1) {
+            let is i64 as at with mut = 0;
+            out[0] = 0;
+            if (_cat(out, cap, &at, &dir[0], _len(&dir[0])) == 1 && _cat(out, cap, &at, "/cursors/", 9) == 1 &&
+                _cat(out, cap, &at, name, _len(name)) == 1 && _exists(out) == 1) {
+                return 1;
+            }
+            if (have_parents == 0) {
+                let is [1100]u8 as index with mut;
+                let is i64 as ia with mut = 0;
+                index[0] = 0;
+                if (_cat(&index[0], 1100, &ia, &dir[0], _len(&dir[0])) == 1 && _cat(&index[0], 1100, &ia, "//index.theme", 13) == 1) {
+                    have_parents = _inherits(&index[0], &parents[0], 8192);
+                }
+            }
+        }
+        p = _next(p);
+    }
+    if (have_parents == 0 || depth + 1 >= MAX_INHERIT) { return 0; }
+    let is *u8 as t with mut = &parents[0];
+    while (cast(i64, t) != 0) {
+        if (_entry(t) > 0 && _scan(t, name, out, cap, depth + 1) == 1) { return 1; }
+        t = _next(t);
+    }
+    return 0;
+}
+
+// The file of the cursor name in theme (null: none but "default"), or in
+// "default" when the theme has none, into out (cap bytes): 1 when found.
+fn find(theme as *u8, name as *u8, out as *u8, cap as i64) as i32 {
+    if (cast(i64, theme) != 0 && theme[0] != 0 && _scan(theme, name, out, cap, 0) == 1) { return 1; }
+    return _scan("default", name, out, cap, 0);
+}
+
+// --- Files ---
+
+fn _u32(p as *u8, off as i64) as u32 {
+    return cast(u32, p[off]) | (cast(u32, p[off + 1]) << 8) | (cast(u32, p[off + 2]) << 16) | (cast(u32, p[off + 3]) << 24);
+}
+
+fn _dist(a as u32, b as u32) as u32 {
+    if (a > b) { return a - b; }
+    return b - a;
+}
+
+// The images of the cursor file at path at the nominal size nearest size,
+// into out: 1 when there was one.
+fn load_file(path as *u8, size as i32, out as *Cursor) as i32 {
+    out.count = 0; out.size = 0; out.data = cast(*u8, 0); out.bytes = 0;
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as n = linux.lseek(fd, 0, linux.SEEK_END);
+    if (n < 16) { linux.close(fd); return 0; }
+    let is *u8 as f = linux.mmap(cast(*u8, 0), n, linux.PROT_READ, linux.MAP_PRIVATE, fd, 0);
+    linux.close(fd);
+    if (cast(i64, f) == linux.MAP_FAILED) { return 0; }
+    let is i32 as ok = _load(f, n, cast(u32, size), out);
+    linux.munmap(f, n);
+    return ok;
+}
+
+fn _load(f as *u8, n as i64, size as u32, out as *Cursor) as i32 {
+    if (_u32(f, 0) != FILE_MAGIC) { return 0; }
+    let is i64 as header = cast(i64, _u32(f, 4));
+    let is i64 as ntoc = cast(i64, _u32(f, 12));
+    if (header < 16 || ntoc > 0x10000 || header + ntoc * 12 > n) { return 0; }
+    // The nearest nominal size, the first met on a tie, and how many images.
+    let is u32 as best with mut = 0;
+    let is i64 as t with mut = 0;
+    while (t < ntoc) {
+        let is i64 as e = header + t * 12;
+        if (_u32(f, e) == IMAGE_TYPE) {
+            let is u32 as s = _u32(f, e + 4);
+            if (best == 0 || _dist(s, size) < _dist(best, size)) { best = s; }
+        }
+        t = t + 1;
+    }
+    if (best == 0) { return 0; }
+    // Room for every image of that size.
+    let is i64 as total with mut = 0;
+    t = 0;
+    while (t < ntoc) {
+        let is i64 as e = header + t * 12;
+        if (_u32(f, e) == IMAGE_TYPE && _u32(f, e + 4) == best) {
+            let is i64 as pos = cast(i64, _u32(f, e + 8));
+            if (pos + 36 <= n) { total = total + cast(i64, _u32(f, pos + 16)) * cast(i64, _u32(f, pos + 20)) * 4; }
+        }
+        t = t + 1;
+    }
+    if (total <= 0 || total > 268435456) { return 0; }
+    out.data = mem.core.mmap_anon(total);
+    if (cast(i64, out.data) == 0) { return 0; }
+    out.bytes = total;
+    out.size = cast(i32, best);
+    let is i64 as used with mut = 0;
+    t = 0;
+    while (t < ntoc && out.count < MAX_FRAMES) {
+        let is i64 as e = header + t * 12;
+        if (_u32(f, e) == IMAGE_TYPE && _u32(f, e + 4) == best) {
+            let is i64 as pos = cast(i64, _u32(f, e + 8));
+            if (pos + 36 > n) { break; }
+            // Chunk header: its size, type and subtype as the table says, a
+            // version; then width, height, hot spot, delay.
+            let is i64 as chunk = cast(i64, _u32(f, pos));
+            let is u32 as w = _u32(f, pos + 16);
+            let is u32 as h = _u32(f, pos + 20);
+            let is u32 as xhot = _u32(f, pos + 24);
+            let is u32 as yhot = _u32(f, pos + 28);
+            if (chunk != 36 || _u32(f, pos + 4) != IMAGE_TYPE || _u32(f, pos + 8) != best ||
+                w > 0x7fff || h > 0x7fff || w == 0 || h == 0 || xhot > w || yhot > h) { break; }
+            let is i64 as bytes = cast(i64, w) * cast(i64, h) * 4;
+            if (pos + 36 + bytes > n || used + bytes > total) { break; }
+            let is *Frame as fr = &out.frames[out.count];
+            fr.width = cast(i32, w); fr.height = cast(i32, h);
+            fr.xhot = cast(i32, xhot); fr.yhot = cast(i32, yhot);
+            fr.delay = cast(i32, _u32(f, pos + 32));
+            fr.size = cast(i32, best);
+            fr.pixels = cast(*u32, cast(i64, out.data) + used);
+            mem.memcpy(cast(*u8, fr.pixels), cast(*u8, cast(i64, f) + pos + 36), bytes);
+            used = used + bytes;
+            out.count = out.count + 1;
+        }
+        t = t + 1;
+    }
+    if (out.count == 0) { free(out); return 0; }
+    return 1;
+}
+
+// The cursor name of theme at size: found as libXcursor finds it and read.
+fn load(theme as *u8, name as *u8, size as i32, out as *Cursor) as i32 {
+    let is [1200]u8 as path with mut;
+    if (find(theme, name, &path[0], 1200) == 0) { out.count = 0; out.data = cast(*u8, 0); out.bytes = 0; return 0; }
+    return load_file(&path[0], size, out);
+}
+
+// The shape's cursor in theme: its CSS name, else the older name meaning the
+// same; 0 when the theme has neither.
+fn load_shape(theme as *u8, shape as i32, size as i32, out as *Cursor) as i32 {
+    if (load(theme, shape_name(shape), size, out) == 1) { return 1; }
+    let is *u8 as old = legacy_name(shape);
+    if (cast(i64, old) == 0) { return 0; }
+    return load(theme, old, size, out);
+}
+
+// The frame of an animation at ms since it began (delays looping).
+fn frame_at(c as *Cursor, ms as i64) as i32 {
+    if (c.count <= 1) { return 0; }
+    let is i64 as cycle with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < c.count) { cycle = cycle + cast(i64, c.frames[i].delay); i = i + 1; }
+    if (cycle <= 0) { return 0; }
+    let is i64 as t with mut = ms % cycle;
+    i = 0;
+    while (i < c.count) {
+        if (t < cast(i64, c.frames[i].delay)) { return i; }
+        t = t - cast(i64, c.frames[i].delay);
+        i = i + 1;
+    }
+    return c.count - 1;
+}
