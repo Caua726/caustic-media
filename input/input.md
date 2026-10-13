@@ -371,7 +371,7 @@ without a field or in a password's, the document asked) and
 `program_win32_test` (an entry of a toolkit program composing and
 committing through it). Not proved here: an installed method composing on
 Wayland — KWin nested in Xvfb never hands XTest's keys to its input method's
-grab, a GTK client's neither — and Wine's IMM32 keeps no attributes it is
+grab, nor any other client's — and Wine's IMM32 keeps no attributes it is
 given, so the target clause is checked from attributes as a method sets
 them.
 

@@ -89,11 +89,12 @@ surface and events, and nothing else from the platform.
 
 The costs, stated rather than discovered:
 
-- **It does not look native unless the theme makes it.** So it follows the
-  platform's conventions wherever they are observable: dialog button order,
-  shortcut modifiers, scroll direction, double-click time, the system font and
-  scale, and the light or dark preference — the XDG portal's `color-scheme` on
-  Linux, `AppsUseLightTheme` on Windows.
+- **It does not look native, and does not try to.** The toolkit has one look
+  of its own on every platform — its theme and its window frames — and
+  follows the platform only in behaviour wherever that is observable: dialog
+  button order, shortcut modifiers, scroll direction, double-click time, the
+  system font and scale, and the light or dark preference — the XDG portal's
+  `color-scheme` on Linux, `AppsUseLightTheme` on Windows.
 - **Accessibility is ours to provide.** A native control brings its own; a drawn
   one is invisible to a screen reader until the toolkit exposes it. Qt carries
   the same obligation and meets it with AT-SPI on Linux and UI Automation on
@@ -176,7 +177,7 @@ Two passes, run only over subtrees marked dirty:
 The containers are **box** (a row or column, with spacing and stretch factors),
 **grid** (forms), **stack** (one visible child: tabs, wizards), **overlay**
 (children layered, each aligned on its own), **scroll area** and **splitter**.
-That set covers what GTK's and Qt's layouts are used for in practice. The last
+That set covers what an application's layouts need in practice. The last
 two are interactive — scrollbars, a draggable handle — and take their input on
 the same protocol as any widget; what they look like comes with painting and
 the theme.
@@ -241,9 +242,8 @@ itself.
 A list of ten thousand rows does not create ten thousand widgets. Lists, trees
 and tables take a **model** — functions answering how many rows there are, what
 is in a cell, and that something changed — and create widgets only for the rows
-on screen, recycling them as it scrolls. That is Qt's model/view and GTK 4's list
-models, for the same reason: it is the difference between a file manager and one
-that freezes opening `/usr/lib`.
+on screen, recycling them as it scrolls: it is the difference between a file
+manager and one that freezes opening `/usr/lib`.
 
 ---
 
@@ -310,13 +310,14 @@ fonts, and a variant per state — normal, hover, pressed, focused, disabled,
 selected. One struct the window carries, and a widget may override fields of its
 own.
 
-**Not CSS.** GTK 3 moved its theming to CSS and took on the cascade, selector
-matching and invalidation that CSS engines are built around. Most of what an
-application changes is a colour or a spacing, and a struct does that.
+**Not CSS.** A stylesheet brings the cascade, selector matching and the
+invalidation CSS engines are built around. Most of what an application changes
+is a colour or a spacing, and a struct does that.
 
-Light, dark and high contrast ship, with Adwaita-, Breeze- and Windows 11-like
-themes beside them, chosen from the platform's preferences and switchable at run
-time. Every theme holds its text to WCAG contrast — 4.5 to 1, 7 in high
+One theme of the toolkit's own, caustic — cool slate greys, a teal accent, small
+radii, the same on every platform — ships light, dark and high contrast, chosen
+from the platform's preferences and switchable at run time. It imitates no
+platform's look. Every theme holds its text to WCAG contrast — 4.5 to 1, 7 in high
 contrast — whatever accent the user picked: text, the ring and the selection
 are moved towards black or white until they read.
 
@@ -435,7 +436,7 @@ counterparts — the registry's settings, `Shell_NotifyIconW`, toasts,
   what they are drawn in, as text is — each a path on a 16 by 16 grid in a
   small language of SVG's absolute commands plus whole circles, filled even-odd
   by the text service's rasterizer, so crisp at any scale: message boxes'
-  signs, header bars' buttons, arrows, places, a check, a search; `image` shows
+  signs, arrows, places, a check, a search; `image` shows
   one. Turned into pixels (`rasterize`), one is a window's icon
   (`app.set_icon`, `_NET_WM_ICON` on X11). The desktop's icon theme
   (`icon_theme.cst`) finds a named icon as the freedesktop Icon Theme
@@ -678,7 +679,7 @@ technology sets or steps.
 that respects clipping, bubbling, capture by whoever handles the press,
 per-widget enter and leave kept as a chain so a destroyed widget does not
 confuse it, click counting and the drag threshold from settings, scrolling that
-bubbles — past a disabled widget, as GTK lets it, where a press stops —
+bubbles — past a disabled widget, where a press stops —
 context menus by right click, Menu key or Shift+F10, focus with Tab order,
 focus ring only after keyboard use, what holds the focus told as it comes in
 and leaves (`FOCUS_ENTER`, `FOCUS_LEAVE`, for a composite that commits when
@@ -722,7 +723,7 @@ does not select all of itself), nothing else focused on the way; a scope
 destroyed while set is none, so the window is never left shut.
 
 The router keeps a text caret's blink (`blink_test`): on for two thirds of the
-desktop's cycle and off for the rest, as GTK draws it, started again by each
+desktop's cycle and off for the rest, started again by each
 key, text, composition, paste, press and change of focus, and steady again a
 while after the last (`caret_blink_timeout_ms`, ten seconds), since a caret
 blinking in a window nobody types into would keep the machine awake. It says
@@ -836,8 +837,7 @@ at the first tick after it is made, from the value as it is then; one made for
 something that already has one replaces it from where it got to, so a reversed
 fade turns back rather than jumps. A curve by name — the usual polynomial, sine
 and exponential ones, CSS's `ease` family and Windows 11's Fluent curves as
-cubic Béziers — or the theme's (`style.Motion.ease`: ease-out cubic for
-Adwaita, in-out quadratic for Breeze, Fluent's point to point for Windows 11).
+cubic Béziers — or the theme's (`style.Motion.ease`: ease-out exponential).
 Colours move premultiplied, as CSS's do. Repeating, back and forth, for ever;
 callbacks after each step and when done, which is never for one cancelled,
 replaced or whose widget was destroyed — that one is dropped with nothing
@@ -866,8 +866,8 @@ the same on its way down, so every paint entry gets its widget's theme, and a
 cached subtree too. `app.set_theme` and `app.set_prefs` switch every window at
 once; the theme lives in the application's mapping, so the trees' pointers to
 it survive the `App` being returned by value. Reading the preferences from the
-platform is `window/`'s (`window/settings.cst`: GTK's files, XSETTINGS, the
-portal over D-Bus); `system.cst` turns what it reads into `style.Prefs` and the
+platform is `window/`'s (`window/settings.cst`: XSETTINGS, the portal over
+D-Bus, the registry on Windows); `system.cst` turns what it reads into `style.Prefs` and the
 router's timings — double-click time and distance, the drag threshold, the
 caret's blink — and `app.set_system` applies both to every window, keeping its
 own copy so the theme's font names outlive the caller's record (`system_test`).
@@ -914,7 +914,7 @@ monospace and the rest — of its part of the window, so a theme change or an
 override's text scale sets it again; spans of the program's styles over it,
 their empty fields the label's. Measured as wide as its text would like and
 as tall as its text at the width offered — rounded up to whole physical pixels,
-as GTK rounds Pango's sizes, so a label given its own width on snapped edges
+so a label given its own width on snapped edges
 does not wrap its last word; wrapping, no narrower than its
 widest word; at most a number of lines with an ellipsis, and then, not
 wrapping, cut to its width and no narrower than the ellipsis. Drawn in the
@@ -956,7 +956,7 @@ underlined text in the link colour, no padding, saying `ACTIVATED` with its
 address and told visited once followed.
 
 **Check boxes and radio buttons** (`widgets/check.cst`, tested by
-`check_test`): one widget for both, as GTK 4 makes it — an indicator beside a
+`check_test`): one widget for both — an indicator beside a
 label with its mnemonic, the label past it in the widget's direction, the
 whole of it clicked. A check box is on, off, or mixed when the program says or
 as the third state a click goes through on request. Radios are joined in a
@@ -973,7 +973,7 @@ square with a tick, or a bar when mixed; a circle with a dot.
 theme's size, rounded at its ends and filled when on, with a knob that slides
 to its end over the theme's fast duration through the window's animator — at
 once with reduced motion or no animator — mirrored right to left. Clicked,
-toggled by Space released or Enter as GTK's is, and by assistive technology;
+toggled by Space released or Enter, and by assistive technology;
 named by the label beside it.
 
 **Sliders** (`widgets/slider.cst`, tested by `slider_test`): a value in a
@@ -1023,7 +1023,7 @@ flat buttons at its end — mirrored right to left — each disabled at its end
 of the range, giving the focus to the entry. One field is drawn around the
 frameless entry and the buttons, in its focused look while the entry has
 the focus. The arrows step it as they go down, Page Up and Down move ten
-steps, Control and Page Up or Down go to the ends, as GTK's do, the wheel a
+steps, Control and Page Up or Down go to the ends, the wheel a
 step a notch — over a disabled button too. Typed into, the entry edits as
 any does, taking only what a number can hold (a comma for the point too),
 thirty-two at most; Enter, the focus leaving, a button or a step commits it
@@ -1207,52 +1207,59 @@ Moving says VALUE_CHANGED, Finish ACTIVATED and Cancel CLOSED — closing is the
 program's to do. Bound to a window's router, Enter is Next or Finish and
 Escape Cancel. Told as a panel named by its step's title.
 
-**Header bars** (`widgets/headerbar.cst`, tested by `headerbar_test`): a
-window's title bar drawn by the toolkit, for the client-side decorations of
-6.13b. The title, and a subtitle under it, in the middle of the whole bar where
-there is room, else of what is left; the program's widgets at its start and
-end; the window's buttons where the desktop's layout puts them — GNOME's
-`button-layout`, `close:minimize,maximize`, names before the colon at the
-start and after it at the end, unknown ones left out. What the window does is
+**Title bars** (`widgets/titlebar.cst`, tested by `titlebar_test`): a
+window's title bar drawn by the toolkit, its own on every platform. The
+program's widgets at its start; the title, and a subtitle under it, after
+them from the start, cut with an ellipsis where there is no more room; the
+program's widgets at its end; the window's buttons last — minimize, maximize,
+close, whichever `set_buttons` asks for, always in that order: a dialog has
+only close. As tall as the theme's `titlebar_height`, taller only for what it
+holds; the buttons squares of `caption_button` with the theme's corners, lit
+under the pointer, close in the destructive colour, their glyphs stroked — a
+line, a square, two squares once maximized, a cross. What the window does is
 asked of it through the tree: the program lends `tree.set_window_ops` a
 callback, and widgets call `tree.window_op` with WIN_MOVE, WIN_MINIMIZE,
 WIN_MAXIMIZE, WIN_CLOSE or WIN_MENU at a window point, for the program to pass
 on to the platform. The buttons minimize, maximize — restore once
 `set_maximized` says so — and close; a drag on the bar's empty places moves the
 window, a double click maximizes it, and the right button opens the window's
-own menu where it was pressed. Drawn in the header's colour over a line, all
-mirrored in right to left; told as a title bar named by its title, its buttons
-named for what they do.
+own menu where it was pressed. Drawn in the title bar's colour, no line under
+it, all mirrored in right to left; told as a title bar named by its title, its
+buttons named for what they do.
 
 **Window frames** (`widgets/decoration.cst`, tested by `decoration_test`):
-the client-side decoration itself, for where the desktop draws none — GNOME's
-Wayland compositor, or a program that asks not to have one on X11. A header
-bar across the window's top, rounded with it, a column under it for what the
-window holds, and the window's colour inside rounded corners within a shadow;
-the buffer is larger than the window as the desktop counts it, and
+the frame itself, the same on every platform. A title bar across the window's
+top, rounded with it, a column under it for what the window holds, a hairline
+round it in the border colour, and the window's colour inside rounded corners
+within a shadow where the platform shows what is behind the window; the
+buffer is then larger than the window as the desktop counts it, and
 `geometry()`, `extents()` and `input()` say by how much and where the pointer
 is taken — the window and the edges' reach just beyond it, never the rest of
 the shadow. Eight handles lie over the edges and corners, a corner taking 16
 pixels of each side by it: the pointer is the resize cursor there, and a press
 asks the window, through `tree.window_op`, to resize from that edge
-(WIN_RESIZE_N … WIN_RESIZE_NW). Maximized it has no shadow, rounding or
-edges, and its header's button restores; full screen it is only what it
+(WIN_RESIZE_N … WIN_RESIZE_NW). Maximized it has no shadow, rounding, edges
+or hairline, and its maximize button restores; full screen it is only what it
 holds; tiled to a side (TILED_*) it has no shadow or rounding at all and no
 edge on that side; in an inactive window its shadow is lighter; flat
-(`set_flat`) — where nothing behind the window would show through it, X with
-no compositing manager — it has no shadow or rounding either, all of it
-inside the window, still resized from every edge. Painted with
-`paint.Options.see_through`, where every damaged region starts from nothing
-instead of the window's colour (`draw2d.replace_rect`, written, not blended),
-so the shadow lies over whatever is behind the window. A program gives a
-window its own frame with `app.set_decoration`; the host does the rest.
+(`set_flat`) — on X11, which has no word for a shadow outside the window; on
+Windows, whose system draws the shadow and rounds the corners itself; where
+nothing behind the window would show through it — it has no shadow or
+rounding of its own, all of it inside the window, still resized from every
+edge. Painted with `paint.Options.see_through`, where every damaged region
+starts from nothing instead of the window's colour (`draw2d.replace_rect`,
+written, not blended), so the shadow lies over whatever is behind the window.
 
-On Wayland, when the compositor does not supply server decorations, the host
-adds an automatic frame. Original root children keep their overlay layout
-inside its body; popups remain above it. The header follows the window title
-and desktop button layout. Native dialogs are measured with the frame before
-opening, so their content and header fit the native buffer. Explicit
-`app.set_decoration` frames remain application-owned and are not replaced.
+Every top-level window and dialog the host shows has one. A program gives a
+window a frame it made with `app.set_decoration`; any other gets the host's
+automatic frame when it is first shown, its root's children moved into its
+body, keeping their overlay layout; popups remain above it. The automatic
+title bar follows the window's title, its buttons all three or, a dialog's,
+close alone. Dialogs are measured with the frame before opening, so their
+content and title bar fit the platform's window. A program's own frame given
+later takes the automatic one's place, what it held moved back under the root.
+The window's menu is the toolkit's own (`widgets/menu.cst`): restore or
+maximize, minimize and close — a dialog's, close — in the tree's language.
 
 **List views** (`widgets/listview.cst`, tested by `listview_test`): the rows
 of a flat model in a scroll area of their own, each as tall as the first,
@@ -1280,7 +1287,7 @@ it say other roles and add to what a row says (`set_roles`,
 **Trees** (`flatten.cst`, `widgets/treeview.cst`, tested by `flatten_test`
 and `treeview_test`): a tree model's rows that show — the top level and,
 under each open row, its children — are a flat model of their own, each row
-with its depth, GTK 4's tree list model; a branch's children are read only
+with its depth; a branch's children are read only
 when it opens, and the tree's changes become the changes of the rows shown.
 A tree view is a list view over it: each row an expander and a name, one
 indent further in per level; the expander, Right and Left (the other way
@@ -1338,7 +1345,7 @@ of the window, on a layer above it. Modal, the window behind is dimmed and
 the dialog is the router's modal scope — presses outside go nowhere, the
 window's shortcuts wait; not modal, the window goes on. The buttons stand in
 the platform's order (`set_order`): the affirmative answers last at the end,
-as GNOME and macOS have them, or first, as Windows does, Help at the start,
+as Linux desktops and macOS have them, or first, as Windows does, Help at the start,
 all mirrored right to left. The default answer's button is in the accent,
 has the focus when nothing in the dialog takes it, and answers Enter; Escape
 answers CANCEL. A check (`set_check`) looks at an answer first and can keep
@@ -1371,7 +1378,7 @@ Select does nothing until the answer is right; then `chosen()` is the whole
 path.
 
 **Colour choosers** (`widgets/colorpicker.cst`, tested by `colorpicker_test`):
-GNOME's palette — a column a hue, five shades down it, then the greys — over
+its own palette — a column a hue, five shades down it, then the cool greys — over
 a plane of saturation across and value up beside a strip of hue, a strip of
 alpha when asked for, and the colour over a checkerboard beside its hex
 code to type ("#rrggbb", "#rrggbbaa", "#rgb", "#rgba"). Colours are the
@@ -1402,14 +1409,14 @@ X; a modal dialog in a window of its own above its owner, the owner told
 nothing meanwhile; a text dragged from one window to another; the loop asleep
 until a timer, a descriptor, another thread or an event wakes it. The
 accessibility bridge runs in it (`atspi/hosted.cst`, `atspi_hosted_test` on a
-private bus). A window with a frame of its own (`app.set_decoration`) opens
-without the window manager's and seen through; its header dragged, its edges
-pressed, its buttons and its menu are asked of the window manager
-(`_NET_WM_MOVERESIZE`, `_GTK_SHOW_WINDOW_MENU`…), the press let go of once the
-window manager has the pointer; where the window really is and where it takes
-the pointer are told it as the frame is laid out, in physical pixels; the
-frame follows what the window manager says — maximized, full screen, tiled —
-and is drawn flat with no compositing manager. Wayland text-input-v3 publishes
+private bus). Every window opens with a frame of the toolkit's own — the
+program's (`app.set_decoration`) or the automatic one — and none of the window
+manager's, drawn flat on X11; its title bar dragged, its edges pressed and its
+buttons are asked of the window manager (`_NET_WM_MOVERESIZE`…), the press let
+go of once the window manager has the pointer, and its menu is the toolkit's;
+where it takes the pointer is told the window manager as the frame is laid
+out, in physical pixels; the frame follows what the window manager says —
+maximized, full screen. Wayland text-input-v3 publishes
 the caret rectangle when the compositor provides the protocol. Candidate
 placement with an installed IME remains unverified; X11 candidate placement
 at the caret is not implemented.
@@ -1435,9 +1442,9 @@ settings portal followed (`desktop_test`, under Xvfb); one instance
 (`instance_test`); notifications (`notify_test`); the tray, never starting a
 watcher (`tray_test`); links through the portal and through a stand-in
 `xdg-open` (`open_uri_test`). The toolkit's icons (`icons_test`), drawn in
-message boxes, header bars and images; the desktop's icon theme
+message boxes and images; the desktop's icon theme
 (`icon_theme_test`, over themes made for it in `testdata/icons`), its name
-from GTK's files, XSETTINGS and the portal. Not yet: SVG icons, a menu
+from XSETTINGS and the portal. Not yet: SVG icons, a menu
 exported with the tray's item (`com.canonical.dbusmenu`).
 
 **Words** (`strings.cst`, tested by `strings_test`, and each widget's own
@@ -1449,7 +1456,7 @@ settings, `settings.K_LOCALE`), the windows' direction right to left for a
 language written so; message boxes, assistants, the text's context menu,
 accelerators ("Ctrl+Espaço"), about dialogs, file choosers (places where
 `user-dirs.dirs` says, tested by `window_user_dirs_test`; sizes with the
-decimal mark), colour and font choosers, header bars, combo boxes, spin
+decimal mark), colour and font choosers, title bars, combo boxes, spin
 boxes and the AT-SPI bridge (its `Locale`, roles' and actions' names for
 people) all in it.
 
@@ -1491,7 +1498,7 @@ widget set applications actually use, done properly, not parity.
    composed text. *Done, with the text view.*
 6. **Scroll areas, models with list, tree and table, menus and popups, dialogs.**
    *Scroll areas, tabs, splitters, stacks and assistants, expanders, toolbars,
-   status bars, header bars, menus and menu bars, lists, trees, tables, combo
+   status bars, title bars, menus and menu bars, lists, trees, tables, combo
    boxes, popovers and menu buttons done; dialogs, message boxes, our own
    file chooser and the desktop's through the portal, colour and font
    choosers, about dialogs and windows' state kept done.*

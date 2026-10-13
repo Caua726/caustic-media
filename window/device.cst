@@ -33,7 +33,6 @@ use "std/mem.cst" as mem;
 use "event.cst" as event;
 use "../input/event.cst" as ie;
 use "settings.cst" as settings;
-use "linux/gtk_ini.cst" as gtk_ini;
 use "locale.cst" as locale;
 use "positioner.cst" as positioner;
 use "damage.cst" as damage;
@@ -256,21 +255,22 @@ fn _open_win32(w as *Window, c as *Config) as void {
     else { w.err = NO_WINDOW; }
 }
 
+// The backend a window asked for with AUTO gets: Win32 on Windows; on Linux,
+// Wayland when WAYLAND_DISPLAY names a compositor, else X11.
+fn auto_backend() as i32 {
+    if (os.current() == os.OS_WINDOWS) { return WIN32; }
+    let is *u8 as display = env.getenv("WAYLAND_DISPLAY");
+    if (cast(i64, display) != 0 && display[0] != 0) { return WAYLAND; }
+    return X11;
+}
+
 fn open_config(c as *Config) as Window {
     let is Window as w;
     w.backend = c.backend;
     w.transparent = c.transparent;
     w.popup = c.popup; w._pad0 = 0; w.popup_x = 0; w.popup_y = 0; w.popup_owner = c.owner;
     w.wayland_win = cast(*wayland.Window, 0);
-    if (w.backend == AUTO) {
-        if (os.current() == os.OS_WINDOWS) {
-            w.backend = WIN32;
-        } else {
-            let is *u8 as display = env.getenv("WAYLAND_DISPLAY");
-            if (cast(i64, display) != 0 && display[0] != 0) { w.backend = WAYLAND; }
-            else { w.backend = X11; }
-        }
-    }
+    if (w.backend == AUTO) { w.backend = auto_backend(); }
     if (os.current() == os.OS_LINUX && w.backend == X11) {
         let is x11.window.Config as xc with mut;
         if (c.resizable == 0) {
@@ -669,15 +669,17 @@ fn hide(w as *Window) as void {
 
 // --- A frame of the program's own ---
 //
-// A window drawing its own title bar, edges and shadow (ui/widgets/
-// decoration.cst) tells the platform it needs none of its own, where the
-// window really is inside the shadow, and where it takes the pointer; and
-// hands it the moving and resizing a press begins, its menu, minimizing and
-// maximizing. What the platform says of its state comes back as STATE events
-// and state(). On X11: Motif's hints, _GTK_FRAME_EXTENTS, the SHAPE input
-// region, _NET_WM_MOVERESIZE, _GTK_SHOW_WINDOW_MENU (x11/frame.cst). On
-// Windows: the window style, hit-testing and the system's own move, size and
-// menu loops.
+// A window drawing its own title bar and edges (ui/widgets/decoration.cst)
+// tells the platform it needs none of its own, where the window really is
+// inside a shadow drawn round it where the platform has a word for that, and
+// where it takes the pointer; and hands it the moving and resizing a press
+// begins, minimizing and maximizing. Its menu is the toolkit's. What the
+// platform says of its state comes back as STATE events and state(). On X11:
+// Motif's hints, the SHAPE input region, _NET_WM_MOVERESIZE
+// (x11/frame.cst) — no shadow outside the window. On Wayland:
+// xdg-decoration, xdg_surface.set_window_geometry, the input region. On
+// Windows: the window's non-client area taken in, DWM's shadow and corners,
+// hit-testing and the system's own move and size loops.
 
 // How a press moves or resizes it (begin_move_resize): from an edge or a
 // corner, numbered as EWMH numbers them, or moved whole.
@@ -736,12 +738,12 @@ fn decorated(w as *Window) as i32 {
 }
 
 // The shadow round the window, in physical pixels each side: the window as
-// the desktop counts it is inside it. 1 when told.
+// the desktop counts it is inside it. 1 when told; 0 where the platform has
+// no word for it (X11), and the frame is then drawn inside the window.
 fn set_frame_extents(w as *Window, left as i64, right as i64, top as i64, bottom as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (os.current() == os.OS_LINUX) {
-        if (w.backend == X11) { return x11.set_client_extents(&w.x11_win, left, right, top, bottom); }
-        if (w.backend == WAYLAND) { return wayland.set_frame_extents(w.wayland_win, left, right, top, bottom); }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) {
+        return wayland.set_frame_extents(w.wayland_win, left, right, top, bottom);
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_frame_extents(&w.win32_win, left, right, top, bottom); }
     return 0;
@@ -783,15 +785,12 @@ fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64
     return 0;
 }
 
-// Its own menu — move, resize, minimize, on top, close — at x, y in the
-// window: 1 when asked.
-fn show_window_menu(w as *Window, x as i64, y as i64) as i32 {
+// Where its own maximize button is, in physical pixels in the window — 0 by
+// 0 for none — so the platform can treat it as its own: on Windows, the
+// snap layouts it offers over the button. 1 when told; 0 elsewhere.
+fn set_maximize_button(w as *Window, x as i64, y as i64, bw as i64, bh as i64) as i32 {
     if (w.ok == 0) { return 0; }
-    if (os.current() == os.OS_LINUX) {
-        if (w.backend == X11) { return x11.show_window_menu(&w.x11_win, x, y); }
-        if (w.backend == WAYLAND) { return wayland.show_window_menu(w.wayland_win, x, y); }
-    }
-    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.show_window_menu(&w.win32_win, x, y); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_maximize_button(&w.win32_win, x, y, bw, bh); }
     return 0;
 }
 
@@ -1228,23 +1227,20 @@ fn clear_drop(w as *Window) as void {
 
 // --- The desktop's settings ---
 
-// What this backend can read of them, into out. On Linux: GTK's settings.ini
-// and the language from the environment, then XSETTINGS on X11 — after which
-// a SETTINGS event says they changed; the portal needs a D-Bus connection and
-// is linux/portal.cst's, for whoever holds one. On Windows: the registry and
-// SystemParametersInfo. How many sources answered.
+// What this backend can read of them, into out. On Linux: the language from
+// the environment, then XSETTINGS on X11 — after which a SETTINGS event says
+// they changed; the portal needs a D-Bus connection and is linux/portal.cst's,
+// for whoever holds one. On Windows: the registry and SystemParametersInfo.
+// How many sources answered.
 fn read_settings(w as *Window, out as *settings.Settings) as i32 {
     *out = settings.defaults();
     if (os.current() == os.OS_WINDOWS) {
         if (w.backend == WIN32) { return win32.read_settings(&w.win32_win, out); }
         return 0;
     }
-    let is settings.Settings as files with mut = settings.defaults();
-    let is i32 as n with mut = gtk_ini.read_user(&files);
-    settings.merge(out, &files);
     locale.read(out);
-    if (w.backend == X11) { n = n + x11.read_settings(&w.x11_win, out); }
-    return n;
+    if (w.backend == X11) { return x11.read_settings(&w.x11_win, out); }
+    return 0;
 }
 
 // --- GPU Presentation surfaces ---

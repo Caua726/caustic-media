@@ -238,8 +238,9 @@ out of its tile, back to its size; is minimized and shown again
 (`xdg_toplevel` 6's `suspended` is `STATE_MINIMIZED`, its size kept); and at a
 1.5 output scale opens at a preferred scale of 180, its buffer 450 by 300 for
 300 by 200 logical pixels, read back from the X screen as 450 by 300. On
-Weston, with no decoration manager, `decorated` is 0 and the toolkit draws
-its own frame. KWin found two faults no Weston run could: the `xdg_surface`'s
+Weston, with no decoration manager, `decorated` is 0; the toolkit draws its
+own frame there and on KWin alike, asking for client side where
+`xdg-decoration` is offered. KWin found two faults no Weston run could: the `xdg_surface`'s
 id was handed out before the viewport's and fractional scale's, which a
 server refuses ("not a valid new object id"), so fractional scale failed on
 every compositor offering it; and an output's integer scale, arriving after

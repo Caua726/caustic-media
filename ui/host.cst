@@ -22,21 +22,24 @@
 // a portal's — another thread posts something to run, or the next timer is
 // due: an idle program takes no time at all.
 //
-// A window with a frame of its own (app.set_decoration) is opened without
-// the platform's, seen through where its shadow is; what the frame asks
-// (tree.set_window_ops) — moved or resized from a press, its menu,
-// minimized, maximized, closed — is asked of the platform's window, and the
-// platform told where the window really is inside the shadow and where it
-// takes the pointer. What the platform says of the window — maximized, full
-// screen, tiled — the frame follows. Every window is kept from being made
-// smaller than its content can be laid out in (layout.min_size), told the
-// platform again whenever that changes. Where nothing behind the window shows
-// through — X with no compositing manager — the frame is drawn flat. While a
-// text field has the keyboard the platform's input method composes for it:
-// told where the caret is (its candidates go there), what the field holds
-// around it and what it is for (a password's text never), its composition
-// shown in the field as it draws it, and abandoned when the field with the
-// keyboard changes.
+// Every top-level window and dialog has a frame of the toolkit's own on every
+// platform — the automatic one (decoration.cst, titlebar.cst), or one the
+// program made (app.set_decoration) — and is opened without the platform's,
+// seen through where its shadow is on Wayland; what the frame asks
+// (tree.set_window_ops) — moved or resized from a press, minimized, maximized,
+// closed — is asked of the platform's window, its menu is the toolkit's own,
+// and the platform is told where the window really is inside the shadow,
+// where it takes the pointer and where its maximize button is. What the
+// platform says of the window — maximized, full screen, tiled — the frame
+// follows. Every window is kept from being made smaller than its content can
+// be laid out in (layout.min_size), told the platform again whenever that
+// changes. On X11 and Windows, and where nothing behind the window shows
+// through, the frame is drawn flat: the shadow there is the platform's or
+// none. While a text field has the keyboard the platform's input method
+// composes for it: told where the caret is (its candidates go there), what
+// the field holds around it and what it is for (a password's text never), its
+// composition shown in the field as it draws it, and abandoned when the field
+// with the keyboard changes.
 use "std/os.cst" as os;
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
@@ -68,7 +71,11 @@ use "layout.cst" as layout;
 use "geom.cst" as geom;
 use "stack.cst" as stack;
 use "widgets/decoration.cst" as decoration;
-use "widgets/headerbar.cst" as headerbar;
+use "widgets/titlebar.cst" as titlebar;
+use "widgets/menu.cst" as menu;
+use "signal.cst" as signal;
+use "strings.cst" as strings;
+use "../window/positioner.cst" as positioner;
 use "../gpu/software/target.cst" as tgt;
 use "../window/damage.cst" as damage;
 
@@ -115,8 +122,9 @@ struct Native {
     told_in   as [4]i64;         // and the input region
     told_min  as [2]i64;         // the smallest it may be made, as last told, physical pixels
     title     as [256]u8;        // as given to the platform, and a zero
-    frame_layout as [96]u8;
-    frame_layout_len as i32;
+    told_max  as [4]i64;         // its maximize button, as last told, physical pixels
+    wmenu     as i64;            // its window menu, while there is one in its tree
+    deco_auto as i32;            // deco is the automatic frame, not the program's
     // What changed of it since it was last shown, physical pixels — kept
     // until it is, whatever stops a frame — and what the frames shown last
     // changed: a platform buffer's age says which of those it lacks.
@@ -375,26 +383,25 @@ fn _paste(user as *u8, which as i32, w as i64) as void {
     }
 }
 
-// Only the fallback frame follows the system's button layout; an explicit
-// app.set_decoration keeps the program's header widgets and choices.
+// The automatic frame's buttons: a dialog has only a close button.
 fn _sync_frame(hs as *Host, n as *Native) as void {
     if (n.deco == 0 || app.decoration_is_automatic(hs.a, n.h) == 0) { return; }
-    let is *u8 as buttons with mut = ":minimize,maximize,close";
-    let is i64 as length with mut = 24;
-    if (app.is_dialog(hs.a, n.h) == 1) { buttons = ":close"; length = 6; }
-    if ((hs.desktop.known & wsettings.K_BUTTON_LAYOUT) != 0) {
-        buttons = &hs.desktop.button_layout[0];
-        length = 0;
-        while (length < 96 && buttons[length] != 0) { length = length + 1; }
-    }
-    if (n.frame_layout_len == length && mem.memcmp(&n.frame_layout[0], buttons, length) == 0) { return; }
+    let is i32 as flags with mut = titlebar.BTN_ALL;
+    if (app.is_dialog(hs.a, n.h) == 1) { flags = titlebar.BTN_CLOSE; }
     let is *tree.Tree as t = app.tree(hs.a, n.h);
-    headerbar.set_layout(t, decoration.header_of(t, n.deco), buttons, length);
-    mem.memcpy(&n.frame_layout[0], buttons, length);
-    n.frame_layout_len = cast(i32, length);
+    titlebar.set_buttons(t, decoration.header_of(t, n.deco), flags);
 }
 
-// Keep the root's overlay rule when moving its content under a fallback frame.
+// Whether n's frame is drawn flat: always on X11, which has no word for a
+// shadow outside the window, and on Windows, whose system draws its own; on
+// Wayland where nothing behind the window shows through it.
+fn _flat(n as *Native) as i32 {
+    if (n.win.backend != device.WAYLAND) { return 1; }
+    return cast(i32, device.transparent(&n.win) == 0 || device.composited(&n.win) == 0);
+}
+
+// Moves the root's children under a new automatic frame, keeping the root's
+// overlay rule.
 fn _automatic_frame(a as *app.App, h as i64) as i64 {
     let is *tree.Tree as t = app.tree(a, h);
     let is i64 as root = tree.root(t);
@@ -414,6 +421,21 @@ fn _automatic_frame(a as *app.App, h as i64) as i64 {
     return deco;
 }
 
+// An automatic frame taken away again: what it held back under the root, as
+// it was before the frame came.
+fn _unwrap_frame(t as *tree.Tree, deco as i64) as void {
+    if (cast(i64, t) == 0 || tree.is_valid(t, deco) == 0) { return; }
+    let is i64 as root = tree.root(t);
+    let is i64 as overlay = tree.first_child(t, decoration.content_of(t, deco));
+    let is i64 as child with mut = tree.first_child(t, overlay);
+    while (overlay != 0 && child != 0) {
+        let is i64 as next = tree.next_sibling(t, child);
+        tree.reparent(t, child, root);
+        child = next;
+    }
+    tree.destroy(t, deco);
+}
+
 // A platform window for h, owned by its owner's: 1, or 0 on failure.
 fn _put_up(hs as *Host, h as i64) as i32 {
     let is i64 as i with mut = 0;
@@ -425,14 +447,13 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     let is f64 as s with mut = _scale(hs);
     let is i64 as o = _slot_of(hs, app.owner(a, h));
     let is i64 as deco with mut = app.decoration(a, h);
-    if (deco == 0 && o >= 0 && _native(hs, o).win.backend == device.WAYLAND &&
-        app.decoration_is_automatic(a, app.owner(a, h)) == 1) {
+    if (deco == 0) {
         deco = _automatic_frame(a, h);
         if (deco == 0) { return 0; }
     }
-    // Dialogs are sized to their content. Include the fallback frame before
+    // Dialogs are sized to their content. Include the automatic frame before
     // opening, also when a hidden dialog is shown again with different content.
-    if (deco != 0 && app.is_dialog(a, h) == 1 && app.decoration_is_automatic(a, h) == 1) {
+    if (app.is_dialog(a, h) == 1 && app.decoration_is_automatic(a, h) == 1) {
         let is geom.Constraint as free = geom.unbounded();
         let is geom.Size as pref;
         layout.measure(app.tree(a, h), deco, &free, &pref);
@@ -445,18 +466,15 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     if (o >= 0) { c.owner = &_native(hs, o).win; }
     c.dialog = app.is_dialog(a, h);
     c.modal = app.is_modal(a, h);
-    // A frame of its own: none of the platform's, its shadow seen through.
-    if (deco != 0) {
-        c.transparent = 1;
-        c.decorated = 0;
-    }
+    // A frame of its own: none of the platform's. Its shadow seen through
+    // only on Wayland; elsewhere the frame is flat (_flat).
+    c.decorated = 0;
+    let is i32 as backend with mut = c.backend;
+    if (backend == device.AUTO) { backend = device.auto_backend(); }
+    if (backend == device.WAYLAND) { c.transparent = 1; }
     n.win = device.open_config(&c);
     let is f64 as opened_at = s;
     if (device.is_open(&n.win) == 0) { return 0; }
-    if (deco == 0 && n.win.backend == device.WAYLAND && device.decorated(&n.win) == 0) {
-        deco = _automatic_frame(a, h);
-        if (deco == 0) { device.close(&n.win); return 0; }
-    }
     n.h = h;
     n.hs = hs;
     n.scale = s;
@@ -471,11 +489,13 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     n.over = 0;
     n.icon_gen = 0;
     n.deco = deco;
+    n.deco_auto = app.decoration_is_automatic(a, h);
     n.typed = 0;
     n.texting = 0;
     n.finger = 0 - 1;
     n.pen_in = 0;
-    n.frame_layout_len = 0 - 1;
+    mem.memset(cast(*u8, &n.told_max), 255, 32);
+    n.wmenu = 0;
     // Nothing told yet (-1 each, all bits set): told with its first frame.
     mem.memset(cast(*u8, &n.told_ext), 255, 32);
     mem.memset(cast(*u8, &n.told_in), 255, 32);
@@ -506,8 +526,8 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     }
     app.set_scale(a, h, n.scale);
     let is *tree.Tree as t = app.tree(a, h);
-    if (deco != 0 && app.decoration_is_automatic(a, h) == 1) {
-        headerbar.set_title(t, decoration.header_of(t, deco), app.title(a, h), app.title_length(a, h));
+    if (app.decoration_is_automatic(a, h) == 1) {
+        titlebar.set_title(t, decoration.header_of(t, deco), app.title(a, h), app.title_length(a, h));
         _sync_frame(hs, n);
     }
     tree.set_clipboard(t, fn_ptr(_copy), cast(*u8, n));
@@ -517,7 +537,8 @@ fn _put_up(hs as *Host, h as i64) as i32 {
     // Its texture keeps what it holds: a scroll area's pixels are moved.
     tree.set_moves(t, 1);
     // Its shadow only where what is behind shows through it.
-    decoration.set_flat(t, deco, cast(i32, device.transparent(&n.win) == 0 || device.composited(&n.win) == 0));
+    decoration.set_flat(t, deco, _flat(n));
+    app.set_see_through(a, h, 1 - _flat(n));
     tree.invalidate_paint_subtree(t, tree.root(t));
     return 1;
 }
@@ -554,6 +575,10 @@ fn _sync(hs as *Host) as void {
     while (i < MAX_WINDOWS) {
         let is *Native as n = _native(hs, i);
         if (n.h != 0 && (app.window_valid(a, n.h) == 0 || app.is_shown(a, n.h) == 0 || app.decoration(a, n.h) != n.deco)) {
+            // The program gave it a frame of its own: the automatic one goes.
+            if (n.deco_auto == 1 && app.window_valid(a, n.h) == 1 && app.decoration(a, n.h) != n.deco) {
+                _unwrap_frame(app.tree(a, n.h), n.deco);
+            }
             _put_away(hs, i);
         }
         i = i + 1;
@@ -582,7 +607,7 @@ fn _sync(hs as *Host) as void {
                 device.set_title(&n.win, s, k);
                 if (n.deco != 0 && app.decoration_is_automatic(a, n.h) == 1) {
                     let is *tree.Tree as t = app.tree(a, n.h);
-                    headerbar.set_title(t, decoration.header_of(t, n.deco), s, k);
+                    titlebar.set_title(t, decoration.header_of(t, n.deco), s, k);
                 }
             }
             _sync_frame(hs, n);
@@ -668,10 +693,11 @@ fn _recomposite(hs as *Host) as void {
         let is *Native as n = _native(hs, i);
         let is *tree.Tree as t = app.tree(hs.a, n.h);
         if (n.h != 0 && n.deco != 0 && cast(i64, t) != 0 && tree.is_valid(t, n.deco) == 1) {
-            let is i32 as flat = cast(i32, device.transparent(&n.win) == 0 || device.composited(&n.win) == 0);
+            let is i32 as flat = _flat(n);
             if (flat != decoration.is_flat(t, n.deco)) {
                 let is decoration.Extents as was = decoration.extents(t, n.deco);
                 decoration.set_flat(t, n.deco, flat);
+                app.set_see_through(hs.a, n.h, 1 - flat);
                 let is decoration.Extents as now = decoration.extents(t, n.deco);
                 let is f64 as dw = (now.left + now.right - was.left - was.right) * n.scale;
                 let is f64 as dh = (now.top + now.bottom - was.top - was.bottom) * n.scale;
@@ -806,6 +832,44 @@ fn _close_asked(hs as *Host, n as *Native, now as i64) as void {
     app.window_close(a, n.h);
 }
 
+// The window menu's items, by id.
+let is i64 as _MENU_MAXIMIZE with imut = 1;
+let is i64 as _MENU_MINIMIZE with imut = 2;
+let is i64 as _MENU_CLOSE    with imut = 3;
+
+// The window's own menu, the toolkit's, at x, y in the window: restore or
+// maximize, minimize, close — a dialog's, close alone. Made afresh each time,
+// in the tree's language and as the window is now.
+fn _window_menu(n as *Native, x as f64, y as f64) as void {
+    let is *app.App as a = n.hs.a;
+    let is *tree.Tree as t = app.tree(a, n.h);
+    if (n.wmenu != 0 && tree.is_valid(t, n.wmenu) == 1) { tree.destroy(t, n.wmenu); }
+    n.wmenu = menu.create(t);
+    if (n.wmenu == 0) { return; }
+    let is i64 as k with mut = 0;
+    if (app.is_dialog(a, n.h) == 0) {
+        let is i64 as word with mut = strings.MAXIMIZE;
+        if (app.is_maximized(a, n.h) == 1) { word = strings.RESTORE; }
+        let is *u8 as size_word = strings.of(t, word, &k);
+        menu.add_item(t, n.wmenu, size_word, k, _MENU_MAXIMIZE);
+        let is *u8 as min_word = strings.of(t, strings.MINIMIZE, &k);
+        menu.add_item(t, n.wmenu, min_word, k, _MENU_MINIMIZE);
+        menu.add_separator(t, n.wmenu);
+    }
+    let is *u8 as close_word = strings.of(t, strings.CLOSE_WINDOW, &k);
+    menu.add_item(t, n.wmenu, close_word, k, _MENU_CLOSE);
+    signal.connect(t, n.wmenu, signal.ACTIVATED, fn_ptr(_window_menu_chosen), cast(*u8, n));
+    menu.popup_at(t, app.router(a, n.h), n.wmenu, math.rect.rect(x, y, 0.0, 0.0), positioner.TOP_LEFT,
+                  positioner.BOTTOM_RIGHT, 0);
+}
+
+fn _window_menu_chosen(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is i64 as id = *cast(*i64, arg);
+    if (id == _MENU_MAXIMIZE) { _window_op(user, tree.WIN_MAXIMIZE, 0.0, 0.0); }
+    if (id == _MENU_MINIMIZE) { _window_op(user, tree.WIN_MINIMIZE, 0.0, 0.0); }
+    if (id == _MENU_CLOSE) { _window_op(user, tree.WIN_CLOSE, 0.0, 0.0); }
+}
+
 // What the window's frame asks — moved or resized from a press, its menu,
 // minimized, maximized or back, closed — asked of the platform's window, at
 // window x, y in logical pixels.
@@ -823,7 +887,7 @@ fn _window_op(user as *u8, op as i32, x as f64, y as f64) as void {
         return;
     }
     if (op == tree.WIN_MENU) {
-        device.show_window_menu(&n.win, px, py);
+        _window_menu(n, x, y);
         return;
     }
     if (op == tree.WIN_MINIMIZE) {
@@ -846,7 +910,8 @@ fn _round(v as f64) as i64 {
 }
 
 // What the frame says of the window, laid out — where it really is inside
-// the shadow, where it takes the pointer — told the platform when it changed.
+// the shadow, where it takes the pointer, where its maximize button is — told
+// the platform when it changed.
 fn _tell_frame(hs as *Host, n as *Native) as void {
     let is *tree.Tree as t = app.tree(hs.a, n.h);
     if (tree.is_valid(t, n.deco) == 0) { return; }
@@ -871,6 +936,21 @@ fn _tell_frame(hs as *Host, n as *Native) as void {
         device.set_input_region(&n.win, inp[0], inp[1], inp[2], inp[3]);
         mem.memcpy(cast(*u8, &n.told_in), cast(*u8, &inp), 32);
     }
+    let is [4]i64 as mx;
+    mem.memset(cast(*u8, &mx), 0, 32);
+    let is i64 as bar = decoration.header_of(t, n.deco);
+    let is i64 as max_btn = titlebar.button(t, bar, titlebar.MAXIMIZE);
+    if (max_btn != 0 && tree.is_visible(t, bar) == 1) {
+        let is math.rect.Rect as b = layout.window_rect(t, max_btn);
+        mx[0] = _px(b.x, s);
+        mx[1] = _px(b.y, s);
+        mx[2] = _px(b.w, s);
+        mx[3] = _px(b.h, s);
+    }
+    if (mem.memcmp(cast(*u8, &mx), cast(*u8, &n.told_max), 32) != 0) {
+        device.set_maximize_button(&n.win, mx[0], mx[1], mx[2], mx[3]);
+        mem.memcpy(cast(*u8, &n.told_max), cast(*u8, &mx), 32);
+    }
 }
 
 // v, s times, up to a whole number of physical pixels: room enough.
@@ -890,7 +970,9 @@ fn _px_down(v as f64, s as f64) as i64 {
 }
 
 // The smallest its content can be laid out in, told the platform as the
-// window's floor when it changed.
+// window's floor when it changed, and the window grown to it when it is
+// smaller: a window manager that keeps the floor would, and one that does not
+// (none at all, under Xvfb) leaves it to the program.
 fn _tell_min(hs as *Host, n as *Native) as void {
     let is geom.Size as least;
     layout.min_size(app.tree(hs.a, n.h), &least);
@@ -900,6 +982,15 @@ fn _tell_min(hs as *Host, n as *Native) as void {
     device.set_min_size(&n.win, mw, mh);
     n.told_min[0] = mw;
     n.told_min[1] = mh;
+    let is i64 as cw = device.width(&n.win);
+    let is i64 as ch = device.height(&n.win);
+    if (cw < mw || ch < mh) {
+        let is i64 as gw with mut = cw;
+        let is i64 as gh with mut = ch;
+        if (gw < mw) { gw = mw; }
+        if (gh < mh) { gh = mh; }
+        device.set_size(&n.win, gw, gh);
+    }
 }
 
 // The sides the platform says the window is tiled to, as the frame counts them.

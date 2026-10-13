@@ -27,10 +27,6 @@ let is i32 as BAD_ARGUMENT with imut = 4;
 let is i64 as MAX_WINDOWS with imut = 32;
 let is i64 as MAX_EVENTS with imut = 128;
 
-// Asks the window's own thread to show the system menu: TrackPopupMenu runs
-// its modal loop from the window procedure, not from the caller.
-let is i64 as _WM_WINDOW_MENU with imut = t.WM_APP + 256;
-
 struct DIBInfo {
     header as t.BITMAPINFOHEADER;
     masks as [3]u32;
@@ -46,6 +42,17 @@ struct Native {
     fixed as i32;
     modal as i32;
     decorated as i32;
+    // A frame of the program's own on a window the system would frame: the
+    // non-client area taken into the client (WM_NCCALCSIZE), DWM's shadow and
+    // corners kept, the system's snap and size loops still its.
+    own_frame as i32;
+    // Its own maximize button, client pixels; 0 wide for none. Hit-tested as
+    // the system's (HTMAXBUTTON) so Windows offers its snap layouts over it.
+    maxbtn_x as i64;
+    maxbtn_y as i64;
+    maxbtn_w as i64;
+    maxbtn_h as i64;
+    nc_over as i32;         // the pointer is over that button, tracked as non-client
     popup as i32;           // a popup's kind (device.POPUP_*), 0 for a window
     popup_done as i32;      // taken down by a press outside the program's popups
     dpi as i32;
@@ -605,6 +612,95 @@ fn _edge(n as *Native, hx as i64, hy as i64) as i64 {
     return t.HTRIGHT;
 }
 
+// Whether hx, hy of the client is on its own maximize button.
+fn _over_maxbtn(n as *Native, hx as i64, hy as i64) as i32 {
+    if (n.own_frame == 0 || n.maxbtn_w <= 0 || n.maxbtn_h <= 0) { return 0; }
+    return cast(i32, hx >= n.maxbtn_x && hy >= n.maxbtn_y && hx < n.maxbtn_x + n.maxbtn_w && hy < n.maxbtn_y + n.maxbtn_h);
+}
+
+// The pointer's leaving, asked to be said: of the client, or with nonclient
+// of the area the system counts as its frame.
+fn _track_leave(hwnd as i64, nonclient as i32) as void {
+    let is t.TRACKMOUSEEVENT as track; mem.memset(cast(*u8, &track), 0, sizeof(t.TRACKMOUSEEVENT));
+    track.cbSize = cast(u32, sizeof(t.TRACKMOUSEEVENT));
+    track.dwFlags = cast(u32, t.TME_LEAVE);
+    if (nonclient == 1) { track.dwFlags = cast(u32, t.TME_LEAVE | t.TME_NONCLIENT); }
+    track.hwndTrack = hwnd; u.TrackMouseEvent(&track);
+}
+
+// Where the pointer is, in client pixels.
+fn _cursor_at(hwnd as i64, x as *i64, y as *i64) as i32 {
+    let is t.POINT as p;
+    if (u.GetCursorPos(&p) == 0) { return 0; }
+    u.ScreenToClient(hwnd, &p);
+    *x = cast(i64, p.x); *y = cast(i64, p.y);
+    return 1;
+}
+
+// The pointer over its own maximize button, which the system counts as its
+// frame (HTMAXBUTTON): said as it would be over the client, so the program's
+// button hovers, presses and clicks as its others do, and the system acts on
+// none of it. A press takes the capture, after which the pointer's messages
+// are the client's again. The result, or -1 for a message it leaves alone.
+fn _nc_pointer(n as *Native, hwnd as i64, m as i64, wp as u64, lp as i64) as i64 {
+    if (n.own_frame == 0) { return 0 - 1; }
+    if (m == t.WM_NCMOUSELEAVE) {
+        if (n.nc_over == 0) { return 0 - 1; }
+        n.nc_over = 0;
+        let is i64 as cx with mut = 0;
+        let is i64 as cy with mut = 0;
+        // Gone into the rest of the window: the client's leaving is tracked
+        // from here, and nothing has left.
+        if (_cursor_at(hwnd, &cx, &cy) == 1 && cx >= 0 && cy >= 0 && cx < n.width && cy < n.height) {
+            _track_leave(hwnd, 0);
+            return 0;
+        }
+        n.entered = 0;
+        _pointer(n, ie.LEAVE, n.mouse_x, n.mouse_y, 0);
+        return 0;
+    }
+    if (cast(i64, wp) != t.HTMAXBUTTON) { return 0 - 1; }
+    if (m != t.WM_NCMOUSEMOVE && m != t.WM_NCLBUTTONDOWN && m != t.WM_NCLBUTTONDBLCLK && m != t.WM_NCLBUTTONUP &&
+        m != t.WM_NCRBUTTONDOWN && m != t.WM_NCRBUTTONUP) { return 0 - 1; }
+    let is t.POINT as p;
+    p.x = cast(i32, _signed16(cast(u64, lp))); p.y = cast(i32, _signed16(cast(u64, lp) >> 16));
+    u.ScreenToClient(hwnd, &p);
+    n.mouse_x = cast(i64, p.x); n.mouse_y = cast(i64, p.y);
+    if (m == t.WM_NCMOUSEMOVE) {
+        if (n.nc_over == 0) { n.nc_over = 1; _track_leave(hwnd, 1); }
+        if (n.entered == 0) { n.entered = 1; _pointer(n, ie.ENTER, n.mouse_x, n.mouse_y, 0); }
+        _pointer(n, ie.MOTION, n.mouse_x, n.mouse_y, 0);
+        return 0;
+    }
+    if (m == t.WM_NCLBUTTONDOWN || m == t.WM_NCLBUTTONDBLCLK) {
+        n.buttons = n.buttons | 1;
+        if (_ngrab == 0) { u.SetCapture(hwnd); }
+        _pointer(n, ie.BUTTON_DOWN, n.mouse_x, n.mouse_y, 1);
+        return 0;
+    }
+    if (m == t.WM_NCLBUTTONUP && (n.buttons & 1) != 0) {
+        n.buttons = n.buttons & cast(i32, 0 - 2);
+        if (n.buttons == 0 && _ngrab == 0) { u.ReleaseCapture(); }
+        _pointer(n, ie.BUTTON_UP, n.mouse_x, n.mouse_y, 1);
+    }
+    return 0;
+}
+
+// DWM's part in a frame of the program's own: its shadow, kept by a frame
+// reaching one pixel into the client, its corners rounded where it rounds
+// them, and no border of its colour round what draws its own. Where it does
+// neither (Windows 10, Wine) the window is as it was.
+fn _dwm_frame(hwnd as i64, on as i32) as void {
+    let is t.MARGINS as m;
+    m.cxLeftWidth = 0; m.cxRightWidth = 0; m.cyTopHeight = 0; m.cyBottomHeight = on;
+    dwm.DwmExtendFrameIntoClientArea(hwnd, &m);
+    let is u32 as corner with mut = cast(u32, t.DWMWCP_DEFAULT);
+    let is u32 as border with mut = cast(u32, t.DWMWA_COLOR_DEFAULT);
+    if (on == 1) { corner = cast(u32, t.DWMWCP_ROUND); border = cast(u32, t.DWMWA_COLOR_NONE); }
+    dwm.DwmSetWindowAttribute(hwnd, cast(u32, t.DWMWA_WINDOW_CORNER_PREFERENCE), cast(*u8, &corner), 4);
+    dwm.DwmSetWindowAttribute(hwnd, cast(u32, t.DWMWA_BORDER_COLOR), cast(*u8, &border), 4);
+}
+
 // Bytes of UTF-8 the first count UTF-16 units of wide make.
 fn _utf8_of(wide as *u16, count as i64) as i64 {
     if (count <= 0) { return 0; }
@@ -937,19 +1033,38 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
     }
     let is *Native as n = cast(*Native, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA)));
     if (cast(i64, n) == 0) { return u.DefWindowProcW(hwnd, msg, wp, lp); }
-    if (cast(i64, msg) == t.WM_NCHITTEST && n.region_on == 1) {
+    if (n.own_frame == 1 && cast(i64, msg) == t.WM_NCCALCSIZE) {
+        // The whole window is the client. Maximized, the system puts what
+        // would be its frame past the monitor's edges: the client is taken in
+        // by as much, so nothing of it is off the screen.
+        if (wp != 0 && u.IsZoomed(hwnd) != 0) {
+            let is *t.RECT as r = cast(*t.RECT, lp);
+            let is i32 as pad = u.GetSystemMetricsForDpi(cast(i32, t.SM_CXPADDEDBORDER), cast(u32, n.dpi));
+            let is i32 as fx = u.GetSystemMetricsForDpi(cast(i32, t.SM_CXFRAME), cast(u32, n.dpi)) + pad;
+            let is i32 as fy = u.GetSystemMetricsForDpi(cast(i32, t.SM_CYFRAME), cast(u32, n.dpi)) + pad;
+            r.left = r.left + fx; r.right = r.right - fx;
+            r.top = r.top + fy; r.bottom = r.bottom - fy;
+        }
+        return 0;
+    }
+    if (cast(i64, msg) == t.WM_NCHITTEST && (n.region_on == 1 || n.own_frame == 1)) {
         let is t.POINT as hit;
         hit.x = cast(i32, _signed16(cast(u64, lp))); hit.y = cast(i32, _signed16(cast(u64, lp) >> 16));
         u.ScreenToClient(hwnd, &hit);
         let is i64 as hx = cast(i64, hit.x); let is i64 as hy = cast(i64, hit.y);
-        if (hx < n.region_x || hy < n.region_y || hx >= n.region_x + n.region_w || hy >= n.region_y + n.region_h) {
+        if (n.region_on == 1 &&
+            (hx < n.region_x || hy < n.region_y || hx >= n.region_x + n.region_w || hy >= n.region_y + n.region_h)) {
             return t.HTTRANSPARENT;
         }
+        // Its own maximize button: the system's, for the snap layouts.
+        if (_over_maxbtn(n, hx, hy) == 1) { return t.HTMAXBUTTON; }
         // An edge of a frame of its own: the system's to resize from.
         let is i64 as edge = _edge(n, hx, hy);
         if (edge != 0) { return edge; }
+        if (n.own_frame == 1) { return t.HTCLIENT; }
     }
-    if (cast(i64, msg) == _WM_WINDOW_MENU) { _window_menu(n, lp); return 0; }
+    let is i64 as nc = _nc_pointer(n, hwnd, cast(i64, msg), wp, lp);
+    if (nc >= 0) { return nc; }
     if (_ngrab > 0) {
         let is *Native as top = _top_grab();
         // The owner's keys are the grabbing popup's.
@@ -981,8 +1096,12 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         let is *t.MINMAXINFO as limits = cast(*t.MINMAXINFO, lp);
         let is t.RECT as outer;
         outer.left = 0; outer.top = 0; outer.right = 0; outer.bottom = 0;
-        u.AdjustWindowRectExForDpi(&outer, cast(u32, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWL_STYLE))),
-                                  0, 0, cast(u32, n.dpi));
+        // A frame of its own has no border the system adds: the window is
+        // as large as its client.
+        if (n.own_frame == 0) {
+            u.AdjustWindowRectExForDpi(&outer, cast(u32, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWL_STYLE))),
+                                      0, 0, cast(u32, n.dpi));
+        }
         let is i32 as border_w = outer.right - outer.left;
         let is i32 as border_h = outer.bottom - outer.top;
         if (n.min_width > 0) { limits.ptMinTrackSize.x = cast(i32, n.min_width) + border_w; }
@@ -1106,7 +1225,14 @@ fn _window_proc(ctx as *u8, args as *u64) as i64 {
         }
         _pointer(n, ie.MOTION, mx, my, 0); return 0;
     }
-    if (cast(i64, msg) == t.WM_MOUSELEAVE) { n.entered = 0; _pointer(n, ie.LEAVE, n.mouse_x, n.mouse_y, 0); return 0; }
+    if (cast(i64, msg) == t.WM_MOUSELEAVE) {
+        // Onto its own maximize button, which the system counts as frame: the
+        // pointer has not left, and the button's own tracking says when it does.
+        let is i64 as lx with mut = 0;
+        let is i64 as ly with mut = 0;
+        if (n.own_frame == 1 && _cursor_at(hwnd, &lx, &ly) == 1 && _over_maxbtn(n, lx, ly) == 1) { return 0; }
+        n.entered = 0; _pointer(n, ie.LEAVE, n.mouse_x, n.mouse_y, 0); return 0;
+    }
     if (cast(i64, msg) == t.WM_LBUTTONDOWN || cast(i64, msg) == t.WM_LBUTTONUP ||
         cast(i64, msg) == t.WM_MBUTTONDOWN || cast(i64, msg) == t.WM_MBUTTONUP ||
         cast(i64, msg) == t.WM_RBUTTONDOWN || cast(i64, msg) == t.WM_RBUTTONUP) {
@@ -1215,12 +1341,18 @@ fn open_config(c as *Config) as Window {
         n.min_width = c.width; n.max_width = c.width;
         n.min_height = c.height; n.max_height = c.height;
     }
+    // A frame of its own on a window the system would frame — not a popup,
+    // not one seen through: the system's style kept, for its snap, its size
+    // loop and its minimize and maximize animations, and its frame taken
+    // into the client (WM_NCCALCSIZE).
+    n.own_frame = cast(i32, c.decorated == 0 && c.popup == 0 && c.transparent == 0);
     let is u32 as style with mut = cast(u32, t.WS_OVERLAPPEDWINDOW);
-    if (c.decorated == 0) { style = cast(u32, t.WS_POPUP | t.WS_VISIBLE); }
-    if (c.resizable == 0) { style = cast(u32, cast(i64, style) & (0 - 262145)); }
-    // A dialog the system frames: a caption and a close button, no more. One
-    // drawing its own frame is as frameless as any such window.
+    if (c.decorated == 0 && n.own_frame == 0) { style = cast(u32, t.WS_POPUP | t.WS_VISIBLE); }
+    // A dialog: a caption and a close button, no more — the system's, or
+    // under a frame of its own.
     if (c.dialog == 1 && c.decorated != 0) { style = cast(u32, t.WS_CAPTION | t.WS_SYSMENU | t.WS_VISIBLE); }
+    if (c.dialog == 1 && n.own_frame == 1) { style = cast(u32, t.WS_CAPTION | t.WS_SYSMENU | t.WS_THICKFRAME | t.WS_VISIBLE); }
+    if (c.resizable == 0) { style = cast(u32, cast(i64, style) & (0 - 262145)); }
     // A popup: no frame, no taskbar entry, never activated — the owner keeps
     // the focus, and its keys come to the popup while it holds the capture.
     let is u32 as ex with mut = 0;
@@ -1235,7 +1367,7 @@ fn open_config(c as *Config) as Window {
         n.layered = 1;
     }
     let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, c.width); r.bottom = cast(i32, c.height);
-    if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { u.AdjustWindowRectEx(&r, style, 0, ex); }
+    if (n.own_frame == 0 && u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { u.AdjustWindowRectEx(&r, style, 0, ex); }
     let is [512]u16 as title; title[0] = cast(u16, 0);
     if (cast(i64, c.title) != 0) { k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, c.title), cast(i32, 0 - 1), &title[0], 512); }
     let is i32 as outer_width = r.right - r.left;
@@ -1247,6 +1379,10 @@ fn open_config(c as *Config) as Window {
         at_x, at_y, outer_width, outer_height, c.owner, 0, _instance, cast(*u8, n));
     if (hwnd == 0) { ie.destroy(n.input); n.input = cast(*ie.Queue, 0); n.used = 0; w.err = NO_WINDOW; return w; }
     n.hwnd = hwnd; n.alive = 1; n.dpi = cast(i32, u.GetDpiForWindow(hwnd)); if (n.dpi < 96) { n.dpi = 96; }
+    if (n.own_frame == 1) {
+        _dwm_frame(hwnd, 1);
+        u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, cast(u32, t.SWP_NOMOVE | t.SWP_NOSIZE | t.SWP_NOZORDER | t.SWP_FRAMECHANGED));
+    }
     // Created with the thread's input context; it has none until a text
     // field has the keyboard (text_input_enable).
     n.ime_on = 1; n.ime_text_len = 0 - 1;
@@ -1440,7 +1576,10 @@ fn set_decorated(w as *Window, on as i32) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
     let is i64 as style = u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE));
     let is i64 as next with mut = style;
-    if (on == 0) { next = next & (0 - 12582913); }
+    // Undecorated, one that is neither seen through nor a popup draws its
+    // own frame over the system's style; one seen through has no frame at all.
+    let is i32 as own = cast(i32, on == 0 && n.layered == 0 && n.popup == 0);
+    if (on == 0 && own == 0) { next = next & (0 - 12582913); }
     else { next = next | t.WS_CAPTION | t.WS_SYSMENU; }
     u.SetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE), next);
     // Framed by the system, it is not seen through: its frame is not its own
@@ -1450,6 +1589,10 @@ fn set_decorated(w as *Window, on as i32) as i32 {
                             u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_EXSTYLE)) & (0 - 1 - t.WS_EX_LAYERED));
         n.layered = 0;
         _drop_layer(n);
+    }
+    if (own != n.own_frame) {
+        n.own_frame = own;
+        _dwm_frame(w.hwnd, own);
     }
     u.SetWindowPos(w.hwnd, 0, 0, 0, 0, 0, cast(u32, t.SWP_NOMOVE | t.SWP_NOSIZE | t.SWP_NOZORDER | t.SWP_FRAMECHANGED));
     n.decorated = cast(i32, on != 0); return 1;
@@ -1547,8 +1690,9 @@ fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
 }
 
 // The client asked to be cw by ch physical pixels, the frame round it as the
-// window's style and DPI make it; a window of fixed size is fixed at that
-// size from now. 1 when asked: the size arrives as a RESIZE.
+// window's style and DPI make it — none for a frame of its own, whose window
+// is its client; a window of fixed size is fixed at that size from now. 1
+// when asked: the size arrives as a RESIZE.
 fn set_size(w as *Window, cw as i64, ch as i64) as i32 {
     let is *Native as n = _native(w);
     if (cast(i64, n) == 0 || cw <= 0 || ch <= 0 || cw > 16384 || ch > 16384) { return 0; }
@@ -1556,7 +1700,7 @@ fn set_size(w as *Window, cw as i64, ch as i64) as i32 {
     let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, cw); r.bottom = cast(i32, ch);
     let is u32 as style = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE)));
     let is u32 as ex = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_EXSTYLE)));
-    if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { return 0; }
+    if (n.own_frame == 0 && u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { return 0; }
     return cast(i32, u.SetWindowPos(w.hwnd, 0, 0, 0, r.right - r.left, r.bottom - r.top,
                                     cast(u32, t.SWP_NOMOVE | t.SWP_NOZORDER | t.SWP_NOACTIVATE)) != 0);
 }
@@ -1626,7 +1770,8 @@ fn grabbing(w as *Window) as i32 {
 }
 
 // The client put at x, y of the screen and made cw by ch, the frame round it
-// as the window's style and DPI make it. 1 when moved.
+// as the window's style and DPI make it — none for a frame of its own. 1 when
+// moved.
 fn move_resize(w as *Window, x as i64, y as i64, cw as i64, ch as i64) as i32 {
     let is *Native as n = _native(w);
     if (cast(i64, n) == 0 || cw <= 0 || ch <= 0 || cw > 16384 || ch > 16384) { return 0; }
@@ -1634,7 +1779,7 @@ fn move_resize(w as *Window, x as i64, y as i64, cw as i64, ch as i64) as i32 {
     let is t.RECT as r; r.left = 0; r.top = 0; r.right = cast(i32, cw); r.bottom = cast(i32, ch);
     let is u32 as style = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_STYLE)));
     let is u32 as ex = cast(u32, u.GetWindowLongPtrW(w.hwnd, cast(i32, t.GWL_EXSTYLE)));
-    if (u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { return 0; }
+    if (n.own_frame == 0 && u.AdjustWindowRectExForDpi(&r, style, 0, ex, cast(u32, n.dpi)) == 0) { return 0; }
     return cast(i32, u.SetWindowPos(w.hwnd, 0, cast(i32, x) + r.left, cast(i32, y) + r.top, r.right - r.left, r.bottom - r.top,
                                     cast(u32, t.SWP_NOZORDER | t.SWP_NOACTIVATE)) != 0);
 }
@@ -1761,25 +1906,18 @@ fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64
     return 1;
 }
 
-// The system menu — restore, move, size, minimize, maximize, close — at x, y
-// in the window, shown from its own thread's next dispatch. 1 when asked.
-fn show_window_menu(w as *Window, x as i64, y as i64) as i32 {
-    if (is_open(w) == 0) { return 0; }
-    let is t.POINT as p; p.x = cast(i32, x); p.y = cast(i32, y);
-    u.ClientToScreen(w.hwnd, &p);
-    let is i64 as at = (cast(i64, p.x) & 65535) | ((cast(i64, p.y) & 65535) << 16);
-    return cast(i32, u.PostMessageW(w.hwnd, cast(u32, _WM_WINDOW_MENU), 0, at) != 0);
+// Where its own maximize button is, client pixels — 0 by 0 for none: there
+// the system counts it as its own (HTMAXBUTTON) and offers its snap layouts.
+// 1 when told; 0 for a window without a frame of its own.
+fn set_maximize_button(w as *Window, x as i64, y as i64, bw as i64, bh as i64) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || n.own_frame == 0 || bw < 0 || bh < 0) { return 0; }
+    n.maxbtn_x = x; n.maxbtn_y = y; n.maxbtn_w = bw; n.maxbtn_h = bh;
+    return 1;
 }
 
-fn _window_menu(n as *Native, at as i64) as void {
-    let is i64 as menu = u.GetSystemMenu(n.hwnd, 0);
-    if (menu == 0) { return; }
-    u.SetForegroundWindow(n.hwnd);
-    let is i32 as chosen = u.TrackPopupMenu(menu, cast(u32, t.TPM_RETURNCMD | t.TPM_RIGHTBUTTON),
-                                           cast(i32, _signed16(cast(u64, at))), cast(i32, _signed16(cast(u64, at) >> 16)),
-                                           0, n.hwnd, cast(*t.RECT, 0));
-    if (chosen != 0) { u.PostMessageW(n.hwnd, cast(u32, t.WM_SYSCOMMAND), cast(u64, chosen), 0); }
-}
+// Whether it draws its own frame over the system's style.
+fn own_frame(w as *Window) as i32 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.own_frame; }
 
 fn read_settings(w as *Window, out as *desktop_settings.settings.Settings) as i32 {
     *out = desktop_settings.read();

@@ -40,8 +40,8 @@ window/
   native.cst      native handle accessors — the public contract
 
   x11/      done — 8 modules over bind/, see x11/x11.md
-  linux/    what every Linux backend shares: GTK's settings.ini, the portals,
-            the user's folders (user-dirs.dirs)
+  linux/    what every Linux backend shares: the portals, the user's folders
+            (user-dirs.dirs)
   wayland/  protocol.cst  + backend.cst      see wayland/wayland.md
   kms/      drm.cst       + backend.cst      see kms/kms.md
   win32/    user32.cst gdi32.cst + backend.cst   see win32/win32.md
@@ -409,19 +409,19 @@ that large to hit it. `x11/all_link_test.cst` links all seven X libraries —
 **The desktop's settings** (`settings.cst`) are one record — dark, high
 contrast, the accent, the interface and monospace fonts, text scaling,
 animations, double-click time and distance, the drag threshold, the caret's
-blink, the cursor theme, the title bar's buttons — filled by whatever the
-platform has, each source marking what it reported so they merge field by
-field in order of trust:
+blink, the cursor and icon themes — filled by whatever the platform has, each
+source marking what it reported so they merge field by field in order of
+trust; what none reported keeps the toolkit's own default:
 
-- `linux/gtk_ini.cst`: GTK's `settings.ini` files, gtk-3.0's then gtk-4.0's
-  (`settings_test`);
-- `x11/xsettings.cst`: XSETTINGS, followed through the daemon starting,
-  changing its property and quitting, with every length checked against a
-  guard page (`xsettings_test`, `settings_x11_test` under Xvfb);
+- `x11/xsettings.cst`: XSETTINGS — the specification's `Net/` keys and Xft's
+  DPI, nothing a toolkit keeps there under its own prefix — followed through
+  the daemon starting, changing its property and quitting, with every length
+  checked against a guard page (`xsettings_test`, `settings_x11_test` under
+  Xvfb);
 - `linux/portal.cst`: org.freedesktop.portal.Settings over D-Bus (`../dbus/`),
-  GNOME's and KDE's keys under the cross-desktop org.freedesktop.appearance,
-  tested against a fake portal on a private bus (`portal_test`) and read from
-  this desktop's own by `linux/portal_check.cst`.
+  KDE's keys under the cross-desktop org.freedesktop.appearance, tested
+  against a fake portal on a private bus (`portal_test`) and read from this
+  desktop's own by `linux/portal_check.cst`.
 
 - `locale.cst`: the user's language, from the environment as POSIX orders
   it — `LANGUAGE` (its first that is a name; not in the C locale), `LC_ALL`,
@@ -587,27 +587,28 @@ where said:
   `EnumDisplaySettingsW` (`device_win32_test`).
   Neither is imported by `device.cst`: they link libXcursor, libXfixes, libXi
   and libXrandr, which a program that sets no cursor does not need.
-- A frame of the program's own (`device.cst`, `x11/frame.cst`): a window
-  opened see-through (`Config.transparent`, a visual with alpha) and without
-  the window manager's decoration (`Config.decorated` 0, told before it is
-  first mapped — `_MOTIF_WM_HINTS`), or told later (`set_decorated`); where it
-  really is inside its shadow (`set_frame_extents`, `_GTK_FRAME_EXTENTS`) and
-  where it takes the pointer (`set_input_region`, SHAPE); moved or resized
-  from a press (`begin_move_resize`, `MOVE` and the eight `RESIZE_*`, as
-  EWMH numbers them), its menu, minimized, maximized, all asked of the window
-  manager (`_NET_WM_MOVERESIZE`, `_GTK_SHOW_WINDOW_MENU`, `WM_CHANGE_STATE`,
-  `_NET_WM_STATE`); its state with the tiled sides (`state`); and whether a
-  compositing manager shows what is behind it (`composited`,
-  `_NET_WM_CM_S<screen>`'s owner), without which the frame is drawn flat.
-  Its starting or stopping is heard as it happens once `display.follow` was
-  told of a window (`x11/compositor.cst`: XFixes, followed anew on a
-  connection opened again), a `COMPOSITOR` event; the toolkit then draws the
-  frame flat or with its shadow, the platform's window grown or shrunk by the
-  shadow so the window keeps its size (`host_x11_test`).
-  Tested by `device_x11_test` and `x11/frame_test`, a second client holding
-  the map and playing the window manager and the compositing manager.
-  Wayland's `xdg-decoration` and Windows' layered windows and hit-testing come
-  with their backends.
+- A frame of the program's own (`device.cst`, `x11/frame.cst`): every window
+  the toolkit shows draws its own, the same on every platform. Opened without
+  the platform's decoration (`Config.decorated` 0 — on X11 `_MOTIF_WM_HINTS`,
+  told before it is first mapped), or told later (`set_decorated`); where it
+  takes the pointer (`set_input_region`, SHAPE); moved or resized from a press
+  (`begin_move_resize`, `MOVE` and the eight `RESIZE_*`, as EWMH numbers
+  them), minimized, maximized, all asked of the window manager
+  (`_NET_WM_MOVERESIZE`, `WM_CHANGE_STATE`, `_NET_WM_STATE`); its state
+  (`state`); and whether a compositing manager shows what is behind it
+  (`composited`, `_NET_WM_CM_S<screen>`'s owner). EWMH has no word for a
+  shadow outside the window, so on X11 the frame lies wholly inside it
+  (`set_frame_extents` answers 0) and is drawn flat; the window's menu is the
+  toolkit's own on every platform. A compositing manager starting or stopping
+  is heard as it happens once `display.follow` was told of a window
+  (`x11/compositor.cst`: XFixes, followed anew on a connection opened again),
+  a `COMPOSITOR` event. Tested by `device_x11_test` and `x11/frame_test`, a
+  second client holding the map and playing the window manager and the
+  compositing manager. On Wayland the frame asks `xdg-decoration` for client
+  side, and its shadow lies outside the window as `set_window_geometry` says;
+  on Windows the system's style is kept with its frame taken into the client
+  and DWM's shadow and corners (`win32/win32.md`), its own maximize button
+  told the system (`set_maximize_button`) for the snap layouts.
 - The smallest and largest a window may be made (`set_min_size`, `min_size`,
   `set_max_size`): asked again whenever they change — what a layout cannot
   fit into changes after the window is open — as `WM_NORMAL_HINTS`, floor and

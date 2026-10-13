@@ -229,19 +229,34 @@ cursor each portable shape shows and the shapes Windows has none for refused
 zoom-out: `set_cursor` 0, the cursor shown kept), decorations, frame extents, an input region
 exact to its edges (HTTRANSPARENT outside), the command each move or resize
 edge gives the system and the press it takes, a system move from a real synthetic left-button drag,
-the system menu's modal loop until Escape and with Close chosen, an owned modal
+a frame of its own with its maximize button hit-tested as the system's, an owned modal
 dialog and close requests. It found that `WM_NCCREATE` skipped the default
 procedure, so creation titles were lost, and that `resized`, the motion and the
 wheel were never per frame (a window looked resized every frame after its
 first); both are fixed.
 
-A window drawing its own frame answers hit-testing for its edges: between the
-window as the desktop counts it (inside the frame extents) and the input
-region's edge — its edges' reach beyond it — `WM_NCHITTEST` says `HTLEFT` …
-`HTBOTTOMRIGHT`, a corner taking twice that reach along each side as the
-toolkit's frame does, and the system's own sizing loop follows the press; not
-for a framed, fixed-size, maximized or full-screen window or a popup. A dialog
-drawing its own frame is no longer given the system's caption. A move to a
+A window drawing its own frame — `Config.decorated` 0, not a popup, not seen
+through — keeps the system's style (`WS_OVERLAPPEDWINDOW`; a dialog's caption,
+system menu and sizing border), so Aero Snap, the system's size loop and its
+minimize and maximize animations stay; `WM_NCCALCSIZE` takes its whole frame
+into the client, so the window is as large as its client and the toolkit draws
+everything, maximized taken in by the frame the system puts past the monitor's
+edges so nothing is off the work area. `DwmExtendFrameIntoClientArea` one
+pixel deep keeps DWM's shadow; `DWMWA_WINDOW_CORNER_PREFERENCE` rounds its
+corners and `DWMWA_BORDER_COLOR` none leaves the toolkit's hairline as its
+border, where the system does either (Windows 11; Wine and Windows 10 ignore
+them). Its own maximize button, told with `set_maximize_button`, is
+`HTMAXBUTTON` to `WM_NCHITTEST`, so Windows 11 offers its snap layouts over
+it; the pointer's `WM_NCMOUSEMOVE`, `WM_NCLBUTTONDOWN` and `WM_NCLBUTTONUP`
+there, and its leaving (`TME_NONCLIENT`), are said as over the client, the
+press taking the capture, so the button hovers and clicks as the toolkit's
+others and the system acts on none of it. Its window menu is the toolkit's;
+Alt+Space still opens the system's. Between the window as the desktop counts
+it (inside the frame extents) and the input region's edge — its edges' reach
+beyond it — `WM_NCHITTEST` says `HTLEFT` … `HTBOTTOMRIGHT`, a corner taking
+twice that reach along each side as the toolkit's frame does, and the system's
+own sizing loop follows the press; not for a framed, fixed-size, maximized or
+full-screen window or a popup. A move to a
 monitor of another DPI (`WM_DPICHANGED`) takes the size the system suggests
 and says `RESIZE` then `SETTINGS`, so the toolkit lays out again at the new
 scale. Minimized is `STATE_MINIMIZED`, the window's size kept while it is
@@ -249,11 +264,16 @@ not shown; `WM_DWMCOMPOSITIONCHANGED` is `COMPOSITOR`. `monitor_of` says the
 monitor it is most on: its rectangle and work area, the DPI there
 (`GetDpiForMonitor`), its refresh rate (`EnumDisplaySettingsW`, 0 where the
 system knows none, as Wine on Xvfb) and device name. `device_win32_test`
-checks the edges' answers and a real resize from the right edge by the
-system's loop (SendInput), a synthetic `WM_DPICHANGED` and back, minimized
-and restored, the monitor against `GetMonitorInfoW`, and a layered window:
-its opaque pixels exact on the screen, not layered once framed or when asked
-for with a frame. `../transparent_win32_test.cst` with `tools/alpha_check.cst`
+checks the frame of its own — no system frame round it, its client the whole
+window, the style kept, `HTMAXBUTTON` where its button is told and the press
+and release there arriving as the client's, the window not maximized by the
+system, maximized within the work area — the edges' answers and a real resize
+from the right edge by the system's loop (SendInput), a synthetic
+`WM_DPICHANGED` and back, minimized and restored, the monitor against
+`GetMonitorInfoW`, and a layered window: its opaque pixels exact on the
+screen, not layered once framed or when asked for with a frame. Snap layouts
+themselves are Windows 11's and not seen under Wine.
+`../transparent_win32_test.cst` with `tools/alpha_check.cst`
 (`tools/run_alpha.sh`) shows a half-seen red blended over the blue desktop of
 the nested Weston as 0x80007f and the blue itself through the clear part.
 `../../ui/program_win32_test.cst` checks the toolkit following the DPI change:
@@ -272,5 +292,5 @@ area, capturing the pointer and taking the owner's keys, taken down by a press
 outside the program's popups, by the capture going elsewhere and by the
 application's deactivation (`../popup_win32_test.cst`, SendInput). The
 toolkit's own menus are not yet hosted in them; OLE DnD, toolkit UIA, platform
-choosers, notifications, complete CSD and modal-loop toolkit rendering remain
+choosers, notifications and modal-loop toolkit rendering remain
 implementation work, and Wine is not proof of real-Windows behavior.
