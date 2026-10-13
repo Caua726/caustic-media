@@ -1,0 +1,345 @@
+// window/win32/dnd_test.cst — OLE drag and drop with another program, the
+// independent peer window/win32/tools/ole_dnd_peer.c (built with mingw-w64,
+// none of this repository's code), in a Wine prefix and X server of their
+// own, the pointer and keys SendInput's:
+//   sh tools/wine_session.sh sh -c 'rm -f build/ole-peer.log*;
+//       wine build/ole_dnd_peer.exe build/ole-peer.log &
+//       sh tools/run_wine.sh build/win32_dnd_test.exe'
+// Into this window, from the peer's source: two files (copied; moved with
+// Shift held over this window), and 3 MB of text whole. Out of it, OLE's
+// DoDragDrop run on this thread while another moves the pointer: files and
+// text to the peer's target, copied, and moved with Shift held, what it
+// received read back; text alone; Escape over it — DRAG_DONE with no action
+// and nothing received — and let go over nothing.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/thread.cst" as thread;
+use "../../input/event.cst" as ie;
+use "../event.cst" as event;
+use "../transfer.cst" as transfer;
+use "bind/types.cst" as t;
+use "bind/user32.cst" as u;
+use "bind/kernel32.cst" as k;
+use "backend.cst" as win;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+let is win.Window as w with mut;
+let is [64]event.Event as heard;
+let is i32 as nheard with mut = 0;
+let is i32 as taken with mut = 0;   // BUTTON_UP, taken by a drag
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (1 == 1) {
+        win.pump(&w);
+        let is event.Event as e;
+        while (win.poll_event(&w, &e) == 1) {
+            if (((e.kind >= event.DND_ENTER && e.kind <= event.DND_DROP) || e.kind == event.DRAG_DONE) && nheard < 64) {
+                heard[nheard] = e;
+                nheard = nheard + 1;
+            }
+        }
+        let is ie.Event as i;
+        while (win.poll_input(&w, &i) == 1) {
+            if (i.kind == ie.BUTTON_UP && i.detail == ie.BUTTON_TAKEN) { taken = taken + 1; }
+        }
+        if (time.now_ms() >= until) { return; }
+        time.sleep_ms(2);
+    }
+}
+
+fn last(kind as i32) as i32 {
+    let is i32 as i with mut = nheard - 1;
+    while (i >= 0) {
+        if (heard[i].kind == kind) { return i; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+fn until_heard(kind as i32, ms as i64) as i32 {
+    let is i64 as end = time.now_ms() + ms;
+    while (time.now_ms() < end && last(kind) < 0) { pump(10); }
+    return last(kind);
+}
+
+// --- Input, as a device's ---
+
+fn mouse(x as i64, y as i64, flags as i64) as void {
+    let is t.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(t.INPUT));
+    in.c_type = cast(u32, t.INPUT_MOUSE);
+    let is *t.MOUSEINPUT as m = cast(*t.MOUSEINPUT, &in._anon1);
+    let is i64 as sw = cast(i64, u.GetSystemMetrics(cast(i32, t.SM_CXSCREEN)));
+    let is i64 as sh = cast(i64, u.GetSystemMetrics(cast(i32, t.SM_CYSCREEN)));
+    // Rounded up: the system takes the pixel as dx * width / 65536, truncated.
+    m.dx = cast(i32, (x * 65536 + sw - 1) / sw);
+    m.dy = cast(i32, (y * 65536 + sh - 1) / sh);
+    m.dwFlags = cast(u32, flags | t.MOUSEEVENTF_ABSOLUTE | t.MOUSEEVENTF_MOVE);
+    u.SendInput(1, &in, cast(i32, sizeof(t.INPUT)));
+}
+
+fn key(vk as i64, down as i32) as void {
+    let is t.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(t.INPUT));
+    in.c_type = cast(u32, t.INPUT_KEYBOARD);
+    let is *t.KEYBDINPUT as kb = cast(*t.KEYBDINPUT, &in._anon1);
+    kb.wVk = cast(u16, vk);
+    if (down == 0) { kb.dwFlags = cast(u32, t.KEYEVENTF_KEYUP); }
+    u.SendInput(1, &in, cast(i32, sizeof(t.INPUT)));
+}
+
+// The pointer from x0, y0 to x1, y1 in steps, sleeping (pump: 1, this
+// window pumped meanwhile — not from the thread a drag of ours runs on).
+fn glide(x0 as i64, y0 as i64, x1 as i64, y1 as i64, pumping as i32) as void {
+    let is i64 as s with mut = 1;
+    while (s <= 24) {
+        mouse(x0 + (x1 - x0) * s / 24, y0 + (y1 - y0) * s / 24, 0);
+        if (pumping == 1) { pump(25); } else { time.sleep_ms(25); }
+        s = s + 1;
+    }
+}
+
+// --- The peer's log ---
+
+let is transfer.Bytes as logb with mut;
+
+// The file at a path relative to the working directory, read whole: 1 when
+// it was there.
+fn read_file(path as *u8, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    let is [256]u16 as wide;
+    let is i64 as i with mut = 0;
+    while (path[i] != 0 && i < 255) {
+        let is u16 as c with mut = cast(u16, path[i]);
+        if (c == cast(u16, 47)) { c = cast(u16, 92); }
+        wide[i] = c;
+        i = i + 1;
+    }
+    wide[i] = cast(u16, 0);
+    let is i64 as h = k.CreateFileW(&wide[0], cast(u32, t.GENERIC_READ), cast(u32, t.FILE_SHARE_READ | t.FILE_SHARE_WRITE),
+                                    cast(*u8, 0), cast(u32, t.OPEN_EXISTING), cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    let is [65536]u8 as buf with mut;
+    while (1 == 1) {
+        let is u32 as got with mut = cast(u32, 0);
+        if (k.ReadFile(h, &buf[0], cast(u32, 65536), &got, cast(*u8, 0)) == 0 || got == cast(u32, 0)) { break; }
+        transfer.append(out, &buf[0], cast(i64, got));
+    }
+    k.CloseHandle(h);
+    return 1;
+}
+
+fn contains(b as *transfer.Bytes, s as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= b.len) {
+        if (mem.memcmp(cast(*u8, cast(i64, b.data) + i), s, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// How many times line is in the peer's log, within ms of waiting for it to
+// be there at least count times.
+fn log_has(line as *u8, count as i32, ms as i64) as i32 {
+    let is i64 as end = time.now_ms() + ms;
+    while (1 == 1) {
+        if (read_file("build/ole-peer.log", &logb) == 1) {
+            let is i32 as n with mut = 0;
+            let is i64 as len with mut = 0;
+            while (line[len] != 0) { len = len + 1; }
+            let is i64 as i with mut = 0;
+            while (i + len <= logb.len) {
+                if (mem.memcmp(cast(*u8, cast(i64, logb.data) + i), line, len) == 0) { n = n + 1; }
+                i = i + 1;
+            }
+            if (n >= count) { return 1; }
+        }
+        if (time.now_ms() >= end) { return 0; }
+        pump(20);
+    }
+    return 0;
+}
+
+fn same(b as *transfer.Bytes, p as *u8, n as i64) as i32 {
+    if (b.len != n) { io.printf("  %d bytes, want %d\n", b.len, n); return 0; }
+    return cast(i32, mem.memcmp(b.data, p, n) == 0);
+}
+
+fn str_same(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (b[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i32, a[i] == b[i]);
+}
+
+// Whole lines until 3 MB or more: what the peer makes.
+fn big_text(out as *transfer.Bytes) as void {
+    transfer.bytes_clear(out);
+    let is *u8 as line = "ole ação — 3 MB through a global ✓ ";
+    let is i64 as n with mut = 0;
+    while (line[n] != 0) { n = n + 1; }
+    while (out.len < 3145728) { transfer.append(out, line, n); }
+}
+
+// --- Where things are ---
+
+let is i64 as mid_x with mut = 0;   // this window's client, its middle on the screen
+let is i64 as mid_y with mut = 0;
+
+// The peer's target, and its source's bands: files, text, 3 MB of text.
+let is i64 as TARGET_X with imut = 750;
+let is i64 as TARGET_Y with imut = 250;
+let is i64 as SOURCE_X with imut = 750;
+let is i64 as FILES_Y with imut = 500;
+let is i64 as TEXT_Y with imut = 600;
+let is i64 as BIG_Y with imut = 700;
+
+// The peer's source dragged here from band y; Shift held over this window
+// when asked. The drop heard, or -1.
+fn drag_in(y as i64, shift as i32) as i32 {
+    mouse(SOURCE_X, y, 0);
+    pump(100);
+    nheard = 0;
+    mouse(SOURCE_X, y, t.MOUSEEVENTF_LEFTDOWN);
+    pump(100);
+    glide(SOURCE_X, y, mid_x, mid_y, 1);
+    if (shift == 1) { key(t.VK_SHIFT, 1); glide(mid_x, mid_y, mid_x + 10, mid_y + 10, 1); }
+    mouse(mid_x + 10 * cast(i64, shift), mid_y + 10 * cast(i64, shift), t.MOUSEEVENTF_LEFTUP);
+    let is i32 as dr = until_heard(event.DND_DROP, 8000);
+    if (shift == 1) { key(t.VK_SHIFT, 0); }
+    pump(100);
+    return dr;
+}
+
+// A drag out of ours is OLE's DoDragDrop, on this thread to its end; the
+// pointer is moved meanwhile from another: to x, y, Shift held there when
+// shift is 1, Escape pressed there when 2, and let go.
+let is i64 as out_x with mut = 0;
+let is i64 as out_y with mut = 0;
+let is i32 as out_how with mut = 0;
+
+fn mover(arg as i64) as i64 {
+    time.sleep_ms(200);
+    glide(mid_x, mid_y, out_x, out_y, 0);
+    if (out_how == 1) { key(t.VK_SHIFT, 1); glide(out_x, out_y, out_x + 10, out_y + 10, 0); }
+    if (out_how == 2) { key(t.VK_ESCAPE, 1); key(t.VK_ESCAPE, 0); time.sleep_ms(100); }
+    mouse(out_x + 10 * cast(i64, out_how == 1), out_y + 10 * cast(i64, out_how == 1), t.MOUSEEVENTF_LEFTUP);
+    time.sleep_ms(100);
+    if (out_how == 1) { key(t.VK_SHIFT, 0); }
+    return 0;
+}
+
+// Pressed in this window, o dragged to x, y as how says: the DRAG_DONE heard,
+// or -1; *begun what drag_begin said.
+fn drag_out(o as *transfer.Offer, x as i64, y as i64, how as i32, begun as *i32) as i32 {
+    mouse(mid_x, mid_y, 0);
+    pump(100);
+    mouse(mid_x, mid_y, t.MOUSEEVENTF_LEFTDOWN);
+    pump(150);
+    nheard = 0;
+    taken = 0;
+    out_x = x; out_y = y; out_how = how;
+    let is thread.Thread as th;
+    thread.spawn(&th, cast(*u8, fn_ptr(mover)), 0);
+    *begun = win.drag_begin(&w, o, transfer.COPY | transfer.MOVE);
+    thread.join(&th);
+    let is i32 as done = until_heard(event.DRAG_DONE, 3000);
+    pump(100);
+    return done;
+}
+
+fn main() as i32 {
+    transfer.bytes_init(&logb);
+    let is win.Config as c = win.config("dnd-ours", 300, 300);
+    w = win.open_config(&c);
+    if (w.ok == 0) { io.printf("FAIL: no window\n"); return 1; }
+    u.SetWindowPos(w.hwnd, 0, 0, 0, 0, 0, cast(u32, t.SWP_NOSIZE | t.SWP_NOZORDER));
+    pump(300);
+    let is t.POINT as p;
+    p.x = 150; p.y = 150;
+    u.ClientToScreen(w.hwnd, &p);
+    mid_x = cast(i64, p.x); mid_y = cast(i64, p.y);
+    check("the peer ready", log_has("ready", 1, 20000) == 1);
+    let is transfer.Bytes as got with mut;
+    transfer.bytes_init(&got);
+
+    // --- In: the peer's files, copied ---
+    let is i32 as dr with mut = drag_in(FILES_Y, 0);
+    let is i32 as en with mut = last(event.DND_ENTER);
+    check("in: entered, files offered, copying and moving allowed", en >= 0 && heard[en].drop == event.DROP_FILES &&
+          heard[en].action == (transfer.COPY | transfer.MOVE));
+    check("in: dropped, files, a copy", dr >= 0 && heard[dr].drop == event.DROP_FILES && heard[dr].action == transfer.COPY);
+    check("in: the paths", win.dropped_files(&w) == 2 && str_same(win.dropped_file(&w, 0), "C:\\peer one.txt") == 1 &&
+          str_same(win.dropped_file(&w, 1), "C:\\peer-two") == 1);
+    check("in: the peer told it was copied", log_has("end copy", 1, 3000) == 1);
+    win.clear_drop(&w);
+
+    // --- In: moved, Shift held over this window ---
+    dr = drag_in(FILES_Y, 1);
+    check("in, Shift held: dropped as a move", dr >= 0 && heard[dr].action == transfer.MOVE);
+    check("in, Shift held: the peer told it was moved", log_has("end move", 1, 3000) == 1);
+    win.clear_drop(&w);
+
+    // --- In: 3 MB of text ---
+    let is transfer.Bytes as big with mut;
+    transfer.bytes_init(&big);
+    big_text(&big);
+    dr = drag_in(BIG_Y, 0);
+    check("in: 3 MB of text dropped", dr >= 0 && heard[dr].drop == event.DROP_TEXT);
+    transfer.bytes_set(&got, win.dropped_text(&w), win.dropped_text_length(&w));
+    check("in: all 3 MB, as the peer made them", same(&got, big.data, big.len) == 1);
+    win.clear_drop(&w);
+
+    // --- Out: files and text, copied ---
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    check("Windows paths offered", transfer.offer_files(&o, "C:\\our one.txt\x00C:\\ação\x00", 2) == 1);
+    transfer.offer_text(&o, "our text", 8);
+    let is i32 as begun with mut = 0;
+    let is i32 as done with mut = drag_out(&o, TARGET_X, TARGET_Y, 0, &begun);
+    check("out: begun and ended", begun == 1);
+    check("out: the press taken by the drag", taken == 1);
+    check("out: done, a copy", done >= 0 && heard[done].action == transfer.COPY);
+    check("out: the peer received the files, copied", log_has("drop files copy", 1, 3000) == 1 &&
+          read_file("build/ole-peer.log.1", &got) == 1 && same(&got, "C:\\our one.txt\nC:\\ação\n", 25) == 1);
+
+    // --- Out: moved, with Shift held ---
+    done = drag_out(&o, TARGET_X, TARGET_Y, 1, &begun);
+    check("out, Shift held: done, a move", begun == 1 && done >= 0 && heard[done].action == transfer.MOVE);
+    check("out, Shift held: the peer moved them", log_has("drop files move", 1, 3000) == 1);
+
+    // --- Out: text only ---
+    let is transfer.Offer as tx with mut;
+    transfer.offer_init(&tx);
+    transfer.offer_text(&tx, "texto: ação ✓", 17);
+    done = drag_out(&tx, TARGET_X, TARGET_Y, 0, &begun);
+    check("out, text: done, a copy", begun == 1 && done >= 0 && heard[done].action == transfer.COPY);
+    check("out, text: the peer received it", log_has("drop text copy 17", 1, 3000) == 1 &&
+          read_file("build/ole-peer.log.3", &got) == 1 && same(&got, "texto: ação ✓", 17) == 1);
+
+    // --- Out: Escape over the peer ---
+    done = drag_out(&o, TARGET_X, TARGET_Y, 2, &begun);
+    check("out, Escape: done, nothing", begun == 1 && done >= 0 && heard[done].action == 0);
+    check("out, Escape: the peer received nothing", read_file("build/ole-peer.log.4", &got) == 0);
+
+    // --- Out: let go over nothing ---
+    done = drag_out(&o, 450, 900, 0, &begun);
+    check("out, over nothing: done, nothing", begun == 1 && done >= 0 && heard[done].action == 0);
+    check("out, over nothing: the peer received nothing", read_file("build/ole-peer.log.4", &got) == 0);
+
+    transfer.offer_free(&o);
+    transfer.offer_free(&tx);
+    win.close(&w);
+    if (fails == 0) { io.printf("win32 dnd with an OLE peer: all checks passed\n"); return 0; }
+    io.printf("win32 dnd with an OLE peer: %d failures\n", fails);
+    return 1;
+}

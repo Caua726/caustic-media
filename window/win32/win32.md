@@ -181,10 +181,22 @@ place and bit 30 as the system's repeat, a `WM_CHAR` the key's only right
 after it went down, focus loss a `CANCEL` that lets the buttons and the
 capture go, a press a system move takes ending in `BUTTON_TAKEN` and a
 release of a button not held unsaid — plus modal owners,
-fullscreen restore, size constraints and native cursors. Unicode clipboard
-ownership and reads use `CF_UNICODETEXT`. `settings.cst` reads the desktop's
-locale, font, DPI, timings, high contrast, animation preference and available
-registry/DWM preferences.
+fullscreen restore, size constraints and native cursors. The clipboard is
+had by format (`../transfer.cst`): `CF_UNICODETEXT` for text and the
+registered `"PNG"`, its block exactly the image (readers take
+`GlobalSize`); there is no primary selection, and asking for one is
+refused rather than made up. Drag and drop is OLE's, implemented directly
+(`ole.cst`): each window registers an `IDropTarget` of its own that offers
+what `CF_HDROP` and `CF_UNICODETEXT` hold, says the effect the program
+takes (a move with Shift held) and does at the drop what its last
+`DragOver` said (Wine passes no key held to `Drop`); `drag_begin` makes an
+`IDataObject` with its `IEnumFORMATETC` and an `IDropSource` (Escape
+cancels) and runs `DoDragDrop` to its end, `DRAG_DONE` after it.
+`selection_test.cst` and `dnd_test.cst` prove both against peers built with
+mingw-w64 from the SDK alone (`tools/clipboard_peer.c`,
+`tools/ole_dnd_peer.c`), SendInput's pointer and keys. `settings.cst` reads
+the desktop's locale, font, DPI, timings, high contrast, animation
+preference and available registry/DWM preferences.
 
 `backend_test.cst` exercises actual windows under Wine/Xvfb: presented pixels,
 keys with their place and the system's repeat, Unicode surrogate pairs, whose

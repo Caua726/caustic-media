@@ -1,85 +1,218 @@
-// CF_UNICODETEXT ownership belongs to Windows after SetClipboardData succeeds.
+// window/win32/clipboard.cst — the Windows clipboard, and the global memory
+// blocks it and OLE's data objects carry.
+//
+// Text is CF_UNICODETEXT (UTF-16, NUL-terminated), made from and read back as
+// UTF-8; a PNG is the registered format "PNG", the file's bytes, as image
+// programs on Windows put it. Windows owns a block once SetClipboardData
+// took it. There is no primary selection: asked for, refused. The clipboard
+// answers at once — request() reads it there and then.
 use "std/mem.cst" as mem;
 use "bind/user32.cst" as u;
 use "bind/kernel32.cst" as k;
 use "bind/types.cst" as t;
+use "../transfer.cst" as transfer;
 
 struct State {
-    text as *u8;
-    length as i64;
-    bytes as i64;
-    ready as i32;
+    ready   as i32;
+    got     as i32;      // the format read; 0 for none
+    offered as i32;      // the formats there, as transfer bits
+    _pad    as i32;
+    data    as transfer.Bytes;
+}
+
+fn init(s as *State) as void {
+    s.ready = 0; s.got = 0; s.offered = 0;
+    transfer.bytes_init(&s.data);
 }
 
 fn clear(s as *State) as void {
-    if (cast(i64, s.text) != 0) { mem.core.munmap(s.text, s.bytes); }
-    mem.memzero(cast(*u8, s), sizeof(State));
+    transfer.bytes_free(&s.data);
+    init(s);
 }
 
-fn set(hwnd as i64, text as *u8, length as i64) as i32 {
-    if (length < 0 || length > 2147483646 || (length > 0 && cast(i64, text) == 0)) { return 0; }
+let is u32 as _png_format with mut = 0;
+
+// The registered "PNG" format, registered once.
+fn png_format() as u32 {
+    if (_png_format == cast(u32, 0)) {
+        let is [4]u16 as name;
+        name[0] = cast(u16, 80); name[1] = cast(u16, 78); name[2] = cast(u16, 71); name[3] = cast(u16, 0);
+        _png_format = u.RegisterClipboardFormatW(&name[0]);
+    }
+    return _png_format;
+}
+
+// --- Global memory blocks ---
+
+// A movable block of exactly n bytes copied from p — what reads it takes
+// GlobalSize for its length: 0 when refused.
+fn block_of(p as *u8, n as i64) as i64 {
+    let is i64 as size with mut = n;
+    if (size < 1) { size = 1; }
+    let is i64 as block = k.GlobalAlloc(cast(u32, t.GMEM_MOVEABLE), cast(u64, size));
+    if (block == 0) { return 0; }
+    let is *u8 as d = cast(*u8, k.GlobalLock(block));
+    if (cast(i64, d) == 0) { k.GlobalFree(block); return 0; }
+    if (n > 0) { mem.memcpy(d, p, n); }
+    k.GlobalUnlock(block);
+    return block;
+}
+
+// UTF-8 as a block of UTF-16 with its NUL: CF_UNICODETEXT. extra: how many
+// bytes to leave free before it (a DROPFILES header), zeroed. 0 when refused.
+fn block_wide(text as *u8, n as i64, extra as i64) as i64 {
+    if (n < 0 || n > 2147483646) { return 0; }
     let is i32 as units with mut = 0;
-    if (length > 0) {
-        units = k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 8, cast(*i8, text), cast(i32, length), cast(*u16, 0), 0);
+    if (n > 0) {
+        units = k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 8, cast(*i8, text), cast(i32, n), cast(*u16, 0), 0);
         if (units <= 0) { return 0; }
     }
-    let is i64 as block = k.GlobalAlloc(cast(u32, t.GMEM_MOVEABLE), cast(u64, (cast(i64, units) + 1) * 2));
+    let is i64 as bytes = extra + (cast(i64, units) + 1) * 2;
+    let is i64 as block = k.GlobalAlloc(cast(u32, t.GMEM_MOVEABLE | t.GMEM_ZEROINIT), cast(u64, bytes));
     if (block == 0) { return 0; }
-    let is *u16 as wide = cast(*u16, k.GlobalLock(block));
-    if (cast(i64, wide) == 0) { k.GlobalFree(block); return 0; }
-    if (units > 0) {
-        if (k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 8, cast(*i8, text), cast(i32, length), wide, units) != units) {
-            k.GlobalUnlock(block); k.GlobalFree(block); return 0;
-        }
+    let is *u8 as base = cast(*u8, k.GlobalLock(block));
+    if (cast(i64, base) == 0) { k.GlobalFree(block); return 0; }
+    let is *u16 as wide = cast(*u16, cast(i64, base) + extra);
+    if (units > 0 && k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 8, cast(*i8, text), cast(i32, n), wide, units) != units) {
+        k.GlobalUnlock(block); k.GlobalFree(block); return 0;
     }
     wide[units] = cast(u16, 0);
     k.GlobalUnlock(block);
-    if (u.OpenClipboard(hwnd) == 0) { k.GlobalFree(block); return 0; }
-    let is i32 as ok with mut = 0;
-    if (u.EmptyClipboard() != 0 && u.SetClipboardData(cast(u32, t.CF_UNICODETEXT), block) != 0) { ok = 1; }
-    u.CloseClipboard();
-    if (ok == 0) { k.GlobalFree(block); }
-    return ok;
+    return block;
 }
 
-fn request(s as *State, hwnd as i64) as i32 {
-    clear(s);
-    if (u.OpenClipboard(hwnd) == 0) { return 0; }
-    if (u.IsClipboardFormatAvailable(cast(u32, t.CF_UNICODETEXT)) == 0) {
-        u.CloseClipboard(); s.ready = 1; return 1;
+// count paths, back to back, each zero-terminated UTF-8, as CF_HDROP: a
+// DROPFILES header, then each path UTF-16 with its NUL, a NUL after all.
+fn block_files(paths as *u8, count as i64) as i64 {
+    // The paths with NULs between, as one string: each NUL becomes a wide NUL.
+    let is i64 as total with mut = 0;
+    let is i64 as k2 with mut = 0;
+    while (k2 < count) {
+        while (paths[total] != 0) { total = total + 1; }
+        total = total + 1;
+        k2 = k2 + 1;
     }
-    let is i64 as block = u.GetClipboardData(cast(u32, t.CF_UNICODETEXT));
+    // MultiByteToWideChar converts embedded NULs as they are; one more after.
+    let is i64 as header = 20;
+    let is i64 as block = block_wide(paths, total, header);
+    if (block == 0) { return 0; }
+    let is *u8 as base = cast(*u8, k.GlobalLock(block));
+    if (cast(i64, base) == 0) { k.GlobalFree(block); return 0; }
+    *cast(*u32, base) = cast(u32, header);   // pFiles
+    *cast(*i32, cast(i64, base) + 16) = 1;  // fWide
+    k.GlobalUnlock(block);
+    return block;
+}
+
+// n UTF-16 units at wide (fewer when a NUL comes first) as UTF-8 into out.
+fn wide_to(wide as *u16, n as i64, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    let is i64 as units with mut = 0;
+    while (units < n && wide[units] != cast(u16, 0)) { units = units + 1; }
+    if (units == 0) { return 1; }
+    if (units > 2147483647) { return 0; }
+    let is i32 as size = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, cast(i32, units), cast(*i8, 0), 0,
+                                               cast(*i8, 0), cast(*i32, 0));
+    if (size <= 0 || transfer.reserve(out, cast(i64, size)) == 0) { return 0; }
+    let is i32 as made = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, cast(i32, units), cast(*i8, out.data), size,
+                                               cast(*i8, 0), cast(*i32, 0));
+    if (made != size) { return 0; }
+    out.len = cast(i64, size);
+    out.data[out.len] = 0;
+    return 1;
+}
+
+// A PNG's own length within n bytes — its chunks to the end of IEND — for a
+// block the system may have made larger than what was put in it; n when the
+// bytes are not a PNG's.
+fn png_length(p as *u8, n as i64) as i64 {
+    if (n < 8 || p[0] != 137 || p[1] != 80 || p[2] != 78 || p[3] != 71) { return n; }
+    let is i64 as at with mut = 8;
+    while (at + 12 <= n) {
+        let is i64 as len = (cast(i64, p[at]) << 24) | (cast(i64, p[at + 1]) << 16) | (cast(i64, p[at + 2]) << 8) | cast(i64, p[at + 3]);
+        let is i64 as next = at + 12 + len;
+        if (len < 0 || next > n) { return n; }
+        if (p[at + 4] == 73 && p[at + 5] == 69 && p[at + 6] == 78 && p[at + 7] == 68) { return next; }   // IEND
+        at = next;
+    }
+    return n;
+}
+
+// A CF_UNICODETEXT block read as UTF-8.
+fn read_wide(block as i64, out as *transfer.Bytes) as i32 {
     let is i64 as capacity = cast(i64, k.GlobalSize(block)) / 2;
     let is *u16 as wide = cast(*u16, k.GlobalLock(block));
-    if (cast(i64, wide) == 0) { u.CloseClipboard(); return 0; }
-    let is i64 as units with mut = 0;
-    while (units < capacity && wide[units] != 0) { units = units + 1; }
-    let is i32 as size with mut = 0;
-    if (units > 0 && units <= 2147483647) {
-        size = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, cast(i32, units), cast(*i8, 0), 0,
-                                   cast(*i8, 0), cast(*i32, 0));
-    }
-    let is i32 as ok with mut = 1;
-    if (size > 0) {
-        s.bytes = cast(i64, size) + 1;
-        s.text = mem.core.mmap_anon(s.bytes);
-        if (cast(i64, s.text) == 0) { ok = 0; }
-        else {
-            s.length = cast(i64, k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, cast(i32, units),
-                                                      cast(*i8, s.text), size, cast(*i8, 0), cast(*i32, 0)));
-            s.text[s.length] = cast(u8, 0);
-        }
-    }
-    k.GlobalUnlock(block); u.CloseClipboard();
-    s.ready = ok;
+    if (cast(i64, wide) == 0) { return 0; }
+    let is i32 as ok = wide_to(wide, capacity, out);
+    k.GlobalUnlock(block);
     return ok;
 }
 
-fn read(s as *State, out as *u8, cap as i64) as i64 {
-    if (cap <= 0 || cast(i64, out) == 0) { return 0; }
-    let is i64 as length with mut = s.length;
-    if (length >= cap) { length = cap - 1; }
-    if (length > 0) { mem.memcpy(out, s.text, length); }
-    out[length] = cast(u8, 0);
-    return length;
+// A block holding a PNG read as its bytes, no more than the PNG's own.
+fn read_png(block as i64, out as *transfer.Bytes) as i32 {
+    let is i64 as n = cast(i64, k.GlobalSize(block));
+    let is *u8 as p = cast(*u8, k.GlobalLock(block));
+    if (cast(i64, p) == 0) { return 0; }
+    let is i32 as ok = transfer.bytes_set(out, p, png_length(p, n));
+    k.GlobalUnlock(block);
+    return ok;
+}
+
+// --- The clipboard ---
+
+// What o offers on the clipboard, owned by hwnd: text and a PNG, both when
+// both are offered. 1 when the system took them.
+fn set(hwnd as i64, o as *transfer.Offer) as i32 {
+    if ((o.formats & (transfer.TEXT | transfer.PNG)) == 0) { return 0; }
+    let is i64 as text with mut = 0;
+    let is i64 as png with mut = 0;
+    if ((o.formats & transfer.TEXT) != 0) {
+        text = block_wide(o.text.data, o.text.len, 0);
+        if (text == 0) { return 0; }
+    }
+    if ((o.formats & transfer.PNG) != 0) {
+        png = block_of(o.png.data, o.png.len);
+        if (png == 0) { if (text != 0) { k.GlobalFree(text); } return 0; }
+    }
+    if (u.OpenClipboard(hwnd) == 0) {
+        if (text != 0) { k.GlobalFree(text); }
+        if (png != 0) { k.GlobalFree(png); }
+        return 0;
+    }
+    let is i32 as ok with mut = cast(i32, u.EmptyClipboard() != 0);
+    // A block the system took is its own; one it did not is still ours.
+    if (text != 0) {
+        if (ok == 1 && u.SetClipboardData(cast(u32, t.CF_UNICODETEXT), text) != 0) { text = 0; } else { ok = 0; }
+    }
+    if (png != 0) {
+        if (ok == 1 && u.SetClipboardData(png_format(), png) != 0) { png = 0; } else { ok = 0; }
+    }
+    u.CloseClipboard();
+    if (text != 0) { k.GlobalFree(text); }
+    if (png != 0) { k.GlobalFree(png); }
+    return ok;
+}
+
+// The clipboard read as format (transfer.TEXT, PNG; 0 for which formats
+// are there), now: ready, got, offered and data say what came. 1 when it
+// could be opened.
+fn request(s as *State, hwnd as i64, format as i32) as i32 {
+    s.ready = 0; s.got = 0; s.offered = 0;
+    transfer.bytes_clear(&s.data);
+    if (u.OpenClipboard(hwnd) == 0) { return 0; }
+    if (u.IsClipboardFormatAvailable(cast(u32, t.CF_UNICODETEXT)) != 0) { s.offered = s.offered | transfer.TEXT; }
+    if (u.IsClipboardFormatAvailable(png_format()) != 0) { s.offered = s.offered | transfer.PNG; }
+    if (format != 0 && (s.offered & format) != 0) {
+        let is u32 as cf with mut = cast(u32, t.CF_UNICODETEXT);
+        if (format == transfer.PNG) { cf = png_format(); }
+        let is i64 as block = u.GetClipboardData(cf);
+        if (block != 0) {
+            let is i32 as ok with mut = 0;
+            if (format == transfer.TEXT) { ok = read_wide(block, &s.data); } else { ok = read_png(block, &s.data); }
+            if (ok == 1) { s.got = format; } else { transfer.bytes_clear(&s.data); }
+        }
+    }
+    u.CloseClipboard();
+    s.ready = 1;
+    return 1;
 }

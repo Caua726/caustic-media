@@ -36,6 +36,7 @@ use "settings.cst" as settings;
 use "locale.cst" as locale;
 use "positioner.cst" as positioner;
 use "damage.cst" as damage;
+use "transfer.cst" as transfer;
 use "../math/math.cst" as math;
 
 // --- Backends ---
@@ -603,6 +604,7 @@ fn _x11_event(w as *Window, out as *event.Event) as i32 {
     out.width = xev.width;
     out.height = xev.height;
     out.drop = xev.drop;
+    out.action = xev.action;
     out.state = xev.state;
     return 1;
 }
@@ -629,11 +631,15 @@ fn poll_input(w as *Window, out as *ie.Event) as i32 {
     return 0;
 }
 
-// Milliseconds until the window's backend has input of its own to say — a
-// held key's next repeat where the platform leaves repeating to the client
-// (Wayland) — 0 when due, -1 for none. wait.cst sleeps no longer than this.
+// Milliseconds until the window's backend has something of its own to say —
+// a held key's next repeat where the platform leaves repeating to the client
+// (Wayland), a transfer to move on, a drag or a selection's answer given up
+// after its time — 0 when due, -1 for none. wait.cst sleeps no longer than
+// this.
 fn input_due(w as *Window) as i64 {
-    if (os.current() == os.OS_LINUX && w.backend == WAYLAND && w.ok == 1) { return wayland.input_due(w.wayland_win); }
+    if (w.ok == 0) { return 0 - 1; }
+    if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.input_due(w.wayland_win); }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.input_due(&w.x11_win); }
     return 0 - 1;
 }
 
@@ -1100,38 +1106,40 @@ fn text_input_reset(w as *Window) as i32 {
     return 0;
 }
 
-// --- The clipboard ---
+// --- The clipboard and the primary selection ---
 //
 // CLIPBOARD, what copying fills, and PRIMARY, what selecting fills where the
-// platform has one (X11, Wayland; not Windows). Text set is served by the
-// window while it lives; text asked for arrives as the events are pumped:
-// ready, then read. Windows answers at once.
+// platform has one (X11, Wayland; Windows has none: refused there). What is
+// set (transfer.Offer: text, a PNG) is copied and served by the window while
+// it lives and owns it. What is asked for, by format (transfer.TEXT, PNG; 0
+// for which formats are offered), arrives as the events are pumped: ready,
+// then read — format 0 when the selection has none of it. Windows answers at
+// once.
 
 let is i32 as CLIPBOARD with imut = 0;
 let is i32 as PRIMARY   with imut = 1;
 
-fn clipboard_set(w as *Window, which as i32, s as *u8, n as i64) as i32 {
+fn clipboard_set(w as *Window, which as i32, o as *transfer.Offer) as i32 {
     if (w.ok == 0) { return 0; }
     if (os.current() == os.OS_LINUX) {
-        if (w.backend == X11) { return x11.selection_set_text(&w.x11_win, which, s, n); }
-        if (w.backend == WAYLAND) { return wayland.clipboard_set(w.wayland_win, which, s, n); }
+        if (w.backend == X11) { return x11.selection_set(&w.x11_win, which, o); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_set(w.wayland_win, which, o); }
     }
-    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_set(&w.win32_win, which, s, n); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_set(&w.win32_win, which, o); }
     return 0;
 }
 
-fn clipboard_request(w as *Window, which as i32) as i32 {
+fn clipboard_request(w as *Window, which as i32, format as i32) as i32 {
     if (w.ok == 0) { return 0; }
     if (os.current() == os.OS_LINUX) {
-        if (w.backend == X11) { return x11.selection_request_text(&w.x11_win, which); }
-        if (w.backend == WAYLAND) { return wayland.clipboard_request(w.wayland_win, which); }
+        if (w.backend == X11) { return x11.selection_request(&w.x11_win, which, format); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_request(w.wayland_win, which, format); }
     }
-    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_request(&w.win32_win, which); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_request(&w.win32_win, which, format); }
     return 0;
 }
 
-// Whether what was asked for came: then clipboard_text has it (empty when
-// there was none to have).
+// Whether what was asked for came: then clipboard_format and the rest have it.
 fn clipboard_ready(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
     if (os.current() == os.OS_LINUX) {
@@ -1153,29 +1161,70 @@ fn clipboard_pending(w as *Window) as i32 {
     return 0;
 }
 
-fn clipboard_text(w as *Window, buf as *u8, cap as i64) as i64 {
+// The format that came: what was asked for, or 0 when there was none of it.
+fn clipboard_format(w as *Window) as i32 {
     if (w.ok == 0) { return 0; }
     if (os.current() == os.OS_LINUX) {
-        if (w.backend == X11) { return x11.clipboard_text(&w.x11_win, buf, cap); }
-        if (w.backend == WAYLAND) { return wayland.clipboard_text(w.wayland_win, buf, cap); }
+        if (w.backend == X11) { return x11.selection_format(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_format(w.wayland_win); }
     }
-    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_text(&w.win32_win, buf, cap); }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_format(&w.win32_win); }
     return 0;
 }
 
-// --- Dropped on the window ---
-//
-// What another program drags over the window is heard as event.DND_* events;
-// what the program takes where the pointer is, drop_answer says to the source
-// (event.DROP_FILES, DROP_TEXT, 0) — until it does, everything offered is
-// taken. What arrived stays readable until clear_drop.
+// Its bytes — UTF-8 for text, the file for a PNG — clipboard_length of them,
+// a zero after; the window's until asked again.
+fn clipboard_data(w as *Window) as *u8 {
+    if (w.ok == 0) { return cast(*u8, 0); }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.selection_data(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_data(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_data(&w.win32_win); }
+    return cast(*u8, 0);
+}
 
-fn drop_answer(w as *Window, takes as i32) as i32 {
+fn clipboard_length(w as *Window) as i64 {
     if (w.ok == 0) { return 0; }
     if (os.current() == os.OS_LINUX) {
-        if (w.backend == X11) { return x11.drop_answer(&w.x11_win, takes); }
-        if (w.backend == WAYLAND) { return wayland.drop_answer(w.wayland_win, takes); }
+        if (w.backend == X11) { return x11.selection_length(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_length(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_length(&w.win32_win); }
+    return 0;
+}
+
+// The formats the selection offered (transfer bits), once an answer came.
+fn clipboard_offered(w as *Window) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.selection_offered(&w.x11_win); }
+        if (w.backend == WAYLAND) { return wayland.clipboard_offered(w.wayland_win); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_offered(&w.win32_win); }
+    return 0;
+}
+
+// --- Drag and drop ---
+//
+// What another program drags over the window is heard as event.DND_* events:
+// what it offers (transfer.FILES, TEXT) and the actions it allows
+// (transfer.COPY, MOVE). What the program takes where the pointer is, and
+// how, drop_answer says to the source — until it does, everything offered is
+// taken, as the source suggests. What arrived stays readable until clear_drop.
+//
+// A drag out of the window (drag_begin, from a press still held) is the
+// platform's from there: the press is said taken (input's BUTTON_UP,
+// BUTTON_TAKEN), and its end is event.DRAG_DONE, with the action the target
+// did — 0 when refused or cancelled.
+
+fn drop_answer(w as *Window, takes as i32, action as i32) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.drop_answer(&w.x11_win, takes, action); }
+        if (w.backend == WAYLAND) { return wayland.drop_answer(w.wayland_win, takes, action); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.drop_answer(&w.win32_win, takes, action); }
     return 0;
 }
 
@@ -1185,26 +1234,29 @@ fn dropped_files(w as *Window) as i64 {
         if (w.backend == X11) { return x11.dropped_files(&w.x11_win); }
         if (w.backend == WAYLAND) { return wayland.dropped_files(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_files(&w.win32_win); }
     return 0;
 }
 
-// The i-th path, zero-terminated; null for none.
+// The i-th path, zero-terminated UTF-8; null for none.
 fn dropped_file(w as *Window, i as i64) as *u8 {
     if (w.ok == 0) { return cast(*u8, 0); }
     if (os.current() == os.OS_LINUX) {
         if (w.backend == X11) { return x11.dropped_file(&w.x11_win, i); }
         if (w.backend == WAYLAND) { return wayland.dropped_file(w.wayland_win, i); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_file(&w.win32_win, i); }
     return cast(*u8, 0);
 }
 
-// The text dropped, UTF-8, dropped_text_length bytes, not terminated.
+// The text dropped, UTF-8, dropped_text_length bytes.
 fn dropped_text(w as *Window) as *u8 {
     if (w.ok == 0) { return cast(*u8, 0); }
     if (os.current() == os.OS_LINUX) {
         if (w.backend == X11) { return x11.dropped_text(&w.x11_win); }
         if (w.backend == WAYLAND) { return wayland.dropped_text(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_text(&w.win32_win); }
     return cast(*u8, 0);
 }
 
@@ -1214,6 +1266,7 @@ fn dropped_text_length(w as *Window) as i64 {
         if (w.backend == X11) { return x11.dropped_text_length(&w.x11_win); }
         if (w.backend == WAYLAND) { return wayland.dropped_text_length(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_text_length(&w.win32_win); }
     return 0;
 }
 
@@ -1223,6 +1276,20 @@ fn clear_drop(w as *Window) as void {
         if (w.backend == X11) { x11.clear_drop(&w.x11_win); }
         if (w.backend == WAYLAND) { wayland.clear_drop(w.wayland_win); }
     }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.clear_drop(&w.win32_win); }
+}
+
+// A drag of what o offers out of the window, the actions allowed: 1 when it
+// began. On Windows it runs to its end here (OLE's DoDragDrop), DRAG_DONE
+// queued by the time this returns.
+fn drag_begin(w as *Window, o as *transfer.Offer, actions as i32) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (os.current() == os.OS_LINUX) {
+        if (w.backend == X11) { return x11.drag_begin(&w.x11_win, o, actions); }
+        if (w.backend == WAYLAND) { return wayland.drag_begin(w.wayland_win, o, actions); }
+    }
+    if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.drag_begin(&w.win32_win, o, actions); }
+    return 0;
 }
 
 // --- The desktop's settings ---

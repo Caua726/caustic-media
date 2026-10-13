@@ -194,7 +194,22 @@ Optional globals degrade independently. Clipboard and DnD require
 `wl_data_device_manager`; primary selection requires
 `zwp_primary_selection_device_manager_v1`; fractional scaling requires both
 `wp_viewporter` and `wp_fractional_scale_manager_v1`; server decorations and
-dialog roles use their corresponding optional protocols. The pointer's shape
+dialog roles use their corresponding optional protocols. Selections and drops
+move by format (`../transfer.cst`): a source offers text under
+`text/plain;charset=utf-8`, `UTF8_STRING` and `text/plain`, a PNG as
+`image/png`, files as `text/uri-list`, and writes each request's pipe as the
+pump goes, never blocking — a reader that stops reading or leaves (`EPIPE`,
+`SIGPIPE` ignored) is let go of, its descriptor closed; what is asked for is
+read the same way, `input_due` 0 while a transfer has data. A selection is
+owned by the latest input serial — a key's, a press's, the keyboard's enter
+(KWin refuses one older than the selection's own). Drops answer with the type
+they would read and, at version 3, the actions taken and the one preferred
+(the compositor makes it a move while Shift is held); a drag out is
+`wl_data_device.start_drag` under the press's serial, `DRAG_DONE` from
+`dnd_finished` or `cancelled`. `clipboard_test` plays the compositor on a
+socket pair; `selection_test` proves them against wl-copy/wl-paste and
+`dnd_test` against GTK 3 on a KWin nested in Xvfb, XTest's pointer and keys.
+The pointer's shape
 is `wp_cursor_shape_manager_v1`'s where the compositor has it; without it
 (Weston), or with `CAUSTIC_WAYLAND_CURSOR_SHAPE=0` keeping it unbound, the
 client draws the shape from the cursor theme (`../xcursor.cst`; the
@@ -216,14 +231,14 @@ Keys still type while text input is on: an input method grabs the keys it
 composes with (`wayland/text_input_test`, `text_input_wayland_test` on KWin).
 
 `caustic-mk run test-wayland` checks the generated protocol catalog, exercises
-clipboard/DnD and text-input-v3 through internal wire tests, opens and presents
-windows on Weston at scale 1 and 2, and runs the toolkit application loop.
-Native regressions cover parent/child and independent-window lifetimes,
-abandoned acquisitions, presentation permits, maximize/fullscreen frames and
-normal-size restoration.
+clipboard/DnD and text-input-v3 through internal wire tests and against
+other programs on KWin, opens and presents windows on Weston at scale 1 and
+2, and runs the toolkit application loop. Native regressions cover
+parent/child and independent-window lifetimes, abandoned acquisitions,
+presentation permits, maximize/fullscreen frames and normal-size restoration.
 The toolkit regression checks that dialogs fit their native buffer and stay
 below their client-side header. The headless Weston has no keyboard/pointer
-seat; it cannot prove desktop clipboard, DnD or IME interaction.
+seat; installed IME interaction is the separate KWin and Fcitx5 gate.
 
 KWin is the second compositor (`tools/run_kwin.sh`: its own runtime,
 configuration and bare session bus; `KWIN_BACKEND=x11` nests it in Xvfb,
@@ -287,8 +302,8 @@ The settings form accepts text and Tab; header maximize/restore preserves
 its original buffer size. The browser accepts an edited directory path and
 scrolls its table. Closing the modified settings form shows its native
 confirmation dialog; selecting No exits cleanly. Screenshots establish the
-visible native surfaces and client-side frames. External desktop clipboard,
-DnD and installed IME interaction remain unverified. Presentation sends
+visible native surfaces and client-side frames. Installed IME interaction
+through the toolkit remains for the desktop gate. Presentation sends
 explicit surface damage
 before the frame request and commit, including when a buffer is reused.
 

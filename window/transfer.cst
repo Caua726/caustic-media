@@ -1,0 +1,305 @@
+// window/transfer.cst — what moves between programs: the clipboard's and a
+// drag's data, by format, and the bytes that carry it.
+//
+// Three formats, as bits: FILES (paths — text/uri-list on Linux, CF_HDROP on
+// Windows), TEXT (UTF-8 — UTF8_STRING and text/plain;charset=utf-8 on Linux,
+// CF_UNICODETEXT on Windows) and PNG (image/png's bytes; Windows' registered
+// "PNG"). Two actions: COPY and MOVE.
+//
+// An Offer is what this program puts on the clipboard or drags: a copy of the
+// data of each format offered, kept by the window until another offer takes
+// its place. Bytes grow as data arrives — a selection's chunks, a pipe's
+// reads — up to MAX_BYTES, beyond which a transfer is refused rather than cut
+// short.
+use "std/mem.cst" as mem;
+
+let is i32 as FILES with imut = 1;
+let is i32 as TEXT  with imut = 2;
+let is i32 as PNG   with imut = 4;
+
+let is i32 as COPY with imut = 1;
+let is i32 as MOVE with imut = 2;
+
+let is i64 as MAX_BYTES with imut = 268435456;   // 256 MB
+
+// --- Bytes ---
+
+struct Bytes {
+    data as *u8;
+    len  as i64;
+    cap  as i64;
+}
+
+fn bytes_init(b as *Bytes) as void { b.data = cast(*u8, 0); b.len = 0; b.cap = 0; }
+
+fn bytes_free(b as *Bytes) as void {
+    if (cast(i64, b.data) != 0) { mem.core.munmap(b.data, b.cap); }
+    bytes_init(b);
+}
+
+// Room for n bytes in all, one more kept for a terminating zero: 1, or 0 when
+// that is more than MAX_BYTES or memory is refused (what was there kept).
+fn reserve(b as *Bytes, n as i64) as i32 {
+    if (n < 0 || n > MAX_BYTES) { return 0; }
+    if (n + 1 <= b.cap) { return 1; }
+    let is i64 as cap with mut = b.cap * 2;
+    if (cap < 4096) { cap = 4096; }
+    while (cap < n + 1) { cap = cap * 2; }
+    let is *u8 as d = mem.core.mmap_anon(cap);
+    if (cast(i64, d) == 0) { return 0; }
+    if (b.len > 0) { mem.memcpy(d, b.data, b.len); }
+    if (cast(i64, b.data) != 0) { mem.core.munmap(b.data, b.cap); }
+    b.data = d; b.cap = cap;
+    return 1;
+}
+
+// n bytes of p after what is there, a zero after them: 1, or 0 when there is
+// no room (nothing added).
+fn append(b as *Bytes, p as *u8, n as i64) as i32 {
+    if (n < 0 || reserve(b, b.len + n) == 0) { return 0; }
+    if (n > 0) { mem.memcpy(cast(*u8, cast(i64, b.data) + b.len), p, n); }
+    b.len = b.len + n;
+    b.data[b.len] = 0;
+    return 1;
+}
+
+// Emptied, its memory kept.
+fn bytes_clear(b as *Bytes) as void {
+    b.len = 0;
+    if (cast(i64, b.data) != 0) { b.data[0] = 0; }
+}
+
+fn bytes_set(b as *Bytes, p as *u8, n as i64) as i32 {
+    bytes_clear(b);
+    return append(b, p, n);
+}
+
+// --- What is offered ---
+
+struct Offer {
+    formats as i32;     // the formats it has, bits
+    text    as Bytes;   // TEXT: UTF-8
+    png     as Bytes;   // PNG: the file's bytes
+    uris    as Bytes;   // FILES: text/uri-list, built from the paths
+    paths   as Bytes;   // FILES: the paths, back to back, each zero-terminated
+    count   as i64;     // FILES: how many
+}
+
+fn offer_init(o as *Offer) as void {
+    o.formats = 0;
+    bytes_init(&o.text); bytes_init(&o.png); bytes_init(&o.uris); bytes_init(&o.paths);
+    o.count = 0;
+}
+
+fn offer_free(o as *Offer) as void {
+    bytes_free(&o.text); bytes_free(&o.png); bytes_free(&o.uris); bytes_free(&o.paths);
+    o.formats = 0; o.count = 0;
+}
+
+// Text, n bytes of UTF-8 at s, offered too: 1, or 0 when it could not be kept.
+fn offer_text(o as *Offer, s as *u8, n as i64) as i32 {
+    if (bytes_set(&o.text, s, n) == 0) { return 0; }
+    o.formats = o.formats | TEXT;
+    return 1;
+}
+
+// A PNG image, n bytes at p, offered too.
+fn offer_png(o as *Offer, p as *u8, n as i64) as i32 {
+    if (n < 8 || bytes_set(&o.png, p, n) == 0) { return 0; }
+    o.formats = o.formats | PNG;
+    return 1;
+}
+
+// n absolute paths, back to back at paths, each zero-terminated, offered too:
+// as text/uri-list, each file:// with its bytes percent-encoded where a URI
+// may not hold them. Absolute is "/…", or Windows' "C:\…" (file:///C:/…) or
+// "\\host\share\…" (file://host/share/…), their backslashes slashes in the
+// URI. 0 for a path that is not absolute.
+fn offer_files(o as *Offer, paths as *u8, n as i64) as i32 {
+    bytes_clear(&o.uris); bytes_clear(&o.paths);
+    o.count = 0;
+    let is i64 as at with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is *u8 as p = cast(*u8, cast(i64, paths) + at);
+        let is i64 as len with mut = 0;
+        while (p[len] != 0) { len = len + 1; }
+        let is i32 as kind = _absolute(p, len);
+        if (kind == 0) { return 0; }
+        if (append(&o.paths, p, len + 1) == 0) { return 0; }
+        let is *u8 as head with mut = "file://";
+        if (kind == _DRIVE) { head = "file:///"; }
+        if (kind == _SHARE) { head = "file:"; }
+        let is i64 as hn with mut = 0;
+        while (head[hn] != 0) { hn = hn + 1; }
+        if (append(&o.uris, head, hn) == 0) { return 0; }
+        let is i64 as i with mut = 0;
+        while (i < len) {
+            let is i64 as c with mut = cast(i64, p[i]) & 255;
+            if (c == 92 && kind != _POSIX) { c = 47; }
+            if (_uri_plain(c) == 1) {
+                let is u8 as b = cast(u8, c);
+                if (append(&o.uris, &b, 1) == 0) { return 0; }
+            } else {
+                let is [3]u8 as e;
+                e[0] = 37; e[1] = _hex_digit(c >> 4); e[2] = _hex_digit(c & 15);
+                if (append(&o.uris, &e[0], 3) == 0) { return 0; }
+            }
+            i = i + 1;
+        }
+        if (append(&o.uris, "\r\n", 2) == 0) { return 0; }
+        at = at + len + 1;
+        k = k + 1;
+    }
+    o.count = n;
+    o.formats = o.formats | FILES;
+    return 1;
+}
+
+let is i32 as _POSIX with imut = 1;
+let is i32 as _DRIVE with imut = 2;
+let is i32 as _SHARE with imut = 3;
+
+// What absolute path p (len bytes) is: _POSIX, _DRIVE, _SHARE; 0 for none.
+fn _absolute(p as *u8, len as i64) as i32 {
+    if (len >= 1 && p[0] == 47) { return _POSIX; }
+    let is i64 as c = cast(i64, p[0]) | 32;
+    if (len >= 3 && c >= 97 && c <= 122 && p[1] == 58 && (p[2] == 92 || p[2] == 47)) { return _DRIVE; }
+    if (len >= 3 && p[0] == 92 && p[1] == 92 && p[2] != 92) { return _SHARE; }
+    return 0;
+}
+
+// The bytes of format f as they go out: text, the PNG, the uri-list.
+fn offer_bytes(o as *Offer, f as i32) as *Bytes {
+    if (f == PNG) { return &o.png; }
+    if (f == FILES) { return &o.uris; }
+    return &o.text;
+}
+
+// A path's byte as is in a URI: unreserved, '/', and the sub-delimiters a
+// path may hold — the rest percent-encoded.
+fn _uri_plain(c as i64) as i32 {
+    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)) { return 1; }
+    if (c == 45 || c == 46 || c == 95 || c == 126 || c == 47) { return 1; }   // - . _ ~ /
+    if (c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 || c == 42 ||
+        c == 43 || c == 44 || c == 59 || c == 61 || c == 58 || c == 64) { return 1; }   // ! $ & ' ( ) * + , ; = : @
+    return 0;
+}
+
+fn _hex_digit(v as i64) as u8 {
+    if (v < 10) { return cast(u8, 48 + v); }
+    return cast(u8, 55 + v);
+}
+
+fn _hex(c as i64) as i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0 - 1;
+}
+
+// --- text/uri-list ---
+
+// The local files of a text/uri-list, n bytes at src — one URI a line, CRLF
+// or LF, '#' a comment — as paths into out, back to back, each
+// zero-terminated, percent-escapes decoded; "file:" URIs only, their host
+// part skipped ("file://host/path", "file:///path", "file:/path"). How many.
+fn parse_uri_list(src as *u8, n as i64, out as *Bytes) as i64 {
+    bytes_clear(out);
+    let is i64 as count with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        while (i < n && (src[i] == 13 || src[i] == 10 || src[i] == 32 || src[i] == 9)) { i = i + 1; }
+        if (i >= n) { break; }
+        let is i64 as start = i;
+        while (i < n && src[i] != 13 && src[i] != 10) { i = i + 1; }
+        let is i64 as end with mut = i;
+        while (end > start && (src[end - 1] == 32 || src[end - 1] == 9)) { end = end - 1; }
+        if (src[start] != 35 && _take_file_uri(src, start, end, out) == 1) { count = count + 1; }
+    }
+    return count;
+}
+
+fn _take_file_uri(src as *u8, from as i64, to as i64, out as *Bytes) as i32 {
+    let is i64 as i with mut = from;
+    if (to - i < 6 || src[i] != 102 || src[i + 1] != 105 || src[i + 2] != 108 || src[i + 3] != 101 || src[i + 4] != 58) {
+        return 0;
+    }
+    i = i + 5;
+    if (to - i >= 2 && src[i] == 47 && src[i + 1] == 47) {
+        // An authority: the path begins at the next '/'.
+        i = i + 2;
+        while (i < to && src[i] != 47) { i = i + 1; }
+    }
+    if (i >= to || src[i] != 47) { return 0; }
+    let is i64 as mark = out.len;
+    while (i < to) {
+        let is i64 as c = cast(i64, src[i]) & 255;
+        let is [1]u8 as one;
+        if (c == 37 && i + 2 < to && _hex(cast(i64, src[i + 1]) & 255) >= 0 && _hex(cast(i64, src[i + 2]) & 255) >= 0) {
+            let is i64 as v = _hex(cast(i64, src[i + 1]) & 255) * 16 + _hex(cast(i64, src[i + 2]) & 255);
+            if (v == 0) { out.len = mark; return 0; }   // a NUL in a path: not a path
+            one[0] = cast(u8, v);
+            i = i + 3;
+        } else {
+            one[0] = cast(u8, c);
+            i = i + 1;
+        }
+        if (append(out, &one[0], 1) == 0) { out.len = mark; return 0; }
+    }
+    let is [1]u8 as z;
+    z[0] = 0;
+    if (append(out, &z[0], 1) == 0) { out.len = mark; return 0; }
+    return 1;
+}
+
+// The i-th of count paths back to back in b; null for none.
+fn path_at(b as *Bytes, count as i64, i as i64) as *u8 {
+    if (i < 0 || i >= count || cast(i64, b.data) == 0) { return cast(*u8, 0); }
+    let is i64 as at with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < i) {
+        while (b.data[at] != 0) { at = at + 1; }
+        at = at + 1;
+        k = k + 1;
+    }
+    return cast(*u8, cast(i64, b.data) + at);
+}
+
+// --- Names on Linux ---
+
+let is *u8 as MIME_URIS with imut = "text/uri-list";
+let is *u8 as MIME_PNG  with imut = "image/png";
+let is *u8 as MIME_UTF8 with imut = "text/plain;charset=utf-8";
+
+fn _is(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n && b[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i32, i == n && b[i] == 0);
+}
+
+// The format a MIME type (or X target) name, n bytes, carries; 0 for none of
+// ours.
+fn format_of(name as *u8, n as i64) as i32 {
+    if (_is(name, n, MIME_URIS) == 1) { return FILES; }
+    if (_is(name, n, MIME_PNG) == 1) { return PNG; }
+    if (text_rank(name, n) < 9) { return TEXT; }
+    return 0;
+}
+
+// How much a text type is preferred: lower first; 9 for not text. UTF-8 by
+// name, then UTF8_STRING, then text/plain (UTF-8 from any current program).
+fn text_rank(name as *u8, n as i64) as i32 {
+    if (_is(name, n, MIME_UTF8) == 1) { return 0; }
+    if (_is(name, n, "UTF8_STRING") == 1) { return 1; }
+    if (_is(name, n, "text/plain") == 1) { return 2; }
+    return 9;
+}
+
+// UTF-8 cut at most max bytes, never inside a character: how many are kept.
+fn utf8_cut(s as *u8, n as i64, max as i64) as i64 {
+    if (n <= max) { return n; }
+    let is i64 as m with mut = max;
+    while (m > 0 && (cast(i64, s[m]) & 192) == 128) { m = m - 1; }
+    return m;
+}

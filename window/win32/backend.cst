@@ -12,6 +12,8 @@ use "bind/imm32.cst" as ime;
 use "../../input/text.cst" as content;
 use "abi.cst" as abi;
 use "clipboard.cst" as clipboard;
+use "ole.cst" as ole;
+use "../transfer.cst" as transfer;
 use "bind/dwmapi.cst" as dwm;
 use "bind/shell32.cst" as shell;
 use "bind/shcore.cst" as sh;
@@ -124,6 +126,8 @@ struct Native {
     layer_width as i64;
     layer_height as i64;
     clip as clipboard.State;
+    // OLE's drag and drop onto it: its IDropTarget and what it heard.
+    drop as ole.Drop;
     // Cooked input, as this file's translator says it (input/event.cst).
     input as *ie.Queue;
     // The window's own events: resized, closed, its state.
@@ -1387,6 +1391,8 @@ fn open_config(c as *Config) as Window {
     // field has the keyboard (text_input_enable).
     n.ime_on = 1; n.ime_text_len = 0 - 1;
     _ime_associate(n);
+    // A drop target of its own; a popup takes no drops.
+    if (c.popup == 0) { ole.register(&n.drop, hwnd); }
     let is t.RECT as client; u.GetClientRect(hwnd, &client);
     if (_dib(n, cast(i64, client.right - client.left), cast(i64, client.bottom - client.top)) == 0) {
         u.DestroyWindow(hwnd); ie.destroy(n.input); n.input = cast(*ie.Queue, 0); n.used = 0; w.err = NO_SURFACE; return w;
@@ -1414,6 +1420,7 @@ fn close(w as *Window) as void {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.used == 0) { w.ok = 0; return; }
     if (n.modal == 1 && n.owner != 0 && u.IsWindow(n.owner) == 1) { u.EnableWindow(n.owner, 1); }
     _ungrab(n);
+    ole.revoke(&n.drop);
     if (n.hwnd != 0 && u.IsWindow(n.hwnd) == 1) { u.DestroyWindow(n.hwnd); }
     if (n.hdc != 0) { g.DeleteDC(n.hdc); n.hdc = 0; }
     if (n.bitmap != 0) { g.DeleteObject(n.bitmap); n.bitmap = 0; }
@@ -1454,11 +1461,15 @@ fn next_frame(w as *Window) as i32 {
 // Whether an event waits, of the window's own or of its input.
 fn pending(w as *Window) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
-    return cast(i32, n.event_len > 0 || ie.pending(n.input) == 1);
+    return cast(i32, n.event_len > 0 || ole.notes(&n.drop) > 0 || ie.pending(n.input) == 1);
 }
 fn connection_fd(w as *Window) as i64 { return 0 - 1; }
 fn poll_event(w as *Window, out as *event.Event) as i32 {
-    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.event_len == 0) { return 0; }
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    // What OLE told the drop target, in the order it came, queued first.
+    let is event.Event as note;
+    while (ole.take(&n.drop, &note) == 1) { _enqueue(n, &note); }
+    if (n.event_len == 0) { return 0; }
     *out = n.events[n.event_head];
     n.event_head = (n.event_head + 1) % MAX_EVENTS; n.event_len = n.event_len - 1;
     return 1;
@@ -1791,22 +1802,79 @@ fn position(w as *Window, x as *i64, y as *i64) as i32 {
     *x = p.x; *y = p.y; return 1;
 }
 
-fn clipboard_set(w as *Window, which as i32, text as *u8, length as i64) as i32 {
+// --- The clipboard (no primary selection: refused) ---
+
+fn clipboard_set(w as *Window, which as i32, o as *transfer.Offer) as i32 {
     if (is_open(w) == 0 || which != 0) { return 0; }
-    return clipboard.set(w.hwnd, text, length);
+    return clipboard.set(w.hwnd, o);
 }
-fn clipboard_request(w as *Window, which as i32) as i32 {
+fn clipboard_request(w as *Window, which as i32, format as i32) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0 || which != 0) { return 0; }
-    return clipboard.request(&n.clip, w.hwnd);
+    if (format != 0 && format != transfer.TEXT && format != transfer.PNG) { return 0; }
+    return clipboard.request(&n.clip, w.hwnd, format);
 }
 fn clipboard_ready(w as *Window) as i32 {
     let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return n.clip.ready;
 }
-fn clipboard_text(w as *Window, out as *u8, cap as i64) as i64 {
-    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return clipboard.read(&n.clip, out, cap);
-}
 // The Windows clipboard answers request() at once: nothing is ever awaited.
 fn clipboard_pending(w as *Window) as i32 { return 0; }
+fn clipboard_format(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.clip.ready == 0) { return 0; } return n.clip.got;
+}
+fn clipboard_data(w as *Window) as *u8 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.clip.ready == 0 || n.clip.got == 0) { return cast(*u8, 0); }
+    return n.clip.data.data;
+}
+fn clipboard_length(w as *Window) as i64 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.clip.ready == 0 || n.clip.got == 0) { return 0; }
+    return n.clip.data.len;
+}
+fn clipboard_offered(w as *Window) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0 || n.clip.ready == 0) { return 0; } return n.clip.offered;
+}
+
+// --- Drag and drop (OLE, ole.cst) ---
+
+fn drop_answer(w as *Window, takes as i32, action as i32) as i32 {
+    let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; }
+    return ole.answer(&n.drop, takes, action);
+}
+fn dropped_files(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return ole.dropped_files(&n.drop); }
+fn dropped_file(w as *Window, i as i64) as *u8 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return cast(*u8, 0); } return ole.dropped_file(&n.drop, i); }
+fn dropped_text(w as *Window) as *u8 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return cast(*u8, 0); } return ole.dropped_text(&n.drop); }
+fn dropped_text_length(w as *Window) as i64 { let is *Native as n = _native(w); if (cast(i64, n) == 0) { return 0; } return ole.dropped_text_length(&n.drop); }
+fn clear_drop(w as *Window) as void { let is *Native as n = _native(w); if (cast(i64, n) != 0) { ole.clear(&n.drop); } }
+
+// A drag of what o offers out of the window, the effects allowed: OLE's
+// DoDragDrop, run here to its end, the window's messages dispatched
+// meanwhile. The press is OLE's: the input says the buttons held are up,
+// taken; DRAG_DONE is queued with the effect the target took. 1 when it ran.
+fn drag_begin(w as *Window, o as *transfer.Offer, actions as i32) as i32 {
+    let is *Native as n = _native(w);
+    if (cast(i64, n) == 0 || (actions & (transfer.COPY | transfer.MOVE)) == 0) { return 0; }
+    let is i32 as b with mut = 1;
+    while (b <= 3) {
+        if ((n.buttons & cast(i32, 1 << (b - 1))) != 0) {
+            let is ie.Event as up = _input(ie.BUTTON_UP);
+            up.button = b;
+            up.detail = ie.BUTTON_TAKEN;
+            up.x = n.mouse_x;
+            up.y = n.mouse_y;
+            _push(n, &up, cast(*u8, 0), 0);
+        }
+        b = b + 1;
+    }
+    n.buttons = 0;
+    u.ReleaseCapture();
+    let is i32 as done = ole.drag(o, actions);
+    if (done < 0) { return 0; }
+    let is event.Event as e;
+    event.clear(&e);
+    e.kind = event.DRAG_DONE;
+    e.action = done;
+    _enqueue(n, &e);
+    return 1;
+}
 
 fn transport_name(w as *Window) as *u8 { return "win32"; }
 

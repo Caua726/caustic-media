@@ -336,8 +336,8 @@ Dialogs are windows with a modal flag and a result. The file dialog is our own
 first; the XDG desktop portal on Linux (`window/linux/filechooser.cst`) and the
 system dialog on Windows give users their own.
 
-Clipboard and drag-and-drop come from `window/`, where the X11 side is already
-done.
+Clipboard and drag-and-drop come from `window/` (`transfer.cst`), on X11,
+Wayland and Windows alike.
 
 **The application on the screen** (`host.cst`). `app.cst` keeps the program's
 windows and is fed by calls; the host is what feeds it. For every window of
@@ -360,9 +360,11 @@ shortcut that quits, a timer's callback — goes on until that is over, its
 tree and router still in use until then, and closes after. `present` brings
 a window forward, as a later start of the program asks (`instance.cst`).
 The clipboard and the primary selection are the platform's through the
-trees' `set_clipboard` and `set_paste`; the pointer's shape is the one the
-widget under it asks for; the scale is the screen's DPI, or the desktop's
-when its settings say one.
+trees' `set_clipboard` and `set_paste`: copied text goes out as an offer,
+a paste asks for text and is answered when it comes, however large; a drop
+from another program is answered with what the widget under it takes and
+how. The pointer's shape is the one the widget under it asks for; the scale
+is the screen's DPI, or the desktop's when its settings say one.
 
 Each window is painted into a texture of its own on the program's device —
 what changed, as the damage says — and shown from it by the parts that

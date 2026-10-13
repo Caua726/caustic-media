@@ -71,6 +71,7 @@ use "xsettings.cst" as xsettings;
 use "../settings.cst" as settings;
 use "../damage.cst" as damage;
 use "std/time.cst" as time;
+use "../transfer.cst" as transfer;
 
 // --- How things fail ---
 //
@@ -908,9 +909,9 @@ fn close(w as *Window) as void {
     _unregister(w);
     _ungrab(w);
     text.close(&w.txt);
-    dnd.close(&w.drop);
+    dnd.close(&w.drop, w.display);
     framesync.close(&w.fsync, w.display);
-    clipboard.close(&w.clip);
+    clipboard.close(&w.clip, w.display);
     surface.close(&w.back, w.display);
     if (cast(i64, w.ring) != 0) {
         mem.core.munmap(w.ring, w.ring_cap * sizeof(xev.XEvent));
@@ -1260,6 +1261,12 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
         _preedit_said(w);
         if (eaten == 1) { return; }
 
+        // 0b. This window dragging out: the grabbed pointer's motion and
+        //     release, and Escape, are the drag's, not the program's input.
+        let is i32 as source = dnd.source_event(&w.drop, &w.clip, w.display, e, &_dnd_note);
+        if (source == 2) { _ring_push(w, &_dnd_note); }
+        if (source != 0) { return; }
+
         // 1. Fold. Unconditional and before the ring, so a full ring never
         //    costs a resize, a close, or a held key.
         events.fold(&w.st, e, w.wm_delete);
@@ -1302,7 +1309,7 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
         //     send one — a source that gets no XdndStatus refuses to drop, with
         //     nothing anywhere reporting why. What the program is to hear of it
         //     is queued as a note of its own (events.DND_*).
-        let is i32 as dragged = dnd.handle(&w.drop, w.display, w.xid, e, &_dnd_note);
+        let is i32 as dragged = dnd.handle(&w.drop, &w.clip, w.display, w.xid, e, &_dnd_note);
         if (dragged == 2) { _ring_push(w, &_dnd_note); }
         if (dragged != 0) { return; }
 
@@ -1310,14 +1317,11 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
         //    and any selection traffic. A SelectionRequest this program does not
         //    answer leaves the client that sent it waiting, so it is serviced
         //    here rather than deferred to a frame loop that may never drain.
+        //    A drop's data, arriving there, finishes the drop.
         if (surface.complete(&w.back, e) == 1) { return; }
-        // Both of these are SelectionNotify and only the property tells them
-        // apart, so the drop is offered the event first and the clipboard sees
-        // what is left.
-        let is i32 as landed = dnd.handle_selection(&w.drop, w.display, w.xid, e, &_dnd_note);
-        if (landed == 2) { _ring_push(w, &_dnd_note); }
-        if (landed != 0) { return; }
-        if (clipboard.answer(&w.clip, w.display, w.xid, e) == 1) { return; }
+        let is i32 as selected = clipboard.answer(&w.clip, w.display, w.xid, e);
+        if (selected == 2 && dnd.landed(&w.drop, &w.clip, w.display, w.xid, &_dnd_note) == 2) { _ring_push(w, &_dnd_note); }
+        if (selected != 0) { return; }
 
         // 6. Queue it. WM_DELETE_WINDOW is folded above AND pushed here,
         //    because a program may want to veto rather than obey.
@@ -1420,6 +1424,8 @@ fn _pump(w as *Window, block as i32) as void {
             // read — a composition's callbacks run then, for whichever of
             // our windows it composes in.
             if (target != 0) {
+                // A requestor's window during an INCR answer of ours.
+                if (_foreign(&_scratch) == 1) { continue; }
                 if (text.filter(&w.txt, &_scratch) == 1) { _preedits_said(); }
                 continue;
             }
@@ -1435,6 +1441,27 @@ fn _pump(w as *Window, block as i32) as void {
     // callbacks meanwhile — so what they drew is said here, not only after
     // a filtered event.
     _preedits_said();
+    // A drop whose target never finished, an answer whose requestor stopped
+    // asking: given up.
+    let is i64 as i with mut = 0;
+    while (i < _reg_count) {
+        let is *Window as rw = cast(*Window, _reg_win[i]);
+        if (dnd.tick(&rw.drop, &rw.clip, rw.display, &_dnd_note) == 2) { _ring_push(rw, &_dnd_note); }
+        clipboard.tick(&rw.clip, rw.display);
+        i = i + 1;
+    }
+}
+
+// An event for a window of no one here, offered to each window's
+// selections: 1 when one took it.
+fn _foreign(e as *xev.XEvent) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < _reg_count) {
+        let is *Window as rw = cast(*Window, _reg_win[i]);
+        if (clipboard.foreign(&rw.clip, rw.display, e) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 // Every window's composition, said where it changed: an input method's
@@ -1832,55 +1859,33 @@ fn root(w as *Window) as i64 {
     return xlib.XRootWindow(w.display, w.screen);
 }
 
-// --- Clipboard ---
-
-fn clipboard_set_text(w as *Window, s as *u8, n as i64) as i32 {
-    if (w.ok == 0) { return 0; }
-    return clipboard.set_text(&w.clip, w.display, w.xid, clipboard.CLIPBOARD, s, n);
-}
-fn clipboard_request_text(w as *Window) as i32 {
-    if (w.ok == 0) { return 0; }
-    return clipboard.request_text(&w.clip, w.display, w.xid, clipboard.CLIPBOARD);
-}
-fn clipboard_text(w as *Window, buf as *u8, cap as i64) as i64 {
-    return clipboard.text(&w.clip, buf, cap);
-}
-
+// --- Selections: the clipboard and the primary selection ---
+//
 // Either selection — clipboard.CLIPBOARD, what Ctrl+C fills, or PRIMARY,
-// what selecting with the mouse fills — owned with text, or asked for; what
-// was asked arrives while the pump runs (selection_ready).
-fn selection_set_text(w as *Window, which as i32, s as *u8, n as i64) as i32 {
+// what selecting with the mouse fills — owned with what an offer has (text,
+// a PNG), or asked for as a format (transfer.TEXT, PNG; 0 for which formats
+// are offered): the answer arrives while the pump runs (selection_ready),
+// INCR and all, and stays until asked again or forgotten.
+fn selection_set(w as *Window, which as i32, o as *transfer.Offer) as i32 {
+    if (w.ok == 0 || (which != clipboard.CLIPBOARD && which != clipboard.PRIMARY)) { return 0; }
+    return clipboard.set(&w.clip, w.display, w.xid, which, o, x.CurrentTime);
+}
+fn selection_owns(w as *Window, which as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    return clipboard.set_text(&w.clip, w.display, w.xid, which, s, n);
+    return clipboard.owns(&w.clip, w.display, w.xid, which);
 }
-fn selection_request_text(w as *Window, which as i32) as i32 {
-    if (w.ok == 0) { return 0; }
-    return clipboard.request_text(&w.clip, w.display, w.xid, which);
+fn selection_request(w as *Window, which as i32, format as i32) as i32 {
+    if (w.ok == 0 || (which != clipboard.CLIPBOARD && which != clipboard.PRIMARY)) { return 0; }
+    return clipboard.request(&w.clip, w.display, w.xid, clipboard.PASTE, which, format, 0, x.CurrentTime);
 }
-fn selection_ready(w as *Window) as i32 { return clipboard.ready(&w.clip); }
-fn selection_pending(w as *Window) as i32 { return clipboard.pending(&w.clip); }
-
-// The blocking form. It PUMPS rather than sleeps: if the other client asks us
-// for something while we wait and we are asleep, both sides wait forever.
-fn clipboard_get_text(w as *Window, buf as *u8, cap as i64, rounds as i64) as i64 {
-    if (w.ok == 0) { return 0 - 1; }
-    if (clipboard.request_text(&w.clip, w.display, w.xid, clipboard.CLIPBOARD) == 0) {
-        return 0 - 1;
-    }
-    let is i64 as i with mut = 0;
-    while (i < rounds) {
-        _pump(w, 0);
-        if (clipboard.ready(&w.clip) == 1) { return clipboard.text(&w.clip, buf, cap); }
-        if (clipboard.pending(&w.clip) == 0) { return 0; }
-        i = i + 1;
-    }
-    return 0 - 1;
-}
-
-fn clipboard_owns(w as *Window) as i32 {
-    if (w.ok == 0) { return 0; }
-    return clipboard.owns(&w.clip, w.display, w.xid, clipboard.CLIPBOARD);
-}
+fn selection_ready(w as *Window) as i32 { return clipboard.ready(&w.clip, clipboard.PASTE); }
+fn selection_pending(w as *Window) as i32 { return clipboard.pending(&w.clip, clipboard.PASTE); }
+// The format that came — what was asked, 0 when there was none — its bytes.
+fn selection_format(w as *Window) as i32 { return clipboard.got(&w.clip, clipboard.PASTE); }
+fn selection_data(w as *Window) as *u8 { return clipboard.data(&w.clip, clipboard.PASTE); }
+fn selection_length(w as *Window) as i64 { return clipboard.length(&w.clip, clipboard.PASTE); }
+// The formats offered, when what was asked was which (format 0).
+fn selection_offered(w as *Window) as i32 { return clipboard.offered(&w.clip, clipboard.PASTE); }
 
 // --- Window state, through the window manager ---
 //
@@ -2134,10 +2139,11 @@ fn dropped_files(w as *Window) as i64 { return dnd.count(&w.drop); }
 fn dropped_text(w as *Window) as *u8 { return dnd.text(&w.drop); }
 fn dropped_text_length(w as *Window) as i64 { return dnd.text_length(&w.drop); }
 // What the program takes of the drag over the window where the pointer is now
-// (dnd.FILES, dnd.TEXT, 0): told the source at once. 1 when a drag is there.
-fn drop_answer(w as *Window, takes as i32) as i32 {
+// (dnd.FILES, dnd.TEXT, 0) and how (transfer.COPY, MOVE; 0 the source's
+// suggestion): told the source at once. 1 when a drag is there.
+fn drop_answer(w as *Window, takes as i32, action as i32) as i32 {
     if (w.ok == 0) { return 0; }
-    return dnd.answer(&w.drop, w.display, w.xid, takes);
+    return dnd.answer(&w.drop, w.display, w.xid, takes, action);
 }
 fn drop_offered(w as *Window) as i32 { return dnd.offered(&w.drop); }
 fn dropped_file(w as *Window, i as i64) as *u8 { return dnd.path_at(&w.drop, i); }
@@ -2145,6 +2151,43 @@ fn clear_drop(w as *Window) as void { dnd.clear(&w.drop); }
 fn dragging(w as *Window) as i32 { return dnd.dragging(&w.drop); }
 fn drag_x(w as *Window) as i64 { return dnd.pointer_x(&w.drop); }
 fn drag_y(w as *Window) as i64 { return dnd.pointer_y(&w.drop); }
+
+// A drag out of the window of what o offers, the actions allowed
+// (transfer.COPY, MOVE), begun while a button is held: 1 when it began. Its
+// end is a DRAG_DONE event with the action the target did, 0 for none.
+fn drag_begin(w as *Window, o as *transfer.Offer, actions as i32) as i32 {
+    if (w.ok == 0) { return 0; }
+    if (dnd.begin(&w.drop, &w.clip, w.display, w.xid, o, actions) == 0) { return 0; }
+    // The drag has the pointer from here: the release is its, so the input
+    // says every held button is up, taken.
+    let is i32 as b with mut = 1;
+    while (b <= 31) {
+        if ((w.held_buttons & cast(i32, 1 << (b - 1))) != 0) {
+            let is ie.Event as up;
+            ie.clear(&up);
+            up.kind = ie.BUTTON_UP;
+            up.detail = ie.BUTTON_TAKEN;
+            up.button = b;
+            up.x = w.pointer_x;
+            up.y = w.pointer_y;
+            ie.push(w.input, &up, cast(*u8, 0), 0);
+        }
+        b = b + 1;
+    }
+    w.held_buttons = 0;
+    return 1;
+}
+
+// Milliseconds until the window's selections have something to say without
+// an event — a drop's target that never finished, an answer that never came
+// — 0 when due, -1 for none.
+fn input_due(w as *Window) as i64 {
+    if (w.ok == 0) { return 0 - 1; }
+    let is i64 as a = dnd.due(&w.drop);
+    let is i64 as b = clipboard.due(&w.clip);
+    if (a < 0 || (b >= 0 && b < a)) { return b; }
+    return a;
+}
 
 // --- A frame of the window's own (frame.cst) ---
 

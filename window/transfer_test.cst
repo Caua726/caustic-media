@@ -1,0 +1,140 @@
+// window/transfer_test.cst — what a drag's or the clipboard's bytes become,
+// and what is made of the program's: a text/uri-list read as local paths, and
+// paths written as one that reads back the same; bytes that grow to a limit;
+// the names of formats. No server: ./build/transfer_test
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "transfer.cst" as transfer;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+fn length(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn same(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, a[i] == 0);
+}
+
+let is transfer.Bytes as paths with mut;
+let is i64 as count with mut = 0;
+
+fn parse(s as *u8) as i64 {
+    count = transfer.parse_uri_list(s, length(s), &paths);
+    return count;
+}
+
+fn path(i as i64) as *u8 { return transfer.path_at(&paths, count, i); }
+
+fn main() as i32 {
+    transfer.bytes_init(&paths);
+
+    // --- A list as file managers send it ---
+    check("lines, CRLF and LF, a comment, blanks", parse("file:///tmp/a%20b\r\n#file:///not\r\n\r\n  \tfile:///x%2fy%2F\nfile:///c%C3%A9") == 3);
+    check("escapes decoded, either case", same(path(0), "/tmp/a b") == 1 && same(path(1), "/x/y/") == 1);
+    check("escaped UTF-8", same(path(2), "/c\xc3\xa9") == 1);
+    check("past the last, before the first: none", cast(i64, path(3)) == 0 && cast(i64, path(0 - 1)) == 0);
+    check("trailing blanks on a line: not the path's", parse("file:///t \t\r\n") == 1 && same(path(0), "/t") == 1);
+
+    // --- The host part, and what is not a local file ---
+    check("a host: skipped to the path", parse("file://host/srv/f\n") == 1 && same(path(0), "/srv/f") == 1);
+    check("no host: the root", parse("file:///\n") == 1 && same(path(0), "/") == 1);
+    check("file:/path, the short form", parse("file:/one\n") == 1 && same(path(0), "/one") == 1);
+    check("a host and no path: nothing", parse("file://host\nfile://\n") == 0);
+    check("not file: URIs, nor bare paths: nothing", parse("http://x/y\n/plain/path\nfile:x//a\nFILE:///up\n") == 0);
+    check("among them, the file one", parse("http://x/y\nfile:///kept\n") == 1 && same(path(0), "/kept") == 1);
+
+    // --- Escapes that are not ---
+    check("a bad escape: as it is", parse("file:///bad%zz\nfile:///half%4\nfile:///end%2\n") == 3 &&
+          same(path(0), "/bad%zz") == 1 && same(path(1), "/half%4") == 1 && same(path(2), "/end%2") == 1);
+    check("an escape just at the end", parse("file:///a%41") == 1 && same(path(0), "/aA") == 1);
+    check("escapes with a zero digit", parse("file:///z%30%09") == 1 && same(path(0), "/z0\t") == 1);
+    check("a NUL escaped: not a path", parse("file:///nul%00x\nfile:///next\n") == 1 && same(path(0), "/next") == 1);
+
+    // --- Many, and long: no limit but memory ---
+    let is transfer.Bytes as many with mut;
+    transfer.bytes_init(&many);
+    let is i64 as k with mut = 0;
+    while (k < 500) {
+        transfer.append(&many, "file:///f/", 10);
+        let is [3]u8 as tail;
+        tail[0] = cast(u8, 97 + k % 26); tail[1] = cast(u8, 97 + (k / 26) % 26); tail[2] = 10;
+        transfer.append(&many, &tail[0], 3);
+        k = k + 1;
+    }
+    count = transfer.parse_uri_list(many.data, many.len, &paths);
+    check("500 files, each", count == 500 && same(path(499), "/f/ft") == 1);
+    let is transfer.Bytes as long with mut;
+    transfer.bytes_init(&long);
+    transfer.append(&long, "file:///", 8);
+    k = 0;
+    while (k < 5000) { transfer.append(&long, "b", 1); k = k + 1; }
+    count = transfer.parse_uri_list(long.data, long.len, &paths);
+    check("a path of 5000 bytes, whole", count == 1 && length(path(0)) == 5001);
+
+    // --- Paths written as a list, read back the same ---
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    let is *u8 as names = "/tmp/a b\x00/home/ação/100%/x#y?z\x00/n\n\x00";
+    check("three paths offered", transfer.offer_files(&o, names, 3) == 1 && o.count == 3 && (o.formats & transfer.FILES) != 0);
+    check("written escaped, one a line, CRLF", same(o.uris.data,
+          "file:///tmp/a%20b\r\nfile:///home/a%C3%A7%C3%A3o/100%25/x%23y%3Fz\r\nfile:///n%0A\r\n") == 1);
+    count = transfer.parse_uri_list(o.uris.data, o.uris.len, &paths);
+    check("read back the same", count == 3 && same(path(0), "/tmp/a b") == 1 &&
+          same(path(1), "/home/ação/100%/x#y?z") == 1 && same(path(2), "/n\n") == 1);
+    check("the paths kept as given", same(transfer.path_at(&o.paths, o.count, 1), "/home/ação/100%/x#y?z") == 1);
+    check("a relative path: refused", transfer.offer_files(&o, "rel/a\x00", 1) == 0);
+    check("an empty one: refused", transfer.offer_files(&o, "\x00", 1) == 0);
+    check("Windows' relative ones: refused", transfer.offer_files(&o, "C:rel\x00", 1) == 0 &&
+          transfer.offer_files(&o, "\\rooted\x00", 1) == 0);
+    check("Windows' absolute paths offered", transfer.offer_files(&o, "C:\\Users\\a b\\ação.txt\x00d:/x\x00\\\\host\\share\\f\x00", 3) == 1 &&
+          o.count == 3 && same(transfer.path_at(&o.paths, o.count, 0), "C:\\Users\\a b\\ação.txt") == 1);
+    check("their URIs: a drive's, a share's, slashes for backslashes", same(o.uris.data,
+          "file:///C:/Users/a%20b/a%C3%A7%C3%A3o.txt\r\nfile:///d:/x\r\nfile://host/share/f\r\n") == 1);
+    check("a POSIX path keeps its backslash, escaped", transfer.offer_files(&o, "/a\\b\x00", 1) == 1 &&
+          same(o.uris.data, "file:///a%5Cb\r\n") == 1);
+    transfer.offer_free(&o);
+
+    // --- Offers ---
+    transfer.offer_init(&o);
+    check("text kept", transfer.offer_text(&o, "abc", 3) == 1 && o.formats == transfer.TEXT && o.text.len == 3 && o.text.data[3] == 0);
+    check("too short for a PNG: refused", transfer.offer_png(&o, "\x89PNG", 4) == 0 && o.formats == transfer.TEXT);
+    check("a PNG beside it", transfer.offer_png(&o, "\x89PNG\r\n\x1a\n....", 12) == 1 && o.formats == (transfer.TEXT | transfer.PNG));
+    check("the bytes of each format", transfer.offer_bytes(&o, transfer.PNG).len == 12 && transfer.offer_bytes(&o, transfer.TEXT).len == 3);
+    transfer.offer_free(&o);
+    check("freed: nothing offered", o.formats == 0 && o.text.len == 0 && cast(i64, o.png.data) == 0);
+
+    // --- Bytes ---
+    let is transfer.Bytes as b with mut;
+    transfer.bytes_init(&b);
+    check("grown past a page, a zero after", transfer.append(&b, "x", 1) == 1 && transfer.reserve(&b, 10000) == 1 &&
+          b.cap >= 10001 && b.data[0] == 120 && b.data[1] == 0);
+    check("no more than the limit", transfer.reserve(&b, transfer.MAX_BYTES + 1) == 0 && b.len == 1 && b.data[0] == 120);
+    transfer.bytes_clear(&b);
+    check("cleared: empty, terminated", b.len == 0 && b.data[0] == 0);
+    transfer.bytes_free(&b);
+
+    // --- Names ---
+    check("formats by name", transfer.format_of("text/uri-list", 13) == transfer.FILES &&
+          transfer.format_of("image/png", 9) == transfer.PNG && transfer.format_of("UTF8_STRING", 11) == transfer.TEXT &&
+          transfer.format_of("text/plain;charset=utf-8", 24) == transfer.TEXT && transfer.format_of("text/plain", 10) == transfer.TEXT &&
+          transfer.format_of("text/html", 9) == 0 && transfer.format_of("image/pngx", 10) == 0 && transfer.format_of("image/pn", 8) == 0);
+    check("text names ranked", transfer.text_rank("text/plain;charset=utf-8", 24) < transfer.text_rank("UTF8_STRING", 11) &&
+          transfer.text_rank("UTF8_STRING", 11) < transfer.text_rank("text/plain", 10) && transfer.text_rank("STRING", 6) == 9);
+
+    if (fails == 0) { io.printf("transfer: all checks passed\n"); return 0; }
+    io.printf("transfer: %d failures\n", fails);
+    return 1;
+}

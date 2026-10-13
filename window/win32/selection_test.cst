@@ -1,0 +1,218 @@
+// window/win32/selection_test.cst — the Windows clipboard against another
+// program, the independent peer window/win32/tools/clipboard_peer.c (built
+// with mingw-w64, none of this repository's code), run as a process of its
+// own in the same Wine prefix:
+//   sh window/win32/tools/run_native.sh build/win32_selection_test.exe
+// Owned here and read by the peer: UTF-8 text as CF_UNICODETEXT, a PNG beside
+// it as the registered "PNG", the formats listed, 3 MB of text. Owned by the
+// peer and asked for here: text, a PNG alone (text not offered: none), 3 MB.
+// No primary selection: refused, not made up. Ours, its window closed: the
+// text it put there still there, as Windows keeps what was rendered.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "../transfer.cst" as transfer;
+use "bind/types.cst" as t;
+use "bind/kernel32.cst" as k;
+use "backend.cst" as win;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+let is win.Window as w with mut;
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (1 == 1) {
+        win.pump(&w);
+        if (time.now_ms() >= until) { return; }
+        time.sleep_ms(2);
+    }
+}
+
+// An ASCII string as UTF-16, '/' as '\'.
+fn wide(s as *u8, out as *u16, cap as i64) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0 && i < cap - 1) {
+        let is u16 as c with mut = cast(u16, s[i]);
+        if (c == cast(u16, 47)) { c = cast(u16, 92); }
+        out[i] = c;
+        i = i + 1;
+    }
+    out[i] = cast(u16, 0);
+}
+
+// The peer run with args, this window pumped meanwhile: its exit code, -1
+// when it did not start or took longer than 20 seconds.
+fn peer(args as *u8) as i32 {
+    let is [512]u8 as line with mut;
+    let is *u8 as head = "build\\clipboard_peer.exe ";
+    let is i64 as n with mut = 0;
+    while (head[n] != 0) { line[n] = head[n]; n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (args[i] != 0 && n < 510) { line[n] = args[i]; n = n + 1; i = i + 1; }
+    line[n] = 0;
+    let is [512]u16 as cmd with mut;
+    let is i64 as j with mut = 0;
+    while (line[j] != 0) { cmd[j] = cast(u16, line[j]); j = j + 1; }
+    cmd[j] = cast(u16, 0);
+    let is t.STARTUPINFOW as si;
+    mem.memzero(cast(*u8, &si), sizeof(t.STARTUPINFOW));
+    si.cb = cast(u32, sizeof(t.STARTUPINFOW));
+    let is t.PROCESS_INFORMATION as pi;
+    mem.memzero(cast(*u8, &pi), sizeof(t.PROCESS_INFORMATION));
+    if (k.CreateProcessW(cast(*u16, 0), &cmd[0], cast(*u8, 0), cast(*u8, 0), 0, cast(u32, 0), cast(*u8, 0),
+                         cast(*u16, 0), &si, &pi) == 0) { return 0 - 1; }
+    let is i64 as until = time.now_ms() + 20000;
+    let is i32 as code with mut = 0 - 1;
+    while (time.now_ms() < until) {
+        win.pump(&w);
+        if (k.WaitForSingleObject(pi.hProcess, cast(u32, 5)) == cast(u32, 0)) {
+            let is u32 as status with mut = cast(u32, 0);
+            k.GetExitCodeProcess(pi.hProcess, &status);
+            code = cast(i32, status);
+            break;
+        }
+    }
+    if (code < 0) { k.TerminateProcess(pi.hProcess, cast(u32, 9)); }
+    k.CloseHandle(pi.hThread);
+    k.CloseHandle(pi.hProcess);
+    return code;
+}
+
+fn read_file(path as *u8, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    let is [256]u16 as name;
+    wide(path, &name[0], 256);
+    let is i64 as h = k.CreateFileW(&name[0], cast(u32, t.GENERIC_READ), cast(u32, t.FILE_SHARE_READ), cast(*u8, 0),
+                                    cast(u32, t.OPEN_EXISTING), cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    let is [65536]u8 as buf with mut;
+    while (1 == 1) {
+        let is u32 as got with mut = cast(u32, 0);
+        if (k.ReadFile(h, &buf[0], cast(u32, 65536), &got, cast(*u8, 0)) == 0 || got == cast(u32, 0)) { break; }
+        transfer.append(out, &buf[0], cast(i64, got));
+    }
+    k.CloseHandle(h);
+    return 1;
+}
+
+fn write_file(path as *u8, p as *u8, n as i64) as i32 {
+    let is [256]u16 as name;
+    wide(path, &name[0], 256);
+    let is i64 as h = k.CreateFileW(&name[0], cast(u32, t.GENERIC_WRITE), 0, cast(*u8, 0), cast(u32, t.CREATE_ALWAYS),
+                                    cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    let is i64 as at with mut = 0;
+    while (at < n) {
+        let is u32 as put with mut = cast(u32, 0);
+        let is i64 as part with mut = n - at;
+        if (part > 1048576) { part = 1048576; }
+        if (k.WriteFile(h, cast(*u8, cast(i64, p) + at), cast(u32, part), &put, cast(*u8, 0)) == 0 || put == cast(u32, 0)) { break; }
+        at = at + cast(i64, put);
+    }
+    k.CloseHandle(h);
+    return cast(i32, at == n);
+}
+
+fn same(b as *transfer.Bytes, p as *u8, n as i64) as i32 {
+    if (b.len != n) { io.printf("  %d bytes, want %d\n", b.len, n); return 0; }
+    return cast(i32, mem.memcmp(b.data, p, n) == 0);
+}
+
+fn contains(b as *transfer.Bytes, s as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= b.len) {
+        if (mem.memcmp(cast(*u8, cast(i64, b.data) + i), s, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The clipboard asked for as format: what came, into out; the format that
+// came.
+fn ask(format as i32, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    if (win.clipboard_request(&w, 0, format) == 0 || win.clipboard_ready(&w) == 0) { return 0 - 1; }
+    transfer.bytes_set(out, win.clipboard_data(&w), win.clipboard_length(&w));
+    return win.clipboard_format(&w);
+}
+
+fn big_text(out as *transfer.Bytes) as void {
+    transfer.bytes_clear(out);
+    let is *u8 as line = "caustic ação — 3 MB through a global ✓ ";
+    let is i64 as n with mut = 0;
+    while (line[n] != 0) { n = n + 1; }
+    while (out.len < 3145728) { transfer.append(out, line, n); }
+}
+
+fn main() as i32 {
+    let is win.Config as c = win.config("selections", 200, 100);
+    w = win.open_config(&c);
+    if (w.ok == 0) { io.printf("FAIL: no window\n"); return 1; }
+    pump(100);
+    let is transfer.Bytes as got with mut;
+    transfer.bytes_init(&got);
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+
+    // --- Owned here, read by the peer ---
+    transfer.offer_text(&o, "héllo ✓ wörld", 17);
+    check("the clipboard owned", win.clipboard_set(&w, 0, &o) == 1);
+    check("read by the peer as CF_UNICODETEXT", peer("get-text build/sel-a") == 0 &&
+          read_file("build/sel-a", &got) == 1 && same(&got, "héllo ✓ wörld", 17) == 1);
+    check("its formats: text, no PNG", peer("formats build/sel-a") == 0 && read_file("build/sel-a", &got) == 1 &&
+          contains(&got, "CF_UNICODETEXT") == 1 && contains(&got, "PNG") == 0);
+    let is transfer.Bytes as png with mut;
+    transfer.bytes_init(&png);
+    check("a PNG to offer", read_file("image/testdata/rgba.png", &png) == 1 && png.len > 8);
+    transfer.offer_png(&o, png.data, png.len);
+    check("text and a PNG owned", win.clipboard_set(&w, 0, &o) == 1);
+    check("the PNG read by the peer as \"PNG\"", peer("get-png build/sel-a") == 0 &&
+          read_file("build/sel-a", &got) == 1 && same(&got, png.data, png.len) == 1);
+    check("both in its formats", peer("formats build/sel-a") == 0 && read_file("build/sel-a", &got) == 1 &&
+          contains(&got, "CF_UNICODETEXT") == 1 && contains(&got, "PNG") == 1);
+    let is transfer.Bytes as big with mut;
+    transfer.bytes_init(&big);
+    big_text(&big);
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, big.data, big.len);
+    check("3 MB owned", win.clipboard_set(&w, 0, &o) == 1);
+    check("3 MB read by the peer whole", peer("get-text build/sel-a") == 0 &&
+          read_file("build/sel-a", &got) == 1 && same(&got, big.data, big.len) == 1);
+    check("no primary selection on Windows: refused", win.clipboard_set(&w, 1, &o) == 0 &&
+          win.clipboard_request(&w, 1, transfer.TEXT) == 0);
+
+    // --- Owned by the peer, asked for here ---
+    write_file("build/sel-in", "from the peer: ação", 20);
+    check("the peer takes the clipboard", peer("put build/sel-in") == 0);
+    check("its text asked for", ask(transfer.TEXT, &got) == transfer.TEXT && same(&got, "from the peer: ação", 20) == 1 &&
+          win.clipboard_offered(&w) == transfer.TEXT);
+    check("a format not offered: none", ask(transfer.PNG, &got) == 0 && got.len == 0);
+    check("the peer offers a PNG alone", peer("put - image/testdata/rgba.png") == 0);
+    check("what is offered: a PNG, no text", ask(0, &got) == 0 && win.clipboard_offered(&w) == transfer.PNG);
+    check("the PNG asked for", ask(transfer.PNG, &got) == transfer.PNG && same(&got, png.data, png.len) == 1);
+    check("text not offered: none", ask(transfer.TEXT, &got) == 0);
+    write_file("build/sel-big", big.data, big.len);
+    check("the peer takes it with 3 MB", peer("put build/sel-big") == 0);
+    check("3 MB asked for, whole", ask(transfer.TEXT, &got) == transfer.TEXT && same(&got, big.data, big.len) == 1);
+
+    // --- Ours, its window closed: what was put there kept ---
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, "kept", 4);
+    check("owned once more", win.clipboard_set(&w, 0, &o) == 1);
+    win.close(&w);
+    check("its window closed: the text still there", peer("get-text build/sel-a") == 0 &&
+          read_file("build/sel-a", &got) == 1 && same(&got, "kept", 4) == 1);
+    transfer.offer_free(&o);
+    if (fails == 0) { io.printf("win32 selections: all checks passed\n"); return 0; }
+    io.printf("win32 selections: %d failures\n", fails);
+    return 1;
+}

@@ -1,171 +1,162 @@
-// window/x11/dnd.cst — files dragged onto the window.
+// window/x11/dnd.cst — drag and drop, XDND version 5, both sides.
 //
-// XDND, the target side. Enough to receive a drop; nothing here starts a drag.
-// That asymmetry is deliberate: every program wants to be dropped on, and
-// almost none wants to be a drag source, which needs a grab, a cursor that
-// follows the pointer and a proxy window.
-//
-// --- It is a conversation, not an event ---
-//
-// Five messages, and skipping any of them leaves the other program waiting:
+// --- Dropped on: the target ---
 //
 //   XdndEnter     the source names up to three types it can offer; more than
-//                 three and they are in a property instead
-//   XdndPosition  the pointer moved. We MUST answer every one with XdndStatus
-//                 saying whether we accept — a source that gets no answer
-//                 shows a "no" cursor and refuses to drop
-//   XdndDrop      it happened. We ask for the selection and wait
+//                 three and they are in its XdndTypeList property instead
+//   XdndPosition  the pointer moved, with the action the source suggests.
+//                 Every one MUST be answered with XdndStatus — a source that
+//                 gets no answer refuses to drop, and nothing reports why
+//   XdndDrop      it happened: the data is asked for (clipboard.cst's DROP
+//                 slot, XdndSelection, INCR and all), XdndFinished told once
+//                 it came, with the action done
 //   XdndLeave     it did not
-//   SelectionNotify   the data, arriving later, as a separate event
 //
-// The XdndStatus answer is the part that is easy to get wrong by omission:
-// nothing crashes, no error appears, and drag-and-drop simply does not work.
+// Accepted: files (text/uri-list, the paths decoded) and text (UTF-8). The
+// program hears the drag as notes queued with the window's events (DND_*:
+// what is offered and the actions allowed; where the pointer is; what came
+// and the action done) and answers what it takes there and how — answer();
+// until it does, everything offered is taken with the action the source
+// suggests.
 //
-// --- What is accepted ---
+// --- Dragged from: the source ---
 //
-// Files: `text/uri-list`, which is what every file manager sends and what "a
-// file was dropped" means in practice. The list arrives as URIs, one per line,
-// and count()/path_at() hand them back already decoded from percent-escapes
-// and stripped of the `file://` prefix — because a caller wants a path, and
-// every one of them would otherwise write the same twenty lines.
-//
-// Text: UTF8_STRING, `text/plain;charset=utf-8` or `text/plain`, the first of
-// those offered, read as UTF-8 (plain text from a modern source is).
-//
-// Offered both, files are taken. A source offering neither gets a polite
-// refusal rather than a drop that produces nothing.
-//
-// --- What the program says ---
-//
-// The program hears the drag as notes queued with the window's events (handle
-// fills one in): it came in, with what it offers; it moved, in the window's
-// coordinates; it left; it was dropped, with what arrived. It can answer
-// which of what is offered it takes where the pointer is now — answer(),
-// FILES, TEXT or 0 — as a toolkit does widget by widget. Every XdndPosition is
-// answered at once with the last answer — offered everything until the
-// program says otherwise — and a changed answer is told the source right away,
-// so it is never left waiting on the program.
-//
-// --- Why it does not know what a Window is ---
-//
-// Same rule as cursor.cst, wm.cst and the rest: display and xid in. window.cst
-// forwards, and the pump feeds it events.
+// begin() owns XdndSelection with the offer (served by clipboard.cst) and
+// grabs the pointer and the keyboard. Each motion finds the XdndAware window
+// under the pointer — its proxy, if it names one — and talks to it: Enter
+// and Leave as the pointer crosses, a Position at a time (the next only once
+// the last is answered). Letting go over a window that accepted drops: the
+// target asks for the data and says XdndFinished; letting go anywhere else,
+// or Escape, cancels. The program hears DRAG_DONE with the action done, 0
+// for none. A target that never finishes is given up after FINISH_MS.
 use "std/mem.cst" as mem;
+use "std/time.cst" as time;
 use "bind/x.cst" as x;
 use "bind/xlib.cst" as xlib;
 use "bind/xevent.cst" as xev;
+use "clipboard.cst" as clipboard;
+use "../transfer.cst" as transfer;
 
 let is i64 as XDND_VERSION with imut = 5;
-let is i64 as MAX_FILES with imut = 64;
-let is i64 as PATH_BYTES with imut = 1024;
-let is i64 as TEXT_BYTES with imut = 65536;
+let is i64 as FINISH_MS with imut = 10000;
 
-// What a drag offers, what a program takes, what arrived: bits.
+// What a drag offers, what a program takes, what arrived: transfer's bits.
 let is i32 as FILES with imut = 1;
 let is i32 as TEXT  with imut = 2;
 
-// The notes handle and handle_selection fill in, as events.cst's DND_* kinds.
+// The notes handle fills in, as events.cst's DND_* kinds and DRAG_DONE.
 let is i64 as _ENTER with imut = 17;
 let is i64 as _MOVE  with imut = 18;
 let is i64 as _LEAVE with imut = 19;
 let is i64 as _DROP  with imut = 20;
+let is i64 as _DONE  with imut = 26;
 let is i32 as _NOTE  with imut = 63;
 
-// XdndStatus' accept flag, and the action we report. XdndActionCopy is what a
-// file manager expects for "the target will read this"; move and link would
-// make it delete or symlink the source, which a window layer must never claim.
+// The source's states.
+let is i32 as _OFF      with imut = 0;
+let is i32 as _DRAGGING with imut = 1;
+let is i32 as _DROPPED  with imut = 2;   // waiting for XdndFinished
+
 struct State {
     ready as i32;
     _pad0 as i32;
 
     a_aware    as i64;   // XdndAware
+    a_proxy    as i64;   // XdndProxy
     a_enter    as i64;
     a_position as i64;
     a_status   as i64;
     a_drop     as i64;
     a_leave    as i64;
     a_finished as i64;
-    a_selection as i64;  // XdndSelection
-    a_action_copy as i64;
+    a_copy     as i64;   // XdndActionCopy
+    a_move     as i64;   // XdndActionMove
+    a_action_list as i64;
     a_type_list as i64;  // XdndTypeList
     a_uri_list  as i64;  // text/uri-list
-    a_primary   as i64;  // the property we ask the data to land in
     a_utf8      as i64;  // UTF8_STRING
     a_text_utf8 as i64;  // text/plain;charset=utf-8
     a_text      as i64;  // text/plain
+    a_png       as i64;  // image/png
+    a_atom      as i64;
+    root        as i64;  // the screen's root, the source's coordinates
 
-    source     as i64;   // the window currently dragging over us, 0 if none
-    version    as i64;   // the source's protocol version
+    // --- Target ---
+    source     as i64;   // the window dragging over us, 0 if none
+    version    as i64;   // its protocol version
     offered    as i32;   // FILES, TEXT: what it offers
+    text_rank  as i32;   // the rank of text_type (clipboard's order); 9 for none
+    text_type  as i64;   // its text type asked for at the drop: the best offered
+    actions    as i32;   // transfer.COPY, MOVE: what it allows, as known
     answer     as i32;   // what the program takes, of that, where the pointer is
-    text_type  as i64;   // the text type it offers that we ask for, 0 for none
+    action     as i32;   // and how; 0 for the source's suggestion
+    suggested  as i32;   // the action the last XdndPosition suggested
+    accepted   as i32;   // the action the last XdndStatus said; 0 refused
     dropped    as i32;   // a drop happened and the data has arrived
     want       as i32;   // FILES or TEXT: asked for at the drop
-    root       as i64;   // the screen's root, the source's coordinates
-
     x          as i64;   // where the pointer was, window coordinates
     y          as i64;
-
     count      as i64;   // files in the last drop
-    paths      as *u8;   // MAX_FILES * PATH_BYTES
-    text       as *u8;   // TEXT_BYTES
-    text_len   as i64;   // text in the last drop
+    paths      as transfer.Bytes;
+    text       as transfer.Bytes;
+
+    // --- Source ---
+    out_state   as i32;
+    out_actions as i32;  // what the program allows
+    out_formats as i32;
+    out_target  as i64;  // the XdndAware window under the pointer, 0 for none
+    out_to      as i64;  // where messages for it go: it, or its proxy
+    out_version as i64;
+    out_waiting as i32;  // a Position sent and not yet answered
+    out_moved   as i32;  // the pointer moved meanwhile
+    out_accept  as i32;  // the last Status: accepted
+    out_action  as i32;  // and with which action (transfer bits)
+    out_x       as i64;  // the pointer, root coordinates
+    out_y       as i64;
+    out_mods    as u32;
+    out_time    as i64;
+    out_since   as i64;  // when the drop was sent, ms
+    out_types   as [8]i64;
+    out_ntypes  as i32;
+    xid         as i64;
 }
 
 // Advertises the window as a drop target. Without the XdndAware property no
-// source will ever talk to it. available() says whether it worked.
+// source will ever talk to it.
 fn init(st as *State, d as *u8, xid as i64) as void {
-    st.ready = 0;
-    st.source = 0;
-    st.version = 0;
-    st.offered = 0;
-    st.answer = 0;
-    st.text_type = 0;
-    st.dropped = 0;
-    st.want = 0;
-    st.x = 0;
-    st.y = 0;
-    st.count = 0;
-    st.paths = cast(*u8, 0);
-    st.text = cast(*u8, 0);
-    st.text_len = 0;
+    mem.memzero(cast(*u8, st), sizeof(State));
+    transfer.bytes_init(&st.paths);
+    transfer.bytes_init(&st.text);
     st.root = xlib.XDefaultRootWindow(d);
-
+    st.xid = xid;
     st.a_aware       = xlib.XInternAtom(d, "XdndAware", 0);
+    st.a_proxy       = xlib.XInternAtom(d, "XdndProxy", 0);
     st.a_enter       = xlib.XInternAtom(d, "XdndEnter", 0);
     st.a_position    = xlib.XInternAtom(d, "XdndPosition", 0);
     st.a_status      = xlib.XInternAtom(d, "XdndStatus", 0);
     st.a_drop        = xlib.XInternAtom(d, "XdndDrop", 0);
     st.a_leave       = xlib.XInternAtom(d, "XdndLeave", 0);
     st.a_finished    = xlib.XInternAtom(d, "XdndFinished", 0);
-    st.a_selection   = xlib.XInternAtom(d, "XdndSelection", 0);
-    st.a_action_copy = xlib.XInternAtom(d, "XdndActionCopy", 0);
+    st.a_copy        = xlib.XInternAtom(d, "XdndActionCopy", 0);
+    st.a_move        = xlib.XInternAtom(d, "XdndActionMove", 0);
+    st.a_action_list = xlib.XInternAtom(d, "XdndActionList", 0);
     st.a_type_list   = xlib.XInternAtom(d, "XdndTypeList", 0);
-    st.a_uri_list    = xlib.XInternAtom(d, "text/uri-list", 0);
-    st.a_primary     = xlib.XInternAtom(d, "CAUSTIC_DND", 0);
+    st.a_uri_list    = xlib.XInternAtom(d, transfer.MIME_URIS, 0);
     st.a_utf8        = xlib.XInternAtom(d, "UTF8_STRING", 0);
-    st.a_text_utf8   = xlib.XInternAtom(d, "text/plain;charset=utf-8", 0);
+    st.a_text_utf8   = xlib.XInternAtom(d, transfer.MIME_UTF8, 0);
     st.a_text        = xlib.XInternAtom(d, "text/plain", 0);
-
-    st.paths = mem.core.mmap_anon(MAX_FILES * PATH_BYTES + TEXT_BYTES);
-    if (cast(i64, st.paths) == 0) { return; }
-    st.text = cast(*u8, cast(i64, st.paths) + MAX_FILES * PATH_BYTES);
-
-    let is i64 as atom = xlib.XInternAtom(d, "ATOM", 0);
+    st.a_png         = xlib.XInternAtom(d, transfer.MIME_PNG, 0);
+    st.a_atom        = xlib.XInternAtom(d, "ATOM", 0);
     let is i64 as v = XDND_VERSION;
-    xlib.XChangeProperty(d, xid, st.a_aware, atom, 32, x.PropModeReplace,
-                         cast(*u8, &v), 1);
+    xlib.XChangeProperty(d, xid, st.a_aware, st.a_atom, 32, x.PropModeReplace, cast(*u8, &v), 1);
     xlib.XFlush(d);
-
     st.ready = 1;
 }
 
-fn close(st as *State) as void {
-    if (cast(i64, st.paths) != 0) {
-        mem.core.munmap(st.paths, MAX_FILES * PATH_BYTES + TEXT_BYTES);
-        st.paths = cast(*u8, 0);
-        st.text = cast(*u8, 0);
-    }
+fn close(st as *State, d as *u8) as void {
+    if (st.out_state != _OFF) { _source_end(st, d); }
+    transfer.bytes_free(&st.paths);
+    transfer.bytes_free(&st.text);
     st.ready = 0;
 }
 
@@ -182,19 +173,19 @@ fn count(st as *State) as i64 {
 }
 
 fn path_at(st as *State, i as i64) as *u8 {
-    if (st.dropped == 0 || i < 0 || i >= st.count) { return cast(*u8, 0); }
-    return cast(*u8, cast(i64, st.paths) + i * PATH_BYTES);
+    if (st.dropped == 0) { return cast(*u8, 0); }
+    return transfer.path_at(&st.paths, st.count, i);
 }
 
 // The text dropped, UTF-8, text_length bytes, not terminated; null for none.
 fn text(st as *State) as *u8 {
-    if (st.dropped == 0 || st.text_len == 0) { return cast(*u8, 0); }
-    return st.text;
+    if (st.dropped == 0 || st.text.len == 0) { return cast(*u8, 0); }
+    return st.text.data;
 }
 
 fn text_length(st as *State) as i64 {
     if (st.dropped == 0) { return 0; }
-    return st.text_len;
+    return st.text.len;
 }
 
 // What the drag over the window offers, FILES and TEXT bits; 0 for none.
@@ -203,42 +194,56 @@ fn offered(st as *State) as i32 {
     return st.offered;
 }
 
-// Clears the last drop, so a program can tell one from the next. Called by the
-// program after it has read the paths, or by the next XdndEnter.
+// Clears the last drop, so a program can tell one from the next.
 fn clear(st as *State) as void {
     st.dropped = 0;
     st.count = 0;
-    st.text_len = 0;
+    transfer.bytes_clear(&st.paths);
+    transfer.bytes_clear(&st.text);
 }
 
-// What the program takes of what is offered, where the pointer is now: FILES,
-// TEXT, both or 0. Told the source at once when it changes. 1 when a drag is
-// there to answer.
-fn answer(st as *State, d as *u8, xid as i64, takes as i32) as i32 {
+fn _action_bit(st as *State, atom as i64) as i32 {
+    if (atom == st.a_copy) { return transfer.COPY; }
+    if (atom == st.a_move) { return transfer.MOVE; }
+    return 0;
+}
+
+fn _action_atom(st as *State, bit as i32) as i64 {
+    if (bit == transfer.MOVE) { return st.a_move; }
+    if (bit == transfer.COPY) { return st.a_copy; }
+    return 0;
+}
+
+// What the program takes of what is offered where the pointer is now —
+// FILES, TEXT, both or 0 — and how: transfer.COPY or MOVE, 0 for the
+// source's suggestion. Told the source at once. 1 when a drag is there.
+fn answer(st as *State, d as *u8, xid as i64, takes as i32, action as i32) as i32 {
     if (st.ready == 0 || st.source == 0) { return 0; }
-    let is i32 as was = st.answer & st.offered;
     st.answer = takes;
-    if ((takes & st.offered) != was) { _status(st, d, xid); }
+    st.action = action;
+    _status(st, d, xid);
     return 1;
 }
 
 // The answer to an XdndPosition: taken or not, and what would be done.
 fn _status(st as *State, d as *u8, xid as i64) as void {
     let is i64 as accept with mut = 0;
-    let is i64 as action with mut = 0;
+    st.accepted = 0;
     if ((st.answer & st.offered) != 0) {
+        let is i32 as act with mut = st.action;
+        if (act == 0) { act = st.suggested; }
+        if (act == 0) { act = transfer.COPY; }
+        st.accepted = act;
         accept = 1;
-        action = st.a_action_copy;
     }
-    // data[2] and data[3] describe a rectangle in which the source need not
-    // send more XdndPosition messages. Zero means "keep telling me", which is
-    // what a program tracking the pointer wants.
-    _send(d, st.source, st.a_status, xid, 0, accept, 0, 0, action);
+    // Bit 1: keep sending positions, whatever rectangle — the program tracks
+    // the pointer. data[2] and data[3], the rectangle, left empty.
+    _send(d, st.source, st.source, st.a_status, xid, accept | 2, 0, 0, _action_atom(st, st.accepted));
 }
 
 // A note for the program, as a client message's layout under events.cst's
 // DND_NOTE type.
-fn _note(out as *xev.XEvent, kind as i64, nx as i64, ny as i64, bits as i64) as void {
+fn _note(out as *xev.XEvent, kind as i64, nx as i64, ny as i64, bits as i64, action as i64) as void {
     xev.clear(out);
     let is *xev.XClientMessageEvent as c = xev.client(out);
     c.kind = _NOTE;
@@ -246,99 +251,22 @@ fn _note(out as *xev.XEvent, kind as i64, nx as i64, ny as i64, bits as i64) as 
     c.data[1] = nx;
     c.data[2] = ny;
     c.data[3] = bits;
-}
-
-// --- Parsing text/uri-list ---
-//
-// One URI per line, CRLF-terminated by the spec and LF-terminated by half the
-// implementations. Lines starting with '#' are comments. Everything a file
-// manager sends starts with file://, and what a caller wants is the path after
-// it, with %20 and friends turned back into bytes.
-
-fn _hex(c as i64) as i64 {
-    if (c >= 48 && c <= 57) { return c - 48; }        // 0-9
-    if (c >= 97 && c <= 102) { return c - 87; }       // a-f
-    if (c >= 65 && c <= 70) { return c - 55; }        // A-F
-    return 0 - 1;
-}
-
-// Writes one decoded path into slot `slot`. Returns 1 if anything was written.
-fn _take_uri(st as *State, src as i64, from as i64, to as i64, slot as i64) as i32 {
-    if (slot >= MAX_FILES) { return 0; }
-    let is i64 as i with mut = from;
-    // Skip a file:// prefix and its (always empty in practice) host part.
-    if (to - i > 7) {
-        let is *u8 as p = cast(*u8, src + i);
-        if (p[0] == cast(u8, 102) && p[1] == cast(u8, 105) && p[2] == cast(u8, 108)
-            && p[3] == cast(u8, 101) && p[4] == cast(u8, 58)
-            && p[5] == cast(u8, 47) && p[6] == cast(u8, 47)) {
-            i = i + 7;
-            // file://host/path — skip to the slash that starts the path.
-            while (i < to && *cast(*u8, src + i) != cast(u8, 47)) { i = i + 1; }
-        }
-    }
-    if (i >= to) { return 0; }
-
-    let is i64 as dst = cast(i64, st.paths) + slot * PATH_BYTES;
-    let is i64 as out with mut = 0;
-    while (i < to && out < PATH_BYTES - 1) {
-        let is i64 as c = cast(i64, *cast(*u8, src + i)) & 255;
-        if (c == 37 && i + 2 < to) {                    // '%'
-            let is i64 as h = _hex(cast(i64, *cast(*u8, src + i + 1)) & 255);
-            let is i64 as l = _hex(cast(i64, *cast(*u8, src + i + 2)) & 255);
-            if (h >= 0 && l >= 0) {
-                *cast(*u8, dst + out) = cast(u8, h * 16 + l);
-                out = out + 1;
-                i = i + 3;
-                continue;
-            }
-        }
-        *cast(*u8, dst + out) = cast(u8, c);
-        out = out + 1;
-        i = i + 1;
-    }
-    // At least a byte: i was short of to.
-    *cast(*u8, dst + out) = cast(u8, 0);
-    return 1;
-}
-
-fn _parse_uri_list(st as *State, data as *u8, n as i64) as i64 {
-    let is i64 as src = cast(i64, data);
-    let is i64 as slot with mut = 0;
-    let is i64 as i with mut = 0;
-    while (i < n && slot < MAX_FILES) {
-        // Skip whitespace and line endings before a URI.
-        while (i < n) {
-            let is i64 as c = cast(i64, *cast(*u8, src + i)) & 255;
-            if (c != 13 && c != 10 && c != 32 && c != 9) { break; }
-            i = i + 1;
-        }
-        if (i >= n) { break; }
-        let is i64 as start = i;
-        while (i < n) {
-            let is i64 as c = cast(i64, *cast(*u8, src + i)) & 255;
-            if (c == 13 || c == 10) { break; }
-            i = i + 1;
-        }
-        // '#' starts a comment line, which is not a file.
-        if ((cast(i64, *cast(*u8, src + start)) & 255) != 35) {
-            if (_take_uri(st, src, start, i, slot) == 1) { slot = slot + 1; }
-        }
-    }
-    return slot;
+    c.data[4] = action;
 }
 
 // --- The conversation ---
 
 let is xev.XEvent as _msg;
 
-fn _send(d as *u8, to as i64, message_type as i64, xid as i64,
-         d0 as i64, d1 as i64, d2 as i64, d3 as i64, d4 as i64) as void {
+// A client message of type message_type to the window to, about the window
+// about (the target, when to is its proxy), data[0] our window.
+fn _send(d as *u8, to as i64, about as i64, message_type as i64, xid as i64,
+         d1 as i64, d2 as i64, d3 as i64, d4 as i64) as void {
     xev.clear(&_msg);
     let is *xev.XClientMessageEvent as c = xev.client(&_msg);
     c.kind = x.ClientMessage;
     c.send_event = 1;
-    c.window = to;
+    c.window = about;
     c.message_type = message_type;
     c.format = 32;
     c.data[0] = xid;
@@ -350,83 +278,110 @@ fn _send(d as *u8, to as i64, message_type as i64, xid as i64,
     xlib.XFlush(d);
 }
 
-let is i64 as _actual_type with mut = 0;
-let is i32 as _actual_format with mut = 0;
-let is i64 as _nitems with mut = 0;
-let is i64 as _after with mut = 0;
-let is *u8 as _prop with mut = cast(*u8, 0);
+// A property of window w, its 32-bit items into out (at most max): how many;
+// 0 for none.
+fn _atoms(d as *u8, w as i64, prop as i64, out as *i64, max as i64) as i64 {
+    let is i64 as ty with mut = 0;
+    let is i32 as fmt with mut = 0;
+    let is i64 as n with mut = 0;
+    let is i64 as after with mut = 0;
+    let is *u8 as data with mut = cast(*u8, 0);
+    if (xlib.XGetWindowProperty(d, w, prop, 0, max, 0, 0, cast(*u8, &ty), cast(*u8, &fmt),
+                                cast(*u8, &n), cast(*u8, &after), cast(*u8, &data)) != x.Success) { return 0; }
+    if (cast(i64, data) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    if (fmt == 32) {
+        while (k < n && k < max) { out[k] = *cast(*i64, cast(i64, data) + k * 8); k = k + 1; }
+    }
+    xlib.XFree(data);
+    return k;
+}
 
-// One type the source offers, folded into what it offers: files for
-// text/uri-list; text for the first text type, in our order of preference.
+// One type the source offers, folded into what it offers.
 fn _take_type(st as *State, t as i64) as void {
     if (t == 0) { return; }
     if (t == st.a_uri_list) { st.offered = st.offered | FILES; }
-    if (t == st.a_utf8 || t == st.a_text_utf8 || t == st.a_text) {
+    let is i32 as rank with mut = 9;
+    if (t == st.a_utf8) { rank = 0; }
+    if (t == st.a_text_utf8) { rank = 1; }
+    if (t == st.a_text) { rank = 2; }
+    if (rank < 9) {
         st.offered = st.offered | TEXT;
-        if (_rank(st, t) < _rank(st, st.text_type)) { st.text_type = t; }
+        if (rank < st.text_rank) { st.text_rank = rank; st.text_type = t; }
     }
 }
 
-// The preference among text types: lower first; 9 for none.
-fn _rank(st as *State, t as i64) as i64 {
-    if (t == st.a_utf8) { return 0; }
-    if (t == st.a_text_utf8) { return 1; }
-    if (t == st.a_text) { return 2; }
-    return 9;
-}
-
 // What the source offers. Up to three types ride in the XdndEnter message
-// itself; more than three and they are in the XdndTypeList property instead,
-// which is the case a naive implementation misses.
+// itself; more than three and they are in the XdndTypeList property instead.
 fn _offers(st as *State, d as *u8, source as i64, c as *xev.XClientMessageEvent) as void {
     st.offered = 0;
+    st.text_rank = 9;
     st.text_type = 0;
     if ((c.data[1] & 1) == 0) {
-        // Three or fewer: they are right here.
         _take_type(st, c.data[2]);
         _take_type(st, c.data[3]);
         _take_type(st, c.data[4]);
         return;
     }
-    _prop = cast(*u8, 0);
-    if (xlib.XGetWindowProperty(d, source, st.a_type_list, 0, 256, 0, 0,
-                                cast(*u8, &_actual_type), cast(*u8, &_actual_format),
-                                cast(*u8, &_nitems), cast(*u8, &_after),
-                                cast(*u8, &_prop)) != 0) { return; }
-    if (cast(i64, _prop) == 0) { return; }
+    let is [64]i64 as t;
+    let is i64 as n = _atoms(d, source, st.a_type_list, &t[0], 64);
     let is i64 as i with mut = 0;
-    while (i < _nitems) {
-        _take_type(st, *cast(*i64, cast(i64, _prop) + i * 8));
-        i = i + 1;
-    }
-    xlib.XFree(_prop);
-    _prop = cast(*u8, 0);
+    while (i < n) { _take_type(st, t[i]); i = i + 1; }
 }
 
-let is i64 as _wx with mut = 0;
-let is i64 as _wy with mut = 0;
-let is i64 as _child with mut = 0;
+// The actions the source allows: its XdndActionList, when it has one.
+fn _source_actions(st as *State, d as *u8, source as i64) as i32 {
+    let is [16]i64 as t;
+    let is i64 as n = _atoms(d, source, st.a_action_list, &t[0], 16);
+    let is i32 as bits with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) { bits = bits | _action_bit(st, t[i]); i = i + 1; }
+    return bits;
+}
 
 // Feeds one event. 0 when it is not the drag protocol's; 1 when it was, and
 // the program should not see it; 2 when it was and note is to be queued for
 // the program.
-//
-// The event this does NOT absorb is SelectionNotify for our own drop property:
-// see handle_selection, which window.cst calls from the same place because the
-// clipboard shares that event type.
-fn handle(st as *State, d as *u8, xid as i64, e as *xev.XEvent, note as *xev.XEvent) as i32 {
+fn handle(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, e as *xev.XEvent, note as *xev.XEvent) as i32 {
     if (st.ready == 0) { return 0; }
     if (xev.kind(e) != x.ClientMessage) { return 0; }
     let is *xev.XClientMessageEvent as c = xev.client(e);
 
+    // --- As the source: the target's answers ---
+    if (c.message_type == st.a_status) {
+        if (st.out_state != _DRAGGING || c.data[0] != st.out_target) { return 1; }
+        st.out_waiting = 0;
+        st.out_accept = cast(i32, (c.data[1] & 1) != 0);
+        st.out_action = _action_bit(st, c.data[4]);
+        if (st.out_accept == 1 && st.out_action == 0) { st.out_action = transfer.COPY; }
+        if (st.out_moved == 1) { _position(st, d); }
+        return 1;
+    }
+    if (c.message_type == st.a_finished) {
+        if (st.out_state != _DROPPED || c.data[0] != st.out_target) { return 1; }
+        let is i32 as done with mut = st.out_action;
+        if (st.out_version >= 5) {
+            if ((c.data[1] & 1) == 0) { done = 0; }
+            else if (_action_bit(st, c.data[2]) != 0) { done = _action_bit(st, c.data[2]); }
+        }
+        _source_end(st, d);
+        clipboard.disown(sel, d, st.xid, clipboard.XDND);
+        _note(note, _DONE, 0, 0, 0, cast(i64, done));
+        return 2;
+    }
+
+    // --- As the target ---
     if (c.message_type == st.a_enter) {
         st.source = c.data[0];
         st.version = (c.data[1] >> 24) & 255;
         _offers(st, d, st.source, c);
+        st.actions = _source_actions(st, d, st.source) | transfer.COPY;
+        st.suggested = 0;
         // Until the program says otherwise, everything it offers is taken.
         st.answer = st.offered;
+        st.action = 0;
         clear(st);
-        _note(note, _ENTER, st.x, st.y, cast(i64, st.offered));
+        _note(note, _ENTER, st.x, st.y, cast(i64, st.offered), cast(i64, st.actions));
         return 2;
     }
 
@@ -435,41 +390,43 @@ fn handle(st as *State, d as *u8, xid as i64, e as *xev.XEvent, note as *xev.XEv
         // Root coordinates, packed two to a word, made the window's.
         let is i64 as rx = (c.data[2] >> 16) & 65535;
         let is i64 as ry = c.data[2] & 65535;
-        _wx = rx;
-        _wy = ry;
-        xlib.XTranslateCoordinates(d, st.root, xid, cast(i32, rx), cast(i32, ry), cast(*u8, &_wx), cast(*u8, &_wy),
-                                   cast(*u8, &_child));
-        st.x = _wx;
-        st.y = _wy;
-        // Every XdndPosition must be answered. A source that gets no
-        // XdndStatus shows the "cannot drop" cursor and refuses the drop, and
-        // nothing anywhere reports an error — which is why this is the single
-        // most-forgotten message in the protocol.
+        let is i64 as wx with mut = 0;
+        let is i64 as wy with mut = 0;
+        let is i64 as child with mut = 0;
+        xlib.XTranslateCoordinates(d, st.root, xid, cast(i32, rx), cast(i32, ry), cast(*u8, &wx), cast(*u8, &wy),
+                                   cast(*u8, &child));
+        st.x = wx;
+        st.y = wy;
+        st.suggested = 0;
+        if (st.version >= 2) { st.suggested = _action_bit(st, c.data[4]); }
+        st.actions = st.actions | st.suggested;
         _status(st, d, xid);
-        _note(note, _MOVE, st.x, st.y, 0);
+        _note(note, _MOVE, st.x, st.y, 0, cast(i64, st.actions));
         return 2;
     }
 
     if (c.message_type == st.a_drop) {
         let is i32 as takes = st.answer & st.offered;
-        if (takes == 0) {
+        if (takes == 0 || st.accepted == 0) {
             // Refuse cleanly rather than leave the source waiting.
-            _send(d, st.source, st.a_finished, xid, 0, 0, 0, 0, 0);
+            _send(d, st.source, st.source, st.a_finished, xid, 0, 0, 0, 0);
             st.source = 0;
-            _note(note, _LEAVE, st.x, st.y, 0);
+            _note(note, _LEAVE, st.x, st.y, 0, 0);
             return 2;
         }
-        // The data does not come with the message. Ask for it, and it arrives
-        // later as SelectionNotify: files when they are taken, text otherwise.
-        let is i64 as asked with mut = st.text_type;
+        // The data does not come with the message: asked for, it arrives
+        // later — landed() finishes the drop. Files when they are taken.
         st.want = TEXT;
-        if ((takes & FILES) != 0) {
-            asked = st.a_uri_list;
-            st.want = FILES;
+        let is i64 as target with mut = st.text_type;
+        if ((takes & FILES) != 0) { st.want = FILES; target = st.a_uri_list; }
+        let is i64 as when with mut = x.CurrentTime;
+        if (st.version >= 1) { when = c.data[2]; }
+        if (clipboard.request(sel, d, xid, clipboard.DROP, clipboard.XDND, st.want, target, when) == 0) {
+            _send(d, st.source, st.source, st.a_finished, xid, 0, 0, 0, 0);
+            st.source = 0;
+            _note(note, _LEAVE, st.x, st.y, 0, 0);
+            return 2;
         }
-        let is i64 as when = c.data[2];
-        xlib.XConvertSelection(d, st.a_selection, asked, st.a_primary, xid, when);
-        xlib.XFlush(d);
         return 1;
     }
 
@@ -477,68 +434,246 @@ fn handle(st as *State, d as *u8, xid as i64, e as *xev.XEvent, note as *xev.XEv
         st.source = 0;
         st.offered = 0;
         clear(st);
-        _note(note, _LEAVE, st.x, st.y, 0);
+        _note(note, _LEAVE, st.x, st.y, 0, 0);
         return 2;
     }
-
     return 0;
 }
 
-// The other half: the data itself, which arrives as its own event type. 1 when
-// it was ours.
-//
-// window.cst calls this beside clipboard.cst's own selection handling, because
-// both are SelectionNotify and only the property tells them apart.
-fn handle_selection(st as *State, d as *u8, xid as i64, e as *xev.XEvent, note as *xev.XEvent) as i32 {
-    if (st.ready == 0) { return 0; }
-    if (xev.kind(e) != x.SelectionNotify) { return 0; }
-    let is *xev.XSelectionEvent as s = xev.selection(e);
-    if (s.property != st.a_primary) { return 0; }
-
-    _prop = cast(*u8, 0);
-    _nitems = 0;
-    // Text: a word past the most kept, to see whether the limit falls inside a
-    // character.
-    let is i64 as longs with mut = 65536;
-    if (st.want == TEXT) { longs = TEXT_BYTES / 4 + 1; }
-    if (xlib.XGetWindowProperty(d, xid, st.a_primary, 0, longs, 1, 0,
-                                cast(*u8, &_actual_type), cast(*u8, &_actual_format),
-                                cast(*u8, &_nitems), cast(*u8, &_after),
-                                cast(*u8, &_prop)) == 0) {
-        if (cast(i64, _prop) != 0) {
-            if (st.want == FILES) {
-                st.count = _parse_uri_list(st, _prop, _nitems);
-            } else {
-                st.text_len = _take_text(st, _prop, _nitems);
-            }
-            st.dropped = 1;
-            xlib.XFree(_prop);
-            _prop = cast(*u8, 0);
-        }
+// The drop's data came (clipboard.cst's DROP slot answered): read, the
+// source told XdndFinished with the action done, the program DND_DROP — or
+// DND_LEAVE, when nothing could be had.
+fn landed(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, note as *xev.XEvent) as i32 {
+    clear(st);
+    let is i32 as got = clipboard.got(sel, clipboard.DROP);
+    let is *u8 as data = clipboard.data(sel, clipboard.DROP);
+    let is i64 as n = clipboard.length(sel, clipboard.DROP);
+    if (got == transfer.FILES) {
+        st.count = transfer.parse_uri_list(data, n, &st.paths);
+        if (st.count > 0) { st.dropped = 1; }
+    } else if (got == transfer.TEXT) {
+        if (transfer.bytes_set(&st.text, data, n) == 1) { st.dropped = 1; }
     }
-
-    // Tell the source it is over, whatever came back. A source that never gets
-    // XdndFinished may keep its grab.
+    clipboard.forget(sel, clipboard.DROP);
+    let is i32 as action = st.accepted;
     if (st.source != 0) {
-        _send(d, st.source, st.a_finished, xid, 0, cast(i64, st.dropped), st.a_action_copy, 0, 0);
+        let is i64 as ok = cast(i64, st.dropped);
+        let is i64 as atom with mut = 0;
+        if (ok == 1) { atom = _action_atom(st, action); }
+        _send(d, st.source, st.source, st.a_finished, xid, ok, atom, 0, 0);
         st.source = 0;
     }
     if (st.dropped == 1) {
-        _note(note, _DROP, st.x, st.y, cast(i64, st.want));
+        _note(note, _DROP, st.x, st.y, cast(i64, st.want), cast(i64, action));
     } else {
-        _note(note, _LEAVE, st.x, st.y, 0);
+        _note(note, _LEAVE, st.x, st.y, 0, 0);
     }
     return 2;
 }
 
-// Text as it came, up to TEXT_BYTES and never ending inside a character: how
-// many bytes were kept.
-fn _take_text(st as *State, data as *u8, n as i64) as i64 {
-    let is i64 as m with mut = n;
-    if (m > TEXT_BYTES) {
-        m = TEXT_BYTES;
-        while (m > 0 && (cast(i64, data[m]) & 192) == 128) { m = m - 1; }
+// --- As the source ---
+
+// A drag of what o offers begun from win, the actions allowed (transfer
+// bits): XdndSelection owned with it, the pointer and the keyboard grabbed.
+// Called while a button is held. 1 when it began.
+fn begin(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, o as *transfer.Offer, actions as i32) as i32 {
+    if (st.ready == 0 || st.out_state != _OFF || o.formats == 0 || (actions & (transfer.COPY | transfer.MOVE)) == 0) { return 0; }
+    if (clipboard.set(sel, d, xid, clipboard.XDND, o, x.CurrentTime) == 0) { return 0; }
+    let is u32 as mask = cast(u32, x.ButtonPressMask | x.ButtonReleaseMask | x.PointerMotionMask);
+    if (xlib.XGrabPointer(d, xid, 0, mask, x.GrabModeAsync, x.GrabModeAsync, 0, 0, x.CurrentTime) != 0) {
+        clipboard.disown(sel, d, xid, clipboard.XDND);
+        return 0;
     }
-    mem.memcpy(st.text, data, m);
-    return m;
+    xlib.XGrabKeyboard(d, xid, 0, x.GrabModeAsync, x.GrabModeAsync, x.CurrentTime);
+    // The types, best first; more than three ride in XdndTypeList.
+    st.out_ntypes = 0;
+    if ((o.formats & transfer.FILES) != 0) { st.out_types[st.out_ntypes] = st.a_uri_list; st.out_ntypes = st.out_ntypes + 1; }
+    if ((o.formats & transfer.TEXT) != 0) {
+        st.out_types[st.out_ntypes] = st.a_text_utf8; st.out_ntypes = st.out_ntypes + 1;
+        st.out_types[st.out_ntypes] = st.a_utf8; st.out_ntypes = st.out_ntypes + 1;
+        st.out_types[st.out_ntypes] = st.a_text; st.out_ntypes = st.out_ntypes + 1;
+    }
+    if ((o.formats & transfer.PNG) != 0) { st.out_types[st.out_ntypes] = st.a_png; st.out_ntypes = st.out_ntypes + 1; }
+    xlib.XChangeProperty(d, xid, st.a_type_list, st.a_atom, 32, x.PropModeReplace, cast(*u8, &st.out_types[0]), st.out_ntypes);
+    // The actions allowed, for a target that asks.
+    let is [2]i64 as acts;
+    let is i32 as na with mut = 0;
+    if ((actions & transfer.COPY) != 0) { acts[na] = st.a_copy; na = na + 1; }
+    if ((actions & transfer.MOVE) != 0) { acts[na] = st.a_move; na = na + 1; }
+    xlib.XChangeProperty(d, xid, st.a_action_list, st.a_atom, 32, x.PropModeReplace, cast(*u8, &acts[0]), na);
+    xlib.XFlush(d);
+    st.out_state = _DRAGGING;
+    st.out_actions = actions;
+    st.out_formats = o.formats;
+    st.out_target = 0;
+    st.out_to = 0;
+    st.out_waiting = 0;
+    st.out_moved = 0;
+    st.out_accept = 0;
+    st.out_action = 0;
+    st.xid = xid;
+    return 1;
+}
+
+fn source_active(st as *State) as i32 { return cast(i32, st.out_state != _OFF); }
+
+fn _source_end(st as *State, d as *u8) as void {
+    if (st.out_state == _DRAGGING) {
+        xlib.XUngrabPointer(d, x.CurrentTime);
+        xlib.XUngrabKeyboard(d, x.CurrentTime);
+    }
+    xlib.XDeleteProperty(d, st.xid, st.a_type_list);
+    xlib.XDeleteProperty(d, st.xid, st.a_action_list);
+    xlib.XFlush(d);
+    st.out_state = _OFF;
+    st.out_target = 0;
+    st.out_to = 0;
+}
+
+// The XdndAware window under root x, y — descending from the root through
+// the windows containing the point — with the version it speaks and where
+// messages for it go (its XdndProxy, when it names one); 0 for none.
+fn _target_at(st as *State, d as *u8, rx as i64, ry as i64, version as *i64, to as *i64) as i64 {
+    let is i64 as w with mut = st.root;
+    let is i32 as depth with mut = 0;
+    while (depth < 32) {
+        let is i64 as cx with mut = 0;
+        let is i64 as cy with mut = 0;
+        let is i64 as child with mut = 0;
+        if (xlib.XTranslateCoordinates(d, st.root, w, cast(i32, rx), cast(i32, ry), cast(*u8, &cx), cast(*u8, &cy),
+                                       cast(*u8, &child)) == 0) { return 0; }
+        if (child == 0) { return 0; }
+        let is [1]i64 as v;
+        let is i64 as proxy with mut = 0;
+        let is [1]i64 as p;
+        if (_atoms(d, child, st.a_proxy, &p[0], 1) == 1) { proxy = p[0]; }
+        let is i64 as where with mut = child;
+        if (proxy != 0) { where = proxy; }
+        if (_atoms(d, where, st.a_aware, &v[0], 1) == 1 && v[0] >= 3) {
+            *version = v[0];
+            *to = where;
+            return child;
+        }
+        w = child;
+        depth = depth + 1;
+    }
+    return 0;
+}
+
+fn _position(st as *State, d as *u8) as void {
+    if (st.out_target == 0) { return; }
+    // The action suggested: MOVE with Shift held where it is allowed, else
+    // COPY where it is, else MOVE.
+    let is i32 as act with mut = transfer.COPY;
+    if ((st.out_actions & transfer.COPY) == 0) { act = transfer.MOVE; }
+    if ((st.out_actions & transfer.MOVE) != 0 && (cast(i32, st.out_mods) & x.ShiftMask) != 0) { act = transfer.MOVE; }
+    _send(d, st.out_to, st.out_target, st.a_position, st.xid, 0, (st.out_x << 16) | (st.out_y & 65535),
+          st.out_time, _action_atom(st, act));
+    st.out_waiting = 1;
+    st.out_moved = 0;
+}
+
+fn _enter(st as *State, d as *u8) as void {
+    let is i64 as v with mut = st.out_version;
+    if (v > XDND_VERSION) { v = XDND_VERSION; }
+    let is i64 as flags with mut = v << 24;
+    if (st.out_ntypes > 3) { flags = flags | 1; }
+    let is [3]i64 as t;
+    let is i32 as k with mut = 0;
+    while (k < 3) {
+        t[k] = 0;
+        if (k < st.out_ntypes) { t[k] = st.out_types[k]; }
+        k = k + 1;
+    }
+    _send(d, st.out_to, st.out_target, st.a_enter, st.xid, flags, t[0], t[1], t[2]);
+}
+
+fn _leave(st as *State, d as *u8) as void {
+    if (st.out_target == 0) { return; }
+    _send(d, st.out_to, st.out_target, st.a_leave, st.xid, 0, 0, 0, 0);
+    st.out_target = 0;
+    st.out_to = 0;
+    st.out_accept = 0;
+    st.out_action = 0;
+    st.out_waiting = 0;
+}
+
+// The pointer at root x, y: the target under it entered, left, told.
+fn _moved(st as *State, d as *u8, rx as i64, ry as i64, mods as u32, t as i64) as void {
+    st.out_x = rx; st.out_y = ry; st.out_mods = mods; st.out_time = t;
+    let is i64 as version with mut = 0;
+    let is i64 as to with mut = 0;
+    let is i64 as target = _target_at(st, d, rx, ry, &version, &to);
+    if (target != st.out_target) {
+        _leave(st, d);
+        if (target != 0) {
+            st.out_target = target;
+            st.out_to = to;
+            st.out_version = version;
+            _enter(st, d);
+        }
+    }
+    if (st.out_target == 0) { return; }
+    if (st.out_waiting == 1) { st.out_moved = 1; return; }
+    _position(st, d);
+}
+
+// Feeds one event while this window drags: the grabbed pointer's motion and
+// release, Escape. 0 when not dragging or not one of those; 1 when taken;
+// 2 when note (DRAG_DONE) is to be queued.
+fn source_event(st as *State, sel as *clipboard.Selection, d as *u8, e as *xev.XEvent, note as *xev.XEvent) as i32 {
+    if (st.out_state != _DRAGGING) { return 0; }
+    let is i32 as ty = xev.kind(e);
+    if (ty == x.MotionNotify) {
+        let is *xev.XMotionEvent as m = xev.motion(e);
+        _moved(st, d, cast(i64, m.x_root), cast(i64, m.y_root), m.state, m.time);
+        return 1;
+    }
+    if (ty == x.ButtonPress) { return 1; }
+    if (ty == x.KeyRelease) { return 1; }
+    if (ty == x.KeyPress) {
+        let is i64 as sym = xlib.XLookupKeysym(cast(*u8, e), 0);
+        if (sym != 65307) { return 1; }   // Escape
+        _leave(st, d);
+        _source_end(st, d);
+        clipboard.disown(sel, d, st.xid, clipboard.XDND);
+        _note(note, _DONE, 0, 0, 0, 0);
+        return 2;
+    }
+    if (ty == x.ButtonRelease) {
+        let is *xev.XButtonEvent as b = xev.button(e);
+        _moved(st, d, cast(i64, b.x_root), cast(i64, b.y_root), b.state, b.time);
+        if (st.out_target != 0 && st.out_accept == 1) {
+            _send(d, st.out_to, st.out_target, st.a_drop, st.xid, 0, b.time, 0, 0);
+            xlib.XUngrabPointer(d, x.CurrentTime);
+            xlib.XUngrabKeyboard(d, x.CurrentTime);
+            xlib.XFlush(d);
+            st.out_state = _DROPPED;
+            st.out_since = time.now_ms();
+            return 1;
+        }
+        _leave(st, d);
+        _source_end(st, d);
+        clipboard.disown(sel, d, st.xid, clipboard.XDND);
+        _note(note, _DONE, 0, 0, 0, 0);
+        return 2;
+    }
+    return 0;
+}
+
+// A drop never finished, given up: 2 with note (DRAG_DONE, nothing done).
+fn tick(st as *State, sel as *clipboard.Selection, d as *u8, note as *xev.XEvent) as i32 {
+    if (st.out_state != _DROPPED || time.now_ms() - st.out_since < FINISH_MS) { return 0; }
+    _source_end(st, d);
+    clipboard.disown(sel, d, st.xid, clipboard.XDND);
+    _note(note, _DONE, 0, 0, 0, 0);
+    return 2;
+}
+
+// Milliseconds until tick has something to say; -1 for nothing.
+fn due(st as *State) as i64 {
+    if (st.out_state != _DROPPED) { return 0 - 1; }
+    let is i64 as left = FINISH_MS - (time.now_ms() - st.out_since);
+    if (left < 0) { return 0; }
+    return left;
 }

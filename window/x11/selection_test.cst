@@ -1,0 +1,358 @@
+// window/x11/selection_test.cst — the clipboard and the primary selection
+// against another program, xclip, under Xvfb:
+//   sh window/x11/tools/run_headless.sh ./build/x11_selection_test
+// Owned here and read by xclip: UTF-8 text by each text target, STRING as
+// Latin-1, the TARGETS listed, a PNG beside the text, 3 MB through INCR, the
+// primary selection apart from the clipboard. Owned by xclip and asked for
+// here: text, 3 MB through INCR, a PNG, the formats offered, a format not
+// offered (none), STRING-only text made UTF-8, the primary selection. And
+// asked of ourselves, through the server, 3 MB through INCR both ways. Then
+// what ends a transfer early: a requestor whose window goes mid-INCR, one
+// that stops asking (given up after the timeout, the pump told when), an
+// owner that goes (nothing offered), and ours closed (nothing to paste).
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "std/env.cst" as env;
+use "x11.cst" as x11;
+use "clipboard.cst" as clipboard;
+use "../transfer.cst" as transfer;
+use "bind/xlib.cst" as xlib;
+use "../../sys/linux.cst" as sys;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+let is x11.window.Window as win with mut;
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        x11.pump(&win);
+        time.sleep_ms(2);
+    }
+}
+
+// sh -c cmd, the window pumped meanwhile (xclip asks it, or it is asked):
+// the exit status, -1 when it took longer than 20 seconds.
+fn run(cmd as *u8) as i32 {
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd); argv[3] = 0;
+    let is i64 as pid = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (pid <= 0) { return 0 - 1; }
+    let is i32 as status with mut = 0;
+    let is i64 as until = time.now_ms() + 20000;
+    while (time.now_ms() < until) {
+        x11.pump(&win);
+        if (linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) { return process.exit_code_of(status); }
+        time.sleep_ms(2);
+    }
+    return 0 - 1;
+}
+
+// sh -c "exec cmd", left running: its process.
+fn spawn_owner(cmd as *u8) as i64 {
+    let is [128]u8 as line with mut;
+    let is *u8 as head = "exec ";
+    let is i64 as n with mut = 0;
+    while (head[n] != 0) { line[n] = head[n]; n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (cmd[i] != 0 && n < 126) { line[n] = cmd[i]; n = n + 1; i = i + 1; }
+    line[n] = 0;
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, &line[0]); argv[3] = 0;
+    return process.spawnp("sh", cast(*u8, &argv[0]));
+}
+
+fn stop(pid as i64) as void {
+    sys.kill(pid, 15);
+    let is i32 as status with mut = 0;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+}
+
+// --- A requestor written here, on a connection apart ---
+
+let is *u8 as rd with mut;
+
+// An event of kind on rq (for PropertyNotify: prop's new value), the window
+// pumped meanwhile: 1 when it came within 3 seconds.
+fn wait_event(rq as i64, kind as i32, prop as i64) as i32 {
+    let is [24]i64 as ev with mut;
+    let is i64 as until = time.now_ms() + 3000;
+    while (time.now_ms() < until) {
+        x11.pump(&win);
+        while (xlib.XPending(rd) > 0) {
+            xlib.XNextEvent(rd, cast(*u8, &ev[0]));
+            let is i32 as ty = *cast(*i32, &ev[0]);
+            if (ty == kind && ev[4] == rq) {
+                if (kind != 28) { return 1; }
+                if (ev[5] == prop && *cast(*i32, &ev[7]) == 0) { return 1; }
+            }
+        }
+        time.sleep_ms(2);
+    }
+    return 0;
+}
+
+// A window of another connection that asks for the clipboard as UTF8_STRING,
+// is answered INCR and takes the first chunk: the window, 0 when that did not
+// happen.
+fn incr_requestor() as i64 {
+    if (cast(i64, rd) == 0) { rd = xlib.XOpenDisplay(cast(*u8, 0)); }
+    if (cast(i64, rd) == 0) { return 0; }
+    let is i64 as rq = xlib.XCreateSimpleWindow(rd, xlib.XDefaultRootWindow(rd), 0, 0, 1, 1, cast(u32, 0), 0, 0);
+    xlib.XSelectInput(rd, rq, 4194304);
+    let is i64 as prop = xlib.XInternAtom(rd, "CAUSTIC_TEST_INCR", 0);
+    xlib.XConvertSelection(rd, xlib.XInternAtom(rd, "CLIPBOARD", 0), xlib.XInternAtom(rd, "UTF8_STRING", 0), prop, rq, 0);
+    xlib.XFlush(rd);
+    if (wait_event(rq, 31, prop) == 0) { return 0; }
+    let is i64 as ty with mut = 0;
+    let is i32 as format with mut = 0;
+    let is i64 as items with mut = 0;
+    let is i64 as after with mut = 0;
+    let is *u8 as data with mut = cast(*u8, 0);
+    xlib.XGetWindowProperty(rd, rq, prop, 0, 1, 0, 0, cast(*u8, &ty), cast(*u8, &format), cast(*u8, &items),
+                            cast(*u8, &after), cast(*u8, &data));
+    if (cast(i64, data) != 0) { xlib.XFree(data); }
+    if (ty != xlib.XInternAtom(rd, "INCR", 0)) { return 0; }
+    // Deleted: the first chunk asked for, and taken.
+    xlib.XDeleteProperty(rd, rq, prop);
+    xlib.XFlush(rd);
+    if (wait_event(rq, 28, prop) == 0) { return 0; }
+    return rq;
+}
+
+// The INCR answers under way, and the bytes their copies hold.
+fn answering() as i32 {
+    let is i32 as n with mut = 0;
+    let is i32 as k with mut = 0;
+    while (k < clipboard.MAX_OUT) {
+        if (win.clip.out[k].active == 1) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+fn copies() as i64 {
+    let is i64 as n with mut = 0;
+    let is i32 as k with mut = 0;
+    while (k < clipboard.MAX_OUT) {
+        n = n + win.clip.out[k].data.cap;
+        k = k + 1;
+    }
+    return n;
+}
+
+fn read_file(path as *u8, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is [65536]u8 as buf with mut;
+    while (1 == 1) {
+        let is i64 as n = linux.read(fd, &buf[0], 65536);
+        if (n <= 0) { break; }
+        transfer.append(out, &buf[0], n);
+    }
+    linux.close(fd);
+    return 1;
+}
+
+fn write_file(path as *u8, p as *u8, n as i64) as void {
+    let is i64 as fd = linux.open(path, 577, 420);
+    if (fd < 0) { return; }
+    let is i64 as at with mut = 0;
+    while (at < n) {
+        let is i64 as w = linux.write(fd, cast(*u8, cast(i64, p) + at), n - at);
+        if (w <= 0) { break; }
+        at = at + w;
+    }
+    linux.close(fd);
+}
+
+fn same(b as *transfer.Bytes, p as *u8, n as i64) as i32 {
+    if (b.len != n) { io.printf("  %d bytes, want %d\n", b.len, n); return 0; }
+    return cast(i32, mem.memcmp(b.data, p, n) == 0);
+}
+
+fn contains(b as *transfer.Bytes, s as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= b.len) {
+        if (mem.memcmp(cast(*u8, cast(i64, b.data) + i), s, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The selection asked for as format, waited for: what came, into out; the
+// format that came.
+fn ask(which as i32, format as i32, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    if (x11.selection_request(&win, which, format) == 0) { return 0 - 1; }
+    let is i64 as until = time.now_ms() + 15000;
+    while (time.now_ms() < until && x11.selection_ready(&win) == 0) {
+        x11.pump(&win);
+        time.sleep_ms(2);
+    }
+    if (x11.selection_ready(&win) == 0) { return 0 - 2; }
+    transfer.bytes_set(out, x11.selection_data(&win), x11.selection_length(&win));
+    return x11.selection_format(&win);
+}
+
+// 3 MB of text, multi-byte characters across every chunk boundary.
+fn big_text(out as *transfer.Bytes) as void {
+    transfer.bytes_clear(out);
+    let is *u8 as line = "caustic ação — 3 MB through INCR ✓ ";
+    let is i64 as n with mut = 0;
+    while (line[n] != 0) { n = n + 1; }
+    while (out.len < 3145728) { transfer.append(out, line, n); }
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    win = x11.open("selections", 200, 100);
+    if (x11.is_open(&win) == 0) { io.printf("FAIL: no window\n"); return 1; }
+    pump(200);
+    linux.mkdir("build/selection-test", 493);
+    let is transfer.Bytes as got with mut;
+    transfer.bytes_init(&got);
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+
+    // --- Owned here, read by xclip ---
+    let is *u8 as hello = "héllo ✓ wörld";
+    let is i64 as hello_n = 17;
+    transfer.offer_text(&o, hello, hello_n);
+    check("the clipboard owned", x11.selection_set(&win, clipboard.CLIPBOARD, &o) == 1 &&
+          x11.selection_owns(&win, clipboard.CLIPBOARD) == 1);
+    check("read as UTF8_STRING", run("xclip -o -selection clipboard -t UTF8_STRING > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, hello, hello_n) == 1);
+    check("read as text/plain;charset=utf-8", run("xclip -o -selection clipboard -t 'text/plain;charset=utf-8' > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, hello, hello_n) == 1);
+    check("read as STRING: Latin-1, a '?' beyond it", run("xclip -o -selection clipboard -t STRING > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, "h\xe9llo ? w\xf6rld", 13) == 1);
+    check("its targets", run("xclip -o -selection clipboard -t TARGETS > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && contains(&got, "UTF8_STRING") == 1 &&
+          contains(&got, "text/plain;charset=utf-8") == 1 && contains(&got, "STRING") == 1 &&
+          contains(&got, "image/png") == 0);
+
+    let is transfer.Bytes as png with mut;
+    transfer.bytes_init(&png);
+    check("a PNG to offer", read_file("image/testdata/rgba.png", &png) == 1 && png.len > 8);
+    transfer.offer_png(&o, png.data, png.len);
+    check("text and a PNG owned", x11.selection_set(&win, clipboard.CLIPBOARD, &o) == 1);
+    check("the PNG read as image/png", run("xclip -o -selection clipboard -t image/png > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, png.data, png.len) == 1);
+    check("both in its targets", run("xclip -o -selection clipboard -t TARGETS > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && contains(&got, "image/png") == 1 && contains(&got, "UTF8_STRING") == 1);
+
+    let is transfer.Bytes as big with mut;
+    transfer.bytes_init(&big);
+    big_text(&big);
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, big.data, big.len);
+    check("3 MB owned", x11.selection_set(&win, clipboard.CLIPBOARD, &o) == 1);
+    check("3 MB read whole, through INCR", run("xclip -o -selection clipboard -t UTF8_STRING > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, big.data, big.len) == 1);
+
+    let is transfer.Offer as p with mut;
+    transfer.offer_init(&p);
+    transfer.offer_text(&p, "primary only", 12);
+    check("the primary selection owned", x11.selection_set(&win, clipboard.PRIMARY, &p) == 1);
+    check("the primary read", run("xclip -o -selection primary > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, "primary only", 12) == 1);
+    check("the clipboard apart from it", run("xclip -o -selection clipboard > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, big.data, big.len) == 1);
+
+    // --- Asked of ourselves, through the server ---
+    check("3 MB asked of ourselves, through INCR both ways", ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == transfer.TEXT &&
+          same(&got, big.data, big.len) == 1);
+
+    // --- Owned by xclip, asked for here ---
+    write_file("build/selection-test/in", "from xclip: ação", 18);
+    check("xclip takes the clipboard", run("xclip -i -selection clipboard build/selection-test/in") == 0);
+    pump(100);
+    check("no longer ours", x11.selection_owns(&win, clipboard.CLIPBOARD) == 0);
+    check("its text asked for", ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == transfer.TEXT && same(&got, "from xclip: ação", 18) == 1);
+    check("a format not offered: none", ask(clipboard.CLIPBOARD, transfer.PNG, &got) == 0 && got.len == 0);
+
+    write_file("build/selection-test/big", big.data, big.len);
+    check("xclip takes it with 3 MB", run("xclip -i -selection clipboard build/selection-test/big") == 0);
+    pump(100);
+    check("3 MB asked for, through INCR", ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == transfer.TEXT && same(&got, big.data, big.len) == 1);
+
+    check("xclip offers a PNG", run("xclip -i -selection clipboard -t image/png image/testdata/rgba.png") == 0);
+    pump(100);
+    check("what is offered: a PNG, no text", ask(clipboard.CLIPBOARD, 0, &got) == 0 && x11.selection_offered(&win) == transfer.PNG);
+    check("the PNG asked for", ask(clipboard.CLIPBOARD, transfer.PNG, &got) == transfer.PNG && same(&got, png.data, png.len) == 1);
+    check("text not offered: none", ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == 0);
+
+    write_file("build/selection-test/latin1", "caf\xe9", 4);
+    check("xclip offers STRING only", run("xclip -i -selection clipboard -t STRING build/selection-test/latin1") == 0);
+    pump(100);
+    check("text from STRING alone, made UTF-8", ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == transfer.TEXT && same(&got, "café", 5) == 1);
+
+    write_file("build/selection-test/primary", "xclip's primary", 15);
+    check("xclip takes the primary selection", run("xclip -i -selection primary build/selection-test/primary") == 0);
+    pump(100);
+    check("the primary asked for", ask(clipboard.PRIMARY, transfer.TEXT, &got) == transfer.TEXT && same(&got, "xclip's primary", 15) == 1);
+    check("the clipboard still xclip's STRING", ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == transfer.TEXT && same(&got, "café", 5) == 1);
+
+    // A requestor that goes mid-answer, and one that stops asking: their
+    // answers ended, the copies they were sent from freed.
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, big.data, big.len);
+    check("3 MB owned again", x11.selection_set(&win, clipboard.CLIPBOARD, &o) == 1);
+    let is i64 as rq with mut = incr_requestor();
+    check("another program's window asks: an INCR answer under way", rq != 0 && answering() == 1);
+    xlib.XDestroyWindow(rd, rq);
+    xlib.XSync(rd, 0);
+    pump(200);
+    check("its window destroyed: the answer ended, its copy freed", answering() == 0 && copies() == 0);
+    rq = incr_requestor();
+    check("asked again: under way", rq != 0 && answering() == 1);
+    let is i64 as due = x11.input_due(&win);
+    check("the window told when to give it up", due > 0 && due <= clipboard.TIMEOUT_MS + 1);
+    let is i64 as asked = time.now_ms();
+    while (answering() == 1 && time.now_ms() - asked < clipboard.TIMEOUT_MS + 5000) { pump(50); }
+    check("a requestor that stops asking: given up after the timeout, its copy freed",
+          answering() == 0 && copies() == 0 && time.now_ms() - asked >= clipboard.TIMEOUT_MS);
+    xlib.XDestroyWindow(rd, rq);
+    xlib.XSync(rd, 0);
+    check("and the clipboard still served whole", run("xclip -o -selection clipboard > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, big.data, big.len) == 1);
+
+    // An owner that goes: nothing offered.
+    let is i64 as owner = spawn_owner("xclip -quiet -i -selection clipboard build/selection-test/in > /dev/null");
+    pump(300);
+    check("an xclip owning it in the foreground", owner > 0 &&
+          ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == transfer.TEXT && got.len > 0);
+    stop(owner);
+    pump(100);
+    check("that owner gone: nothing offered", ask(clipboard.CLIPBOARD, transfer.TEXT, &got) == 0 && got.len == 0 &&
+          x11.selection_offered(&win) == 0);
+
+    // Ours, its window closed: nothing to paste. The xclips owning the
+    // primary selection let go meanwhile: they leave when it is taken.
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, "end", 3);
+    check("owned once more", x11.selection_set(&win, clipboard.CLIPBOARD, &o) == 1 &&
+          x11.selection_set(&win, clipboard.PRIMARY, &o) == 1);
+    pump(200);
+    x11.close(&win);
+    check("its owner closed: nothing to paste", run("xclip -o -selection clipboard > build/selection-test/a 2>/dev/null") != 0 &&
+          run("xclip -o -selection primary > build/selection-test/a 2>/dev/null") != 0);
+    xlib.XCloseDisplay(rd);
+    if (fails == 0) { io.printf("x11 selections: all checks passed\n"); return 0; }
+    io.printf("x11 selections: %d failures\n", fails);
+    return 1;
+}

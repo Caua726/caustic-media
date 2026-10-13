@@ -23,7 +23,8 @@ API and still reach the raw display handle underneath.
 window/
   window.cst      hub
   device.cst      our portable window: open, next_frame, acquire, submit, close;
-                  title, shown, its place, its icon, the clipboard
+                  title, shown, its place, its icon, the clipboard, drags
+  transfer.cst    what moves between programs: offers by format, URI lists
   display.cst     the screen a window is on: its scale, its monitor (monitor.cst),
                   its compositing manager followed
   monitor.cst     a monitor as a platform says it: place, work area, scale, name
@@ -523,10 +524,33 @@ where said:
   asks (`IMR_DOCUMENTFEED`, `IMR_QUERYCHARPOSITION`), `CPS_CANCEL` to reset.
 - `device.set_title` in UTF-8: `_NET_WM_NAME`, and `WM_NAME` in Latin-1 for
   an old window manager, each sequence whole or a `?`; `show`, `hide`,
-  `activate`, `position` on the screen, `set_icon`; `clipboard_set`,
-  `clipboard_request` and the answer for the clipboard and the primary
-  selection (`device_x11_test`, a second client playing the user and the
-  window manager).
+  `activate`, `position` on the screen, `set_icon`.
+- Selections and drag and drop (`transfer.cst`): what moves between programs
+  is an `Offer` — text (UTF-8), a PNG, files (absolute POSIX or Windows
+  paths, a `text/uri-list` of them) — and what is read is had by format
+  (`transfer.TEXT`, `PNG`, `FILES`), no size limit below `MAX_BYTES`
+  (256 MB). `clipboard_set(w, CLIPBOARD | PRIMARY, offer)`;
+  `clipboard_request(w, which, format)` and, once `clipboard_ready`, the
+  `clipboard_format` that came (0: not offered), its `clipboard_data` and
+  `clipboard_length`, and what was `clipboard_offered`. Drops: `DND_ENTER`,
+  `DND_MOVE`, `DND_LEAVE`, `DND_DROP` with what is offered and the actions
+  allowed; `drop_answer(w, takes, action)`, action 0 the user's (a move with
+  Shift held, else a copy); `dropped_files`, `dropped_file`, `dropped_text`.
+  A drag out: `drag_begin(w, offer, actions)` while a button is held — the
+  press's `BUTTON_UP` comes `BUTTON_TAKEN` — and `DRAG_DONE` with the action
+  the target did, 0 when cancelled (Escape) or refused. X11: ICCCM
+  selections with `TARGETS` asked first, `STRING` as Latin-1, INCR both ways
+  (a requestor whose window goes or stops asking is given up, its copy
+  freed), XDND 5 with `XdndProxy` and actions. Wayland: `wl_data_device` and
+  the primary selection, the pipes read and written as the pump goes — never
+  blocking, a reader that leaves let go — owned by the latest input serial,
+  version 3 actions (the compositor applies Shift). Windows:
+  `CF_UNICODETEXT` and the registered `"PNG"`, no primary selection
+  (refused); OLE's own `IDropTarget`, `IDataObject`, `IDropSource` and
+  `DoDragDrop`. Proved against other programs: xclip and GTK 3 on Xvfb
+  (`x11/selection_test`, `x11/dnd_gtk_test`), wl-copy/wl-paste and GTK 3 on
+  KWin (`wayland/selection_test`, `wayland/dnd_test`), mingw-built peers
+  under Wine (`win32/selection_test`, `win32/dnd_test`).
 - Popups (`Config.popup`: `POPUP_MENU`, `POPUP_LIST`, `POPUP_TOOLTIP`), which
   must have an owner and are never put at a point of the screen: `Config.place`
   is a `positioner.cst` positioner against a rectangle of the owner's client,

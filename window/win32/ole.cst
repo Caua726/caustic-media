@@ -1,0 +1,639 @@
+// window/win32/ole.cst — drag and drop on Windows, OLE's both ways.
+//
+// Dropped on: each window registers an IDropTarget of ours (RegisterDragDrop,
+// OLE initialised on the window's thread). OLE calls it as a drag comes in,
+// moves, leaves and is dropped: what the source's IDataObject has — CF_HDROP
+// files, CF_UNICODETEXT text — is offered, the effect said back from what the
+// program takes and how (answer), a Shift held asking to move; at the drop
+// the data is read there and then, the paths and the text kept until the
+// next drop. What the program is to hear comes out as notes (take), queued
+// with the window's events.
+//
+// Dragged from: drag() makes an IDataObject of an offer — CF_HDROP for files,
+// CF_UNICODETEXT for text, the registered "PNG" — with its IEnumFORMATETC,
+// and an IDropSource that drops when the button is let go and cancels on
+// Escape, and runs OLE's DoDragDrop to the end: the effect the target said,
+// 0 when cancelled or refused.
+//
+// The objects are ours in memory, their methods Win64 callbacks (abi.cst)
+// made once; their counts of references kept as COM's rules say, a data
+// object freed with its last.
+use "std/mem.cst" as mem;
+use "bind/types.cst" as t;
+use "bind/user32.cst" as u;
+use "bind/kernel32.cst" as k;
+use "bind/ole32.cst" as ole;
+use "bind/shell32.cst" as shell;
+use "bind/com.cst" as com;
+use "bind/guids.cst" as guids;
+use "abi.cst" as abi;
+use "clipboard.cst" as clipboard;
+use "../event.cst" as event;
+use "../transfer.cst" as transfer;
+
+let is i64 as DATA_S_SAMEFORMATETC with imut = 262448;
+let is i32 as MAX_NOTES with imut = 32;
+
+// --- The objects ---
+
+// A window's drop target: the object OLE holds, and what it has heard.
+struct Drop {
+    vtbl       as *u8;     // the IDropTarget: these two first
+    refs       as i64;
+    hwnd       as i64;
+    registered as i32;
+    offered    as i32;     // FILES, TEXT
+    allowed    as i32;     // COPY, MOVE: what the source allows
+    answer     as i32;     // what the program takes
+    action     as i32;     // and how; 0 for the default
+    accepted   as i32;     // the effect said last
+    keys       as u64;     // the keys held at the last DragEnter, DragOver
+    data       as *t.IDataObject;   // the drag's, while it is over the window
+    x          as i64;
+    y          as i64;
+    // The last drop's.
+    ready      as i32;
+    kind       as i32;     // FILES or TEXT
+    count      as i64;
+    paths      as transfer.Bytes;
+    text       as transfer.Bytes;
+    notes      as [32]event.Event;
+    note_head  as i32;
+    note_len   as i32;
+}
+
+struct DataObj {
+    vtbl  as *u8;
+    refs  as i64;
+    offer as transfer.Offer;
+}
+
+struct EnumObj {
+    vtbl as *u8;
+    refs as i64;
+    data as *DataObj;
+    at   as i32;
+    _pad as i32;
+}
+
+struct SourceObj {
+    vtbl as *u8;
+    refs as i64;
+}
+
+let is abi.Callbacks as _cb with mut;
+let is i32 as _ready with mut = 0;
+let is [7]i64 as _target_vtbl with mut;
+let is [12]i64 as _data_vtbl with mut;
+let is [7]i64 as _enum_vtbl with mut;
+let is [5]i64 as _source_vtbl with mut;
+
+// Method i: proc, taking nargs native arguments ("this" the first).
+fn _slot(i as i64, proc as *u8, nargs as i64) as i32 {
+    return abi.put(&_cb, i, proc, cast(*u8, 0), nargs, 0);
+}
+
+// The methods' code, made once: 1 when it could be.
+fn _init() as i32 {
+    if (_ready == 1) { return 1; }
+    _cb = abi.open(31);
+    let is i32 as ok with mut = 1;
+    // IDropTarget: 0..6
+    ok = ok & _slot(0, fn_ptr(_target_qi), 3);
+    ok = ok & _slot(1, fn_ptr(_target_addref), 1);
+    ok = ok & _slot(2, fn_ptr(_target_release), 1);
+    ok = ok & _slot(3, fn_ptr(_drag_enter), 5);
+    ok = ok & _slot(4, fn_ptr(_drag_over), 4);
+    ok = ok & _slot(5, fn_ptr(_drag_leave), 1);
+    ok = ok & _slot(6, fn_ptr(_drop), 5);
+    // IDataObject: 7..18
+    ok = ok & _slot(7, fn_ptr(_data_qi), 3);
+    ok = ok & _slot(8, fn_ptr(_data_addref), 1);
+    ok = ok & _slot(9, fn_ptr(_data_release), 1);
+    ok = ok & _slot(10, fn_ptr(_get_data), 3);
+    ok = ok & _slot(11, fn_ptr(_not_implemented), 3);   // GetDataHere
+    ok = ok & _slot(12, fn_ptr(_query_get_data), 2);
+    ok = ok & _slot(13, fn_ptr(_canonical), 3);
+    ok = ok & _slot(14, fn_ptr(_not_implemented), 4);   // SetData
+    ok = ok & _slot(15, fn_ptr(_enum_formats), 3);
+    ok = ok & _slot(16, fn_ptr(_no_advise), 5);         // DAdvise
+    ok = ok & _slot(17, fn_ptr(_no_advise), 2);         // DUnadvise
+    ok = ok & _slot(18, fn_ptr(_no_advise), 2);         // EnumDAdvise
+    // IEnumFORMATETC: 19..25
+    ok = ok & _slot(19, fn_ptr(_enum_qi), 3);
+    ok = ok & _slot(20, fn_ptr(_enum_addref), 1);
+    ok = ok & _slot(21, fn_ptr(_enum_release), 1);
+    ok = ok & _slot(22, fn_ptr(_enum_next), 4);
+    ok = ok & _slot(23, fn_ptr(_enum_skip), 2);
+    ok = ok & _slot(24, fn_ptr(_enum_reset), 1);
+    ok = ok & _slot(25, fn_ptr(_enum_clone), 2);
+    // IDropSource: 26..30
+    ok = ok & _slot(26, fn_ptr(_source_qi), 3);
+    ok = ok & _slot(27, fn_ptr(_source_addref), 1);
+    ok = ok & _slot(28, fn_ptr(_source_release), 1);
+    ok = ok & _slot(29, fn_ptr(_query_continue), 3);
+    ok = ok & _slot(30, fn_ptr(_give_feedback), 2);
+    if (ok == 0 || abi.seal(&_cb) == 0) { abi.close(&_cb); return 0; }
+    let is i64 as i with mut = 0;
+    while (i < 7) { _target_vtbl[i] = cast(i64, abi.address(&_cb, i)); i = i + 1; }
+    i = 0;
+    while (i < 12) { _data_vtbl[i] = cast(i64, abi.address(&_cb, 7 + i)); i = i + 1; }
+    i = 0;
+    while (i < 7) { _enum_vtbl[i] = cast(i64, abi.address(&_cb, 19 + i)); i = i + 1; }
+    i = 0;
+    while (i < 5) { _source_vtbl[i] = cast(i64, abi.address(&_cb, 26 + i)); i = i + 1; }
+    _ready = 1;
+    return 1;
+}
+
+fn _same_guid(a as *u8, g as t.GUID) as i32 {
+    let is t.GUID as b = g;
+    return cast(i32, mem.memcmp(a, cast(*u8, &b), 16) == 0);
+}
+
+// QueryInterface's answer: this for IUnknown and the interface, a reference
+// added; none for the rest.
+fn _qi(this as *u8, riid as *u8, out as **u8, iid as t.GUID, refs as *i64) as i64 {
+    if (cast(i64, out) == 0) { return t.E_INVALIDARG; }
+    if (_same_guid(riid, guids.IID_IUnknown()) == 1 || _same_guid(riid, iid) == 1) {
+        *out = this;
+        *refs = *refs + 1;
+        return t.S_OK;
+    }
+    *out = cast(*u8, 0);
+    return t.E_NOINTERFACE;
+}
+
+fn _not_implemented(context as *u8, slots as *u64) as i64 { return t.E_NOTIMPL; }
+fn _no_advise(context as *u8, slots as *u64) as i64 { return t.OLE_E_ADVISENOTSUPPORTED; }
+
+// --- Dropped on ---
+
+fn _note(d as *Drop, kind as i32, drop as i32, action as i32) as void {
+    let is event.Event as e;
+    event.clear(&e);
+    e.kind = kind; e.drop = drop; e.action = action; e.x = d.x; e.y = d.y;
+    if (d.note_len == MAX_NOTES) { d.note_head = (d.note_head + 1) % MAX_NOTES; d.note_len = d.note_len - 1; }
+    d.notes[(d.note_head + d.note_len) % MAX_NOTES] = e;
+    d.note_len = d.note_len + 1;
+}
+
+// The oldest note into out: 1, or 0 when none waits.
+fn take(d as *Drop, out as *event.Event) as i32 {
+    if (d.note_len == 0) { return 0; }
+    *out = d.notes[d.note_head];
+    d.note_head = (d.note_head + 1) % MAX_NOTES;
+    d.note_len = d.note_len - 1;
+    return 1;
+}
+
+fn notes(d as *Drop) as i32 { return d.note_len; }
+
+fn _formatetc(f as *t.FORMATETC, cf as u32) as void {
+    mem.memzero(cast(*u8, f), sizeof(t.FORMATETC));
+    f.cfFormat = cast(u16, cf);
+    f.dwAspect = cast(u32, t.DVASPECT_CONTENT);
+    f.lindex = 0 - 1;
+    f.tymed = cast(u32, t.TYMED_HGLOBAL);
+}
+
+fn _has(data as *t.IDataObject, cf as u32) as i32 {
+    let is t.FORMATETC as f;
+    _formatetc(&f, cf);
+    return cast(i32, com.IDataObject_QueryGetData(data, &f) == 0);
+}
+
+// The client point of a POINTL in screen coordinates, carried in a slot.
+fn _at(d as *Drop, pt as u64) as void {
+    let is t.POINT as p;
+    p.x = cast(i32, cast(i64, pt & cast(u64, 4294967295)));
+    p.y = cast(i32, cast(i64, pt >> 32));
+    u.ScreenToClient(d.hwnd, &p);
+    d.x = cast(i64, p.x);
+    d.y = cast(i64, p.y);
+}
+
+// The effect for the keys held: none when nothing offered is taken; the
+// program's action where the source allows it; else a move with Shift held,
+// a copy with Control, a copy where allowed, a move.
+fn _effect(d as *Drop, keys as u64) as u32 {
+    if ((d.answer & d.offered) == 0 || d.allowed == 0) { d.accepted = 0; return 0; }
+    let is i32 as act with mut = 0;
+    if (d.action != 0 && (d.allowed & d.action) != 0) { act = d.action; }
+    else if ((cast(i64, keys) & t.MK_SHIFT) != 0 && (d.allowed & transfer.MOVE) != 0) { act = transfer.MOVE; }
+    else if ((d.allowed & transfer.COPY) != 0) { act = transfer.COPY; }
+    else { act = transfer.MOVE; }
+    d.accepted = act;
+    return cast(u32, act);
+}
+
+fn _target_qi(context as *u8, slots as *u64) as i64 {
+    let is *Drop as d = cast(*Drop, slots[0]);
+    return _qi(cast(*u8, d), cast(*u8, slots[1]), cast(**u8, slots[2]), guids.IID_IDropTarget(), &d.refs);
+}
+fn _target_addref(context as *u8, slots as *u64) as i64 {
+    let is *Drop as d = cast(*Drop, slots[0]);
+    d.refs = d.refs + 1;
+    return d.refs;
+}
+// The window's own: never freed by its count, only revoked.
+fn _target_release(context as *u8, slots as *u64) as i64 {
+    let is *Drop as d = cast(*Drop, slots[0]);
+    if (d.refs > 0) { d.refs = d.refs - 1; }
+    return d.refs;
+}
+
+fn _let_data_go(d as *Drop) as void {
+    if (cast(i64, d.data) != 0) { com.IDataObject_Release(d.data); }
+    d.data = cast(*t.IDataObject, 0);
+}
+
+fn _drag_enter(context as *u8, slots as *u64) as i64 {
+    let is *Drop as d = cast(*Drop, slots[0]);
+    let is *t.IDataObject as data = cast(*t.IDataObject, slots[1]);
+    let is *u32 as effect = cast(*u32, slots[4]);
+    _let_data_go(d);
+    d.data = data;
+    if (cast(i64, data) != 0) { com.IDataObject_AddRef(data); }
+    d.offered = 0;
+    if (cast(i64, data) != 0) {
+        if (_has(data, cast(u32, t.CF_HDROP)) == 1) { d.offered = d.offered | transfer.FILES; }
+        if (_has(data, cast(u32, t.CF_UNICODETEXT)) == 1) { d.offered = d.offered | transfer.TEXT; }
+    }
+    d.allowed = cast(i32, *effect) & (transfer.COPY | transfer.MOVE);
+    d.answer = d.offered;
+    d.action = 0;
+    _at(d, slots[3]);
+    d.keys = slots[2];
+    *effect = _effect(d, d.keys);
+    _note(d, event.DND_ENTER, d.offered, d.allowed);
+    return t.S_OK;
+}
+
+fn _drag_over(context as *u8, slots as *u64) as i64 {
+    let is *Drop as d = cast(*Drop, slots[0]);
+    let is *u32 as effect = cast(*u32, slots[3]);
+    d.allowed = cast(i32, *effect) & (transfer.COPY | transfer.MOVE);
+    _at(d, slots[2]);
+    d.keys = slots[1];
+    *effect = _effect(d, d.keys);
+    _note(d, event.DND_MOVE, 0, d.allowed);
+    return t.S_OK;
+}
+
+fn _drag_leave(context as *u8, slots as *u64) as i64 {
+    let is *Drop as d = cast(*Drop, slots[0]);
+    _let_data_go(d);
+    d.offered = 0;
+    _note(d, event.DND_LEAVE, 0, 0);
+    return t.S_OK;
+}
+
+// The data of format cf as its block, read with read; 1 when it came.
+fn _read(data as *t.IDataObject, cf as u32, d as *Drop, kind as i32) as i32 {
+    let is t.FORMATETC as f;
+    _formatetc(&f, cf);
+    let is t.STGMEDIUM as m;
+    mem.memzero(cast(*u8, &m), sizeof(t.STGMEDIUM));
+    if (com.IDataObject_GetData(data, &f, &m) != 0) { return 0; }
+    let is i32 as ok with mut = 0;
+    if (m.tymed == cast(u32, t.TYMED_HGLOBAL)) {
+        let is i64 as block = cast(i64, m._anon1.storage[0]);
+        if (kind == transfer.TEXT) { ok = clipboard.read_wide(block, &d.text); }
+        else { ok = _read_files(block, d); }
+    }
+    ole.ReleaseStgMedium(&m);
+    return ok;
+}
+
+// A CF_HDROP block's paths, UTF-8, into the drop.
+fn _read_files(block as i64, d as *Drop) as i32 {
+    transfer.bytes_clear(&d.paths);
+    d.count = 0;
+    let is u32 as n = shell.DragQueryFileW(block, cast(u32, 4294967295), cast(*u16, 0), 0);
+    let is transfer.Bytes as one with mut;
+    transfer.bytes_init(&one);
+    let is u32 as i with mut = 0;
+    while (i < n) {
+        let is u32 as len = shell.DragQueryFileW(block, i, cast(*u16, 0), 0);
+        let is *u16 as wide = cast(*u16, mem.core.mmap_anon((cast(i64, len) + 1) * 2));
+        if (cast(i64, wide) == 0) { transfer.bytes_free(&one); return 0; }
+        shell.DragQueryFileW(block, i, wide, len + cast(u32, 1));
+        let is i32 as ok = clipboard.wide_to(wide, cast(i64, len), &one);
+        mem.core.munmap(cast(*u8, wide), (cast(i64, len) + 1) * 2);
+        if (ok == 0) { transfer.bytes_free(&one); return 0; }
+        let is [1]u8 as z;
+        z[0] = 0;
+        if (transfer.append(&d.paths, one.data, one.len) == 0 || transfer.append(&d.paths, &z[0], 1) == 0) {
+            transfer.bytes_free(&one);
+            return 0;
+        }
+        d.count = d.count + 1;
+        i = i + cast(u32, 1);
+    }
+    transfer.bytes_free(&one);
+    return cast(i32, d.count > 0);
+}
+
+fn _drop(context as *u8, slots as *u64) as i64 {
+    let is *Drop as d = cast(*Drop, slots[0]);
+    let is *t.IDataObject as data = cast(*t.IDataObject, slots[1]);
+    let is *u32 as effect = cast(*u32, slots[4]);
+    d.allowed = cast(i32, *effect) & (transfer.COPY | transfer.MOVE);
+    _at(d, slots[3]);
+    // Done as the last DragOver said, by the keys held then: what the user
+    // was shown. (Wine says no key is held at the drop itself.)
+    let is u32 as done with mut = _effect(d, d.keys);
+    let is i32 as takes = d.answer & d.offered;
+    d.ready = 0;
+    if (done != cast(u32, 0) && cast(i64, data) != 0) {
+        d.kind = transfer.TEXT;
+        if ((takes & transfer.FILES) != 0) { d.kind = transfer.FILES; }
+        let is u32 as cf with mut = cast(u32, t.CF_UNICODETEXT);
+        if (d.kind == transfer.FILES) { cf = cast(u32, t.CF_HDROP); }
+        if (_read(data, cf, d, d.kind) == 1) { d.ready = 1; }
+    }
+    if (d.ready == 0) { done = 0; }
+    *effect = done;
+    _let_data_go(d);
+    if (d.ready == 1) { _note(d, event.DND_DROP, d.kind, cast(i32, done)); }
+    else { _note(d, event.DND_LEAVE, 0, 0); }
+    return t.S_OK;
+}
+
+// The window's drop target registered: 1 when OLE took it.
+fn register(d as *Drop, hwnd as i64) as i32 {
+    if (_init() == 0) { return 0; }
+    let is i32 as r = ole.OleInitialize(cast(*u8, 0));
+    if (r < 0) { return 0; }
+    d.vtbl = cast(*u8, &_target_vtbl[0]);
+    d.refs = 1;
+    d.hwnd = hwnd;
+    transfer.bytes_init(&d.paths);
+    transfer.bytes_init(&d.text);
+    if (ole.RegisterDragDrop(hwnd, cast(*t.IDropTarget, d)) < 0) { return 0; }
+    d.registered = 1;
+    return 1;
+}
+
+fn revoke(d as *Drop) as void {
+    if (d.registered == 1) { ole.RevokeDragDrop(d.hwnd); }
+    d.registered = 0;
+    _let_data_go(d);
+    transfer.bytes_free(&d.paths);
+    transfer.bytes_free(&d.text);
+}
+
+// What the program takes where the pointer is (transfer.FILES, TEXT, 0) and
+// how (COPY, MOVE; 0 the default): said at the next DragOver. 1 when a drag
+// is over the window.
+fn answer(d as *Drop, takes as i32, action as i32) as i32 {
+    if (cast(i64, d.data) == 0) { return 0; }
+    d.answer = takes;
+    d.action = action & (transfer.COPY | transfer.MOVE);
+    return 1;
+}
+
+fn dropped_files(d as *Drop) as i64 {
+    if (d.ready == 0 || d.kind != transfer.FILES) { return 0; }
+    return d.count;
+}
+fn dropped_file(d as *Drop, i as i64) as *u8 {
+    if (d.ready == 0 || d.kind != transfer.FILES) { return cast(*u8, 0); }
+    return transfer.path_at(&d.paths, d.count, i);
+}
+fn dropped_text(d as *Drop) as *u8 {
+    if (d.ready == 0 || d.kind != transfer.TEXT || d.text.len == 0) { return cast(*u8, 0); }
+    return d.text.data;
+}
+fn dropped_text_length(d as *Drop) as i64 {
+    if (d.ready == 0 || d.kind != transfer.TEXT) { return 0; }
+    return d.text.len;
+}
+fn clear(d as *Drop) as void {
+    d.ready = 0; d.count = 0;
+    transfer.bytes_clear(&d.paths);
+    transfer.bytes_clear(&d.text);
+}
+
+// --- Dragged from: the data object ---
+
+// The formats an offer is had as, in order: CF_HDROP, CF_UNICODETEXT, PNG.
+fn _formats(o as *transfer.Offer, out as *u32) as i32 {
+    let is i32 as n with mut = 0;
+    if ((o.formats & transfer.FILES) != 0) { out[n] = cast(u32, t.CF_HDROP); n = n + 1; }
+    if ((o.formats & transfer.TEXT) != 0) { out[n] = cast(u32, t.CF_UNICODETEXT); n = n + 1; }
+    if ((o.formats & transfer.PNG) != 0) { out[n] = clipboard.png_format(); n = n + 1; }
+    return n;
+}
+
+fn _offers_cf(o as *transfer.Offer, cf as u32) as i32 {
+    let is [4]u32 as f;
+    let is i32 as n = _formats(o, &f[0]);
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        if (f[i] == cf) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _data_qi(context as *u8, slots as *u64) as i64 {
+    let is *DataObj as o = cast(*DataObj, slots[0]);
+    return _qi(cast(*u8, o), cast(*u8, slots[1]), cast(**u8, slots[2]), guids.IID_IDataObject(), &o.refs);
+}
+fn _data_addref(context as *u8, slots as *u64) as i64 {
+    let is *DataObj as o = cast(*DataObj, slots[0]);
+    o.refs = o.refs + 1;
+    return o.refs;
+}
+fn _data_release(context as *u8, slots as *u64) as i64 {
+    let is *DataObj as o = cast(*DataObj, slots[0]);
+    o.refs = o.refs - 1;
+    let is i64 as left = o.refs;
+    if (left == 0) {
+        transfer.offer_free(&o.offer);
+        mem.core.munmap(cast(*u8, o), sizeof(DataObj));
+    }
+    return left;
+}
+
+fn _query_get_data(context as *u8, slots as *u64) as i64 {
+    let is *DataObj as o = cast(*DataObj, slots[0]);
+    let is *t.FORMATETC as f = cast(*t.FORMATETC, slots[1]);
+    if (cast(i64, f) == 0) { return t.E_INVALIDARG; }
+    if ((cast(i64, f.tymed) & t.TYMED_HGLOBAL) == 0 || _offers_cf(&o.offer, cast(u32, f.cfFormat)) == 0) { return t.DV_E_FORMATETC; }
+    return t.S_OK;
+}
+
+fn _get_data(context as *u8, slots as *u64) as i64 {
+    let is *DataObj as o = cast(*DataObj, slots[0]);
+    let is *t.FORMATETC as f = cast(*t.FORMATETC, slots[1]);
+    let is *t.STGMEDIUM as m = cast(*t.STGMEDIUM, slots[2]);
+    if (cast(i64, f) == 0 || cast(i64, m) == 0) { return t.E_INVALIDARG; }
+    let is u32 as cf = cast(u32, f.cfFormat);
+    if ((cast(i64, f.tymed) & t.TYMED_HGLOBAL) == 0 || _offers_cf(&o.offer, cf) == 0) { return t.DV_E_FORMATETC; }
+    let is i64 as block with mut = 0;
+    if (cf == cast(u32, t.CF_HDROP)) { block = clipboard.block_files(o.offer.paths.data, o.offer.count); }
+    else if (cf == cast(u32, t.CF_UNICODETEXT)) { block = clipboard.block_wide(o.offer.text.data, o.offer.text.len, 0); }
+    else { block = clipboard.block_of(o.offer.png.data, o.offer.png.len); }
+    if (block == 0) { return t.E_OUTOFMEMORY; }
+    mem.memzero(cast(*u8, m), sizeof(t.STGMEDIUM));
+    m.tymed = cast(u32, t.TYMED_HGLOBAL);
+    m._anon1.storage[0] = cast(u64, block);
+    return t.S_OK;
+}
+
+fn _canonical(context as *u8, slots as *u64) as i64 {
+    let is *t.FORMATETC as out = cast(*t.FORMATETC, slots[2]);
+    if (cast(i64, out) != 0) { out.ptd = cast(*u8, 0); }
+    return DATA_S_SAMEFORMATETC;
+}
+
+fn _enum_formats(context as *u8, slots as *u64) as i64 {
+    let is *DataObj as o = cast(*DataObj, slots[0]);
+    let is **u8 as out = cast(**u8, slots[2]);
+    if (cast(i64, out) == 0) { return t.E_INVALIDARG; }
+    *out = cast(*u8, 0);
+    if (slots[1] != cast(u64, t.DATADIR_GET)) { return t.E_NOTIMPL; }
+    let is *EnumObj as e = _enum_new(o, 0);
+    if (cast(i64, e) == 0) { return t.E_OUTOFMEMORY; }
+    *out = cast(*u8, e);
+    return t.S_OK;
+}
+
+// --- The data object's formats, enumerated ---
+
+fn _enum_new(o as *DataObj, at as i32) as *EnumObj {
+    let is *EnumObj as e = cast(*EnumObj, mem.core.mmap_anon(sizeof(EnumObj)));
+    if (cast(i64, e) == 0) { return e; }
+    e.vtbl = cast(*u8, &_enum_vtbl[0]);
+    e.refs = 1;
+    e.data = o;
+    e.at = at;
+    o.refs = o.refs + 1;
+    return e;
+}
+
+fn _enum_qi(context as *u8, slots as *u64) as i64 {
+    let is *EnumObj as e = cast(*EnumObj, slots[0]);
+    return _qi(cast(*u8, e), cast(*u8, slots[1]), cast(**u8, slots[2]), guids.IID_IEnumFORMATETC(), &e.refs);
+}
+fn _enum_addref(context as *u8, slots as *u64) as i64 {
+    let is *EnumObj as e = cast(*EnumObj, slots[0]);
+    e.refs = e.refs + 1;
+    return e.refs;
+}
+fn _enum_release(context as *u8, slots as *u64) as i64 {
+    let is *EnumObj as e = cast(*EnumObj, slots[0]);
+    e.refs = e.refs - 1;
+    let is i64 as left = e.refs;
+    if (left == 0) {
+        let is [2]u64 as s;
+        s[0] = cast(u64, e.data); s[1] = 0;
+        _data_release(cast(*u8, 0), &s[0]);
+        mem.core.munmap(cast(*u8, e), sizeof(EnumObj));
+    }
+    return left;
+}
+
+fn _enum_next(context as *u8, slots as *u64) as i64 {
+    let is *EnumObj as e = cast(*EnumObj, slots[0]);
+    let is i64 as want = cast(i64, slots[1] & cast(u64, 4294967295));
+    let is *t.FORMATETC as out = cast(*t.FORMATETC, slots[2]);
+    let is *u32 as fetched = cast(*u32, slots[3]);
+    if (cast(i64, out) == 0) { return t.E_INVALIDARG; }
+    let is [4]u32 as f;
+    let is i32 as n = _formats(&e.data.offer, &f[0]);
+    let is i64 as got with mut = 0;
+    while (got < want && e.at < n) {
+        _formatetc(cast(*t.FORMATETC, cast(i64, out) + got * sizeof(t.FORMATETC)), f[e.at]);
+        e.at = e.at + 1;
+        got = got + 1;
+    }
+    if (cast(i64, fetched) != 0) { *fetched = cast(u32, got); }
+    if (got == want) { return t.S_OK; }
+    return t.S_FALSE;
+}
+
+fn _enum_skip(context as *u8, slots as *u64) as i64 {
+    let is *EnumObj as e = cast(*EnumObj, slots[0]);
+    let is [4]u32 as f;
+    let is i32 as n = _formats(&e.data.offer, &f[0]);
+    e.at = e.at + cast(i32, slots[1] & cast(u64, 4294967295));
+    if (e.at > n) { e.at = n; return t.S_FALSE; }
+    return t.S_OK;
+}
+
+fn _enum_reset(context as *u8, slots as *u64) as i64 {
+    let is *EnumObj as e = cast(*EnumObj, slots[0]);
+    e.at = 0;
+    return t.S_OK;
+}
+
+fn _enum_clone(context as *u8, slots as *u64) as i64 {
+    let is *EnumObj as e = cast(*EnumObj, slots[0]);
+    let is **u8 as out = cast(**u8, slots[1]);
+    if (cast(i64, out) == 0) { return t.E_INVALIDARG; }
+    let is *EnumObj as c = _enum_new(e.data, e.at);
+    if (cast(i64, c) == 0) { *out = cast(*u8, 0); return t.E_OUTOFMEMORY; }
+    *out = cast(*u8, c);
+    return t.S_OK;
+}
+
+// --- Dragged from: the source ---
+
+fn _source_qi(context as *u8, slots as *u64) as i64 {
+    let is *SourceObj as s = cast(*SourceObj, slots[0]);
+    return _qi(cast(*u8, s), cast(*u8, slots[1]), cast(**u8, slots[2]), guids.IID_IDropSource(), &s.refs);
+}
+fn _source_addref(context as *u8, slots as *u64) as i64 {
+    let is *SourceObj as s = cast(*SourceObj, slots[0]);
+    s.refs = s.refs + 1;
+    return s.refs;
+}
+fn _source_release(context as *u8, slots as *u64) as i64 {
+    let is *SourceObj as s = cast(*SourceObj, slots[0]);
+    s.refs = s.refs - 1;
+    return s.refs;
+}
+
+// Escape cancels; every button let go drops.
+fn _query_continue(context as *u8, slots as *u64) as i64 {
+    if ((slots[1] & cast(u64, 4294967295)) != cast(u64, 0)) { return t.DRAGDROP_S_CANCEL; }
+    let is i64 as keys = cast(i64, slots[2]);
+    if ((keys & (t.MK_LBUTTON | 2 | 16)) == 0) { return t.DRAGDROP_S_DROP; }
+    return t.S_OK;
+}
+
+fn _give_feedback(context as *u8, slots as *u64) as i64 { return t.DRAGDROP_S_USEDEFAULTCURSORS; }
+
+// A drag of what o offers, the effects allowed (transfer.COPY, MOVE), run
+// to its end: the effect the target took (transfer bits), 0 for none, -1
+// when it could not begin.
+fn drag(o as *transfer.Offer, actions as i32) as i32 {
+    if (_init() == 0 || o.formats == 0) { return 0 - 1; }
+    let is *DataObj as data = cast(*DataObj, mem.core.mmap_anon(sizeof(DataObj)));
+    if (cast(i64, data) == 0) { return 0 - 1; }
+    data.vtbl = cast(*u8, &_data_vtbl[0]);
+    data.refs = 1;
+    transfer.offer_init(&data.offer);
+    if (((o.formats & transfer.TEXT) != 0 && transfer.offer_text(&data.offer, o.text.data, o.text.len) == 0) ||
+        ((o.formats & transfer.PNG) != 0 && transfer.offer_png(&data.offer, o.png.data, o.png.len) == 0) ||
+        ((o.formats & transfer.FILES) != 0 && transfer.offer_files(&data.offer, o.paths.data, o.count) == 0)) {
+        transfer.offer_free(&data.offer);
+        mem.core.munmap(cast(*u8, data), sizeof(DataObj));
+        return 0 - 1;
+    }
+    let is SourceObj as source;
+    source.vtbl = cast(*u8, &_source_vtbl[0]);
+    source.refs = 1;
+    let is u32 as effect with mut = 0;
+    let is i32 as r = ole.DoDragDrop(cast(*t.IDataObject, data), cast(*t.IDropSource, &source),
+                                    cast(u32, actions & (transfer.COPY | transfer.MOVE)), &effect);
+    let is [2]u64 as s;
+    s[0] = cast(u64, data); s[1] = 0;
+    _data_release(cast(*u8, 0), &s[0]);
+    if (cast(i64, r) != t.DRAGDROP_S_DROP) { return 0; }
+    return cast(i32, effect) & (transfer.COPY | transfer.MOVE);
+}

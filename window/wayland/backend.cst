@@ -16,6 +16,7 @@ use "../../input/xkb/compose.cst" as xcompose;
 use "../../input/keys.cst" as keys;
 use "../monitor.cst" as monitor;
 use "../damage.cst" as damage;
+use "../transfer.cst" as transfer;
 use "../xcursor.cst" as xcursor;
 use "../../input/text.cst" as content;
 use "std/unicode/utf8.cst" as utf8;
@@ -43,11 +44,6 @@ let is i32 as MAX_WIRE with imut = 4096;
 // A text-input string's room, its NUL in it: what one message can carry.
 let is i64 as IME_TEXT with imut = 4096;
 let is i32 as MAX_DATA with imut = 8;
-let is i64 as MAX_TEXT with imut = 1048576;
-let is i64 as MAX_DND_TEXT with imut = 65536;
-let is i64 as MAX_DROPPED_FILES with imut = 64;
-let is i64 as DROPPED_PATH_BYTES with imut = 1024;
-let is i64 as DROP_STORAGE_BYTES with imut = 131073;
 let is i32 as FORMAT_ARGB8888 with imut = 0;
 
 struct Buffer {
@@ -79,21 +75,42 @@ struct Output {
     refresh_mhz as i32;
     name as [32]u8;
 }
+// Ours, on the clipboard, the primary selection or dragged: what it offers.
 struct DataSource {
-    object as i32;
-    primary as i32;
-    which as i32;
-    _pad as i32;
-    data as *u8;
-    bytes as i64;
-    length as i64;
+    object  as i32;
+    purpose as i32;   // _FOR_CLIPBOARD, _FOR_PRIMARY, _FOR_DRAG
+    action  as i32;   // a drag's: the action the compositor last said
+    dropped as i32;   // a drag's: let go over a target that took it
+    offer   as transfer.Offer;
 }
 
+// The compositor's: what it says another program offers.
 struct DataOffer {
-    object as i32;
-    primary as i32;
-    text_mime as i32;
-    files as i32;
+    object         as i32;
+    primary        as i32;
+    formats        as i32;   // transfer bits, from its MIME types
+    text_rank      as i32;   // its best text type, transfer.text_rank's; 9 for none
+    source_actions as i32;   // a drag's: what its source allows
+    action         as i32;   // and what the compositor chose
+}
+
+// An offer's data read through a descriptor.
+struct Reader {
+    fd      as i64;          // -1 when not reading
+    offer   as i32;
+    format  as i32;
+    failed  as i32;
+    _pad    as i32;
+    last_ms as i64;
+    data    as transfer.Bytes;
+}
+
+// Ours written to a descriptor someone asked for it through.
+struct Writer {
+    fd      as i64;          // -1 when not writing
+    sent    as i64;
+    last_ms as i64;
+    data    as transfer.Bytes;
 }
 
 
@@ -381,33 +398,31 @@ struct Window {
     ti_caret as i64;
     ti_anchor as i64;
     ti_text as [4000]u8;
-    clipboard_offer as i32;
-    primary_offer as i32;
-    clip_source as i32;
-    primary_source as i32;
-    clipboard_ready as i32;
-    clipboard_pending as i32;
-    transfer_fd as i64;
-    transfer_offer as i32;
-    transfer_primary as i32;
-    transfer_mime as i32;
-    received_text as *u8;
-    received_bytes as i64;
-    transfer_purpose as i32;
-    drop_storage as *u8;
-    drop_len as i64;
-    drop_file_count as i64;
-    drop_truncated as i32;
-    drop_kind as i32;
-    drop_ready as i32;
+    // The selections: the compositor's offer for each (0 the clipboard, 1
+    // the primary), ours when we own one.
+    selection_offer as [2]i32;
+    selection_source as [2]i32;
+    reading as [2]Reader;          // PASTE, DROP
+    writing as [8]Writer;
+    paste_state as i32;            // _PASTE_*
+    paste_got as i32;              // the format that came; 0 for none
+    paste_offered as i32;          // the formats the selection offered
+    // A drag over the window from elsewhere.
     drop_offer as i32;
-    drop_offered as i32;
-    drop_answer as i32;
-    drop_pending as i32;
+    drop_offered as i32;           // FILES, TEXT
+    drop_actions as i32;           // what its source allows
+    drop_answer as i32;            // what the program takes
+    drop_want_action as i32;       // and how; 0 for either
+    drop_pending as i32;           // dropped, its data being read
+    drop_ready as i32;             // its data arrived
+    drop_kind as i32;              // FILES or TEXT, what was read
     drop_serial as u32;
     drop_x as i64;
     drop_y as i64;
-    received_len as i64;
+    drop_count as i64;
+    drop_paths as transfer.Bytes;
+    drop_text as transfer.Bytes;
+    drag_source as i32;            // ours, while a drag runs
     sources as [8]DataSource;
     offers as [8]DataOffer;
     xkb_context as *u8;
@@ -616,7 +631,9 @@ fn _zero(w as *Window) as void {
     w.event_head = 0; w.event_len = 0;
     w.state = 0; w.old_state = 0; w.err = OK; w.opened = 0; w.mapped = 0;
     w.resized = 0; w.frame_ready = 0; w.close_requested = 0; w.acked = 0;
-    w.transfer_fd = 0 - 1; w.drop_storage = cast(*u8, 0);
+    w.reading[0].fd = 0 - 1; w.reading[1].fd = 0 - 1;
+    let is i32 as wk with mut = 0;
+    while (wk < MAX_WRITERS) { w.writing[wk].fd = 0 - 1; wk = wk + 1; }
     w.ime_rect_x = 0 - 1; w.ime_rect_y = 0 - 1;
     w.scroll_source = 0 - 1;
     w.ime_rect_w = 0 - 1; w.ime_rect_h = 0 - 1;
@@ -1157,6 +1174,31 @@ fn _output_event(w as *Window, obj as i32, op as i32, p as *u8) as void {
         o.name[k] = cast(u8, 0);
     }
 }
+// --- Selections and drag and drop ---
+//
+// The compositor's offers (wl_data_offer, the primary selection's) say their
+// MIME types; ours (DataSource) carry a transfer.Offer, copied. Data moves
+// through descriptors: a Reader reads an offer's into its bytes — PASTE for
+// the clipboard or the primary selection asked for, DROP for a drop — and a
+// Writer writes ours to whoever asked; both without blocking, from the pump,
+// so that a transfer this program makes to itself (a drag onto its own
+// window) cannot wait on itself.
+
+let is i32 as PASTE with imut = 0;
+let is i32 as DROP  with imut = 1;
+let is i32 as MAX_WRITERS with imut = 8;
+let is i64 as TRANSFER_TIMEOUT_MS with imut = 10000;
+
+// A source's purpose.
+let is i32 as _FOR_CLIPBOARD with imut = 0;
+let is i32 as _FOR_PRIMARY   with imut = 1;
+let is i32 as _FOR_DRAG      with imut = 2;
+
+// A paste's state.
+let is i32 as _PASTE_IDLE    with imut = 0;
+let is i32 as _PASTE_PENDING with imut = 1;
+let is i32 as _PASTE_READY   with imut = 2;
+
 fn _offer_index(w as *Window, object as i32, primary as i32, create as i32) as i32 {
     let is i32 as free_slot with mut = 0 - 1;
     let is i32 as i with mut = 0;
@@ -1166,12 +1208,13 @@ fn _offer_index(w as *Window, object as i32, primary as i32, create as i32) as i
         i = i + 1;
     }
     if (create == 0 || free_slot < 0) { return 0 - 1; }
+    mem.memzero(cast(*u8, &w.offers[free_slot]), sizeof(DataOffer));
     w.offers[free_slot].object = object;
     w.offers[free_slot].primary = primary;
-    w.offers[free_slot].text_mime = 0;
-    w.offers[free_slot].files = 0;
+    w.offers[free_slot].text_rank = 9;
     return free_slot;
 }
+
 fn _offer_release(w as *Window, index as i32, destroy as i32) as void {
     let is i32 as object = w.offers[index].object;
     if (object == 0) { return; }
@@ -1181,11 +1224,11 @@ fn _offer_release(w as *Window, index as i32, destroy as i32) as void {
         if (w.offers[index].primary == 1) { opcode = 1; }
         _send(w, object, opcode, &empty[0], 0, 0 - 1);
     }
-    if (w.clipboard_offer == object) { w.clipboard_offer = 0; }
-    if (w.primary_offer == object) { w.primary_offer = 0; }
+    if (w.selection_offer[0] == object) { w.selection_offer[0] = 0; }
+    if (w.selection_offer[1] == object) { w.selection_offer[1] = 0; }
+    if (w.drop_offer == object) { w.drop_offer = 0; }
     mem.memzero(cast(*u8, &w.offers[index]), sizeof(DataOffer));
 }
-
 
 fn _source_index(w as *Window, object as i32) as i32 {
     let is i32 as i with mut = 0;
@@ -1196,41 +1239,195 @@ fn _source_index(w as *Window, object as i32) as i32 {
     return 0 - 1;
 }
 
-fn _data_offer_event(w as *Window, object as i32, p as *u8) as void {
-    if (_wire_size < 16) { return; }
-    let is i32 as len = cast(i32, _word(p));
-    let is i32 as padded = ((len + 3) / 4) * 4;
-    if (len <= 1 || len > 256 || 12 + padded > _wire_size) { return; }
+fn _source_slot(w as *Window) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < MAX_DATA) {
+        if (w.sources[i].object == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// An offer's event: a MIME type it has (0), on the data device's the actions
+// its source allows (1) and the one the compositor chose (2).
+fn _data_offer_event(w as *Window, object as i32, op as i32, p as *u8) as void {
     let is i32 as index = _offer_index(w, object, 0, 0);
     if (index < 0) { return; }
-    let is *u8 as mime = cast(*u8, cast(i64, p) + 4);
-    if (_same(mime, len - 1, "text/uri-list") == 1) { w.offers[index].files = 1; }
-    if (_same(mime, len - 1, "UTF8_STRING") == 1 && w.offers[index].text_mime == 0) {
-        w.offers[index].text_mime = 1;
+    let is *DataOffer as o = &w.offers[index];
+    if (op == 0) {
+        if (_wire_size < 16) { return; }
+        let is i32 as len = cast(i32, _word(p));
+        let is i32 as padded = ((len + 3) / 4) * 4;
+        if (len <= 1 || len > 256 || 12 + padded > _wire_size) { return; }
+        let is *u8 as mime = cast(*u8, cast(i64, p) + 4);
+        let is i32 as f = transfer.format_of(mime, cast(i64, len - 1));
+        o.formats = o.formats | f;
+        if (f == transfer.TEXT) {
+            let is i32 as rank = transfer.text_rank(mime, cast(i64, len - 1));
+            if (rank < o.text_rank) { o.text_rank = rank; }
+        }
+        return;
     }
-    if (_same(mime, len - 1, "text/plain;charset=utf-8") == 1 &&
-        (w.offers[index].text_mime == 0 || w.offers[index].text_mime > 2)) {
-        w.offers[index].text_mime = 2;
+    if (o.primary == 1 || _wire_size < 12) { return; }
+    if (op == 1) { o.source_actions = cast(i32, _word(p)) & (transfer.COPY | transfer.MOVE); return; }
+    if (op == 2) { o.action = cast(i32, _word(p)) & (transfer.COPY | transfer.MOVE); return; }
+}
+
+// The MIME type an offer is asked for format by: the best text type it has.
+fn _offer_mime(o as *DataOffer, format as i32) as *u8 {
+    if (format == transfer.FILES) { return transfer.MIME_URIS; }
+    if (format == transfer.PNG) { return transfer.MIME_PNG; }
+    if (o.text_rank == 0) { return transfer.MIME_UTF8; }
+    if (o.text_rank == 1) { return "UTF8_STRING"; }
+    return "text/plain";
+}
+
+// --- Readers ---
+
+// Offer index's data as format read into slot from now on, through a
+// descriptor the source writes: 1 when asked.
+fn _read_start(w as *Window, slot as i32, index as i32, format as i32) as i32 {
+    let is *Reader as r = &w.reading[slot];
+    _read_cancel(w, slot);
+    let is *DataOffer as o = &w.offers[index];
+    let is [2]i32 as fds;
+    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &fds[0]) < 0) { return 0; }
+    if (linux.fcntl(fds[0], 4, 2048) < 0) { linux.close(fds[0]); linux.close(fds[1]); return 0; }
+    let is i32 as opcode with mut = 1;
+    if (o.primary == 1) { opcode = 0; }
+    if (_send_string_fd(w, o.object, opcode, _offer_mime(o, format), fds[1]) == 0) {
+        linux.close(fds[0]); linux.close(fds[1]);
+        return 0;
     }
-    if (_same(mime, len - 1, "text/plain") == 1 && w.offers[index].text_mime == 0) {
-        w.offers[index].text_mime = 3;
+    linux.close(fds[1]);
+    r.fd = fds[0];
+    r.offer = o.object;
+    r.format = format;
+    r.failed = 0;
+    r.last_ms = time.now_ms();
+    transfer.bytes_clear(&r.data);
+    return 1;
+}
+
+fn _read_cancel(w as *Window, slot as i32) as void {
+    let is *Reader as r = &w.reading[slot];
+    if (r.fd >= 0) { linux.close(r.fd); }
+    r.fd = 0 - 1;
+    r.offer = 0;
+}
+
+// What can be read of slot now: 1 when its source has said all (or failed,
+// or gone quiet past the time), 0 while more may come.
+fn _read_some(w as *Window, slot as i32) as i32 {
+    let is *Reader as r = &w.reading[slot];
+    if (r.fd < 0) { return 0; }
+    let is [65536]u8 as chunk;
+    while (1 == 1) {
+        let is i64 as n = linux.read(r.fd, &chunk[0], 65536);
+        if (n > 0) {
+            r.last_ms = time.now_ms();
+            if (transfer.append(&r.data, &chunk[0], n) == 0) { r.failed = 1; _read_cancel(w, slot); return 1; }
+            continue;
+        }
+        if (n == 0) { _read_cancel(w, slot); return 1; }
+        if (n == 0 - sys.EINTR) { continue; }
+        if (n == 0 - 11) {   // EAGAIN: not yet
+            if (time.now_ms() - r.last_ms > TRANSFER_TIMEOUT_MS) { r.failed = 1; _read_cancel(w, slot); return 1; }
+            return 0;
+        }
+        r.failed = 1;
+        _read_cancel(w, slot);
+        return 1;
+    }
+    return 0;
+}
+
+// Both readers advanced: a paste made ready, a drop finished.
+fn _readers(w as *Window) as void {
+    let is i32 as offer = w.reading[PASTE].offer;
+    if (w.reading[PASTE].fd >= 0 && _read_some(w, PASTE) == 1) {
+        w.paste_state = _PASTE_READY;
+        w.paste_got = w.reading[PASTE].format;
+        if (w.reading[PASTE].failed == 1) { w.paste_got = 0; transfer.bytes_clear(&w.reading[PASTE].data); }
+        w.frame_ready = 1;
+        // An offer replaced while it was read: let go now.
+        if (offer != w.selection_offer[0] && offer != w.selection_offer[1]) {
+            let is i32 as index = _offer_index(w, offer, 0, 0);
+            if (index >= 0) { _offer_release(w, index, 1); }
+        }
+    }
+    if (w.reading[DROP].fd >= 0 && _read_some(w, DROP) == 1) { _drop_finish(w); }
+}
+
+// --- Writers ---
+
+// bytes written to fd from now on (a copy: what is offered may change
+// meanwhile), the descriptor closed when all is written or the reader went.
+fn _write_start(w as *Window, fd as i64, bytes as *transfer.Bytes) as void {
+    let is i32 as k with mut = 0;
+    while (k < MAX_WRITERS && w.writing[k].fd >= 0) { k = k + 1; }
+    if (k == MAX_WRITERS || linux.fcntl(fd, 4, 2048) < 0 || transfer.bytes_set(&w.writing[k].data, bytes.data, bytes.len) == 0) {
+        linux.close(fd);
+        return;
+    }
+    w.writing[k].fd = fd;
+    w.writing[k].sent = 0;
+    w.writing[k].last_ms = time.now_ms();
+    _write_some(w, k);
+}
+
+fn _write_end(w as *Window, k as i32) as void {
+    if (w.writing[k].fd >= 0) { linux.close(w.writing[k].fd); }
+    w.writing[k].fd = 0 - 1;
+    transfer.bytes_free(&w.writing[k].data);
+}
+
+fn _write_some(w as *Window, k as i32) as void {
+    let is *Writer as wr = &w.writing[k];
+    while (wr.fd >= 0) {
+        if (wr.sent >= wr.data.len) { _write_end(w, k); return; }
+        let is i64 as n = linux.write(wr.fd, cast(*u8, cast(i64, wr.data.data) + wr.sent), wr.data.len - wr.sent);
+        if (n > 0) { wr.sent = wr.sent + n; wr.last_ms = time.now_ms(); continue; }
+        if (n == 0 - sys.EINTR) { continue; }
+        if (n == 0 - 11 && time.now_ms() - wr.last_ms <= TRANSFER_TIMEOUT_MS) { return; }
+        // The reader went (EPIPE), or stopped reading for good.
+        _write_end(w, k);
     }
 }
 
+fn _writers(w as *Window) as void {
+    let is i32 as k with mut = 0;
+    while (k < MAX_WRITERS) {
+        if (w.writing[k].fd >= 0) { _write_some(w, k); }
+        k = k + 1;
+    }
+}
+
+// Whether a transfer is under way: the pump is then to come back soon.
+fn _transferring(w as *Window) as i32 {
+    if (w.reading[PASTE].fd >= 0 || w.reading[DROP].fd >= 0) { return 1; }
+    let is i32 as k with mut = 0;
+    while (k < MAX_WRITERS) {
+        if (w.writing[k].fd >= 0) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// --- Dropped on ---
+
+// What the program takes where the pointer is, told the offer: the MIME type
+// it would read (none: refused) and, with version 3, the actions it would
+// do and the one it prefers.
 fn _drop_accept(w as *Window) as void {
     if (w.drop_offer == 0) { return; }
     let is i32 as index = _offer_index(w, w.drop_offer, 0, 0);
     if (index < 0) { return; }
+    let is *DataOffer as o = &w.offers[index];
+    let is i32 as takes = w.drop_answer & w.drop_offered;
     let is *u8 as mime with mut = cast(*u8, 0);
-    if ((w.drop_answer & event.DROP_FILES) != 0 && w.offers[index].files == 1) {
-        mime = "text/uri-list";
-    } else if ((w.drop_answer & event.DROP_TEXT) != 0 && w.offers[index].text_mime == 1) {
-        mime = "UTF8_STRING";
-    } else if ((w.drop_answer & event.DROP_TEXT) != 0 && w.offers[index].text_mime == 2) {
-        mime = "text/plain;charset=utf-8";
-    } else if ((w.drop_answer & event.DROP_TEXT) != 0 && w.offers[index].text_mime == 3) {
-        mime = "text/plain";
-    }
+    if ((takes & transfer.FILES) != 0) { mime = transfer.MIME_URIS; }
+    else if ((takes & transfer.TEXT) != 0) { mime = _offer_mime(o, transfer.TEXT); }
     let is [256]u8 as p;
     _put(&p[0], w.drop_serial);
     let is i32 as n with mut = 8;
@@ -1244,85 +1441,54 @@ fn _drop_accept(w as *Window) as void {
         n = 8 + padded;
     } else { _put(&p[4], 0); }
     _send(w, w.drop_offer, 0, &p[0], n, 0 - 1);
-}
-
-fn _drop_hex(c as i64) as i64 {
-    if (c >= 48 && c <= 57) { return c - 48; }
-    if (c >= 97 && c <= 102) { return c - 87; }
-    if (c >= 65 && c <= 70) { return c - 55; }
-    return 0 - 1;
-}
-
-fn _drop_path(w as *Window, src as *u8, from as i64, to as i64, slot as i64) as i32 {
-    let is i64 as i with mut = from;
-    if (to - i > 7 && src[i] == 102 && src[i + 1] == 105 && src[i + 2] == 108 &&
-        src[i + 3] == 101 && src[i + 4] == 58 && src[i + 5] == 47 && src[i + 6] == 47) {
-        i = i + 7;
-        while (i < to && src[i] != 47) { i = i + 1; }
-    }
-    if (i >= to) { return 0; }
-    let is *u8 as dst = cast(*u8, cast(i64, w.drop_storage) + slot * DROPPED_PATH_BYTES);
-    let is i64 as out with mut = 0;
-    while (i < to && out < DROPPED_PATH_BYTES - 1) {
-        let is i64 as c = cast(i64, src[i]) & 255;
-        if (c == 37 && i + 2 < to) {
-            let is i64 as hi = _drop_hex(cast(i64, src[i + 1]) & 255);
-            let is i64 as lo = _drop_hex(cast(i64, src[i + 2]) & 255);
-            if (hi >= 0 && lo >= 0) {
-                dst[out] = cast(u8, hi * 16 + lo);
-                out = out + 1; i = i + 3;
-                continue;
-            }
-        }
-        dst[out] = cast(u8, c);
-        out = out + 1; i = i + 1;
-    }
-    dst[out] = 0;
-    return 1;
-}
-
-fn _drop_parse_files(w as *Window) as void {
-    let is *u8 as src = cast(*u8, cast(i64, w.drop_storage) + 65536);
-    let is i64 as i with mut = 0;
-    w.drop_file_count = 0;
-    while (i < w.drop_len && w.drop_file_count < MAX_DROPPED_FILES) {
-        while (i < w.drop_len && (src[i] == 13 || src[i] == 10 || src[i] == 32 || src[i] == 9)) {
-            i = i + 1;
-        }
-        if (i >= w.drop_len) { break; }
-        let is i64 as start = i;
-        while (i < w.drop_len && src[i] != 13 && src[i] != 10) { i = i + 1; }
-        if (src[start] != 35 &&
-            _drop_path(w, src, start, i, w.drop_file_count) == 1) {
-            w.drop_file_count = w.drop_file_count + 1;
-        }
+    if (_bounded(_globals.data_manager_version, 3) >= 3) {
+        let is i32 as actions with mut = transfer.COPY | transfer.MOVE;
+        if (w.drop_want_action != 0) { actions = w.drop_want_action; }
+        if (cast(i64, mime) == 0) { actions = 0; }
+        let is i32 as preferred with mut = w.drop_want_action;
+        if (preferred == 0) { preferred = transfer.COPY; }
+        if ((actions & preferred) == 0) { preferred = actions & transfer.MOVE; }
+        let is [8]u8 as a;
+        _put(&a[0], cast(u32, actions)); _put(&a[4], cast(u32, preferred));
+        _send(w, w.drop_offer, 4, &a[0], 8, 0 - 1);
     }
 }
 
+// The drop's data came: read as files or text, the offer finished, the
+// program told DND_DROP with the action the compositor chose — or DND_LEAVE
+// when nothing came.
 fn _drop_finish(w as *Window) as void {
     if (w.drop_pending == 0) { return; }
     w.drop_pending = 0;
-    let is *u8 as data = cast(*u8, cast(i64, w.drop_storage) + 65536);
-    if (w.drop_kind == event.DROP_TEXT && w.drop_truncated == 1 &&
-        cast(i64, w.drop_storage) != 0) {
-        let is i64 as n with mut = MAX_DND_TEXT;
-        while (n > 0 && ((cast(i64, data[n]) & 192) == 128)) { n = n - 1; }
-        w.drop_len = n;
+    let is *Reader as r = &w.reading[DROP];
+    w.drop_count = 0;
+    transfer.bytes_clear(&w.drop_text);
+    transfer.bytes_clear(&w.drop_paths);
+    if (r.failed == 0) {
+        if (w.drop_kind == transfer.FILES) {
+            w.drop_count = transfer.parse_uri_list(r.data.data, r.data.len, &w.drop_paths);
+            if (w.drop_count > 0) { w.drop_ready = 1; }
+        } else if (transfer.bytes_set(&w.drop_text, r.data.data, r.data.len) == 1) {
+            w.drop_ready = 1;
+        }
     }
-    if (cast(i64, w.drop_storage) != 0) { data[w.drop_len] = 0; }
-    w.drop_ready = 1;
-    if (w.drop_kind == event.DROP_FILES) { _drop_parse_files(w); }
+    transfer.bytes_clear(&r.data);
+    let is i32 as action with mut = transfer.COPY;
     let is i32 as offer = w.drop_offer;
     if (offer != 0) {
-        let is [0]u8 as empty;
-        _send(w, offer, 3, &empty[0], 0, 0 - 1);
         let is i32 as index = _offer_index(w, offer, 0, 0);
+        if (index >= 0 && w.offers[index].action != 0) { action = w.offers[index].action; }
+        let is [0]u8 as empty;
+        if (w.drop_ready == 1 && _bounded(_globals.data_manager_version, 3) >= 3) { _send(w, offer, 3, &empty[0], 0, 0 - 1); }
         if (index >= 0) { _offer_release(w, index, 1); }
     }
     w.drop_offer = 0; w.drop_offered = 0; w.drop_answer = 0;
     let is event.Event as e;
-    event.clear(&e); e.kind = event.DND_DROP; e.drop = w.drop_kind;
+    event.clear(&e);
     e.x = w.drop_x; e.y = w.drop_y;
+    if (w.drop_ready == 1) { e.kind = event.DND_DROP; e.drop = w.drop_kind; e.action = action; }
+    else { e.kind = event.DND_LEAVE; }
+    w.frame_ready = 1;
     _queue(w, &e);
 }
 
@@ -1339,36 +1505,17 @@ fn _drop_reject(w as *Window) as void {
     _queue(w, &e);
 }
 
+// Dropped: what is taken read — files when they are.
 fn _drop_start(w as *Window) as void {
     let is i32 as takes = w.drop_answer & w.drop_offered;
     let is i32 as index = _offer_index(w, w.drop_offer, 0, 0);
-    if (takes == 0 || index < 0 || w.transfer_fd >= 0) { _drop_reject(w); return; }
-    let is *u8 as mime with mut = cast(*u8, 0);
-    let is i32 as kind with mut = event.DROP_TEXT;
-    let is i32 as offered_files = cast(i32, (takes & event.DROP_FILES) != 0 && w.offers[index].files == 1);
-    if (offered_files == 1) { mime = "text/uri-list"; kind = event.DROP_FILES; }
-    else if (w.offers[index].text_mime == 1) { mime = "UTF8_STRING"; }
-    else if (w.offers[index].text_mime == 2) { mime = "text/plain;charset=utf-8"; }
-    else if (w.offers[index].text_mime == 3) { mime = "text/plain"; }
-    if (cast(i64, mime) == 0) { _drop_reject(w); return; }
-    if (cast(i64, w.drop_storage) == 0) {
-        w.drop_storage = mem.core.mmap_anon(DROP_STORAGE_BYTES);
-        if (cast(i64, w.drop_storage) == 0) { _drop_reject(w); return; }
-    }
-    let is [2]i32 as fds;
-    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &fds[0]) < 0) {
-        _drop_reject(w); return;
-    }
-    if (linux.fcntl(fds[0], 4, 2048) < 0 ||
-        _send_string_fd(w, w.drop_offer, 1, mime, fds[1]) == 0) {
-        linux.close(fds[0]); linux.close(fds[1]); _drop_reject(w); return;
-    }
-    linux.close(fds[1]);
-    w.drop_len = 0; w.drop_file_count = 0; w.drop_ready = 0; w.drop_truncated = 0;
-    w.drop_kind = kind; w.drop_pending = 1;
-    w.transfer_fd = fds[0]; w.transfer_offer = w.drop_offer;
-    w.transfer_primary = 0; w.transfer_mime = w.offers[index].text_mime;
-    w.transfer_purpose = 2;
+    if (takes == 0 || index < 0) { _drop_reject(w); return; }
+    let is i32 as kind with mut = transfer.TEXT;
+    if ((takes & transfer.FILES) != 0) { kind = transfer.FILES; }
+    if (_read_start(w, DROP, index, kind) == 0) { _drop_reject(w); return; }
+    w.drop_ready = 0; w.drop_count = 0;
+    w.drop_kind = kind;
+    w.drop_pending = 1;
 }
 
 fn _data_device_event(w as *Window, op as i32, p as *u8) as void {
@@ -1384,20 +1531,17 @@ fn _data_device_event(w as *Window, op as i32, p as *u8) as void {
         w.drop_x = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
         w.drop_y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 12))) / 256), w.scale120);
         w.drop_offer = cast(i32, _word(cast(*u8, cast(i64, p) + 16)));
-        w.drop_offered = 0; w.drop_answer = 0; w.drop_ready = 0;
-        w.drop_len = 0; w.drop_file_count = 0;
+        w.drop_offered = 0; w.drop_answer = 0; w.drop_want_action = 0; w.drop_actions = 0;
         let is i32 as index = _offer_index(w, w.drop_offer, 0, 0);
         if (index >= 0) {
-            if (w.offers[index].files == 1) { w.drop_offered = w.drop_offered | event.DROP_FILES; }
-            if (w.offers[index].text_mime != 0) { w.drop_offered = w.drop_offered | event.DROP_TEXT; }
+            w.drop_offered = w.offers[index].formats & (transfer.FILES | transfer.TEXT);
+            w.drop_actions = w.offers[index].source_actions;
+            if (w.drop_actions == 0) { w.drop_actions = transfer.COPY; }
             w.drop_answer = w.drop_offered;
-            let is [8]u8 as actions;
-            _put(&actions[0], 1); _put(&actions[4], 1);
-            _send(w, w.drop_offer, 4, &actions[0], 8, 0 - 1);
             _drop_accept(w);
         }
         let is event.Event as e;
-        event.clear(&e); e.kind = event.DND_ENTER; e.drop = w.drop_offered;
+        event.clear(&e); e.kind = event.DND_ENTER; e.drop = w.drop_offered; e.action = w.drop_actions;
         e.x = w.drop_x; e.y = w.drop_y;
         _queue(w, &e);
         return;
@@ -1419,22 +1563,16 @@ fn _data_device_event(w as *Window, op as i32, p as *u8) as void {
         w.drop_x = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 4))) / 256), w.scale120);
         w.drop_y = _scale_up(cast(i64, cast(i32, _word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
         if (w.drop_offer != 0 && w.drop_pending == 0) {
+            let is i32 as index = _offer_index(w, w.drop_offer, 0, 0);
+            if (index >= 0 && w.offers[index].source_actions != 0) { w.drop_actions = w.offers[index].source_actions; }
             let is event.Event as e;
-            event.clear(&e); e.kind = event.DND_MOVE; e.x = w.drop_x; e.y = w.drop_y;
+            event.clear(&e); e.kind = event.DND_MOVE; e.x = w.drop_x; e.y = w.drop_y; e.action = w.drop_actions;
             _queue(w, &e);
         }
         return;
     }
     if (op == 4) { _drop_start(w); return; }
-    if (op == 5) {
-        let is i32 as next = cast(i32, _word(p));
-        let is i32 as previous = w.clipboard_offer;
-        if (previous != 0 && previous != next && previous != w.transfer_offer) {
-            let is i32 as index = _offer_index(w, previous, 0, 0);
-            if (index >= 0) { _offer_release(w, index, 1); }
-        }
-        w.clipboard_offer = next;
-    }
+    if (op == 5) { _selection_offer(w, 0, cast(i32, _word(p))); }
 }
 
 fn _primary_device_event(w as *Window, op as i32, p as *u8) as void {
@@ -1442,51 +1580,116 @@ fn _primary_device_event(w as *Window, op as i32, p as *u8) as void {
         _offer_index(w, cast(i32, _word(p)), 1, 1);
         return;
     }
-    if (op == 1) {
-        let is i32 as next = cast(i32, _word(p));
-        let is i32 as previous = w.primary_offer;
-        if (previous != 0 && previous != next && previous != w.transfer_offer) {
-            let is i32 as index = _offer_index(w, previous, 1, 0);
-            if (index >= 0) { _offer_release(w, index, 1); }
-        }
-        w.primary_offer = next;
+    if (op == 1) { _selection_offer(w, 1, cast(i32, _word(p))); }
+}
+
+// A selection now offered as next (0: none): the one before let go, unless
+// it is still being read.
+fn _selection_offer(w as *Window, which as i32, next as i32) as void {
+    let is i32 as previous = w.selection_offer[which];
+    w.selection_offer[which] = next;
+    if (previous != 0 && previous != next && previous != w.reading[PASTE].offer) {
+        let is i32 as index = _offer_index(w, previous, which, 0);
+        if (index >= 0) { _offer_release(w, index, 1); }
     }
 }
 
+// --- Ours: sources ---
 
 fn _source_release(w as *Window, index as i32, destroy as i32) as void {
     let is *DataSource as s = &w.sources[index];
     if (destroy == 1 && s.object != 0) {
         let is [0]u8 as empty;
-        if (s.primary == 1) { _send(w, s.object, 1, &empty[0], 0, 0 - 1); }
-        else { _send(w, s.object, 1, &empty[0], 0, 0 - 1); }
+        _send(w, s.object, 1, &empty[0], 0, 0 - 1);
     }
-    if (cast(i64, s.data) != 0) { mem.core.munmap(s.data, s.bytes); }
-    if (w.clip_source == s.object) { w.clip_source = 0; }
-    if (w.primary_source == s.object) { w.primary_source = 0; }
+    transfer.offer_free(&s.offer);
+    if (w.selection_source[0] == s.object) { w.selection_source[0] = 0; }
+    if (w.selection_source[1] == s.object) { w.selection_source[1] = 0; }
+    if (w.drag_source == s.object) { w.drag_source = 0; }
     if (s.object >= 2 && s.object < MAX_OBJECTS) { _objects[s.object].owner = cast(*Window, 0); }
     mem.memzero(cast(*u8, s), sizeof(DataSource));
 }
 
-fn _source_event(w as *Window, object as i32, op as i32, primary as i32) as void {
+// A source of what o offers (copied), for purpose, its MIME types told: its
+// index, -1 when it could not be made.
+fn _source_new(w as *Window, purpose as i32, o as *transfer.Offer) as i32 {
+    let is i32 as manager with mut = w.data_manager;
+    if (purpose == _FOR_PRIMARY) { manager = w.primary_manager; }
+    if (manager == 0 || o.formats == 0) { return 0 - 1; }
+    let is i32 as index = _source_slot(w);
+    if (index < 0) { return 0 - 1; }
+    let is *DataSource as s = &w.sources[index];
+    mem.memzero(cast(*u8, s), sizeof(DataSource));
+    transfer.offer_init(&s.offer);
+    if (((o.formats & transfer.TEXT) != 0 && transfer.offer_text(&s.offer, o.text.data, o.text.len) == 0) ||
+        ((o.formats & transfer.PNG) != 0 && transfer.offer_png(&s.offer, o.png.data, o.png.len) == 0) ||
+        ((o.formats & transfer.FILES) != 0 && transfer.offer_files(&s.offer, o.paths.data, o.count) == 0)) {
+        transfer.offer_free(&s.offer);
+        return 0 - 1;
+    }
+    let is i32 as object = _id(w);
+    if (object == 0) { transfer.offer_free(&s.offer); return 0 - 1; }
+    // The event that carries a descriptor: send, 1 on wl_data_source, 0 on
+    // the primary selection's source.
+    _objects[object].fd_opcode = 1;
+    if (purpose == _FOR_PRIMARY) { _objects[object].fd_opcode = 0; }
+    s.object = object;
+    s.purpose = purpose;
+    let is [4]u8 as idp;
+    _put(&idp[0], cast(u32, object));
+    let is i32 as ok with mut = _send(w, manager, 0, &idp[0], 4, 0 - 1);
+    if (ok == 1 && (o.formats & transfer.FILES) != 0) { ok = _send_string(w, object, 0, transfer.MIME_URIS); }
+    if (ok == 1 && (o.formats & transfer.TEXT) != 0) {
+        ok = _send_string(w, object, 0, transfer.MIME_UTF8);
+        if (ok == 1) { ok = _send_string(w, object, 0, "UTF8_STRING"); }
+        if (ok == 1) { ok = _send_string(w, object, 0, "text/plain"); }
+    }
+    if (ok == 1 && (o.formats & transfer.PNG) != 0) { ok = _send_string(w, object, 0, transfer.MIME_PNG); }
+    if (ok == 0) { _source_release(w, index, 1); return 0 - 1; }
+    return index;
+}
+
+// One of our sources' events: wl_data_source's target (0), send (1),
+// cancelled (2), dnd_drop_performed (3), dnd_finished (4), action (5); the
+// primary selection source's send (0), cancelled (1).
+fn _source_event(w as *Window, object as i32, op as i32, p as *u8) as void {
     let is i32 as index = _source_index(w, object);
-    if (index < 0 || w.sources[index].primary != primary) { return; }
+    if (index < 0) { return; }
+    let is *DataSource as s = &w.sources[index];
+    let is i32 as primary = cast(i32, s.purpose == _FOR_PRIMARY);
     if ((primary == 0 && op == 1) || (primary == 1 && op == 0)) {
         let is i64 as fd = _take_recv_fd();
         if (fd < 0) { return; }
-        let is i64 as sent with mut = 0;
-        while (w.sources[index].data != cast(*u8, 0) && sent < w.sources[index].length) {
-            let is i64 as n = linux.write(fd, cast(*u8, cast(i64, w.sources[index].data) + sent),
-                                         w.sources[index].length - sent);
-            if (n <= 0) { break; }
-            sent = sent + n;
-        }
-        linux.close(fd);
+        let is i32 as len = cast(i32, _word(p));
+        let is i32 as f with mut = 0;
+        if (len > 1 && len <= 256 && _wire_size >= 12 + len) { f = transfer.format_of(cast(*u8, cast(i64, p) + 4), cast(i64, len - 1)); }
+        if (f == 0 || (s.offer.formats & f) == 0) { linux.close(fd); return; }
+        _write_start(w, fd, transfer.offer_bytes(&s.offer, f));
         return;
     }
     if ((primary == 0 && op == 2) || (primary == 1 && op == 1)) {
+        // Cancelled: a selection another took; a drag refused or cancelled.
+        if (s.purpose == _FOR_DRAG) { _drag_done(w, 0); }
         _source_release(w, index, 1);
+        return;
     }
+    if (primary == 1) { return; }
+    if (op == 3) { s.dropped = 1; return; }
+    if (op == 4) {
+        let is i32 as done with mut = s.action;
+        if (done == 0) { done = transfer.COPY; }
+        _drag_done(w, done);
+        _source_release(w, index, 1);
+        return;
+    }
+    if (op == 5 && _wire_size >= 12) { s.action = cast(i32, _word(p)) & (transfer.COPY | transfer.MOVE); }
+}
+
+fn _drag_done(w as *Window, action as i32) as void {
+    let is event.Event as e;
+    event.clear(&e); e.kind = event.DRAG_DONE; e.action = action;
+    w.frame_ready = 1;
+    _queue(w, &e);
 }
 
 // A string argument of a text-input event at p into dst (IME_TEXT bytes):
@@ -1982,7 +2185,27 @@ fn input_due(w as *Window) as i64 {
         if (c < 0) { c = 0; }
         if (due < 0 || c < due) { due = c; }
     }
+    // A transfer under way: due now when its descriptor is ready, else soon
+    // — a source or a reader in another program may take its time.
+    if (_transferring(w) == 1) {
+        let is i64 as t with mut = 10;
+        if (_transfer_ready(w) == 1) { t = 0; }
+        if (due < 0 || t < due) { due = t; }
+    }
     return due;
+}
+
+// Whether a reader's descriptor has something to read, or a writer's room to
+// write, now.
+fn _transfer_ready(w as *Window) as i32 {
+    if (w.reading[PASTE].fd >= 0 && sys.wait_readable(w.reading[PASTE].fd, 0) > 0) { return 1; }
+    if (w.reading[DROP].fd >= 0 && sys.wait_readable(w.reading[DROP].fd, 0) > 0) { return 1; }
+    let is i32 as k with mut = 0;
+    while (k < MAX_WRITERS) {
+        if (w.writing[k].fd >= 0 && sys.wait_writable(w.writing[k].fd, 0) > 0) { return 1; }
+        k = k + 1;
+    }
+    return 0;
 }
 
 // The locale whose Compose file a keymap's keyboard composes with.
@@ -2081,6 +2304,9 @@ fn _keyboard_event(w as *Window, op as i32, p as *u8) as void {
     if (op == 1) {
         if (_wire_size < 20 || _word(cast(*u8, cast(i64, p) + 4)) != cast(u32, w.surface)) { return; }
         w.keyboard_focus = 1;
+        // The enter's serial: what a selection set before a key is pressed —
+        // a paste menu's copy — is owned by.
+        w.input_serial = _word(p);
         let is i32 as bytes = cast(i32, _word(cast(*u8, cast(i64, p) + 8)));
         if (bytes >= 0 && (bytes & 3) == 0 && 20 + bytes <= _wire_size && _kb_ready(w) == 1) {
             let is i32 as i with mut = 0;
@@ -2268,7 +2494,7 @@ fn _pointer_event(w as *Window, op as i32, p as *u8) as void {
     }
     if (op == 3) {
         w.pointer_serial = _word(p);
-        if (_word(cast(*u8, cast(i64, p) + 12)) == 1) { w.grab_serial = w.pointer_serial; }
+        if (_word(cast(*u8, cast(i64, p) + 12)) == 1) { w.grab_serial = w.pointer_serial; w.input_serial = w.pointer_serial; }
         let is i32 as button = _button_id(cast(i32, _word(cast(*u8, cast(i64, p) + 8))));
         if (button <= 0 || button >= 8) { return; }
         let is i32 as down = cast(i32, _word(cast(*u8, cast(i64, p) + 12)) == 1);
@@ -2792,13 +3018,8 @@ fn _dispatch(w as *Window, obj as i32) as void {
     if (obj == w.data_device) { _data_device_event(w, op, p); return; }
     if (obj == w.primary_device) { _primary_device_event(w, op, p); return; }
     if (obj == w.text_input) { _text_input_event(w, op, p); return; }
-    if (_offer_index(w, obj, 0, 0) >= 0) { _data_offer_event(w, obj, p); return; }
-    if (_offer_index(w, obj, 1, 0) >= 0) { _data_offer_event(w, obj, p); return; }
-    if (_source_index(w, obj) >= 0) {
-        let is i32 as source_i = _source_index(w, obj);
-        _source_event(w, obj, op, w.sources[source_i].primary);
-        return;
-    }
+    if (_offer_index(w, obj, 0, 0) >= 0) { _data_offer_event(w, obj, op, p); return; }
+    if (_source_index(w, obj) >= 0) { _source_event(w, obj, op, p); return; }
     if (obj == w.seat && op == 0) { _seat_capabilities(w, _word(p)); return; }
     if (obj == w.keyboard) { _keyboard_event(w, op, p); return; }
     if (obj == w.pointer) { _pointer_event(w, op, p); return; }
@@ -2905,11 +3126,12 @@ fn _dispatch(w as *Window, obj as i32) as void {
 
 fn _pump_one(w as *Window, wait as i32) as i32 {
     if (wait == 1) {
+        // A transfer under way: back soon to move it on.
         let is i64 as timeout with mut = 5000;
-        if (w.transfer_fd >= 0) { timeout = 10; }
+        if (_transferring(w) == 1) { timeout = 10; }
         if (sys.wait_readable(w.fd, timeout) <= 0) {
-            if (w.transfer_fd < 0) { return 0; }
-            if (sys.wait_readable(w.transfer_fd, 0) > 0) { _read_transfer(w); }
+            if (_transferring(w) == 0) { return 0; }
+            _transfers(w);
             return 2;
         }
     } else if (sys.wait_readable(w.fd, 0) <= 0) { return 0; }
@@ -2979,227 +3201,205 @@ fn _send_string_fd(w as *Window, object as i32, opcode as i32, text as *u8, fd a
     return _send(w, object, opcode, &p[0], 4 + padded, fd);
 }
 
-fn _read_transfer(w as *Window) as void {
-    if (w.transfer_fd < 0) { return; }
-    if (w.transfer_purpose == 1 && cast(i64, w.received_text) == 0) { return; }
-    if (w.transfer_purpose == 2 && cast(i64, w.drop_storage) == 0) { return; }
-    let is [4096]u8 as chunk;
-    while (1 == 1) {
-        let is i64 as n = linux.read(w.transfer_fd, &chunk[0], 4096);
-        if (n > 0) {
-            let is i64 as room with mut = MAX_TEXT - w.received_len;
-            let is *u8 as dst with mut = w.received_text;
-            if (w.transfer_purpose == 2) {
-                room = MAX_DND_TEXT - w.drop_len;
-                dst = cast(*u8, cast(i64, w.drop_storage) + 65536);
-            }
-            let is i64 as count with mut = n;
-            let is i64 as used with mut = w.received_len;
-            if (w.transfer_purpose == 2) { used = w.drop_len; }
-            if (count > room) { count = room; }
-            if (w.transfer_purpose == 2 && n > room && w.drop_truncated == 0) {
-                dst[used + room] = chunk[room];
-                w.drop_truncated = 1;
-            }
-            if (count > 0) {
-                mem.memcpy(cast(*u8, cast(i64, dst) + used), &chunk[0], count);
-                if (w.transfer_purpose == 2) { w.drop_len = w.drop_len + count; }
-                else { w.received_len = w.received_len + count; }
-            }
-            continue;
-        }
-        if (n == 0) {
-            let is i32 as offer = w.transfer_offer;
-            let is i32 as primary = w.transfer_primary;
-            let is i32 as purpose = w.transfer_purpose;
-            linux.close(w.transfer_fd);
-            w.transfer_fd = 0 - 1;
-            w.transfer_offer = 0; w.transfer_primary = 0; w.transfer_mime = 0;
-            w.transfer_purpose = 0; w.frame_ready = 1;
-            if (purpose == 1) {
-                w.clipboard_pending = 0; w.clipboard_ready = 1;
-                w.received_text[w.received_len] = 0;
-                let is i32 as index = _offer_index(w, offer, primary, 0);
-                if (index >= 0) { _offer_release(w, index, 1); }
-            } else { _drop_finish(w); }
-            return;
-        }
-        if (n == 0 - sys.EINTR) { continue; }
-        return;
+// Every transfer moved on as far as it can now: what is read read, what is
+// written written.
+fn _transfers(w as *Window) as void {
+    _readers(w);
+    _writers(w);
+}
+
+// Both readers and every writer stopped, their descriptors closed.
+fn _transfers_end(w as *Window) as void {
+    _read_cancel(w, PASTE);
+    _read_cancel(w, DROP);
+    transfer.bytes_free(&w.reading[PASTE].data);
+    transfer.bytes_free(&w.reading[DROP].data);
+    let is i32 as k with mut = 0;
+    while (k < MAX_WRITERS) {
+        _write_end(w, k);
+        transfer.bytes_free(&w.writing[k].data);
+        k = k + 1;
     }
+    transfer.bytes_free(&w.drop_paths);
+    transfer.bytes_free(&w.drop_text);
+    w.paste_state = _PASTE_IDLE;
 }
 
-fn _cancel_transfer(w as *Window) as void {
-    if (w.transfer_fd >= 0) { linux.close(w.transfer_fd); }
-    w.transfer_fd = 0 - 1; w.transfer_offer = 0;
-    w.transfer_purpose = 0;
-    w.transfer_primary = 0; w.transfer_mime = 0;
-    w.clipboard_pending = 0;
-}
+// --- The clipboard and the primary selection ---
 
-fn _source_slot(w as *Window) as i32 {
-    let is i32 as i with mut = 0;
-    while (i < MAX_DATA) {
-        if (w.sources[i].object == 0) { return i; }
-        i = i + 1;
-    }
-    return 0 - 1;
-}
-
-fn clipboard_set(w as *Window, which as i32, text as *u8, n as i64) as i32 {
-    if (w.opened == 0 || (which != 0 && which != 1) || n < 0 || n > MAX_TEXT ||
-        (n > 0 && cast(i64, text) == 0) || w.input_serial == 0) { return 0; }
-    let is i32 as primary = which;
-    let is i32 as manager with mut = w.data_manager;
+// The selection which (0 the clipboard, 1 the primary) ours, with what o
+// offers (copied), under the last input's serial: 1, or 0 when there is no
+// such selection here or no input yet to own it by.
+fn clipboard_set(w as *Window, which as i32, o as *transfer.Offer) as i32 {
+    if (w.opened == 0 || (which != 0 && which != 1) || w.input_serial == 0) { return 0; }
     let is i32 as device with mut = w.data_device;
-    if (primary == 1) { manager = w.primary_manager; device = w.primary_device; }
-    if (manager == 0 || device == 0) { return 0; }
-    let is i32 as index = _source_slot(w);
+    let is i32 as purpose with mut = _FOR_CLIPBOARD;
+    if (which == 1) { device = w.primary_device; purpose = _FOR_PRIMARY; }
+    if (device == 0) { return 0; }
+    let is i32 as index = _source_new(w, purpose, o);
     if (index < 0) { return 0; }
-    let is i64 as bytes = n + 1;
-    let is *u8 as copy = mem.core.mmap_anon(bytes);
-    if (cast(i64, copy) == 0) { return 0; }
-    if (n > 0) { mem.memcpy(copy, text, n); }
-    copy[n] = 0;
-    let is i32 as object = _id(w);
-    if (object != 0) {
-        _objects[object].fd_opcode = 1;
-        if (primary == 1) { _objects[object].fd_opcode = 0; }
-    }
-    w.sources[index].object = object;
-    w.sources[index].primary = primary;
-    w.sources[index].which = which;
-    w.sources[index].data = copy;
-    w.sources[index].bytes = bytes;
-    w.sources[index].length = n;
+    let is i32 as object = w.sources[index].object;
     let is [8]u8 as p;
-    _put(&p[0], cast(u32, object));
-    if (_send(w, manager, 0, &p[0], 4, 0 - 1) == 0 ||
-        _send_string(w, object, 0, "UTF8_STRING") == 0 ||
-        _send_string(w, object, 0, "text/plain;charset=utf-8") == 0 ||
-        _send_string(w, object, 0, "text/plain") == 0) {
-        _source_release(w, index, 1);
-        return 0;
-    }
     _put(&p[0], cast(u32, object));
     _put(&p[4], w.input_serial);
     let is i32 as opcode with mut = 1;
-    if (primary == 1) { opcode = 0; }
+    if (which == 1) { opcode = 0; }
     if (_send(w, device, opcode, &p[0], 8, 0 - 1) == 0) {
         _source_release(w, index, 1);
         return 0;
     }
-    if (primary == 1) { w.primary_source = object; }
-    else { w.clip_source = object; }
+    // The one before: the compositor cancels it, which lets it go.
+    w.selection_source[which] = object;
     return 1;
 }
 
-fn clipboard_request(w as *Window, which as i32) as i32 {
-    if (w.opened == 0 || (which != 0 && which != 1) ||
-        w.clipboard_pending == 1 || w.transfer_fd >= 0) { return 0; }
-    let is i32 as primary = which;
+// The selection which asked for as format — transfer.TEXT, PNG, or 0 for
+// which formats it offers — what came before forgotten. It arrives as the
+// pump runs (clipboard_ready); at once when the selection is ours, or has
+// none of it. 1 when asked.
+fn clipboard_request(w as *Window, which as i32, format as i32) as i32 {
+    if (w.opened == 0 || (which != 0 && which != 1)) { return 0; }
+    if (format != 0 && format != transfer.TEXT && format != transfer.PNG) { return 0; }
     let is i32 as device with mut = w.data_device;
-    let is i32 as offer with mut = w.clipboard_offer;
-    let is i32 as source with mut = w.clip_source;
-    if (primary == 1) {
-        device = w.primary_device; offer = w.primary_offer; source = w.primary_source;
-    }
+    if (which == 1) { device = w.primary_device; }
     if (device == 0) { return 0; }
-    _cancel_transfer(w);
-    w.clipboard_ready = 0; w.received_len = 0;
-    if (cast(i64, w.received_text) == 0) {
-        w.received_text = mem.core.mmap_anon(MAX_TEXT + 1);
-        if (cast(i64, w.received_text) == 0) { return 0; }
-    }
-    if (source != 0) {
-        let is i32 as source_i = _source_index(w, source);
-        if (source_i >= 0) {
-            let is i64 as n = w.sources[source_i].length;
-            if (n > 0) { mem.memcpy(w.received_text, w.sources[source_i].data, n); }
-            w.received_len = n; w.received_text[n] = 0; w.clipboard_ready = 1;
-            return 1;
+    _read_cancel(w, PASTE);
+    let is *Reader as r = &w.reading[PASTE];
+    transfer.bytes_clear(&r.data);
+    w.paste_state = _PASTE_READY;
+    w.paste_got = 0;
+    w.paste_offered = 0;
+    // Ours: what we offer, as it is.
+    let is i32 as source_i = _source_index(w, w.selection_source[which]);
+    if (source_i >= 0) {
+        let is *transfer.Offer as o = &w.sources[source_i].offer;
+        w.paste_offered = o.formats & (transfer.TEXT | transfer.PNG);
+        if (format != 0 && (o.formats & format) != 0) {
+            let is *transfer.Bytes as b = transfer.offer_bytes(o, format);
+            if (transfer.bytes_set(&r.data, b.data, b.len) == 1) { w.paste_got = format; }
         }
+        return 1;
     }
-    if (offer == 0) { w.received_text[0] = 0; w.clipboard_ready = 1; return 1; }
-    let is i32 as offer_i = _offer_index(w, offer, primary, 0);
-    if (offer_i < 0 || w.offers[offer_i].text_mime == 0) {
-        w.received_text[0] = 0; w.clipboard_ready = 1; return 1;
-    }
-    let is *u8 as mime with mut = "text/plain";
-    if (w.offers[offer_i].text_mime == 1) { mime = "UTF8_STRING"; }
-    if (w.offers[offer_i].text_mime == 2) { mime = "text/plain;charset=utf-8"; }
-    let is [8]i32 as fds;
-    if (sys.socketpair(sys.AF_UNIX, sys.SOCK_STREAM | sys.SOCK_CLOEXEC, 0, &fds[0]) < 0) { return 0; }
-    if (linux.fcntl(fds[0], 4, 2048) < 0) {
-        linux.close(fds[0]); linux.close(fds[1]); return 0;
-    }
-    let is i32 as opcode with mut = 1;
-    if (primary == 1) { opcode = 0; }
-    if (_send_string_fd(w, offer, opcode, mime, fds[1]) == 0) {
-        linux.close(fds[0]); linux.close(fds[1]); return 0;
-    }
-    linux.close(fds[1]);
-    w.transfer_fd = fds[0]; w.transfer_offer = offer;
-    w.transfer_primary = primary; w.transfer_mime = w.offers[offer_i].text_mime;
-    w.transfer_purpose = 1;
-    w.clipboard_pending = 1;
+    let is i32 as offer_i = _offer_index(w, w.selection_offer[which], which, 0);
+    if (w.selection_offer[which] == 0 || offer_i < 0) { return 1; }
+    w.paste_offered = w.offers[offer_i].formats & (transfer.TEXT | transfer.PNG);
+    if (format == 0 || (w.offers[offer_i].formats & format) == 0) { return 1; }
+    if (_read_start(w, PASTE, offer_i, format) == 0) { return 0; }
+    w.paste_state = _PASTE_PENDING;
     return 1;
 }
 
+// Whether what was asked for came (then clipboard_format and the rest have it).
 fn clipboard_ready(w as *Window) as i32 {
-    if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { _read_transfer(w); }
-    return w.clipboard_ready;
+    _readers(w);
+    return cast(i32, w.paste_state == _PASTE_READY);
 }
 
-fn clipboard_pending(w as *Window) as i32 { return w.clipboard_pending; }
-
-fn clipboard_text(w as *Window, buf as *u8, cap as i64) as i64 {
-    if (w.clipboard_ready == 0) { return 0 - 1; }
-    if (cap <= 0 || cast(i64, buf) == 0) { return 0; }
-    let is i64 as n with mut = w.received_len;
-    if (n > cap - 1) { n = cap - 1; }
-    if (n < 0) { n = 0; }
-    if (n > 0) { mem.memcpy(buf, w.received_text, n); }
-    buf[n] = 0;
-    return n;
+// Whether an answer is still awaited.
+fn clipboard_pending(w as *Window) as i32 {
+    _readers(w);
+    return cast(i32, w.paste_state == _PASTE_PENDING);
 }
-fn drop_answer(w as *Window, takes as i32) as i32 {
+
+// The format that came — what was asked, 0 for none — and its bytes.
+fn clipboard_format(w as *Window) as i32 {
+    if (w.paste_state != _PASTE_READY) { return 0; }
+    return w.paste_got;
+}
+fn clipboard_data(w as *Window) as *u8 {
+    if (w.paste_state != _PASTE_READY || w.paste_got == 0) { return cast(*u8, 0); }
+    return w.reading[PASTE].data.data;
+}
+fn clipboard_length(w as *Window) as i64 {
+    if (w.paste_state != _PASTE_READY || w.paste_got == 0) { return 0; }
+    return w.reading[PASTE].data.len;
+}
+// The formats the selection offered when it was asked for.
+fn clipboard_offered(w as *Window) as i32 {
+    if (w.paste_state != _PASTE_READY) { return 0; }
+    return w.paste_offered;
+}
+
+// --- Drag and drop ---
+
+// What the program takes of the drag over the window where the pointer is
+// (transfer.FILES, TEXT, 0) and how (transfer.COPY, MOVE; 0 for either, a
+// copy preferred — the compositor itself makes it a move while Shift is
+// held, the keyboard its during a drag): told the compositor at once. 1 when
+// a drag is there.
+fn drop_answer(w as *Window, takes as i32, action as i32) as i32 {
     if (w.opened == 0 || w.drop_offer == 0 || w.drop_pending == 1) { return 0; }
     w.drop_answer = takes & w.drop_offered;
+    w.drop_want_action = action & (transfer.COPY | transfer.MOVE);
     _drop_accept(w);
     return 1;
 }
 
 fn dropped_files(w as *Window) as i64 {
-    if (w.drop_ready == 0 || w.drop_kind != event.DROP_FILES) { return 0; }
-    return w.drop_file_count;
+    if (w.drop_ready == 0 || w.drop_kind != transfer.FILES) { return 0; }
+    return w.drop_count;
 }
 
 fn dropped_file(w as *Window, i as i64) as *u8 {
-    if (w.drop_ready == 0 || w.drop_kind != event.DROP_FILES ||
-        i < 0 || i >= w.drop_file_count || cast(i64, w.drop_storage) == 0) {
-        return cast(*u8, 0);
-    }
-    return cast(*u8, cast(i64, w.drop_storage) + i * DROPPED_PATH_BYTES);
+    if (w.drop_ready == 0 || w.drop_kind != transfer.FILES) { return cast(*u8, 0); }
+    return transfer.path_at(&w.drop_paths, w.drop_count, i);
 }
 
 fn dropped_text(w as *Window) as *u8 {
-    if (w.drop_ready == 0 || w.drop_kind != event.DROP_TEXT || w.drop_len == 0 ||
-        cast(i64, w.drop_storage) == 0) { return cast(*u8, 0); }
-    return cast(*u8, cast(i64, w.drop_storage) + 65536);
+    if (w.drop_ready == 0 || w.drop_kind != transfer.TEXT || w.drop_text.len == 0) { return cast(*u8, 0); }
+    return w.drop_text.data;
 }
 
 fn dropped_text_length(w as *Window) as i64 {
-    if (w.drop_ready == 0 || w.drop_kind != event.DROP_TEXT) { return 0; }
-    return w.drop_len;
+    if (w.drop_ready == 0 || w.drop_kind != transfer.TEXT) { return 0; }
+    return w.drop_text.len;
 }
 
 fn clear_drop(w as *Window) as void {
-    w.drop_ready = 0; w.drop_file_count = 0; w.drop_len = 0; w.drop_kind = 0; w.drop_truncated = 0;
+    w.drop_ready = 0; w.drop_count = 0; w.drop_kind = 0;
+    transfer.bytes_clear(&w.drop_paths);
+    transfer.bytes_clear(&w.drop_text);
 }
 
-
-
+// A drag of what o offers out of the window, the actions allowed
+// (transfer.COPY, MOVE), from the press of a button still held: the
+// compositor runs it, and its end is a DRAG_DONE event with the action the
+// target did, 0 for none. 1 when it began.
+fn drag_begin(w as *Window, o as *transfer.Offer, actions as i32) as i32 {
+    if (w.opened == 0 || w.data_device == 0 || w.grab_serial == 0 || w.drag_source != 0 ||
+        (actions & (transfer.COPY | transfer.MOVE)) == 0) { return 0; }
+    let is i32 as held with mut = 0;
+    let is i32 as b with mut = 1;
+    while (b < 8) { held = held + w.pointer_buttons[b]; b = b + 1; }
+    if (held == 0) { return 0; }
+    let is i32 as index = _source_new(w, _FOR_DRAG, o);
+    if (index < 0) { return 0; }
+    let is i32 as object = w.sources[index].object;
+    let is [16]u8 as p;
+    if (_bounded(_globals.data_manager_version, 3) >= 3) {
+        _put(&p[0], cast(u32, actions & (transfer.COPY | transfer.MOVE)));
+        _send(w, object, 2, &p[0], 4, 0 - 1);
+    }
+    _put(&p[0], cast(u32, object)); _put(&p[4], cast(u32, w.surface)); _put(&p[8], 0); _put(&p[12], w.grab_serial);
+    if (_send(w, w.data_device, 0, &p[0], 16, 0 - 1) == 0) { _source_release(w, index, 1); return 0; }
+    w.drag_source = object;
+    // The compositor has the pointer from here: the release is its, so the
+    // input says every held button is up, taken.
+    b = 1;
+    while (b < 8) {
+        if (w.pointer_buttons[b] == 1) {
+            w.pointer_buttons[b] = 0;
+            let is ie.Event as up = _input(w, ie.BUTTON_UP);
+            up.button = b;
+            up.detail = ie.BUTTON_TAKEN;
+            up.x = w.pointer_x;
+            up.y = w.pointer_y;
+            _push(w, &up, cast(*u8, 0), 0);
+        }
+        b = b + 1;
+    }
+    return 1;
+}
 
 fn _runtime_socket(w as *Window) as i32 {
     if (_connection_fd >= 0) { w.fd = _connection_fd; return _attach(w); }
@@ -3224,6 +3424,9 @@ fn _runtime_socket(w as *Window) as i32 {
     w.fd = sys.connect_unix(&path[0], n, 0);
     if (w.fd < 0) { return 0; }
     _connection_fd = w.fd;
+    // Clipboards and drops are written to other programs' pipes: one that
+    // went away is an error to see, not a signal that ends this one.
+    sys.ignore_sigpipe();
     return _attach(w);
 }
 
@@ -3793,11 +3996,11 @@ fn next_frame(w as *Window) as i32 {
 }
 
 fn pending(w as *Window) as i32 {
+    if (_transferring(w) == 1) { _transfers(w); }
     if (w.event_len > 0) { return 1; }
     if (cast(i64, w.input) != 0 && ie.pending(w.input) == 1) { return 1; }
     if (input_due(w) == 0) { return 1; }
     if (w.fd < 0) { return 0; }
-    if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { return 1; }
     return cast(i32, sys.wait_readable(w.fd, 0) > 0);
 }
 
@@ -4026,9 +4229,9 @@ fn show(w as *Window) as void {
 
 fn pump(w as *Window) as void {
     if (w.opened == 0) { return; }
-    if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { _read_transfer(w); }
+    _transfers(w);
     while (_pump_one(w, 0) == 1) { }
-    if (w.transfer_fd >= 0 && sys.wait_readable(w.transfer_fd, 0) > 0) { _read_transfer(w); }
+    _transfers(w);
     _apply_configure(w);
     _repeat_keys(w, time.now_ms());
     _cursor_tick(w, time.now_ms());
@@ -4495,7 +4698,7 @@ fn text_input_reset(w as *Window) as i32 {
 
 fn close(w as *Window) as void {
     let is [0]u8 as empty;
-    _cancel_transfer(w);
+    _transfers_end(w);
     let is i32 as data_i with mut = 0;
     while (data_i < MAX_DATA) {
         if (w.offers[data_i].object != 0) { _offer_release(w, data_i, 1); }
@@ -4521,9 +4724,6 @@ fn close(w as *Window) as void {
     if (w.pool != 0) { _send(w, w.pool, 1, &empty[0], 0, 0 - 1); w.pool = 0; }
     if (w.memfd >= 0) { linux.close(w.memfd); w.memfd = 0 - 1; }
     _destroy_buffers(w);
-    if (cast(i64, w.received_text) != 0) { mem.core.munmap(w.received_text, MAX_TEXT + 1); }
-    if (cast(i64, w.drop_storage) != 0) { mem.core.munmap(w.drop_storage, DROP_STORAGE_BYTES); }
-    w.received_text = cast(*u8, 0); w.drop_storage = cast(*u8, 0);
     ie.destroy(w.input);
     w.input = cast(*ie.Queue, 0);
     _touch_cancel(w);
