@@ -1,0 +1,208 @@
+// window/win32/settings_test.cst — the desktop's settings followed as
+// another program changes them, the independent peer
+// window/win32/tools/settings_peer.c (built with mingw-w64, none of this
+// repository's code) doing what the Settings app does — the registry and
+// SystemParametersInfoW, WM_SETTINGCHANGE broadcast:
+//   sh window/win32/tools/run_native.sh build/win32_settings_test.exe
+// For each change: the window hears SETTINGS, and the settings read then
+// say it — dark, text scale, double-click time, animations, the interface
+// font. Wine keeps SystemParametersInfo's answers per process, read once, so
+// what it answers there is read again by this program started anew (`read`
+// mode); the registry's are read in the window's own. Wine refuses
+// SPI_SETHIGHCONTRAST, so high contrast is not changed here.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../event.cst" as event;
+use "../settings.cst" as settings;
+use "bind/types.cst" as t;
+use "bind/kernel32.cst" as k;
+use "settings.cst" as desktop;
+use "backend.cst" as win;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+let is win.Window as w with mut;
+let is i32 as heard with mut = 0;   // SETTINGS events
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (1 == 1) {
+        if (w.ok == 1) {
+            win.pump(&w);
+            let is event.Event as e;
+            while (win.poll_event(&w, &e) == 1) {
+                if (e.kind == event.SETTINGS) { heard = heard + 1; }
+            }
+        }
+        if (time.now_ms() >= until) { return; }
+        time.sleep_ms(2);
+    }
+}
+
+// An ASCII string as UTF-16, '/' as '\'.
+fn wide(s as *u8, out as *u16, cap as i64) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0 && i < cap - 1) {
+        let is u16 as c with mut = cast(u16, s[i]);
+        if (c == cast(u16, 47)) { c = cast(u16, 92); }
+        out[i] = c;
+        i = i + 1;
+    }
+    out[i] = cast(u16, 0);
+}
+
+// The command line run, this window pumped meanwhile: its exit code, -1
+// when it did not start or took longer than 20 seconds.
+fn run(line as *u8) as i32 {
+    let is [512]u16 as cmd with mut;
+    wide(line, &cmd[0], 512);
+    let is t.STARTUPINFOW as si;
+    mem.memzero(cast(*u8, &si), sizeof(t.STARTUPINFOW));
+    si.cb = cast(u32, sizeof(t.STARTUPINFOW));
+    let is t.PROCESS_INFORMATION as pi;
+    mem.memzero(cast(*u8, &pi), sizeof(t.PROCESS_INFORMATION));
+    if (k.CreateProcessW(cast(*u16, 0), &cmd[0], cast(*u8, 0), cast(*u8, 0), 0, cast(u32, 0), cast(*u8, 0),
+                         cast(*u16, 0), &si, &pi) == 0) { return 0 - 1; }
+    let is i64 as until = time.now_ms() + 20000;
+    let is i32 as code with mut = 0 - 1;
+    while (time.now_ms() < until) {
+        pump(5);
+        if (k.WaitForSingleObject(pi.hProcess, cast(u32, 0)) == cast(u32, 0)) {
+            let is u32 as status with mut = cast(u32, 0);
+            k.GetExitCodeProcess(pi.hProcess, &status);
+            code = cast(i32, status);
+            break;
+        }
+    }
+    if (code < 0) { k.TerminateProcess(pi.hProcess, cast(u32, 9)); }
+    k.CloseHandle(pi.hThread);
+    k.CloseHandle(pi.hProcess);
+    return code;
+}
+
+// --- What another process reads ---
+
+let is [1024]u8 as text with mut;
+let is i64 as text_len with mut = 0;
+
+fn put(s as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0 && text_len < 1023) { text[text_len] = s[i]; text_len = text_len + 1; i = i + 1; }
+}
+
+fn put_int(v as i64) as void {
+    let is [24]u8 as d;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    if (x < 0) { put("-"); x = 0 - x; }
+    if (x == 0) { d[0] = 48; n = 1; }
+    while (x > 0) { d[n] = cast(u8, 48 + x % 10); x = x / 10; n = n + 1; }
+    while (n > 0) { n = n - 1; text[text_len] = d[n]; text_len = text_len + 1; }
+}
+
+// `read <path>`: the settings as this process reads them, a line each.
+fn read_mode(path as *u8) as i32 {
+    let is settings.Settings as s = desktop.read();
+    text_len = 0;
+    put("dark "); put_int(cast(i64, s.dark)); put("\n");
+    put("text "); put_int(cast(i64, s.text_scale * 100.0 + 0.5)); put("\n");
+    put("dblclick "); put_int(s.double_click_ms); put("\n");
+    put("anim "); put_int(cast(i64, s.animations)); put("\n");
+    put("font "); put(&s.font[0]); put(" "); put_int(cast(i64, s.font_size + 0.5)); put("\n");
+    let is [256]u16 as name;
+    wide(path, &name[0], 256);
+    let is i64 as h = k.CreateFileW(&name[0], cast(u32, t.GENERIC_WRITE), 0, cast(*u8, 0), cast(u32, t.CREATE_ALWAYS),
+                                    cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 1; }
+    let is u32 as wrote with mut = cast(u32, 0);
+    k.WriteFile(h, &text[0], cast(u32, text_len), &wrote, cast(*u8, 0));
+    k.CloseHandle(h);
+    return 0;
+}
+
+let is [1024]u8 as got with mut;
+let is i64 as got_len with mut = 0;
+
+// Another process's reading, into got: 1 when it came.
+fn read_anew() as i32 {
+    got_len = 0;
+    if (run("build/win32_settings_test.exe read build/settings-read") != 0) { return 0; }
+    let is [256]u16 as name;
+    wide("build/settings-read", &name[0], 256);
+    let is i64 as h = k.CreateFileW(&name[0], cast(u32, t.GENERIC_READ), cast(u32, t.FILE_SHARE_READ), cast(*u8, 0),
+                                    cast(u32, t.OPEN_EXISTING), cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    let is u32 as n with mut = cast(u32, 0);
+    k.ReadFile(h, &got[0], cast(u32, 1023), &n, cast(*u8, 0));
+    k.CloseHandle(h);
+    got_len = cast(i64, n);
+    got[got_len] = 0;
+    return 1;
+}
+
+fn says(line as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (line[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= got_len) {
+        if (mem.memcmp(cast(*u8, cast(i64, &got[0]) + i), line, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The peer's change made and SETTINGS heard for it within two seconds; the
+// settings as this window reads them then into s.
+fn change(args as *u8, s as *settings.Settings) as i32 {
+    let is [256]u8 as line with mut;
+    let is *u8 as head = "build/settings_peer.exe ";
+    let is i64 as n with mut = 0;
+    while (head[n] != 0) { line[n] = head[n]; n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (args[i] != 0 && n < 254) { line[n] = args[i]; n = n + 1; i = i + 1; }
+    line[n] = 0;
+    heard = 0;
+    if (run(&line[0]) != 0) { io.printf("  the peer refused %s\n", args); return 0; }
+    let is i64 as until = time.now_ms() + 2000;
+    while (heard == 0 && time.now_ms() < until) { pump(10); }
+    win.read_settings(&w, s);
+    if (heard == 0) { io.printf("  no SETTINGS after %s\n", args); }
+    return cast(i32, heard > 0);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() > 2 && env.argv(1)[0] == 114) { return read_mode(env.argv(2)); }
+    let is win.Config as c = win.config("settings", 200, 100);
+    w = win.open_config(&c);
+    if (w.ok == 0) { io.printf("FAIL: no window\n"); return 1; }
+    pump(100);
+    let is settings.Settings as s with mut = settings.defaults();
+
+    // The registry's, read in this window's process.
+    check("dark: heard and read", change("dark 1", &s) == 1 && (s.known & settings.K_DARK) != 0 && s.dark == 1);
+    check("light again: heard and read", change("dark 0", &s) == 1 && s.dark == 0);
+    check("text 150%: heard and read", change("text-scale 150", &s) == 1 &&
+          (s.known & settings.K_TEXT_SCALE) != 0 && s.text_scale > 1.49 && s.text_scale < 1.51);
+    // SystemParametersInfo's, heard here and read anew.
+    check("double-click 730 ms: heard", change("double-click 730", &s) == 1);
+    check("and read", read_anew() == 1 && says("dblclick 730\n") == 1);
+    check("no animations: heard", change("animations 0", &s) == 1);
+    check("and read", read_anew() == 1 && says("anim 0\n") == 1);
+    check("animations again: heard and read", change("animations 1", &s) == 1 && read_anew() == 1 && says("anim 1\n") == 1);
+    check("the interface font: heard", change("font Verdana 13", &s) == 1);
+    check("and read, its size in points", read_anew() == 1 && says("font Verdana 13\n") == 1);
+    // The system's colours (a contrast theme's): WM_SYSCOLORCHANGE.
+    check("the system's colours changed: heard", change("highlight 3366cc", &s) == 1);
+
+    win.close(&w);
+    if (fails == 0) { io.printf("win32 settings followed: all checks passed\n"); return 0; }
+    io.printf("win32 settings followed: %d failures\n", fails);
+    return 1;
+}

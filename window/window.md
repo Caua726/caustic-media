@@ -410,19 +410,35 @@ that large to hit it. `x11/all_link_test.cst` links all seven X libraries —
 **The desktop's settings** (`settings.cst`) are one record — dark, high
 contrast, the accent, the interface and monospace fonts, text scaling,
 animations, double-click time and distance, the drag threshold, the caret's
-blink, the cursor and icon themes — filled by whatever the platform has, each
-source marking what it reported so they merge field by field in order of
-trust; what none reported keeps the toolkit's own default:
+blink, the cursor and icon themes, the language — filled by whatever the
+platform has, each source marking what it reported so they merge field by
+field in order of trust, least first; what none reported keeps the toolkit's
+own default. Nothing is taken from GTK; the title bar's buttons are the
+toolkit's own arrangement.
 
+- the environment: `XCURSOR_THEME`, `XCURSOR_SIZE` (`settings.read_environment`);
+- `x11/resources.cst`: the session's resources, RESOURCE_MANAGER as xrdb
+  loads it — `Xcursor.theme`, `Xcursor.size`, `Xft.dpi` — read from the
+  root's property each time and followed by its PropertyNotify;
 - `x11/xsettings.cst`: XSETTINGS — the specification's `Net/` keys and Xft's
   DPI, nothing a toolkit keeps there under its own prefix — followed through
   the daemon starting, changing its property and quitting, with every length
   checked against a guard page (`xsettings_test`, `settings_x11_test` under
-  Xvfb);
+  Xvfb); with the resources, proved against xrdb and xsettingsd
+  (`settings_peers_x11_test`: loaded, changed, reloaded, stopped);
 - `linux/portal.cst`: org.freedesktop.portal.Settings over D-Bus (`../dbus/`),
-  KDE's keys under the cross-desktop org.freedesktop.appearance, tested
-  against a fake portal on a private bus (`portal_test`) and read from this
-  desktop's own by `linux/portal_check.cst`.
+  KDE's kdeglobals keys (fonts, animation speed, double-click, drag
+  distance, the caret's blink, the icon theme — numbers as KDE's portal says
+  them, strings) under the cross-desktop org.freedesktop.appearance (colour
+  scheme, accent, contrast, reduced motion); tested against a fake portal on
+  a private bus (`portal_test`) and against the installed one with its KDE
+  backend, on a bus and in a configuration of their own, a setting changed
+  as System Settings does followed (`portal_kde_test`,
+  `linux/tools/run_portal_kde.sh`);
+- `win32/settings.cst`: the registry and SystemParametersInfoW — dark,
+  text scale, high contrast, animations, DWM's colour, the message font,
+  double-click, drag, the caret, the locale — proved against a mingw peer
+  that changes them as the Settings app does (`win32/settings_test`).
 
 - `locale.cst`: the user's language, from the environment as POSIX orders
   it — `LANGUAGE` (its first that is a name; not in the C locale), `LC_ALL`,
@@ -430,12 +446,16 @@ trust; what none reported keeps the toolkit's own default:
   whether a language is written right to left (`window_locale_test`).
   Windows' `GetUserDefaultLocaleName` comes with the Win32 backend.
 
-`window.read_settings` gives the files, XSETTINGS and the locale, and starts watching:
-from then on a change arrives as a `SETTINGS` event in the window's queue —
-the pump hands every event to the watcher first, since the daemon's window and
-the root belong to no window here. The portal needs a D-Bus connection, so it
-is read by whoever holds one (the toolkit). The Windows registry comes with
-the Win32 backend, whose WM_SETTINGCHANGE is a window message.
+`device.read_settings` gives the environment, the resources, XSETTINGS and
+the locale, and starts watching: from then on a change arrives as a
+`SETTINGS` event in the window's queue — the pump hands every event to the
+watchers first, since the daemon's window and the root belong to no window
+here. The portal needs a D-Bus connection, so it is read by whoever holds one
+(the toolkit, `ui/desktop.cst`), and the host lays it over the platform's
+again each time those are read anew. On Windows WM_SETTINGCHANGE,
+WM_THEMECHANGED, WM_SYSCOLORCHANGE and WM_DWMCOLORIZATIONCOLORCHANGED are
+`SETTINGS`; `device.set_dark_frame` tells DWM the frame is dark
+(DWMWA_USE_IMMERSIVE_DARK_MODE), as the host does when the desktop is.
 
 **The desktop's file chooser** (`linux/filechooser.cst`): files to open or
 save to, or a folder, asked of org.freedesktop.portal.FileChooser over D-Bus,

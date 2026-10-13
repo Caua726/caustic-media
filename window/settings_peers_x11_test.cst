@@ -1,0 +1,121 @@
+// window/settings_peers_x11_test.cst — the desktop's settings on X11 as
+// other programs set them, followed live: the session's resources as xrdb
+// loads them (Xcursor.theme, Xcursor.size, Xft.dpi), over the environment's
+// pointer theme, and XSETTINGS as the xsettingsd daemon keeps them, over the
+// resources — started, reloaded (SIGHUP) and stopped:
+//   env XCURSOR_THEME=from-env XCURSOR_SIZE=30 \
+//       sh window/x11/tools/run_headless.sh ./build/settings_peers_x11_test
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "../sys/linux.cst" as sys;
+use "window.cst" as window;
+use "event.cst" as event;
+use "settings.cst" as settings;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+fn same(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (b[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i32, a[i] == b[i]);
+}
+
+let is window.device.Window as w with mut;
+
+// SETTINGS heard within three seconds, the window pumped meanwhile.
+fn heard() as i32 {
+    let is i64 as until = time.now_ms() + 3000;
+    while (time.now_ms() < until) {
+        window.next_frame(&w);
+        let is event.Event as e;
+        while (window.poll_event(&w, &e) == 1) {
+            if (e.kind == event.SETTINGS) { return 1; }
+        }
+        time.sleep_ms(5);
+    }
+    return 0;
+}
+
+fn write_file(path as *u8, s as *u8) as void {
+    let is i64 as fd = linux.open(path, 577, 420);
+    if (fd < 0) { return; }
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    linux.write(fd, s, n);
+    linux.close(fd);
+}
+
+// sh -c cmd to its end: its status.
+fn run(cmd as *u8) as i32 {
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd); argv[3] = 0;
+    let is i64 as pid = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (pid <= 0) { return 0 - 1; }
+    let is i32 as status with mut = 0;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+    return process.exit_code_of(status);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    w = window.open("settings", 64, 64);
+    if (window.is_open(&w) == 0) { io.printf("FAIL: no X server\n"); return 1; }
+    let is settings.Settings as s with mut = settings.defaults();
+    window.read_settings(&w, &s);
+    check("the environment's pointer theme and size", (s.known & settings.K_CURSOR_THEME) != 0 &&
+          same(&s.cursor_theme[0], "from-env") == 1 && (s.known & settings.K_CURSOR_SIZE) != 0 && s.cursor_size == 30);
+    linux.mkdir("build/settings-peers", 493);
+
+    // --- The session's resources, as xrdb loads them ---
+    write_file("build/settings-peers/a.Xresources", "Xcursor.theme: from-xrdb\nXcursor.size:\t48\nXft.dpi: 120\n");
+    check("xrdb loads them", run("xrdb -merge build/settings-peers/a.Xresources") == 0);
+    check("heard", heard() == 1);
+    window.read_settings(&w, &s);
+    check("the pointer theme and size over the environment's", same(&s.cursor_theme[0], "from-xrdb") == 1 &&
+          s.cursor_size == 48);
+    check("the DPI", (s.known & settings.K_DPI) != 0 && s.dpi == 120.0);
+    write_file("build/settings-peers/b.Xresources", "Xcursor.size: 32\n");
+    check("xrdb changes the size", run("xrdb -merge build/settings-peers/b.Xresources") == 0 && heard() == 1);
+    window.read_settings(&w, &s);
+    check("the new size, the theme kept", s.cursor_size == 32 && same(&s.cursor_theme[0], "from-xrdb") == 1);
+
+    // --- XSETTINGS, as xsettingsd keeps them ---
+    write_file("build/settings-peers/xsettingsd.conf",
+               "Net/DoubleClickTime 555\nNet/IconThemeName \"Papirus\"\nNet/CursorBlinkTime 800\nXft/DPI 147456\n");
+    let is [6]i64 as dargv;
+    dargv[0] = cast(i64, "xsettingsd"); dargv[1] = cast(i64, "-c");
+    dargv[2] = cast(i64, "build/settings-peers/xsettingsd.conf"); dargv[3] = 0;
+    let is i64 as daemon = process.spawnp("xsettingsd", cast(*u8, &dargv[0]));
+    check("xsettingsd started, heard", daemon > 0 && heard() == 1);
+    window.read_settings(&w, &s);
+    check("its double-click time", s.double_click_ms == 555);
+    check("its icon theme", same(&s.icon_theme[0], "Papirus") == 1);
+    check("its blink", s.blink_ms == 800);
+    check("its DPI over the resources'", s.dpi == 144.0);
+    check("the pointer still the resources'", same(&s.cursor_theme[0], "from-xrdb") == 1 && s.cursor_size == 32);
+    write_file("build/settings-peers/xsettingsd.conf",
+               "Net/DoubleClickTime 444\nNet/IconThemeName \"Papirus\"\nNet/CursorBlinkTime 800\nXft/DPI 147456\n");
+    sys.kill(daemon, 1);
+    check("reloaded: heard", heard() == 1);
+    window.read_settings(&w, &s);
+    check("its new double-click time", s.double_click_ms == 444);
+    sys.kill(daemon, 15);
+    let is i32 as st with mut = 0;
+    linux.wait4(daemon, &st, 0, cast(*u8, 0));
+    check("stopped: heard", heard() == 1);
+    window.read_settings(&w, &s);
+    check("its settings gone, the resources' DPI again", s.double_click_ms == 400 && s.dpi == 120.0);
+
+    run("xrdb -remove");
+    window.close(&w);
+    if (fails == 0) { io.printf("settings peers x11: all checks passed\n"); return 0; }
+    io.printf("settings peers x11: %d failures\n", fails);
+    return 1;
+}

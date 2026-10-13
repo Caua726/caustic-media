@@ -196,7 +196,15 @@ cancels) and runs `DoDragDrop` to its end, `DRAG_DONE` after it.
 mingw-w64 from the SDK alone (`tools/clipboard_peer.c`,
 `tools/ole_dnd_peer.c`), SendInput's pointer and keys. `settings.cst` reads
 the desktop's locale, font, DPI, timings, high contrast, animation
-preference and available registry/DWM preferences.
+preference and available registry/DWM preferences; WM_SETTINGCHANGE,
+WM_THEMECHANGED, WM_SYSCOLORCHANGE and WM_DWMCOLORIZATIONCOLORCHANGED say
+they changed (`SETTINGS`), and `set_dark_frame` tells DWM the frame is dark.
+`settings_test.cst` changes them from another program as the Settings app
+does (`tools/settings_peer.c`: the registry, SPI_SET* with SPIF_SENDCHANGE,
+SetSysColors) and checks each is heard; Wine keeps SystemParametersInfo's
+answers per process, so those are read again by the test started anew, and
+it refuses SPI_SETHIGHCONTRAST, which is left to real Windows. DWM's dark
+frame has no effect Wine shows.
 
 `backend_test.cst` exercises actual windows under Wine/Xvfb: presented pixels,
 keys with their place and the system's repeat, Unicode surrogate pairs, whose
