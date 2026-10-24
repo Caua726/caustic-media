@@ -208,7 +208,7 @@ they would read and, at version 3, the actions taken and the one preferred
 `wl_data_device.start_drag` under the press's serial, `DRAG_DONE` from
 `dnd_finished` or `cancelled`. `clipboard_test` plays the compositor on a
 socket pair; `selection_test` proves them against wl-copy/wl-paste and
-`dnd_test` against GTK 3 on a KWin nested in Xvfb, XTest's pointer and keys.
+`dnd_test` against GTK 3 on a KWin, its fake input's pointer and keys.
 The pointer's shape
 is `wp_cursor_shape_manager_v1`'s where the compositor has it; without it
 (Weston), or with `CAUSTIC_WAYLAND_CURSOR_SHAPE=0` keeping it unbound, the
@@ -240,9 +240,19 @@ The toolkit regression checks that dialogs fit their native buffer and stay
 below their client-side header. The headless Weston has no keyboard/pointer
 seat; installed IME interaction is the separate KWin and Fcitx5 gate.
 
+KWin runs on its virtual backend. KWin 6.8 nests only in an X server with
+DRI3 1.2, which neither Xvfb nor Xephyr is, so the tests no longer read an X
+screen nor press through XTest there: `kwin_screen.cst` reads what KWin shows
+through its own `org.kde.KWin.ScreenShot2.CaptureWorkspace` — asked from a
+child process, as KWin leaves the asking program's windows out — and
+`kwin_input.cst` makes up the pointer, buttons, wheel (a continuous device's
+to KWin), keys and fingers through `org_kde_kwin_fake_input`, which
+`run_kwin.sh` lets any client use (`KWIN_WAYLAND_NO_PERMISSION_CHECKS`); its
+animations are off, so nothing is read halfway through a fade.
+
 KWin is the second compositor (`tools/run_kwin.sh`: its own runtime,
-configuration and bare session bus; `KWIN_BACKEND=x11` nests it in Xvfb,
-`KWIN_SCALE=1.5` sets its output's scale with kscreen-doctor), the one that
+configuration and bare session bus; `KWIN_SCALE=1.5` sets its output's scale
+with kscreen-doctor), the one that
 has what Weston does not: server-side decorations, fractional scale, tiling
 and a script interface to drive it as a user's shortcut would
 (`tools/kwin_script.sh`, `testdata/kwin/*.js`). `kwin_test` asks for the
@@ -306,6 +316,35 @@ visible native surfaces and client-side frames. Installed IME interaction
 through the toolkit remains for the desktop gate. Presentation sends
 explicit surface damage
 before the frame request and commit, including when a buffer is reused.
+
+The optional protocols are bound per window when the compositor has them,
+and each call answers 0 when it does not: xdg-activation-v1 (`activation_token`
+made under the latest input serial with the window's surface and app id,
+`activate_with` a token another program gave, `activate` both; a program
+started with `XDG_ACTIVATION_TOKEN` takes it from its environment —
+`window/linux/launch.cst` — and comes forward with it on its first frame);
+xdg-foreign-v2 (`export_handle`, the window exported once and its handle
+kept); xdg-toplevel-icon-v1 (`set_icon`, the pixels premultiplied into a
+square shm buffer, centred); presentation-time (`presentation_times` and
+`frames_discarded` from the feedback asked with every frame, on the clock
+`presentation_clock` says); single-pixel-buffer (`fill`, one pixel stretched
+by the viewport until the next frame, which sets the viewport again — only
+with fractional scaling's viewport, which every frame sets); xdg-system-bell
+(`bell`); xdg-toplevel-drag (`drag_begin_carrying`: another toplevel of the
+program moves with the pointer during a drag, left where it ends — a tab
+torn off). `protocols_test` proves them against KWin, the screen read back
+and KWin scripts reporting what KWin knows (`report.js`):
+the icon drawn by KWin's decoration, a fill shown and gone, frames timed on
+`CLOCK_MONOTONIC`, a token of one window bringing another forward, a
+made-up token refused, this test started again with a token coming forward,
+a GTK 4 window (`window/tools/gtk_transient_peer.py`) made the child of the
+exported handle, the carried window where the drag left it. Its `bell` mode
+rings KWin's bell on its virtual backend (the nested one has none), its
+`weston` mode sees each absent protocol said unavailable through the device,
+and its `portal` mode has the installed portal with its KDE backend show a
+file chooser on that KWin (`run_portal_kde.sh`, `CAUSTIC_PORTAL_SHOWN=1`),
+asked over the device window's parent handle: KWin reports it the window's
+child, gone once the request is closed.
 
 Regenerate the protocol inventory from XML with
 `sh window/wayland/tools/check_protocols.sh`. It links wayland-scanner's

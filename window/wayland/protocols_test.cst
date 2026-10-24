@@ -1,0 +1,629 @@
+// window/wayland/protocols_test.cst — the optional protocols a window uses,
+// each through its life against the compositor and, where there is one,
+// another program:
+//   kwin     KWin on its virtual backend (KWIN_FOCUS_STEALING=2), its fake
+//            input's pointer (kwin_input.cst), the screen read back through
+//            its screenshots (kwin_screen.cst), KWin scripts reporting
+//            what KWin knows (QT_LOGGING_RULES=js=true into
+//            CAUSTIC_KWIN_LOG): the toplevel icon, drawn by KWin's
+//            decoration; presentation times, every frame said shown or
+//            discarded once; a window filled with one pixel; activation — a
+//            token of one window bringing another forward, a made-up one
+//            refused, this program started again without a token kept
+//            behind and with one coming forward, taking it from its
+//            environment with its first frame; xdg-foreign — a GTK 4 window
+//            made the child of this one by its exported handle; a toplevel
+//            carried by a drag, let go of when it ends, carried again after a
+//            drag carrying nothing; the bell rung.
+//   bell     KWin with its own virtual output, which has the bell, a window
+//            of the portable device: the bell rung and the connection still
+//            whole — a token made after it and used; an icon given, the
+//            window filled with one colour.
+//   weston   Weston, which has none of activation, xdg-foreign, the icon,
+//            the bell or toplevel drags: through the device, each said
+//            unavailable; presentation times there.
+//   portal   KWin with its own virtual output and, on a session bus of its
+//            own, the installed portal with its KDE backend showing its
+//            dialogs there (window/linux/tools/run_portal_kde.sh,
+//            CAUSTIC_PORTAL_SHOWN=1): a file chooser asked over the device
+//            window's parent handle comes as its child, as KWin reports,
+//            and goes when the request is closed.
+//   child    started by kwin with XDG_ACTIVATION_TOKEN: exit 0 when its
+//            window came forward and the token left its environment.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "../../sys/linux.cst" as sys;
+use "kwin_screen.cst" as kwin_screen;
+use "kwin_input.cst" as kwin_input;
+use "backend.cst" as wayland;
+use "../event.cst" as event;
+use "../transfer.cst" as transfer;
+use "../../gpu/software/target.cst" as tgt;
+use "../../dbus/dbus.cst" as dbus;
+use "../device.cst" as device;
+use "../linux/portal.cst" as portal;
+use "../linux/filechooser.cst" as files;
+
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+let is wayland.Window as a with mut;
+let is wayland.Window as b with mut;
+let is kwin_screen.Screen as scr with mut;
+let is i32 as done_action with mut = 0 - 1;   // the last DRAG_DONE's action
+
+let is u32 as GREY with imut = 4286611584;    // 0xFF808080
+
+fn paint(w as *wayland.Window, colour as u32) as void {
+    let is tgt.Target as t = wayland.acquire(w);
+    if (cast(i64, t.color) == 0) { return; }
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) { *cast(*u32, cast(i64, t.color) + i * 4) = colour; i = i + 1; }
+    wayland.submit(w);
+}
+
+fn pump_one(w as *wayland.Window) as void {
+    if (w.opened == 0) { return; }
+    wayland.pump(w);
+    let is event.Event as e;
+    while (wayland.poll_event(w, &e) == 1) {
+        if (e.kind == event.DRAG_DONE) { done_action = e.action; }
+    }
+}
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        pump_one(&a);
+        pump_one(&b);
+        if (d_open == 1) { d_focus = dpump(&d, d_focus); }
+        if (d2_open == 1) { d2_focus = dpump(&d2, d2_focus); }
+        time.sleep_ms(4);
+    }
+}
+
+// A device window pumped: whether it has the keyboard, from its focus
+// events (focus as it was before them).
+fn dpump(w as *device.Window, focus as i32) as i32 {
+    let is i32 as now with mut = focus;
+    device.pump(w);
+    let is event.Event as e;
+    while (device.poll_event(w, &e) == 1) {
+        if (e.kind == event.FOCUS_IN) { now = 1; }
+        if (e.kind == event.FOCUS_OUT) { now = 0; }
+    }
+    return now;
+}
+
+// The screen as KWin shows it now (kwin_screen.cst), at x, y.
+fn pixel(x as i64, y as i64) as i64 {
+    if (kwin_screen.read(&scr) == 0) { return 0 - 1; }
+    return kwin_screen.pixel(&scr, x, y);
+}
+
+// Whether the pixel at x, y is near colour (0xRRGGBB) within two seconds.
+fn shows(x as i64, y as i64, colour as i64) as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        let is i64 as v = pixel(x, y);
+        let is i64 as dr = ((v >> 16) & 255) - ((colour >> 16) & 255);
+        let is i64 as dg = ((v >> 8) & 255) - ((colour >> 8) & 255);
+        let is i64 as db = (v & 255) - (colour & 255);
+        if (dr * dr + dg * dg + db * db < 900) { return 1; }
+        pump(20);
+    }
+    return 0;
+}
+
+// Whether the pixel at x, y is exactly colour (0xRRGGBB) within two seconds:
+// for colours KWin shows as they were given.
+fn exactly(x as i64, y as i64, colour as i64) as i32 {
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until) {
+        if (pixel(x, y) == colour) { return 1; }
+        pump(20);
+    }
+    return 0;
+}
+
+// Whether the pixel at x, y is one of the icons' colours, even blended
+// with the title bar where KWin scales an edge: red, green or blue well
+// above the other two.
+fn tinted(x as i64, y as i64) as i32 {
+    let is i64 as v = pixel(x, y);
+    let is i64 as r = (v >> 16) & 255;
+    let is i64 as g = (v >> 8) & 255;
+    let is i64 as b = v & 255;
+    return cast(i32, r > g + 100 || r > b + 100 || g > r + 100 || g > b + 100 || b > r + 100 || b > g + 100);
+}
+
+fn move_to(x as i64, y as i64) as void { kwin_input.move(cast(f64, x), cast(f64, y)); }
+
+fn button(down as i32) as void { kwin_input.button(kwin_input.BTN_LEFT, down); }
+
+fn click(x as i64, y as i64) as void {
+    move_to(x, y);
+    pump(100);
+    button(1);
+    pump(50);
+    button(0);
+    pump(150);
+}
+
+// sh -c cmd, $0 and $1 a0 and a1 (null: none): its process.
+fn spawn_sh(cmd as *u8, a0 as *u8, a1 as *u8) as i64 {
+    let is [6]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd);
+    argv[3] = cast(i64, a0); argv[4] = cast(i64, a1); argv[5] = 0;
+    if (cast(i64, a0) == 0) { argv[3] = 0; }
+    return process.spawnp("sh", cast(*u8, &argv[0]));
+}
+
+// The same, the windows pumped meanwhile: its status.
+fn run_sh(cmd as *u8, a0 as *u8, a1 as *u8) as i32 {
+    let is i64 as pid = spawn_sh(cmd, a0, a1);
+    if (pid <= 0) { return 0 - 1; }
+    let is i32 as status with mut = 0;
+    let is i64 as until = time.now_ms() + 20000;
+    while (time.now_ms() < until) {
+        pump(5);
+        if (linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) { return process.exit_code_of(status); }
+    }
+    return 0 - 1;
+}
+
+fn run(cmd as *u8) as i32 { return run_sh(cmd, cast(*u8, 0), cast(*u8, 0)); }
+
+// KWin's report of each window, from what its script printed into its log.
+let is [65536]u8 as report with mut;
+let is i64 as report_len with mut = 0;
+
+fn kwin_report() as i32 {
+    if (run("sh window/wayland/tools/kwin_script.sh window/wayland/testdata/kwin/report.js") != 0) { return 0; }
+    pump(200);
+    let is *u8 as log = env.getenv("CAUSTIC_KWIN_LOG");
+    if (cast(i64, log) == 0) { return 0; }
+    let is i64 as fd = linux.open(log, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    report_len = 0;
+    while (report_len < 65535) {
+        let is i64 as n = linux.read(fd, &report[report_len], 65535 - report_len);
+        if (n <= 0) { break; }
+        report_len = report_len + n;
+    }
+    linux.close(fd);
+    report[report_len] = 0;
+    return 1;
+}
+
+// Whether KWin's last report has line.
+fn reported(line as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (line[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= report_len) {
+        if (mem.memcmp(&report[i], line, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn focused(w as *wayland.Window, ms as i64) as i32 {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until && w.keyboard_focus == 0) { pump(10); }
+    return w.keyboard_focus;
+}
+
+// Whether KWin reported a window's frame at x, y, a pixel either way.
+fn near(x as i64, y as i64) as i32 {
+    let is i64 as dx with mut = 0 - 1;
+    while (dx <= 1) {
+        let is i64 as dy with mut = 0 - 1;
+        while (dy <= 1) {
+            let is [32]u8 as s;
+            let is i64 as n with mut = 0;
+            s[n] = 124; n = n + 1;
+            n = n + decimal(&s[n], x + dx);
+            s[n] = 44; n = n + 1;
+            n = n + decimal(&s[n], y + dy);
+            s[n] = 0;
+            if (reported(&s[0]) == 1) { return 1; }
+            dy = dy + 1;
+        }
+        dx = dx + 1;
+    }
+    return 0;
+}
+
+// v (not negative) in decimal at out: its digits' count.
+fn decimal(out as *u8, v as i64) as i64 {
+    let is [20]u8 as r;
+    let is i64 as rn with mut = 0;
+    let is i64 as x with mut = v;
+    while (x > 0 || rn == 0) { r[rn] = cast(u8, 48 + x % 10); x = x / 10; rn = rn + 1; }
+    let is i64 as k with mut = 0;
+    while (rn > 0) { rn = rn - 1; out[k] = r[rn]; k = k + 1; }
+    return k;
+}
+
+// The held button's pointer moved from 150, 140 by dx, dy in twenty steps
+// and let go; the drag's end waited for.
+fn drag_to(dx as i64, dy as i64) as void {
+    let is i64 as s with mut = 1;
+    while (s <= 20) {
+        move_to(150 + s * dx / 20, 140 + s * dy / 20);
+        pump(30);
+        s = s + 1;
+    }
+    button(0);
+    let is i64 as until = time.now_ms() + 3000;
+    while (done_action < 0 && time.now_ms() < until) { pump(20); }
+}
+
+fn kwin() as void {
+    check("a window", wayland.open(&a, "proto-a", 300, 200) == 1);
+    paint(&a, GREY);
+    pump(300);
+    paint(&a, GREY);
+    check("placed", run("sh window/wayland/tools/kwin_script.sh window/wayland/testdata/kwin/place-proto.js") == 0);
+    pump(300);
+    paint(&a, GREY);
+    pump(200);
+    // KWin's decoration: its title bar 40 high, the window's icon drawn 28
+    // pixels square from 6, 6; the window's inside below.
+    check("the inside grey", shows(150, 140, 8421504) == 1);
+
+    // --- The toplevel icon, drawn by KWin's decoration ---
+    check("no icon of its own yet: not red where the icon goes", shows(12, 12, 16711680) == 0);
+    // Quarters: red, green above; blue, yellow below.
+    let is [1024]u32 as quarters;
+    let is i64 as i with mut = 0;
+    while (i < 1024) {
+        let is i64 as x = i % 32;
+        let is i64 as y = i / 32;
+        let is u32 as c with mut = cast(u32, 4294901760);
+        if (x >= 16 && y < 16) { c = cast(u32, 4278255360); }
+        if (x < 16 && y >= 16) { c = cast(u32, 4278190335); }
+        if (x >= 16 && y >= 16) { c = cast(u32, 4294967040); }
+        quarters[i] = c;
+        i = i + 1;
+    }
+    check("an icon given", wayland.set_icon(&a, cast(*u8, &quarters[0]), 32, 32) == 1);
+    check("drawn by KWin's decoration, each quarter where it is, as it was given", exactly(12, 12, 16711680) == 1 &&
+          exactly(27, 12, 65280) == 1 && exactly(12, 27, 255) == 1 && exactly(27, 27, 16776960) == 1);
+    // Half as wide as high, red then green: centred in a square, clear
+    // beside it.
+    let is [512]u32 as tall;
+    i = 0;
+    while (i < 512) {
+        tall[i] = cast(u32, 4294901760);
+        if (i % 16 >= 8) { tall[i] = cast(u32, 4278255360); }
+        i = i + 1;
+    }
+    check("one taller than wide", wayland.set_icon(&a, cast(*u8, &tall[0]), 16, 32) == 1);
+    check("centred, its halves in order, nothing beside it", shows(16, 20, 16711680) == 1 && shows(24, 20, 65280) == 1 &&
+          tinted(8, 20) == 0 && tinted(27, 20) == 0 && tinted(31, 20) == 0);
+    // Twice as wide as high, red over green, in a buffer with blue rows
+    // after the ones given: those never read.
+    let is [576]u32 as wide;
+    i = 0;
+    while (i < 576) {
+        wide[i] = cast(u32, 4294901760);
+        if (i >= 256) { wide[i] = cast(u32, 4278255360); }
+        if (i >= 512) { wide[i] = cast(u32, 4278190335); }
+        i = i + 1;
+    }
+    check("one wider than high", wayland.set_icon(&a, cast(*u8, &wide[0]), 32, 16) == 1);
+    check("centred, its halves in order, nothing past its rows", exactly(20, 16, 16711680) == 1 &&
+          exactly(20, 23, 65280) == 1 && tinted(20, 10) == 0 && tinted(20, 27) == 0);
+
+    // --- Presentation times ---
+    let is i64 as was_ns with mut = 0;
+    let is i64 as refresh with mut = 0;
+    let is i64 as before = wayland.presentation_times(&a, &was_ns, &refresh);
+    let is i64 as dropped = wayland.frames_discarded(&a);
+    let is i32 as k with mut = 0;
+    while (k < 10) { paint(&a, GREY); pump(40); k = k + 1; }
+    let is i64 as now_ns with mut = 0;
+    // Each frame said shown or discarded, once: waited for the last.
+    let is i64 as said_until = time.now_ms() + 2000;
+    while (wayland.presentation_times(&a, &now_ns, &refresh) + wayland.frames_discarded(&a) < before + dropped + 10 &&
+           time.now_ms() < said_until) { pump(20); }
+    let is i64 as shown = wayland.presentation_times(&a, &now_ns, &refresh);
+    check("every frame said shown or discarded, once", before >= 0 && shown + wayland.frames_discarded(&a) == before + dropped + 10);
+    check("most shown", shown >= before + 8);
+    check("the last later than before", now_ns > was_ns);
+    check("the output's refresh said", refresh > 5000000 && refresh < 50000000);
+    check("on CLOCK_MONOTONIC, a moment ago", wayland.presentation_clock() == 1 &&
+          time.now_ms() - now_ns / 1000000 >= 0 && time.now_ms() - now_ns / 1000000 < 2000);
+
+    // --- A window filled with one pixel ---
+    check("filled green", wayland.fill(&a, cast(u32, 4278255360)) == 1);
+    check("green on the screen, as given", exactly(150, 140, 65280) == 1);
+    // Half seen through: premultiplied, over what is behind it (black).
+    check("filled half-transparent red", wayland.fill(&a, cast(u32, 2164195328)) == 1);
+    check("half red on the screen", exactly(150, 140, 8388608) == 1);
+    paint(&a, GREY);
+    check("its next frame grey again, the whole of it", shows(150, 140, 8421504) == 1 && shows(290, 230, 8421504) == 1);
+
+    // --- Activation ---
+    check("a second window", wayland.open(&b, "proto-b", 300, 200) == 1);
+    paint(&b, GREY);
+    pump(300);
+    run("sh window/wayland/tools/kwin_script.sh window/wayland/testdata/kwin/place-proto.js");
+    pump(300);
+    click(150, 140);
+    check("the first clicked: it has the keyboard", focused(&a, 2000) == 1);
+    let is [256]u8 as token;
+    let is i64 as tn with mut = wayland.activation_token(&a, &token[0], 256);
+    check("a token made under its click", tn > 0);
+    check("the second brought forward with it", wayland.activate_with(&b, &token[0], tn) == 1 &&
+          focused(&b, 2000) == 1 && a.keyboard_focus == 0);
+    check("a made-up token: refused", wayland.activate_with(&a, "not-a-token", 11) == 1);
+    pump(500);
+    check("the first still without the keyboard", a.keyboard_focus == 0 && b.keyboard_focus == 1);
+    // A newer token is the one KWin honours: these before the one used below.
+    let is [256]u8 as fit;
+    check("one where it fits with its zero; none where it would not",
+          wayland.activation_token(&b, &fit[0], tn + 1) == tn && wayland.activation_token(&b, &fit[0], tn) == 0);
+    // A program started from here — this one again — without a token: kept
+    // behind (KWIN_FOCUS_STEALING=2); with a token of the second's: forward.
+    check("a program started without a token: not brought forward",
+          run_sh("exec env -u XDG_ACTIVATION_TOKEN \"$0\" child", env.argv(0), cast(*u8, 0)) == 3);
+    tn = wayland.activation_token(&b, &token[0], 256);
+    check("one started with a token of the second's comes forward, the token taken", tn > 0 &&
+          run_sh("XDG_ACTIVATION_TOKEN=\"$1\" exec \"$0\" child", env.argv(0), &token[0]) == 0);
+
+    // --- xdg-foreign: a GTK 4 window made this one's child ---
+    let is [160]u8 as handle;
+    let is i64 as hn = wayland.export_handle(&a, &handle[0], 160);
+    check("exported", hn > 0);
+    let is i64 as gtk = spawn_sh("exec env GDK_BACKEND=wayland NO_AT_BRIDGE=1 python3 window/tools/gtk_transient_peer.py \"$0\" proto-peer >/dev/null",
+                                 &handle[0], cast(*u8, 0));
+    pump(2500);
+    check("KWin made the GTK window the child of this one", kwin_report() == 1 && reported("REPORT proto-peer|proto-a|") == 1);
+    sys.kill(gtk, 15);
+    let is i32 as st with mut = 0;
+    linux.wait4(gtk, &st, 0, cast(*u8, 0));
+
+    // --- A toplevel carried by a drag ---
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, "torn off", 8);
+    move_to(150, 140);
+    pump(100);
+    button(1);
+    pump(150);
+    let is wayland.Window as never with mut;
+    wayland._zero(&never);
+    check("a window not open: not carried, no drag begun", wayland.drag_begin_carrying(&a, &o, transfer.MOVE, &never, 0, 0) == 0 &&
+          a.drag_source == 0);
+    done_action = 0 - 1;
+    check("a drag begun, the second window carried", wayland.drag_begin_carrying(&a, &o, transfer.MOVE, &b, 20, 20) == 1);
+    drag_to(400, 300);
+    check("the drag over", done_action >= 0);
+    // Let go at 550, 440: the second window there less the offset — KWin
+    // keeps it from the window's frame, its server-side title bar included.
+    check("KWin moved the carried window with the pointer", kwin_report() == 1 && reported("REPORT proto-b||") == 1 &&
+          near(530, 420) == 1);
+    // A drag carrying nothing, then the same window carried again: the first
+    // carrying let go of when its drag ended.
+    move_to(150, 140);
+    pump(100);
+    button(1);
+    pump(150);
+    done_action = 0 - 1;
+    check("a drag carrying nothing", wayland.drag_begin(&a, &o, transfer.MOVE) == 1);
+    drag_to(100, 100);
+    check("over", done_action >= 0);
+    move_to(150, 140);
+    pump(100);
+    button(1);
+    pump(150);
+    done_action = 0 - 1;
+    check("the second window carried again", wayland.drag_begin_carrying(&a, &o, transfer.MOVE, &b, 20, 20) == 1);
+    drag_to(200, 400);
+    check("over too", done_action >= 0);
+    check("left where this drag ended", kwin_report() == 1 && near(330, 520) == 1);
+    check("the connection whole after them", a.opened == 1 && wayland.activation_token(&a, &fit[0], 256) > 0);
+    transfer.offer_free(&o);
+
+    // --- The bell: the virtual backend has one (the bell mode hears it) ---
+    check("the bell rung, the connection whole after it", wayland.bell(&a) == 1 && a.opened == 1 &&
+          wayland.activation_token(&a, &fit[0], 256) > 0);
+    wayland.close(&b);
+    wayland.close(&a);
+}
+
+fn child() as i32 {
+    if (wayland.open(&a, "proto-child", 200, 120) == 0) { return 2; }
+    paint(&a, GREY);
+    // Taken with the first frame, before anything else could be started.
+    let is i32 as taken = cast(i32, cast(i64, env.getenv("XDG_ACTIVATION_TOKEN")) == 0);
+    pump(200);
+    paint(&a, GREY);
+    let is i32 as got = focused(&a, 3000);
+    wayland.close(&a);
+    if (got == 1 && taken == 1) { return 0; }
+    if (got == 0) { return 3; }
+    io.printf("  child: token taken %d\n", taken);
+    return 1;
+}
+
+// The modes below go through the portable device, as a program does: its
+// window on Wayland, pumped with the others.
+let is device.Window as d with mut;
+let is i32 as d_open with mut = 0;
+let is i32 as d_focus with mut = 0;
+let is device.Window as d2 with mut;
+let is i32 as d2_open with mut = 0;
+let is i32 as d2_focus with mut = 0;
+
+fn dopen(title as *u8) as i32 {
+    d = device.open(title, 300, 200);
+    d_open = device.is_open(&d);
+    if (d_open == 0 || d.backend != device.WAYLAND) { return 0; }
+    let is i32 as k with mut = 0;
+    while (k < 3) { dpaint(&d); pump(100); k = k + 1; }
+    return 1;
+}
+
+fn dpaint(w as *device.Window) as void {
+    let is tgt.Target as t = device.acquire(w);
+    if (cast(i64, t.color) == 0) { return; }
+    let is i64 as n = t.width * t.height;
+    let is i64 as i with mut = 0;
+    while (i < n) { *cast(*u32, cast(i64, t.color) + i * 4) = GREY; i = i + 1; }
+    device.submit(w);
+}
+
+fn dclose() as void {
+    device.close(&d);
+    d_open = 0;
+}
+
+fn has_keyboard(focus as *i32, ms as i64) as i32 {
+    let is i64 as until = time.now_ms() + ms;
+    while (*focus == 0 && time.now_ms() < until) { pump(10); }
+    return *focus;
+}
+
+fn bell_mode() as void {
+    check("a window on Wayland", dopen("proto-bell") == 1);
+    check("the bell rung", device.bell(&d) == 1);
+    pump(200);
+    let is [256]u8 as token;
+    let is i64 as tn = device.activation_token(&d, &token[0], 256);
+    check("the connection still whole: a token made after it", tn > 0 && device.is_open(&d) == 1);
+    check("and taken back to come forward with", device.activate_with(&d, &token[0], tn) == 1);
+    // A second window takes the keyboard; the first, asked to come forward,
+    // has it back.
+    d2 = device.open("proto-bell-2", 200, 120);
+    d2_open = device.is_open(&d2);
+    let is i32 as k with mut = 0;
+    while (k < 3) { dpaint(&d2); pump(100); k = k + 1; }
+    check("a second window: it has the keyboard", has_keyboard(&d2_focus, 2000) == 1 && d_focus == 0);
+    device.activate(&d);
+    check("the first brought forward: the keyboard back", has_keyboard(&d_focus, 2000) == 1 && d2_focus == 0);
+    device.close(&d2);
+    d2_open = 0;
+    let is *u8 as px = mem.core.mmap_anon(1025 * 4 * 2);
+    check("an icon given", device.set_icon(&d, px, 8, 8) == 1);
+    check("none of no width or height", device.set_icon(&d, px, 0, 8) == 0 && device.set_icon(&d, px, 8, 0) == 0);
+    check("1024 wide or high: given; 1025: not", device.set_icon(&d, px, 1024, 1) == 1 && device.set_icon(&d, px, 1, 1024) == 1 &&
+          device.set_icon(&d, px, 1025, 1) == 0 && device.set_icon(&d, px, 1, 1025) == 0);
+    mem.core.munmap(px, 1025 * 4 * 2);
+    check("filled with one colour", device.fill(&d, cast(u32, 4278255360)) == 1);
+    check("and another, the first's buffer let go", device.fill(&d, cast(u32, 4294901760)) == 1);
+    pump(200);
+    let is [256]u8 as after;
+    check("the connection still whole after them", device.activation_token(&d, &after[0], 256) > 0);
+    dclose();
+}
+
+fn weston() as void {
+    check("a window on Wayland", dopen("proto-weston") == 1);
+    let is [256]u8 as out;
+    check("no xdg-activation: no token", device.activation_token(&d, &out[0], 256) == 0);
+    check("nor activation with one", device.activate_with(&d, "abc", 3) == 0);
+    check("no xdg-foreign: no parent handle", device.parent_handle(&d, &out[0], 256) == 0 && out[0] == 0);
+    let is [16]u32 as px;
+    check("no toplevel icon: refused", device.set_icon(&d, cast(*u8, &px[0]), 4, 4) == 0);
+    check("no bell: said unavailable", device.bell(&d) == 0);
+    check("a single-pixel buffer but no fractional scaling's viewport: no fill", device.fill(&d, cast(u32, 4278255360)) == 0);
+    check("no activation: the window not asked forward", wayland.activate(d.wayland_win) == 0);
+    let is i32 as k with mut = 0;
+    while (k < 6) { dpaint(&d); pump(40); k = k + 1; }
+    let is i64 as ns with mut = 0;
+    let is i64 as refresh with mut = 0;
+    // The feedback comes after each frame is shown: waited for a while.
+    let is i64 as until = time.now_ms() + 2000;
+    while (device.presentation_times(&d, &ns, &refresh) < 4 && time.now_ms() < until) { pump(20); }
+    check("presentation times said", device.presentation_times(&d, &ns, &refresh) >= 4 && ns > 0);
+    dclose();
+}
+
+let is files.Request as q with mut;
+
+fn portal_mode() as void {
+    check("a window on Wayland", dopen("proto-a") == 1);
+    let is [200]u8 as parent;
+    let is i64 as pn = device.parent_handle(&d, &parent[0], 200);
+    check("its parent handle: wayland: and what it was exported as", pn > 8 && mem.memcmp(&parent[0], "wayland:", 8) == 0);
+    let is [200]u8 as small;
+    small[pn] = 120;
+    check("none where its zero would not fit, nothing written past",
+          device.parent_handle(&d, &small[0], pn) == 0 && small[0] == 0 && small[pn] == 120);
+    check("given where it fits with its zero", device.parent_handle(&d, &small[0], pn + 1) == pn &&
+          mem.memcmp(&small[0], &parent[0], pn + 1) == 0);
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    check("the portal's bus", dbus.conn.is_open(&c) == 1);
+    let is files.Options as o with mut = files.options();
+    check("a file chooser asked over the window",
+          files.open_file(&c, portal.DESKTOP, &parent[0], pn, "Linked dialog", 13, &o, &q) == 1 && q.state == files.WAITING);
+    // The dialog shown, as KWin knows it: its caption the title given.
+    let is i32 as linked with mut = 0;
+    let is i64 as until with mut = time.now_ms() + 10000;
+    while (linked == 0 && time.now_ms() < until) {
+        dbus.conn.dispatch(&c, 50);
+        pump(200);
+        if (kwin_report() == 1 && reported("REPORT Linked dialog|proto-a|") == 1) { linked = 1; }
+    }
+    check("KWin made the portal's dialog the child of this window", linked == 1);
+    if (linked == 0) { io.printf("  KWin's report:\n%s\n", &report[0]); }
+    files.close(&q);
+    let is i32 as gone with mut = 0;
+    until = time.now_ms() + 5000;
+    while (gone == 0 && time.now_ms() < until) {
+        dbus.conn.dispatch(&c, 50);
+        pump(200);
+        // The log grows: only what was said after the last report counts.
+        let is i64 as before = report_len;
+        if (kwin_report() == 1) {
+            let is i64 as i with mut = before;
+            let is i32 as seen with mut = 0;
+            let is i32 as dialog with mut = 0;
+            let is *u8 as ours = "REPORT proto-a|";
+            let is *u8 as theirs = "REPORT Linked dialog|";
+            while (i < report_len) {
+                if (mem.memcmp(&report[i], ours, 15) == 0) { seen = 1; }
+                if (mem.memcmp(&report[i], theirs, 21) == 0) { dialog = 1; }
+                i = i + 1;
+            }
+            if (seen == 1 && dialog == 0) { gone = 1; }
+        }
+    }
+    check("closed: the request cancelled, the dialog gone", q.state == files.CANCELLED && gone == 1);
+    dbus.conn.close(&c);
+    dclose();
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as mode with mut = "kwin";
+    if (env.argc() > 1) { mode = env.argv(1); }
+    if (mode[0] == 99) { return child(); }
+    if (mode[0] == 98) { bell_mode(); }
+    else if (mode[0] == 119) { weston(); }
+    else if (mode[0] == 112) { portal_mode(); }
+    else {
+        scr = kwin_screen.empty();
+        if (kwin_input.open() == 0) { io.printf("FAIL: no fake input of KWin's to move the pointer\n"); return 1; }
+        kwin();
+        kwin_input.close();
+        kwin_screen.free(&scr);
+    }
+    if (fails == 0) { io.printf("wayland protocols %s: all checks passed\n", mode); return 0; }
+    io.printf("wayland protocols %s: %d failures\n", mode, fails);
+    return 1;
+}

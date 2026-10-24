@@ -10,13 +10,18 @@
 # Everything is private: a runtime directory, a configuration and cache of
 # its own (KWin writes kwinoutputconfig.json and more there), and a bare
 # session bus (dbus/tools/run_dbus_bare.sh) that starts none of the
-# desktop's services. KWIN_BACKEND=virtual (the default) draws nowhere;
-# KWIN_BACKEND=x11 nests it in the X server DISPLAY names, so the screen can
-# be read back. KWIN_SCALE=1.5 sets its output's scale (kscreen-doctor, in
+# desktop's services. KWIN_BACKEND=virtual (the default) draws nowhere a
+# client reads but KWin's screenshots do (kwin_screen.cst); KWIN_BACKEND=x11
+# nests it in the X server DISPLAY names — only one with DRI3 1.2 since
+# KWin 6.8, which Xvfb is not. KWIN_SCALE=1.5 sets its output's scale (kscreen-doctor, in
 # process) before the program starts. KWIN_XWAYLAND=1 starts Xwayland too,
 # the program's DISPLAY. KWIN_INPUT_METHOD=<program> is the
 # input method KWin starts for text fields (input-method-v1):
 # window/wayland/tools/kwin_fcitx.sh, an Fcitx5 of its own.
+# KWIN_FOCUS_STEALING=0..4 is its focus stealing prevention (kwinrc
+# [Windows] FocusStealingPreventionLevel; KWin's own default is 1, low):
+# from 2 a new window without an activation token does not take the
+# keyboard from another.
 set -eu
 [ $# -gt 0 ] || { echo "usage: run_kwin.sh <program> [args...]" >&2; exit 2; }
 if [ "${1:-}" != "--inside" ]; then
@@ -38,6 +43,15 @@ chmod 700 "$run"
 mkdir -m 700 "$run/runtime" "$run/config" "$run/cache" "$run/data"
 export XDG_RUNTIME_DIR="$run/runtime" XDG_CONFIG_HOME="$run/config" XDG_CACHE_HOME="$run/cache" XDG_DATA_HOME="$run/data"
 export XDG_SESSION_TYPE=wayland
+# No animations: a window read back while it fades in or out shows neither
+# its colours nor its place (kdeglobals [KDE] AnimationDurationFactor).
+printf '[KDE]\nAnimationDurationFactor=0\n' > "$run/config/kdeglobals"
+if [ -n "${KWIN_FOCUS_STEALING:-}" ]; then
+    printf '[Windows]\nFocusStealingPreventionLevel=%s\n' "$KWIN_FOCUS_STEALING" > "$run/config/kwinrc"
+fi
+# What the tests make up for KWin's seat (kwin_input.cst, KWin's fake input)
+# is taken from a client KWin knows nothing of.
+export KWIN_WAYLAND_NO_PERMISSION_CHECKS=1
 unset WAYLAND_DISPLAY
 kwin_pid=""
 cleanup() {
@@ -88,6 +102,9 @@ fi
 # Clients must speak to this compositor, not an X server they might inherit,
 # unless it is nested there and they read the screen back.
 if [ "$backend" = virtual ]; then unset DISPLAY; fi
+# A launch token of the user's session is for the user's desktop, not this
+# compositor.
+unset DESKTOP_STARTUP_ID XDG_ACTIVATION_TOKEN
 if [ -n "$xw" ]; then
     waited=0
     while [ ! -s "$run/display" ] && [ "$waited" -lt 200 ]; do sleep 0.05; waited=$((waited + 1)); done
@@ -95,8 +112,9 @@ if [ -n "$xw" ]; then
     DISPLAY=$(cat "$run/display")
     export DISPLAY
 fi
-# The log, for a program that wants to read what a KWin script printed.
-export CAUSTIC_KWIN_LOG="$run/kwin.log"
+# The log, for a program that wants to read what a KWin script printed; the
+# bus KWin is on, for kwin_script.sh under a bus of the program's own.
+export CAUSTIC_KWIN_LOG="$run/kwin.log" CAUSTIC_KWIN_BUS="$DBUS_SESSION_BUS_ADDRESS"
 status=0
 run_child "$@" || status=$?
 if [ "$status" -ne 0 ]; then tail -40 "$run/kwin.log" >&2; fi

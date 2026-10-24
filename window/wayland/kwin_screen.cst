@@ -1,0 +1,229 @@
+// window/wayland/kwin_screen.cst — what a KWin of the tests' own shows,
+// read through its own screenshot interface.
+//
+// The KWin tests read the screen back to see what reached it: an icon drawn
+// by the decoration, a fill, a cursor. Nested in an X server they read that
+// server's root window; KWin 6.8 nests only in one with DRI3 1.2, which Xvfb
+// and Xephyr are not. Its virtual backend draws nowhere a client could read,
+// but KWin itself can: org.kde.KWin.ScreenShot2.CaptureWorkspace writes the
+// whole workspace, raw, into a pipe it is handed, and answers its size,
+// stride and QImage format. Test support, not library: on the session bus
+// run_kwin.sh gives the program, where KWin is.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../dbus/dbus.cst" as dbus;
+
+// QImage's formats KWin answers with: 32 bits a pixel, blue first in memory
+// (ARGB32 and its kin on a little-endian machine), or red first (RGBX8888,
+// RGBA8888 and premultiplied).
+let is i64 as _RGB32     with imut = 4;
+let is i64 as _ARGB32    with imut = 5;
+let is i64 as _ARGB32_PM with imut = 6;
+let is i64 as _RGBX8888  with imut = 16;
+let is i64 as _RGBA8888  with imut = 17;
+let is i64 as _RGBA8888_PM with imut = 18;
+
+struct Screen {
+    px     as *u8;    // stride * h bytes, mapped; null before a read
+    cap    as i64;    // bytes mapped
+    w      as i64;
+    h      as i64;
+    stride as i64;
+    format as i64;
+}
+
+fn empty() as Screen {
+    let is Screen as s;
+    s.px = cast(*u8, 0);
+    s.cap = 0;
+    s.w = 0;
+    s.h = 0;
+    s.stride = 0;
+    s.format = 0;
+    return s;
+}
+
+fn free(s as *Screen) as void {
+    if (cast(i64, s.px) != 0) { mem.core.munmap(s.px, s.cap); }
+    s.px = cast(*u8, 0);
+    s.cap = 0;
+}
+
+fn _same(a as *u8, n as i64, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (b[i] == 0 || a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return cast(i32, b[n] == 0);
+}
+
+// What a capture tells before its pixels, written by the child that asked.
+struct Head {
+    w      as i64;
+    h      as i64;
+    stride as i64;
+    format as i64;
+}
+
+fn _read_all(fd as i64, p as *u8, need as i64) as i64 {
+    let is i64 as n with mut = 0;
+    while (n < need) {
+        let is i64 as k = linux.read(fd, cast(*u8, cast(i64, p) + n), need - n);
+        if (k <= 0) { return n; }
+        n = n + k;
+    }
+    return n;
+}
+
+fn _write_all(fd as i64, p as *u8, n as i64) as i32 {
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as k = linux.write(fd, cast(*u8, cast(i64, p) + done), n - done);
+        if (k <= 0) { return 0; }
+        done = done + k;
+    }
+    return 1;
+}
+
+// Asked of KWin over a connection of the caller's own: the capture's head,
+// then its pixels, written to out; a head of zeros when there is none.
+fn _capture(out as i64, cursor as i32) as void {
+    let is Head as hd;
+    hd.w = 0;
+    hd.h = 0;
+    hd.stride = 0;
+    hd.format = 0;
+    let is dbus.conn.Limits as dl = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&dl);
+    if (dbus.conn.is_open(&c) == 0 || dbus.conn.can_pass_fds(&c) == 0) {
+        _write_all(out, cast(*u8, &hd), sizeof(Head));
+        return;
+    }
+    let is [2]i32 as ends;
+    if (linux.pipe2(cast(*i32, &ends), linux.O_CLOEXEC) != 0) {
+        _write_all(out, cast(*u8, &hd), sizeof(Head));
+        return;
+    }
+    let is dbus.message.Message as m with mut = dbus.message.method_call("org.kde.KWin", "/org/kde/KWin/ScreenShot2",
+                                                                          "org.kde.KWin.ScreenShot2", "CaptureWorkspace");
+    m.signature = "a{sv}h";
+    let is *dbus.wire.Writer as w = dbus.conn.body(&c);
+    let is i64 as at = dbus.wire.put_array(w, 8);
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string(w, "native-resolution");
+    dbus.wire.put_variant(w, "b");
+    dbus.wire.put_bool(w, 1);
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string(w, "include-cursor");
+    dbus.wire.put_variant(w, "b");
+    dbus.wire.put_bool(w, cursor);
+    dbus.wire.put_array_end(w, at, 8);
+    dbus.wire.put_fd(w, cast(i64, ends[1]));
+    let is dbus.message.Message as rep with mut = dbus.message.empty();
+    let is i32 as said = dbus.conn.call_method(&c, &m, 10000, &rep);
+    // KWin has its own copy of the writing end: ours closed, the reading
+    // ends when KWin is done.
+    linux.close(cast(i64, ends[1]));
+    if (said == dbus.conn.OK && rep.kind == dbus.message.METHOD_RETURN) {
+        let is dbus.wire.Reader as r with mut = dbus.message.body(&rep);
+        let is i64 as end = dbus.wire.get_array(&r, 8);
+        while (r.err == 0 && r.pos < end) {
+            dbus.wire.get_struct(&r);
+            let is i64 as kn with mut = 0;
+            let is *u8 as key = dbus.wire.get_string(&r, &kn);
+            let is i64 as sn with mut = 0;
+            let is *u8 as sig = dbus.wire.get_variant(&r, &sn);
+            if (r.err != 0) { break; }
+            if (sn == 1 && sig[0] == cast(u8, 117)) {
+                let is i64 as v = dbus.wire.get_u32(&r);
+                if (_same(key, kn, "width") == 1) { hd.w = v; }
+                if (_same(key, kn, "height") == 1) { hd.h = v; }
+                if (_same(key, kn, "stride") == 1) { hd.stride = v; }
+                if (_same(key, kn, "format") == 1) { hd.format = v; }
+            } else {
+                dbus.wire.skip(&r, sig, sn);
+            }
+        }
+    }
+    if (hd.w <= 0 || hd.h <= 0 || hd.stride < hd.w * 4) {
+        hd.w = 0;
+        hd.h = 0;
+        _write_all(out, cast(*u8, &hd), sizeof(Head));
+        linux.close(cast(i64, ends[0]));
+        return;
+    }
+    if (_write_all(out, cast(*u8, &hd), sizeof(Head)) == 0) { return; }
+    let is [65536]u8 as buf;
+    while (1 == 1) {
+        let is i64 as k = linux.read(cast(i64, ends[0]), cast(*u8, &buf), 65536);
+        if (k <= 0) { break; }
+        if (_write_all(out, cast(*u8, &buf), k) == 0) { break; }
+    }
+    linux.close(cast(i64, ends[0]));
+    dbus.conn.close(&c);
+}
+
+// The workspace as it is now, into s: 1, or 0 when KWin is not there,
+// refused, or answered nothing readable. Asked from a child process: KWin
+// leaves the asking program's own windows out of what it captures.
+fn read(s as *Screen) as i32 { return _read(s, 0); }
+
+// The same with the pointer drawn where it is.
+fn read_with_cursor(s as *Screen) as i32 { return _read(s, 1); }
+
+fn _read(s as *Screen, cursor as i32) as i32 {
+    let is [2]i32 as rp;
+    if (linux.pipe2(cast(*i32, &rp), linux.O_CLOEXEC) != 0) { return 0; }
+    let is i64 as pid = linux.fork();
+    if (pid < 0) {
+        linux.close(cast(i64, rp[0]));
+        linux.close(cast(i64, rp[1]));
+        return 0;
+    }
+    if (pid == 0) {
+        linux.close(cast(i64, rp[0]));
+        _capture(cast(i64, rp[1]), cursor);
+        linux.exit(0);
+    }
+    linux.close(cast(i64, rp[1]));
+    let is Head as hd;
+    let is i64 as got = _read_all(cast(i64, rp[0]), cast(*u8, &hd), sizeof(Head));
+    let is i32 as ok with mut = 0;
+    if (got == sizeof(Head) && hd.w > 0 && hd.h > 0) {
+        free(s);
+        let is i64 as need = hd.stride * hd.h;
+        s.px = mem.core.mmap_anon(need);
+        if (cast(i64, s.px) <= 0) {
+            s.px = cast(*u8, 0);
+        } else {
+            s.cap = need;
+            if (_read_all(cast(i64, rp[0]), s.px, need) == need) {
+                s.w = hd.w;
+                s.h = hd.h;
+                s.stride = hd.stride;
+                s.format = hd.format;
+                ok = 1;
+            } else {
+                free(s);
+            }
+        }
+    }
+    linux.close(cast(i64, rp[0]));
+    let is i32 as status with mut = 0;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+    return ok;
+}
+
+// The pixel at x, y as 0xRRGGBB; -1 outside it, or before a read.
+fn pixel(s as *Screen, x as i64, y as i64) as i64 {
+    if (cast(i64, s.px) == 0 || x < 0 || y < 0 || x >= s.w || y >= s.h) { return 0 - 1; }
+    let is *u8 as p = cast(*u8, cast(i64, s.px) + y * s.stride + x * 4);
+    let is i64 as b0 = cast(i64, p[0]);
+    let is i64 as b1 = cast(i64, p[1]);
+    let is i64 as b2 = cast(i64, p[2]);
+    if (s.format == _RGBX8888 || s.format == _RGBA8888 || s.format == _RGBA8888_PM) {
+        return (b0 << 16) | (b1 << 8) | b2;
+    }
+    return (b2 << 16) | (b1 << 8) | b0;
+}

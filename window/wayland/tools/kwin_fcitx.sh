@@ -6,7 +6,7 @@
 # KWin's private one, no X frontend, no tray. FCITX_LOG=path: its log, the
 # protocol it was spoken included, kept there.
 #
-#   env KWIN_BACKEND=x11 KWIN_INPUT_METHOD=window/wayland/tools/kwin_fcitx.sh \
+#   env KWIN_INPUT_METHOD=window/wayland/tools/kwin_fcitx.sh \
 #       FCITX_LOG=build/kwin_fcitx.log sh window/wayland/tools/run_kwin.sh <program>
 set -eu
 command -v fcitx5 >/dev/null 2>&1 || { echo "kwin_fcitx: fcitx5 not found" >&2; exit 127; }

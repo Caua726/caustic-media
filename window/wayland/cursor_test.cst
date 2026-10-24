@@ -1,7 +1,9 @@
 // window/wayland/cursor_test.cst — the pointer a client draws itself, as a
 // compositor without cursor-shape-v1 leaves it to (Weston has none; KWin's
-// is not bound with CAUSTIC_WAYLAND_CURSOR_SHAPE=0): the compositor nested in
-// Xvfb, the pointer XTest's, the screen read back from the X server:
+// is not bound with CAUSTIC_WAYLAND_CURSOR_SHAPE=0): Weston nested in Xvfb,
+// the pointer XTest's, the screen read back from the X server (or "kwin":
+// KWin's virtual backend, its fake input and its screenshots with the
+// pointer drawn, kwin_input.cst and kwin_screen.cst):
 //   sh window/x11/tools/run_headless.sh env WESTON_BACKEND=x11 WESTON_SHELL=kiosk \
 //       sh window/wayland/tools/run_wayland.sh env XCURSOR_PATH=$PWD/build/cursor-themes \
 //       ./build/wayland_cursor_test
@@ -25,6 +27,8 @@ use "../../input/event.cst" as ie;
 use "../../gpu/software/target.cst" as tgt;
 use "../x11/bind/xlib.cst" as xlib;
 use "../x11/bind/xfixes.cst" as xfixes;
+use "kwin_screen.cst" as kwin_screen;
+use "kwin_input.cst" as kwin_input;
 
 extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
 extern "libXtst.so.6" fn XTestFakeButtonEvent(display as *u8, button as u32, is_press as i32, delay as u64) as i32;
@@ -132,11 +136,16 @@ struct Box {
 }
 
 // Where the compositor shows its pointer: drawn into the screen (Weston), or
-// as the X server's cursor over its window (KWin, "kwin").
+// as the X server's cursor over its window (KWin nested in X, "kwin-x").
 let is i32 as server_cursor with mut = 0;
+// KWin on its virtual backend ("kwin"): the screen read through its own
+// screenshots, the pointer drawn into them, moved by its fake input.
+let is i32 as on_kwin with mut = 0;
+let is kwin_screen.Screen as scr with mut;
 
 fn look(colour as i64, out as *Box) as i32 {
     if (server_cursor == 1) { return _look_cursor(colour, out); }
+    if (on_kwin == 1) { return _look_kwin(colour, out); }
     let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, px - AROUND), cast(i32, py - AROUND),
                                        cast(u32, AROUND * 2), cast(u32, AROUND * 2), 0 - 1, 2);
     if (cast(i64, img) == 0) { return 0; }
@@ -159,6 +168,37 @@ fn look(colour as i64, out as *Box) as i32 {
         y = y + 1;
     }
     xlib.XDestroyImage(img);
+    if (r < 0) { return 0; }
+    out.left = l - AROUND; out.top = t - AROUND; out.width = r - l + 1; out.height = b - t + 1;
+    return 1;
+}
+
+// KWin's screen with the pointer drawn in: its pixels of colour round the
+// pointer.
+fn _look_kwin(colour as i64, out as *Box) as i32 {
+    if (kwin_screen.read_with_cursor(&scr) == 0) { return 0; }
+    // Captured in physical pixels: the pointer's logical place times the
+    // scale the window is at.
+    let is i64 as k with mut = cast(i64, wayland.scale(&win)) / 120;
+    if (k < 1) { k = 1; }
+    let is i64 as l with mut = AROUND * 2;
+    let is i64 as t with mut = AROUND * 2;
+    let is i64 as r with mut = 0 - 1;
+    let is i64 as b with mut = 0 - 1;
+    let is i64 as y with mut = 0;
+    while (y < AROUND * 2) {
+        let is i64 as x with mut = 0;
+        while (x < AROUND * 2) {
+            if (kwin_screen.pixel(&scr, px * k - AROUND + x, py * k - AROUND + y) == colour) {
+                if (x < l) { l = x; }
+                if (y < t) { t = y; }
+                if (x > r) { r = x; }
+                if (y > b) { b = y; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
     if (r < 0) { return 0; }
     out.left = l - AROUND; out.top = t - AROUND; out.width = r - l + 1; out.height = b - t + 1;
     return 1;
@@ -259,11 +299,16 @@ fn animates(left as i64, top as i64, side as i64) as i32 {
 
 fn move_to(x as i64, y as i64) as void {
     px = x; py = y;
+    if (on_kwin == 1) {
+        kwin_input.move(cast(f64, x), cast(f64, y));
+        return;
+    }
     XTestFakeMotionEvent(xd, 0 - 1, cast(i32, x), cast(i32, y), cast(u64, 0));
     xlib.XFlush(xd);
 }
 
 fn pixel(x as i64, y as i64) as i64 {
+    if (on_kwin == 1) { return kwin_screen.pixel(&scr, x, y); }
     let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, x), cast(i32, y), cast(u32, 1), cast(u32, 1), 0 - 1, 2);
     if (cast(i64, img) == 0) { return 0 - 1; }
     let is i64 as v = xlib.XGetPixel(img, 0, 0) & 16777215;
@@ -307,6 +352,7 @@ fn find_grey(x0 as i64, x1 as i64, y1 as i64, x as *i64, y as *i64) as i32 {
     let is i64 as until = time.now_ms() + 2000;
     while (time.now_ms() < until) {
         pump(20);
+        if (on_kwin == 1) { kwin_screen.read(&scr); }
         let is i64 as yy with mut = 0;
         while (yy < y1) {
             let is i64 as xx with mut = x0;
@@ -396,12 +442,18 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is *u8 as root = env.getenv("XCURSOR_PATH");
     if (cast(i64, root) == 0 || root[0] != 47) { io.printf("FAIL: XCURSOR_PATH: one absolute directory for the themes\n"); return 1; }
     write_themes(root);
-    xd = xlib.XOpenDisplay(cast(*u8, 0));
-    if (cast(i64, xd) == 0) { io.printf("FAIL: no X screen to read back\n"); return 1; }
-    // "scales": the two-output run; "kwin": KWin's pointer is the X server's
-    // cursor over its window.
+    // "scales": the two-output run; "kwin": KWin on its virtual backend;
+    // "kwin-x": KWin nested in X, its pointer the X server's cursor.
     let is *u8 as mode with mut = "";
     if (env.argc() > 1) { mode = env.argv(1); }
+    scr = kwin_screen.empty();
+    on_kwin = cast(i32, mode[0] == 107 && mode[4] != 45);
+    if (on_kwin == 1) {
+        if (kwin_input.open() == 0) { io.printf("FAIL: no fake input of KWin's to move the pointer\n"); return 1; }
+    } else {
+        xd = xlib.XOpenDisplay(cast(*u8, 0));
+        if (cast(i64, xd) == 0) { io.printf("FAIL: no X screen to read back\n"); return 1; }
+    }
     if (mode[0] == 115) {
         scales();
         xlib.XCloseDisplay(xd);
@@ -409,7 +461,7 @@ fn main(argc as i64, argv as *u8) as i32 {
         io.printf("wayland cursor across scales: %d failures\n", fails);
         return 1;
     }
-    if (mode[0] == 107) { server_cursor = 1; }
+    if (mode[0] == 107 && on_kwin == 0) { server_cursor = 1; }
     // The pointer away from where it is looked at: nothing of the client's
     // there before it is set.
     move_to(1000, 900);
@@ -495,13 +547,26 @@ fn main(argc as i64, argv as *u8) as i32 {
         let is i64 as t0 = time.now_ms();
         while (wayland.scale(&win) != 240 && time.now_ms() - t0 < 15000) { pump(10); }
         check("the output's scale, live: the window's", wayland.scale(&win) == 240);
-        let is i32 as entered = win.pointer_inside;
-        check("its image at it, without the pointer moved", shows(ORANGE, 0 - 20, 0 - 4, 48) == 1);
-        check("the pointer kept in", entered == 1);
+        if (on_kwin == 1) {
+            // KWin's virtual backend makes its output again at the new scale,
+            // the pointer leaving the window as it does: brought back over
+            // it, drawn at the scale the window is now at.
+            pump(300);
+            kwin_screen.read(&scr);
+            let is i64 as gx with mut = 0;
+            let is i64 as gy with mut = 0;
+            check("the window shown at the new scale", find_grey(0, scr.w, scr.h, &gx, &gy) == 1);
+            move_to(gx / 2 + 100, gy / 2 + 75);
+            check("its image at it, at the new scale", shows(ORANGE, 0 - 20, 0 - 4, 48) == 1);
+        } else {
+            let is i32 as entered = win.pointer_inside;
+            check("its image at it, without the pointer moved", shows(ORANGE, 0 - 20, 0 - 4, 48) == 1);
+            check("the pointer kept in", entered == 1);
+        }
     }
 
     wayland.close(&win);
-    xlib.XCloseDisplay(xd);
+    if (on_kwin == 1) { kwin_input.close(); } else { xlib.XCloseDisplay(xd); }
     if (fails == 0) { io.printf("wayland cursor: all checks passed\n"); return 0; }
     io.printf("wayland cursor: %d failures\n", fails);
     return 1;
