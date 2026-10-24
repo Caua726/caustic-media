@@ -358,7 +358,10 @@ Each event is given inside `app.begin_dispatch`/`end_dispatch`, as the
 timers are inside `app.tick`: a window closed by what it sets off — a
 shortcut that quits, a timer's callback — goes on until that is over, its
 tree and router still in use until then, and closes after. `present` brings
-a window forward, as a later start of the program asks (`instance.cst`).
+a window forward, as a later start of the program asks (`instance.cst`),
+with the token that start came with (`instance.token`): an xdg-activation
+token on Wayland, a startup ID on X11 (its feedback ended, its click's time
+given to the window manager).
 The clipboard and the primary selection are the platform's through the
 trees' `set_clipboard` and `set_paste`: copied text goes out as an offer,
 a paste asks for text and is answered when it comes, however large; a drop
@@ -451,7 +454,11 @@ counterparts — the registry's settings, `Shell_NotifyIconW`, toasts,
 - **One instance** (`instance.cst`): the first to own the application's id
   on the bus is the application; a later start hands it what it was asked —
   come forward, open these files, do this action — through
-  `org.freedesktop.Application`, and leaves.
+  `org.freedesktop.Application`, and leaves, its `XDG_ACTIVATION_TOKEN` and
+  `DESKTOP_STARTUP_ID` handed over in `platform_data` (`activation-token`,
+  `desktop-startup-id`) and taken from its environment; the instance keeps
+  what each call came with, from such a start or a desktop's launcher
+  (`instance_test` plays one with gdbus).
 - **Notifications** (`notify.cst`): `org.freedesktop.Notifications` — a
   summary, a body, an icon of the theme, actions; the program told which
   action was chosen and when one closed.

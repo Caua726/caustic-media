@@ -20,6 +20,7 @@ use "../transfer.cst" as transfer;
 use "../xcursor.cst" as xcursor;
 use "../../input/text.cst" as content;
 use "std/unicode/utf8.cst" as utf8;
+use "../linux/launch.cst" as launch;
 
 let is i32 as OK with imut = 0;
 let is i32 as NO_RUNTIME with imut = 1;
@@ -196,6 +197,17 @@ struct Globals {
     tablet_manager_global as i32;
     gestures_global as i32;
     gestures_version as i32;
+    // Optional, each 0 where the compositor has none: xdg-activation,
+    // xdg-foreign's exporter, the toplevel icon, presentation-time, the
+    // single-pixel buffer, the system bell, toplevel drags.
+    activation_global as i32;
+    exporter_global as i32;
+    icon_global as i32;
+    presentation_global as i32;
+    single_pixel_global as i32;
+    bell_global as i32;
+    toplevel_drag_global as i32;
+    presentation_clock as i32;   // the clock its times are of (CLOCK_*)
     output_count as i32;
     outputs as [8]GlobalOutput;
 }
@@ -510,6 +522,30 @@ struct Window {
     subcompositor as i32;
     subsurface as i32;
     sub_sync as i32;
+    // Optional protocols' objects, 0 where the compositor has none.
+    activation as i32;           // xdg_activation_v1
+    token_object as i32;         // an xdg_activation_token_v1 being made
+    token_len as i32;            // its token's length once done; -1 while made
+    token as [256]u8;
+    exporter as i32;             // zxdg_exporter_v2
+    exported as i32;             // this toplevel exported, once asked
+    export_len as i32;           // its handle's length once said; -1 while not
+    export_handle as [128]u8;
+    icon_manager as i32;         // xdg_toplevel_icon_manager_v1
+    icon_buffer as i32;          // the icon's pixels, kept while it is shown
+    icon_map as *u8;
+    icon_bytes as i64;
+    presentation as i32;         // wp_presentation
+    feedback as [8]i32;          // feedback asked of the frames in flight
+    presented_ns as i64;         // when the last frame was shown, presentation_clock
+    refresh_ns as i64;           // the output's refresh then, 0 unknown
+    presented as i64;            // frames shown
+    discarded as i64;            // frames never shown
+    single_pixel as i32;         // wp_single_pixel_buffer_manager_v1
+    fill_buffer as i32;          // the one-pixel buffer last filled with
+    bell as i32;                 // xdg_system_bell_v1
+    toplevel_drag_manager as i32;
+    toplevel_drag as i32;        // the drag a toplevel rides, while it does
 }
 
 let is [4096]u8 as _wire with mut;
@@ -1062,6 +1098,27 @@ fn _registry_global() as void {
     }
     if (_same(text, len - 1, "zwp_pointer_gestures_v1") == 1 && _globals.gestures_global == 0) {
         _globals.gestures_global = cast(i32, name); _globals.gestures_version = version;
+    }
+    if (_same(text, len - 1, "xdg_activation_v1") == 1 && _globals.activation_global == 0) {
+        _globals.activation_global = cast(i32, name);
+    }
+    if (_same(text, len - 1, "zxdg_exporter_v2") == 1 && _globals.exporter_global == 0) {
+        _globals.exporter_global = cast(i32, name);
+    }
+    if (_same(text, len - 1, "xdg_toplevel_icon_manager_v1") == 1 && _globals.icon_global == 0) {
+        _globals.icon_global = cast(i32, name);
+    }
+    if (_same(text, len - 1, "wp_presentation") == 1 && _globals.presentation_global == 0) {
+        _globals.presentation_global = cast(i32, name);
+    }
+    if (_same(text, len - 1, "wp_single_pixel_buffer_manager_v1") == 1 && _globals.single_pixel_global == 0) {
+        _globals.single_pixel_global = cast(i32, name);
+    }
+    if (_same(text, len - 1, "xdg_system_bell_v1") == 1 && _globals.bell_global == 0) {
+        _globals.bell_global = cast(i32, name);
+    }
+    if (_same(text, len - 1, "xdg_toplevel_drag_manager_v1") == 1 && _globals.toplevel_drag_global == 0) {
+        _globals.toplevel_drag_global = cast(i32, name);
     }
 }
 
@@ -1686,6 +1743,8 @@ fn _source_event(w as *Window, object as i32, op as i32, p as *u8) as void {
 }
 
 fn _drag_done(w as *Window, action as i32) as void {
+    // A toplevel carried by the drag: let go of, where the drag left it.
+    if (w.toplevel_drag != 0) { _send(w, w.toplevel_drag, 0, cast(*u8, 0), 0, 0 - 1); w.toplevel_drag = 0; }
     let is event.Event as e;
     event.clear(&e); e.kind = event.DRAG_DONE; e.action = action;
     w.frame_ready = 1;
@@ -3015,6 +3074,10 @@ fn _dispatch(w as *Window, obj as i32) as void {
         _set_scale120(w, cast(i32, _word(p)), 1);
         return;
     }
+    if (obj == w.token_object && obj != 0 && op == 0) { _token_done(w, p); return; }
+    if (obj == w.exported && obj != 0 && op == 0) { _export_said(w, p); return; }
+    if (obj == w.presentation && obj != 0 && op == 0) { _globals.presentation_clock = cast(i32, _word(p)); return; }
+    if (_feedback_index(w, obj) >= 0) { _feedback_event(w, _feedback_index(w, obj), op, p); return; }
     if (obj == w.data_device) { _data_device_event(w, op, p); return; }
     if (obj == w.primary_device) { _primary_device_event(w, op, p); return; }
     if (obj == w.text_input) { _text_input_event(w, op, p); return; }
@@ -3366,8 +3429,17 @@ fn clear_drop(w as *Window) as void {
 // compositor runs it, and its end is a DRAG_DONE event with the action the
 // target did, 0 for none. 1 when it began.
 fn drag_begin(w as *Window, o as *transfer.Offer, actions as i32) as i32 {
+    return drag_begin_carrying(w, o, actions, cast(*Window, 0), 0, 0);
+}
+
+// The same, carried's toplevel moving with the pointer while it lasts, the
+// pointer at x_off, y_off of it (logical) — a tab torn off into a window of
+// its own (xdg-toplevel-drag): left where the drag ends. 0 without the
+// toplevel drag manager when a toplevel is to be carried.
+fn drag_begin_carrying(w as *Window, o as *transfer.Offer, actions as i32, carried as *Window, x_off as i64, y_off as i64) as i32 {
     if (w.opened == 0 || w.data_device == 0 || w.grab_serial == 0 || w.drag_source != 0 ||
         (actions & (transfer.COPY | transfer.MOVE)) == 0) { return 0; }
+    if (cast(i64, carried) != 0 && (w.toplevel_drag_manager == 0 || carried.toplevel == 0)) { return 0; }
     let is i32 as held with mut = 0;
     let is i32 as b with mut = 1;
     while (b < 8) { held = held + w.pointer_buttons[b]; b = b + 1; }
@@ -3379,6 +3451,13 @@ fn drag_begin(w as *Window, o as *transfer.Offer, actions as i32) as i32 {
     if (_bounded(_globals.data_manager_version, 3) >= 3) {
         _put(&p[0], cast(u32, actions & (transfer.COPY | transfer.MOVE)));
         _send(w, object, 2, &p[0], 4, 0 - 1);
+    }
+    if (cast(i64, carried) != 0) {
+        w.toplevel_drag = _id(w);
+        _put(&p[0], cast(u32, w.toplevel_drag)); _put(&p[4], cast(u32, object));
+        _send(w, w.toplevel_drag_manager, 1, &p[0], 8, 0 - 1);
+        _put(&p[0], cast(u32, carried.toplevel)); _put(&p[4], cast(u32, x_off)); _put(&p[8], cast(u32, y_off));
+        _send(w, w.toplevel_drag, 1, &p[0], 12, 0 - 1);
     }
     _put(&p[0], cast(u32, object)); _put(&p[4], cast(u32, w.surface)); _put(&p[8], 0); _put(&p[12], w.grab_serial);
     if (_send(w, w.data_device, 0, &p[0], 16, 0 - 1) == 0) { _source_release(w, index, 1); return 0; }
@@ -3612,6 +3691,31 @@ fn _init_protocol(w as *Window, title as *u8, app_id as *u8) as i32 {
         w.gestures = _binding(w, cast(u32, _globals.gestures_global), "zwp_pointer_gestures_v1", w.gestures_version);
         if (w.gestures == 0) { return 0; }
         _gesture_objects(w);
+    }
+    // The optional protocols the window's calls use where the compositor has
+    // them (activation, exporting, the icon, presentation times, one-pixel
+    // buffers, the bell, toplevel drags); without one, what uses it answers
+    // 0.
+    if (_globals.activation_global != 0) {
+        w.activation = _binding(w, cast(u32, _globals.activation_global), "xdg_activation_v1", 1);
+    }
+    if (_globals.exporter_global != 0) {
+        w.exporter = _binding(w, cast(u32, _globals.exporter_global), "zxdg_exporter_v2", 1);
+    }
+    if (_globals.icon_global != 0) {
+        w.icon_manager = _binding(w, cast(u32, _globals.icon_global), "xdg_toplevel_icon_manager_v1", 1);
+    }
+    if (_globals.presentation_global != 0) {
+        w.presentation = _binding(w, cast(u32, _globals.presentation_global), "wp_presentation", 1);
+    }
+    if (_globals.single_pixel_global != 0) {
+        w.single_pixel = _binding(w, cast(u32, _globals.single_pixel_global), "wp_single_pixel_buffer_manager_v1", 1);
+    }
+    if (_globals.bell_global != 0) {
+        w.bell = _binding(w, cast(u32, _globals.bell_global), "xdg_system_bell_v1", 1);
+    }
+    if (_globals.toplevel_drag_global != 0) {
+        w.toplevel_drag_manager = _binding(w, cast(u32, _globals.toplevel_drag_global), "xdg_toplevel_drag_manager_v1", 1);
     }
     while (_pump_one(w, 0) == 1) { }
     w.surface = _id(w);
@@ -4174,6 +4278,7 @@ fn _present(w as *Window, l as *damage.List) as void {
     }
     _put(&p[0], cast(u32, id));
     _send(w, w.surface, 3, &p[0], 4, 0 - 1);
+    _feedback_ask(w);
     _send(w, w.surface, 6, cast(*u8, 0), 0, 0 - 1);
     w.callback = id;
     w.buffers[w.current].busy = 1;
@@ -4183,6 +4288,7 @@ fn _present(w as *Window, l as *damage.List) as void {
     w.visible = 1; w.resize_detached = 0;
     w.frame_ready = 0;
     w.current = 0 - 1;
+    if (w.presents == 1) { _startup_activation(w); }
 }
 
 fn hide(w as *Window) as void {
@@ -4768,4 +4874,261 @@ fn close(w as *Window) as void {
     }
     _disconnect(w);
     w.fd = 0 - 1; w.opened = 0;
+}
+
+// --- Optional protocols ---
+
+// A string argument at p, its bytes into out (cap, zero-terminated): its
+// length, -1 when it is not there whole or does not fit.
+fn _string_arg(p as *u8, out as *u8, cap as i64) as i64 {
+    let is i64 as len = cast(i64, _word(p));
+    if (len <= 0 || 8 + 4 + len > cast(i64, _wire_size) || len > cap) { return 0 - 1; }
+    let is i64 as n = len - 1;
+    mem.memcpy(out, cast(*u8, cast(i64, p) + 4), n);
+    out[n] = 0;
+    return n;
+}
+
+fn _token_done(w as *Window, p as *u8) as void {
+    let is i64 as n = _string_arg(p, &w.token[0], 256);
+    if (n < 0) { w.token_len = 0; } else { w.token_len = cast(i32, n); }
+    _send(w, w.token_object, 4, cast(*u8, 0), 0, 0 - 1);
+    w.token_object = 0;
+}
+
+fn _export_said(w as *Window, p as *u8) as void {
+    let is i64 as n = _string_arg(p, &w.export_handle[0], 128);
+    if (n < 0) { w.export_len = 0; } else { w.export_len = cast(i32, n); }
+}
+
+// Events until done() says *flag is no longer negative, a second at most.
+fn _until_said(w as *Window, flag as *i32) as void {
+    let is i64 as until = time.now_ms() + 1000;
+    while (*flag < 0 && time.now_ms() < until) {
+        if (_pump_one(w, 1) == 0) { return; }
+    }
+}
+
+// xdg-activation: a token made for this window under its latest input — the
+// key or press the user just gave it — for this window's activate or for a
+// program started from here to come forward with (XDG_ACTIVATION_TOKEN). Its
+// length into out (cap bytes, zero-terminated); 0 when the compositor has no
+// xdg_activation_v1 or said none.
+fn activation_token(w as *Window, out as *u8, cap as i64) as i64 {
+    if (w.opened == 0 || w.activation == 0 || cap <= 1 || w.token_object != 0) { return 0; }
+    let is [8]u8 as p;
+    w.token_object = _id(w);
+    w.token_len = 0 - 1;
+    _put(&p[0], cast(u32, w.token_object));
+    if (_send(w, w.activation, 1, &p[0], 4, 0 - 1) == 0) { w.token_object = 0; return 0; }
+    if (w.input_serial != 0 && w.seat != 0) {
+        _put(&p[0], w.input_serial); _put(&p[4], cast(u32, w.seat));
+        _send(w, w.token_object, 0, &p[0], 8, 0 - 1);
+    }
+    _put(&p[0], cast(u32, w.surface));
+    _send(w, w.token_object, 2, &p[0], 4, 0 - 1);
+    _send(w, w.token_object, 3, cast(*u8, 0), 0, 0 - 1);
+    _until_said(w, &w.token_len);
+    if (w.token_len <= 0 || cast(i64, w.token_len) >= cap) { return 0; }
+    mem.memcpy(out, &w.token[0], cast(i64, w.token_len));
+    out[w.token_len] = 0;
+    return cast(i64, w.token_len);
+}
+
+// Brought forward with token, n bytes — one another program gave, or one of
+// this window's: 1 when asked; the compositor grants it or not.
+fn activate_with(w as *Window, token as *u8, n as i64) as i32 {
+    if (w.opened == 0 || w.activation == 0 || n <= 0 || n > 240) { return 0; }
+    let is [256]u8 as p;
+    let is i64 as len = n + 1;
+    let is i64 as padded = ((len + 3) / 4) * 4;
+    mem.memzero(&p[0], 256);
+    _put(&p[0], cast(u32, len));
+    mem.memcpy(&p[4], token, n);
+    _put(cast(*u8, cast(i64, &p[0]) + 4 + padded), cast(u32, w.surface));
+    return _send(w, w.activation, 2, &p[0], cast(i32, 8 + padded), 0 - 1);
+}
+
+// Brought forward: a token of its own made and used. 0 without xdg-activation.
+fn activate(w as *Window) as i32 {
+    let is [256]u8 as token;
+    let is i64 as n = activation_token(w, &token[0], 256);
+    if (n <= 0) { return 0; }
+    return activate_with(w, &token[0], n);
+}
+
+// Started by another program with a token for its first window: brought
+// forward with it, the token taken from what this one passes on.
+fn _startup_activation(w as *Window) as void {
+    if (w.popup_kind != 0 || w.subsurface != 0 || w.activation == 0) { return; }
+    let is [256]u8 as token;
+    let is i64 as n = launch.take("XDG_ACTIVATION_TOKEN", &token[0], 256);
+    if (n > 0) { activate_with(w, &token[0], n); }
+}
+
+// xdg-foreign: the handle another program — a portal's dialog — makes a
+// window of its own this one's child by. Its length into out (cap bytes,
+// zero-terminated); 0 without zxdg_exporter_v2. Exported once, kept while the
+// window is.
+fn export_handle(w as *Window, out as *u8, cap as i64) as i64 {
+    if (w.opened == 0 || w.exporter == 0 || w.toplevel == 0 || cap <= 1) { return 0; }
+    if (w.exported == 0) {
+        let is [8]u8 as p;
+        w.exported = _id(w);
+        w.export_len = 0 - 1;
+        _put(&p[0], cast(u32, w.exported)); _put(&p[4], cast(u32, w.surface));
+        if (_send(w, w.exporter, 1, &p[0], 8, 0 - 1) == 0) { w.exported = 0; return 0; }
+    }
+    _until_said(w, &w.export_len);
+    if (w.export_len <= 0 || cast(i64, w.export_len) >= cap) { return 0; }
+    mem.memcpy(out, &w.export_handle[0], cast(i64, w.export_len));
+    out[w.export_len] = 0;
+    return cast(i64, w.export_len);
+}
+
+// The system bell rung for this window: 1, 0 without xdg_system_bell_v1.
+fn bell(w as *Window) as i32 {
+    if (w.opened == 0 || w.bell == 0) { return 0; }
+    let is [4]u8 as p;
+    _put(&p[0], cast(u32, w.surface));
+    return _send(w, w.bell, 1, &p[0], 4, 0 - 1);
+}
+
+// Its icon (xdg_toplevel_icon_v1): argb, iw by ih, 0xAARRGGBB a pixel,
+// centred in a square as the protocol has icons, premultiplied in a buffer
+// of its own kept while it is shown. 0 without the icon manager.
+fn set_icon(w as *Window, argb as *u8, iw as i64, ih as i64) as i32 {
+    if (w.opened == 0 || w.icon_manager == 0 || w.toplevel == 0 || iw <= 0 || ih <= 0 || iw > 1024 || ih > 1024) { return 0; }
+    let is i64 as side with mut = iw;
+    if (ih > side) { side = ih; }
+    let is i64 as bytes = side * side * 4;
+    let is i64 as fd = sys.memfd_create("caustic-wayland-icon", 1);
+    if (fd < 0) { return 0; }
+    if (linux.ftruncate(fd, bytes) != 0) { linux.close(fd); return 0; }
+    let is *u8 as map = linux.mmap(cast(*u8, 0), bytes, linux.PROT_READ | linux.PROT_WRITE, linux.MAP_SHARED, fd, 0);
+    if (cast(i64, map) == linux.MAP_FAILED) { linux.close(fd); return 0; }
+    mem.memzero(map, bytes);
+    let is i64 as ox = (side - iw) / 2;
+    let is i64 as oy = (side - ih) / 2;
+    let is i64 as y with mut = 0;
+    while (y < ih) {
+        let is i64 as x with mut = 0;
+        while (x < iw) {
+            let is u32 as c = *cast(*u32, cast(i64, argb) + (y * iw + x) * 4);
+            let is u32 as a = (c >> 24) & 255;
+            let is u32 as r = (((c >> 16) & 255) * a + 127) / 255;
+            let is u32 as g = (((c >> 8) & 255) * a + 127) / 255;
+            let is u32 as b = ((c & 255) * a + 127) / 255;
+            *cast(*u32, cast(i64, map) + ((oy + y) * side + ox + x) * 4) = (a << 24) | (r << 16) | (g << 8) | b;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is [24]u8 as p;
+    let is i32 as pool = _id(w);
+    _put(&p[0], cast(u32, pool)); _put(&p[4], cast(u32, bytes));
+    let is i32 as sent = _send(w, w.shm, 0, &p[0], 8, fd);
+    linux.close(fd);
+    if (sent == 0) { linux.munmap(map, bytes); return 0; }
+    let is i32 as buffer = _id(w);
+    _put(&p[0], cast(u32, buffer)); _put(&p[4], 0);
+    _put(&p[8], cast(u32, side)); _put(&p[12], cast(u32, side));
+    _put(&p[16], cast(u32, side * 4)); _put(&p[20], cast(u32, FORMAT_ARGB8888));
+    _send(w, pool, 0, &p[0], 24, 0 - 1);
+    _send(w, pool, 1, cast(*u8, 0), 0, 0 - 1);
+    let is i32 as icon = _id(w);
+    _put(&p[0], cast(u32, icon));
+    _send(w, w.icon_manager, 1, &p[0], 4, 0 - 1);
+    _put(&p[0], cast(u32, buffer)); _put(&p[4], 1);
+    _send(w, icon, 2, &p[0], 8, 0 - 1);
+    _put(&p[0], cast(u32, w.toplevel)); _put(&p[4], cast(u32, icon));
+    _send(w, w.icon_manager, 2, &p[0], 8, 0 - 1);
+    _send(w, icon, 0, cast(*u8, 0), 0, 0 - 1);
+    // The icon before it, no longer shown: let go.
+    if (w.icon_buffer != 0) { _send(w, w.icon_buffer, 0, cast(*u8, 0), 0, 0 - 1); linux.munmap(w.icon_map, w.icon_bytes); }
+    w.icon_buffer = buffer; w.icon_map = map; w.icon_bytes = bytes;
+    return 1;
+}
+
+// presentation-time: feedback asked of the frame about to be committed, a
+// slot of its own while it is in flight (none free: not asked).
+fn _feedback_ask(w as *Window) as void {
+    if (w.presentation == 0) { return; }
+    let is i32 as k with mut = 0;
+    while (k < 8 && w.feedback[k] != 0) { k = k + 1; }
+    if (k == 8) { return; }
+    let is [8]u8 as p;
+    w.feedback[k] = _id(w);
+    _put(&p[0], cast(u32, w.surface)); _put(&p[4], cast(u32, w.feedback[k]));
+    _send(w, w.presentation, 1, &p[0], 8, 0 - 1);
+}
+
+fn _feedback_index(w as *Window, obj as i32) as i32 {
+    if (obj == 0) { return 0 - 1; }
+    let is i32 as k with mut = 0;
+    while (k < 8) {
+        if (w.feedback[k] == obj) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// presented: tv_sec_hi, tv_sec_lo, tv_nsec, refresh, seq_hi, seq_lo, flags;
+// discarded. Either ends the feedback (the server destroys it).
+fn _feedback_event(w as *Window, k as i32, op as i32, p as *u8) as void {
+    if (op == 1 && _wire_size >= 8 + 28) {
+        let is i64 as sec = (cast(i64, _word(p)) << 32) | cast(i64, _word(cast(*u8, cast(i64, p) + 4)));
+        let is i64 as nsec = cast(i64, _word(cast(*u8, cast(i64, p) + 8)));
+        w.presented_ns = sec * 1000000000 + nsec;
+        w.refresh_ns = cast(i64, _word(cast(*u8, cast(i64, p) + 12)));
+        w.presented = w.presented + 1;
+        w.feedback[k] = 0;
+    } else if (op == 2) {
+        w.discarded = w.discarded + 1;
+        w.feedback[k] = 0;
+    }
+}
+
+// What presentation-time said of the frames: how many were shown (-1
+// without wp_presentation), when the last was (ns of presentation_clock's
+// clock) and the refresh then (ns, 0 unknown).
+fn presentation_times(w as *Window, presented_ns as *i64, refresh_ns as *i64) as i64 {
+    if (w.presentation == 0) { return 0 - 1; }
+    *presented_ns = w.presented_ns;
+    *refresh_ns = w.refresh_ns;
+    return w.presented;
+}
+
+fn presentation_clock() as i32 { return _globals.presentation_clock; }
+fn frames_discarded(w as *Window) as i64 { return w.discarded; }
+
+// The window shown as one colour, argb (0xAARRGGBB), with no buffer of its
+// size: wp_single_pixel_buffer_v1's one pixel stretched over it by the
+// viewport, until the next frame — which sets the viewport's size again, as
+// every frame with fractional scaling does. 1, or 0 without the single-pixel
+// buffer or fractional scaling's viewport.
+fn fill(w as *Window, argb as u32) as i32 {
+    if (w.opened == 0 || w.single_pixel == 0 || w.viewport == 0 || w.fractional_active == 0 || w.logical_width <= 0) { return 0; }
+    let is u32 as a = (argb >> 24) & 255;
+    // Premultiplied, each channel scaled to the whole of a u32.
+    let is u32 as r = (((argb >> 16) & 255) * a + 127) / 255;
+    let is u32 as g = (((argb >> 8) & 255) * a + 127) / 255;
+    let is u32 as b = ((argb & 255) * a + 127) / 255;
+    let is [20]u8 as p;
+    let is i32 as buffer = _id(w);
+    _put(&p[0], cast(u32, buffer));
+    _put(&p[4], r * 16843009); _put(&p[8], g * 16843009); _put(&p[12], b * 16843009); _put(&p[16], a * 16843009);
+    if (_send(w, w.single_pixel, 1, &p[0], 20, 0 - 1) == 0) { return 0; }
+    _put(&p[0], 1);
+    _send(w, w.surface, 8, &p[0], 4, 0 - 1);
+    _put(&p[0], cast(u32, w.logical_width)); _put(&p[4], cast(u32, w.logical_height));
+    _send(w, w.viewport, 2, &p[0], 8, 0 - 1);
+    _put(&p[0], cast(u32, buffer)); _put(&p[4], 0); _put(&p[8], 0);
+    _send(w, w.surface, 1, &p[0], 12, 0 - 1);
+    _put(&p[0], 0); _put(&p[4], 0); _put(&p[8], 2147483647); _put(&p[12], 2147483647);
+    _send(w, w.surface, 2, &p[0], 16, 0 - 1);
+    _send(w, w.surface, 6, cast(*u8, 0), 0, 0 - 1);
+    if (w.fill_buffer != 0) { _send(w, w.fill_buffer, 0, cast(*u8, 0), 0, 0 - 1); }
+    w.fill_buffer = buffer;
+    return 1;
 }

@@ -95,6 +95,9 @@ fi
 
 # AUTO must use this private X server, not the caller's Wayland session.
 unset WAYLAND_DISPLAY
+# A launch token of the user's session (the terminal this was started from)
+# is for a window on the user's desktop, not one on this display.
+unset DESKTOP_STARTUP_ID XDG_ACTIVATION_TOKEN
 export XDG_SESSION_TYPE=x11
 export DISPLAY=":$num"
 # X_LAYOUTS=us,ru,de: the keyboard's layouts, each an XKB group, loaded before

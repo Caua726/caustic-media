@@ -253,7 +253,12 @@ a frame of its own with its maximize button hit-tested as the system's, an owned
 dialog and close requests. It found that `WM_NCCREATE` skipped the default
 procedure, so creation titles were lost, and that `resized`, the motion and the
 wheel were never per frame (a window looked resized every frame after its
-first); both are fixed.
+first); both are fixed. The bell (`device.bell`, `MessageBeep`) is heard where
+Wine shows it: `tools/bell_heard.sh` runs `bell_test.exe` with a watcher of
+its X server's bells (`XkbBellNotify`, `x11/desktop_test heard`) beside it.
+Windows has no xdg-activation, xdg-foreign, presentation feedback or
+single-pixel fill: those calls answer 0 there; the parent window a Windows
+dialog or `ShellExecuteW` takes is the HWND itself.
 
 A window drawing its own frame — `Config.decorated` 0, not a popup, not seen
 through — keeps the system's style (`WS_OVERLAPPEDWINDOW`; a dialog's caption,

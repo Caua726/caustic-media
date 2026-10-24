@@ -11,8 +11,17 @@
 // dashes underscores ("/org/example/Notes").
 //
 // The connection is the program's, dispatched by its loop (session.cst).
+//
+// A start the desktop launched carries a token to come forward with —
+// XDG_ACTIVATION_TOKEN on Wayland, DESKTOP_STARTUP_ID on X11 — which it
+// hands over in platform_data as "activation-token" and
+// "desktop-startup-id", taken from its environment, as GLib does; the
+// instance keeps what each call came with (token), for its window to come
+// forward with (host.present_with) rather than be refused as a window
+// stealing the keyboard.
 use "std/mem.cst" as mem;
 use "../dbus/dbus.cst" as dbus;
+use "../window/linux/launch.cst" as launch;
 
 let is *u8 as IFACE with imut = "org.freedesktop.Application";
 
@@ -26,6 +35,9 @@ type ActionFn = fn(*u8, *u8, i64) as void;
 
 let is i64 as _DO_NOT_QUEUE  with imut = 4;
 let is i64 as _PRIMARY_OWNER with imut = 1;
+
+// The longest token kept.
+let is i64 as MAX_TOKEN with imut = 255;
 
 struct Instance {
     c        as *dbus.conn.Conn;
@@ -41,6 +53,8 @@ struct Instance {
     methods  as [3]dbus.conn.Method;
     iface    as dbus.conn.Interface;
     uris     as [8192]u8;
+    token    as [256]u8;     // the current call's, zero-terminated
+    token_n  as i64;
 }
 
 // The object path of id, n bytes, into out (n + 2 bytes): its length.
@@ -58,8 +72,45 @@ fn _path_of(id as *u8, n as i64, out as *u8) as i64 {
     return n + 1;
 }
 
+// The call's platform_data (a{sv}) read from r: its "activation-token", or
+// without one its "desktop-startup-id", kept as the token; none kept when it
+// has neither, or is malformed.
+fn _platform_data(inst as *Instance, r as *dbus.wire.Reader) as void {
+    inst.token_n = 0;
+    inst.token[0] = cast(u8, 0);
+    let is i32 as from_activation with mut = 0;
+    let is i64 as n with mut = 0;
+    let is i64 as end = dbus.wire.get_array(r, 8);
+    while (r.err == 0 && r.pos < end) {
+        dbus.wire.get_struct(r);
+        let is *u8 as key = dbus.wire.get_string(r, &n);
+        let is i64 as sn with mut = 0;
+        let is *u8 as sig = dbus.wire.get_variant(r, &sn);
+        if (r.err != 0) { break; }
+        let is i32 as activation = dbus.message.named(key, "activation-token");
+        let is i32 as startup = dbus.message.named(key, "desktop-startup-id");
+        if ((activation == 1 || (startup == 1 && from_activation == 0)) && dbus.message.named(sig, "s") == 1) {
+            let is i64 as tn with mut = 0;
+            let is *u8 as t = dbus.wire.get_string(r, &tn);
+            if (r.err == 0 && tn > 0 && tn <= MAX_TOKEN) {
+                mem.memcpy(cast(*u8, &inst.token), t, tn);
+                inst.token[tn] = cast(u8, 0);
+                inst.token_n = tn;
+                from_activation = activation;
+            }
+        } else {
+            dbus.wire.skip(r, sig, sn);
+        }
+    }
+    if (r.err != 0) {
+        inst.token_n = 0;
+        inst.token[0] = cast(u8, 0);
+    }
+}
+
 fn _activate(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
     let is *Instance as inst = cast(*Instance, user);
+    _platform_data(inst, &k.args);
     if (cast(i64, inst.activate) != 0) { call(inst.activate, inst.user); }
 }
 
@@ -80,6 +131,7 @@ fn _open(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
     }
     // Back to back, the last one's zero not counted.
     if (n > 0) { n = n - 1; }
+    _platform_data(inst, &k.args);
     if (cast(i64, inst.open) != 0) { call(inst.open, inst.user, cast(*u8, &inst.uris), n, count); }
 }
 
@@ -87,7 +139,10 @@ fn _action(c as *dbus.conn.Conn, k as *dbus.conn.Call, user as *u8) as void {
     let is *Instance as inst = cast(*Instance, user);
     let is i64 as len with mut = 0;
     let is *u8 as name = dbus.wire.get_string(&k.args, &len);
-    if (k.args.err == 0 && cast(i64, inst.action) != 0) { call(inst.action, inst.user, name, len); }
+    if (k.args.err != 0) { return; }
+    dbus.wire.skip(&k.args, "av", 2);
+    _platform_data(inst, &k.args);
+    if (cast(i64, inst.action) != 0) { call(inst.action, inst.user, name, len); }
 }
 
 fn _method(m as *dbus.conn.Method, name as *u8, ins as *u8, h as dbus.conn.MethodFn, names as *u8) as void {
@@ -111,6 +166,8 @@ fn claim(inst as *Instance, c as *dbus.conn.Conn, id as *u8, n as i64, on_activa
     inst.open = on_open;
     inst.action = on_action;
     inst.user = user;
+    inst.token_n = 0;
+    inst.token[0] = cast(u8, 0);
     if (n <= 0 || n > 255) { return 0; }
     mem.memcpy(cast(*u8, &inst.id), id, n);
     inst.id[n] = cast(u8, 0);
@@ -154,10 +211,30 @@ fn _message(id as *u8, n as i64, member as *u8, sig as *u8, name as *u8, p as *u
     return m;
 }
 
-fn _empty_dict(w as *dbus.wire.Writer) as void {
+fn _token_entry(w as *dbus.wire.Writer, key as *u8, value as *u8, n as i64) as void {
+    dbus.wire.put_struct(w);
+    dbus.wire.put_string(w, key);
+    dbus.wire.put_variant(w, "s");
+    dbus.wire.put_string_n(w, value, n);
+}
+
+// platform_data: the token this start came with, taken from its environment
+// — each kind under its name — so the instance comes forward with it.
+fn _platform_data_out(w as *dbus.wire.Writer) as void {
+    let is [256]u8 as token;
     let is i64 as at = dbus.wire.put_array(w, 8);
+    let is i64 as tn = launch.take("XDG_ACTIVATION_TOKEN", &token[0], 256);
+    if (tn > 0) { _token_entry(w, "activation-token", &token[0], tn); }
+    let is i64 as sn = launch.take("DESKTOP_STARTUP_ID", &token[0], 256);
+    if (sn > 0) { _token_entry(w, "desktop-startup-id", &token[0], sn); }
     dbus.wire.put_array_end(w, at, 8);
 }
+
+// The token the current call came with (activation-token, else
+// desktop-startup-id), zero-terminated; token_length 0 for none. Read in
+// the callback: the next call replaces it.
+fn token(inst as *Instance) as *u8 { return cast(*u8, &inst.token); }
+fn token_length(inst as *Instance) as i64 { return inst.token_n; }
 
 fn _call(c as *dbus.conn.Conn, m as *dbus.message.Message) as i32 {
     let is dbus.message.Message as rep with mut = dbus.message.empty();
@@ -170,7 +247,7 @@ fn activate_remote(c as *dbus.conn.Conn, id as *u8, n as i64) as i32 {
     let is [256]u8 as name;
     let is [258]u8 as p;
     let is dbus.message.Message as m with mut = _message(id, n, "Activate", "a{sv}", cast(*u8, &name), cast(*u8, &p));
-    _empty_dict(dbus.conn.body(c));
+    _platform_data_out(dbus.conn.body(c));
     return _call(c, &m);
 }
 
@@ -193,7 +270,7 @@ fn open_remote(c as *dbus.conn.Conn, id as *u8, n as i64, s as *u8, sn as i64, c
         k = k + 1;
     }
     dbus.wire.put_array_end(w, at, 4);
-    _empty_dict(w);
+    _platform_data_out(w);
     return _call(c, &m);
 }
 
@@ -209,6 +286,6 @@ fn action_remote(c as *dbus.conn.Conn, id as *u8, n as i64, action as *u8, an as
     // No parameter: an empty array of variants, which align to a byte.
     let is i64 as at = dbus.wire.put_array(w, 1);
     dbus.wire.put_array_end(w, at, 1);
-    _empty_dict(w);
+    _platform_data_out(w);
     return _call(c, &m);
 }

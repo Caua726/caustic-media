@@ -545,6 +545,22 @@ where said:
 - `device.set_title` in UTF-8: `_NET_WM_NAME`, and `WM_NAME` in Latin-1 for
   an old window manager, each sequence whole or a `?`; `show`, `hide`,
   `activate`, `position` on the screen, `set_icon`.
+- Among the desktop's other programs: `parent_handle` names the window to
+  another program — a portal's dialog, the application a link opens in
+  (`ui/host.parent_handle`, `ui/open_uri.cst`) — as `x11:<id in hex>` or
+  `wayland:<handle>` (xdg-foreign-v2), and the portal's dialog comes as its
+  child; `activation_token` and `activate_with` pass the keyboard between
+  programs on Wayland (xdg-activation-v1), a program started with
+  `XDG_ACTIVATION_TOKEN` coming forward with it on its first frame, as one
+  started with `DESKTOP_STARTUP_ID` on X11 ends its launch feedback
+  (`_NET_STARTUP_ID`, `remove:` on `_NET_STARTUP_INFO`), each taken from the
+  environment so its own children do not reuse it; on X11 `activate_with`
+  takes another start's startup ID, ends its feedback and asks the window
+  manager with the time it carries; `bell` (XkbBell,
+  xdg-system-bell, `MessageBeep`); `presentation_times` (presentation-time:
+  frames shown, when, the refresh); `fill` (a single-pixel buffer stretched
+  over the window until its next frame). Where the platform or compositor has
+  none of these, each answers 0 — unavailable, never pretended.
 - Selections and drag and drop (`transfer.cst`): what moves between programs
   is an `Offer` — text (UTF-8), a PNG, files (absolute POSIX or Windows
   paths, a `text/uri-list` of them) — and what is read is had by format

@@ -82,6 +82,9 @@ while :; do
 done
 # Clients must speak to this compositor, not an X server they might inherit.
 if [ "$backend" = headless ]; then unset DISPLAY; fi
+# A launch token of the user's session is for the user's desktop, not this
+# compositor.
+unset DESKTOP_STARTUP_ID XDG_ACTIVATION_TOKEN
 status=0
 run_child "$@" || status=$?
 if [ "$status" -ne 0 ]; then cat "$run/weston.log" >&2; fi

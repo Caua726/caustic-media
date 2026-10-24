@@ -1,0 +1,349 @@
+// window/x11/desktop_test.cst — a window among the desktop's other programs,
+// under Xvfb:
+//   sh window/x11/tools/run_headless.sh ./build/x11_desktop_test
+//   sh window/x11/tools/run_headless.sh env CAUSTIC_PORTAL_SHOWN=1 \
+//       sh window/linux/tools/run_portal_kde.sh window/linux/testdata/kdeglobals ./build/x11_desktop_test portal
+// Startup notification: a program started with DESKTOP_STARTUP_ID (this
+// test again, mode `child`) puts the ID on its first window as
+// _NET_STARTUP_ID, takes it from its environment, and once the window is
+// mapped says "remove: ID=..." — heard by an independent listener written
+// with python-xlib (window/tools/startup_listener.py). The bell: XkbBell for
+// the window, which the server tells as an XkbBellNotify, heard on a
+// connection of its own. Mode `portal`: the installed portal with its KDE
+// backend shows a file chooser asked over the window's parent handle as its
+// transient (WM_TRANSIENT_FOR, set by the portal's own toolkit), gone when
+// the request is closed.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "x11.cst" as x11;
+use "bind/xlib.cst" as xlib;
+use "bind/xkblib.cst" as xkb;
+use "../device.cst" as device;
+use "../../dbus/dbus.cst" as dbus;
+use "../linux/portal.cst" as portal;
+use "../linux/filechooser.cst" as files;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+fn read_file(path as *u8, out as *u8, cap as i64) as i64 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is i64 as n = linux.read(fd, out, cap - 1);
+    linux.close(fd);
+    if (n < 0) { return 0; }
+    out[n] = 0;
+    return n;
+}
+
+fn contains(p as *u8, n as i64, s as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (s[k] != 0) { k = k + 1; }
+    let is i64 as i with mut = 0;
+    while (i + k <= n) {
+        if (mem.memcmp(cast(*u8, cast(i64, p) + i), s, k) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// sh -c cmd, $0 and $1 a0 and a1: its process.
+fn spawn(cmd as *u8, a0 as *u8, a1 as *u8) as i64 {
+    let is [6]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd);
+    argv[3] = cast(i64, a0); argv[4] = cast(i64, a1); argv[5] = 0;
+    return process.spawnp("sh", cast(*u8, &argv[0]));
+}
+
+// "/tmp/caustic-desktop-<this process>.log" into out (64 bytes).
+fn log_path(out as *u8) as *u8 {
+    let is *u8 as head = "/tmp/caustic-desktop-";
+    let is i64 as k with mut = 0;
+    while (head[k] != 0) { out[k] = head[k]; k = k + 1; }
+    let is [24]u8 as digits;
+    let is i64 as dn with mut = 0;
+    let is i64 as v with mut = linux.getpid();
+    while (v > 0 || dn == 0) { digits[dn] = cast(u8, 48 + v % 10); v = v / 10; dn = dn + 1; }
+    while (dn > 0) { dn = dn - 1; out[k] = digits[dn]; k = k + 1; }
+    mem.memcpy(cast(*u8, cast(i64, out) + k), ".log", 5);
+    return out;
+}
+
+fn wait(pid as i64) as i32 {
+    let is i32 as status with mut = 0;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+    return process.exit_code_of(status);
+}
+
+// Started with DESKTOP_STARTUP_ID: its first window carries it, and the ID
+// is gone from the environment. Exit 0 then.
+fn child() as i32 {
+    let is device.Window as w with mut = device.open("startup child", 160, 100);
+    if (device.is_open(&w) == 0) { return 2; }
+    let is *u8 as d = x11.display(&w.x11_win);
+    let is i64 as kind with mut = 0;
+    let is i32 as format with mut = 0;
+    let is i64 as items with mut = 0;
+    let is i64 as after with mut = 0;
+    let is *u8 as data with mut = cast(*u8, 0);
+    xlib.XGetWindowProperty(d, x11.xid(&w.x11_win), xlib.XInternAtom(d, "_NET_STARTUP_ID", 0), 0, 64, 0, 0,
+                            cast(*u8, &kind), cast(*u8, &format), cast(*u8, &items), cast(*u8, &after), cast(*u8, &data));
+    let is i32 as carried = cast(i32, cast(i64, data) != 0 && items == 24 && mem.memcmp(data, "caustic-startup_TIME1234", 24) == 0);
+    if (cast(i64, data) != 0) { xlib.XFree(data); }
+    let is i32 as taken = cast(i32, cast(i64, env.getenv("DESKTOP_STARTUP_ID")) == 0);
+    // The launcher's message out before the window goes.
+    let is i64 as until = time.now_ms() + 300;
+    while (time.now_ms() < until) { device.pump(&w); time.sleep_ms(10); }
+    device.close(&w);
+    if (carried == 1 && taken == 1) { return 0; }
+    io.printf("  child: the ID carried %d, taken %d\n", carried, taken);
+    return 1;
+}
+
+// A window the portal shows over parent: a top-level one, mapped, whose
+// WM_TRANSIENT_FOR is parent. 0 for none.
+fn transient_of(d as *u8, parent as i64) as i64 {
+    let is i64 as root_ret with mut = 0;
+    let is i64 as parent_ret with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is u32 as count with mut = 0;
+    if (xlib.XQueryTree(d, xlib.XDefaultRootWindow(d), cast(*u8, &root_ret), cast(*u8, &parent_ret),
+                        cast(*u8, &kids), cast(*u8, &count)) == 0) { return 0; }
+    let is i64 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, count) && found == 0) {
+        let is i64 as kid = kids[i];
+        let is i64 as owner with mut = 0;
+        let is [17]i64 as attrs;
+        if (xlib.XGetTransientForHint(d, kid, cast(*u8, &owner)) != 0 && owner == parent &&
+            xlib.XGetWindowAttributes(d, kid, cast(*u8, &attrs[0])) != 0 &&
+            *cast(*i32, cast(i64, &attrs[0]) + 92) == 2) { found = kid; }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+let is files.Request as q with mut;
+
+fn portal_mode() as void {
+    let is device.Window as w with mut = device.open("asks", 300, 200);
+    check("a window", device.is_open(&w) == 1);
+    let is *u8 as d = x11.display(&w.x11_win);
+    let is [64]u8 as handle;
+    let is i64 as hn = device.parent_handle(&w, &handle[0], 64);
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    check("the portal's bus", dbus.conn.is_open(&c) == 1);
+    let is files.Options as o with mut = files.options();
+    check("a file chooser asked over the window",
+          hn > 4 && files.open_file(&c, portal.DESKTOP, &handle[0], hn, "Linked dialog", 13, &o, &q) == 1);
+    let is i64 as dialog with mut = 0;
+    let is i64 as until with mut = time.now_ms() + 10000;
+    while (dialog == 0 && time.now_ms() < until) {
+        dbus.conn.dispatch(&c, 20);
+        device.pump(&w);
+        xlib.XSync(d, 0);
+        dialog = transient_of(d, x11.xid(&w.x11_win));
+    }
+    check("the portal's dialog shown, transient for the window", dialog != 0);
+    files.close(&q);
+    until = time.now_ms() + 5000;
+    while (dialog != 0 && time.now_ms() < until) {
+        dbus.conn.dispatch(&c, 20);
+        device.pump(&w);
+        xlib.XSync(d, 0);
+        dialog = transient_of(d, x11.xid(&w.x11_win));
+    }
+    check("closed: the request cancelled, the dialog gone", q.state == files.CANCELLED && dialog == 0);
+    dbus.conn.close(&c);
+    device.close(&w);
+}
+
+// A connection of its own the server tells of every bell rung on it
+// (XkbBellNotify); null without XKB.
+let is i32 as xkb_event with mut = 0;
+
+fn bell_watcher() as *u8 {
+    let is *u8 as watcher = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, watcher) == 0) { return watcher; }
+    let is i32 as xkb_error with mut = 0;
+    let is i32 as major with mut = 1;
+    let is i32 as minor with mut = 0;
+    let is i32 as opcode with mut = 0;
+    if (xkb.XkbQueryExtension(watcher, cast(*u8, &opcode), cast(*u8, &xkb_event), cast(*u8, &xkb_error),
+                              cast(*u8, &major), cast(*u8, &minor)) == 0) {
+        xlib.XCloseDisplay(watcher);
+        return cast(*u8, 0);
+    }
+    // XkbUseCoreKbd 0x100, XkbBellNotifyMask 1 << 8.
+    xkb.XkbSelectEvents(watcher, cast(u32, 256), cast(u32, 256), cast(u32, 256));
+    xlib.XSync(watcher, 0);
+    return watcher;
+}
+
+// Whether the server told watcher of a bell within ms, w (when not null)
+// pumped meanwhile.
+fn bell_heard(watcher as *u8, w as *device.Window, ms as i64) as i32 {
+    if (cast(i64, watcher) == 0) { return 0; }
+    let is i64 as until = time.now_ms() + ms;
+    let is [24]i64 as ev;
+    while (time.now_ms() < until) {
+        if (cast(i64, w) != 0) { device.pump(w); }
+        while (xlib.XPending(watcher) > 0) {
+            xlib.XNextEvent(watcher, cast(*u8, &ev[0]));
+            // XkbAnyEvent: xkb_type after type, serial, send_event, display
+            // and time, at 40 — XkbBellNotify is 8.
+            if (*cast(*i32, &ev[0]) == xkb_event && *cast(*i32, cast(i64, &ev[0]) + 40) == 8) { return 1; }
+        }
+        time.sleep_ms(10);
+    }
+    return 0;
+}
+
+// Mode `heard <file>`: "watching" written to file once the server tells it
+// of bells, then exit 0 for the first rung by anyone within 30 seconds —
+// the bell of a Windows program Wine draws on this server
+// (window/win32/tools/bell_heard.sh).
+fn heard(file as *u8) as i32 {
+    let is *u8 as watcher = bell_watcher();
+    if (cast(i64, watcher) == 0) { return 2; }
+    let is i64 as fd = linux.open(file, linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC, 420);
+    if (fd < 0) { return 2; }
+    linux.write(fd, "watching\n", 9);
+    linux.close(fd);
+    let is i32 as rung = bell_heard(watcher, cast(*device.Window, 0), 30000);
+    xlib.XCloseDisplay(watcher);
+    if (rung == 1) { return 0; }
+    return 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (env.argc() > 1 && env.argv(1)[0] == 99) { return child(); }
+    if (env.argc() > 2 && env.argv(1)[0] == 104) { return heard(env.argv(2)); }
+    if (env.argc() > 1 && env.argv(1)[0] == 112) {
+        portal_mode();
+        if (fails == 0) { io.printf("x11 desktop portal: all checks passed\n"); return 0; }
+        io.printf("x11 desktop portal: %d failures\n", fails);
+        return 1;
+    }
+
+    // --- Startup notification ---
+    let is [64]u8 as log;
+    let is *u8 as said = log_path(&log[0]);
+    linux.unlink(said);
+    let is i64 as listener = spawn("exec python3 window/tools/startup_listener.py 10 > \"$0\" 2>&1", said, cast(*u8, 0));
+    let is [4096]u8 as heard_text;
+    let is i64 as n with mut = 0;
+    let is i64 as until with mut = time.now_ms() + 5000;
+    while (time.now_ms() < until && contains(&heard_text[0], n, "listening") == 0) {
+        time.sleep_ms(20);
+        n = read_file(said, &heard_text[0], 4096);
+    }
+    check("the listener watching", contains(&heard_text[0], n, "listening") == 1);
+    // This program again, as `child`.
+    let is i64 as started = spawn("DESKTOP_STARTUP_ID=caustic-startup_TIME1234 exec \"$0\" child", env.argv(0), cast(*u8, 0));
+    check("the program started: its window carried the ID, which left its environment", wait(started) == 0);
+    let is i32 as listened with mut = wait(listener);
+    n = read_file(said, &heard_text[0], 4096);
+    check("the listener heard the start over", listened == 0 && contains(&heard_text[0], n, "remove: ID=caustic-startup_TIME1234") == 1);
+    linux.unlink(said);
+
+    // --- A window without an ID, the bell, other starts' IDs ---
+    // The listener first: a window opened without an ID says nothing.
+    linux.unlink(said);
+    let is i64 as again = spawn("exec python3 window/tools/startup_listener.py 10 11 > \"$0\" 2>&1", said, cast(*u8, 0));
+    n = 0;
+    until = time.now_ms() + 5000;
+    while (time.now_ms() < until && contains(&heard_text[0], n, "listening") == 0) {
+        time.sleep_ms(20);
+        n = read_file(said, &heard_text[0], 4096);
+    }
+    let is *u8 as watcher = bell_watcher();
+    check("XKB on the server", cast(i64, watcher) != 0);
+    let is device.Window as w with mut = device.open("bell", 120, 80);
+    check("a window", device.is_open(&w) == 1);
+    let is *u8 as d = x11.display(&w.x11_win);
+    let is i64 as kind with mut = 0;
+    let is i32 as format with mut = 0;
+    let is i64 as items with mut = 0;
+    let is i64 as after with mut = 0;
+    let is *u8 as data with mut = cast(*u8, 0);
+    xlib.XGetWindowProperty(d, x11.xid(&w.x11_win), xlib.XInternAtom(d, "_NET_STARTUP_ID", 0), 0, 64, 0, 0,
+                            cast(*u8, &kind), cast(*u8, &format), cast(*u8, &items), cast(*u8, &after), cast(*u8, &data));
+    check("started without an ID: none on its window, not even an empty one", kind == 0 && items == 0);
+    if (cast(i64, data) != 0) { xlib.XFree(data); }
+    check("no bell before it is rung", bell_heard(watcher, &w, 300) == 0);
+    check("the bell rung", device.bell(&w) == 1);
+    check("the server told it as an XkbBellNotify", bell_heard(watcher, &w, 3000) == 1);
+    // Brought forward for another start that handed its ID over: that
+    // start's launch feedback ended too, as the listener hears.
+    check("brought forward with another start's ID", device.activate_with(&w, "caustic-other_TIME77", 20) == 1);
+    // The time an ID says: "_TIME" and digits at its very end, a 32-bit
+    // server time; anything else none (0, "now").
+    device.activate_with(&w, "plain", 5);
+    device.activate_with(&w, "no-digits_TIME", 14);
+    device.activate_with(&w, "x_TIME4294967296", 16);
+    device.activate_with(&w, "xTIME5", 6);
+    device.activate_with(&w, "y_TIME4294967295", 16);
+    device.activate_with(&w, "z_TIME5x", 8);
+    device.activate_with(&w, "w_TIME100", 9);
+    device.activate_with(&w, "_TIME5", 6);
+    // One longer than any kept: asked for, no feedback said for it; the
+    // longest kept: said.
+    let is [300]u8 as longest with mut;
+    mem.memset(&longest[0], 108, 256);
+    device.activate_with(&w, &longest[0], 256);
+    device.activate_with(&w, &longest[0], 255);
+    // Spaces, quotes and backslashes escaped as the spec quotes them.
+    device.activate_with(&w, "s p\"q\\r", 7);
+    check("none without its text", device.activate_with(&w, "", 0) == 0);
+    let is i32 as heard_all = wait(again);
+    n = read_file(said, &heard_text[0], 4096);
+    // Each _NET_ACTIVE_WINDOW from an application (1) at its time, then that
+    // start's feedback ended.
+    let is [1600]u8 as expected with mut;
+    let is *u8 as first_part = "listening\nactive 1 77\nremove: ID=caustic-other_TIME77\nactive 1 0\nremove: ID=plain\nactive 1 0\nremove: ID=no-digits_TIME\nactive 1 0\nremove: ID=x_TIME4294967296\nactive 1 0\nremove: ID=xTIME5\nactive 1 4294967295\nremove: ID=y_TIME4294967295\nactive 1 0\nremove: ID=z_TIME5x\nactive 1 100\nremove: ID=w_TIME100\nactive 1 5\nremove: ID=_TIME5\nactive 1 0\nactive 1 0\nremove: ID=";
+    let is i64 as en with mut = 0;
+    while (first_part[en] != 0) { expected[en] = first_part[en]; en = en + 1; }
+    mem.memset(&expected[en], 108, 255);
+    en = en + 255;
+    let is *u8 as last_part = "\nactive 1 0\nremove: ID=s\\ p\\\"q\\\\r\n";
+    let is i64 as lk with mut = 0;
+    while (last_part[lk] != 0) { expected[en] = last_part[lk]; en = en + 1; lk = lk + 1; }
+    expected[en] = 0;
+    check("the window manager asked at each time the IDs say, each start's feedback over, nothing else said",
+          heard_all == 0 && contains(&heard_text[0], n, &expected[0]) == 1);
+    if (contains(&heard_text[0], n, "remove: ID=s") == 0) { io.printf("  heard:\n%s\n", &heard_text[0]); }
+    linux.unlink(said);
+    device.close(&w);
+    xlib.XCloseDisplay(watcher);
+    // The handle a portal reads, for ids with every hex digit between them
+    // (the server's own here have few): "x11:" and the id in lower-case hex.
+    let is device.Window as named with mut;
+    mem.memzero(cast(*u8, &named), sizeof(device.Window));
+    named.ok = 1;
+    named.backend = device.X11;
+    named.x11_win.xid = 2023406814;   // 0x789abcde
+    let is [32]u8 as handle;
+    check("x11: and the id in hex", device.parent_handle(&named, &handle[0], 24) == 12 &&
+          mem.memcmp(&handle[0], "x11:789abcde", 13) == 0);
+    named.x11_win.xid = 4027724886;   // 0xf0123456
+    check("the other digits", device.parent_handle(&named, &handle[0], 24) == 12 &&
+          mem.memcmp(&handle[0], "x11:f0123456", 13) == 0);
+    named.x11_win.xid = 19088743;     // 0x1234567
+    check("no leading zero", device.parent_handle(&named, &handle[0], 24) == 11 &&
+          mem.memcmp(&handle[0], "x11:1234567", 12) == 0);
+    check("not where the longest would not fit", device.parent_handle(&named, &handle[0], 23) == 0);
+    if (fails == 0) { io.printf("x11 desktop: all checks passed\n"); return 0; }
+    io.printf("x11 desktop: %d failures\n", fails);
+    return 1;
+}

@@ -2,11 +2,14 @@
 // its id on the session bus is the application; a later start finds it,
 // hands over what it was asked and leaves. On a private bus:
 //   sh dbus/tools/run_dbus.sh ./build/instance_test
-// The later start is a child process.
+// The later start is a child process; one started with the launcher's
+// tokens in its environment is this test again (mode `token`), and gdbus
+// plays a launcher calling the instance with platform_data of its own.
 use "std/io.cst" as io;
 use "std/env.cst" as env;
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
+use "std/process.cst" as process;
 use "std/os/linux.cst" as linux;
 use "../dbus/dbus.cst" as dbus;
 use "instance.cst" as instance;
@@ -35,9 +38,20 @@ let is i64 as uris_n with mut = 0;
 let is [64]u8 as action with mut;
 let is i64 as action_n with mut = 0;
 
-fn on_activate(user as *u8) as void { activated = activated + 1; }
+let is [256]u8 as token_seen with mut;
+let is i64 as token_seen_n with mut = 0 - 1;
+let is instance.Instance as first with mut;
+
+// What the current call came with, kept as each callback sees it.
+fn seen() as void {
+    token_seen_n = instance.token_length(&first);
+    if (token_seen_n > 0) { mem.memcpy(cast(*u8, &token_seen), instance.token(&first), token_seen_n + 1); }
+}
+
+fn on_activate(user as *u8) as void { activated = activated + 1; seen(); }
 
 fn on_open(user as *u8, s as *u8, n as i64, count as i64) as void {
+    seen();
     opened = count;
     opens = opens + 1;
     uris_n = n;
@@ -46,6 +60,7 @@ fn on_open(user as *u8, s as *u8, n as i64, count as i64) as void {
 }
 
 fn on_action(user as *u8, name as *u8, n as i64) as void {
+    seen();
     if (n > 64) { return; }
     mem.memcpy(cast(*u8, &action), name, n);
     action_n = n;
@@ -125,12 +140,45 @@ fn run_later(c as *dbus.conn.Conn) as i32 {
     return status;
 }
 
+// A start with the launcher's tokens in its environment (mode `token`):
+// the instance asked to come forward, the tokens handed over and gone from
+// its environment.
+fn later_with_tokens() as i32 {
+    let is dbus.conn.Limits as l = dbus.conn.limits_default();
+    let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
+    if (dbus.conn.is_open(&c) == 0) { return 2; }
+    if (instance.activate_remote(&c, ID, 20) != 1) { return 3; }
+    if (cast(i64, env.getenv("XDG_ACTIVATION_TOKEN")) != 0 || cast(i64, env.getenv("DESKTOP_STARTUP_ID")) != 0) { return 4; }
+    dbus.conn.close(&c);
+    return 0;
+}
+
+// sh -c cmd, $0 a0, the instance dispatching meanwhile: its status.
+fn run_sh(c as *dbus.conn.Conn, cmd as *u8, a0 as *u8) as i32 {
+    let is [5]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd); argv[3] = cast(i64, a0); argv[4] = 0;
+    let is i64 as pid = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (pid <= 0) { return 0 - 1; }
+    let is i32 as status with mut = 0;
+    let is i64 as until = time.now_ms() + 10000;
+    while (time.now_ms() < until) {
+        dbus.conn.dispatch(c, 20);
+        if (linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) {
+            dbus.conn.dispatch(c, 50);
+            return process.exit_code_of(status);
+        }
+    }
+    return 0 - 1;
+}
+
+fn token_is(s as *u8) as i32 { return same(cast(*u8, &token_seen), token_seen_n, s); }
+
 fn main(argc as i64, argv as *u8) as i32 {
     env.init(argc, argv);
+    if (env.argc() > 1 && env.argv(1)[0] == 116) { return cast(i32, later_with_tokens()); }
     let is dbus.conn.Limits as l = dbus.conn.limits_default();
     let is dbus.conn.Conn as c with mut = dbus.conn.open_session(&l);
     check("a session bus", dbus.conn.is_open(&c) == 1);
-    let is instance.Instance as first with mut;
     check("the first: the instance", instance.claim(&first, &c, ID, 20, fn_ptr(on_activate), fn_ptr(on_open), fn_ptr(on_action),
           cast(*u8, 0)) == 1 && instance.is_primary(&first) == 1);
     check("its object where the specification puts it", same(instance.path(&first), instance.path_length(&first),
@@ -166,6 +214,35 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as opens_before = opens;
     check("an id of 255: asked of it; longer or none: not", run_later(&c) == 0 && activated == 1 &&
           opens == opens_before + 1 && same(cast(*u8, &action), action_n, "go") == 1);
+
+    // --- What a launched start comes forward with ---
+    check("a start with both tokens: the activation one handed over, both gone from its environment",
+          run_sh(&c, "XDG_ACTIVATION_TOKEN=tok-a DESKTOP_STARTUP_ID=id-b_TIME9 exec \"$0\" token", env.argv(0)) == 0 &&
+          token_is("tok-a") == 1);
+    check("with a startup ID only: that",
+          run_sh(&c, "DESKTOP_STARTUP_ID=id-c_TIME7 exec \"$0\" token", env.argv(0)) == 0 && token_is("id-c_TIME7") == 1);
+    check("with none: none", run_sh(&c, "exec env -u XDG_ACTIVATION_TOKEN -u DESKTOP_STARTUP_ID \"$0\" token", env.argv(0)) == 0 &&
+          token_seen_n == 0);
+    // gdbus as a launcher, its platform_data its own: the startup ID first
+    // and something else between, the activation token preferred all the same.
+    check("a launcher's Activate: its activation token", run_sh(&c,
+          "exec gdbus call --session --dest org.caustic.Test-App --object-path /org/caustic/Test_App --method org.freedesktop.Application.Activate \"{'desktop-startup-id': <'g_TIME1'>, 'other': <42>, 'activation-token': <'from-gdbus'>}\" >/dev/null",
+          cast(*u8, 0)) == 0 && token_is("from-gdbus") == 1);
+    check("its Open: the token, and the file", run_sh(&c,
+          "exec gdbus call --session --dest org.caustic.Test-App --object-path /org/caustic/Test_App --method org.freedesktop.Application.Open \"['file:///x']\" \"{'activation-token': <'open-tok'>}\" >/dev/null",
+          cast(*u8, 0)) == 0 && token_is("open-tok") == 1 && opened == 1 && same(cast(*u8, &uris), uris_n, "file:///x") == 1);
+    check("its action, a parameter before the startup ID", run_sh(&c,
+          "exec gdbus call --session --dest org.caustic.Test-App --object-path /org/caustic/Test_App --method org.freedesktop.Application.ActivateAction go \"[<'p'>, <3>]\" \"{'desktop-startup-id': <'act_TIME3'>}\" >/dev/null",
+          cast(*u8, 0)) == 0 && token_is("act_TIME3") == 1 && same(cast(*u8, &action), action_n, "go") == 1);
+    check("a token that is not a string: none", run_sh(&c,
+          "exec gdbus call --session --dest org.caustic.Test-App --object-path /org/caustic/Test_App --method org.freedesktop.Application.Activate \"{'activation-token': <7>}\" >/dev/null",
+          cast(*u8, 0)) == 0 && token_seen_n == 0);
+    check("a token of 255 bytes: kept", run_sh(&c,
+          "t=$(printf 'a%.0s' $(seq 255)); exec gdbus call --session --dest org.caustic.Test-App --object-path /org/caustic/Test_App --method org.freedesktop.Application.Activate \"{'activation-token': <'$t'>}\" >/dev/null",
+          cast(*u8, 0)) == 0 && token_seen_n == 255 && token_seen[254] == 97 && token_seen[255] == 0);
+    check("of 256: none", run_sh(&c,
+          "t=$(printf 'a%.0s' $(seq 256)); exec gdbus call --session --dest org.caustic.Test-App --object-path /org/caustic/Test_App --method org.freedesktop.Application.Activate \"{'activation-token': <'$t'>}\" >/dev/null",
+          cast(*u8, 0)) == 0 && token_seen_n == 0);
     instance.release(&longest);
 
     instance.release(&first);
