@@ -1,0 +1,269 @@
+// window/win32/filedialog.cst — Windows' own file dialog: IFileOpenDialog
+// and IFileSaveDialog, the Common Item Dialog every Windows program since
+// Vista shows.
+//
+// The Linux desktop's own is the portal's (window/linux/filechooser.cst),
+// answered later over D-Bus; this one is modal, its owner window disabled
+// while it is shown, and answers when it is closed: open_file and
+// save_file return with the request's state CHOSEN, CANCELLED or FAILED.
+// The same options and filters as the portal's — patterns as our own
+// chooser has them, "*.txt;*.md" — and the same answer: the paths chosen,
+// UTF-8 with '/' between their parts ("C:/Users/me/notes.txt", as
+// sys/file.cst has paths), and the filter left chosen. Only files and
+// folders of the file system are offered (FOS_FORCEFILESYSTEM): a path is
+// what the program reads.
+//
+// IFileSaveDialog derives from IFileDialog as IFileOpenDialog does, and the
+// two share its slots — everything up to GetResult — so one pointer to
+// either is driven through IFileOpenDialog's: only GetResults is the open
+// dialog's own.
+use "std/mem.cst" as mem;
+use "abi.cst" as abi;
+use "bind/types.cst" as t;
+use "bind/guids.cst" as ids;
+use "bind/com.cst" as com;
+use "bind/kernel32.cst" as k;
+use "bind/ole32.cst" as ole;
+use "bind/shell32.cst" as shell;
+
+// What became of a request, as the portal's.
+let is i32 as WAITING   with imut = 0;
+let is i32 as CHOSEN    with imut = 1;
+let is i32 as CANCELLED with imut = 2;
+let is i32 as FAILED    with imut = 3;   // not shown, or it ended some other way
+
+let is i64 as MAX_FILTERS with imut = 8;
+let is i64 as MAX_PATHS   with imut = 128;
+let is i64 as PATH_BYTES  with imut = 32768;
+
+// HRESULT_FROM_WIN32(ERROR_CANCELLED): the person closed it.
+let is i32 as _CANCELLED with imut = 0 - 2147023673;
+
+// What the dialog is asked to be. Texts are the program's, read when asked.
+struct Options {
+    accept     as *u8;   // the button's label, null for Windows' own
+    accept_len as i64;
+    multiple   as i32;   // opening: more than one file
+    directory  as i32;   // opening: a folder, not files
+    folder     as *u8;   // where it starts, null for Windows' choice
+    folder_len as i64;
+    name       as *u8;   // saving: the name proposed
+    name_len   as i64;
+    nf         as i64;   // filters
+    fname      as [8]*u8;
+    fname_len  as [8]i64;
+    fpat       as [8]*u8;
+    fpat_len   as [8]i64;
+    current    as i64;   // the filter chosen at first, -1 for the first
+}
+
+fn options() as Options {
+    let is Options as o;
+    mem.memzero(cast(*u8, &o), sizeof(Options));
+    o.current = 0 - 1;
+    return o;
+}
+
+// A filter named s (n bytes) of patterns ("*.txt;*.md"): its index, -1 when
+// there are MAX_FILTERS already.
+fn add_filter(o as *Options, s as *u8, n as i64, patterns as *u8, pn as i64) as i64 {
+    if (o.nf >= MAX_FILTERS) { return 0 - 1; }
+    o.fname[o.nf] = s;
+    o.fname_len[o.nf] = n;
+    o.fpat[o.nf] = patterns;
+    o.fpat_len[o.nf] = pn;
+    o.nf = o.nf + 1;
+    return o.nf - 1;
+}
+
+// The answer: the paths, back to back in blob, each zero-terminated.
+struct Request {
+    state  as i32;
+    _pad   as i32;
+    n      as i64;
+    filter as i64;          // the filter left chosen, -1 for none
+    used   as i64;
+    at     as [128]i64;
+    len    as [128]i64;
+    blob   as [32768]u8;
+}
+
+fn state(q as *Request) as i32 { return q.state; }
+
+fn count(q as *Request) as i64 { return q.n; }
+
+// Path i into out (cap bytes, zero-terminated): its length, 0 when there is
+// no such path or it does not fit.
+fn path(q as *Request, i as i64, out as *u8, cap as i64) as i64 {
+    if (i < 0 || i >= q.n || q.len[i] + 1 > cap) { return 0; }
+    mem.memcpy(out, cast(*u8, cast(i64, &q.blob) + q.at[i]), q.len[i] + 1);
+    return q.len[i];
+}
+
+fn filter_index(q as *Request) as i64 { return q.filter; }
+
+// --- Asked ---
+
+// s, n bytes of UTF-8, into out (cap units) as UTF-16 with its zero; null
+// s: nothing. 1, or 0 when it does not fit.
+fn _wide(s as *u8, n as i64, out as *u16, cap as i32) as i32 {
+    if (n <= 0) {
+        out[0] = cast(u16, 0);
+        return 1;
+    }
+    let is i32 as m = k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, s), cast(i32, n), out, cap - 1);
+    if (m <= 0) { return 0; }
+    out[m] = cast(u16, 0);
+    return 1;
+}
+
+// The patterns at p (pn bytes) as Windows has them: ';' between them, the
+// spaces our chooser also splits at as ';'.
+fn _spec(p as *u8, pn as i64, out as *u16, cap as i32) as i32 {
+    if (_wide(p, pn, out, cap) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (out[i] != cast(u16, 0)) {
+        if (out[i] == cast(u16, 32)) { out[i] = cast(u16, 59); }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The item's file system path, as UTF-8 with '/', added to q: 1, or 0.
+fn _add_item(q as *Request, item as *t.IShellItem) as i32 {
+    if (q.n >= MAX_PATHS) { return 0; }
+    let is *u16 as wide with mut = cast(*u16, 0);
+    if (com.IShellItem_GetDisplayName(item, cast(i32, t.SIGDN_FILESYSPATH), &wide) < 0 || cast(i64, wide) == 0) { return 0; }
+    let is *u8 as out = cast(*u8, cast(i64, &q.blob) + q.used);
+    let is i32 as m = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, wide, cast(i32, 0 - 1), cast(*i8, out),
+                                            cast(i32, PATH_BYTES - q.used), cast(*i8, 0), cast(*i32, 0));
+    ole.CoTaskMemFree(cast(*u8, wide));
+    if (m <= 0) { return 0; }
+    let is i64 as n = cast(i64, m) - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (out[i] == cast(u8, 92)) { out[i] = cast(u8, 47); }
+        i = i + 1;
+    }
+    q.at[q.n] = q.used;
+    q.len[q.n] = n;
+    q.used = q.used + n + 1;
+    q.n = q.n + 1;
+    return 1;
+}
+
+fn _show(owner as i64, save as i32, title as *u8, tn as i64, o as *Options, q as *Request) as i32 {
+    mem.memzero(cast(*u8, q), sizeof(Request));
+    q.state = FAILED;
+    q.filter = 0 - 1;
+    // The dialog is COM's: this thread an apartment of it (already one, as
+    // the toolkit's OLE drag and drop makes it, is as good).
+    let is i32 as init = ole.CoInitializeEx(cast(*u8, 0), cast(u32, t.COINIT_APARTMENTTHREADED));
+    let is t.GUID as cls with mut = ids.CLSID_FileOpenDialog();
+    let is t.GUID as iid with mut = ids.IID_IFileOpenDialog();
+    if (save == 1) {
+        cls = ids.CLSID_FileSaveDialog();
+        iid = ids.IID_IFileSaveDialog();
+    }
+    let is *u8 as ptr with mut = cast(*u8, 0);
+    if (ole.CoCreateInstance(&cls, cast(*t.IUnknown, 0), cast(u32, t.CLSCTX_INPROC_SERVER), &iid, &ptr) < 0 || cast(i64, ptr) == 0) {
+        if (init >= 0) { ole.CoUninitialize(); }
+        return 0;
+    }
+    let is *t.IFileOpenDialog as d = cast(*t.IFileOpenDialog, ptr);
+    let is u32 as opts with mut = cast(u32, 0);
+    com.IFileOpenDialog_GetOptions(d, &opts);
+    opts = opts | cast(u32, t.FOS_FORCEFILESYSTEM);
+    if (save == 1) { opts = opts | cast(u32, t.FOS_OVERWRITEPROMPT); }
+    if (save == 0 && o.multiple == 1) { opts = opts | cast(u32, t.FOS_ALLOWMULTISELECT); }
+    if (save == 0 && o.directory == 1) { opts = opts | cast(u32, t.FOS_PICKFOLDERS); }
+    com.IFileOpenDialog_SetOptions(d, opts);
+    let is [1024]u16 as w;
+    if (tn > 0 && _wide(title, tn, &w[0], 1024) == 1) { com.IFileOpenDialog_SetTitle(d, &w[0]); }
+    if (o.accept_len > 0 && _wide(o.accept, o.accept_len, &w[0], 1024) == 1) { com.IFileOpenDialog_SetOkButtonLabel(d, &w[0]); }
+    if (o.name_len > 0 && _wide(o.name, o.name_len, &w[0], 1024) == 1) { com.IFileOpenDialog_SetFileName(d, &w[0]); }
+    if (o.folder_len > 0 && _wide(o.folder, o.folder_len, &w[0], 1024) == 1) {
+        // A parsing name: the shell takes '\' only, unlike the file calls.
+        let is i64 as i with mut = 0;
+        while (w[i] != cast(u16, 0)) {
+            if (w[i] == cast(u16, 47)) { w[i] = cast(u16, 92); }
+            i = i + 1;
+        }
+        let is t.GUID as item_id = ids.IID_IShellItem();
+        let is *u8 as item with mut = cast(*u8, 0);
+        if (shell.SHCreateItemFromParsingName(&w[0], cast(*u8, 0), &item_id, &item) >= 0 && cast(i64, item) != 0) {
+            com.IFileOpenDialog_SetFolder(d, cast(*t.IShellItem, item));
+            com.IShellItem_Release(cast(*t.IShellItem, item));
+        }
+    }
+    // Filters: names and specs alive until Show returns.
+    if (o.nf > 0 && o.directory == 0) {
+        let is [8]t.COMDLG_FILTERSPEC as specs;
+        let is [8][128]u16 as names;
+        let is [8][512]u16 as pats;
+        let is i64 as i with mut = 0;
+        while (i < o.nf) {
+            _wide(o.fname[i], o.fname_len[i], &names[i][0], 128);
+            _spec(o.fpat[i], o.fpat_len[i], &pats[i][0], 512);
+            specs[i].pszName = &names[i][0];
+            specs[i].pszSpec = &pats[i][0];
+            i = i + 1;
+        }
+        com.IFileOpenDialog_SetFileTypes(d, cast(u32, o.nf), &specs[0]);
+        if (o.current >= 0 && o.current < o.nf) { com.IFileOpenDialog_SetFileTypeIndex(d, cast(u32, o.current + 1)); }
+        let is i32 as shown = com.IFileOpenDialog_Show(d, owner);
+        _answer(d, save, shown, o, q);
+    } else {
+        _answer(d, save, com.IFileOpenDialog_Show(d, owner), o, q);
+    }
+    com.IFileOpenDialog_Release(d);
+    if (init >= 0) { ole.CoUninitialize(); }
+    return 1;
+}
+
+// What Show said, and what was chosen, into q.
+fn _answer(d as *t.IFileOpenDialog, save as i32, shown as i32, o as *Options, q as *Request) as void {
+    if (shown == _CANCELLED) {
+        q.state = CANCELLED;
+        return;
+    }
+    if (shown < 0) { return; }
+    if (save == 0) {
+        let is *t.IShellItemArray as items with mut = cast(*t.IShellItemArray, 0);
+        if (com.IFileOpenDialog_GetResults(d, &items) < 0 || cast(i64, items) == 0) { return; }
+        let is u32 as n with mut = cast(u32, 0);
+        com.IShellItemArray_GetCount(items, &n);
+        let is u32 as i with mut = cast(u32, 0);
+        while (i < n) {
+            let is *t.IShellItem as item with mut = cast(*t.IShellItem, 0);
+            if (com.IShellItemArray_GetItemAt(items, i, &item) >= 0 && cast(i64, item) != 0) {
+                _add_item(q, item);
+                com.IShellItem_Release(item);
+            }
+            i = i + cast(u32, 1);
+        }
+        com.IShellItemArray_Release(items);
+    } else {
+        let is *t.IShellItem as item with mut = cast(*t.IShellItem, 0);
+        if (com.IFileOpenDialog_GetResult(d, &item) < 0 || cast(i64, item) == 0) { return; }
+        _add_item(q, item);
+        com.IShellItem_Release(item);
+    }
+    if (o.nf > 0 && o.directory == 0) {
+        let is u32 as fi with mut = cast(u32, 0);
+        if (com.IFileOpenDialog_GetFileTypeIndex(d, &fi) >= 0 && fi > cast(u32, 0)) { q.filter = cast(i64, fi) - 1; }
+    }
+    if (q.n > 0) { q.state = CHOSEN; }
+}
+
+// The open dialog shown above owner (an HWND, 0 for none), titled title (tn
+// bytes), as o says; answered into q when it closes. 1 when it was shown.
+fn open_file(owner as i64, title as *u8, tn as i64, o as *Options, q as *Request) as i32 {
+    return _show(owner, 0, title, tn, o, q);
+}
+
+// The save dialog, the same way: one path, Windows asking before a file
+// there is replaced.
+fn save_file(owner as i64, title as *u8, tn as i64, o as *Options, q as *Request) as i32 {
+    return _show(owner, 1, title, tn, o, q);
+}

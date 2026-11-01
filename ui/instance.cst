@@ -19,9 +19,24 @@
 // instance keeps what each call came with (token), for its window to come
 // forward with (host.present_with) rather than be refused as a window
 // stealing the keyboard.
+//
+// Windows has no session bus: there the id is a named mutex
+// ("Local\CausticMediaInstance.<id>"), whose first creator is the
+// instance, and the instance a message-only window named the id, which a
+// later start finds (FindWindowExW under HWND_MESSAGE) and hands what it was
+// asked with WM_COPYDATA — 1 to come forward, 2 the uris back to back, 3 an
+// action's name. Before it does, it lets the instance take the foreground
+// (AllowSetForegroundWindow), Windows' way of a start's token; the
+// connection is not used and token is always empty there. The window's
+// messages come through the program's loop, as its other windows' do.
+use "std/os.cst" as os;
 use "std/mem.cst" as mem;
 use "../dbus/dbus.cst" as dbus;
 use "../window/linux/launch.cst" as launch;
+use "../window/win32/abi.cst" as abi;
+use "../window/win32/bind/types.cst" as t;
+use "../window/win32/bind/kernel32.cst" as k32;
+use "../window/win32/bind/user32.cst" as u;
 
 let is *u8 as IFACE with imut = "org.freedesktop.Application";
 
@@ -55,6 +70,8 @@ struct Instance {
     uris     as [8192]u8;
     token    as [256]u8;     // the current call's, zero-terminated
     token_n  as i64;
+    mutex    as i64;         // Windows: the id's mutex, and the window it is reached at
+    hwnd     as i64;
 }
 
 // The object path of id, n bytes, into out (n + 2 bytes): its length.
@@ -168,10 +185,18 @@ fn claim(inst as *Instance, c as *dbus.conn.Conn, id as *u8, n as i64, on_activa
     inst.user = user;
     inst.token_n = 0;
     inst.token[0] = cast(u8, 0);
+    inst.mutex = 0;
+    inst.hwnd = 0;
     if (n <= 0 || n > 255) { return 0; }
     mem.memcpy(cast(*u8, &inst.id), id, n);
     inst.id[n] = cast(u8, 0);
     inst.path_n = _path_of(id, n, cast(*u8, &inst.path));
+    if (os.current() == os.OS_WINDOWS) { return _claim_windows(inst); }
+    if (os.current() == os.OS_LINUX) { return _claim_bus(inst, c); }
+    return 0;
+}
+
+fn _claim_bus(inst as *Instance, c as *dbus.conn.Conn) as i32 {
     if (dbus.conn.request_name(c, cast(*u8, &inst.id), _DO_NOT_QUEUE) != _PRIMARY_OWNER) { return 0; }
     _method(&inst.methods[0], "Activate", "a{sv}", fn_ptr(_activate), "platform_data");
     _method(&inst.methods[1], "Open", "asa{sv}", fn_ptr(_open), "uris,platform_data");
@@ -197,6 +222,15 @@ fn path_length(inst as *Instance) as i64 { return inst.path_n; }
 // No longer the instance: the name and the object let go.
 fn release(inst as *Instance) as void {
     if (inst.primary == 0) { return; }
+    if (os.current() == os.OS_WINDOWS) {
+        u.SetWindowLongPtrW(inst.hwnd, cast(i32, t.GWLP_USERDATA), 0);
+        u.DestroyWindow(inst.hwnd);
+        k32.CloseHandle(inst.mutex);
+        inst.hwnd = 0;
+        inst.mutex = 0;
+        inst.primary = 0;
+        return;
+    }
     dbus.conn.unexport(inst.c, cast(*u8, &inst.path));
     dbus.conn.release_name(inst.c, cast(*u8, &inst.id));
     inst.primary = 0;
@@ -244,6 +278,7 @@ fn _call(c as *dbus.conn.Conn, m as *dbus.message.Message) as i32 {
 // The instance of id, n bytes, asked to come forward: 1 when it answered.
 fn activate_remote(c as *dbus.conn.Conn, id as *u8, n as i64) as i32 {
     if (n <= 0 || n > 255) { return 0; }
+    if (os.current() == os.OS_WINDOWS) { return _send(id, n, _ACTIVATE, cast(*u8, 0), 0); }
     let is [256]u8 as name;
     let is [258]u8 as p;
     let is dbus.message.Message as m with mut = _message(id, n, "Activate", "a{sv}", cast(*u8, &name), cast(*u8, &p));
@@ -255,6 +290,18 @@ fn activate_remote(c as *dbus.conn.Conn, id as *u8, n as i64) as i32 {
 // zero-terminated, n bytes in all: 1 when it answered.
 fn open_remote(c as *dbus.conn.Conn, id as *u8, n as i64, s as *u8, sn as i64, count as i64) as i32 {
     if (n <= 0 || n > 255) { return 0; }
+    if (os.current() == os.OS_WINDOWS) {
+        // The first count of them, each with its zero.
+        let is i64 as i with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < count && i < sn) {
+            while (i < sn && s[i] != 0) { i = i + 1; }
+            i = i + 1;
+            k = k + 1;
+        }
+        if (i > sn) { i = sn; }
+        return _send(id, n, _OPEN, s, i);
+    }
     let is [256]u8 as name;
     let is [258]u8 as p;
     let is dbus.message.Message as m with mut = _message(id, n, "Open", "asa{sv}", cast(*u8, &name), cast(*u8, &p));
@@ -278,6 +325,7 @@ fn open_remote(c as *dbus.conn.Conn, id as *u8, n as i64, s as *u8, sn as i64, c
 // 1 when it answered.
 fn action_remote(c as *dbus.conn.Conn, id as *u8, n as i64, action as *u8, an as i64) as i32 {
     if (n <= 0 || n > 255) { return 0; }
+    if (os.current() == os.OS_WINDOWS) { return _send(id, n, _ACTION, action, an); }
     let is [256]u8 as name;
     let is [258]u8 as p;
     let is dbus.message.Message as m with mut = _message(id, n, "ActivateAction", "sava{sv}", cast(*u8, &name), cast(*u8, &p));
@@ -288,4 +336,142 @@ fn action_remote(c as *dbus.conn.Conn, id as *u8, n as i64, action as *u8, an as
     dbus.wire.put_array_end(w, at, 1);
     _platform_data_out(w);
     return _call(c, &m);
+}
+
+// --- Windows ---
+
+let is u64 as _ACTIVATE with imut = 1;
+let is u64 as _OPEN     with imut = 2;
+let is u64 as _ACTION   with imut = 3;
+
+let is abi.Callbacks as _callbacks with mut;
+let is i32 as _class_ready with mut = 0;
+let is [32]u16 as _class with mut;
+
+// s, n bytes of UTF-8, after prefix into out (cap units) as UTF-16 with its
+// zero: 1, or 0 when it does not fit.
+fn _wide(prefix as *u8, s as *u8, n as i64, out as *u16, cap as i32) as i32 {
+    let is i32 as p = k32.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, prefix), cast(i32, 0 - 1), out, cap);
+    if (p <= 0) { return 0; }
+    let is i32 as at = p - 1;
+    let is i32 as m = k32.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, s), cast(i32, n), cast(*u16, cast(i64, out) + cast(i64, at) * 2),
+                                              cap - at - 1);
+    if (m <= 0 && n > 0) { return 0; }
+    *cast(*u16, cast(i64, out) + cast(i64, at + m) * 2) = cast(u16, 0);
+    return 1;
+}
+
+// A start's message to the instance's window: what it asked handed to its
+// callbacks; TRUE that it was heard.
+fn _proc(ctx as *u8, args as *u64) as i64 {
+    let is i64 as hwnd = cast(i64, args[0]);
+    let is u32 as msg = cast(u32, args[1]);
+    let is u64 as wp = args[2];
+    let is i64 as lp = cast(i64, args[3]);
+    if (cast(i64, msg) != t.WM_COPYDATA) { return u.DefWindowProcW(hwnd, msg, wp, lp); }
+    let is *Instance as inst = cast(*Instance, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA)));
+    if (cast(i64, inst) == 0) { return 0; }
+    let is *t.COPYDATASTRUCT as cd = cast(*t.COPYDATASTRUCT, lp);
+    let is i64 as n with mut = cast(i64, cd.cbData);
+    inst.token_n = 0;
+    inst.token[0] = cast(u8, 0);
+    if (cd.dwData == _ACTIVATE) {
+        if (cast(i64, inst.activate) != 0) { call(inst.activate, inst.user); }
+        return 1;
+    }
+    if (cd.dwData == _OPEN) {
+        if (n > 8192) { n = 8192; }
+        mem.memcpy(cast(*u8, &inst.uris), cd.lpData, n);
+        // Counted by their zeros; the last one's not counted, as on the bus.
+        let is i64 as count with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            if (inst.uris[i] == 0) { count = count + 1; }
+            i = i + 1;
+        }
+        if (n > 0 && inst.uris[n - 1] == 0) { n = n - 1; }
+        if (cast(i64, inst.open) != 0) { call(inst.open, inst.user, cast(*u8, &inst.uris), n, count); }
+        return 1;
+    }
+    if (cd.dwData == _ACTION) {
+        if (n > 255) { n = 255; }
+        let is [256]u8 as name;
+        mem.memcpy(cast(*u8, &name), cd.lpData, n);
+        if (cast(i64, inst.action) != 0) { call(inst.action, inst.user, cast(*u8, &name), n); }
+        return 1;
+    }
+    return 0;
+}
+
+fn _ensure_class() as i32 {
+    if (_class_ready == 1) { return 1; }
+    k32.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, "CausticMediaInstance"), cast(i32, 0 - 1), &_class[0], 32);
+    // The class's procedure: made once, kept as long as the program runs.
+    _callbacks = abi.open(1);
+    if (cast(i64, _callbacks.code) == 0) { return 0; }
+    if (abi.put(&_callbacks, 0, fn_ptr(_proc), cast(*u8, 0), 4, 0) == 0 || abi.seal(&_callbacks) == 0) {
+        abi.close(&_callbacks);
+        return 0;
+    }
+    let is t.WNDCLASSEXW as wc;
+    mem.memzero(cast(*u8, &wc), sizeof(t.WNDCLASSEXW));
+    wc.cbSize = cast(u32, sizeof(t.WNDCLASSEXW));
+    wc.lpfnWndProc = abi.address(&_callbacks, 0);
+    wc.hInstance = k32.GetModuleHandleW(cast(*u16, 0));
+    wc.lpszClassName = &_class[0];
+    if (u.RegisterClassExW(&wc) == 0) {
+        abi.close(&_callbacks);
+        return 0;
+    }
+    _class_ready = 1;
+    return 1;
+}
+
+fn _claim_windows(inst as *Instance) as i32 {
+    let is [300]u16 as name;
+    let is i64 as n with mut = 0;
+    while (inst.id[n] != 0) { n = n + 1; }
+    if (_wide("Local\\CausticMediaInstance.", cast(*u8, &inst.id), n, &name[0], 300) == 0) { return 0; }
+    let is i64 as m = k32.CreateMutexW(cast(*u8, 0), 0, &name[0]);
+    if (m == 0) { return 0; }
+    if (cast(i64, k32.GetLastError()) == t.ERROR_ALREADY_EXISTS) {
+        k32.CloseHandle(m);
+        return 0;
+    }
+    let is [260]u16 as title;
+    if (_ensure_class() == 0 || _wide("", cast(*u8, &inst.id), n, &title[0], 260) == 0) {
+        k32.CloseHandle(m);
+        return 0;
+    }
+    let is i64 as hwnd = u.CreateWindowExW(0, &_class[0], &title[0], 0, 0, 0, 0, 0, t.HWND_MESSAGE, 0,
+                                           k32.GetModuleHandleW(cast(*u16, 0)), cast(*u8, 0));
+    if (hwnd == 0) {
+        k32.CloseHandle(m);
+        return 0;
+    }
+    u.SetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA), cast(i64, inst));
+    inst.mutex = m;
+    inst.hwnd = hwnd;
+    inst.primary = 1;
+    return 1;
+}
+
+// What kind asks — with the n bytes at s — sent to the instance of id (in
+// bytes): 1 when it heard it, 0 when there is none.
+fn _send(id as *u8, idn as i64, kind as u64, s as *u8, n as i64) as i32 {
+    if (_ensure_class() == 0) { return 0; }
+    let is [260]u16 as title;
+    if (_wide("", id, idn, &title[0], 260) == 0) { return 0; }
+    let is i64 as hwnd = u.FindWindowExW(t.HWND_MESSAGE, 0, &_class[0], &title[0]);
+    if (hwnd == 0) { return 0; }
+    // Its windows may come forward: this start's leave to, handed over.
+    let is u32 as pid with mut = cast(u32, 0);
+    u.GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != cast(u32, 0)) { u.AllowSetForegroundWindow(pid); }
+    let is t.COPYDATASTRUCT as cd;
+    mem.memzero(cast(*u8, &cd), sizeof(t.COPYDATASTRUCT));
+    cd.dwData = kind;
+    cd.cbData = cast(u32, n);
+    cd.lpData = s;
+    return cast(i32, u.SendMessageW(hwnd, cast(u32, t.WM_COPYDATA), cast(u64, 0), cast(i64, &cd)) == 1);
 }

@@ -1,7 +1,7 @@
 // ui/dirmodel.cst — a folder's entries as a flat model.
 //
 // What a file chooser lists: the entries of one folder, read with
-// getdents64 and stat — "." and ".." left out, as are names starting with a
+// sys/file.cst — "." and ".." left out, as are names starting with a
 // dot unless hidden ones are asked for (set_hidden), and files no pattern of
 // the filter matches (set_filter: "*.txt;*.md", '*' and '?' as the shell
 // has them, letters' case aside), or all files when only folders are wanted
@@ -14,19 +14,15 @@
 // once the program says which stand for a folder and a file (set_icons:
 // the toolkit's own, icons.cst, which this model does not draw). Rows are numbered from 1
 // in the order shown; reading another folder, or the same again, says a
-// reset. Linux for now: Windows lists folders with FindFirstFileW, which
-// comes with its window backend.
+// reset. Linux reads a folder with getdents64 and stat, Windows with
+// FindFirstFileW, where a hidden attribute hides an entry as a dot does.
 use "std/mem.cst" as mem;
-use "std/os/linux.cst" as linux;
+use "../sys/file.cst" as file;
 use "model.cst" as model;
 use "strings.cst" as strings;
 
 let is i64 as MAX_PATH   with imut = 4096;
 let is i64 as MAX_FILTER with imut = 256;
-
-let is i64 as _O_DIRECTORY with imut = 65536;
-let is i64 as _DT_DIR      with imut = 4;
-let is i64 as _DT_REG      with imut = 8;
 
 // An entry: its name in the blob, and what stat said.
 struct Ent {
@@ -267,6 +263,14 @@ fn _sort(d as *Dir, tmp as *Ent, lo as i64, hi as i64) as void {
                (hi - lo) * sizeof(Ent));
 }
 
+// How long the top of the path p, n bytes, is: "/" or a drive's "C:/"
+// (file.root); a relative path's first byte stands for it.
+fn _top(p as *u8, n as i64) as i64 {
+    let is i64 as r = file.root(p, n);
+    if (r == 0) { return 1; }
+    return r;
+}
+
 // The folder at p, n bytes, read into d: 1, or 0 when it cannot be opened,
 // d as it was.
 fn _read(d as *Dir, p as *u8, n as i64) as i32 {
@@ -274,58 +278,32 @@ fn _read(d as *Dir, p as *u8, n as i64) as i32 {
     let is [4096]u8 as at;
     mem.memcpy(cast(*u8, &at), p, n);
     at[n] = cast(u8, 0);
-    let is i64 as fd = linux.open(cast(*u8, &at), _O_DIRECTORY, 0);
-    if (fd < 0) { return 0; }
+    let is file.Lister as l;
+    if (file.open_dir(&l, cast(*u8, &at)) == 0) { return 0; }
     _free(d);
-    let is [8192]u8 as buf;
-    let is [4096]u8 as child;
-    let is i64 as base with mut = n;
-    mem.memcpy(cast(*u8, &child), p, n);
-    if (child[n - 1] != cast(u8, 47)) {
-        child[n] = cast(u8, 47);
-        base = n + 1;
-    }
-    let is i64 as got with mut = linux.getdents64(fd, cast(*u8, &buf), 8192);
-    while (got > 0) {
-        let is i64 as pos with mut = 0;
-        while (pos < got) {
-            let is i64 as e = cast(i64, &buf) + pos;
-            let is i64 as reclen = cast(i64, *cast(*u8, e + 16)) + cast(i64, *cast(*u8, e + 17)) * 256;
-            let is i64 as kind = cast(i64, *cast(*u8, e + 18));
-            let is *u8 as nm = cast(*u8, e + 19);
-            let is i64 as nl with mut = 0;
-            while (nm[nl] != 0) { nl = nl + 1; }
-            let is i32 as dots = cast(i32, (nl == 1 && nm[0] == cast(u8, 46)) || (nl == 2 && nm[0] == cast(u8, 46) && nm[1] == cast(u8, 46)));
-            let is i32 as hidden = cast(i32, nl > 0 && nm[0] == cast(u8, 46));
-            if (dots == 0 && (hidden == 0 || d.hidden == 1) && base + nl < MAX_PATH) {
-                mem.memcpy(cast(*u8, cast(i64, &child) + base), nm, nl + 1);
-                let is [144]u8 as st;
-                let is i64 as size with mut = 0;
-                let is i64 as mtime with mut = 0;
-                let is i64 as dir with mut = cast(i64, kind == _DT_DIR);
-                if (linux.stat(cast(*u8, &child), cast(*u8, &st)) == 0) {
-                    let is i64 as mode = cast(i64, *cast(*u32, cast(i64, &st) + 24));
-                    dir = cast(i64, (mode & 61440) == 16384);
-                    size = *cast(*i64, cast(i64, &st) + 48);
-                    mtime = *cast(*i64, cast(i64, &st) + 88);
-                }
-                let is i32 as wanted = cast(i32, dir == 1 || (d.folders == 0 && _passes(d, nm, nl) == 1));
-                if (wanted == 1 && _room(d, d.n + 1, d.bn + nl) == 1) {
-                    d.ents[d.n].at = d.bn;
-                    d.ents[d.n].len = nl;
-                    d.ents[d.n].size = size;
-                    d.ents[d.n].mtime = mtime;
-                    d.ents[d.n].dir = dir;
-                    mem.memcpy(cast(*u8, cast(i64, d.blob) + d.bn), nm, nl);
-                    d.bn = d.bn + nl;
-                    d.n = d.n + 1;
-                }
+    let is [1024]u8 as nm;
+    let is file.Info as info;
+    let is i64 as nl with mut = file.next(&l, cast(*u8, &nm), 1024, &info);
+    while (nl >= 0) {
+        // Hidden by a leading dot, and on Windows by its attribute too.
+        let is i32 as hidden = cast(i32, (nl > 0 && nm[0] == cast(u8, 46)) || info.hidden == 1);
+        if (hidden == 0 || d.hidden == 1) {
+            let is i64 as dir = cast(i64, info.kind == file.DIR);
+            let is i32 as wanted = cast(i32, dir == 1 || (d.folders == 0 && _passes(d, cast(*u8, &nm), nl) == 1));
+            if (wanted == 1 && _room(d, d.n + 1, d.bn + nl) == 1) {
+                d.ents[d.n].at = d.bn;
+                d.ents[d.n].len = nl;
+                d.ents[d.n].size = info.size;
+                d.ents[d.n].mtime = info.mtime;
+                d.ents[d.n].dir = dir;
+                mem.memcpy(cast(*u8, cast(i64, d.blob) + d.bn), cast(*u8, &nm), nl);
+                d.bn = d.bn + nl;
+                d.n = d.n + 1;
             }
-            pos = pos + reclen;
         }
-        got = linux.getdents64(fd, cast(*u8, &buf), 8192);
+        nl = file.next(&l, cast(*u8, &nm), 1024, &info);
     }
-    linux.close(fd);
+    file.close_dir(&l);
     if (d.n > 1) {
         let is *u8 as tmp = mem.core.mmap_anon(d.n * sizeof(Ent));
         if (cast(i64, tmp) > 0) {
@@ -333,9 +311,10 @@ fn _read(d as *Dir, p as *u8, n as i64) as i32 {
             mem.core.munmap(tmp, d.n * sizeof(Ent));
         }
     }
-    // The path kept, a slash at its end only for the top.
+    // The path kept, a slash at its end only for the top ("/", "C:/").
     let is i64 as k with mut = n;
-    while (k > 1 && p[k - 1] == cast(u8, 47)) { k = k - 1; }
+    let is i64 as top = _top(p, n);
+    while (k > top && p[k - 1] == cast(u8, 47)) { k = k - 1; }
     mem.memcpy(cast(*u8, &d.path), p, k);
     d.path[k] = cast(u8, 0);
     d.plen = k;
@@ -359,10 +338,11 @@ fn reload(d as *Dir) as i32 {
 
 // The folder it is in read instead; 0 at the top.
 fn up(d as *Dir) as i32 {
-    if (d.plen <= 1) { return 0; }
+    let is i64 as top = _top(cast(*u8, &d.path), d.plen);
+    if (d.plen <= top) { return 0; }
     let is i64 as k with mut = d.plen - 1;
     while (k > 0 && d.path[k] != cast(u8, 47)) { k = k - 1; }
-    if (k == 0) { k = 1; }
+    if (k < top) { k = top; }
     let is [4096]u8 as p;
     mem.memcpy(cast(*u8, &p), cast(*u8, &d.path), k);
     return set_path(d, cast(*u8, &p), k);

@@ -23,7 +23,9 @@ use "std/io.cst" as io;
 use "std/env.cst" as env;
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
-use "std/os/linux.cst" as linux;
+use "std/os.cst" as os;
+use "../sys/file.cst" as file;
+use "../window/win32/known_folders.cst" as known;
 use "../window/event.cst" as wevent;
 use "../input/keys.cst" as keys;
 use "../ui/program.cst" as program;
@@ -49,7 +51,7 @@ use "../ui/widgets/treeview.cst" as treeview;
 use "../ui/widgets/statusbar.cst" as statusbar;
 use "../ui/widgets/dialog.cst" as dialog;
 use "../ui/widgets/about.cst" as about;
-use "x11_input.cst" as xin;
+use "user_input.cst" as xin;
 
 let is *u8 as NAME with imut = "Files";
 
@@ -287,13 +289,13 @@ fn go(p as *u8, n as i64) as i32 {
     if (n <= 0 || n > 4096) { return 0; }
     mem.memcpy(cast(*u8, &z), p, n);
     z[n] = cast(u8, 0);
-    let is i64 as fd = linux.open(cast(*u8, &z), 65536, 0);
-    if (fd < 0) {
+    let is file.Lister as l;
+    if (file.open_dir(&l, cast(*u8, &z)) == 0) {
         tell("This folder cannot be opened", "It is not there, or it is not yours to read.");
         _shown();
         return 0;
     }
-    linux.close(fd);
+    file.close_dir(&l);
     if (dirmodel.set_path(br.dir, p, n) == 0) { return 0; }
     _shown();
     return 1;
@@ -303,9 +305,22 @@ fn up() as void {
     if (dirmodel.up(br.dir) == 1) { _shown(); }
 }
 
-fn home() as void {
+// Home's path into out (4096 bytes): HOME, or on Windows the profile; its
+// length, 0 for none.
+fn home_path(out as *u8) as i64 {
+    if (os.current() == os.OS_WINDOWS) { return known.path(known.PROFILE, out, 4096); }
     let is *u8 as h = env.getenv("HOME");
-    if (cast(i64, h) != 0) { go(h, _len(h)); }
+    if (cast(i64, h) == 0) { return 0; }
+    let is i64 as n with mut = _len(h);
+    if (n > 4095) { n = 4095; }
+    mem.memcpy(out, h, n);
+    return n;
+}
+
+fn home() as void {
+    let is [4096]u8 as h;
+    let is i64 as n = home_path(cast(*u8, &h));
+    if (n > 0) { go(cast(*u8, &h), n); }
 }
 
 fn set_hidden(on as i32) as void {
@@ -325,16 +340,21 @@ fn activate(i as i64) as void {
         go(cast(*u8, &p), n);
         return;
     }
-    // As a file link, its bytes escaped where a URI needs them.
+    // As a file link, its bytes escaped where a URI needs them; a drive's
+    // path (Windows: "C:/…") after one more '/', "file:///C:/…".
     let is [8200]u8 as uri;
     mem.memcpy(cast(*u8, &uri), "file://", 7);
     let is i64 as k with mut = 7;
+    if (n > 0 && p[0] != 47) {
+        uri[7] = cast(u8, 47);
+        k = 8;
+    }
     let is *u8 as hex = "0123456789ABCDEF";
     let is i64 as j with mut = 0;
     while (j < n) {
         let is u8 as c = p[j];
         if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 47 || c == 45 || c == 46 || c == 95 ||
-            c == 126) {
+            c == 126 || c == 58) {
             uri[k] = c;
             k = k + 1;
         } else {
@@ -495,7 +515,7 @@ fn rounds(n as i64) as void {
     }
 }
 
-// Keys as a user's come: sent through X to the window (x11_input.cst), read
+// Keys as a user's come: sent through the system to the window (user_input.cst), read
 // back the whole way.
 let is xin.Sender as xs with mut;
 
@@ -522,24 +542,26 @@ fn status_is(s as *u8) as i32 { return _same(statusbar.message(br.t, br.status),
 // The row named s in the table, -1 for none.
 fn row_named(s as *u8) as i64 { return dirmodel.index_of_name(br.dir, s, _len(s)); }
 
-fn mk(p as *u8) as void { linux.mkdir(p, 493); }
+fn mk(p as *u8) as void { file.make_dir(p, 0); }
 
-fn touch(p as *u8) as void { linux.close(linux.open(p, 577, 420)); }
+fn touch(p as *u8) as void { file.write_atomic(p, "", 0, 0); }
 
+// What the desktop was handed ends as the file's link should: the stand-in
+// xdg-open's record of it; on Windows, where the shell opened it, the link
+// itself. 1, 0 when not as it should, -1 when nothing was said.
 fn opened_said() as i64 {
+    if (os.current() == os.OS_WINDOWS) {
+        if (open_uri.how(&link) != open_uri.SHELL) { return 0 - 1; }
+        return cast(i64, ends_with(cast(*u8, &link.uri), link.n, "/browser_check/b%20c.txt"));
+    }
     let is *u8 as path = env.getenv("CAUSTIC_XDG_OPEN_OUT");
     if (cast(i64, path) == 0) { return 0 - 1; }
     let is i64 as until = time.now_ms() + 2000;
     let is [512]u8 as b;
     let is i64 as n with mut = 0 - 1;
     while (n < 0 && time.now_ms() < until) {
-        let is i64 as fd = linux.open(path, 0, 0);
-        if (fd >= 0) {
-            n = linux.read(fd, cast(*u8, &b), 512);
-            linux.close(fd);
-        } else {
-            rounds(1);
-        }
+        n = file.read(path, cast(*u8, &b), 512);
+        if (n < 0) { rounds(1); }
     }
     if (n <= 0) { return 0 - 1; }
     return cast(i64, ends_with(cast(*u8, &b), n, "/browser_check/b%20c.txt"));
@@ -622,9 +644,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as sn with mut = 0;
     if (checking == 1) {
         let is *u8 as out = env.getenv("CAUSTIC_XDG_OPEN_OUT");
-        if (cast(i64, out) != 0) { linux.unlink(out); }
-        linux.getcwd(cast(*u8, &start), 3900);
-        sn = _len(cast(*u8, &start));
+        if (cast(i64, out) != 0) { file.remove(out); }
+        sn = file.cwd(cast(*u8, &start), 3900);
         mem.memcpy(cast(*u8, cast(i64, &start) + sn), "/build/browser_check", 21);
         sn = sn + 20;
         mk(cast(*u8, &start));
@@ -643,10 +664,11 @@ fn main(argc as i64, argv as *u8) as i32 {
         if (sn > 4000) { sn = 4000; }
         mem.memcpy(cast(*u8, &start), env.argv(1), sn);
     } else {
-        let is *u8 as h with mut = env.getenv("HOME");
-        if (cast(i64, h) == 0) { h = "/"; }
-        sn = _len(h);
-        mem.memcpy(cast(*u8, &start), h, sn);
+        sn = home_path(cast(*u8, &start));
+        if (sn == 0) {
+            start[0] = cast(u8, 47);
+            sn = 1;
+        }
     }
     br.dir = dirmodel.open(cast(*u8, &start), sn);
     if (cast(i64, br.dir) == 0) {

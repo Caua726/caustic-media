@@ -1,0 +1,156 @@
+// ui/instance_win32_test.cst — one instance of an application on Windows
+// (under Wine in test-win32): the first start owns the id; a second start —
+// this program again, as a child — finds it, hands over files to open, a
+// request to come forward and an action, and leaves; the first hears each
+// through its loop. Let go, the id is free for the next.
+use "std/io.cst" as io;
+use "std/os.cst" as os;
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../window/win32/bind/types.cst" as t;
+use "../window/win32/bind/kernel32.cst" as k;
+use "../window/win32/bind/user32.cst" as u;
+use "instance.cst" as instance;
+use "../dbus/dbus.cst" as dbus;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+let is i32 as activated with mut = 0;
+let is i32 as opened with mut = 0;
+let is i64 as opened_count with mut = 0;
+let is [256]u8 as opened_text with mut;
+let is i64 as opened_n with mut = 0;
+let is [64]u8 as action_name with mut;
+let is i64 as action_n with mut = 0;
+
+fn on_activate(user as *u8) as void { activated = activated + 1; }
+
+fn on_open(user as *u8, s as *u8, n as i64, count as i64) as void {
+    opened = opened + 1;
+    opened_count = count;
+    let is i64 as k with mut = n;
+    if (k > 256) { k = 256; }
+    mem.memcpy(cast(*u8, &opened_text), s, k);
+    opened_n = k;
+}
+
+fn on_action(user as *u8, s as *u8, n as i64) as void {
+    let is i64 as k with mut = n;
+    if (k > 63) { k = 63; }
+    mem.memcpy(cast(*u8, &action_name), s, k);
+    action_n = k;
+}
+
+// The messages for this thread's windows taken and handed on, for ms.
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    let is t.MSG as m;
+    while (time.now_ms() < until) {
+        while (u.PeekMessageW(&m, 0, 0, 0, cast(u32, t.PM_REMOVE)) != 0) {
+            u.TranslateMessage(&m);
+            u.DispatchMessageW(&m);
+        }
+        time.sleep_ms(5);
+    }
+}
+
+// The second start: this program run again with "second" and the id; its
+// exit code, -1 when it did not start or did not end in 20 seconds. The
+// first's messages are taken meanwhile: the second's calls wait on them.
+fn second(id as *u8) as i32 {
+    let is [600]u16 as cmd;
+    let is u32 as n = k.GetModuleFileNameW(0, cast(*u16, cast(i64, &cmd) + 2), cast(u32, 500));
+    if (n == cast(u32, 0)) { return 0 - 1; }
+    cmd[0] = cast(u16, 34);
+    let is i64 as j with mut = cast(i64, n) + 1;
+    cmd[j] = cast(u16, 34);
+    j = j + 1;
+    let is *u8 as tail = " second ";
+    let is i64 as i with mut = 0;
+    while (tail[i] != 0) { cmd[j] = cast(u16, tail[i]); j = j + 1; i = i + 1; }
+    i = 0;
+    while (id[i] != 0) { cmd[j] = cast(u16, id[i]); j = j + 1; i = i + 1; }
+    cmd[j] = cast(u16, 0);
+    let is t.STARTUPINFOW as si;
+    mem.memzero(cast(*u8, &si), sizeof(t.STARTUPINFOW));
+    si.cb = cast(u32, sizeof(t.STARTUPINFOW));
+    let is t.PROCESS_INFORMATION as pi;
+    mem.memzero(cast(*u8, &pi), sizeof(t.PROCESS_INFORMATION));
+    if (k.CreateProcessW(cast(*u16, 0), &cmd[0], cast(*u8, 0), cast(*u8, 0), 0, cast(u32, 0), cast(*u8, 0),
+                         cast(*u16, 0), &si, &pi) == 0) { return 0 - 1; }
+    let is i64 as until = time.now_ms() + 20000;
+    let is i32 as code with mut = 0 - 1;
+    while (time.now_ms() < until) {
+        pump(5);
+        if (k.WaitForSingleObject(pi.hProcess, cast(u32, 0)) == cast(u32, 0)) {
+            let is u32 as status with mut = cast(u32, 0);
+            k.GetExitCodeProcess(pi.hProcess, &status);
+            code = cast(i32, status);
+            break;
+        }
+    }
+    k.CloseHandle(pi.hProcess);
+    k.CloseHandle(pi.hThread);
+    return code;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *dbus.conn.Conn as none = cast(*dbus.conn.Conn, 0);
+    if (env.argc() >= 3 && _len(env.argv(1)) == 6 && mem.memcmp(env.argv(1), "second", 6) == 0) {
+        // The second start: not the instance; what it was asked handed over.
+        let is *u8 as id = env.argv(2);
+        let is instance.Instance as two;
+        if (instance.claim(&two, none, id, _len(id), fn_ptr(on_activate), fn_ptr(on_open), fn_ptr(on_action), cast(*u8, 0)) != 0) { return 2; }
+        if (instance.open_remote(none, id, _len(id), "C:/notes/olá.txt\0b.md\0", 23, 2) != 1) { return 3; }
+        if (instance.activate_remote(none, id, _len(id)) != 1) { return 4; }
+        if (instance.action_remote(none, id, _len(id), "quit", 4) != 1) { return 5; }
+        return 0;
+    }
+
+    let is [64]u8 as id;
+    let is i64 as idn = io.sprintf(cast(*u8, &id), 64, "org.example.InstanceTest%d", os.pid());
+    let is instance.Instance as one;
+    check("the first start owns the id", instance.claim(&one, none, cast(*u8, &id), idn, fn_ptr(on_activate), fn_ptr(on_open),
+                                                         fn_ptr(on_action), cast(*u8, 0)) == 1 && instance.is_primary(&one) == 1);
+    let is instance.Instance as again;
+    check("claimed again in the same program: another owns it", instance.claim(&again, none, cast(*u8, &id), idn, fn_ptr(on_activate),
+                                                                               fn_ptr(on_open), fn_ptr(on_action), cast(*u8, 0)) == 0);
+    check("the second start handed over and left", second(cast(*u8, &id)) == 0);
+    pump(100);
+    check("asked to open: two files, as handed over", opened == 1 && opened_count == 2 && opened_n == 22 &&
+          mem.memcmp(cast(*u8, &opened_text), "C:/notes/olá.txt\0b.md", 22) == 0);
+    check("asked to come forward, once", activated == 1);
+    check("asked to do quit", action_n == 4 && mem.memcmp(cast(*u8, &action_name), "quit", 4) == 0);
+    check("no token on Windows: none kept", instance.token_length(&one) == 0);
+
+    instance.release(&one);
+    check("let go: no longer the instance", instance.is_primary(&one) == 0);
+    check("let go: nobody to hand over to", instance.activate_remote(none, cast(*u8, &id), idn) == 0);
+    check("let go: the id free for the next", instance.claim(&again, none, cast(*u8, &id), idn, fn_ptr(on_activate), fn_ptr(on_open),
+                                                              fn_ptr(on_action), cast(*u8, 0)) == 1);
+    instance.release(&again);
+    check("an id too long: never claimed", instance.claim(&again, none, cast(*u8, &opened_text), 300, fn_ptr(on_activate),
+                                                          fn_ptr(on_open), fn_ptr(on_action), cast(*u8, 0)) == 0);
+
+    if (fails != 0) {
+        io.printf("instance win32: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("instance win32: all checks passed\n");
+    return 0;
+}

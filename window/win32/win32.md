@@ -316,6 +316,18 @@ message. The first window is sized once its scale is known. Popups are
 area, capturing the pointer and taking the owner's keys, taken down by a press
 outside the program's popups, by the capture going elsewhere and by the
 application's deactivation (`../popup_win32_test.cst`, SendInput). The
-toolkit's own menus are not yet hosted in them; OLE DnD, toolkit UIA, platform
-choosers, notifications and modal-loop toolkit rendering remain
-implementation work, and Wine is not proof of real-Windows behavior.
+toolkit's own menus are not yet hosted in them; OLE DnD, toolkit UIA,
+notifications and modal-loop toolkit rendering remain implementation work,
+and Wine is not proof of real-Windows behavior.
+
+`filedialog.cst` is Windows' own file dialog (IFileOpenDialog and
+IFileSaveDialog), with the portal's options, filters and answer: paths in
+UTF-8 with '/', as `sys/file.cst` has them (`filedialog_test.cst`, answered
+through its controls). `known_folders.cst` names the user's folders and the
+local application data through SHGetKnownFolderPath, which the toolkit's
+file chooser and window state use on Windows
+(`../../ui/files_win32_test.cst`). One instance finds the first through a
+message-only window (`../../ui/instance_win32_test.cst`), and links and files
+are opened by the shell (`../../ui/open_uri_win32_test.cst`). The three
+examples run with `--check` under `tools/run_wine_desktop.sh`, a prefix set up
+as a Windows desktop is.

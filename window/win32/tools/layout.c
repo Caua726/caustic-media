@@ -873,6 +873,9 @@ int main(void) {
     _Static_assert(offsetof(ITableItemProvider, lpVtbl) == 0, "ITableItemProvider.lpVtbl");
     int failures = 0;
     if ((long long)(CW_USEDEFAULT) != (-2147483648LL)) { printf("FAIL constant CW_USEDEFAULT\n"); failures++; }
+    if ((long long)(MB_ERR_INVALID_CHARS) != 8LL) { printf("FAIL constant MB_ERR_INVALID_CHARS\n"); failures++; }
+    if ((long long)(IDOK) != 1LL) { printf("FAIL constant IDOK\n"); failures++; }
+    if ((long long)(IDCANCEL) != 2LL) { printf("FAIL constant IDCANCEL\n"); failures++; }
     if ((long long)(INFINITE) != 4294967295LL) { printf("FAIL constant INFINITE\n"); failures++; }
     if ((long long)(SRCCOPY) != 13369376LL) { printf("FAIL constant SRCCOPY\n"); failures++; }
     if ((long long)(MAX_PATH) != 260LL) { printf("FAIL constant MAX_PATH\n"); failures++; }
@@ -3360,6 +3363,6 @@ int main(void) {
     if ((long long)(WVR_VALIDRECTS) != 1024LL) { printf("FAIL constant WVR_VALIDRECTS\n"); failures++; }
     if ((long long)(WVR_VREDRAW) != 512LL) { printf("FAIL constant WVR_VREDRAW\n"); failures++; }
     if (failures != 0) return 1;
-    printf("win32 constants: 2487 checked\n");
+    printf("win32 constants: 2490 checked\n");
     return 0;
 }

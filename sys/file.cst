@@ -1,0 +1,443 @@
+// sys/file.cst — files and folders by path, the same on Linux and Windows.
+//
+// What a program of the toolkit asks of files: one read whole, one written
+// whole so that a reader never meets half of it, a folder made, an entry
+// renamed or removed, what a path is, the entries of a folder, the current
+// folder. std/io.cst does some of this, but on Windows through the A calls,
+// which read a path in the system's code page: a name with "á" in it is
+// another name, or none. Here paths are UTF-8 everywhere, turned UTF-16 for
+// the W calls on Windows.
+//
+// Paths have '/' between their parts on both: Windows' calls take it as they
+// take '\', and the toolkit's path handling (the file chooser's, dirmodel's)
+// knows one separator. What Windows says back — the current folder — comes
+// with '/' too: "C:/Users/me".
+//
+// Linux answers with raw syscalls (open, getdents64, stat with links
+// followed, rename, mkdir, unlink, rmdir, getcwd); Windows with CreateFileW,
+// FindFirstFileW, GetFileAttributesExW, MoveFileExW, CreateDirectoryW,
+// DeleteFileW, RemoveDirectoryW and GetCurrentDirectoryW.
+use "std/os.cst" as os;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../window/win32/bind/types.cst" as t;
+use "../window/win32/bind/kernel32.cst" as k;
+
+// The longest path, in bytes, with its NUL.
+let is i64 as MAX_PATH with imut = 4096;
+
+let is i32 as NONE with imut = 0;
+let is i32 as FILE with imut = 1;
+let is i32 as DIR  with imut = 2;
+
+struct Info {
+    kind   as i32;   // NONE, FILE or DIR (a device, a pipe: NONE)
+    hidden as i32;   // Windows' hidden attribute; on Linux a name's dot, which the caller sees
+    size   as i64;   // bytes
+    mtime  as i64;   // seconds since 1970, UTC
+}
+
+fn _len(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// How long the top of the path p, n bytes, is: 1 for "/" — on Windows the
+// current drive's, '\' too — 3 for a lettered drive's ("C:/", "C:\") on
+// Windows, 0 for a relative path ("C:x" is one on Windows, relative to that
+// drive's current folder; on Linux "C:/" is a folder named "C:"). What ".."
+// never climbs above, and what "up" stops at.
+fn root(p as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    let is i32 as windows = cast(i32, os.current() == os.OS_WINDOWS);
+    if (p[0] == cast(u8, 47) || (windows == 1 && p[0] == cast(u8, 92))) { return 1; }
+    if (windows == 0 || n < 3 || p[1] != cast(u8, 58) || (p[2] != cast(u8, 47) && p[2] != cast(u8, 92))) { return 0; }
+    let is u8 as c = p[0] | cast(u8, 32);
+    if (c < cast(u8, 97) || c > cast(u8, 122)) { return 0; }
+    return 3;
+}
+
+fn _clear(out as *Info) as void {
+    out.kind = NONE;
+    out.hidden = 0;
+    out.size = 0;
+    out.mtime = 0;
+}
+
+// --- Windows' text and times ---
+
+// The longest path in UTF-16 units the W calls are given here, with its NUL.
+let is i32 as _WIDE with imut = 1024;
+
+// path in UTF-16 into out, _WIDE units: 1, or 0 when it does not fit or is
+// not UTF-8.
+fn _wide(path as *u8, out as *u16) as i32 {
+    return cast(i32, k.MultiByteToWideChar(cast(u32, t.CP_UTF8), cast(u32, t.MB_ERR_INVALID_CHARS), cast(*i8, path),
+                                           cast(i32, 0 - 1), out, _WIDE) > 0);
+}
+
+// The UTF-16 text at w, NUL-ended, into out as UTF-8, cap bytes: its length,
+// or -1 when it does not fit.
+fn _narrow(w as *u16, out as *u8, cap as i64) as i64 {
+    let is i32 as n = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, w, cast(i32, 0 - 1), cast(*i8, out), cast(i32, cap),
+                                            cast(*i8, 0), cast(*i32, 0));
+    if (n <= 0) { return 0 - 1; }
+    return cast(i64, n) - 1;
+}
+
+// A FILETIME, 100-nanosecond intervals since 1601, as seconds since 1970.
+fn _seconds(ft as *t.FILETIME) as i64 {
+    let is i64 as ticks = (cast(i64, ft.dwHighDateTime) << 32) | cast(i64, ft.dwLowDateTime);
+    return (ticks - 116444736000000000) / 10000000;
+}
+
+fn _from_attributes(attrs as i64, hi as u32, lo as u32, ft as *t.FILETIME, out as *Info) as void {
+    if ((attrs & t.FILE_ATTRIBUTE_DIRECTORY) != 0) { out.kind = DIR; } else { out.kind = FILE; }
+    out.hidden = cast(i32, (attrs & t.FILE_ATTRIBUTE_HIDDEN) != 0);
+    out.size = (cast(i64, hi) << 32) | cast(i64, lo);
+    out.mtime = _seconds(ft);
+}
+
+// --- What a path is ---
+
+fn _mode(st as *u8) as i64 {
+    if (__target_is_aarch64 == 1) { return cast(i64, *cast(*u32, cast(i64, st) + 16)); }
+    return cast(i64, *cast(*u32, cast(i64, st) + 24));
+}
+
+fn _from_stat(st as *u8, out as *Info) as void {
+    let is i64 as kind = _mode(st) & 61440;   // S_IFMT
+    if (kind == 16384) { out.kind = DIR; }    // S_IFDIR
+    if (kind == 32768) { out.kind = FILE; }   // S_IFREG
+    out.size = *cast(*i64, cast(i64, st) + 48);
+    out.mtime = *cast(*i64, cast(i64, st) + 88);
+}
+
+// What the path is, links followed, into out: 1, or 0 when it is not there
+// (out.kind NONE).
+fn stat(path as *u8, out as *Info) as i32 {
+    _clear(out);
+    if (os.current() == os.OS_WINDOWS) {
+        let is [1024]u16 as w;
+        if (_wide(path, &w[0]) == 0) { return 0; }
+        let is t.WIN32_FILE_ATTRIBUTE_DATA as d;
+        if (k.GetFileAttributesExW(&w[0], 0, cast(*u8, &d)) == 0) { return 0; }   // GetFileExInfoStandard
+        _from_attributes(cast(i64, d.dwFileAttributes), d.nFileSizeHigh, d.nFileSizeLow, &d.ftLastWriteTime, out);
+        return 1;
+    }
+    if (os.current() == os.OS_LINUX) {
+        let is [144]u8 as st;
+        if (linux.stat(path, cast(*u8, &st)) != 0) { return 0; }
+        _from_stat(cast(*u8, &st), out);
+        return 1;
+    }
+    return 0;
+}
+
+// --- Whole files ---
+
+// The file at path read into buf, as much as cap bytes hold: how many, or
+// -1 when it cannot be opened.
+fn read(path as *u8, buf as *u8, cap as i64) as i64 {
+    if (os.current() == os.OS_WINDOWS) {
+        let is [1024]u16 as w;
+        if (_wide(path, &w[0]) == 0) { return 0 - 1; }
+        let is i64 as h = k.CreateFileW(&w[0], cast(u32, t.GENERIC_READ), cast(u32, t.FILE_SHARE_READ | t.FILE_SHARE_WRITE | t.FILE_SHARE_DELETE),
+                                        cast(*u8, 0), cast(u32, t.OPEN_EXISTING), cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+        if (h == t.INVALID_HANDLE_VALUE) { return 0 - 1; }
+        let is i64 as got with mut = 0;
+        while (got < cap) {
+            let is i64 as ask with mut = cap - got;
+            if (ask > 1073741824) { ask = 1073741824; }
+            let is u32 as n with mut = cast(u32, 0);
+            if (k.ReadFile(h, cast(*u8, cast(i64, buf) + got), cast(u32, ask), &n, cast(*u8, 0)) == 0 || n == cast(u32, 0)) { break; }
+            got = got + cast(i64, n);
+        }
+        k.CloseHandle(h);
+        return got;
+    }
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as fd = linux.open(path, linux.O_CLOEXEC, 0);   // O_RDONLY
+        if (fd < 0) { return 0 - 1; }
+        let is i64 as got with mut = 0;
+        while (got < cap) {
+            let is i64 as n = linux.read(fd, cast(*u8, cast(i64, buf) + got), cap - got);
+            if (n == 0 - 4) { continue; }   // EINTR
+            if (n <= 0) { break; }
+            got = got + n;
+        }
+        linux.close(fd);
+        return got;
+    }
+    return 0 - 1;
+}
+
+// path with ".<pid>.tmp" after it into out: 1, or 0 when it does not fit.
+fn _temporary(path as *u8, out as *u8) as i32 {
+    let is i64 as n = _len(path);
+    if (n + 32 > MAX_PATH) { return 0; }
+    mem.memcpy(out, path, n);
+    out[n] = cast(u8, 46);
+    let is [24]u8 as digits;
+    let is i64 as p with mut = os.pid();
+    if (p < 0) { p = 0 - p; }
+    let is i64 as d with mut = 0;
+    while (d == 0 || p > 0) {
+        digits[d] = cast(u8, 48 + p % 10);
+        p = p / 10;
+        d = d + 1;
+    }
+    let is i64 as w with mut = n + 1;
+    while (d > 0) {
+        d = d - 1;
+        out[w] = digits[d];
+        w = w + 1;
+    }
+    mem.memcpy(cast(*u8, cast(i64, out) + w), ".tmp", 5);
+    return 1;
+}
+
+fn _write_windows(path as *u8, buf as *u8, n as i64) as i32 {
+    let is [1024]u16 as w;
+    if (_wide(path, &w[0]) == 0) { return 0; }
+    let is i64 as h = k.CreateFileW(&w[0], cast(u32, t.GENERIC_WRITE), 0, cast(*u8, 0), cast(u32, t.CREATE_ALWAYS),
+                                    cast(u32, t.FILE_ATTRIBUTE_NORMAL), 0);
+    if (h == t.INVALID_HANDLE_VALUE) { return 0; }
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as ask with mut = n - done;
+        if (ask > 1073741824) { ask = 1073741824; }
+        let is u32 as wrote with mut = cast(u32, 0);
+        if (k.WriteFile(h, cast(*u8, cast(i64, buf) + done), cast(u32, ask), &wrote, cast(*u8, 0)) == 0 || wrote == cast(u32, 0)) { break; }
+        done = done + cast(i64, wrote);
+    }
+    k.CloseHandle(h);
+    return cast(i32, done == n);
+}
+
+fn _write_linux(path as *u8, buf as *u8, n as i64, private as i32) as i32 {
+    let is i64 as mode with mut = 420;   // 0644
+    if (private == 1) { mode = 384; }    // 0600
+    let is i64 as fd = linux.open(path, 577 | linux.O_CLOEXEC, mode);   // O_WRONLY|O_CREAT|O_TRUNC
+    if (fd < 0) { return 0; }
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as w = linux.write(fd, cast(*u8, cast(i64, buf) + done), n - done);
+        if (w == 0 - 4) { continue; }   // EINTR
+        if (w <= 0) { break; }
+        done = done + w;
+    }
+    linux.close(fd);
+    return cast(i32, done == n);
+}
+
+// The n bytes at buf as the whole of the file at path: written beside it
+// first, then renamed over it, so a reader meets the old file or the new,
+// never part of one. private: readable by its owner only (Linux's 0600;
+// Windows leaves it to the folder, a profile's being its user's). 1, or 0
+// with the file as it was.
+fn write_atomic(path as *u8, buf as *u8, n as i64, private as i32) as i32 {
+    let is [4096]u8 as tmp;
+    if (_temporary(path, cast(*u8, &tmp)) == 0) { return 0; }
+    let is i32 as wrote with mut = 0;
+    if (os.current() == os.OS_WINDOWS) { wrote = _write_windows(cast(*u8, &tmp), buf, n); }
+    if (os.current() == os.OS_LINUX) { wrote = _write_linux(cast(*u8, &tmp), buf, n, private); }
+    if (wrote == 0 || rename(cast(*u8, &tmp), path) == 0) {
+        remove(cast(*u8, &tmp));
+        return 0;
+    }
+    return 1;
+}
+
+// --- Entries ---
+
+// A folder at path, its parent there already; private: its owner's only
+// (0700; Windows leaves it to the parent). 1 when made or already a folder.
+fn make_dir(path as *u8, private as i32) as i32 {
+    let is i32 as made with mut = 0;
+    if (os.current() == os.OS_WINDOWS) {
+        let is [1024]u16 as w;
+        if (_wide(path, &w[0]) == 0) { return 0; }
+        made = cast(i32, k.CreateDirectoryW(&w[0], cast(*u8, 0)) != 0);
+    }
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as mode with mut = 493;   // 0755
+        if (private == 1) { mode = 448; }    // 0700
+        made = cast(i32, linux.mkdir(path, mode) == 0);
+    }
+    if (made == 1) { return 1; }
+    let is Info as info;
+    return cast(i32, stat(path, &info) == 1 && info.kind == DIR);
+}
+
+// The entry at from named to instead, replacing a file there: 1, or 0.
+fn rename(from as *u8, to as *u8) as i32 {
+    if (os.current() == os.OS_WINDOWS) {
+        let is [1024]u16 as a;
+        let is [1024]u16 as b;
+        if (_wide(from, &a[0]) == 0 || _wide(to, &b[0]) == 0) { return 0; }
+        return cast(i32, k.MoveFileExW(&a[0], &b[0], cast(u32, t.MOVEFILE_REPLACE_EXISTING)) != 0);
+    }
+    if (os.current() == os.OS_LINUX) { return cast(i32, linux.rename(from, to) == 0); }
+    return 0;
+}
+
+// The file, or the empty folder, at path removed: 1, or 0.
+fn remove(path as *u8) as i32 {
+    if (os.current() == os.OS_WINDOWS) {
+        let is [1024]u16 as w;
+        if (_wide(path, &w[0]) == 0) { return 0; }
+        if (k.DeleteFileW(&w[0]) != 0) { return 1; }
+        return cast(i32, k.RemoveDirectoryW(&w[0]) != 0);
+    }
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as r = linux.unlink(path);
+        if (r == 0) { return 1; }
+        if (r == 0 - 21) { return cast(i32, linux.rmdir(path) == 0); }   // EISDIR
+        return 0;
+    }
+    return 0;
+}
+
+// The current folder, absolute, into out, cap bytes with its NUL: its
+// length, or 0 when it does not fit.
+fn cwd(out as *u8, cap as i64) as i64 {
+    if (os.current() == os.OS_WINDOWS) {
+        let is [1024]u16 as w;
+        let is u32 as n = k.GetCurrentDirectoryW(cast(u32, _WIDE), &w[0]);
+        if (n == cast(u32, 0) || cast(i64, n) >= cast(i64, _WIDE)) { return 0; }
+        let is i64 as len = _narrow(&w[0], out, cap);
+        if (len <= 0) { return 0; }
+        let is i64 as i with mut = 0;
+        while (i < len) {
+            if (out[i] == cast(u8, 92)) { out[i] = cast(u8, 47); }
+            i = i + 1;
+        }
+        return len;
+    }
+    if (os.current() == os.OS_LINUX) {
+        let is i64 as n = linux.getcwd(out, cap);   // with its NUL
+        if (n <= 1) { return 0; }
+        return n - 1;
+    }
+    return 0;
+}
+
+// --- A folder's entries ---
+
+struct Lister {
+    open   as i32;
+    first  as i32;           // Windows: the entry FindFirstFileW gave, not yet said
+    fd     as i64;           // Linux's directory
+    handle as i64;           // Windows' search
+    pos    as i64;           // Linux: where in buf, and how much getdents64 gave
+    got    as i64;
+    plen   as i64;           // the folder's path and a '/', for stat on Linux
+    path   as [4096]u8;
+    buf    as [8192]u8;
+    found  as t.WIN32_FIND_DATAW;
+}
+
+// The folder at path opened for next: 1, or 0 when it cannot be read.
+fn open_dir(l as *Lister, path as *u8) as i32 {
+    l.open = 0;
+    l.first = 0;
+    l.pos = 0;
+    l.got = 0;
+    // Room for the path, a '/' and its NUL; an entry whose own path would
+    // not fit is passed over by next.
+    let is i64 as n with mut = _len(path);
+    if (n == 0 || n + 2 > MAX_PATH) { return 0; }
+    mem.memcpy(cast(*u8, &l.path), path, n);
+    if (l.path[n - 1] != cast(u8, 47) && l.path[n - 1] != cast(u8, 92)) {
+        l.path[n] = cast(u8, 47);
+        n = n + 1;
+    }
+    l.plen = n;
+    l.path[n] = cast(u8, 0);
+    if (os.current() == os.OS_WINDOWS) {
+        if (n + 2 > MAX_PATH) { return 0; }
+        // The search's pattern: the folder, '/', "*".
+        l.path[n] = cast(u8, 42);
+        l.path[n + 1] = cast(u8, 0);
+        let is [1024]u16 as w;
+        let is i32 as ok = _wide(cast(*u8, &l.path), &w[0]);
+        l.path[n] = cast(u8, 0);
+        if (ok == 0) { return 0; }
+        l.handle = k.FindFirstFileW(&w[0], &l.found);
+        if (l.handle == t.INVALID_HANDLE_VALUE) { return 0; }
+        l.first = 1;
+        l.open = 1;
+        return 1;
+    }
+    if (os.current() == os.OS_LINUX) {
+        l.fd = linux.open(cast(*u8, &l.path), 65536 | linux.O_CLOEXEC, 0);   // O_DIRECTORY
+        if (l.fd < 0) { return 0; }
+        l.open = 1;
+        return 1;
+    }
+    return 0;
+}
+
+fn _dots(name as *u8) as i32 {
+    if (name[0] != cast(u8, 46)) { return 0; }
+    if (name[1] == cast(u8, 0)) { return 1; }
+    return cast(i32, name[1] == cast(u8, 46) && name[2] == cast(u8, 0));
+}
+
+// The next entry's name into out, cap bytes with its NUL, and what it is
+// into info — "." and ".." left out: the name's length, or -1 at the end.
+// A name that does not fit is passed over.
+fn next(l as *Lister, out as *u8, cap as i64, info as *Info) as i64 {
+    _clear(info);
+    if (l.open == 0) { return 0 - 1; }
+    if (os.current() == os.OS_WINDOWS) {
+        while (1 == 1) {
+            if (l.first == 0) {
+                if (k.FindNextFileW(l.handle, &l.found) == 0) { return 0 - 1; }
+            }
+            l.first = 0;
+            let is i64 as n = _narrow(&l.found.cFileName[0], out, cap);
+            if (n > 0 && _dots(out) == 0) {
+                _from_attributes(cast(i64, l.found.dwFileAttributes), l.found.nFileSizeHigh, l.found.nFileSizeLow,
+                                 &l.found.ftLastWriteTime, info);
+                return n;
+            }
+        }
+    }
+    if (os.current() == os.OS_LINUX) {
+        while (1 == 1) {
+            if (l.pos >= l.got) {
+                l.got = linux.getdents64(l.fd, cast(*u8, &l.buf), 8192);
+                l.pos = 0;
+                if (l.got <= 0) { return 0 - 1; }
+            }
+            let is i64 as e = cast(i64, &l.buf) + l.pos;
+            l.pos = l.pos + (cast(i64, *cast(*u8, e + 16)) | (cast(i64, *cast(*u8, e + 17)) << 8));
+            let is *u8 as name = cast(*u8, e + 19);
+            let is i64 as n = _len(name);
+            if (_dots(name) == 0 && n < cap && l.plen + n < MAX_PATH) {
+                mem.memcpy(out, name, n + 1);
+                // What it is, links followed: stat on the folder's path and the name.
+                mem.memcpy(cast(*u8, cast(i64, &l.path) + l.plen), name, n + 1);
+                let is [144]u8 as st;
+                if (linux.stat(cast(*u8, &l.path), cast(*u8, &st)) == 0) {
+                    _from_stat(cast(*u8, &st), info);
+                } else if (*cast(*u8, e + 18) == cast(u8, 4)) {   // DT_DIR, a link to nowhere aside
+                    info.kind = DIR;
+                }
+                l.path[l.plen] = cast(u8, 0);
+                return n;
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+fn close_dir(l as *Lister) as void {
+    if (l.open == 0) { return; }
+    if (os.current() == os.OS_WINDOWS) { k.FindClose(l.handle); }
+    if (os.current() == os.OS_LINUX) { linux.close(l.fd); }
+    l.open = 0;
+}

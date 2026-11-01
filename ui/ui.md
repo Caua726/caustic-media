@@ -400,7 +400,7 @@ windows on `program.app` and runs.
 Three programs a user would recognise, each built only from the toolkit's
 pieces and each with a `--check` that drives it as a user would, under Xvfb
 (`test-x11`): its keys, clicks and wheel sent through the X server to its own
-window (`examples/x11_input.cst`, XSendEvent from a connection of its own),
+window (`examples/user_input.cst`: XSendEvent from a connection of its own on X, SendInput on Windows),
 so they are read the whole way — X's keycodes and modifier bits,
 `window/device.cst`, the host, the router — as a user's are; its dialogs
 answered directly. Events handed to the host already in the toolkit's terms
