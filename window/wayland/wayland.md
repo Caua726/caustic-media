@@ -5,9 +5,21 @@ The backend for a native Wayland session. Not for XWayland — that is
 
 ```
 wayland/
-  protocol.cst  the interfaces, generated from the XML
-  backend.cst   window/device.cst implemented over them
+  protocol.cst    the interfaces, generated from the XML
+  backend.cst     window/device.cst implemented over them: the connection,
+                  the registry, the dispatch, windows, frames and the API
+  state.cst       what the parts share: the Window, the objects, the wire
+  selection.cst   the clipboard, the primary selection, drag and drop
+  text_input.cst  text-input-v3
+  keyboard.cst    the keymap's reader, keys, Compose, repeat
+  pointer.cst     the pointer and its image, touch, tablets, gestures
 ```
+
+Caustic takes no import cycle, so the parts do not import `backend.cst`:
+each imports `state.cst`, and `backend.cst` imports them all. A type is
+named from the module that declares it — `state.Window`, `state.Options` —
+while the backend's answers (`OK`, `NO_*`) and keymap readers stay
+`backend`'s.
 
 This is the backend the portable API was shaped around: everything in
 [`../window.md`](../window.md) about the pull model, per-frame buffers and

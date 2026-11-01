@@ -1,0 +1,900 @@
+// window/wayland/state.cst — what the Wayland client's parts share: the
+// window, its buffers, offers and tools; the one connection, its objects
+// and the wire; the window's event queue and cooked input. backend.cst and
+// each part (selection, text_input, keyboard, pointer) build on it.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "../../sys/linux.cst" as sys;
+use "../event.cst" as event;
+use "../../input/event.cst" as ie;
+use "../../input/xkb/keymap.cst" as xkbkeymap;
+use "../../input/xkb/state.cst" as xkbstate;
+use "../../input/xkb/compose.cst" as xcompose;
+use "../transfer.cst" as transfer;
+use "../xcursor.cst" as xcursor;
+
+let is i32 as OK with imut = 0;
+let is i32 as NO_RUNTIME with imut = 1;
+let is i32 as NO_SOCKET with imut = 2;
+let is i32 as NO_COMPOSITOR with imut = 3;
+let is i32 as NO_SHELL with imut = 4;
+let is i32 as NO_MEMORY with imut = 5;
+let is i32 as NO_CONFIGURE with imut = 6;
+let is i32 as NO_PROTOCOL with imut = 7;
+
+// Who reads the keymap the compositor sends: libxkbcommon, the supported
+// one, or the own interpreter (input/xkb). Chosen when the window opens;
+// neither stands in for the other — a keymap the chosen one refuses leaves
+// the keyboard without one, keymap_refused saying where.
+let is i32 as KEYMAP_XKBCOMMON with imut = 0;
+let is i32 as KEYMAP_CAUSTIC   with imut = 1;
+
+let is i32 as MAX_EVENTS with imut = 64;
+let is i32 as BUFFER_COUNT with imut = 2;
+let is i32 as RETIRED_COUNT with imut = 4;
+let is i32 as MAX_WIRE with imut = 4096;
+// A text-input string's room, its NUL in it: what one message can carry.
+let is i64 as IME_TEXT with imut = 4096;
+let is i32 as MAX_DATA with imut = 8;
+let is i32 as FORMAT_ARGB8888 with imut = 0;
+
+struct Buffer {
+    object as i32;
+    busy as i32;
+    // The presentation (Window.presents) it was last committed in, 0 for
+    // none since it was made: what its age is measured from.
+    at as i64;
+}
+
+struct BufferSet {
+    pixels as *u8;
+    bytes as i64;
+    buffers as [2]Buffer;
+    used as i32;
+}
+struct Output {
+    global as i32;
+    object as i32;
+    version as i32;
+    scale as i32;
+    entered as i32;
+    // As wl_output says it: its place in the compositor's space, its current
+    // mode (physical pixels, millihertz), its name (version 4).
+    x as i32;
+    y as i32;
+    mode_width as i32;
+    mode_height as i32;
+    refresh_mhz as i32;
+    name as [32]u8;
+}
+// Ours, on the clipboard, the primary selection or dragged: what it offers.
+struct DataSource {
+    object  as i32;
+    purpose as i32;   // _FOR_CLIPBOARD, _FOR_PRIMARY, _FOR_DRAG
+    action  as i32;   // a drag's: the action the compositor last said
+    dropped as i32;   // a drag's: let go over a target that took it
+    offer   as transfer.Offer;
+}
+
+// The compositor's: what it says another program offers.
+struct DataOffer {
+    object         as i32;
+    primary        as i32;
+    formats        as i32;   // transfer bits, from its MIME types
+    text_rank      as i32;   // its best text type, transfer.text_rank's; 9 for none
+    source_actions as i32;   // a drag's: what its source allows
+    action         as i32;   // and what the compositor chose
+}
+
+// An offer's data read through a descriptor.
+struct Reader {
+    fd      as i64;          // -1 when not reading
+    offer   as i32;
+    format  as i32;
+    failed  as i32;
+    _pad    as i32;
+    last_ms as i64;
+    data    as transfer.Bytes;
+}
+
+// Ours written to a descriptor someone asked for it through.
+struct Writer {
+    fd      as i64;          // -1 when not writing
+    sent    as i64;
+    last_ms as i64;
+    data    as transfer.Bytes;
+}
+
+struct Options {
+    app_id as *u8;
+    parent as i32;
+    resizable as i32;
+    dialog as i32;
+    modal as i32;
+    decorated as i32;
+    // A popup (device.POPUP_*), 0 for a toplevel: an xdg_popup of the
+    // xdg_surface parent_surface, placed by the compositor from the
+    // positioner's numbers — logical pixels relative to the parent's window
+    // geometry — and, with grab, given the seat's grab under serial (an input
+    // event of the parent's: a press, a key).
+    popup as i32;
+    grab as i32;
+    serial as u32;
+    parent_surface as i32;
+    anchor_x as i32;
+    anchor_y as i32;
+    anchor_w as i32;
+    anchor_h as i32;
+    anchor as i32;
+    gravity as i32;
+    adjust as i32;
+    off_x as i32;
+    off_y as i32;
+    // A subsurface of the wl_surface subsurface_of, 0 for none: its top left
+    // at sub_x, sub_y of the parent's surface, logical; at the parent's scale
+    // until the compositor tells its own.
+    subsurface_of as i32;
+    sub_x as i32;
+    sub_y as i32;
+    sub_scale120 as i32;
+    sub_scale as i32;
+    // KEYMAP_XKBCOMMON or KEYMAP_CAUSTIC.
+    keymap as i32;
+}
+
+struct GlobalOutput {
+    global as i32;
+    version as i32;
+}
+
+struct Globals {
+    compositor_global as i32;
+    compositor_version as i32;
+    shm_global as i32;
+    shell_global as i32;
+    shell_version as i32;
+    decoration_global as i32;
+    decoration_version as i32;
+    dialog_global as i32;
+    dialog_version as i32;
+    cursor_shape_global as i32;
+    cursor_shape_version as i32;
+    viewporter_global as i32;
+    viewporter_version as i32;
+    fractional_global as i32;
+    fractional_version as i32;
+    seat_global as i32;
+    seat_version as i32;
+    data_manager_global as i32;
+    data_manager_version as i32;
+    primary_manager_global as i32;
+    primary_manager_version as i32;
+    text_input_manager_global as i32;
+    text_input_manager_version as i32;
+    subcompositor_global as i32;
+    tablet_manager_global as i32;
+    gestures_global as i32;
+    gestures_version as i32;
+    // Optional, each 0 where the compositor has none: xdg-activation,
+    // xdg-foreign's exporter, the toplevel icon, presentation-time, the
+    // single-pixel buffer, the system bell, toplevel drags.
+    activation_global as i32;
+    exporter_global as i32;
+    icon_global as i32;
+    presentation_global as i32;
+    single_pixel_global as i32;
+    bell_global as i32;
+    toplevel_drag_global as i32;
+    presentation_clock as i32;   // the clock its times are of (CLOCK_*)
+    output_count as i32;
+    outputs as [8]GlobalOutput;
+}
+
+// A tablet tool: the server's object (0 free), what it is (ie.TOOL_*), the
+// contact it is said as, what it can say (CAP_* bits), whether it is in
+// range over this window's surface and touching; its last place and
+// readings; and what its events said since the last frame.
+struct Tool {
+    object   as i32;
+    kind     as i32;
+    contact  as i32;
+    caps     as i32;
+    inside   as i32;
+    down     as i32;
+    x        as i64;
+    y        as i64;
+    pressure as f64;
+    tilt_x   as f64;
+    tilt_y   as f64;
+    distance as f64;
+    f_in     as i32;
+    f_out    as i32;
+    f_down   as i32;
+    f_up     as i32;
+    f_moved  as i32;
+    nbuttons as i32;
+    buttons  as [4]i32;    // button << 1 | pressed, in order
+    time     as i64;
+}
+
+// A shape's images as drawn on the pointer's surface (cursor-shape-v1 not
+// there): the theme's, at a scale, in shm buffers of their own.
+struct CursorSlot {
+    shape   as i32;      // 0: none here
+    scale   as i32;
+    used    as i64;      // when last used, in Window.cursor_uses' count
+    images  as xcursor.Cursor;
+    map     as *u8;
+    map_bytes as i64;
+    buffers as [64]i32;
+}
+
+struct Window {
+    fd as i64;
+    memfd as i64;
+    registry as i32;
+    registry_sync as i32;
+    compositor as i32;
+    shm as i32;
+    wm_base as i32;
+    decoration_manager as i32;
+    toplevel_decoration as i32;
+    dialog_manager as i32;
+    cursor_shape_manager as i32;
+    cursor_shape_device as i32;
+    // The pointer's shape as last asked (1..35), set again at each enter. Without
+    // cursor-shape-v1 the client draws it: the theme's images (window/xcursor)
+    // on a surface of its own, one buffer a frame, animated by their delays;
+    // the shapes last drawn kept, a pointer going over text and back drawing
+    // from them again rather than reading the theme's file.
+    cursor_want as i32;
+    cursor_size as i32;          // logical pixels; 0: XCURSOR_SIZE, else 24
+    cursor_theme as [64]u8;      // empty: XCURSOR_THEME, else "default"
+    cursor_surface as i32;
+    cursor_slots as [4]CursorSlot;
+    cursor_slot as i32;          // the one shown, -1 for none
+    cursor_uses as i64;          // counted, the least recently used slot the one to go
+    cursor_frame as i32;
+    cursor_set_scale as i32;     // the buffer scale the surface was given
+    cursor_started as i64;       // when the animation began, ms
+    cursor_next as i64;          // its next frame due, ms; -1 for none
+    viewporter as i32;
+    viewport as i32;
+    fractional_manager as i32;
+    fractional_surface as i32;
+    data_manager as i32;
+    data_device as i32;
+    primary_manager as i32;
+    primary_device as i32;
+    text_input_manager as i32;
+    text_input as i32;
+    dialog as i32;
+    parent_toplevel as i32;
+    surface as i32;
+    xdg_surface as i32;
+    toplevel as i32;
+    pool as i32;
+    callback as i32;
+    output_count as i32;
+    outputs as [8]Output;
+    active_output as i32;
+    scale as i32;
+    scale120 as i32;
+    fractional_active as i32;
+    seat_version as i32;
+    seat as i32;
+    pointer as i32;
+    keyboard as i32;
+    keyboard_focus as i32;
+    pointer_inside as i32;
+    pointer_serial as u32;
+    // The pointer as the translator last said it, and the buttons it holds
+    // (one a press handed to the compositor is taken from).
+    pointer_x as i64;
+    pointer_y as i64;
+    pointer_version as i32;
+    // A pointer frame's scrolling, said as one SCROLL when the frame ends:
+    // axis motion (wl_fixed), notches (axis_discrete, before 8), 120ths of a
+    // notch (axis_value120), where it came from (axis_source, -1 unsaid) and
+    // what stopped (STOP_* bits); and the 120ths short of a whole notch kept
+    // from frame to frame.
+    scroll_y as i64;
+    scroll_x as i64;
+    scroll_discrete as i32;
+    scroll_discrete_x as i32;
+    scroll_v120_x as i32;
+    scroll_v120_y as i32;
+    scroll_source as i32;
+    scroll_stop as i32;
+    v120_rest_x as i32;
+    v120_rest_y as i32;
+    // Touch (wl_touch): the points down on this surface, by the compositor's
+    // id, and where each last was.
+    touch as i32;
+    touch_ids as [10]i32;
+    touch_used as [10]i32;
+    touch_x as [10]i64;
+    touch_y as [10]i64;
+    // Tablets (tablet-v2): the seat's tablets (server objects, destroyed when
+    // removed) and tools, each a pen's state gathered until its frame.
+    tablet_manager as i32;
+    tablet_seat as i32;
+    tablets as [4]i32;
+    tools as [8]Tool;
+    tool_serial as i32;   // the last tool contact handed out
+    // Touchpad gestures (pointer-gestures): one object of each kind, the one
+    // going on now (ie.SWIPE, PINCH, HOLD; 0 none).
+    gestures as i32;
+    gestures_version as i32;
+    swipe as i32;
+    pinch as i32;
+    hold as i32;
+    gesture_kind as i32;
+    gesture_fingers as i32;
+    // Each held key as its press said it: which key, and the key a shortcut
+    // is matched against (input/event.cst's key and shortcut).
+    key_syms as [256]i32;
+    key_cuts as [256]i32;
+    pointer_buttons as [8]i32;
+    // Keys the compositor says are down: what xkb is told to let go of when
+    // the focus leaves.
+    key_down as [256]i32;
+    modifiers as i32;
+    // A held key repeated here, as the compositor's repeat_info asks (this
+    // seat's wl_keyboard sends no repeats of its own): so many a second,
+    // after so many milliseconds; the code repeating (-1: none) and when
+    // its next repeat is due, on the monotonic clock in milliseconds.
+    repeat_rate as i32;
+    repeat_delay as i32;
+    repeat_code as i32;
+    repeat_next as i64;
+    text_len as i32;
+    text_buf as [256]u8;
+    input_serial as u32;
+    // text-input-v3: enabled, the program wants it (a field has the
+    // keyboard); entered, the compositor's text-input focus is on the
+    // surface. What enter..done said, double-buffered until done; shown, a
+    // composition said and not yet emptied.
+    text_input_enabled as i32;
+    text_input_entered as i32;
+    ime_preedit_changed as i32;
+    ime_commit_changed as i32;
+    ime_delete_changed as i32;
+    ime_shown as i32;
+    ime_preedit_len as i64;
+    ime_commit_len as i64;
+    ime_cursor as i64;
+    ime_cursor_end as i64;
+    ime_delete_before as i64;
+    ime_delete_after as i64;
+    ime_preedit as [4096]u8;
+    ime_commit as [4096]u8;
+    ime_rect_x as i64;
+    ime_rect_y as i64;
+    ime_rect_w as i64;
+    ime_rect_h as i64;
+    // What the method is told, double-buffered too: commits counts the
+    // commit requests (done's serial is how many the compositor had seen);
+    // hold, a done came before the last of them, so nothing more is told
+    // until one that saw them all; dirty, the TI_* parts to tell next;
+    // by_method, the text last changed by what the method sent.
+    ti_commits as u32;
+    ti_hold as i32;
+    ti_dirty as i32;
+    ti_by_method as i32;
+    ti_purpose as i32;
+    ti_hints as i32;
+    ti_text_len as i64;   // -1: no text told
+    ti_caret as i64;
+    ti_anchor as i64;
+    ti_text as [4000]u8;
+    // The selections: the compositor's offer for each (0 the clipboard, 1
+    // the primary), ours when we own one.
+    selection_offer as [2]i32;
+    selection_source as [2]i32;
+    reading as [2]Reader;          // PASTE, DROP
+    writing as [8]Writer;
+    paste_state as i32;            // _PASTE_*
+    paste_got as i32;              // the format that came; 0 for none
+    paste_offered as i32;          // the formats the selection offered
+    // A drag over the window from elsewhere.
+    drop_offer as i32;
+    drop_offered as i32;           // FILES, TEXT
+    drop_actions as i32;           // what its source allows
+    drop_answer as i32;            // what the program takes
+    drop_want_action as i32;       // and how; 0 for either
+    drop_pending as i32;           // dropped, its data being read
+    drop_ready as i32;             // its data arrived
+    drop_kind as i32;              // FILES or TEXT, what was read
+    drop_serial as u32;
+    drop_x as i64;
+    drop_y as i64;
+    drop_count as i64;
+    drop_paths as transfer.Bytes;
+    drop_text as transfer.Bytes;
+    drag_source as i32;            // ours, while a drag runs
+    sources as [8]DataSource;
+    offers as [8]DataOffer;
+    xkb_context as *u8;
+    xkb_keymap as *u8;
+    xkb_state as *u8;
+    compose_table as *u8;
+    compose_state as *u8;
+    // The own interpreter's, with keymap_kind KEYMAP_CAUSTIC.
+    keymap_kind as i32;
+    own_keymap as *xkbkeymap.Keymap;
+    own_state as *xkbstate.State;
+    own_compose_table as *xcompose.Table;
+    own_compose as *xcompose.State;
+    // The byte the chosen interpreter refused the last keymap at, -1 for none.
+    keymap_refused_at as i64;
+    min_width as i64;
+    min_height as i64;
+    max_width as i64;
+    max_height as i64;
+    ext_left as i64;
+    ext_right as i64;
+    ext_top as i64;
+    ext_bottom as i64;
+    input_x as i64;
+    input_y as i64;
+    input_width as i64;
+    input_height as i64;
+    width as i64;
+    height as i64;
+    logical_width as i64;
+    logical_height as i64;
+    normal_width as i64;
+    normal_height as i64;
+    configured_width as i64;
+    last_buffer as i32;
+    visible as i32;
+    configured_height as i64;
+    stride as i64;
+    bytes as i64;
+    buffer_width as i64;
+    buffer_height as i64;
+    resize_detached as i32;
+    pixels as *u8;
+    buffers as [2]Buffer;
+    presents as i64;   // frames committed
+    retired as [4]BufferSet;
+    current as i32;
+    // Cooked input, as this file's translator says it (input/event.cst).
+    input as *ie.Queue;
+    // The window's own events.
+    event_head as i32;
+    event_len as i32;
+    events as [64]event.Event;
+    state as i32;
+    server_decorated as i32;
+    input_region_set as i32;
+    modal_wanted as i32;
+    decorated_wanted as i32;
+    old_state as i32;
+    err as i32;
+    opened as i32;
+    mapped as i32;
+    resized as i32;
+    frame_ready as i32;
+    close_requested as i32;
+    acked as i32;
+    connection_slot as i32;
+    _pad1 as i32;
+    // The serial of the last press or key on this window: what a popup of it
+    // grabs under.
+    grab_serial as u32;
+    // A popup: its xdg_popup, the positioner it is opened with, where the
+    // compositor put it (logical, relative to the parent's window geometry)
+    // and whether the compositor took it down.
+    xdg_popup as i32;
+    popup_kind as i32;
+    popup_done as i32;
+    popup_x as i32;
+    popup_y as i32;
+    pos as Options;
+    reposition_token as i32;
+    swallowed as i32;     // buttons whose press took a popup down: their release no one's
+    // A subsurface: its wl_subsurface, and whether its commits wait for its
+    // parent's (synchronized, the protocol's default) or apply at once.
+    subcompositor as i32;
+    subsurface as i32;
+    sub_sync as i32;
+    // Optional protocols' objects, 0 where the compositor has none.
+    activation as i32;           // xdg_activation_v1
+    token_object as i32;         // an xdg_activation_token_v1 being made
+    token_len as i32;            // its token's length once done; -1 while made
+    token as [256]u8;
+    exporter as i32;             // zxdg_exporter_v2
+    exported as i32;             // this toplevel exported, once asked
+    export_len as i32;           // its handle's length once said; -1 while not
+    export_handle as [128]u8;
+    icon_manager as i32;         // xdg_toplevel_icon_manager_v1
+    icon_buffer as i32;          // the icon's pixels, kept while it is shown
+    icon_map as *u8;
+    icon_bytes as i64;
+    presentation as i32;         // wp_presentation
+    feedback as [8]i32;          // feedback asked of the frames in flight
+    presented_ns as i64;         // when the last frame was shown, presentation_clock
+    refresh_ns as i64;           // the output's refresh then, 0 unknown
+    presented as i64;            // frames shown
+    discarded as i64;            // frames never shown
+    single_pixel as i32;         // wp_single_pixel_buffer_manager_v1
+    fill_buffer as i32;          // the one-pixel buffer last filled with
+    bell as i32;                 // xdg_system_bell_v1
+    toplevel_drag_manager as i32;
+    toplevel_drag as i32;        // the drag a toplevel rides, while it does
+}
+
+let is [4096]u8 as _wire with mut;
+let is i32 as _wire_size with mut = 0;
+let is i32 as MAX_WINDOWS with imut = 64;
+let is i32 as MAX_OBJECTS with imut = 8192;
+struct ObjectSlot {
+    owner as *Window;
+    next as i32;
+    fd_opcode as i32; // retained until delete_id, including after owner closes
+}
+struct Binding {
+    global as u32;
+    object as i32;
+}
+let is [8192]ObjectSlot as _objects with mut;
+let is [64]*Window as _windows with mut;
+let is [32]Binding as _bindings with mut;
+let is Globals as _globals with mut;
+let is i32 as _registry with mut = 0;
+let is i32 as _objects_ready with mut = 0;
+let is i32 as _free_object with mut = 0;
+let is i64 as _connection_fd with mut = 0 - 1;
+let is i32 as _connection_refs with mut = 0;
+// The popups holding the seat's grab, innermost last. The compositor gives a
+// press on any surface of this client to that surface, as an X server does a
+// grabbing client's; one on a window that is not a popup takes the innermost
+// down here, and goes to no one — as on X11 and Windows.
+let is [16]*Window as _grabbers with mut;
+let is i32 as _ngrabbers with mut = 0;
+
+fn _ungrabber(w as *Window) as void {
+    let is i32 as i with mut = 0;
+    while (i < _ngrabbers && _grabbers[i] != w) { i = i + 1; }
+    if (i == _ngrabbers) { return; }
+    while (i < _ngrabbers - 1) {
+        _grabbers[i] = _grabbers[i + 1];
+        i = i + 1;
+    }
+    _ngrabbers = _ngrabbers - 1;
+}
+let is [16]i32 as _recv_fds with mut;
+let is i32 as _recv_fd_count with mut = 0;
+let is i32 as _recv_fd_head with mut = 0;
+
+fn _object_pool() as void {
+    let is i32 as i with mut = 2;
+    while (i < MAX_OBJECTS) {
+        _objects[i].owner = cast(*Window, 0);
+        _objects[i].next = i + 1;
+        _objects[i].fd_opcode = 0 - 1;
+        i = i + 1;
+    }
+    _objects[MAX_OBJECTS - 1].next = 0;
+    _free_object = 2; _objects_ready = 1;
+}
+
+fn _release_object(id as i32) as void {
+    if (id < 2 || id >= MAX_OBJECTS || _objects[id].next != 0 - 1) { return; }
+    _objects[id].owner = cast(*Window, 0);
+    _objects[id].fd_opcode = 0 - 1;
+    _objects[id].next = _free_object;
+    _free_object = id;
+}
+
+fn _attach(w as *Window) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (cast(i64, _windows[i]) == 0) {
+            _windows[i] = w; w.connection_slot = i;
+            _connection_refs = _connection_refs + 1;
+            return 1;
+        }
+        i = i + 1;
+    }
+    w.fd = 0 - 1;
+    return 0;
+}
+
+fn _disconnect(w as *Window) as void {
+    let is i32 as i with mut = 2;
+    while (i < MAX_OBJECTS) {
+        if (_objects[i].owner == w) { _objects[i].owner = cast(*Window, 0); }
+        i = i + 1;
+    }
+    if (w.connection_slot >= 0) {
+        _windows[w.connection_slot] = cast(*Window, 0);
+        _connection_refs = _connection_refs - 1;
+    }
+    if (_connection_refs == 0 && _connection_fd >= 0) {
+        _close_recv_fds();
+        linux.close(_connection_fd);
+        _connection_fd = 0 - 1; _objects_ready = 0;
+        mem.memzero(cast(*u8, &_bindings[0]), 32 * sizeof(Binding));
+        mem.memzero(cast(*u8, &_globals), sizeof(Globals));
+        _registry = 0;
+    }
+    w.fd = 0 - 1; w.connection_slot = 0 - 1;
+}
+
+fn _zero(w as *Window) as void {
+    mem.memzero(cast(*u8, w), sizeof(Window));
+    w.fd = 0 - 1; w.memfd = 0 - 1; w.connection_slot = 0 - 1;
+    w.repeat_code = 0 - 1;
+    w.keymap_refused_at = 0 - 1;
+    w.cursor_next = 0 - 1;
+    w.cursor_slot = 0 - 1;
+    w.registry = 0; w.compositor = 0; w.shm = 0; w.wm_base = 0;
+    w.surface = 0; w.xdg_surface = 0; w.toplevel = 0; w.pool = 0;
+    w.callback = 0;
+    w.width = 0; w.height = 0; w.logical_width = 0; w.logical_height = 0;
+    w.configured_width = 0; w.configured_height = 0;
+    w.scale = 1; w.scale120 = 120; w.fractional_active = 0;
+    w.active_output = 0 - 1; w.output_count = 0;
+    w.buffer_width = 0; w.buffer_height = 0; w.resize_detached = 0;
+    w.buffers[0].object = 0; w.buffers[0].busy = 0;
+    w.buffers[1].object = 0; w.buffers[1].busy = 0; w.current = 0 - 1;
+    w.last_buffer = 0 - 1; w.visible = 0;
+    w.event_head = 0; w.event_len = 0;
+    w.state = 0; w.old_state = 0; w.err = OK; w.opened = 0; w.mapped = 0;
+    w.resized = 0; w.frame_ready = 0; w.close_requested = 0; w.acked = 0;
+    w.reading[0].fd = 0 - 1; w.reading[1].fd = 0 - 1;
+    let is i32 as wk with mut = 0;
+    while (wk < MAX_WRITERS) { w.writing[wk].fd = 0 - 1; wk = wk + 1; }
+    w.ime_rect_x = 0 - 1; w.ime_rect_y = 0 - 1;
+    w.scroll_source = 0 - 1;
+    w.ime_rect_w = 0 - 1; w.ime_rect_h = 0 - 1;
+    w.ti_text_len = 0 - 1;
+
+}
+fn _queue(w as *Window, e as *event.Event) as void {
+    if (w.event_len == MAX_EVENTS) {
+        w.event_head = (w.event_head + 1) % MAX_EVENTS;
+        w.event_len = w.event_len - 1;
+    }
+    w.events[(w.event_head + w.event_len) % MAX_EVENTS] = *e;
+    w.event_len = w.event_len + 1;
+}
+
+// Cooked input of kind, the modifiers held now on it.
+fn _input(w as *Window, kind as i32) as ie.Event {
+    let is ie.Event as e;
+    ie.clear(&e);
+    e.kind = kind;
+    e.modifiers = w.modifiers;
+    return e;
+}
+
+fn _push(w as *Window, e as *ie.Event, text as *u8, len as i64) as void {
+    if (cast(i64, w.input) != 0) { ie.push(w.input, e, text, len); }
+}
+
+// The pointer at x, y: kind (ENTER, MOTION, BUTTON_*), button for a press.
+fn _pointer_input(w as *Window, kind as i32, button as i32) as void {
+    let is ie.Event as e = _input(w, kind);
+    e.x = w.pointer_x;
+    e.y = w.pointer_y;
+    e.button = button;
+    _push(w, &e, cast(*u8, 0), 0);
+}
+
+// The keyboard's focus left: everything held — keys and buttons — is let go,
+// a release that comes later says nothing, and no key repeats.
+fn _cancel_input(w as *Window) as void {
+    mem.memzero(cast(*u8, &w.pointer_buttons[0]), 8 * 4);
+    w.repeat_code = 0 - 1;
+    if (cast(i64, w.input) != 0) { ie.cancel(w.input, ie.CANCEL_FOCUS); }
+}
+
+fn _event(w as *Window, kind as i32) as void {
+    let is event.Event as e;
+    event.clear(&e);
+    e.kind = kind;
+    _queue(w, &e);
+}
+
+fn _id(w as *Window) as i32 {
+    if (_objects_ready == 0) { _object_pool(); }
+    let is i32 as id = _free_object;
+    if (id == 0) { w.err = NO_MEMORY; return 0; }
+    _free_object = _objects[id].next;
+    _objects[id].next = 0 - 1;
+    _objects[id].owner = w;
+    _objects[id].fd_opcode = 0 - 1;
+    return id;
+}
+
+fn _word(p as *u8) as u32 { return *cast(*u32, p); }
+fn _put(p as *u8, value as u32) as void { *cast(*u32, p) = value; }
+
+fn _write_all(fd as i64, p as *u8, n as i64) as i32 {
+    let is i64 as sent with mut = 0;
+    while (sent < n) {
+        let is i64 as r = linux.sendto(fd, cast(*u8, cast(i64, p) + sent), n - sent, sys.MSG_NOSIGNAL, cast(*u8, 0), 0);
+        if (r <= 0) { return 0; }
+        sent = sent + r;
+    }
+    return 1;
+}
+
+fn _read_all(fd as i64, p as *u8, n as i64) as i32 {
+    let is i64 as got with mut = 0;
+    while (got < n) {
+        let is i64 as r = linux.read(fd, cast(*u8, cast(i64, p) + got), n - got);
+        if (r <= 0) { return 0; }
+        got = got + r;
+    }
+    return 1;
+}
+
+fn _send(w as *Window, object as i32, opcode as i32, body as *u8, n as i32, pass_fd as i64) as i32 {
+    if (w.fd < 0) { return 0; }
+    if (n < 0 || n > MAX_WIRE - 8) { return 0; }
+    if (w.err == NO_MEMORY) { return 0; }
+    let is [4096]u8 as packet;
+    _put(&packet[0], cast(u32, object));
+    _put(&packet[4], cast(u32, ((n + 8) << 16) | opcode));
+    if (n > 0) { mem.memcpy(cast(*u8, cast(i64, &packet) + 8), body, n); }
+    let is i64 as total = n + 8;
+    if (pass_fd >= 0) {
+        let is i32 as fd = cast(i32, pass_fd);
+        let is i64 as sent = sys.send_fds(w.fd, cast(*u8, &packet), total, &fd, 1);
+        if (sent <= 0) { return 0; }
+        if (sent < total) { return _write_all(w.fd, cast(*u8, cast(i64, &packet) + sent), total - sent); }
+        return 1;
+    }
+    return _write_all(w.fd, cast(*u8, &packet), total);
+}
+
+fn _surface_commit(w as *Window) as i32 {
+    if (w.surface == 0) { return 0; }
+    return _send(w, w.surface, 6, cast(*u8, 0), 0, 0 - 1);
+}
+
+// SCM_RIGHTS is an ordered stream independent of message byte boundaries:
+// a descriptor received with an earlier event waits for its FD argument.
+fn _take_recv_fd() as i64 {
+    if (_recv_fd_count == 0) { return 0 - 1; }
+    let is i32 as index = _recv_fd_head;
+    let is i64 as fd = _recv_fds[index];
+    _recv_fds[index] = 0 - 1;
+    _recv_fd_head = (index + 1) & 15;
+    _recv_fd_count = _recv_fd_count - 1;
+    return fd;
+}
+
+fn _close_recv_fds() as void {
+    while (_recv_fd_count > 0) {
+        let is i64 as fd = _take_recv_fd();
+        if (fd >= 0) { linux.close(fd); }
+    }
+}
+
+fn _recv_part(w as *Window, p as *u8, n as i64) as i32 {
+    let is i64 as got with mut = 0;
+    while (got < n) {
+        let is [16]i32 as fds;
+        let is i64 as count with mut = 0;
+        let is i64 as r = sys.recv_fds(w.fd, cast(*u8, cast(i64, p) + got), n - got,
+                                        &fds[0], &count, 1);
+        if (r <= 0) {
+            let is i64 as j with mut = 0;
+            while (j < count) { linux.close(fds[j]); j = j + 1; }
+            _close_recv_fds();
+            return 0;
+        }
+        let is i64 as j with mut = 0;
+        while (j < count) {
+            if (_recv_fd_count < 16) {
+                _recv_fds[(_recv_fd_head + _recv_fd_count) & 15] = fds[j];
+                _recv_fd_count = _recv_fd_count + 1;
+            } else {
+                while (j < count) { linux.close(fds[j]); j = j + 1; }
+                _close_recv_fds();
+                return 0;
+            }
+            j = j + 1;
+        }
+        got = got + r;
+    }
+    return 1;
+}
+
+fn _recv(w as *Window) as i32 {
+    if (_recv_part(w, &_wire[0], 8) == 0) { return 0; }
+    let is u32 as obj = _word(&_wire[0]);
+    let is u32 as oh = _word(&_wire[4]);
+    let is i32 as size = cast(i32, oh >> 16);
+    if (size < 8 || size > MAX_WIRE || (size & 3) != 0) { return 0; }
+    if (_recv_part(w, &_wire[8], size - 8) == 0) { return 0; }
+    _wire_size = size;
+    return cast(i32, obj);
+}
+
+fn _same(p as *u8, n as i32, s as *u8) as i32 {
+    let is i32 as k with mut = 0;
+    while (s[k] != 0) { k = k + 1; }
+    if (k != n) { return 0; }
+    return cast(i32, mem.memcmp(p, s, n) == 0);
+}
+
+fn _bounded(a as i32, b as i32) as i32 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn _scale_up(value as i64, factor as i32) as i64 {
+    return (value * factor + 119) / 120;
+}
+
+fn _scale_down(value as i64, factor as i32) as i64 {
+    if (factor <= 0) { return 0; }
+    return value * 120 / factor;
+}
+let is i32 as PASTE with imut = 0;
+let is i32 as DROP  with imut = 1;
+let is i32 as MAX_WRITERS with imut = 8;
+let is i64 as TRANSFER_TIMEOUT_MS with imut = 10000;
+
+// A source's purpose.
+let is i32 as _FOR_CLIPBOARD with imut = 0;
+let is i32 as _FOR_PRIMARY   with imut = 1;
+let is i32 as _FOR_DRAG      with imut = 2;
+
+// A paste's state.
+let is i32 as _PASTE_IDLE    with imut = 0;
+let is i32 as _PASTE_PENDING with imut = 1;
+let is i32 as _PASTE_READY   with imut = 2;
+
+//
+// 1 enable, 2 disable, 3 set_surrounding_text, 4 set_text_change_cause,
+// 5 set_content_type, 6 set_cursor_rectangle, 7 commit. All but enable and
+// disable are double-buffered state, applied on commit; enable resets it,
+// and nothing sent between leave and enter counts.
+let is i32 as TI_TEXT with imut = 1;
+let is i32 as TI_TYPE with imut = 2;
+let is i32 as TI_RECT with imut = 4;
+
+let is i32 as CAP_PRESSURE with imut = 2;
+let is i32 as CAP_DISTANCE with imut = 3;
+
+fn _send_string(w as *Window, object as i32, opcode as i32, text as *u8) as i32 {
+    let is [2048]u8 as p;
+    let is i32 as len with mut = 1;
+    while (text[len - 1] != 0 && len < 2000) { len = len + 1; }
+    if (len >= 2000) { return 0; }
+    _put(&p[0], cast(u32, len));
+    let is i32 as padded = ((len + 3) / 4) * 4;
+    mem.memcpy(&p[4], text, len);
+    if (padded > len) { mem.memset(cast(*u8, cast(i64, &p[4]) + len), 0, padded - len); }
+    return _send(w, object, opcode, &p[0], 4 + padded, 0 - 1);
+}
+fn _send_string_n(w as *Window, object as i32, opcode as i32, text as *u8, n as i64) as i32 {
+    if (n < 0 || n >= 2000) { return 0; }
+    let is [2048]u8 as p;
+    let is i64 as len = n + 1;
+    _put(&p[0], cast(u32, len));
+    if (n > 0) { mem.memcpy(&p[4], text, n); }
+    p[4 + n] = 0;
+    let is i64 as padded = ((len + 3) / 4) * 4;
+    if (padded > len) { mem.memset(cast(*u8, cast(i64, &p[4]) + len), 0, padded - len); }
+    return _send(w, object, opcode, &p[0], cast(i32, 4 + padded), 0 - 1);
+}
+fn _send_string_fd(w as *Window, object as i32, opcode as i32, text as *u8, fd as i64) as i32 {
+    let is [256]u8 as p;
+    let is i32 as len with mut = 1;
+    while (text[len - 1] != 0 && len < 240) { len = len + 1; }
+    if (len >= 240) { return 0; }
+    _put(&p[0], cast(u32, len));
+    let is i32 as padded = ((len + 3) / 4) * 4;
+    mem.memcpy(&p[4], text, len);
+    if (padded > len) { mem.memset(cast(*u8, cast(i64, &p[4]) + len), 0, padded - len); }
+    return _send(w, object, opcode, &p[0], 4 + padded, fd);
+}

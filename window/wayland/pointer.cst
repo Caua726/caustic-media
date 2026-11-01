@@ -1,0 +1,746 @@
+// window/wayland/pointer.cst — the pointer, touch, tablets and gestures:
+// wl_pointer's frames and scrolling, wl_touch, tablet-v2's tools and the
+// pointer-gestures swipes, pinches and holds, cooked into input events;
+// and the pointer's image, cursor-shape-v1's or drawn from the theme.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../../sys/linux.cst" as sys;
+use "../event.cst" as event;
+use "../../input/event.cst" as ie;
+use "../xcursor.cst" as xcursor;
+use "state.cst" as st;
+
+fn _button_id(code as i32) as i32 {
+    if (code == 272) { return 1; }
+    if (code == 274) { return 2; }
+    if (code == 273) { return 3; }
+    if (code >= 275 && code <= 279) { return code - 271; }
+    return 0;
+}
+
+// Whole notches in 120ths given, the rest kept for the next: toward zero, so
+// a turn back starts from what is left.
+fn _notches(v120 as i32, rest as *i32) as i32 {
+    *rest = *rest + v120;
+    let is i32 as whole = *rest / 120;
+    *rest = *rest - whole * 120;
+    return whole;
+}
+
+// A pointer frame's scrolling, said as one SCROLL. Where it came from as the
+// compositor said (axis_source; a frame with notches and no source a
+// wheel's). A wheel's in notches — 120ths where it says them (value120, 8),
+// whole ones before (axis_discrete), whole notches counted from what is left
+// between frames; fingers' and continuous devices' in lines of LINE_PIXELS
+// of the compositor's motion, and the axes they stopped on (axis_stop).
+// Before version 5 there are no frames: each axis event a wheel's notch.
+fn _scroll(w as *st.Window) as void {
+    if (w.scroll_x == 0 && w.scroll_y == 0 && w.scroll_discrete == 0 && w.scroll_discrete_x == 0 &&
+        w.scroll_v120_x == 0 && w.scroll_v120_y == 0 && w.scroll_stop == 0) { return; }
+    let is ie.Event as e = st._input(w, ie.SCROLL);
+    e.x = w.pointer_x;
+    e.y = w.pointer_y;
+    let is i32 as notched = cast(i32, w.scroll_v120_x != 0 || w.scroll_v120_y != 0 ||
+                                     w.scroll_discrete != 0 || w.scroll_discrete_x != 0);
+    e.source = ie.SCROLL_CONTINUOUS;
+    if (w.scroll_source == 0 || (w.scroll_source < 0 && notched == 1)) { e.source = ie.SCROLL_WHEEL; }
+    if (w.scroll_source == 1) { e.source = ie.SCROLL_FINGER; }
+    if (w.scroll_source == 3) { e.source = ie.SCROLL_TILT; }
+    if (w.pointer_version < 5) {
+        e.source = ie.SCROLL_WHEEL;
+        if (w.scroll_y > 0) { e.steps_y = 1; } else if (w.scroll_y < 0) { e.steps_y = 0 - 1; }
+        if (w.scroll_x > 0) { e.steps_x = 1; } else if (w.scroll_x < 0) { e.steps_x = 0 - 1; }
+        e.dx = cast(f64, e.steps_x);
+        e.dy = cast(f64, e.steps_y);
+        e.value120_x = e.steps_x * 120;
+        e.value120_y = e.steps_y * 120;
+    } else if (e.source == ie.SCROLL_WHEEL || e.source == ie.SCROLL_TILT) {
+        let is i32 as vx with mut = w.scroll_v120_x;
+        let is i32 as vy with mut = w.scroll_v120_y;
+        if (notched == 0) {
+            // A wheel the compositor gives no notches for: its motion, a
+            // notch every LINE_PIXELS.
+            vx = cast(i32, w.scroll_x * 120 / 256 / 15);
+            vy = cast(i32, w.scroll_y * 120 / 256 / 15);
+        } else if (vx == 0 && vy == 0) {
+            vx = w.scroll_discrete_x * 120;
+            vy = w.scroll_discrete * 120;
+        }
+        e.value120_x = vx;
+        e.value120_y = vy;
+        e.dx = cast(f64, vx) / 120.0;
+        e.dy = cast(f64, vy) / 120.0;
+        e.steps_x = _notches(vx, &w.v120_rest_x);
+        e.steps_y = _notches(vy, &w.v120_rest_y);
+    } else {
+        e.dx = cast(f64, w.scroll_x) / 256.0 / ie.LINE_PIXELS;
+        e.dy = cast(f64, w.scroll_y) / 256.0 / ie.LINE_PIXELS;
+        e.stop = w.scroll_stop;
+    }
+    st._push(w, &e, cast(*u8, 0), 0);
+    w.scroll_x = 0; w.scroll_y = 0; w.scroll_discrete = 0; w.scroll_discrete_x = 0;
+    w.scroll_v120_x = 0; w.scroll_v120_y = 0; w.scroll_source = 0 - 1; w.scroll_stop = 0;
+}
+
+fn _pointer_event(w as *st.Window, op as i32, p as *u8) as void {
+    if (op == 0) {
+        if (st._word(cast(*u8, cast(i64, p) + 4)) != cast(u32, w.surface)) { return; }
+        w.pointer_serial = st._word(p);
+        w.pointer_inside = 1;
+        w.pointer_x = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
+        w.pointer_y = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 12))) / 256), w.scale120);
+        st._pointer_input(w, ie.ENTER, 0);
+        // Each enter is a new serial the pointer's shape is set under.
+        _cursor_apply(w);
+        return;
+    }
+    if (op == 1) {
+        w.pointer_serial = st._word(p); w.pointer_inside = 0;
+        // What a wheel turned short of a notch is not carried to another
+        // visit, nor a frame left unended.
+        w.scroll_x = 0; w.scroll_y = 0; w.scroll_discrete = 0; w.scroll_discrete_x = 0;
+        w.scroll_v120_x = 0; w.scroll_v120_y = 0; w.scroll_source = 0 - 1; w.scroll_stop = 0;
+        w.v120_rest_x = 0; w.v120_rest_y = 0;
+        st._pointer_input(w, ie.LEAVE, 0);
+        return;
+    }
+    if (w.pointer_inside == 0) { return; }
+    if (op == 2) {
+        w.pointer_x = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 4))) / 256), w.scale120);
+        w.pointer_y = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 8))) / 256), w.scale120);
+        st._pointer_input(w, ie.MOTION, 0);
+        return;
+    }
+    if (op == 3) {
+        w.pointer_serial = st._word(p);
+        if (st._word(cast(*u8, cast(i64, p) + 12)) == 1) { w.grab_serial = w.pointer_serial; w.input_serial = w.pointer_serial; }
+        let is i32 as button = _button_id(cast(i32, st._word(cast(*u8, cast(i64, p) + 8))));
+        if (button <= 0 || button >= 8) { return; }
+        let is i32 as down = cast(i32, st._word(cast(*u8, cast(i64, p) + 12)) == 1);
+        // A release of a button not held says nothing: its press was taken
+        // by the compositor to move or resize from, or let go by a CANCEL.
+        if (down == 0 && w.pointer_buttons[button] == 0 && (w.swallowed & cast(i32, 1 << button)) == 0) { return; }
+        let is i32 as bit = cast(i32, 1 << button);
+        if (down == 1) { w.swallowed = w.swallowed & cast(i32, 0 - 1 - bit); }
+        if (down == 1 && w.xdg_popup == 0 && st._ngrabbers > 0) {
+            let is *st.Window as top = st._grabbers[st._ngrabbers - 1];
+            if (top.popup_done == 0) {
+                top.popup_done = 1;
+                st._event(top, event.POPUP_DONE);
+            }
+            w.swallowed = w.swallowed | bit;
+            return;
+        }
+        if (down == 0 && (w.swallowed & bit) != 0) {
+            w.swallowed = w.swallowed & cast(i32, 0 - 1 - bit);
+            return;
+        }
+        w.pointer_buttons[button] = down;
+        if (down == 1) { st._pointer_input(w, ie.BUTTON_DOWN, button); }
+        else { st._pointer_input(w, ie.BUTTON_UP, button); }
+        return;
+    }
+    if (op == 4 && st._wire_size >= 20) {
+        let is i64 as value = cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 8))));
+        if (st._word(cast(*u8, cast(i64, p) + 4)) == 0) { w.scroll_y = w.scroll_y + value; }
+        else { w.scroll_x = w.scroll_x + value; }
+        if (w.pointer_version < 5) { _scroll(w); }
+        return;
+    }
+    if (op == 6 && st._wire_size >= 12) {
+        let is u32 as source = st._word(p);
+        if (source <= cast(u32, 3)) { w.scroll_source = cast(i32, source); }
+        return;
+    }
+    if (op == 7 && st._wire_size >= 16) {
+        if (st._word(cast(*u8, cast(i64, p) + 4)) == 0) { w.scroll_stop = w.scroll_stop | ie.STOP_Y; }
+        else { w.scroll_stop = w.scroll_stop | ie.STOP_X; }
+        return;
+    }
+    if (op == 8 && st._wire_size >= 16) {
+        let is i32 as steps = cast(i32, st._word(cast(*u8, cast(i64, p) + 4)));
+        if (st._word(p) == 0) { w.scroll_discrete = w.scroll_discrete + steps; }
+        else { w.scroll_discrete_x = w.scroll_discrete_x + steps; }
+        return;
+    }
+    if (op == 9 && st._wire_size >= 16) {
+        let is i32 as v120 = cast(i32, st._word(cast(*u8, cast(i64, p) + 4)));
+        if (st._word(p) == 0) { w.scroll_v120_y = w.scroll_v120_y + v120; }
+        else { w.scroll_v120_x = w.scroll_v120_x + v120; }
+        return;
+    }
+    if (op == 5 && w.pointer_version >= 5) { _scroll(w); }
+}
+
+// --- Touch (wl_touch) ---
+//
+// A point is this window's from its down on this surface to its up: the
+// compositor sends a client's every touch object the points on any of its
+// surfaces. Coordinates as the pointer's, buffer pixels.
+
+fn _touch_slot(w as *st.Window, id as i32) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < 10) {
+        if (w.touch_used[i] == 1 && w.touch_ids[i] == id) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _touch_input(w as *st.Window, kind as i32, slot as i32, time as u32) as void {
+    let is ie.Event as e = st._input(w, kind);
+    e.contact = w.touch_ids[slot];
+    e.x = w.touch_x[slot];
+    e.y = w.touch_y[slot];
+    e.time_ms = cast(i64, time);
+    st._push(w, &e, cast(*u8, 0), 0);
+}
+
+// Every point this window had, gone without lifting: one TOUCH_CANCEL.
+fn _touch_cancel(w as *st.Window) as void {
+    let is i32 as had with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < 10) {
+        if (w.touch_used[i] == 1) { had = 1; }
+        w.touch_used[i] = 0;
+        i = i + 1;
+    }
+    if (had == 0) { return; }
+    let is ie.Event as e = st._input(w, ie.TOUCH_CANCEL);
+    st._push(w, &e, cast(*u8, 0), 0);
+}
+
+fn _touch_event(w as *st.Window, op as i32, p as *u8) as void {
+    if (op == 0 && st._wire_size >= 32) {
+        // down: serial, time, surface, id, x, y
+        if (cast(i32, st._word(cast(*u8, cast(i64, p) + 8))) != w.surface) { return; }
+        let is i32 as id = cast(i32, st._word(cast(*u8, cast(i64, p) + 12)));
+        let is i32 as slot with mut = _touch_slot(w, id);
+        if (slot < 0) {
+            slot = 0;
+            // More fingers than kept: the eleventh is not said, nor its up.
+            while (slot < 10 && w.touch_used[slot] == 1) { slot = slot + 1; }
+            if (slot == 10) { return; }
+        }
+        w.touch_used[slot] = 1;
+        w.touch_ids[slot] = id;
+        w.touch_x[slot] = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 16)))) / 256, w.scale120);
+        w.touch_y[slot] = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 20)))) / 256, w.scale120);
+        _touch_input(w, ie.TOUCH_DOWN, slot, st._word(cast(*u8, cast(i64, p) + 4)));
+        return;
+    }
+    if (op == 1 && st._wire_size >= 20) {
+        // up: serial, time, id
+        let is i32 as slot = _touch_slot(w, cast(i32, st._word(cast(*u8, cast(i64, p) + 8))));
+        if (slot < 0) { return; }
+        _touch_input(w, ie.TOUCH_UP, slot, st._word(cast(*u8, cast(i64, p) + 4)));
+        w.touch_used[slot] = 0;
+        return;
+    }
+    if (op == 2 && st._wire_size >= 24) {
+        // motion: time, id, x, y
+        let is i32 as slot = _touch_slot(w, cast(i32, st._word(cast(*u8, cast(i64, p) + 4))));
+        if (slot < 0) { return; }
+        w.touch_x[slot] = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 8)))) / 256, w.scale120);
+        w.touch_y[slot] = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 12)))) / 256, w.scale120);
+        _touch_input(w, ie.TOUCH_MOTION, slot, st._word(p));
+        return;
+    }
+    if (op == 4) { _touch_cancel(w); }
+}
+// --- Pens (tablet-v2) ---
+//
+// The tablet seat says each tablet and tool as it comes, as an object of the
+// compositor's; a tool's events are gathered until its frame and said then,
+// in order: in range, down or moved, its buttons, up, out of range. A tool
+// is this window's from its proximity_in on this surface to its
+// proximity_out. Pads (a tablet's own buttons and rings) are not said.
+
+fn _tablet_index(w as *st.Window, obj as i32) as i32 {
+    if (obj == 0) { return 0 - 1; }
+    let is i32 as i with mut = 0;
+    while (i < 4) {
+        if (w.tablets[i] == obj) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _tool_index(w as *st.Window, obj as i32) as i32 {
+    if (obj == 0) { return 0 - 1; }
+    let is i32 as i with mut = 0;
+    while (i < 8) {
+        if (w.tools[i].object == obj) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _tablet_seat_event(w as *st.Window, op as i32, p as *u8) as void {
+    if (st._wire_size < 12) { return; }
+    let is i32 as obj = cast(i32, st._word(p));
+    if (op == 0) {
+        let is i32 as free with mut = 0;
+        while (free < 4 && w.tablets[free] != 0) { free = free + 1; }
+        if (free < 4) { w.tablets[free] = obj; } else { st._send(w, obj, 0, cast(*u8, 0), 0, 0 - 1); }
+        return;
+    }
+    if (op == 1) {
+        let is i32 as free with mut = 0;
+        while (free < 8 && w.tools[free].object != 0) { free = free + 1; }
+        if (free == 8) {
+            st._send(w, obj, 1, cast(*u8, 0), 0, 0 - 1);
+            return;
+        }
+        let is *st.Tool as t = &w.tools[free];
+        mem.memzero(cast(*u8, t), sizeof(st.Tool));
+        t.object = obj;
+        t.kind = ie.TOOL_PEN;
+        w.tool_serial = w.tool_serial + 1;
+        t.contact = w.tool_serial;
+        t.pressure = 0.0 - 1.0;
+        t.tilt_x = 0.0;
+        t.tilt_y = 0.0;
+        t.distance = 0.0 - 1.0;
+        return;
+    }
+    // A pad: its own buttons, not said here; let go of at once.
+    if (op == 2) { st._send(w, obj, 1, cast(*u8, 0), 0, 0 - 1); }
+}
+
+fn _tablet_event(w as *st.Window, i as i32, op as i32) as void {
+    if (op != 4) { return; }
+    st._send(w, w.tablets[i], 0, cast(*u8, 0), 0, 0 - 1);
+    w.tablets[i] = 0;
+}
+
+fn _pen(w as *st.Window, t as *st.Tool, kind as i32) as ie.Event {
+    let is ie.Event as e = st._input(w, kind);
+    e.contact = t.contact;
+    e.x = t.x;
+    e.y = t.y;
+    e.pressure = t.pressure;
+    e.tilt_x = t.tilt_x;
+    e.tilt_y = t.tilt_y;
+    e.distance = t.distance;
+    e.time_ms = t.time;
+    return e;
+}
+
+fn _tool_frame(w as *st.Window, t as *st.Tool) as void {
+    if (t.f_in == 1) {
+        let is ie.Event as e = _pen(w, t, ie.PEN_IN);
+        e.detail = t.kind;
+        st._push(w, &e, cast(*u8, 0), 0);
+    }
+    if (t.f_down == 1 && t.down == 0) {
+        t.down = 1;
+        let is ie.Event as e = _pen(w, t, ie.PEN_DOWN);
+        st._push(w, &e, cast(*u8, 0), 0);
+    } else if (t.f_moved == 1 && t.f_in == 0) {
+        let is ie.Event as e = _pen(w, t, ie.PEN_MOTION);
+        st._push(w, &e, cast(*u8, 0), 0);
+    }
+    let is i32 as b with mut = 0;
+    while (b < t.nbuttons) {
+        let is ie.Event as e = _pen(w, t, ie.PEN_BUTTON);
+        e.button = t.buttons[b] >> 1;
+        e.detail = t.buttons[b] & 1;
+        st._push(w, &e, cast(*u8, 0), 0);
+        b = b + 1;
+    }
+    if ((t.f_up == 1 || t.f_out == 1) && t.down == 1) {
+        t.down = 0;
+        let is ie.Event as e = _pen(w, t, ie.PEN_UP);
+        st._push(w, &e, cast(*u8, 0), 0);
+    }
+    if (t.f_out == 1) {
+        t.inside = 0;
+        let is ie.Event as e = _pen(w, t, ie.PEN_OUT);
+        st._push(w, &e, cast(*u8, 0), 0);
+    }
+    t.f_in = 0; t.f_out = 0; t.f_down = 0; t.f_up = 0; t.f_moved = 0; t.nbuttons = 0;
+}
+
+fn _tool_event(w as *st.Window, i as i32, op as i32, p as *u8) as void {
+    let is *st.Tool as t = &w.tools[i];
+    if (op == 0 && st._wire_size >= 12) {
+        // type: pen 0x140, eraser 0x141, pencil 0x143; brush, airbrush,
+        // finger, mouse and lens are other tools.
+        let is u32 as kind = st._word(p);
+        t.kind = ie.TOOL_OTHER;
+        if (kind == cast(u32, 320) || kind == cast(u32, 323)) { t.kind = ie.TOOL_PEN; }
+        if (kind == cast(u32, 321)) { t.kind = ie.TOOL_ERASER; }
+        return;
+    }
+    if (op == 3 && st._wire_size >= 12) {
+        let is u32 as cap = st._word(p);
+        if (cap < cast(u32, 31)) { t.caps = t.caps | cast(i32, 1 << cap); }
+        return;
+    }
+    if (op == 4) {
+        // done: what it can say starts at rest.
+        if ((t.caps & (1 << st.CAP_PRESSURE)) != 0) { t.pressure = 0.0; }
+        if ((t.caps & (1 << st.CAP_DISTANCE)) != 0) { t.distance = 0.0; }
+        return;
+    }
+    if (op == 5) {
+        // removed: out of range first if it was in it.
+        if (t.inside == 1) {
+            t.f_out = 1;
+            _tool_frame(w, t);
+        }
+        st._send(w, t.object, 1, cast(*u8, 0), 0, 0 - 1);
+        t.object = 0;
+        return;
+    }
+    if (op == 6 && st._wire_size >= 20) {
+        // proximity_in: serial, tablet, surface
+        if (cast(i32, st._word(cast(*u8, cast(i64, p) + 8))) == w.surface) {
+            t.inside = 1;
+            t.f_in = 1;
+            t.down = 0;
+        }
+        return;
+    }
+    if (t.inside == 0) { return; }
+    if (op == 7) { t.f_out = 1; return; }
+    if (op == 8) { t.f_down = 1; return; }
+    if (op == 9) { t.f_up = 1; return; }
+    if (op == 10 && st._wire_size >= 16) {
+        t.x = st._scale_up(cast(i64, cast(i32, st._word(p))) / 256, w.scale120);
+        t.y = st._scale_up(cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + 4)))) / 256, w.scale120);
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 11 && st._wire_size >= 12) {
+        t.pressure = cast(f64, st._word(p)) / 65535.0;
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 12 && st._wire_size >= 12) {
+        t.distance = cast(f64, st._word(p)) / 65535.0;
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 13 && st._wire_size >= 16) {
+        t.tilt_x = cast(f64, cast(i32, st._word(p))) / 256.0;
+        t.tilt_y = cast(f64, cast(i32, st._word(cast(*u8, cast(i64, p) + 4)))) / 256.0;
+        t.f_moved = 1;
+        return;
+    }
+    if (op == 17 && st._wire_size >= 20) {
+        // button: serial, button (BTN_STYLUS 0x14b, BTN_STYLUS2 0x14c,
+        // BTN_STYLUS3 0x149), state
+        let is u32 as code = st._word(cast(*u8, cast(i64, p) + 4));
+        let is i32 as button with mut = 0;
+        if (code == cast(u32, 331)) { button = 1; }
+        if (code == cast(u32, 332)) { button = 2; }
+        if (code == cast(u32, 329)) { button = 3; }
+        if (button != 0 && t.nbuttons < 4) {
+            t.buttons[t.nbuttons] = (button << 1) | cast(i32, st._word(cast(*u8, cast(i64, p) + 8)) != 0);
+            t.nbuttons = t.nbuttons + 1;
+        }
+        return;
+    }
+    if (op == 18 && st._wire_size >= 12) {
+        t.time = cast(i64, st._word(p));
+        _tool_frame(w, t);
+    }
+}
+
+// The tablets and tools let go of: a tool in range said out of it.
+fn _drop_tablets(w as *st.Window) as void {
+    let is i32 as i with mut = 0;
+    while (i < 8) {
+        let is *st.Tool as t = &w.tools[i];
+        if (t.object != 0) {
+            if (t.inside == 1) {
+                t.f_out = 1;
+                _tool_frame(w, t);
+            }
+            st._send(w, t.object, 1, cast(*u8, 0), 0, 0 - 1);
+            t.object = 0;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        if (w.tablets[i] != 0) { st._send(w, w.tablets[i], 0, cast(*u8, 0), 0, 0 - 1); }
+        w.tablets[i] = 0;
+        i = i + 1;
+    }
+    if (w.tablet_seat != 0) { st._send(w, w.tablet_seat, 0, cast(*u8, 0), 0, 0 - 1); }
+    if (w.tablet_manager != 0) { st._send(w, w.tablet_manager, 1, cast(*u8, 0), 0, 0 - 1); }
+    w.tablet_seat = 0;
+    w.tablet_manager = 0;
+}
+
+// --- Touchpad gestures (pointer-gestures) ---
+
+fn _gesture_objects(w as *st.Window) as void {
+    if (w.gestures == 0 || w.pointer == 0) { return; }
+    let is [8]u8 as b;
+    if (w.swipe == 0) {
+        w.swipe = st._id(w);
+        st._put(&b[0], cast(u32, w.swipe)); st._put(&b[4], cast(u32, w.pointer));
+        st._send(w, w.gestures, 0, &b[0], 8, 0 - 1);
+    }
+    if (w.pinch == 0) {
+        w.pinch = st._id(w);
+        st._put(&b[0], cast(u32, w.pinch)); st._put(&b[4], cast(u32, w.pointer));
+        st._send(w, w.gestures, 1, &b[0], 8, 0 - 1);
+    }
+    if (w.hold == 0 && w.gestures_version >= 3) {
+        w.hold = st._id(w);
+        st._put(&b[0], cast(u32, w.hold)); st._put(&b[4], cast(u32, w.pointer));
+        st._send(w, w.gestures, 3, &b[0], 8, 0 - 1);
+    }
+}
+
+// The gesture objects let go of with their pointer: one going on said
+// cancelled.
+fn _drop_gestures(w as *st.Window) as void {
+    if (w.gesture_kind != 0) {
+        let is ie.Event as e = st._input(w, ie.GESTURE_END);
+        e.gesture = w.gesture_kind;
+        e.fingers = w.gesture_fingers;
+        e.detail = ie.CANCELLED;
+        st._push(w, &e, cast(*u8, 0), 0);
+        w.gesture_kind = 0;
+    }
+    if (w.swipe != 0) { st._send(w, w.swipe, 0, cast(*u8, 0), 0, 0 - 1); }
+    if (w.pinch != 0) { st._send(w, w.pinch, 0, cast(*u8, 0), 0, 0 - 1); }
+    if (w.hold != 0) { st._send(w, w.hold, 0, cast(*u8, 0), 0, 0 - 1); }
+    w.swipe = 0; w.pinch = 0; w.hold = 0;
+}
+
+// begin (serial, time, surface, fingers) on this surface starts one; its
+// updates — a swipe's motion, a pinch's motion, scale and rotation — and its
+// end (serial, time, cancelled) are said while it goes on.
+fn _gesture_event(w as *st.Window, obj as i32, op as i32, p as *u8) as void {
+    let is i32 as kind with mut = ie.SWIPE;
+    if (obj == w.pinch) { kind = ie.PINCH; }
+    if (obj == w.hold) { kind = ie.HOLD; }
+    if (op == 0) {
+        if (st._wire_size < 24 || cast(i32, st._word(cast(*u8, cast(i64, p) + 8))) != w.surface) { return; }
+        w.gesture_kind = kind;
+        w.gesture_fingers = cast(i32, st._word(cast(*u8, cast(i64, p) + 12)));
+        let is ie.Event as e = st._input(w, ie.GESTURE_BEGIN);
+        e.gesture = kind;
+        e.fingers = w.gesture_fingers;
+        e.x = w.pointer_x;
+        e.y = w.pointer_y;
+        e.time_ms = cast(i64, st._word(cast(*u8, cast(i64, p) + 4)));
+        st._push(w, &e, cast(*u8, 0), 0);
+        return;
+    }
+    if (w.gesture_kind != kind) { return; }
+    let is i32 as ending = cast(i32, (kind == ie.HOLD && op == 1) || (kind != ie.HOLD && op == 2));
+    if (ending == 1) {
+        if (st._wire_size < 20) { return; }
+        let is ie.Event as e = st._input(w, ie.GESTURE_END);
+        e.gesture = kind;
+        e.fingers = w.gesture_fingers;
+        e.x = w.pointer_x;
+        e.y = w.pointer_y;
+        e.time_ms = cast(i64, st._word(cast(*u8, cast(i64, p) + 4)));
+        if (st._word(cast(*u8, cast(i64, p) + 8)) != 0) { e.detail = ie.CANCELLED; }
+        st._push(w, &e, cast(*u8, 0), 0);
+        w.gesture_kind = 0;
+        return;
+    }
+    if (op != 1 || kind == ie.HOLD) { return; }
+    if (st._wire_size < 20 || (kind == ie.PINCH && st._wire_size < 28)) { return; }
+    let is ie.Event as e = st._input(w, ie.GESTURE_UPDATE);
+    e.gesture = kind;
+    e.fingers = w.gesture_fingers;
+    e.x = w.pointer_x;
+    e.y = w.pointer_y;
+    e.time_ms = cast(i64, st._word(p));
+    // In the window's pixels, as positions are: the surface's units scaled.
+    e.dx = cast(f64, cast(i32, st._word(cast(*u8, cast(i64, p) + 4)))) / 256.0 * cast(f64, w.scale120) / 120.0;
+    e.dy = cast(f64, cast(i32, st._word(cast(*u8, cast(i64, p) + 8)))) / 256.0 * cast(f64, w.scale120) / 120.0;
+    if (kind == ie.PINCH) {
+        e.scale = cast(f64, cast(i32, st._word(cast(*u8, cast(i64, p) + 12)))) / 256.0;
+        e.rotation = cast(f64, cast(i32, st._word(cast(*u8, cast(i64, p) + 16)))) / 256.0;
+    }
+    st._push(w, &e, cast(*u8, 0), 0);
+}
+
+fn _cursor_shape_wanted() as i32 {
+    let is *u8 as v = env.getenv("CAUSTIC_WAYLAND_CURSOR_SHAPE");
+    return cast(i32, cast(i64, v) == 0 || v[0] != 48);
+}
+
+fn _cursor_scale(w as *st.Window) as i32 { return (w.scale120 + 119) / 120; }
+
+fn _cursor_free_slot(w as *st.Window, k as i32) as void {
+    let is *st.CursorSlot as s = &w.cursor_slots[k];
+    if (s.shape == 0) { return; }
+    let is i32 as i with mut = 0;
+    while (i < s.images.count) {
+        if (s.buffers[i] != 0) { st._send(w, s.buffers[i], 0, cast(*u8, 0), 0, 0 - 1); s.buffers[i] = 0; }
+        i = i + 1;
+    }
+    xcursor.free(&s.images);
+    if (cast(i64, s.map) != 0) { linux.munmap(s.map, s.map_bytes); }
+    s.map = cast(*u8, 0); s.map_bytes = 0;
+    s.shape = 0; s.scale = 0;
+    if (w.cursor_slot == k) { w.cursor_slot = 0 - 1; w.cursor_next = 0 - 1; }
+}
+
+fn _cursor_unload(w as *st.Window) as void {
+    let is i32 as k with mut = 0;
+    while (k < 4) { _cursor_free_slot(w, k); k = k + 1; }
+}
+
+// The shape's images, from the theme at the size times the surface's scale,
+// in shm buffers of their own — kept from before, or read into the slot
+// least recently used: 1, the slot the one shown, or 0 when the theme has no
+// such cursor.
+fn _cursor_load(w as *st.Window, shape as i32) as i32 {
+    let is i32 as scale = _cursor_scale(w);
+    w.cursor_uses = w.cursor_uses + 1;
+    let is i32 as k with mut = 0;
+    while (k < 4) {
+        if (w.cursor_slots[k].shape == shape && w.cursor_slots[k].scale == scale) {
+            w.cursor_slots[k].used = w.cursor_uses;
+            w.cursor_slot = k;
+            return 1;
+        }
+        k = k + 1;
+    }
+    let is i64 as size with mut = cast(i64, w.cursor_size);
+    if (size <= 0) {
+        let is *u8 as env_size = env.getenv("XCURSOR_SIZE");
+        size = 0;
+        if (cast(i64, env_size) != 0) {
+            let is i64 as i with mut = 0;
+            while (env_size[i] >= 48 && env_size[i] <= 57) { size = size * 10 + cast(i64, env_size[i] - 48); i = i + 1; }
+        }
+        if (size <= 0) { size = 24; }
+    }
+    let is *u8 as theme with mut = &w.cursor_theme[0];
+    if (theme[0] == 0) { theme = env.getenv("XCURSOR_THEME"); }
+    let is xcursor.Cursor as c with mut;
+    if (xcursor.load_shape(theme, shape, cast(i32, size) * scale, &c) == 0) { return 0; }
+    // The slot: an empty one, else the least recently used.
+    let is i32 as v with mut = 0;
+    k = 1;
+    while (k < 4) {
+        if (w.cursor_slots[v].shape != 0 && (w.cursor_slots[k].shape == 0 || w.cursor_slots[k].used < w.cursor_slots[v].used)) { v = k; }
+        k = k + 1;
+    }
+    _cursor_free_slot(w, v);
+    let is *st.CursorSlot as s = &w.cursor_slots[v];
+    // One pool for every frame's pixels, a buffer for each.
+    let is i64 as bytes = c.bytes;
+    let is i64 as fd = sys.memfd_create("caustic-wayland-cursor", 1);
+    if (fd < 0) { xcursor.free(&c); return 0; }
+    if (linux.ftruncate(fd, bytes) != 0) { linux.close(fd); xcursor.free(&c); return 0; }
+    let is *u8 as map = linux.mmap(cast(*u8, 0), bytes, linux.PROT_READ | linux.PROT_WRITE, linux.MAP_SHARED, fd, 0);
+    if (cast(i64, map) == linux.MAP_FAILED) { linux.close(fd); xcursor.free(&c); return 0; }
+    mem.memcpy(map, c.data, bytes);
+    let is i32 as pool = st._id(w);
+    let is [24]u8 as p;
+    st._put(&p[0], cast(u32, pool)); st._put(&p[4], cast(u32, bytes));
+    let is i32 as sent = st._send(w, w.shm, 0, &p[0], 8, fd);
+    linux.close(fd);
+    if (sent == 0) { linux.munmap(map, bytes); xcursor.free(&c); return 0; }
+    s.images = c;
+    s.map = map; s.map_bytes = bytes;
+    let is i32 as i with mut = 0;
+    while (i < c.count) {
+        let is *xcursor.Frame as f = &s.images.frames[i];
+        s.buffers[i] = st._id(w);
+        st._put(&p[0], cast(u32, s.buffers[i]));
+        st._put(&p[4], cast(u32, cast(i64, f.pixels) - cast(i64, s.images.data)));
+        st._put(&p[8], cast(u32, f.width)); st._put(&p[12], cast(u32, f.height));
+        st._put(&p[16], cast(u32, f.width * 4)); st._put(&p[20], st.FORMAT_ARGB8888);
+        st._send(w, pool, 0, &p[0], 24, 0 - 1);
+        i = i + 1;
+    }
+    st._send(w, pool, 1, cast(*u8, 0), 0, 0 - 1);
+    if (w.cursor_surface == 0) {
+        w.cursor_surface = st._id(w);
+        st._put(&p[0], cast(u32, w.cursor_surface));
+        st._send(w, w.compositor, 0, &p[0], 4, 0 - 1);
+    }
+    s.shape = shape;
+    s.scale = scale;
+    s.used = w.cursor_uses;
+    w.cursor_slot = v;
+    return 1;
+}
+
+// Frame i of the slot shown on the cursor surface, the pointer told its hot
+// spot when told to or when it moved.
+fn _cursor_show(w as *st.Window, i as i32, tell as i32) as void {
+    let is *st.CursorSlot as s = &w.cursor_slots[w.cursor_slot];
+    let is *xcursor.Frame as f = &s.images.frames[i];
+    let is i32 as scale = s.scale;
+    let is [16]u8 as p;
+    if (tell == 1 || f.xhot != s.images.frames[w.cursor_frame].xhot || f.yhot != s.images.frames[w.cursor_frame].yhot) {
+        st._put(&p[0], w.pointer_serial); st._put(&p[4], cast(u32, w.cursor_surface));
+        st._put(&p[8], cast(u32, f.xhot / scale)); st._put(&p[12], cast(u32, f.yhot / scale));
+        st._send(w, w.pointer, 0, &p[0], 16, 0 - 1);
+    }
+    if (w.cursor_set_scale != scale && st._bounded(st._globals.compositor_version, 4) >= 3) {
+        st._put(&p[0], cast(u32, scale));
+        st._send(w, w.cursor_surface, 8, &p[0], 4, 0 - 1);
+        w.cursor_set_scale = scale;
+    }
+    st._put(&p[0], cast(u32, s.buffers[i])); st._put(&p[4], 0); st._put(&p[8], 0);
+    st._send(w, w.cursor_surface, 1, &p[0], 12, 0 - 1);
+    st._put(&p[0], 0); st._put(&p[4], 0); st._put(&p[8], cast(u32, f.width)); st._put(&p[12], cast(u32, f.height));
+    if (st._bounded(st._globals.compositor_version, 4) >= 4) { st._send(w, w.cursor_surface, 9, &p[0], 16, 0 - 1); }
+    else { st._send(w, w.cursor_surface, 2, &p[0], 16, 0 - 1); }
+    st._send(w, w.cursor_surface, 6, cast(*u8, 0), 0, 0 - 1);
+    w.cursor_frame = i;
+}
+
+// The shape asked for, set over the window now that the pointer is in.
+fn _cursor_apply(w as *st.Window) as void {
+    if (w.pointer == 0 || w.pointer_inside == 0 || w.pointer_serial == 0 || w.cursor_want == 0) { return; }
+    let is [16]u8 as p;
+    w.cursor_next = 0 - 1;
+    if (w.cursor_want == 35) {
+        st._put(&p[0], w.pointer_serial); st._put(&p[4], 0); st._put(&p[8], 0); st._put(&p[12], 0);
+        st._send(w, w.pointer, 0, &p[0], 16, 0 - 1);
+        return;
+    }
+    if (w.cursor_shape_device != 0) {
+        st._put(&p[0], w.pointer_serial); st._put(&p[4], cast(u32, w.cursor_want));
+        st._send(w, w.cursor_shape_device, 1, &p[0], 8, 0 - 1);
+        return;
+    }
+    if (w.cursor_shape_manager != 0 || _cursor_load(w, w.cursor_want) == 0) { return; }
+    let is *st.CursorSlot as s = &w.cursor_slots[w.cursor_slot];
+    w.cursor_started = time.now_ms();
+    _cursor_show(w, 0, 1);
+    if (s.images.count > 1) { w.cursor_next = w.cursor_started + cast(i64, s.images.frames[0].delay); }
+}
+
+// The drawn pointer as of now: its next frame when one is due, its images
+// again at a scale the window moved to.
+fn _cursor_tick(w as *st.Window, now as i64) as void {
+    if (w.pointer_inside == 0 || w.cursor_slot < 0 || w.cursor_shape_manager != 0 || w.cursor_want == 35) { return; }
+    let is *st.CursorSlot as s = &w.cursor_slots[w.cursor_slot];
+    if (s.scale != _cursor_scale(w)) { _cursor_apply(w); return; }
+    if (w.cursor_next < 0 || now < w.cursor_next) { return; }
+    let is i32 as i = xcursor.frame_at(&s.images, now - w.cursor_started);
+    if (i != w.cursor_frame) { _cursor_show(w, i, 0); }
+    // The next change: the end of this frame in its cycle.
+    let is i64 as cycle with mut = 0;
+    let is i32 as k with mut = 0;
+    while (k < s.images.count) { cycle = cycle + cast(i64, s.images.frames[k].delay); k = k + 1; }
+    if (cycle <= 0) { w.cursor_next = 0 - 1; return; }
+    let is i64 as into = (now - w.cursor_started) % cycle;
+    let is i64 as end with mut = 0;
+    k = 0;
+    while (k <= i) { end = end + cast(i64, s.images.frames[k].delay); k = k + 1; }
+    w.cursor_next = now + (end - into);
+}

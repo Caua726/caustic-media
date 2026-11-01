@@ -1,0 +1,413 @@
+// window/wayland/keyboard.cst — the keyboard: the keymap the compositor
+// sends, read by libxkbcommon or our own interpreter, keys to ids and
+// text, Compose, repeat, and wl_keyboard's events.
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../event.cst" as event;
+use "../../input/event.cst" as ie;
+use "xkb.cst" as xkb;
+use "../../input/xkb/keymap.cst" as xkbkeymap;
+use "../../input/xkb/state.cst" as xkbstate;
+use "../../input/xkb/compose.cst" as xcompose;
+use "../../input/keys.cst" as keys;
+use "state.cst" as st;
+
+// A keysym as input/keys.cst names keys: what the keysym is, a Latin
+// capital as its small letter.
+fn _key_id(sym as u32) as i32 {
+    if (sym >= 65 && sym <= 90) { return cast(i32, sym + 32); }
+    if (sym == 0 || sym > 2147483647) { return keys.UNKNOWN; }
+    return cast(i32, sym);
+}
+
+// Whether key id is the same key whatever the layout says: a Latin letter,
+// digit or punctuation, or a function key's (the 0xff.. keysyms).
+fn _latin(id as i32) as i32 {
+    return cast(i32, (id >= 32 && id <= 126) || (id >= 65280 && id <= 65535));
+}
+
+// --- The keymap's reader: libxkbcommon, or with keymap_kind KEYMAP_CAUSTIC
+// the own interpreter (input/xkb), behind the same few questions. ---
+
+fn _own(w as *st.Window) as i32 { return cast(i32, w.keymap_kind == st.KEYMAP_CAUSTIC); }
+
+fn _kb_ready(w as *st.Window) as i32 {
+    if (_own(w) == 1) { return cast(i32, cast(i64, w.own_state) != 0); }
+    return cast(i32, cast(i64, w.xkb_state) != 0);
+}
+
+fn _kb_update_key(w as *st.Window, xcode as u32, down as i32) as void {
+    if (_kb_ready(w) == 0) { return; }
+    if (_own(w) == 1) { xkbstate.update_key(w.own_state, cast(i64, xcode), down); return; }
+    xkb.xkb_state_update_key(w.xkb_state, xcode, down);
+}
+
+fn _kb_update_mask(w as *st.Window, depressed as u32, latched as u32, locked as u32, group as u32) as void {
+    if (_kb_ready(w) == 0) { return; }
+    if (_own(w) == 1) {
+        xkbstate.update_mask(w.own_state, depressed, latched, locked, 0, 0, cast(i32, group));
+        return;
+    }
+    xkb.xkb_state_update_mask(w.xkb_state, depressed, latched, locked, 0, 0, group);
+}
+
+fn _kb_one_sym(w as *st.Window, xcode as u32) as u32 {
+    if (_kb_ready(w) == 0) { return 0; }
+    if (_own(w) == 1) { return xkbstate.key_one_sym(w.own_state, cast(i64, xcode)); }
+    return xkb.xkb_state_key_get_one_sym(w.xkb_state, xcode);
+}
+
+fn _kb_layout(w as *st.Window, xcode as u32) as u32 {
+    if (_own(w) == 1) { return cast(u32, xkbstate.key_layout(w.own_state, cast(i64, xcode))); }
+    return xkb.xkb_state_key_get_layout(w.xkb_state, xcode);
+}
+
+fn _kb_num_layouts(w as *st.Window, xcode as u32) as u32 {
+    if (_own(w) == 1) {
+        if (cast(i64, w.own_keymap) == 0) { return 0; }
+        return cast(u32, xkbkeymap.num_layouts_for_key(w.own_keymap, cast(i64, xcode)));
+    }
+    if (cast(i64, w.xkb_keymap) == 0) { return 0; }
+    return xkb.xkb_keymap_num_layouts_for_key(w.xkb_keymap, xcode);
+}
+
+// The keysym at key xcode's first level in layout: 0 for none.
+fn _kb_first_sym(w as *st.Window, xcode as u32, layout as u32) as u32 {
+    let is *u32 as syms with mut = cast(*u32, 0);
+    let is i32 as n with mut = 0;
+    if (_own(w) == 1) {
+        if (cast(i64, w.own_keymap) == 0) { return 0; }
+        n = xkbkeymap.key_syms(w.own_keymap, cast(i64, xcode), cast(i32, layout), 0, &syms);
+    } else {
+        if (cast(i64, w.xkb_keymap) == 0) { return 0; }
+        n = xkb.xkb_keymap_key_get_syms_by_level(w.xkb_keymap, xcode, layout, 0, cast(*u8, &syms));
+    }
+    if (n < 1 || cast(i64, syms) == 0) { return 0; }
+    return syms[0];
+}
+
+fn _kb_utf8(w as *st.Window, xcode as u32, out as *u8, size as i64) as i32 {
+    if (_kb_ready(w) == 0) { return 0; }
+    if (_own(w) == 1) { return cast(i32, xkbstate.key_utf8(w.own_state, cast(i64, xcode), out, size)); }
+    return xkb.xkb_state_key_get_utf8(w.xkb_state, xcode, out, cast(u64, size));
+}
+
+fn _kb_repeats(w as *st.Window, xcode as u32) as i32 {
+    if (_own(w) == 1) {
+        if (cast(i64, w.own_keymap) == 0) { return 0; }
+        return xkbkeymap.key_repeats(w.own_keymap, cast(i64, xcode));
+    }
+    if (cast(i64, w.xkb_keymap) == 0) { return 0; }
+    return xkb.xkb_keymap_key_repeats(w.xkb_keymap, xcode);
+}
+
+// keys.MOD_* of the effective modifiers.
+fn _kb_modifiers(w as *st.Window) as i32 {
+    if (_kb_ready(w) == 0) { return 0; }
+    let is i32 as out with mut = 0;
+    if (_own(w) == 1) {
+        let is *xkbstate.State as s = w.own_state;
+        let is i32 as e = xkbstate.MODS_EFFECTIVE;
+        if (xkbstate.mod_active(s, xkbkeymap.MOD_SHIFT, e) == 1) { out = out | keys.MOD_SHIFT; }
+        if (xkbstate.mod_active(s, xkbkeymap.MOD_LOCK, e) == 1) { out = out | keys.MOD_LOCK; }
+        if (xkbstate.mod_active(s, xkbkeymap.MOD_CONTROL, e) == 1) { out = out | keys.MOD_CONTROL; }
+        if (xkbstate.mod_active(s, xkbkeymap.MOD_MOD1, e) == 1) { out = out | keys.MOD_ALT; }
+        if (xkbstate.mod_active(s, xkbkeymap.MOD_MOD4, e) == 1) { out = out | keys.MOD_SUPER; }
+        return out;
+    }
+    let is i32 as flags with imut = 8;
+    if (xkb.xkb_state_mod_name_is_active(w.xkb_state, "Shift", flags) != 0) { out = out | keys.MOD_SHIFT; }
+    if (xkb.xkb_state_mod_name_is_active(w.xkb_state, "Lock", flags) != 0) { out = out | keys.MOD_LOCK; }
+    if (xkb.xkb_state_mod_name_is_active(w.xkb_state, "Control", flags) != 0) { out = out | keys.MOD_CONTROL; }
+    if (xkb.xkb_state_mod_name_is_active(w.xkb_state, "Mod1", flags) != 0) { out = out | keys.MOD_ALT; }
+    if (xkb.xkb_state_mod_name_is_active(w.xkb_state, "Mod4", flags) != 0) { out = out | keys.MOD_SUPER; }
+    return out;
+}
+
+// A keysym fed to the Compose state: its status after (both readers say
+// NOTHING 0, COMPOSING 1, COMPOSED 2, CANCELLED 3), -1 without a table.
+fn _kb_compose(w as *st.Window, sym as u32) as i32 {
+    if (_own(w) == 1) {
+        if (cast(i64, w.own_compose) == 0) { return 0 - 1; }
+        xcompose.feed(w.own_compose, sym);
+        return xcompose.status(w.own_compose);
+    }
+    if (cast(i64, w.compose_state) == 0) { return 0 - 1; }
+    xkb.xkb_compose_state_feed(w.compose_state, sym);
+    return xkb.xkb_compose_state_get_status(w.compose_state);
+}
+
+fn _kb_compose_utf8(w as *st.Window, out as *u8, size as i64) as i32 {
+    if (_own(w) == 1) { return cast(i32, xcompose.utf8(w.own_compose, out, size)); }
+    return xkb.xkb_compose_state_get_utf8(w.compose_state, out, cast(u64, size));
+}
+
+fn _kb_compose_reset(w as *st.Window) as void {
+    if (_own(w) == 1) {
+        if (cast(i64, w.own_compose) != 0) { xcompose.reset(w.own_compose); }
+        return;
+    }
+    if (cast(i64, w.compose_state) != 0) { xkb.xkb_compose_state_reset(w.compose_state); }
+}
+
+fn _kb_free_own(w as *st.Window) as void {
+    if (cast(i64, w.own_compose) != 0) { xcompose.state_free(w.own_compose); }
+    if (cast(i64, w.own_compose_table) != 0) { xcompose.free_table(w.own_compose_table); }
+    if (cast(i64, w.own_state) != 0) { xkbstate.free(w.own_state); }
+    if (cast(i64, w.own_keymap) != 0) { xkbkeymap.free(w.own_keymap); }
+    w.own_compose = cast(*xcompose.State, 0); w.own_compose_table = cast(*xcompose.Table, 0);
+    w.own_state = cast(*xkbstate.State, 0); w.own_keymap = cast(*xkbkeymap.Keymap, 0);
+}
+
+// Which key xcode is in the layout in use, at its first level — a, not A —
+// into *key; and the key a shortcut is matched against into *shortcut: the
+// same where it is Latin, else the key's Latin letter in the first layout
+// that has one, so Ctrl+C is Ctrl+C in a Cyrillic layout. Nothing guessed:
+// a key no layout gives a Latin letter keeps its own.
+fn _key_ids(w as *st.Window, xcode as u32, key as *i32, shortcut as *i32) as void {
+    *key = keys.UNKNOWN;
+    *shortcut = keys.UNKNOWN;
+    if (_kb_ready(w) == 0) { return; }
+    let is u32 as sym with mut = _kb_first_sym(w, xcode, _kb_layout(w, xcode));
+    if (sym == 0) { sym = _kb_one_sym(w, xcode); }
+    *key = _key_id(sym);
+    *shortcut = *key;
+    if (_latin(*key) == 1) { return; }
+    let is u32 as layouts = _kb_num_layouts(w, xcode);
+    let is u32 as l with mut = 0;
+    while (l < layouts) {
+        let is i32 as other = _key_id(_kb_first_sym(w, xcode, l));
+        if (other >= 32 && other <= 126) {
+            *shortcut = other;
+            return;
+        }
+        l = l + 1;
+    }
+}
+
+// Key code (evdev's) went down or up: the key, as its press said it, and the
+// text it typed — repeat 1 for a repeat of a held key.
+fn _key_input(w as *st.Window, down as i32, code as i32, repeat as i32) as void {
+    let is u32 as xcode = cast(u32, code + 8);
+    let is ie.Event as e = st._input(w, ie.KEY_UP);
+    if (down == 1) {
+        e.kind = ie.KEY_DOWN;
+        e.repeat = repeat;
+    }
+    e.key = w.key_syms[code];
+    e.shortcut = w.key_cuts[code];
+    e.physical = cast(i32, xcode);
+    st._push(w, &e, cast(*u8, 0), 0);
+    // What it typed. Control characters are not text, and neither is what a
+    // key held with Control, Alt or Super types: that key is a command.
+    // Looked up all the same — a compose sequence moves with each key. With
+    // text input on too: a compositor's input method grabs the keys it
+    // composes with, so the ones that arrive here are the ones nobody did —
+    // and with no method at all, every key.
+    if (down == 0 || _kb_ready(w) == 0) { return; }
+    let is i32 as typed = _key_text(w, _kb_one_sym(w, xcode), xcode);
+    let is i32 as command = cast(i32, (w.modifiers & (keys.MOD_CONTROL | keys.MOD_ALT | keys.MOD_SUPER)) != 0);
+    if (typed > 0 && command == 0 && w.text_buf[0] >= cast(u8, 32) && w.text_buf[0] != cast(u8, 127)) {
+        let is ie.Event as t = st._input(w, ie.TEXT);
+        t.from_key = 1;
+        st._push(w, &t, &w.text_buf[0], cast(i64, typed));
+    }
+}
+
+// The held key repeating, as of now (the monotonic clock, ms): its repeat
+// when one is due — one at most, so a loop late to pump catches up rather
+// than flooding — the next due a period after.
+fn _repeat_keys(w as *st.Window, now as i64) as void {
+    if (w.repeat_code < 0 || w.repeat_rate <= 0 || w.keyboard_focus == 0) { return; }
+    if (now < w.repeat_next) { return; }
+    _key_input(w, 1, w.repeat_code, 1);
+    let is i64 as period with mut = 1000 / cast(i64, w.repeat_rate);
+    if (period < 1) { period = 1; }
+    w.repeat_next = w.repeat_next + period;
+    if (w.repeat_next <= now) { w.repeat_next = now + period; }
+}
+
+// The locale whose Compose file a keymap's keyboard composes with.
+fn _locale() as *u8 {
+    let is *u8 as locale with mut = env.getenv("LC_ALL");
+    if (cast(i64, locale) == 0 || locale[0] == 0) { locale = env.getenv("LC_CTYPE"); }
+    if (cast(i64, locale) == 0 || locale[0] == 0) { locale = env.getenv("LANG"); }
+    if (cast(i64, locale) == 0 || locale[0] == 0) { locale = "C.UTF-8"; }
+    return locale;
+}
+
+// The keymap text read by the own interpreter: the old keyboard kept when
+// it refuses it, keymap_refused saying where.
+fn _load_own_keymap(w as *st.Window, map as *u8, size as i64) as void {
+    let is i64 as where with mut = 0 - 1;
+    let is *xkbkeymap.Keymap as km = xkbkeymap.parse(map, size, &where);
+    if (cast(i64, km) == 0) { w.keymap_refused_at = where; return; }
+    let is *xkbstate.State as s = xkbstate.new(km);
+    if (cast(i64, s) == 0) { xkbkeymap.free(km); return; }
+    let is *xcompose.Table as table = xcompose.table_from_locale(_locale());
+    let is *xcompose.State as compose with mut = cast(*xcompose.State, 0);
+    if (cast(i64, table) != 0) { compose = xcompose.state_new(table); }
+    _kb_free_own(w);
+    w.own_keymap = km; w.own_state = s;
+    w.own_compose_table = table; w.own_compose = compose;
+    w.keymap_refused_at = 0 - 1;
+    w.repeat_code = 0 - 1;
+}
+
+fn _load_keymap(w as *st.Window, fd as i64, size as i64) as void {
+    if (fd < 0 || size < 1 || size > 16777216) { return; }
+    let is *u8 as map = linux.mmap(cast(*u8, 0), size, linux.PROT_READ, linux.MAP_PRIVATE, fd, 0);
+    if (cast(i64, map) == linux.MAP_FAILED) { return; }
+    if (map[size - 1] != 0) { linux.munmap(map, size); return; }
+    if (_own(w) == 1) {
+        _load_own_keymap(w, map, size);
+        linux.munmap(map, size);
+        return;
+    }
+    if (cast(i64, w.xkb_context) == 0) { w.xkb_context = xkb.xkb_context_new(0); }
+    if (cast(i64, w.xkb_context) == 0) { linux.munmap(map, size); return; }
+    let is *u8 as keymap = xkb.xkb_keymap_new_from_string(w.xkb_context, map, 1, 0);
+    if (cast(i64, keymap) == 0) { w.keymap_refused_at = 0; linux.munmap(map, size); return; }
+    let is *u8 as state = xkb.xkb_state_new(keymap);
+    if (cast(i64, state) == 0) {
+        xkb.xkb_keymap_unref(keymap);
+        linux.munmap(map, size);
+        return;
+    }
+    let is *u8 as table = xkb.xkb_compose_table_new_from_locale(w.xkb_context, _locale(), 0);
+    let is *u8 as compose with mut = cast(*u8, 0);
+    if (cast(i64, table) != 0) { compose = xkb.xkb_compose_state_new(table, 0); }
+    if (cast(i64, w.xkb_state) != 0) { xkb.xkb_state_unref(w.xkb_state); }
+    if (cast(i64, w.xkb_keymap) != 0) { xkb.xkb_keymap_unref(w.xkb_keymap); }
+    if (cast(i64, w.compose_state) != 0) { xkb.xkb_compose_state_unref(w.compose_state); }
+    if (cast(i64, w.compose_table) != 0) { xkb.xkb_compose_table_unref(w.compose_table); }
+    w.xkb_keymap = keymap; w.xkb_state = state;
+    w.compose_table = table; w.compose_state = compose;
+    w.keymap_refused_at = 0 - 1;
+    // A key repeating under the old keymap is not the new one's.
+    w.repeat_code = 0 - 1;
+    linux.munmap(map, size);
+}
+
+fn _key_text(w as *st.Window, sym as u32, keycode as u32) as i32 {
+    w.text_len = 0;
+    mem.memzero(cast(*u8, &w.text_buf[0]), 256);
+    if (sym != 0) {
+        let is i32 as status = _kb_compose(w, sym);
+        if (status == 1) { return 0; }
+        if (status == 2) {
+            w.text_len = _kb_compose_utf8(w, &w.text_buf[0], 256);
+            _kb_compose_reset(w);
+            if (w.text_len > 255) { w.text_len = 255; }
+            return w.text_len;
+        }
+        if (status == 3) { _kb_compose_reset(w); return 0; }
+    }
+    w.text_len = _kb_utf8(w, keycode, &w.text_buf[0], 256);
+    if (w.text_len > 255) { w.text_len = 255; }
+    return w.text_len;
+}
+
+fn _keyboard_event(w as *st.Window, op as i32, p as *u8) as void {
+    if (op == 0) {
+        let is i64 as fd = st._take_recv_fd();
+        if (fd < 0) { return; }
+        if (st._wire_size >= 16) {
+            let is u32 as format = st._word(p);
+            let is i64 as size = cast(i64, st._word(cast(*u8, cast(i64, p) + 4)));
+            if (format == 1) { _load_keymap(w, fd, size); }
+        }
+        linux.close(fd);
+        return;
+    }
+    if (op == 1) {
+        if (st._wire_size < 20 || st._word(cast(*u8, cast(i64, p) + 4)) != cast(u32, w.surface)) { return; }
+        w.keyboard_focus = 1;
+        // The enter's serial: what a selection set before a key is pressed —
+        // a paste menu's copy — is owned by.
+        w.input_serial = st._word(p);
+        let is i32 as bytes = cast(i32, st._word(cast(*u8, cast(i64, p) + 8)));
+        if (bytes >= 0 && (bytes & 3) == 0 && 20 + bytes <= st._wire_size && _kb_ready(w) == 1) {
+            let is i32 as i with mut = 0;
+            while (i < bytes / 4) {
+                let is i32 as code = cast(i32, st._word(cast(*u8, cast(i64, p) + 12 + i * 4)));
+                if (code >= 0 && code < 256) {
+                    let is u32 as xcode = cast(u32, code + 8);
+                    _kb_update_key(w, xcode, 1);
+                    w.key_down[code] = 1;
+                    _key_ids(w, xcode, &w.key_syms[code], &w.key_cuts[code]);
+                }
+                i = i + 1;
+            }
+        }
+        let is event.Event as e;
+        event.clear(&e); e.kind = event.FOCUS_IN; e.raw_kind = op;
+        st._queue(w, &e);
+        return;
+    }
+    if (op == 2) {
+        if (w.keyboard_focus == 1) {
+            let is i32 as i with mut = 0;
+            while (i < 256) {
+                if (w.key_down[i] == 1) { _kb_update_key(w, cast(u32, i + 8), 0); }
+                i = i + 1;
+            }
+            w.keyboard_focus = 0; w.modifiers = 0;
+            mem.memzero(cast(*u8, &w.key_down[0]), 256 * 4);
+            mem.memzero(cast(*u8, &w.key_syms[0]), 256 * 4);
+            mem.memzero(cast(*u8, &w.key_cuts[0]), 256 * 4);
+            _kb_compose_reset(w);
+            let is event.Event as e;
+            event.clear(&e); e.kind = event.FOCUS_OUT; e.raw_kind = op;
+            st._queue(w, &e);
+            // The keys it held are let go where this window cannot hear it.
+            st._cancel_input(w);
+        }
+        return;
+    }
+    if (op == 3 && st._wire_size >= 24) {
+        w.input_serial = st._word(p);
+        if (st._word(cast(*u8, cast(i64, p) + 12)) != 0) { w.grab_serial = w.input_serial; }
+    }
+    if (op == 3) {
+        if (w.keyboard_focus == 0) { return; }
+        let is i32 as code = cast(i32, st._word(cast(*u8, cast(i64, p) + 8)));
+        let is i32 as state = cast(i32, st._word(cast(*u8, cast(i64, p) + 12)));
+        let is i32 as down = cast(i32, state != 0);
+        if (code < 0 || code >= 256) { return; }
+        let is u32 as xcode = cast(u32, code + 8);
+        if (down == 1) {
+            _kb_update_key(w, xcode, 1);
+            _key_ids(w, xcode, &w.key_syms[code], &w.key_cuts[code]);
+            w.key_down[code] = 1;
+            // The key held repeats, from here, if the keymap says it does.
+            if (w.repeat_rate > 0 && _kb_repeats(w, xcode) == 1) {
+                w.repeat_code = code;
+                w.repeat_next = time.now_ms() + cast(i64, w.repeat_delay);
+            }
+        } else {
+            _kb_update_key(w, xcode, 0);
+            w.key_down[code] = 0;
+            if (code == w.repeat_code) { w.repeat_code = 0 - 1; }
+        }
+        w.modifiers = _kb_modifiers(w);
+        _key_input(w, down, code, 0);
+        if (down == 0) { w.key_syms[code] = 0; w.key_cuts[code] = 0; }
+        return;
+    }
+    if (op == 5 && st._wire_size >= 16) {
+        // repeat_info: so many repeats a second (0: none), after so many ms.
+        w.repeat_rate = cast(i32, st._word(p));
+        w.repeat_delay = cast(i32, st._word(cast(*u8, cast(i64, p) + 4)));
+        if (w.repeat_rate <= 0) { w.repeat_rate = 0; w.repeat_code = 0 - 1; }
+        if (w.repeat_delay < 0) { w.repeat_delay = 0; }
+        return;
+    }
+    if (op == 4 && _kb_ready(w) == 1) {
+        _kb_update_mask(w, st._word(cast(*u8, cast(i64, p) + 4)), st._word(cast(*u8, cast(i64, p) + 8)),
+                        st._word(cast(*u8, cast(i64, p) + 12)), st._word(cast(*u8, cast(i64, p) + 16)));
+        w.modifiers = _kb_modifiers(w);
+    }
+}

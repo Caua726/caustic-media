@@ -1,0 +1,196 @@
+// window/wayland/text_input.cst — text-input-v3: what the input method
+// says (preedit, commit, delete around) and what it is told (the text,
+// its kind, the caret's rectangle). The public calls are backend.cst's.
+use "std/mem.cst" as mem;
+use "../../input/event.cst" as ie;
+use "std/unicode/utf8.cst" as utf8;
+use "state.cst" as st;
+
+// A string argument of a text-input event at p into dst (IME_TEXT bytes):
+// the bytes it takes on the wire, its length in *out_len — 0 for null — or
+// -1 for one malformed: longer than the message, not ended by its NUL, not
+// UTF-8. A method's text is never cut.
+fn _ime_string(p as *u8, dst as *u8, out_len as *i64) as i64 {
+    if (st._wire_size < 12) { return 0 - 1; }
+    let is u32 as wire_len = st._word(p);
+    if (wire_len == cast(u32, 0)) { *out_len = 0; return 4; }
+    if (wire_len > cast(u32, st.IME_TEXT)) { return 0 - 1; }
+    let is i32 as padded = cast(i32, (wire_len + 3) & 0xfffffffc);
+    if (12 + padded > st._wire_size) { return 0 - 1; }
+    let is i64 as len = cast(i64, wire_len) - 1;
+    let is *u8 as src = cast(*u8, cast(i64, p) + 4);
+    if (src[len] != 0 || utf8.validate(src, len) != 0) { return 0 - 1; }
+    if (len > 0) { mem.memcpy(dst, src, len); }
+    dst[len] = 0;
+    *out_len = len;
+    return 4 + padded;
+}
+
+// A byte offset into a composition of n bytes, as the method said it: -1
+// for none, past the end the end, inside a character that character's start.
+fn _ime_offset(s as *u8, n as i64, at as i64) as i64 {
+    if (at < 0) { return 0 - 1; }
+    let is i64 as o with mut = at;
+    if (o > n) { o = n; }
+    while (o > 0 && o < n && (cast(i64, s[o]) & 192) == 128) { o = o - 1; }
+    return o;
+}
+
+// What enter..done said and done has not applied, forgotten.
+fn _ime_pending_clear(w as *st.Window) as void {
+    w.ime_delete_changed = 0; w.ime_commit_changed = 0; w.ime_preedit_changed = 0;
+    w.ime_delete_before = 0; w.ime_delete_after = 0;
+    w.ime_commit_len = 0; w.ime_preedit_len = 0; w.ime_cursor = 0; w.ime_cursor_end = 0;
+}
+
+// The composition said gone, once, if one was said.
+fn _ime_unshow(w as *st.Window) as void {
+    if (w.ime_shown == 0) { return; }
+    w.ime_shown = 0;
+    let is ie.Event as e = st._input(w, ie.PREEDIT);
+    e.cursor = 0;
+    st._push(w, &e, cast(*u8, 0), 0);
+}
+
+fn _text_input_event(w as *st.Window, op as i32, p as *u8) as void {
+    if (op == 0 && st._wire_size >= 12) {
+        if (cast(i32, st._word(p)) != w.surface) { return; }
+        w.text_input_entered = 1;
+        // What was told before is forgotten across leave: told again.
+        if (w.text_input_enabled == 1) { _ti_enable(w); }
+        return;
+    }
+    if (op == 1 && st._wire_size >= 12) {
+        if (cast(i32, st._word(p)) != w.surface || w.text_input_entered == 0) { return; }
+        w.text_input_entered = 0;
+        _ime_pending_clear(w);
+        _ime_unshow(w);
+        return;
+    }
+    if (op == 2) {
+        let is i64 as used = _ime_string(p, &w.ime_preedit[0], &w.ime_preedit_len);
+        if (used < 0 || 8 + used + 8 > st._wire_size) {
+            w.ime_preedit_len = 0;
+            return;
+        }
+        let is i64 as n = w.ime_preedit_len;
+        let is i64 as begin = cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + used))));
+        let is i64 as end = cast(i64, cast(i32, st._word(cast(*u8, cast(i64, p) + used + 4))));
+        // The caret at begin, begin to end the part being converted, both
+        // byte offsets into the text; -1 hides the caret, so it goes at the end.
+        w.ime_cursor = _ime_offset(&w.ime_preedit[0], n, begin);
+        w.ime_cursor_end = _ime_offset(&w.ime_preedit[0], n, end);
+        if (w.ime_cursor < 0 || w.ime_cursor_end < 0) {
+            w.ime_cursor = n;
+            w.ime_cursor_end = n;
+        }
+        if (w.ime_cursor_end < w.ime_cursor) { w.ime_cursor_end = w.ime_cursor; }
+        w.ime_preedit_changed = 1;
+        return;
+    }
+    if (op == 3) {
+        if (_ime_string(p, &w.ime_commit[0], &w.ime_commit_len) >= 0) { w.ime_commit_changed = 1; }
+        return;
+    }
+    if (op == 4 && st._wire_size >= 16) {
+        w.ime_delete_before = cast(i64, st._word(p));
+        w.ime_delete_after = cast(i64, st._word(cast(*u8, cast(i64, p) + 4)));
+        w.ime_delete_changed = 1;
+        return;
+    }
+    if (op != 5 || st._wire_size < 12) { return; }
+    // done: applied in the protocol's order — the composition out, the text
+    // around deleted, the commit in, the new composition at the caret. A
+    // composition not sent again is gone.
+    let is u32 as serial = st._word(p);
+    let is i32 as by_method = cast(i32, w.ime_delete_changed == 1 || w.ime_commit_changed == 1);
+    if (w.ime_delete_changed == 1 && (w.ime_delete_before > 0 || w.ime_delete_after > 0)) {
+        let is ie.Event as e = st._input(w, ie.DELETE_SURROUNDING);
+        e.delete_before = w.ime_delete_before; e.delete_after = w.ime_delete_after;
+        st._push(w, &e, cast(*u8, 0), 0);
+    }
+    if (w.ime_commit_changed == 1 && w.ime_commit_len > 0) {
+        let is ie.Event as e = st._input(w, ie.TEXT);
+        st._push(w, &e, &w.ime_commit[0], w.ime_commit_len);
+    }
+    if (w.ime_preedit_changed == 1 && w.ime_preedit_len > 0) {
+        let is ie.Event as e = st._input(w, ie.PREEDIT);
+        e.cursor = w.ime_cursor;
+        if (w.ime_cursor_end > w.ime_cursor) {
+            e.hl_start = w.ime_cursor;
+            e.hl_end = w.ime_cursor_end;
+        }
+        st._push(w, &e, &w.ime_preedit[0], w.ime_preedit_len);
+        w.ime_shown = 1;
+    } else {
+        _ime_unshow(w);
+    }
+    _ime_pending_clear(w);
+    // A done that had not seen every commit: the method worked on older
+    // text, and nothing more is told until a done that has. One that had:
+    // what waited is told now.
+    w.ti_hold = cast(i32, serial != w.ti_commits);
+    _ti_flush(w);
+    if (by_method == 1) { w.ti_by_method = 1; }
+}
+// --- What the method is told: text-input-v3's requests ---
+
+fn _ti_commit(w as *st.Window) as i32 {
+    if (st._send(w, w.text_input, 7, cast(*u8, 0), 0, 0 - 1) == 0) { return 0; }
+    w.ti_commits = w.ti_commits + cast(u32, 1);
+    return 1;
+}
+
+// The parts what says sent, uncommitted.
+fn _ti_state(w as *st.Window, what as i32) as i32 {
+    if ((what & st.TI_TEXT) != 0 && w.ti_text_len >= 0) {
+        let is [4016]u8 as s;
+        let is i64 as n = w.ti_text_len;
+        let is i64 as padded = ((n + 1 + 3) / 4) * 4;
+        mem.memset(&s[0], 0, 4 + padded + 8);
+        st._put(&s[0], cast(u32, n + 1));
+        if (n > 0) { mem.memcpy(&s[4], &w.ti_text[0], n); }
+        st._put(cast(*u8, cast(i64, &s[0]) + 4 + padded), cast(u32, w.ti_caret));
+        st._put(cast(*u8, cast(i64, &s[0]) + 8 + padded), cast(u32, w.ti_anchor));
+        if (st._send(w, w.text_input, 3, &s[0], cast(i32, 12 + padded), 0 - 1) == 0) { return 0; }
+        // input_method 0, other 1.
+        let is [4]u8 as cause;
+        st._put(&cause[0], cast(u32, 1 - w.ti_by_method));
+        if (st._send(w, w.text_input, 4, &cause[0], 4, 0 - 1) == 0) { return 0; }
+        w.ti_by_method = 0;
+    }
+    if ((what & st.TI_TYPE) != 0) {
+        let is [8]u8 as ct;
+        st._put(&ct[0], cast(u32, w.ti_hints));
+        st._put(&ct[4], cast(u32, w.ti_purpose));
+        if (st._send(w, w.text_input, 5, &ct[0], 8, 0 - 1) == 0) { return 0; }
+    }
+    if ((what & st.TI_RECT) != 0 && w.ime_rect_w >= 0) {
+        let is [16]u8 as r;
+        st._put(&r[0], cast(u32, st._scale_down(w.ime_rect_x, w.scale120)));
+        st._put(&r[4], cast(u32, st._scale_down(w.ime_rect_y, w.scale120)));
+        st._put(&r[8], cast(u32, st._scale_down(w.ime_rect_w, w.scale120)));
+        st._put(&r[12], cast(u32, st._scale_down(w.ime_rect_h, w.scale120)));
+        if (st._send(w, w.text_input, 6, &r[0], 16, 0 - 1) == 0) { return 0; }
+    }
+    return 1;
+}
+
+// What changed told and committed — with the text-input focus, the program
+// wanting it, and no done behind; otherwise kept for then.
+fn _ti_flush(w as *st.Window) as i32 {
+    if (w.text_input_entered == 0 || w.text_input_enabled == 0 || w.ti_hold == 1 || w.ti_dirty == 0) { return 1; }
+    let is i32 as what = w.ti_dirty;
+    w.ti_dirty = 0;
+    if (_ti_state(w, what) == 0) { return 0; }
+    return _ti_commit(w);
+}
+
+// Enabled, everything told again, committed.
+fn _ti_enable(w as *st.Window) as i32 {
+    w.ti_hold = 0;
+    w.ti_dirty = 0;
+    if (st._send(w, w.text_input, 1, cast(*u8, 0), 0, 0 - 1) == 0) { return 0; }
+    if (_ti_state(w, st.TI_TEXT | st.TI_TYPE | st.TI_RECT) == 0) { return 0; }
+    return _ti_commit(w);
+}
