@@ -617,6 +617,10 @@ program's function for text copied to the clipboard or the primary selection
 forgotten when the label goes), the window's animator (`set_animator`) and the
 application's timers (`set_timers`), for a widget that acts after a pause, and
 the window's router (`set_router`), for a widget that opens a popup of its own.
+The four are bare pointers in the tree, which must not import the modules
+that import it; each module hands its own out typed — `router.of(t)`,
+`timer.of(t)`, `anim.of(t)`, `text.of(t)` — and lends it with `lend`, so the
+cast is made in one place rather than at every call.
 A widget's event entry may ask for the focus for another
 (`tree.request_focus`): the router gives it once the event is delivered,
 by keyboard or pointer as the event was.
