@@ -158,11 +158,20 @@ A new kind of widget is a new table and a struct, and a program writes one
 exactly as this library does. That is the extension point, and a toolkit without
 one cannot grow it later.
 
-**Handles, not pointers.** A program holds a `ui.Widget` — an index and a
+**Handles, not pointers.** A program holds a widget as an `i64` — an index and a
 generation into its window's node pool — so a destroyed widget's handle fails a
 check instead of pointing into reused memory. The pool is bounded and sized when
 the window is created; growing it is explicit, the same rule the draw queue and
 the event queue follow.
+
+The handle is one integer for every kind, not a struct per kind: Caustic
+accepts one struct where another of the same size is asked for, so a
+`Button` and a `Slider` handle would not be told apart at compile time, and
+they would cost a cast at every call into the tree. The check is made at run
+time instead. Every kind's functions start from `tree.data_of`, which answers
+null for a stale handle and, for a live widget of another kind, null with the
+tree's last error `WRONG_KIND` — so `slider.value` asked of a check box says
+what went wrong rather than answering 0 in silence.
 
 ---
 
@@ -231,7 +240,7 @@ be lost. The toolkit routes them:
 
 **Out.** A widget emits signals — clicked, changed, activated — and the program
 connects a callback: a function pointer and a user-data pointer, called
-synchronously. No signals named by string, no generated code, no delivery queued
+synchronously — `signal.on` for the common case of no user pointer. No signals named by string, no generated code, no delivery queued
 across threads; a callback that wants to act later posts to the window's queue
 itself.
 
@@ -933,7 +942,12 @@ tone, in the colour what holds it gives instead), aligned across
 by its alignment in the widget's direction and centred down. Its text is its
 name to assistive technology, and the name of the widget it labels. A
 mnemonic (`_Save`; `__` for an underscore) underlines its letter while Alt is
-held; bound to the router, Alt and the letter focus what it labels.
+held, and in a tree that has its window's router — every window's does — the
+letter is bound there as the text is set: Alt and it focus and activate what
+the label names, followed when the text or the target changes, let go when
+the text has none. A menu's items, a menu bar's and a tab's titles set theirs
+with `set_text_marked`, which underlines without binding: their owners bind
+them (`tabs.bind_mnemonics`) or take them without Alt.
 Selectable on request, it keeps a `text/layout` Layout of its own beside its
 run (`text.lay_layout`) for the cursor's questions: dragged across, by words
 after a double click and paragraphs after a triple, extended with Shift, and
