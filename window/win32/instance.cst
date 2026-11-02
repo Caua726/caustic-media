@@ -1,0 +1,148 @@
+// window/win32/instance.cst — one instance of a program, as Windows finds it.
+//
+// Windows has no session bus: the id is a named mutex
+// ("Local\CausticMediaInstance.<id>"), whose first creator is the instance,
+// and the instance a message-only window named the id, which a later start
+// finds (FindWindowExW under HWND_MESSAGE) and hands what it was asked with
+// WM_COPYDATA: a kind and its bytes. Before it does, it lets the instance
+// take the foreground (AllowSetForegroundWindow), Windows' way of a start's
+// token. The window's messages come through the program's loop, as its
+// other windows' do.
+//
+// What the kinds mean — to come forward, the uris back to back, an action's
+// name — is the toolkit's (ui/instance.cst); this carries them.
+use "std/mem.cst" as mem;
+use "abi.cst" as abi;
+use "bind/types.cst" as t;
+use "bind/kernel32.cst" as k32;
+use "bind/user32.cst" as u;
+
+// Heard by the instance: cb(user, kind, s, n), the n bytes at s valid only
+// during the call.
+type ReceiveFn = fn(*u8, u64, *u8, i64) as void;
+
+struct Claim {
+    mutex as i64;          // the id's mutex, and the window it is reached at
+    hwnd  as i64;
+    on    as ReceiveFn;
+    user  as *u8;
+}
+
+let is abi.Callbacks as _callbacks with mut;
+let is i32 as _class_ready with mut = 0;
+let is [32]u16 as _class with mut;
+
+// s, n bytes of UTF-8, after prefix into out (cap units) as UTF-16 with its
+// zero: 1, or 0 when it does not fit.
+fn _wide(prefix as *u8, s as *u8, n as i64, out as *u16, cap as i32) as i32 {
+    let is i32 as p = k32.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, prefix), cast(i32, 0 - 1), out, cap);
+    if (p <= 0) { return 0; }
+    let is i32 as at = p - 1;
+    let is i32 as m = k32.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, s), cast(i32, n), cast(*u16, cast(i64, out) + cast(i64, at) * 2),
+                                              cap - at - 1);
+    if (m <= 0 && n > 0) { return 0; }
+    *cast(*u16, cast(i64, out) + cast(i64, at + m) * 2) = cast(u16, 0);
+    return 1;
+}
+
+// A start's message to the instance's window: handed to its callback; TRUE
+// that it was heard.
+fn _proc(ctx as *u8, args as *u64) as i64 {
+    let is i64 as hwnd = cast(i64, args[0]);
+    let is u32 as msg = cast(u32, args[1]);
+    let is u64 as wp = args[2];
+    let is i64 as lp = cast(i64, args[3]);
+    if (cast(i64, msg) != t.WM_COPYDATA) { return u.DefWindowProcW(hwnd, msg, wp, lp); }
+    let is *Claim as c = cast(*Claim, u.GetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA)));
+    if (cast(i64, c) == 0) { return 0; }
+    let is *t.COPYDATASTRUCT as cd = cast(*t.COPYDATASTRUCT, lp);
+    if (cast(i64, c.on) != 0) { call(c.on, c.user, cd.dwData, cd.lpData, cast(i64, cd.cbData)); }
+    return 1;
+}
+
+fn _ensure_class() as i32 {
+    if (_class_ready == 1) { return 1; }
+    k32.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, "CausticMediaInstance"), cast(i32, 0 - 1), &_class[0], 32);
+    // The class's procedure: made once, kept as long as the program runs.
+    _callbacks = abi.open(1);
+    if (cast(i64, _callbacks.code) == 0) { return 0; }
+    if (abi.put(&_callbacks, 0, fn_ptr(_proc), cast(*u8, 0), 4, 0) == 0 || abi.seal(&_callbacks) == 0) {
+        abi.close(&_callbacks);
+        return 0;
+    }
+    let is t.WNDCLASSEXW as wc;
+    mem.memzero(cast(*u8, &wc), sizeof(t.WNDCLASSEXW));
+    wc.cbSize = cast(u32, sizeof(t.WNDCLASSEXW));
+    wc.lpfnWndProc = abi.address(&_callbacks, 0);
+    wc.hInstance = k32.GetModuleHandleW(cast(*u16, 0));
+    wc.lpszClassName = &_class[0];
+    if (u.RegisterClassExW(&wc) == 0) {
+        abi.close(&_callbacks);
+        return 0;
+    }
+    _class_ready = 1;
+    return 1;
+}
+
+// The instance of id, n bytes of UTF-8, claimed into c, which must not move
+// while it is held: 1 when this start is it — what later starts send handed
+// to on(user, …) — 0 when another start is, or it could not be made.
+fn claim(c as *Claim, id as *u8, n as i64, on as ReceiveFn, user as *u8) as i32 {
+    c.mutex = 0;
+    c.hwnd = 0;
+    c.on = on;
+    c.user = user;
+    let is [300]u16 as name;
+    if (_wide("Local\\CausticMediaInstance.", id, n, &name[0], 300) == 0) { return 0; }
+    let is i64 as m = k32.CreateMutexW(cast(*u8, 0), 0, &name[0]);
+    if (m == 0) { return 0; }
+    if (cast(i64, k32.GetLastError()) == t.ERROR_ALREADY_EXISTS) {
+        k32.CloseHandle(m);
+        return 0;
+    }
+    let is [260]u16 as title;
+    if (_ensure_class() == 0 || _wide("", id, n, &title[0], 260) == 0) {
+        k32.CloseHandle(m);
+        return 0;
+    }
+    let is i64 as hwnd = u.CreateWindowExW(0, &_class[0], &title[0], 0, 0, 0, 0, 0, t.HWND_MESSAGE, 0,
+                                           k32.GetModuleHandleW(cast(*u16, 0)), cast(*u8, 0));
+    if (hwnd == 0) {
+        k32.CloseHandle(m);
+        return 0;
+    }
+    u.SetWindowLongPtrW(hwnd, cast(i32, t.GWLP_USERDATA), cast(i64, c));
+    c.mutex = m;
+    c.hwnd = hwnd;
+    return 1;
+}
+
+// No longer the instance: the window and the mutex let go.
+fn release(c as *Claim) as void {
+    if (c.hwnd == 0) { return; }
+    u.SetWindowLongPtrW(c.hwnd, cast(i32, t.GWLP_USERDATA), 0);
+    u.DestroyWindow(c.hwnd);
+    k32.CloseHandle(c.mutex);
+    c.hwnd = 0;
+    c.mutex = 0;
+}
+
+// kind — with the n bytes at s — sent to the instance of id (idn bytes): 1
+// when it heard it, 0 when there is none.
+fn send(id as *u8, idn as i64, kind as u64, s as *u8, n as i64) as i32 {
+    if (_ensure_class() == 0) { return 0; }
+    let is [260]u16 as title;
+    if (_wide("", id, idn, &title[0], 260) == 0) { return 0; }
+    let is i64 as hwnd = u.FindWindowExW(t.HWND_MESSAGE, 0, &_class[0], &title[0]);
+    if (hwnd == 0) { return 0; }
+    // Its windows may come forward: this start's leave to, handed over.
+    let is u32 as pid with mut = cast(u32, 0);
+    u.GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != cast(u32, 0)) { u.AllowSetForegroundWindow(pid); }
+    let is t.COPYDATASTRUCT as cd;
+    mem.memzero(cast(*u8, &cd), sizeof(t.COPYDATASTRUCT));
+    cd.dwData = kind;
+    cd.cbData = cast(u32, n);
+    cd.lpData = s;
+    return cast(i32, u.SendMessageW(hwnd, cast(u32, t.WM_COPYDATA), cast(u64, 0), cast(i64, &cd)) == 1);
+}

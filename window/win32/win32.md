@@ -325,9 +325,11 @@ IFileSaveDialog), with the portal's options, filters and answer: paths in
 UTF-8 with '/', as `sys/file.cst` has them (`filedialog_test.cst`, answered
 through its controls). `known_folders.cst` names the user's folders and the
 local application data through SHGetKnownFolderPath, which the toolkit's
-file chooser and window state use on Windows
+file chooser and window state use on Windows through `../folders.cst`
 (`../../ui/files_win32_test.cst`). One instance finds the first through a
-message-only window (`../../ui/instance_win32_test.cst`), and links and files
-are opened by the shell (`../../ui/open_uri_win32_test.cst`). The three
+named mutex and a message-only window (`instance.cst`, reached through
+`../instance.cst`; `../../ui/instance_win32_test.cst`), and links and files
+are opened by the shell (`shell_open.cst`, through `../open.cst`;
+`../../ui/open_uri_win32_test.cst`). The three
 examples run with `--check` under `tools/run_wine_desktop.sh`, a prefix set up
 as a Windows desktop is.

@@ -38,6 +38,11 @@ window/
   settings.cst    the desktop's settings: dark, accent, fonts, timings, language
   locale.cst      the language the user reads, as a BCP 47 tag
   fonts.cst       where the platform keeps fonts, and the font index
+  folders.cst     the user's folders as the platform names them (Windows' known folders)
+  open.cst        a link or a file opened the platform's way: the shell, xdg-open
+  instance.cst    one instance found through the window system (Windows; Linux uses the bus)
+  input_extras.cst  what a toolkit turns on for input: the locale X11's input methods
+                  compose in, XInput 2 — kept out of device.cst for the libraries they link
   native.cst      native handle accessors — the public contract
 
   x11/      done — 8 modules over bind/, see x11/x11.md
@@ -68,6 +73,18 @@ out by `poll_input`; `event.cst` keeps what happens to the window itself
 turning keys into "the JUMP action is active" or mapping a gamepad is
 `input/`'s work. Without this line either `input/` has to speak to four
 platforms, or `window/` grows game logic.
+
+**The toolkit reaches the platform through this directory's portable
+modules, never a backend's.** `ui/` imports nothing under `x11/`,
+`wayland/` or `win32/`: what it needs of one — XInput 2 turned on, Windows'
+shell, its known folders, the window an instance is found by — has a module
+here that takes the toolkit's terms and dispatches on `os.current()` or on
+the window's backend. A caller that does more on one platform than another
+tests `os.current()` itself, because that comparison is what the compiler
+folds: a branch behind a function's answer is compiled for every target,
+and a Linux path that makes a system call then fails to build for Windows.
+`linux/` is not a backend but what every Linux one shares — the portals, the
+user's folders, the start's tokens — and the toolkit uses it as it is.
 
 **The swapchain is not here.** It belongs to `gpu/`, because when there is a GPU
 it is the swapchain that presents, not the window. This layer only hands over the

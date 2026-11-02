@@ -594,6 +594,12 @@ theme change restyles them all:
 `input/` is still a design note: the router takes keys and text from
 `window/`'s events as they are.
 
+The toolkit takes `window/` through its portable modules only — `device`,
+`display`, `cursor`, `folders`, `open`, `instance`, `input_extras` and the
+rest — and imports nothing under `window/x11/`, `window/wayland/` or
+`window/win32/`; `window/linux/`'s portals and folders it uses as they are
+(see [`window.md`](../window/window.md), *The tree*).
+
 ## Current state
 
 **The tree** (`tree.cst`, `widget.cst`, tested by `tree_test.cst`): handles
