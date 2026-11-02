@@ -126,13 +126,27 @@ out, setters in, and models for anything large — rather than a binding
 framework.
 
 ```cst
-// The designed interface; it does not compile today.
-let is ui.Window as w     = ui.window(&app, "Settings", 480, 320);
-let is ui.Widget as form  = ui.grid(&w, ui.root(&w));
-let is ui.Widget as name  = ui.entry(&w, form);
-let is ui.Widget as save  = ui.button(&w, form, "Save");
-ui.on_clicked(&w, save, on_save, cast(*u8, &doc));
+use "caustic-media/ui/ui.cst" as ui;
+
+// t is the window's tree: ui.app.tree(&a, win).
+let is i64 as form = ui.grid.create(t, ui.tree.root(t));
+let is i64 as name = ui.entry.create(t, form);
+ui.label_for(t, form, "_Name", name);          // Alt+N goes to the entry
+let is i64 as save = ui.button(t, form, "_Save");
+ui.on(t, save, ui.signal.CLICKED, fn_ptr(on_save));
 ```
+
+**One use.** `ui.cst` is the hub: every module of the toolkit is reached
+through it by its own name — `ui.tree.Tree`, `ui.box.create`,
+`ui.entry.text` — so a program has one `use` instead of one per module, and
+the binary is no larger for it: what the program does not call is not in it
+(the settings form is the same size either way, to within a kilobyte).
+Beside the modules it has the forms a program writes with words in them —
+`ui.label`, `ui.button`, `ui.check`, `ui.radio`, `ui.group`, `ui.menu_item`,
+`ui.tab`, `ui.message`, `ui.set_text` and the rest — taking a zero-terminated
+string where the module's form takes the bytes and their length. The
+module's form stays the one for text that is not a literal: a slice of a
+buffer, what an entry holds. Tested by `ui_test`.
 
 ---
 
