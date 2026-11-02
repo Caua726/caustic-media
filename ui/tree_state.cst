@@ -1,0 +1,474 @@
+// ui/tree_state.cst — what the tree's parts share: its types — the tree,
+// its nodes, the kinds of widget and what they are asked — its limits and
+// constants, and the node table's own accessors. tree.cst and each part
+// (tree_draw, tree_lent) build on it.
+use "../math/math.cst" as math;
+use "geom.cst" as geom;
+use "event.cst" as event;
+use "painter.cst" as painter;
+use "style.cst" as style;
+
+// --- Errors ---
+
+let is i32 as OK             with imut = 0;
+let is i32 as FULL           with imut = 1;
+let is i32 as INVALID_HANDLE with imut = 2;
+let is i32 as BAD_ARGUMENT   with imut = 3;
+let is i32 as DATA_TOO_BIG   with imut = 4;
+let is i32 as OUT_OF_MEMORY  with imut = 5;
+let is i32 as LAYOUT_TOO_LARGE with imut = 6;   // a container needed more scratch than there is
+let is i32 as WRONG_KIND     with imut = 7;   // a live widget, but not of the kind the call is for
+
+// --- Flags ---
+//
+// Hidden and disabled rather than visible and enabled, so a zeroed node is the
+// default state and nothing has to remember to switch a widget on.
+let is i64 as F_HIDDEN       with imut = 1;
+let is i64 as F_DISABLED     with imut = 2;
+let is i64 as F_NEEDS_LAYOUT with imut = 4;
+let is i64 as F_FOCUSABLE    with imut = 8;
+let is i64 as F_NEEDS_PAINT  with imut = 16;
+// Repaint when the focus enters or leaves the subtree — a frame that lights up
+// while a field inside it has focus. Opt-in, so a Tab does not repaint every
+// ancestor up to the window.
+let is i64 as F_FOCUS_WITHIN_LOOK with imut = 32;
+// Paint the subtree once into a texture of its own and, while nothing in it
+// changes, put that back instead of painting it again — for something that
+// moves as a whole: a card being dragged, a panel sliding in. See paint.Cache.
+let is i64 as F_CACHE        with imut = 64;
+// Something inside a cached subtree changed since its texture was painted.
+let is i64 as F_CACHE_DIRTY  with imut = 128;
+
+// --- Damage ---
+//
+// What has to be repainted, as a few rectangles in window coordinates. Kept in
+// the tree because a widget whose look changes only has the tree in hand, and
+// bounded because a frame never needs more: a rectangle that would not fit is
+// merged into the one it grows least, so the region can cover more than
+// changed but never less. damage.cst brings it up to date with the tree; the
+// painter reads it; whoever presented the frame clears it.
+let is i64 as MAX_DAMAGE with imut = 16;
+
+// --- How much a tree may hold ---
+
+struct Limits {
+    widgets     as i64;   // alive at once, the root included
+    data_bytes  as i64;   // the largest per-widget data any kind may ask for
+    connections as i64;   // signal connections, see signal.cst
+}
+
+// --- Signal connections ---
+//
+// Stored here because a widget that emits only has the tree in hand; what
+// connecting and emitting mean is signal.cst's. Kept in the order they were
+// made — a connection is appended, and the table is compacted when it fills —
+// so emitting calls them in that order.
+struct Connection {
+    widget as i64;
+    seq    as i64;   // its id, and its place in connection order
+    made   as i64;   // the emission count when it was made
+    cb     as SignalFn;   // null once disconnected
+    user   as *u8;
+    signal as i32;
+    _pad0  as i32;
+}
+
+// --- Kinds of widget ---
+//
+// Caustic has no classes, so a kind of widget is a value: a name, how many
+// bytes of data each widget of the kind carries, and the functions that give
+// it behaviour. widget.cst documents each entry and makes an empty Kind; it
+// lives here because the tree stores a pointer to one in every node, and the
+// entries' types name the Tree.
+//
+// Every entry has a function-pointer type rather than a bare *u8, so the
+// compiler checks both ends: a function stored in a Kind must have the entry's
+// signature, and call() through it must pass arguments of the entry's types.
+// Every kind a program defines is checked the same way this library's are.
+type DestroyFn = fn(*Tree, i64, *u8) as void;
+type MeasureFn = fn(*Tree, i64, *u8, *geom.Constraint, *geom.Size) as void;
+type ArrangeFn = fn(*Tree, i64, *u8, *math.rect.Rect) as void;
+type EventFn   = fn(*Tree, i64, *u8, *event.Event) as i64;
+type HitFn     = fn(*Tree, i64, *u8, *math.vec.Vec2) as i32;
+type PaintFn   = fn(*Tree, i64, *u8, *painter.Painter) as void;
+
+// What assistive technology is told about a widget, and what it asks of
+// one. access.cst fills it and says what each field means; it is declared
+// here because a kind's access entry takes one.
+struct Access {
+    action          as i64;   // access.ASK, or the action asked for
+    arg             as f64;   // SET_VALUE's value
+    role            as i64;
+    name            as *u8;   // UTF-8, name_len bytes; null for none
+    name_len        as i64;
+    description     as *u8;
+    description_len as i64;
+    states          as i64;   // a bit each
+    actions         as i64;   // what it answers to, a bit each
+    value           as f64;
+    min             as f64;
+    max             as f64;
+    step            as f64;
+    has_value       as i32;
+    _pad0           as i32;
+    // A list's or a table's rows, all of them shown or not, and a row's place
+    // among them: rows 0 for none told. A table's columns, and the widget
+    // whose children head them (0 for none).
+    row             as i64;
+    rows            as i64;
+    columns         as i64;
+    headers         as i64;
+}
+
+type AccessFn  = fn(*Tree, i64, *u8, *Access) as i64;
+
+// What the pointer looks like over a widget at a point of it, its own
+// coordinates: a SHAPE_ below, or SHAPE_INHERIT for its parent's to decide.
+// See router.pointer_shape.
+type ShapeFn   = fn(*Tree, i64, *u8, *math.vec.Vec2) as i32;
+// Where a text widget's caret is now, in the window — what to draw again
+// when it blinks: 1 and *out, or 0 for no caret shown.
+type CaretFn   = fn(*Tree, i64, *u8, *math.rect.Rect) as i32;
+
+// --- Pointer shapes ---
+//
+// CSS's cursors, in the order Wayland's cursor-shape-v1 has them; the
+// window layer gives each its platform's: an X cursor font or theme name,
+// a Wayland shape, a Windows IDC_. NONE hides the pointer.
+let is i32 as SHAPE_INHERIT       with imut = 0;
+let is i32 as SHAPE_DEFAULT       with imut = 1;
+let is i32 as SHAPE_CONTEXT_MENU  with imut = 2;
+let is i32 as SHAPE_HELP          with imut = 3;
+let is i32 as SHAPE_POINTER       with imut = 4;    // a hand: a link
+let is i32 as SHAPE_PROGRESS      with imut = 5;
+let is i32 as SHAPE_WAIT          with imut = 6;
+let is i32 as SHAPE_CELL          with imut = 7;
+let is i32 as SHAPE_CROSSHAIR     with imut = 8;
+let is i32 as SHAPE_TEXT          with imut = 9;    // the beam over text
+let is i32 as SHAPE_VERTICAL_TEXT with imut = 10;
+let is i32 as SHAPE_ALIAS         with imut = 11;
+let is i32 as SHAPE_COPY          with imut = 12;
+let is i32 as SHAPE_MOVE          with imut = 13;
+let is i32 as SHAPE_NO_DROP       with imut = 14;
+let is i32 as SHAPE_NOT_ALLOWED   with imut = 15;
+let is i32 as SHAPE_GRAB          with imut = 16;
+let is i32 as SHAPE_GRABBING      with imut = 17;
+let is i32 as SHAPE_E_RESIZE      with imut = 18;
+let is i32 as SHAPE_N_RESIZE      with imut = 19;
+let is i32 as SHAPE_NE_RESIZE     with imut = 20;
+let is i32 as SHAPE_NW_RESIZE     with imut = 21;
+let is i32 as SHAPE_S_RESIZE      with imut = 22;
+let is i32 as SHAPE_SE_RESIZE     with imut = 23;
+let is i32 as SHAPE_SW_RESIZE     with imut = 24;
+let is i32 as SHAPE_W_RESIZE      with imut = 25;
+let is i32 as SHAPE_EW_RESIZE     with imut = 26;
+let is i32 as SHAPE_NS_RESIZE     with imut = 27;
+let is i32 as SHAPE_NESW_RESIZE   with imut = 28;
+let is i32 as SHAPE_NWSE_RESIZE   with imut = 29;
+let is i32 as SHAPE_COL_RESIZE    with imut = 30;   // a splitter between side-by-side panes
+let is i32 as SHAPE_ROW_RESIZE    with imut = 31;
+let is i32 as SHAPE_ALL_SCROLL    with imut = 32;
+let is i32 as SHAPE_ZOOM_IN       with imut = 33;
+let is i32 as SHAPE_ZOOM_OUT      with imut = 34;
+let is i32 as SHAPE_NONE          with imut = 35;
+
+struct Kind {
+    name       as *u8;
+    data_bytes as i64;   // zeroed for each new widget, owned by the tree
+    destroy    as DestroyFn;
+    measure    as MeasureFn;
+    arrange    as ArrangeFn;
+    event      as EventFn;
+    hit        as HitFn;
+    paint      as PaintFn;
+    role       as i64;   // access.ROLE_*: what it is to assistive technology
+    access     as AccessFn;
+    shape      as ShapeFn;   // the pointer's shape over it; null for its parent's
+    paint_over as PaintFn;   // drawn after its children, over them: a scroll area's bars
+    text       as TextFn;    // its text, to assistive technology; null for none (access.text_of)
+    caret      as CaretFn;   // where its caret is: drawn again alone when it blinks; null for all of it
+}
+
+// A widget's text asked of it, or something done to it (TEXT_*), by
+// assistive technology through access.cst. Offsets are UTF-8 bytes of the
+// text as the widget has it; a rectangle and a point are the widget's own
+// coordinates.
+struct TextQuery {
+    op       as i64;
+    editable as i64;             // GET: it can be edited
+    text     as *u8;             // GET: its text, the kind's to keep; REPLACE: what goes in
+    text_len as i64;
+    caret    as i64;             // GET: the caret, -1 for none
+    a        as i64;             // GET: the selection, a to b; SELECT, REPLACE, COPY, CUT: the range
+    b        as i64;
+    at       as i64;             // EXTENTS, SET_CARET, PASTE: an offset; OFFSET_AT: the answer
+    x        as f64;             // OFFSET_AT: the point
+    y        as f64;
+    rect     as math.rect.Rect;  // EXTENTS: the answer
+    chars    as i64;             // INFO: how many characters it has
+    tells    as i64;             // INFO: 1 when it tells every change of its text (notify_text)
+}
+
+let is i64 as TEXT_GET        with imut = 0;
+let is i64 as TEXT_EXTENTS    with imut = 1;   // the character at `at`
+let is i64 as TEXT_OFFSET_AT  with imut = 2;   // the offset nearest x, y
+let is i64 as TEXT_SET_CARET  with imut = 3;
+let is i64 as TEXT_SELECT     with imut = 4;
+let is i64 as TEXT_REPLACE    with imut = 5;   // a to b by text: an insertion when a == b, a deletion with no text
+let is i64 as TEXT_COPY       with imut = 6;   // a to b to the clipboard
+let is i64 as TEXT_CUT        with imut = 7;
+let is i64 as TEXT_PASTE      with imut = 8;   // the clipboard's text at `at`
+// Questions a widget with a large text answers from what it keeps, so its
+// text need not be read whole; one that does not is answered from GET's.
+let is i64 as TEXT_INFO      with imut = 9;    // GET's answer but the text: text_len, chars, caret, a, b, editable, tells
+let is i64 as TEXT_SPAN      with imut = 10;   // bytes a to b, in one piece, into text and text_len
+let is i64 as TEXT_CHAR_OF   with imut = 11;   // the characters before byte `at`, into a
+let is i64 as TEXT_BYTE_OF   with imut = 12;   // where character `at` starts, in bytes, into a
+let is i64 as TEXT_PARAGRAPH with imut = 13;   // the paragraph byte `at` is in, a to b, its line feed in it
+
+// q asked of, or done to, a widget's text: 1 when answered or done.
+type TextFn = fn(*Tree, i64, *u8, *TextQuery) as i64;
+
+// Text handed to the platform: cb(user, which, text, n). See set_clipboard.
+type ClipboardFn = fn(*u8, i32, *u8, i64) as void;
+
+// Text asked of the platform for widget w: cb(user, which, w). See set_paste.
+type PasteFn = fn(*u8, i32, i64) as void;
+
+// What a widget asks of the window it is in — a title bar drawn by the
+// toolkit (WIN_*) — at window x, y where that matters: cb(user, op, x, y).
+// See set_window_ops.
+type WindowOpFn = fn(*u8, i32, f64, f64) as void;
+
+let is i32 as WIN_MOVE     with imut = 1;   // follow the pointer from where it is pressed
+let is i32 as WIN_MINIMIZE with imut = 2;
+let is i32 as WIN_MAXIMIZE with imut = 3;   // maximized, or back from it
+let is i32 as WIN_CLOSE    with imut = 4;   // asked to close, as its close button would
+let is i32 as WIN_MENU     with imut = 5;   // the window's own menu, at x, y
+// Follow the pointer, resizing from an edge or a corner, as a frame the
+// toolkit draws asks (decoration.cst): north, then round clockwise.
+let is i32 as WIN_RESIZE_N  with imut = 6;
+let is i32 as WIN_RESIZE_NE with imut = 7;
+let is i32 as WIN_RESIZE_E  with imut = 8;
+let is i32 as WIN_RESIZE_SE with imut = 9;
+let is i32 as WIN_RESIZE_S  with imut = 10;
+let is i32 as WIN_RESIZE_SW with imut = 11;
+let is i32 as WIN_RESIZE_W  with imut = 12;
+let is i32 as WIN_RESIZE_NW with imut = 13;
+
+// What a widget asks of the application its window is in (HOST_*), the
+// window named as the application names it: cb(user, window, op, arg), its
+// answer an i64. app.cst sets it on every window's tree; see set_host.
+type HostFn = fn(*u8, i64, i32, i64) as i64;
+
+let is i32 as HOST_DIALOG    with imut = 1;   // a window of its own for a dialog, belonging to this one, hidden: its tree, as an i64; 0 for none
+let is i32 as HOST_IS_DIALOG with imut = 2;   // 1 when this is a dialog's window
+let is i32 as HOST_SHOW      with imut = 3;   // shown, modal when arg is 1
+let is i32 as HOST_HIDE      with imut = 4;
+let is i32 as HOST_TITLE     with imut = 5;   // arg a *HostText, copied
+let is i32 as HOST_SIZE      with imut = 6;   // arg a *math.vec.Vec2, logical pixels
+let is i32 as HOST_CLOSE     with imut = 7;   // this window closed, and its tree with it
+
+struct HostText {
+    s as *u8;
+    n as i64;
+}
+
+// Who watches the tree change — an accessibility bridge — told of widget w
+// (WATCH_*): cb(user, t, w, what). See set_watch.
+type WatchFn = fn(*u8, *Tree, i64, i32) as void;
+
+let is i32 as WATCH_ADDED   with imut = 1;   // made, or moved here: its parent's children changed
+let is i32 as WATCH_REMOVED with imut = 2;   // about to be destroyed, or moved away
+let is i32 as WATCH_CHANGED with imut = 3;   // it may look or say something else now
+let is i32 as WATCH_FOCUS   with imut = 4;   // the focus came to it (0: went nowhere)
+let is i32 as WATCH_TEXT    with imut = 5;   // its text changed: text_change says how
+let is i32 as WATCH_STATE   with imut = 6;   // shown or hidden, enabled or disabled: what is under it too
+
+// A widget's text changed, as told to whoever watches (notify_text): bytes
+// put in at at — told once they are in — or taken out — told before they go.
+// What it says is the watcher's only while it is told.
+let is i64 as TEXT_INSERTED with imut = 1;
+let is i64 as TEXT_DELETED  with imut = 2;
+
+struct TextChange {
+    what as i64;
+    at   as i64;    // bytes into the text as the widget tells it
+    text as *u8;    // what went in or out, len bytes
+    len  as i64;
+}
+
+// The input method told to give up its composition for widget w: cb(user,
+// w). See set_ime_reset.
+type ImeResetFn = fn(*u8, i64) as void;
+
+// A signal callback: cb(tree, widget, arg, user). See signal.cst.
+type SignalFn = fn(*Tree, i64, *u8, *u8) as void;
+
+// --- Nodes ---
+//
+// Links are slot indices, -1 for none: inside the tree an index is enough,
+// and handles are only made at the boundary.
+struct Node {
+    era    as i32;
+    used   as i32;
+    kind   as *Kind;
+    parent as i64;
+    first  as i64;
+    last   as i64;
+    next   as i64;
+    prev   as i64;
+    count  as i64;
+    flags  as i64;
+    item   as geom.Item;   // layout's, see geom.cst
+    // What of it was last painted, in window coordinates: its rectangle clipped
+    // by its ancestors', since a child never draws outside its parent. Empty
+    // while it has never been on screen or is hidden. The place it leaves is
+    // repainted from this.
+    painted as math.rect.Rect;
+    // Where it was laid out then — the same, unclipped by its ancestors. A
+    // change here is what says it moved.
+    placed  as math.rect.Rect;
+    layer   as i64;   // 0, or above everything at lower layers; see set_layer
+    labelled_by as i64;   // the widget that names it; see set_labelled_by
+    group   as i64;   // the Tab group it is in, 0 for none; see set_tab_group
+    overrides as *style.Overrides;   // the program's; null for none. See set_overrides
+    // Where it is drawn, moved from where it is laid out, and how much of it
+    // shows: see set_translation and set_opacity.
+    tx      as f64;
+    ty      as f64;
+    opacity as f64;
+}
+
+struct Tree {
+    nodes       as *u8;   // cap * sizeof(Node)
+    data        as *u8;   // cap * stride
+    stride      as i64;
+    cap         as i64;
+    live        as i64;
+    next_free   as i64;   // where the next search for a free slot starts
+    root        as i64;   // slot index of the root
+    block       as *u8;
+    block_bytes as i64;
+    scratch       as *u8;   // see scratch_alloc
+    scratch_bytes as i64;
+    scratch_used  as i64;
+    conns         as *u8;   // conn_cap Connections
+    conn_cap      as i64;
+    conn_used     as i64;
+    conn_seq      as i64;
+    emit_serial   as i64;
+    emitting      as i64;   // emissions in progress, nested
+    damage        as [16]math.rect.Rect;
+    damage_n      as i64;
+    paint_wanted  as i64;   // anything changed since damage_clear
+    shift_w       as i64;   // the scroll area that asked to move its pixels this frame; see shift_request
+    shift_n       as i64;   // how many asked: more than one, none moved
+    shift_dx      as f64;   // how far its content moved, logical pixels
+    shift_dy      as f64;
+    shift_keep    as math.rect.Rect;   // what of it may move, in its own coordinates
+    shift_ok      as i64;   // damage.collect took the ask
+    blink_w       as i64;   // the widget whose caret blinked since the last frame; see blink
+    moves         as i64;   // the window moves pixels when told (shift); see set_moves
+    shift_at      as math.rect.Rect;   // and moves this, in the window
+    scale         as f64;   // physical pixels per logical one; layout.set_scale
+    layered       as i64;   // widgets with a layer above 0
+    theme         as *style.Theme;   // the program's; null for the default. See set_theme
+    text          as *u8;            // the application's text service; see set_text_service
+    animator      as *u8;            // the window's animator; see set_animator
+    timers        as *u8;            // the application's timers; see set_timers
+    router        as *u8;            // the window's router; see set_router
+    want_focus    as i64;            // the focus a widget asked for; see request_focus
+    clip_fn       as ClipboardFn;    // the program's, null for none; see set_clipboard
+    clip_user     as *u8;
+    paste_fn      as PasteFn;        // the program's, null for none; see set_paste
+    paste_user    as *u8;
+    area_w        as i64;            // where text is typed; see set_text_area
+    area          as math.rect.Rect;
+    ime_fn        as ImeResetFn;     // the program's, null for none; see set_ime_reset
+    ime_user      as *u8;
+    win_fn        as WindowOpFn;     // the program's, null for none; see set_window_ops
+    win_user      as *u8;
+    host_fn       as HostFn;         // the application's, null for none; see set_host
+    host_user     as *u8;
+    host_window   as i64;
+    watch_fn      as WatchFn;        // null for none; see set_watch
+    watch_user    as *u8;
+    text_change   as *TextChange;    // while WATCH_TEXT is told; null otherwise
+    language      as i32;            // the language its widgets speak (ui/strings.cst); 0, English
+    _pad_lang     as i32;
+    err         as i32;
+    ok          as i32;
+}
+
+// --- Scratch ---
+//
+// Room containers work in while they measure and arrange — the sizes of their
+// children, the widths of a grid's columns — taken in stack order and given
+// back before they return. It is part of the tree's one mapping, sized from
+// the capacity, so laying out allocates nothing.
+//
+// Two entries per widget is enough for any tree: the containers active at once
+// form a path from the root, and the children of different containers on one
+// path are different widgets. A grid is the exception — its tracks run to the
+// highest row and column named, which a sparse grid can push past that — and a
+// grid that needs more says so with LAYOUT_TOO_LARGE rather than dropping cells.
+let is i64 as SCRATCH_ENTRY_BYTES with imut = 48;
+
+// The root's kind. Module scope rather than inside the Tree, because a Tree
+// is returned by value and a pointer into it would not survive the copy.
+let is Kind as _root_kind with mut;
+
+fn _node(t as *Tree, i as i64) as *Node {
+    return cast(*Node, cast(i64, t.nodes) + i * sizeof(Node));
+}
+
+fn _data_at(t as *Tree, i as i64) as *u8 {
+    return cast(*u8, cast(i64, t.data) + i * t.stride);
+}
+
+fn _handle(t as *Tree, i as i64) as i64 {
+    if (i < 0) { return 0; }
+    return (cast(i64, _node(t, i).era) << 32) | (i + 1);
+}
+
+// The slot a handle names, or -1 when it names nothing alive.
+fn _index(t as *Tree, h as i64) as i64 {
+    if (t.ok == 0 || h == 0) { return 0 - 1; }
+    let is i64 as i = (h & 4294967295) - 1;
+    if (i < 0 || i >= t.cap) { return 0 - 1; }
+    let is *Node as n = _node(t, i);
+    if (n.used == 0) { return 0 - 1; }
+    if (n.era != cast(i32, (h >> 32) & 4294967295)) { return 0 - 1; }
+    return i;
+}
+
+fn _set(flags as i64, bit as i64, on as i32) as i64 {
+    if (on == 1) { return flags | bit; }
+    return (flags | bit) - bit;
+}
+fn is_valid(t as *Tree, w as i64) as i32 {
+    if (_index(t, w) < 0) { return 0; }
+    return 1;
+}
+
+// --- The theme ---
+//
+// One per tree, which is one per window: the program's, pointed at rather
+// than copied, so an application switches every window by changing the one
+// theme and telling each tree (app.set_theme does both). A widget can lay
+// overrides on its subtree; widget.theme resolves what applies to it, and
+// painting hands each paint entry its resolved theme.
+//
+// Changing either lays out again — text sizes and paddings are in the theme —
+// and repaints what it reaches.
+
+// The theme with no program's set: light. Module scope, filled when a tree
+// opens, because a Tree is returned by value.
+let is style.Theme as _default_theme with mut;
+
+// Text copied by a widget goes to the platform through the program: to the
+// clipboard Ctrl+C fills, or to the primary selection a mouse selection
+// fills on X11 and Wayland. The tree only passes it on.
+let is i32 as CLIPBOARD with imut = 0;
+let is i32 as PRIMARY   with imut = 1;

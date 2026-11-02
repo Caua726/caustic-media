@@ -1,0 +1,249 @@
+// ui/router_pointer.cst — the pointer as the platform says it: moves,
+// presses and their counts, the wheel, touches, long presses, the caret's
+// blink.
+use "tree.cst" as tree;
+use "event.cst" as event;
+use "router_state.cst" as rst;
+use "router_hit.cst" as rhit;
+use "router_focus.cst" as rfocus;
+use "router_drag.cst" as rdrag;
+
+// --- From the platform ---
+
+// The focus a widget asked for while an event was delivered
+// (tree.request_focus), given now — by keyboard or by pointer as the event
+// was — when it can be taken.
+fn _requested(t as *tree.Tree, r as *rst.Router, by_keyboard as i32) as void {
+    let is i64 as w = tree.take_focus_request(t);
+    if (w != 0) { rfocus.focus(t, r, w, by_keyboard); }
+}
+
+fn _pointer_move(t as *tree.Tree, r as *rst.Router, x as f64, y as f64, time as i64) as void {
+    r.pointer_x = x;
+    r.pointer_y = y;
+    r.pointer_in = 1;
+    if (r.lp_armed == 1) {
+        let is f64 as lx = x - r.lp_x;
+        let is f64 as ly = y - r.lp_y;
+        let is f64 as th = r.settings.drag_threshold;
+        if (lx * lx + ly * ly > th * th) { r.lp_armed = 0; }
+    }
+    // A drag begun here goes where the pointer goes.
+    if (r.drag_on == 1 && r.drag_own == 1) {
+        r.drag_x = x;
+        r.drag_y = y;
+        rdrag._drag_over(t, r, time);
+        return;
+    }
+    let is i64 as captor = rhit._captor(t, r);
+    if (captor != 0) {
+        if (r.buttons != 0 && r.dragging == 0) {
+            let is f64 as ddx = x - r.press_x;
+            let is f64 as ddy = y - r.press_y;
+            let is f64 as th = r.settings.drag_threshold;
+            if (ddx * ddx + ddy * ddy > th * th) {
+                r.dragging = 1;
+                let is event.Event as ds = event.make(event.DRAG_START, time);
+                ds.x = x;
+                ds.y = y;
+                ds.mods = r.mods;
+                rhit._direct(t, captor, &ds);
+                // It began a drag: the pointer is the drag's from here.
+                if (r.drag_on == 1 && r.drag_own == 1) { return; }
+            }
+        }
+        let is event.Event as e = event.make(event.POINTER_MOVE, time);
+        e.x = x;
+        e.y = y;
+        e.mods = r.mods;
+        rhit._direct(t, captor, &e);
+        return;
+    }
+    rhit._update_hover(t, r, rfocus._hit_scoped(t, r, x, y), time);
+    let is event.Event as e = event.make(event.POINTER_MOVE, time);
+    e.x = x;
+    e.y = y;
+    e.mods = r.mods;
+    if (r.scope != 0 && rhit.hover(r) == 0) {
+        // Outside a modal scope: only the scope hears of it — a menu bar's
+        // open menu, for the pointer reaching another of its titles.
+        e.kind = event.MOVE_OUTSIDE;
+        rhit._direct(t, r.scope, &e);
+        return;
+    }
+    rhit._dispatch(t, &e, rhit.hover(r));
+}
+
+fn _context(t as *tree.Tree, r as *rst.Router, x as f64, y as f64, time as i64) as void {
+    let is event.Event as e = event.make(event.CONTEXT_MENU, time);
+    e.x = x;
+    e.y = y;
+    e.button = 3;
+    e.mods = r.mods;
+    rhit._dispatch(t, &e, rfocus._hit_scoped(t, r, x, y));
+}
+
+fn _pointer_button(t as *tree.Tree, r as *rst.Router, button as i32, pressed as i32,
+                   x as f64, y as f64, time as i64) as void {
+    if (pressed == 1) { r.inputs = r.inputs + 1; }
+    r.pointer_x = x;
+    r.pointer_y = y;
+    r.pointer_in = 1;
+    let is i32 as bit = 1 << cast(i32, button - 1);
+
+    if (pressed == 1) {
+        // Another click of the same button, soon enough and close enough to
+        // the last, counts up to three; a fourth starts again at one.
+        let is f64 as ddx = x - r.last_click_x;
+        let is f64 as ddy = y - r.last_click_y;
+        let is f64 as near = r.settings.double_click_distance;
+        if (button == r.last_button && time - r.last_click_time <= r.settings.double_click_ms
+            && ddx * ddx + ddy * ddy <= near * near && r.clicks < 3) {
+            r.clicks = r.clicks + 1;
+        } else {
+            r.clicks = 1;
+        }
+        r.last_button = button;
+        r.last_click_time = time;
+        r.last_click_x = x;
+        r.last_click_y = y;
+
+        // The primary button held still is a long press — from a finger or a
+        // pen, or a mouse when the settings ask. Any other press disarms it.
+        r.lp_armed = 0;
+        if (button == 1 && r.settings.long_press_ms > 0
+            && (r.source != rst.MOUSE || r.settings.long_press_mouse == 1)) {
+            r.lp_armed = 1;
+            r.lp_due = time + r.settings.long_press_ms;
+            r.lp_x = x;
+            r.lp_y = y;
+        }
+
+        let is event.Event as e = event.make(event.POINTER_DOWN, time);
+        e.x = x;
+        e.y = y;
+        e.button = button;
+        e.clicks = r.clicks;
+        e.mods = r.mods;
+        let is i64 as captor = rhit._captor(t, r);
+        if (captor != 0) {
+            rhit._direct(t, captor, &e);
+        } else {
+            let is i64 as target = rfocus._hit_scoped(t, r, x, y);
+            r.spent = 0;
+            if (r.scope != 0 && target == 0) {
+                // Outside a modal scope the press goes nowhere, but the
+                // scope hears of it — a popup closes, the
+                // press spent on closing it, opening no menu either.
+                r.spent = 1;
+                let is event.Event as out = event.make(event.PRESS_OUTSIDE, time);
+                out.x = x;
+                out.y = y;
+                out.button = button;
+                out.mods = r.mods;
+                rhit._direct(t, r.scope, &out);
+            }
+            rhit._update_hover(t, r, target, time);
+            // A click moves focus to the nearest widget that can take it, and
+            // hides the focus ring: it is for whoever is using the keyboard.
+            r.focus_visible = 0;
+            let is i64 as f = rfocus._focusable_from(t, r, target);
+            if (f != 0) { rfocus.focus(t, r, f, 0); }
+            r.capture = rhit._dispatch(t, &e, target);
+            tree.invalidate_paint(t, r.capture);
+            r.press_x = x;
+            r.press_y = y;
+            r.dragging = 0;
+        }
+        r.buttons = r.buttons | bit;
+        if (button == 3 && r.settings.context_on_release == 0 && r.spent == 0) { _context(t, r, x, y, time); }
+        return;
+    }
+
+    r.buttons = (r.buttons | bit) - bit;
+    r.lp_armed = 0;
+    // Let go: a drag begun here is dropped where it is.
+    if (r.drag_on == 1 && r.drag_own == 1 && r.buttons == 0) {
+        r.drag_x = x;
+        r.drag_y = y;
+        rdrag._drag_over(t, r, time);
+        rdrag._end(t, r, rdrag._drop(t, r, time), time);
+        r.capture = 0;
+        r.dragging = 0;
+        r.spent = 0;
+        if (r.pointer_in == 1) { rhit._update_hover(t, r, rfocus._hit_scoped(t, r, x, y), time); }
+        return;
+    }
+    if (r.swallow == 1 && button == 1) {
+        // The long press already answered this press with a menu.
+        r.swallow = 0;
+        if (r.buttons == 0) {
+            r.capture = 0;
+            r.dragging = 0;
+            if (r.pointer_in == 1) { rhit._update_hover(t, r, rfocus._hit_scoped(t, r, x, y), time); }
+        }
+        return;
+    }
+    let is event.Event as e = event.make(event.POINTER_UP, time);
+    e.x = x;
+    e.y = y;
+    e.button = button;
+    e.mods = r.mods;
+    let is i64 as captor = rhit._captor(t, r);
+    if (captor != 0) {
+        rhit._direct(t, captor, &e);
+    } else {
+        rhit._dispatch(t, &e, rfocus._hit_scoped(t, r, x, y));
+    }
+    if (r.buttons == 0) {
+        tree.invalidate_paint(t, r.capture);
+        r.capture = 0;
+        r.dragging = 0;
+        // The hover catches up with wherever the pointer went meanwhile.
+        if (r.pointer_in == 1) { rhit._update_hover(t, r, rfocus._hit_scoped(t, r, x, y), time); }
+    }
+    if (button == 3 && r.settings.context_on_release == 1 && r.spent == 0) { _context(t, r, x, y, time); }
+    if (r.buttons == 0) { r.spent = 0; }
+}
+
+fn _long_press(t as *tree.Tree, r as *rst.Router, now as i64) as i32 {
+    if (r.lp_armed == 0 || now < r.lp_due) { return 0; }
+    r.lp_armed = 0;
+    r.swallow = 1;
+    let is i64 as captor = rhit._captor(t, r);
+    if (captor != 0) {
+        let is event.Event as c = event.make(event.POINTER_CANCEL, now);
+        c.x = r.lp_x;
+        c.y = r.lp_y;
+        rhit._direct(t, captor, &c);
+        r.capture = 0;
+        r.dragging = 0;
+    }
+    let is event.Event as e = event.make(event.CONTEXT_MENU, now);
+    e.x = r.lp_x;
+    e.y = r.lp_y;
+    e.button = 1;
+    e.mods = r.mods;
+    rhit._dispatch(t, &e, rfocus._hit_scoped(t, r, r.lp_x, r.lp_y));
+    return 1;
+}
+
+// When the caret next goes off or on after the time last known; -1 for
+// never.
+fn _blink_due(r as *rst.Router) as i64 {
+    let is i64 as p = r.settings.caret_blink_ms;
+    if (p <= 0 || r.blinking == 0) { return 0 - 1; }
+    let is i64 as el = r.now - r.blink_from;
+    let is i64 as limit = r.settings.caret_blink_timeout_ms;
+    if (el < 0 || (limit > 0 && el >= limit)) { return 0 - 1; }
+    let is i64 as on = p * 2 / 3;
+    let is i64 as c = el % p;
+    let is i64 as next with mut = el - c + on;
+    if (c >= on) { next = el - c + p; }
+    if (limit > 0 && next >= limit) {
+        // Off at the end: on then, for good.
+        if (c >= on) { return r.blink_from + limit; }
+        return 0 - 1;
+    }
+    return r.blink_from + next;
+}

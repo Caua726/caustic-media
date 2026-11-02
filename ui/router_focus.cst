@@ -1,0 +1,274 @@
+// ui/router_focus.cst — the focus: the modal scope, the chain Tab walks,
+// and what is brought into view as it moves.
+use "../math/math.cst" as math;
+use "tree.cst" as tree;
+use "layout.cst" as layout;
+use "event.cst" as event;
+use "router_state.cst" as rst;
+use "router_hit.cst" as rhit;
+
+// --- Modal scope ---
+//
+// While a scope is set — a dialog drawn inside the window — only its subtree
+// reacts: the pointer reaches nothing outside it, focus cannot leave it, and
+// Tab cycles within it. Setting one takes focus inside if it was outside and
+// drops the hover from everything behind. One subtree outside it may be let
+// through as well (set_scope_also): an entry typed in while what it suggests
+// is shown keeps the focus, and presses on it are its own.
+
+fn _in_scope(t as *tree.Tree, r as *rst.Router, w as i64) as i32 {
+    // A scope destroyed while set is none: the window is not left shut.
+    if (r.scope == 0 || tree.is_valid(t, r.scope) == 0) { return 1; }
+    let is i64 as a with mut = w;
+    while (a != 0) {
+        if (a == r.scope || a == r.scope_also) { return 1; }
+        a = tree.parent(t, a);
+    }
+    return 0;
+}
+
+fn _hit_scoped(t as *tree.Tree, r as *rst.Router, x as f64, y as f64) as i64 {
+    let is i64 as h = rhit.hit(t, x, y);
+    if (h != 0 && _in_scope(t, r, h) == 0) { return 0; }
+    return h;
+}
+
+fn _set_scope(t as *tree.Tree, r as *rst.Router, w as i64) as void {
+    r.scope = w;
+    r.scope_also = 0;
+    if (r.scope != 0 && tree.is_valid(t, r.scope) == 0) { r.scope = 0; }
+    if (r.capture != 0 && _in_scope(t, r, r.capture) == 0) {
+        r.capture = 0;
+        r.dragging = 0;
+    }
+}
+
+fn _rehover(t as *tree.Tree, r as *rst.Router) as void {
+    if (r.pointer_in == 1 && r.capture == 0) {
+        rhit._update_hover(t, r, _hit_scoped(t, r, r.pointer_x, r.pointer_y), 0);
+    }
+}
+
+// --- Focus ---
+
+fn _can_focus(t as *tree.Tree, r as *rst.Router, w as i64) as i32 {
+    if (w == 0 || tree.is_valid(t, w) == 0) { return 0; }
+    if (tree.is_focusable(t, w) == 0) { return 0; }
+    if (tree.is_visible(t, w) == 0 || tree.is_enabled(t, w) == 0) { return 0; }
+    return _in_scope(t, r, w);
+}
+
+// The nearest widget at or above w that can take focus, 0 for none.
+fn _focusable_from(t as *tree.Tree, r as *rst.Router, w as i64) as i64 {
+    let is i64 as a with mut = w;
+    while (a != 0) {
+        if (_can_focus(t, r, a) == 1) { return a; }
+        a = tree.parent(t, a);
+    }
+    return 0;
+}
+fn focused(t as *tree.Tree, r as *rst.Router) as i64 {
+    if (_can_focus(t, r, r.focus) == 0) { return 0; }
+    return r.focus;
+}
+fn focus(t as *tree.Tree, r as *rst.Router, w as i64, by_keyboard as i32) as i32 {
+    if (w != 0 && _can_focus(t, r, w) == 0) { return 0; }
+    _focus(t, r, w, by_keyboard, by_keyboard);
+    // Whoever is on the keyboard has to see where focus went; a click was
+    // aimed at something already in view.
+    if (w != 0 && by_keyboard == 1) { reveal(t, w); }
+    return 1;
+}
+
+fn _focus(t as *tree.Tree, r as *rst.Router, w as i64, by_keyboard as i32, ring as i32) as void {
+    let is i64 as old = focused(t, r);
+    // Focus and its ring change how both widgets look.
+    if (old != w || r.focus_visible != ring) {
+        tree.invalidate_paint(t, old);
+        tree.invalidate_paint(t, w);
+        _repaint_within(t, old);
+        _repaint_within(t, w);
+    }
+    r.focus_visible = ring;
+    if (old != w) {
+        r.focus = w;
+        if (old != 0) {
+            let is event.Event as out = event.make(event.FOCUS_OUT, 0);
+            out.related = w;
+            rhit._direct(t, old, &out);
+        }
+        _leave_within(t, old, w);
+        if (w != 0) { _enter_within(t, tree.parent(t, w), old); }
+        if (w != 0) {
+            let is event.Event as in = event.make(event.FOCUS_IN, 0);
+            in.related = old;
+            in.which = by_keyboard;
+            rhit._direct(t, w, &in);
+        }
+        tree.notify(t, w, tree.WATCH_FOCUS);
+    }
+    rst._awake(t, r, r.now);
+}
+
+// Whether w is a or inside it.
+fn _holds(t as *tree.Tree, a as i64, w as i64) as i32 {
+    let is i64 as cur with mut = w;
+    while (cur != 0) {
+        if (cur == a) { return 1; }
+        cur = tree.parent(t, cur);
+    }
+    return 0;
+}
+
+// What held the focus at from and does not hold it at to hears FOCUS_LEAVE,
+// innermost first — a composite learning that its parts lost the focus, as
+// a spin box commits what was typed into its entry.
+fn _leave_within(t as *tree.Tree, from as i64, to as i64) as void {
+    if (from == 0) { return; }
+    let is i64 as a with mut = tree.parent(t, from);
+    while (a != 0) {
+        if (_holds(t, a, to) == 0) {
+            let is event.Event as e = event.make(event.FOCUS_LEAVE, 0);
+            e.related = to;
+            rhit._direct(t, a, &e);
+        }
+        a = tree.parent(t, a);
+    }
+}
+
+// And what holds it now and did not, from a up, hears FOCUS_ENTER,
+// outermost first.
+fn _enter_within(t as *tree.Tree, a as i64, from as i64) as void {
+    if (a == 0) { return; }
+    _enter_within(t, tree.parent(t, a), from);
+    if (_holds(t, a, from) == 1) { return; }
+    let is event.Event as e = event.make(event.FOCUS_ENTER, 0);
+    e.related = from;
+    rhit._direct(t, a, &e);
+}
+
+// The ancestors of w that look different with the focus inside them — those
+// that asked, with tree.F_FOCUS_WITHIN_LOOK. Repainting every ancestor would
+// repaint the whole window on every Tab.
+fn _repaint_within(t as *tree.Tree, w as i64) as void {
+    if (w == 0) { return; }
+    let is i64 as a with mut = tree.parent(t, w);
+    while (a != 0) {
+        if (tree.has_flag(t, a, tree.F_FOCUS_WITHIN_LOOK) == 1) { tree.invalidate_paint(t, a); }
+        a = tree.parent(t, a);
+    }
+}
+fn reveal_rect(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void {
+    if (tree.is_valid(t, w) == 0) { return; }
+    let is event.Event as e = event.make(event.REVEAL, 0);
+    e.x = r.x;
+    e.y = r.y;
+    e.width = r.w;
+    e.height = r.h;
+    e.target = w;
+    e.phase = event.BUBBLE;
+    let is i64 as a with mut = tree.parent(t, w);
+    while (a != 0) {
+        rhit._deliver(t, a, &e);
+        a = tree.parent(t, a);
+    }
+}
+fn reveal(t as *tree.Tree, w as i64) as void {
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    reveal_rect(t, w, &r);
+}
+
+// The next widget in tree order after w within top, without descending into
+// hidden widgets — nothing under them can take focus.
+fn _next_in_order(t as *tree.Tree, w as i64, top as i64) as i64 {
+    if (tree.is_visible(t, w) == 1 || w == top) {
+        let is i64 as c = tree.first_child(t, w);
+        if (c != 0) { return c; }
+    }
+    let is i64 as cur with mut = w;
+    while (cur != top && cur != 0) {
+        let is i64 as s = tree.next_sibling(t, cur);
+        if (s != 0) { return s; }
+        cur = tree.parent(t, cur);
+    }
+    return 0;
+}
+fn focus_next(t as *tree.Tree, r as *rst.Router, dir as i32) as i32 {
+    let is i64 as top with mut = r.scope;
+    if (top == 0) { top = tree.root(t); }
+    let is i64 as mark = tree.scratch_mark(t);
+    let is i64 as live = tree.live_count(t);
+    let is *i64 as list = cast(*i64, tree.scratch_alloc(t, live * 8));
+    // The Tab groups whose stop can take the focus, and those given a
+    // stand-in: at most one entry each per widget.
+    let is *i64 as held = cast(*i64, tree.scratch_alloc(t, live * 8));
+    let is *i64 as stood = cast(*i64, tree.scratch_alloc(t, live * 8));
+    if (cast(i64, list) == 0 || cast(i64, held) == 0 || cast(i64, stood) == 0) { tree.scratch_release(t, mark); return 0; }
+    let is i64 as nheld with mut = 0;
+    let is i64 as w with mut = top;
+    while (w != 0) {
+        let is i64 as g = tree.tab_group(t, w);
+        if (g != 0 && _can_focus(t, r, w) == 1) {
+            held[nheld] = g;
+            nheld = nheld + 1;
+        }
+        w = _next_in_order(t, w, top);
+    }
+    let is i64 as nstood with mut = 0;
+    let is i64 as n with mut = 0;
+    w = top;
+    while (w != 0) {
+        if (_can_focus(t, r, w) == 1) {
+            list[n] = w;
+            n = n + 1;
+        } else if (_stands_in(t, r, w, held, nheld, stood, nstood) == 1) {
+            stood[nstood] = tree.tab_group(t, w);
+            nstood = nstood + 1;
+            list[n] = w;
+            n = n + 1;
+        }
+        w = _next_in_order(t, w, top);
+    }
+    if (n == 0) { tree.scratch_release(t, mark); return 0; }
+
+    let is i64 as cur = focused(t, r);
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (list[i] == cur) { at = i; }
+        i = i + 1;
+    }
+    let is i64 as pick with mut = 0;
+    if (at < 0) {
+        if (dir < 0) { pick = n - 1; }
+    } else if (dir < 0) {
+        pick = (at + n - 1) % n;
+    } else {
+        pick = (at + 1) % n;
+    }
+    let is i64 as chosen = list[pick];
+    tree.scratch_release(t, mark);
+    let is i64 as g = tree.tab_group(t, chosen);
+    if (g != 0 && tree.is_focusable(t, chosen) == 0) { _move_stop(t, top, g, chosen); }
+    focus(t, r, chosen, 1);
+    return 1;
+}
+
+// Whether w stands in for its Tab group's stop: the group's stop cannot take
+// the focus, nor has another of it stood in, and w could but for not being
+// the stop.
+fn _stands_in(t as *tree.Tree, r as *rst.Router, w as i64, held as *i64, nheld as i64, stood as *i64, nstood as i64) as i32 {
+    let is i64 as g = tree.tab_group(t, w);
+    if (g == 0 || rhit._in(held, nheld, g) == 1 || rhit._in(stood, nstood, g) == 1) { return 0; }
+    if (tree.is_visible(t, w) == 0 || tree.is_enabled(t, w) == 0) { return 0; }
+    return _in_scope(t, r, w);
+}
+
+// Tab group g's stop moved to w: the only one of it focusable.
+fn _move_stop(t as *tree.Tree, top as i64, g as i64, w as i64) as void {
+    let is i64 as v with mut = top;
+    while (v != 0) {
+        if (tree.tab_group(t, v) == g) { tree.set_focusable(t, v, cast(i32, v == w)); }
+        v = _next_in_order(t, v, top);
+    }
+}

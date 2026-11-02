@@ -61,6 +61,9 @@ for f in ui/ui.cst $(ls ui/*.cst | grep -v -e '_test\.cst$' -e '^ui/ui\.cst$' | 
         sig = $0
         sub(/ *\{.*$/, "", sig)
         sub(/^fn /, "", sig)
+        # a main module names its own types through its state part (tree.cst
+        # says tst.Tree); the reference names them as callers do
+        gsub(/tst\.|rst\.|hst\./, "", sig)
         c = flush_sentence(comment)
         if (c != "") { printf "- `%s` — %s\n", sig, c } else { printf "- `%s`\n", sig }
         comment = ""

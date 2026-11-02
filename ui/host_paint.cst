@@ -1,0 +1,278 @@
+// ui/host_paint.cst — a window of the application's painted and shown: only
+// what changed, as the damage says, into its texture and onto the screen.
+use "std/mem.cst" as mem;
+use "../gpu/gpu.cst" as gpu;
+use "../math/math.cst" as math;
+use "../render/draw2d.cst" as draw2d;
+use "../window/device.cst" as device;
+use "../window/cursor.cst" as cursor;
+use "app.cst" as app;
+use "tree.cst" as tree;
+use "access.cst" as access;
+use "../input/text.cst" as itext;
+use "text.cst" as text;
+use "style.cst" as style;
+use "paint.cst" as paint;
+use "layout.cst" as layout;
+use "geom.cst" as geom;
+use "widgets/decoration.cst" as decoration;
+use "widgets/titlebar.cst" as titlebar;
+use "../gpu/software/target.cst" as tgt;
+use "../window/damage.cst" as damage;
+use "host_state.cst" as hst;
+
+// What the frame says of the window, laid out — where it really is inside
+// the shadow, where it takes the pointer, where its maximize button is — told
+// the platform when it changed.
+fn _tell_frame(hs as *hst.Host, n as *hst.Native) as void {
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    if (tree.is_valid(t, n.deco) == 0) { return; }
+    let is decoration.Extents as e = decoration.extents(t, n.deco);
+    let is math.rect.Rect as r = decoration.input(t, n.deco);
+    let is f64 as s = n.scale;
+    let is [4]i64 as ext;
+    ext[0] = hst._px(e.left, s);
+    ext[1] = hst._px(e.right, s);
+    ext[2] = hst._px(e.top, s);
+    ext[3] = hst._px(e.bottom, s);
+    let is [4]i64 as inp;
+    inp[0] = hst._px(r.x, s);
+    inp[1] = hst._px(r.y, s);
+    inp[2] = hst._px(r.w, s);
+    inp[3] = hst._px(r.h, s);
+    if (mem.memcmp(cast(*u8, &ext), cast(*u8, &n.told_ext), 32) != 0) {
+        device.set_frame_extents(&n.win, ext[0], ext[1], ext[2], ext[3]);
+        mem.memcpy(cast(*u8, &n.told_ext), cast(*u8, &ext), 32);
+    }
+    if (mem.memcmp(cast(*u8, &inp), cast(*u8, &n.told_in), 32) != 0) {
+        device.set_input_region(&n.win, inp[0], inp[1], inp[2], inp[3]);
+        mem.memcpy(cast(*u8, &n.told_in), cast(*u8, &inp), 32);
+    }
+    let is [4]i64 as mx;
+    mem.memset(cast(*u8, &mx), 0, 32);
+    let is i64 as bar = decoration.header_of(t, n.deco);
+    let is i64 as max_btn = titlebar.button(t, bar, titlebar.MAXIMIZE);
+    if (max_btn != 0 && tree.is_visible(t, bar) == 1) {
+        let is math.rect.Rect as b = layout.window_rect(t, max_btn);
+        mx[0] = hst._px(b.x, s);
+        mx[1] = hst._px(b.y, s);
+        mx[2] = hst._px(b.w, s);
+        mx[3] = hst._px(b.h, s);
+    }
+    if (mem.memcmp(cast(*u8, &mx), cast(*u8, &n.told_max), 32) != 0) {
+        device.set_maximize_button(&n.win, mx[0], mx[1], mx[2], mx[3]);
+        mem.memcpy(cast(*u8, &n.told_max), cast(*u8, &mx), 32);
+    }
+}
+
+// The smallest its content can be laid out in, told the platform as the
+// window's floor when it changed, and the window grown to it when it is
+// smaller: a window manager that keeps the floor would, and one that does not
+// (none at all, under Xvfb) leaves it to the program.
+fn _tell_min(hs as *hst.Host, n as *hst.Native) as void {
+    let is geom.Size as least;
+    layout.min_size(app.tree(hs.a, n.h), &least);
+    let is i64 as mw = hst._px_up(least.min_w, n.scale);
+    let is i64 as mh = hst._px_up(least.min_h, n.scale);
+    if (mw == n.told_min[0] && mh == n.told_min[1]) { return; }
+    device.set_min_size(&n.win, mw, mh);
+    n.told_min[0] = mw;
+    n.told_min[1] = mh;
+    let is i64 as cw = device.width(&n.win);
+    let is i64 as ch = device.height(&n.win);
+    if (cw < mw || ch < mh) {
+        let is i64 as gw with mut = cw;
+        let is i64 as gh with mut = ch;
+        if (gw < mw) { gw = mw; }
+        if (gh < mh) { gh = mh; }
+        device.set_size(&n.win, gw, gh);
+    }
+}
+
+// --- Painted and shown ---
+
+fn _paint(hs as *hst.Host, now as i64) as void {
+    let is *app.App as a = hs.a;
+    let is i32 as glyphs with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_WINDOWS) {
+        let is *hst.Native as n = hst._native(hs, i);
+        if (n.h != 0 && (app.needs_frame(a, n.h) == 1 || n.present == 1)) {
+            if (glyphs == 0 && cast(i64, hs.svc) != 0) {
+                text.next_frame(cast(*text.Service, hs.svc));
+                glyphs = 1;
+            }
+            _frame(hs, n, now);
+        }
+        // The pointer's shape, as the widget under it asks.
+        if (n.h != 0) {
+            let is i32 as shape with mut = app.pointer_shape(a, n.h);
+            if (shape == tree.SHAPE_INHERIT) { shape = tree.SHAPE_DEFAULT; }
+            if (shape != n.shape) {
+                // A shape the platform has not got: the default pointer, chosen
+                // here, where it is known that another was asked for.
+                if (cursor.set(&n.cur, &n.win, shape) == 0) { cursor.set(&n.cur, &n.win, tree.SHAPE_DEFAULT); }
+                n.shape = shape;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _text_inputs(hs as *hst.Host) as void {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_WINDOWS) {
+        let is *hst.Native as n = hst._native(hs, i);
+        if (n.h != 0) {
+            let is *tree.Tree as t = app.tree(hs.a, n.h);
+            let is i64 as area = tree.text_area(t);
+            let is i32 as active = cast(i32, app.blocked(hs.a, n.h) == 0 && area != 0);
+            // Another field: what was composing for the last one is not this one's.
+            if (active == 1 && n.texting != 0 && n.texting != area) { device.text_input_reset(&n.win); }
+            n.texting = 0;
+            if (active == 1) { n.texting = area; }
+            if (device.text_input_enable(&n.win, active) == 1 && active == 1) {
+                let is math.rect.Rect as r = tree.text_area_rect(t);
+                let is i64 as x = hst._round(r.x * n.scale);
+                let is i64 as y = hst._round(r.y * n.scale);
+                let is i64 as width = hst._px_up(r.w, n.scale);
+                let is i64 as height = hst._px_up(r.h, n.scale);
+                device.text_input_rect(&n.win, x, y, width, height);
+                _text_context(n, t, area);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// What the field with the keyboard is and holds, told the platform's input
+// method: its purpose from its role — a password keeps its text — and its
+// text around the caret.
+fn _text_context(n as *hst.Native, t as *tree.Tree, area as i64) as void {
+    let is i64 as role = access.role(t, area);
+    let is i32 as purpose with mut = itext.PURPOSE_NORMAL;
+    let is i32 as hints with mut = itext.HINT_NONE;
+    if (role == access.ROLE_PASSWORD) {
+        purpose = itext.PURPOSE_PASSWORD;
+        hints = itext.HINT_HIDDEN_TEXT | itext.HINT_SENSITIVE_DATA;
+    }
+    if (role == access.ROLE_TEXT) { hints = itext.HINT_MULTILINE; }
+    let is tree.TextQuery as q;
+    if (itext.secret(purpose) == 1 || access.text_around(t, area, itext.CONTEXT_MAX, &q) == 0) {
+        device.text_input_context(&n.win, cast(*u8, 0), 0, 0, 0, purpose, hints);
+        return;
+    }
+    device.text_input_context(&n.win, q.text, q.text_len, q.caret, q.a, purpose, hints);
+}
+
+fn _frame(hs as *hst.Host, n as *hst.Native, now as i64) as void {
+    let is *app.App as a = hs.a;
+    let is *tree.Tree as t = app.tree(a, n.h);
+    let is i64 as pw = device.width(&n.win);
+    let is i64 as ph = device.height(&n.win);
+    if (pw <= 0 || ph <= 0) { return; }
+    // A texture the window's size: made again when it is not, and then all
+    // of it painted.
+    let is i32 as made with mut = 0;
+    if (n.tex == 0 || n.tw != pw || n.th != ph) {
+        made = 1;
+        if (n.tex != 0) { gpu.texture.destroy(hs.dv, n.tex); }
+        let is gpu.texture.Desc as td = gpu.texture.desc(pw, ph, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+        n.tex = gpu.texture.create(hs.dv, &td);
+        n.tw = pw;
+        n.th = ph;
+        if (n.tex == 0) { return; }
+        tree.invalidate_paint_subtree(t, tree.root(t));
+        damage.whole(&n.pending);
+        damage.history_clear(&n.shown);
+    }
+    let is i64 as k = app.frame(a, n.h);
+    _tell_frame(hs, n);
+    _tell_min(hs, n);
+    if (k > 0) {
+        draw2d.begin(&hs.canvas, cast(f64, pw), cast(f64, ph), n.scale);
+        app.paint(a, n.h, &hs.canvas, cast(*style.Theme, 0), now, cast(*paint.Stats, 0));
+        gpu.command.begin(hs.dv, hs.cmd);
+        // A scroll area's pixels that only moved, moved first: the damage
+        // painted over what they left (tree.shift). Both where they were and
+        // where they went changed.
+        let is math.rect.Rect as sr;
+        let is f64 as sdx with mut = 0.0;
+        let is f64 as sdy with mut = 0.0;
+        let is f64 as s = n.scale;
+        if (made == 0 && tree.shift(t, &sr, &sdx, &sdy) == 1) {
+            gpu.command.move_region(hs.dv, hs.cmd, n.tex, hst._px(sr.x, s), hst._px(sr.y, s), hst._px(sr.w, s), hst._px(sr.h, s),
+                                    hst._round(sdx * s), hst._round(sdy * s));
+            _changed(n, sr.x, sr.y, sr.w, sr.h);
+            _changed(n, sr.x + sdx, sr.y + sdy, sr.w, sr.h);
+        }
+        let is gpu.command.Pass as ps = gpu.command.pass_load(n.tex, 0);
+        gpu.command.begin_pass(hs.dv, hs.cmd, &ps);
+        draw2d.flush(&hs.canvas, hs.cmd);
+        gpu.command.end_pass(hs.dv, hs.cmd);
+        gpu.command.end(hs.dv, hs.cmd);
+        gpu.command.submit(hs.dv, hs.cmd);
+        let is i64 as d with mut = 0;
+        while (d < tree.damage_count(t)) {
+            let is math.rect.Rect as r = tree.damage_at(t, d);
+            _changed(n, r.x, r.y, r.w, r.h);
+            d = d + 1;
+        }
+        tree.damage_clear(t);
+    }
+    if (k == 0 && n.present == 0) { return; }
+    // Shown, when the platform's buffer is still the texture's size — a
+    // resize just read waits for the next round, and what changed waits with
+    // it. Into the buffer goes what it lacks for its age: what changed since
+    // it was last shown, all of it when that is not known.
+    if (device.next_frame(&n.win) == 0) { return; }
+    let is tgt.Target as out = device.acquire(&n.win);
+    if (out.width != pw || out.height != ph || cast(i64, out.color) == 0) {
+        n.present = 1;
+        return;
+    }
+    let is damage.List as fix;
+    if (damage.repair(&n.shown, &n.pending, device.buffer_age(&n.win), pw, ph, &fix) == 0) {
+        gpu.texture.read(hs.dv, n.tex, out.color, pw * ph * 4);
+        device.submit(&n.win);
+    } else if (damage.empty(&fix) == 0) {
+        let is i32 as i with mut = 0;
+        while (i < fix.n) {
+            let is *damage.Rect as r = &fix.rects[i];
+            let is *u8 as at = cast(*u8, cast(i64, out.color) + (cast(i64, r.y) * pw + cast(i64, r.x)) * 4);
+            gpu.texture.read_region(hs.dv, n.tex, cast(i64, r.x), cast(i64, r.y), cast(i64, r.w), cast(i64, r.h), at, pw * 4);
+            i = i + 1;
+        }
+        device.submit_region(&n.win, &fix);
+    }
+    damage.push(&n.shown, &n.pending);
+    damage.clear(&n.pending);
+    n.present = 0;
+}
+
+// A rectangle of the window, logical pixels, changed: what it covers in
+// physical ones, rounded out, kept until shown.
+fn _changed(n as *hst.Native, x as f64, y as f64, w as f64, h as f64) as void {
+    let is i64 as x0 = hst._px_down(x, n.scale);
+    let is i64 as y0 = hst._px_down(y, n.scale);
+    let is i64 as x1 = hst._px_up(x + w, n.scale);
+    let is i64 as y1 = hst._px_up(y + h, n.scale);
+    damage.add(&n.pending, x0, y0, x1 - x0, y1 - y0, n.tw, n.th);
+}
+
+fn _first(hs as *hst.Host) as *device.Window {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_WINDOWS) {
+        if (hst._native(hs, i).h != 0) { return &hst._native(hs, i).win; }
+        i = i + 1;
+    }
+    return cast(*device.Window, 0);
+}
+
+// The timers, long presses and animations come due by now: an animation
+// steps at its frame clock, not each time X wakes the loop — a frame shown
+// is itself an event.
+fn _tick(hs as *hst.Host, now as i64) as void {
+    let is i64 as due = app.next_due(hs.a);
+    if (due >= 0 && due <= now) { app.tick(hs.a, now); }
+}

@@ -1,0 +1,179 @@
+// ui/tree_draw.cst — what a frame repaints and where things are drawn:
+// the damage region, what moved, the layers above the rest, each widget's
+// translation and opacity.
+use "../math/math.cst" as math;
+use "tree_state.cst" as tst;
+
+// --- The damage region ---
+
+fn _area(r as math.rect.Rect) as f64 { return r.w * r.h; }
+
+// Whether two rectangles that overlap or share a stretch of edge are better
+// painted as their box: when the box is no larger than the two of them, so
+// painting it never costs more than painting both. Two that only touch at a
+// corner, or whose box reaches well past both — a band along a hole's top
+// and one down its side — are kept apart: the box would paint the hole.
+fn _joinable(a as math.rect.Rect, b as math.rect.Rect) as i32 {
+    let is f64 as ox = _minf(a.x + a.w, b.x + b.w) - _maxf(a.x, b.x);
+    let is f64 as oy = _minf(a.y + a.h, b.y + b.h) - _maxf(a.y, b.y);
+    if (ox < 0.0 || oy < 0.0) { return 0; }
+    if (ox == 0.0 && oy == 0.0) { return 0; }
+    return cast(i32, _area(math.rect.rect_union(a, b)) <= _area(a) + _area(b) + 0.5);
+}
+
+fn _minf(a as f64, b as f64) as f64 { if (a < b) { return a; } return b; }
+fn _maxf(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
+
+fn _take(t as *tst.Tree, i as i64) as math.rect.Rect {
+    let is math.rect.Rect as r = t.damage[i];
+    t.damage_n = t.damage_n - 1;
+    t.damage[i] = t.damage[t.damage_n];
+    return r;
+}
+fn damage_add(t as *tst.Tree, r as *math.rect.Rect) as void {
+    if (t.ok == 0 || r.w <= 0.0 || r.h <= 0.0) { return; }
+    t.paint_wanted = 1;
+    let is math.rect.Rect as cur with mut = *r;
+    while (1 == 1) {
+        let is i64 as hit with mut = 0 - 1;
+        let is i64 as i with mut = 0;
+        while (i < t.damage_n && hit < 0) {
+            if (_joinable(t.damage[i], cur) == 1) { hit = i; }
+            i = i + 1;
+        }
+        if (hit < 0 && t.damage_n < tst.MAX_DAMAGE) {
+            t.damage[t.damage_n] = cur;
+            t.damage_n = t.damage_n + 1;
+            return;
+        }
+        if (hit < 0) {
+            let is f64 as best with mut = 0.0;
+            i = 0;
+            while (i < t.damage_n) {
+                let is f64 as grow = _area(math.rect.rect_union(t.damage[i], cur)) - _area(t.damage[i]);
+                if (hit < 0 || grow < best) { hit = i; best = grow; }
+                i = i + 1;
+            }
+        }
+        cur = math.rect.rect_union(_take(t, hit), cur);
+    }
+}
+fn damage_clip(t as *tst.Tree, r as math.rect.Rect) as void {
+    let is i64 as i with mut = 0;
+    while (i < t.damage_n) {
+        let is math.rect.Rect as c = math.rect.rect_intersect(t.damage[i], r);
+        if (math.rect.rect_is_empty(c) == 1) {
+            _take(t, i);
+        } else {
+            t.damage[i] = c;
+            i = i + 1;
+        }
+    }
+}
+fn damage_count(t as *tst.Tree) as i64 { return t.damage_n; }
+fn damage_at(t as *tst.Tree, i as i64) as math.rect.Rect {
+    if (i < 0 || i >= t.damage_n) { return math.rect.rect_zero(); }
+    return t.damage[i];
+}
+fn paint_wanted(t as *tst.Tree) as i32 {
+    if (t.paint_wanted != 0) { return 1; }
+    return 0;
+}
+fn want_paint(t as *tst.Tree) as void { t.paint_wanted = 1; }
+fn damage_clear(t as *tst.Tree) as void {
+    t.damage_n = 0;
+    t.paint_wanted = 0;
+    _shift_reset(t);
+    t.blink_w = 0;
+}
+fn blink(t as *tst.Tree, w as i64) as void {
+    if (t.ok == 0 || w == 0) { return; }
+    t.blink_w = w;
+    t.paint_wanted = 1;
+}
+fn blinked(t as *tst.Tree) as i64 { return t.blink_w; }
+
+// --- Moving what is drawn ---
+//
+// Scrolled, a scroll area's content moves while the area stays: what was in
+// view and still is has only moved, and drawing it again is most of what
+// scrolling costs on the software backend. So the area asks to move those
+// pixels instead (shift_request), and damage.collect takes the ask when
+// nothing but what the area holds is drawn over them, damaging only what
+// comes into view, what changed, and the area's own edges. The window then
+// moves the pixels (shift, command.move_region) before painting the damage.
+
+fn _shift_reset(t as *tst.Tree) as void {
+    t.shift_w = 0;
+    t.shift_n = 0;
+    t.shift_dx = 0.0;
+    t.shift_dy = 0.0;
+    t.shift_keep = math.rect.rect_zero();
+    t.shift_ok = 0;
+    t.shift_at = math.rect.rect_zero();
+}
+fn set_moves(t as *tst.Tree, on as i32) as void { t.moves = cast(i64, on); }
+fn moves(t as *tst.Tree) as i32 { return cast(i32, t.moves); }
+fn shift_request(t as *tst.Tree, w as i64, dx as f64, dy as f64, keep as *math.rect.Rect) as void {
+    if (t.ok == 0) { return; }
+    t.paint_wanted = 1;
+    if (t.shift_n > 1 || (t.shift_n == 1 && t.shift_w != w)) {
+        t.shift_n = t.shift_n + 1;
+        return;
+    }
+    t.shift_w = w;
+    t.shift_n = 1;
+    t.shift_dx = t.shift_dx + dx;
+    t.shift_dy = t.shift_dy + dy;
+    t.shift_keep = *keep;
+}
+fn shift_asked(t as *tst.Tree, dx as *f64, dy as *f64, keep as *math.rect.Rect) as i64 {
+    if (t.shift_n != 1 || tst.is_valid(t, t.shift_w) == 0) { return 0; }
+    *dx = t.shift_dx;
+    *dy = t.shift_dy;
+    *keep = t.shift_keep;
+    return t.shift_w;
+}
+fn set_shifted(t as *tst.Tree, ok as i32, at as math.rect.Rect) as void {
+    t.shift_ok = cast(i64, ok);
+    t.shift_at = at;
+}
+fn shift(t as *tst.Tree, r as *math.rect.Rect, dx as *f64, dy as *f64) as i32 {
+    if (t.shift_ok == 0) { return 0; }
+    *r = t.shift_at;
+    *dx = t.shift_dx;
+    *dy = t.shift_dy;
+    return 1;
+}
+fn has_layered(t as *tst.Tree) as i32 { return cast(i32, t.layered > 0); }
+fn layer(t as *tst.Tree, w as i64) as i64 {
+    let is i64 as i = tst._index(t, w);
+    if (i < 0) { return 0; }
+    return tst._node(t, i).layer;
+}
+fn layered_count(t as *tst.Tree) as i64 { return t.layered; }
+fn set_translation(t as *tst.Tree, w as i64, x as f64, y as f64) as void {
+    let is i64 as i = tst._index(t, w);
+    if (i < 0) { return; }
+    let is *tst.Node as n = tst._node(t, i);
+    if (n.tx == x && n.ty == y) { return; }
+    n.tx = x;
+    n.ty = y;
+    // Nothing to lay out; damage.cst sees it move.
+    t.paint_wanted = 1;
+}
+fn translation_x(t as *tst.Tree, w as i64) as f64 {
+    let is i64 as i = tst._index(t, w);
+    if (i < 0) { return 0.0; }
+    return tst._node(t, i).tx;
+}
+fn translation_y(t as *tst.Tree, w as i64) as f64 {
+    let is i64 as i = tst._index(t, w);
+    if (i < 0) { return 0.0; }
+    return tst._node(t, i).ty;
+}
+fn opacity(t as *tst.Tree, w as i64) as f64 {
+    let is i64 as i = tst._index(t, w);
+    if (i < 0) { return 0.0; }
+    return tst._node(t, i).opacity;
+}

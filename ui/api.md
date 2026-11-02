@@ -289,6 +289,31 @@ the application on the screen.
 - `step(hs as *Host, timeout_ms as i64) as i32` — One round: the windows put up and away as the application's are, every event given to it, what was posted run, the timers, the round's callbacks, what changed painted and shown — then asleep until something is to be...
 - `run(hs as *Host) as void` — Rounds until no window is left on the screen and nothing holds the loop, or quit is asked.
 
+## `ui/host_paint.cst`
+
+a window of the application's painted and shown: only what changed, as the damage says, into its texture and onto the screen.
+
+
+## `ui/host_platform.cst`
+
+what the platform says of a window, told the application and its router: the pointer, keys, text, focus, size, state, drags and requests to close.
+
+
+## `ui/host_settings.cst`
+
+the desktop's settings, followed: the platform's, the portal's, the program's over them, handed to the application.
+
+
+## `ui/host_state.cst`
+
+what the parts of the application's loop share: the host, each window it put on the screen, and their limits.
+
+
+## `ui/host_windows.cst`
+
+the application's windows put on the screen and away: a platform window for each one shown, its frame, its floor.
+
+
 ## `ui/icon_theme.cst`
 
 icons by name from the desktop's icon theme.
@@ -445,9 +470,7 @@ where each event goes.
 - `of(t as *tree.Tree) as *Router` — The router lent to t (lend): its window's, for a widget that opens a popup of its own.
 - `lend(t as *tree.Tree, r as *Router) as void`
 - `init(s as Settings) as Router`
-- `hit(t as *tree.Tree, x as f64, y as f64) as i64` — The deepest visible widget containing the point, searching children last to first because later children are drawn above earlier ones.
 - `inputs(r as *Router) as i64` — How many presses and key presses have come so far: what changes when the user does something, for a tooltip to go away on.
-- `hover(r as *Router) as i64` — The deepest widget under the pointer, 0 for none.
 - `hovered(t as *tree.Tree, r as *Router, w as i64) as i32` — Whether w is under the pointer — itself or through a descendant.
 - `capture(r as *Router) as i64` — The widget holding the pointer, 0 for none.
 - `refresh_hover(t as *tree.Tree, r as *Router, time as i64) as void` — For when widgets moved under a pointer that did not: after a layout pass, a scroll, a widget shown or hidden.
@@ -468,13 +491,8 @@ where each event goes.
 - `set_scope_also(t as *tree.Tree, r as *Router, w as i64, also as i64) as void` — A scope set, with also's subtree let through.
 - `restore(t as *tree.Tree, r as *Router, scope as i64, w as i64, ring as i32) as void` — A popup ending: the scope as it was before it — scope, 0 for none — and the focus given back to w, as give_back gives it, in one step, so that nothing else is focused on the way — as set_scope would, finding the...
 - `scope(r as *Router) as i64`
-- `focused(t as *tree.Tree, r as *Router) as i64` — The focused widget, or 0 — also when the one that had focus has since been destroyed, hidden or disabled, or is outside the scope.
 - `focus_visible(r as *Router) as i32` — Whether to draw the focus ring: focus last moved by keyboard.
-- `focus(t as *tree.Tree, r as *Router, w as i64, by_keyboard as i32) as i32` — Gives w the keyboard focus; 0 clears it.
 - `give_back(t as *tree.Tree, r as *Router, w as i64, ring as i32) as i32` — The focus given back to w — a popup closing, to what had it before — its ring shown as ring says, as it was then; no move by keyboard, so the widget hears FOCUS_IN as from the pointer, and an entry does not select...
-- `reveal_rect(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void` — Asks every ancestor of w to bring the rectangle r (window coordinates) into view — a scroll area moves its content until it shows.
-- `reveal(t as *tree.Tree, w as i64) as void`
-- `focus_next(t as *tree.Tree, r as *Router, dir as i32) as i32` — Moves focus to the next (dir 1) or previous (dir -1) widget that can take it, in tree order within the scope, wrapping.
 - `set_modifiers(r as *Router, mods as i32) as void` — The modifiers held, as the platform says them with the pointer's events — the state at the moment, which a pointer event has right — from now on.
 - `modifiers(r as *Router) as i32`
 - `key(t as *tree.Tree, r as *Router, k as i32, mods as i32, pressed as i32,` — A key press goes, in order: 1.
@@ -505,6 +523,50 @@ where each event goes.
 - `drag_takes(r as *Router) as i32`
 - `add_drop_target(r as *Router, w as i64, offers as i32) as i32` — w taken as a drop target of the program's, of what offers says: a drag offering some of it is taken there, and a drop on it said with signal.DROPPED.
 - `remove_drop_target(r as *Router, w as i64) as void`
+- `hit(t as *tree.Tree, x as f64, y as f64) as i64` — The deepest visible widget containing the point, searching children last to first because later children are drawn above earlier ones.
+- `hover(r as *Router) as i64` — The deepest widget under the pointer, 0 for none.
+- `focused(t as *tree.Tree, r as *Router) as i64` — The focused widget, or 0 — also when the one that had focus has since been destroyed, hidden or disabled, or is outside the scope.
+- `focus(t as *tree.Tree, r as *Router, w as i64, by_keyboard as i32) as i32` — Gives w the keyboard focus; 0 clears it.
+- `reveal_rect(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void` — Asks every ancestor of w to bring the rectangle r (window coordinates) into view — a scroll area moves its content until it shows.
+- `reveal(t as *tree.Tree, w as i64) as void`
+- `focus_next(t as *tree.Tree, r as *Router, dir as i32) as i32` — Moves focus to the next (dir 1) or previous (dir -1) widget that can take it, in tree order within the scope, wrapping.
+
+## `ui/router_drag.cst`
+
+drags begun in the window, over it and over the program's other windows.
+
+
+## `ui/router_focus.cst`
+
+the focus: the modal scope, the chain Tab walks, and what is brought into view as it moves.
+
+- `focused(t as *tree.Tree, r as *Router) as i64`
+- `focus(t as *tree.Tree, r as *Router, w as i64, by_keyboard as i32) as i32`
+- `reveal_rect(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void`
+- `reveal(t as *tree.Tree, w as i64) as void`
+- `focus_next(t as *tree.Tree, r as *Router, dir as i32) as i32`
+
+## `ui/router_hit.cst`
+
+the widget under a point: hit-testing, delivery to it and up, hover.
+
+- `hit(t as *tree.Tree, x as f64, y as f64) as i64`
+- `hover(r as *Router) as i64`
+
+## `ui/router_keys.cst`
+
+keys and the text they type: to the focused widget and up, the window's shortcuts, the mnemonics.
+
+
+## `ui/router_pointer.cst`
+
+the pointer as the platform says it: moves, presses and their counts, the wheel, touches, long presses, the caret's blink.
+
+
+## `ui/router_state.cst`
+
+what the router's parts share: the router, its settings and limits, and the small walks of the tree they all take.
+
 
 ## `ui/scroll.cst`
 
@@ -787,7 +849,6 @@ widgets as nodes in a window's tree, and the handles to them.
 - `reparent(t as *Tree, w as i64, new_parent as i64) as i32` — Moves w, with its subtree, to the end of new_parent's children.
 - `insert(t as *Tree, w as i64, parent as i64, before as i64) as i32` — Moves w, with its subtree, under parent just before `before` — one of parent's children, or 0 for the end.
 - `move_before(t as *Tree, w as i64, before as i64) as i32` — Moves w among its siblings, just before `before`; 0 is the end.
-- `is_valid(t as *Tree, w as i64) as i32`
 - `parent(t as *Tree, w as i64) as i64`
 - `first_child(t as *Tree, w as i64) as i64`
 - `last_child(t as *Tree, w as i64) as i64`
@@ -824,6 +885,12 @@ widgets as nodes in a window's tree, and the handles to them.
 - `painted(t as *Tree, w as i64) as math.rect.Rect`
 - `placed(t as *Tree, w as i64) as math.rect.Rect`
 - `set_painted(t as *Tree, w as i64, at as math.rect.Rect, shown as math.rect.Rect) as void` — Where w was laid out, and the part of that on screen.
+- `set_layer(t as *Tree, w as i64, layer as i64) as void`
+- `set_text_service(t as *Tree, s as *u8) as void` — The text service (ui/text.cst) every widget that shows text lays it out with: one per application, so a form of fifty labels holds one shaper.
+- `set_theme(t as *Tree, th as *style.Theme) as void` — th must outlive the tree, or be replaced first; null goes back to the default.
+- `set_overrides(t as *Tree, w as i64, o as *style.Overrides) as void` — Lays o over the theme for w and everything under it; null removes it.
+- `set_opacity(t as *Tree, w as i64, a as f64) as void` — From 0, not drawn, to 1, opaque; outside that, the nearer end.
+- `is_valid(t as *Tree, w as i64) as i32` — --- Walking the tree ---
 - `damage_add(t as *Tree, r as *math.rect.Rect) as void` — Adds r to what has to be repainted.
 - `damage_clip(t as *Tree, r as math.rect.Rect) as void` — Keeps only what lies inside r — the window, at collection.
 - `damage_count(t as *Tree) as i64`
@@ -840,10 +907,8 @@ widgets as nodes in a window's tree, and the handles to them.
 - `set_shifted(t as *Tree, ok as i32, at as math.rect.Rect) as void` — damage.collect's answer: the window's rectangle at to be moved, or none.
 - `shift(t as *Tree, r as *math.rect.Rect, dx as *f64, dy as *f64) as i32` — After collect: 1 when the pixels of *r — window coordinates, logical pixels — are to be moved dx, dy before the damage is painted over them.
 - `has_layered(t as *Tree) as i32` — Whether any widget is on a layer above 0, shown or not.
-- `set_layer(t as *Tree, w as i64, layer as i64) as void`
 - `layer(t as *Tree, w as i64) as i64`
 - `layered_count(t as *Tree) as i64` — How many widgets are on a layer above 0; with none, painting and hit-testing skip looking for them.
-- `set_text_service(t as *Tree, s as *u8) as void` — The text service (ui/text.cst) every widget that shows text lays it out with: one per application, so a form of fifty labels holds one shaper.
 - `text_service(t as *Tree) as *u8`
 - `set_animator(t as *Tree, a as *u8) as void` — The window's animator (anim.cst), for widgets that move on their own — a switch's knob sliding, a progress bar's pulse.
 - `animator(t as *Tree) as *u8`
@@ -879,14 +944,85 @@ widgets as nodes in a window's tree, and the handles to them.
 - `tab_group(t as *Tree, w as i64) as i64`
 - `labelled_by(t as *Tree, w as i64) as i64` — The widget that names w, or 0 — also once that widget is gone.
 - `theme(t as *Tree) as *style.Theme`
-- `set_theme(t as *Tree, th as *style.Theme) as void` — th must outlive the tree, or be replaced first; null goes back to the default.
-- `set_overrides(t as *Tree, w as i64, o as *style.Overrides) as void` — Lays o over the theme for w and everything under it; null removes it.
 - `overrides(t as *Tree, w as i64) as *style.Overrides`
+- `set_translation(t as *Tree, w as i64, x as f64, y as f64) as void` — Translation moves a widget and everything under it from where layout put it: painted there, hit there, its rectangle in the window there — and laid out exactly as before, which is what lets an animation slide someth...
+- `translation_x(t as *Tree, w as i64) as f64`
+- `translation_y(t as *Tree, w as i64) as f64`
+- `opacity(t as *Tree, w as i64) as f64`
+
+## `ui/tree_draw.cst`
+
+what a frame repaints and where things are drawn: the damage region, what moved, the layers above the rest, each widget's translation and opacity.
+
+- `damage_add(t as *Tree, r as *math.rect.Rect) as void`
+- `damage_clip(t as *Tree, r as math.rect.Rect) as void`
+- `damage_count(t as *Tree) as i64`
+- `damage_at(t as *Tree, i as i64) as math.rect.Rect`
+- `paint_wanted(t as *Tree) as i32`
+- `want_paint(t as *Tree) as void`
+- `damage_clear(t as *Tree) as void`
+- `blink(t as *Tree, w as i64) as void`
+- `blinked(t as *Tree) as i64`
+- `set_moves(t as *Tree, on as i32) as void`
+- `moves(t as *Tree) as i32`
+- `shift_request(t as *Tree, w as i64, dx as f64, dy as f64, keep as *math.rect.Rect) as void`
+- `shift_asked(t as *Tree, dx as *f64, dy as *f64, keep as *math.rect.Rect) as i64`
+- `set_shifted(t as *Tree, ok as i32, at as math.rect.Rect) as void`
+- `shift(t as *Tree, r as *math.rect.Rect, dx as *f64, dy as *f64) as i32`
+- `has_layered(t as *Tree) as i32`
+- `layer(t as *Tree, w as i64) as i64`
+- `layered_count(t as *Tree) as i64`
 - `set_translation(t as *Tree, w as i64, x as f64, y as f64) as void`
 - `translation_x(t as *Tree, w as i64) as f64`
 - `translation_y(t as *Tree, w as i64) as f64`
-- `set_opacity(t as *Tree, w as i64, a as f64) as void` — From 0, not drawn, to 1, opaque; outside that, the nearer end.
 - `opacity(t as *Tree, w as i64) as f64`
+
+## `ui/tree_lent.cst`
+
+what the tree is lent and keeps for its widgets: the theme, the application's services, the focus asked for, where text is typed and the host's text, which widget names which.
+
+- `text_service(t as *Tree) as *u8`
+- `set_animator(t as *Tree, a as *u8) as void`
+- `animator(t as *Tree) as *u8`
+- `set_timers(t as *Tree, ts as *u8) as void`
+- `timers(t as *Tree) as *u8`
+- `set_router(t as *Tree, r as *u8) as void`
+- `router(t as *Tree) as *u8`
+- `request_focus(t as *Tree, w as i64) as void`
+- `focus_request(t as *Tree) as i64`
+- `take_focus_request(t as *Tree) as i64`
+- `set_clipboard(t as *Tree, cb as ClipboardFn, user as *u8) as void`
+- `copy(t as *Tree, which as i32, text as *u8, n as i64) as void`
+- `set_paste(t as *Tree, cb as PasteFn, user as *u8) as void`
+- `request_paste(t as *Tree, which as i32, w as i64) as void`
+- `set_text_area(t as *Tree, w as i64, r as math.rect.Rect) as void`
+- `text_area(t as *Tree) as i64`
+- `text_area_rect(t as *Tree) as math.rect.Rect`
+- `set_ime_reset(t as *Tree, cb as ImeResetFn, user as *u8) as void`
+- `reset_ime(t as *Tree, w as i64) as void`
+- `set_window_ops(t as *Tree, cb as WindowOpFn, user as *u8) as void`
+- `window_op(t as *Tree, op as i32, x as f64, y as f64) as i32`
+- `set_watch(t as *Tree, cb as WatchFn, user as *u8) as void`
+- `notify(t as *Tree, w as i64, what as i32) as void`
+- `notify_text(t as *Tree, w as i64, what as i64, at as i64, s as *u8, n as i64) as void`
+- `set_language(t as *Tree, lang as i32) as void`
+- `language(t as *Tree) as i32`
+- `text_change(t as *Tree) as *TextChange`
+- `set_host(t as *Tree, cb as HostFn, user as *u8, window as i64) as void`
+- `host_id(t as *Tree) as i64`
+- `ask_host(t as *Tree, op as i32, arg as i64) as i64`
+- `set_labelled_by(t as *Tree, w as i64, label as i64) as void`
+- `set_tab_group(t as *Tree, w as i64, g as i64) as void`
+- `tab_group(t as *Tree, w as i64) as i64`
+- `labelled_by(t as *Tree, w as i64) as i64`
+- `theme(t as *Tree) as *style.Theme`
+- `overrides(t as *Tree, w as i64) as *style.Overrides`
+
+## `ui/tree_state.cst`
+
+what the tree's parts share: its types — the tree, its nodes, the kinds of widget and what they are asked — its limits and constants, and the node table's own accessors.
+
+- `is_valid(t as *Tree, w as i64) as i32`
 
 ## `ui/widget.cst`
 

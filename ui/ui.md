@@ -7,9 +7,13 @@ X11, Wayland and Windows, and links no toolkit of anybody else's.
 
 ```
 ui/
-  ui.cst          hub
+  ui.cst          hub: every module through one use, words without lengths
   app.cst         the application: its windows, each with its own tree
-  tree.cst        widgets as nodes in a window's tree, and the handles to them
+  host.cst        the application on the screen, the loop; in parts — host_state,
+                  _windows, _settings, _platform, _paint
+  tree.cst        widgets as nodes in a window's tree, and the handles to them;
+                  its types in tree_state.cst, what frames repaint in tree_draw.cst,
+                  what it is lent in tree_lent.cst
   widget.cst      the table of functions every kind of widget fills in
   geom.cst        sizes, constraints, and the layout record each widget carries
   layout.cst      measure, place, the pass, sharing room along an axis
@@ -20,7 +24,8 @@ ui/
   splitter.cst    panes divided by handles the user drags
   event.cst       what a widget receives
   router.cst      where events go: hit-testing, capture, bubbling, hover,
-                  focus, shortcuts, mnemonics, the modal scope
+                  focus, shortcuts, mnemonics, the modal scope; in parts —
+                  router_state, _hit, _pointer, _focus, _keys, _drag
   timer.cst       things that happen later, on an explicit clock
   signal.cst      connecting a callback to what a widget emits
   model.cst       row and cell models behind lists, trees and tables

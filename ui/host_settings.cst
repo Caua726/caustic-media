@@ -1,0 +1,123 @@
+// ui/host_settings.cst — the desktop's settings, followed: the platform's,
+// the portal's, the program's over them, handed to the application.
+use "../window/device.cst" as device;
+use "../window/cursor.cst" as cursor;
+use "../window/display.cst" as display;
+use "../window/settings.cst" as wsettings;
+use "app.cst" as app;
+use "tree.cst" as tree;
+use "widgets/decoration.cst" as decoration;
+use "host_state.cst" as hst;
+
+// Physical pixels per logical one in n's window. Wayland's and Windows' scale
+// is the window's own — its output's, its monitor's — whatever DPI the
+// desktop's settings say; X11 has one for the screen, which those settings
+// may say (Xft/DPI) and the display otherwise works out.
+fn _window_scale(hs as *hst.Host, n as *hst.Native) as f64 {
+    if (n.win.backend == device.X11 && (hs.desktop.known & wsettings.K_DPI) != 0 && hs.desktop.dpi > 0.0) {
+        return hs.desktop.dpi / 96.0;
+    }
+    if (hs.disp_ok == 1) { return display.scale(&hs.disp, &n.win); }
+    return 1.0;
+}
+
+// Whether n's frame is drawn flat: always on X11, which has no word for a
+// shadow outside the window, and on Windows, whose system draws its own; on
+// Wayland where nothing behind the window shows through it.
+fn _flat(n as *hst.Native) as i32 {
+    if (n.win.backend != device.WAYLAND) { return 1; }
+    return cast(i32, device.transparent(&n.win) == 0 || device.composited(&n.win) == 0);
+}
+
+// --- The desktop's settings ---
+
+fn _read_settings(hs as *hst.Host, n as *hst.Native) as void {
+    let is wsettings.Settings as s with mut = wsettings.defaults();
+    device.read_settings(&n.win, &s);
+    hs.platform = s;
+    _compose_settings(hs);
+}
+
+fn _compose_settings(hs as *hst.Host) as void {
+    hs.desktop = hs.platform;
+    wsettings.merge(&hs.desktop, &hs.beside);
+    app.set_system(hs.a, &hs.desktop);
+    _cursor_themes(hs);
+    _dark_frames(hs);
+}
+
+// Each window's frame, where the system draws part of it, dark when the
+// desktop says dark.
+fn _dark_frames(hs as *hst.Host) as void {
+    if ((hs.desktop.known & wsettings.K_DARK) == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_WINDOWS) {
+        let is *hst.Native as n = hst._native(hs, i);
+        if (n.h != 0) { device.set_dark_frame(&n.win, hs.desktop.dark); }
+        i = i + 1;
+    }
+}
+
+// The pointer drawn from the desktop's cursor theme and size, when it says
+// them.
+fn _cursor_theme(hs as *hst.Host, n as *hst.Native) as void {
+    let is wsettings.Settings as d = hs.desktop;
+    if ((d.known & (wsettings.K_CURSOR_THEME | wsettings.K_CURSOR_SIZE)) == 0) { return; }
+    let is *u8 as theme with mut = cast(*u8, 0);
+    if ((d.known & wsettings.K_CURSOR_THEME) != 0) { theme = &hs.desktop.cursor_theme[0]; }
+    let is i64 as size with mut = 0;
+    if ((d.known & wsettings.K_CURSOR_SIZE) != 0) { size = d.cursor_size; }
+    cursor.set_theme(&n.cur, &n.win, theme, size);
+}
+
+fn _cursor_themes(hs as *hst.Host) as void {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_WINDOWS) {
+        let is *hst.Native as n = hst._native(hs, i);
+        if (n.h != 0) { _cursor_theme(hs, n); }
+        i = i + 1;
+    }
+}
+
+fn _rescale(hs as *hst.Host) as void {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_WINDOWS) {
+        let is *hst.Native as n = hst._native(hs, i);
+        if (n.h != 0) {
+            let is f64 as s = _window_scale(hs, n);
+            if (n.scale != s) {
+                n.scale = s;
+                app.set_scale(hs.a, n.h, s);
+                app.resize(hs.a, n.h, cast(f64, device.width(&n.win)) / s,
+                           cast(f64, device.height(&n.win)) / s);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Each frame of the program's own drawn as what is behind it now shows: flat
+// where nothing would, with its shadow where something does. The window as
+// the desktop counts it keeps its size: the platform's grows or shrinks by
+// the shadow it gains or loses.
+fn _recomposite(hs as *hst.Host) as void {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_WINDOWS) {
+        let is *hst.Native as n = hst._native(hs, i);
+        let is *tree.Tree as t = app.tree(hs.a, n.h);
+        if (n.h != 0 && n.deco != 0 && cast(i64, t) != 0 && tree.is_valid(t, n.deco) == 1) {
+            let is i32 as flat = _flat(n);
+            if (flat != decoration.is_flat(t, n.deco)) {
+                let is decoration.Extents as was = decoration.extents(t, n.deco);
+                decoration.set_flat(t, n.deco, flat);
+                app.set_see_through(hs.a, n.h, 1 - flat);
+                let is decoration.Extents as now = decoration.extents(t, n.deco);
+                let is f64 as dw = (now.left + now.right - was.left - was.right) * n.scale;
+                let is f64 as dh = (now.top + now.bottom - was.top - was.bottom) * n.scale;
+                device.set_size(&n.win, device.width(&n.win) + hst._round(dw), device.height(&n.win) + hst._round(dh));
+                tree.invalidate_paint_subtree(t, tree.root(t));
+            }
+        }
+        i = i + 1;
+    }
+}
