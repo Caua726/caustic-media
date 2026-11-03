@@ -1,0 +1,603 @@
+// ui/host_popups.cst — the surfaces of a window's tree on the screen: a
+// platform popup (window/device.cst's Config.popup) for each widget the
+// tree shows in a window of its own (tree.surface_open) — a menu, a list
+// dropping down, a tooltip.
+//
+// The tree is lent a function that opens, moves and closes them; each is
+// placed by the platform from the positioner the tree keeps, its anchor
+// rectangle in the window's coordinates turned into the physical pixels of
+// what it is opened against — the window, or the popup a submenu belongs to
+// — and where it went is told the tree, which lays the widget out there.
+// What the platform says of a popup's window becomes the window's: its
+// pointer, buttons, wheel and keys in the window's coordinates, through the
+// window's router; it taken down by the window system (POPUP_DONE) a press
+// outside the window's modal scope (router.dismiss); exposed, resized, at
+// another scale, painted and shown again. The pointer leaves the window only
+// when it is over neither the window nor any of its popups, and the window
+// is active while either has the keyboard: a grab's keys lent to a popup on
+// Wayland leave it active. Its pointer's shape is the router's for where the
+// pointer is, set on whichever window it is over.
+//
+// Painted from the window's frame, into a texture of its own, at its own
+// scale: only what the surface's damage says, and its pixels moved when a
+// scroll area inside it asks (tree.shift_surface). Seen through — rounded
+// corners, a shadow — where its window can be: always on Wayland, where a
+// compositor runs on X11 and Windows.
+//
+// When the window is hidden, closed or minimized its popups close; when it
+// stops being active, those that hold no grab — a tooltip, a list an entry
+// keeps the keys for — close; the platform takes grabbing ones down itself.
+// Moved, a window on X11 or Windows has its popups placed again, since there
+// they are windows of their own on the screen.
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../render/draw2d.cst" as draw2d;
+use "../window/device.cst" as device;
+use "../window/event.cst" as wevent;
+use "../input/event.cst" as ie;
+use "../window/cursor.cst" as cursor;
+use "../window/positioner.cst" as positioner;
+use "../window/settings.cst" as wsettings;
+use "../window/damage.cst" as damage;
+use "../gpu/software/target.cst" as tgt;
+use "app.cst" as app;
+use "tree.cst" as tree;
+use "router.cst" as router;
+use "style.cst" as style;
+use "paint.cst" as paint;
+use "host_state.cst" as hst;
+
+fn _slot(hs as *hst.Host, n as *hst.Native) as i64 {
+    return (cast(i64, n) - cast(i64, hs.natives)) / sizeof(hst.Native);
+}
+
+// The popup for surface s of n's window; null for none.
+fn _of(hs as *hst.Host, n as *hst.Native, s as i64) as *hst.Pop {
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot && p.s == s) { return p; }
+        i = i + 1;
+    }
+    return cast(*hst.Pop, 0);
+}
+
+// Its own scale: the window's on X11, where every window has the one DPI;
+// the platform's for it elsewhere.
+fn _scale_of(n as *hst.Native, w as *device.Window) as f64 {
+    if (w.backend == device.X11) { return n.scale; }
+    let is i32 as s = device.scale_120(w);
+    if (s <= 0) { return n.scale; }
+    return cast(f64, s) / 120.0;
+}
+
+// What surface s is opened against: its window, and where that window's
+// corner is in the window's coordinates and its scale.
+fn _owner(hs as *hst.Host, n as *hst.Native, t as *tree.Tree, s as i64, ox as *f64, oy as *f64, os as *f64) as *device.Window {
+    *ox = 0.0;
+    *oy = 0.0;
+    *os = n.scale;
+    let is i64 as o = tree.surface_owner(t, s);
+    if (o >= 0) {
+        let is *hst.Pop as op = _of(hs, n, o);
+        if (cast(i64, op) != 0) {
+            let is math.rect.Rect as at = tree.surface_rect(t, o);
+            *ox = at.x;
+            *oy = at.y;
+            *os = op.scale;
+            return &op.win;
+        }
+    }
+    return &n.win;
+}
+
+// Surface s's positioner in physical pixels of what it opens against, its
+// corner at ox, oy of the window, at scale os.
+fn _physical(t as *tree.Tree, s as i64, ox as f64, oy as f64, os as f64) as positioner.Positioner {
+    let is positioner.Positioner as p with mut = tree.surface_place(t, s);
+    let is math.rect.Rect as a = p.anchor_rect;
+    let is f64 as x0 = (a.x - ox) * os;
+    let is f64 as y0 = (a.y - oy) * os;
+    p.anchor_rect = math.rect.rect(cast(f64, hst._round(x0)), cast(f64, hst._round(y0)),
+                                   cast(f64, hst._px_up(a.w, os)), cast(f64, hst._px_up(a.h, os)));
+    p.w = cast(f64, hst._px_up(p.w, os));
+    p.h = cast(f64, hst._px_up(p.h, os));
+    p.off_x = p.off_x * os;
+    p.off_y = p.off_y * os;
+    return p;
+}
+
+// Where the platform put it, told the tree in the window's coordinates.
+fn _placed(n as *hst.Native, t as *tree.Tree, s as i64, p as *hst.Pop, ox as f64, oy as f64, os as f64) as void {
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    let is i64 as pw with mut = 0;
+    let is i64 as ph with mut = 0;
+    if (device.popup_rect(&p.win, &px, &py, &pw, &ph) == 0) { return; }
+    tree.surface_set_rect(t, s, math.rect.rect(ox + cast(f64, px) / os, oy + cast(f64, py) / os,
+                                               cast(f64, pw) / os, cast(f64, ph) / os));
+}
+
+// Whether a popup of n's window can be seen through: every Wayland surface,
+// a window where a compositor runs elsewhere.
+fn _clear(n as *hst.Native) as i32 {
+    if (n.win.backend == device.WAYLAND) { return 1; }
+    return device.composited(&n.win);
+}
+
+fn _cursor_theme(hs as *hst.Host, p as *hst.Pop) as void {
+    let is wsettings.Settings as d = hs.desktop;
+    if ((d.known & (wsettings.K_CURSOR_THEME | wsettings.K_CURSOR_SIZE)) == 0) { return; }
+    let is *u8 as theme with mut = cast(*u8, 0);
+    if ((d.known & wsettings.K_CURSOR_THEME) != 0) { theme = &hs.desktop.cursor_theme[0]; }
+    let is i64 as size with mut = 0;
+    if ((d.known & wsettings.K_CURSOR_SIZE) != 0) { size = d.cursor_size; }
+    cursor.set_theme(&p.cur, &p.win, theme, size);
+}
+
+fn _open(hs as *hst.Host, n as *hst.Native, t as *tree.Tree, s as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS && hst._pop(hs, i).used == 1) { i = i + 1; }
+    if (i == hst.MAX_POPUPS) { return 0; }
+    let is *hst.Pop as p = hst._pop(hs, i);
+    let is f64 as ox with mut = 0.0;
+    let is f64 as oy with mut = 0.0;
+    let is f64 as os with mut = 1.0;
+    let is *device.Window as ow = _owner(hs, n, t, s, &ox, &oy, &os);
+    let is positioner.Positioner as pp = _physical(t, s, ox, oy, os);
+    let is device.Config as c with mut = device.config("", cast(i64, pp.w), cast(i64, pp.h));
+    c.backend = n.win.backend;
+    c.owner = ow;
+    c.popup = tree.surface_kind(t, s);
+    c.grab = tree.surface_grab(t, s);
+    c.place = pp;
+    c.decorated = 0;
+    c.resizable = 0;
+    c.transparent = _clear(n);
+    p.win = device.open_config(&c);
+    if (device.is_open(&p.win) == 0) { return 0; }
+    p.used = 1;
+    p.slot = _slot(hs, n);
+    p.s = s;
+    p.tex = 0;
+    p.tw = 0;
+    p.th = 0;
+    p.scale = _scale_of(n, &p.win);
+    p.shape = 0;
+    p.ptr_in = 0;
+    p.focused = 0;
+    p.present = 1;
+    p.told_in[0] = 0 - 1;
+    p.told_in[1] = 0 - 1;
+    p.told_in[2] = 0 - 1;
+    p.told_in[3] = 0 - 1;
+    damage.whole(&p.pending);
+    damage.history_clear(&p.shown);
+    p.cur = cursor.open(&p.win);
+    _cursor_theme(hs, p);
+    tree.surface_set_native(t, s, i + 1);
+    tree.surface_set_see_through(t, s, cast(i32, c.transparent == 1 && device.transparent(&p.win) == 1));
+    _placed(n, t, s, p, ox, oy, os);
+    return 1;
+}
+
+fn _move(hs as *hst.Host, n as *hst.Native, t as *tree.Tree, s as i64) as i32 {
+    let is *hst.Pop as p = _of(hs, n, s);
+    if (cast(i64, p) == 0) { return 0; }
+    let is f64 as ox with mut = 0.0;
+    let is f64 as oy with mut = 0.0;
+    let is f64 as os with mut = 1.0;
+    _owner(hs, n, t, s, &ox, &oy, &os);
+    let is positioner.Positioner as pp = _physical(t, s, ox, oy, os);
+    device.reposition(&p.win, &pp);
+    _placed(n, t, s, p, ox, oy, os);
+    return 1;
+}
+
+fn _drop(hs as *hst.Host, p as *hst.Pop) as void {
+    if (p.used == 0) { return; }
+    // Closed with a button held — a list choosing on the press, the press
+    // still being said — the release goes where the pointer is, which may be
+    // no window of this program's: weighed after this round (_settle_lost).
+    hst._native(hs, p.slot).lost = 1;
+    if (p.tex != 0) { gpu.texture.destroy(hs.dv, p.tex); }
+    cursor.close(&p.cur, &p.win);
+    device.close(&p.win);
+    p.used = 0;
+    p.tex = 0;
+}
+
+// What the tree asks: cb(user, t, op, s), user the window's Native.
+fn _surface(user as *u8, t as *tree.Tree, op as i32, s as i64) as i32 {
+    let is *hst.Native as n = cast(*hst.Native, user);
+    let is *hst.Host as hs = n.hs;
+    if (op == tree.SURFACE_OPEN) { return _open(hs, n, t, s); }
+    if (op == tree.SURFACE_MOVE) { return _move(hs, n, t, s); }
+    if (op == tree.SURFACE_CLOSE) {
+        let is *hst.Pop as p = _of(hs, n, s);
+        if (cast(i64, p) != 0) { _drop(hs, p); }
+        return 1;
+    }
+    return 0;
+}
+
+// n's window put on the screen: its tree shows its popups through it.
+fn _lend(hs as *hst.Host, n as *hst.Native) as void {
+    n.ptr_in = 0;
+    n.focus_main = 0;
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    tree.set_surfaces(t, fn_ptr(_surface), cast(*u8, n));
+    tree.set_surfaces_clear(t, _clear(n));
+}
+
+// Where its widget takes the pointer, told its window when that changed.
+fn _tell_input(t as *tree.Tree, p as *hst.Pop) as void {
+    let is math.rect.Rect as r;
+    if (tree.surface_input(t, p.s, &r) == 0) { return; }
+    let is math.rect.Rect as at = tree.surface_rect(t, p.s);
+    let is i64 as x0 = hst._px_down(r.x - at.x, p.scale);
+    let is i64 as y0 = hst._px_down(r.y - at.y, p.scale);
+    let is i64 as x1 = hst._px_up(r.x + r.w - at.x, p.scale);
+    let is i64 as y1 = hst._px_up(r.y + r.h - at.y, p.scale);
+    if (x0 == p.told_in[0] && y0 == p.told_in[1] && x1 - x0 == p.told_in[2] && y1 - y0 == p.told_in[3]) { return; }
+    device.set_input_region(&p.win, x0, y0, x1 - x0, y1 - y0);
+    p.told_in[0] = x0;
+    p.told_in[1] = y0;
+    p.told_in[2] = x1 - x0;
+    p.told_in[3] = y1 - y0;
+}
+
+// Closed: what is modal hears it was taken down, and closes as it would;
+// what is left — a tooltip, which is nobody's scope — is hidden and its
+// window put away. all 0: only what holds no grab.
+fn _dismiss(hs as *hst.Host, n as *hst.Native, all as i32, now as i64) as void {
+    if (n.h == 0 || app.window_valid(hs.a, n.h) == 0) { return; }
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is *router.Router as r = app.router(hs.a, n.h);
+    let is i32 as grabbing with mut = 0;
+    let is i64 as s with mut = 0;
+    while (s < tree.MAX_SURFACES) {
+        if (tree.surface_widget(t, s) != 0 && tree.surface_grab(t, s) == 1) { grabbing = 1; }
+        s = s + 1;
+    }
+    app.begin_dispatch(hs.a);
+    // The scope dismissed — a popup closes its own submenus — until none is left.
+    let is i64 as tries with mut = 0;
+    while ((all == 1 || grabbing == 0) && tries < tree.MAX_SURFACES && router.scope(r) != 0 &&
+           tree.surface_of(t, router.scope(r)) >= 0) {
+        let is i64 as was = router.scope(r);
+        router.dismiss(t, r, now);
+        if (router.scope(r) == was) { tries = tree.MAX_SURFACES; }
+        tries = tries + 1;
+    }
+    s = 0;
+    while (app.window_valid(hs.a, n.h) == 1 && s < tree.MAX_SURFACES) {
+        let is i64 as w = tree.surface_widget(t, s);
+        if (w != 0 && (all == 1 || tree.surface_grab(t, s) == 0)) {
+            tree.set_visible(t, w, 0);
+            tree.surface_close(t, w);
+        }
+        s = s + 1;
+    }
+    app.end_dispatch(hs.a);
+}
+
+// n's window put away: every popup of it closed and put away, and its tree
+// lent nothing more.
+fn _close_all(hs as *hst.Host, n as *hst.Native, now as i64) as void {
+    _dismiss(hs, n, 1, now);
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot) { _drop(hs, p); }
+        i = i + 1;
+    }
+    if (n.h != 0 && app.window_valid(hs.a, n.h) == 1) {
+        tree.set_surfaces(app.tree(hs.a, n.h), cast(tree.SurfaceFn, 0), cast(*u8, 0));
+    }
+}
+
+// n's window moved: its popups placed again, where they are windows of
+// their own on the screen — X11's, Windows'. A Wayland compositor moves
+// them with it.
+fn _owner_moved(hs as *hst.Host, n as *hst.Native) as void {
+    if (n.win.backend == device.WAYLAND || n.h == 0) { return; }
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is i64 as s with mut = 0;
+    while (s < tree.MAX_SURFACES) {
+        if (tree.surface_widget(t, s) != 0 && tree.surface_owner(t, s) < 0) { _move(hs, n, t, s); }
+        s = s + 1;
+    }
+    // Then the submenus, against where their menus went.
+    s = 0;
+    while (s < tree.MAX_SURFACES) {
+        if (tree.surface_widget(t, s) != 0 && tree.surface_owner(t, s) >= 0) { _move(hs, n, t, s); }
+        s = s + 1;
+    }
+}
+
+// Whether the pointer is over a popup of n's window.
+fn _pointer_in(hs as *hst.Host, n as *hst.Native) as i32 {
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot && p.ptr_in == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Whether n's window is active: it, or one of its popups, has the keyboard.
+fn _active(hs as *hst.Host, n as *hst.Native) as i32 {
+    if (n.focus_main == 1) { return 1; }
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot && p.focused == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The platform's own events for n's popups: taken down, exposed, resized or
+// at another scale, the keyboard come or gone.
+fn _events(hs as *hst.Host, n as *hst.Native, now as i64) as void {
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot) {
+            device.pump(&p.win);
+            let is wevent.Event as e;
+            while (p.used == 1 && n.h != 0 && device.poll_event(&p.win, &e) == 1) { _event(hs, n, p, &e, now); }
+        }
+        i = i + 1;
+    }
+}
+
+fn _event(hs as *hst.Host, n as *hst.Native, p as *hst.Pop, e as *wevent.Event, now as i64) as void {
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is i32 as k = e.kind;
+    if (k == wevent.POPUP_DONE) {
+        app.begin_dispatch(hs.a);
+        router.dismiss(t, app.router(hs.a, n.h), now);
+        app.end_dispatch(hs.a);
+        return;
+    }
+    if (k == wevent.EXPOSE) {
+        if (e.width > 0 && e.height > 0) {
+            damage.add(&p.pending, e.x, e.y, e.width, e.height, p.tw, p.th);
+        } else {
+            damage.whole(&p.pending);
+        }
+        p.present = 1;
+        return;
+    }
+    if (k == wevent.RESIZE || k == wevent.SETTINGS) {
+        // Placed or sized again by the platform, or at another scale: told
+        // the tree, laid out and painted again.
+        let is f64 as was = p.scale;
+        p.scale = _scale_of(n, &p.win);
+        let is f64 as ox with mut = 0.0;
+        let is f64 as oy with mut = 0.0;
+        let is f64 as os with mut = 1.0;
+        _owner(hs, n, t, p.s, &ox, &oy, &os);
+        _placed(n, t, p.s, p, ox, oy, os);
+        if (was != p.scale) { tree.invalidate_paint_subtree(t, tree.surface_widget(t, p.s)); }
+        p.present = 1;
+        return;
+    }
+    if (k == wevent.FOCUS_IN || k == wevent.FOCUS_OUT) {
+        p.focused = cast(i32, k == wevent.FOCUS_IN);
+        app.set_active(hs.a, n.h, _active(hs, n));
+        return;
+    }
+    if (k == wevent.CLOSE) { device.keep_open(&p.win); }
+}
+
+// The next thing a person did over one of n's popups, as if over the window
+// itself: its point in the window's physical pixels. Leaving a popup is
+// leaving only when the pointer is over neither the window nor another of
+// its popups. 1 and *out, or 0 when there is nothing more.
+fn _next_input(hs as *hst.Host, n as *hst.Native, out as *ie.Event) as i32 {
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot) {
+            let is *tree.Tree as t = app.tree(hs.a, n.h);
+            let is math.rect.Rect as at = tree.surface_rect(t, p.s);
+            while (device.poll_input(&p.win, out) == 1) {
+                if (out.kind == ie.ENTER || out.kind == ie.MOTION) { p.ptr_in = 1; }
+                let is i32 as keep with mut = 1;
+                if (out.kind == ie.LEAVE) {
+                    p.ptr_in = 0;
+                    if (n.ptr_in == 1 || _pointer_in(hs, n) == 1) { keep = 0; }
+                }
+                if (keep == 1) {
+                    out.x = hst._round((at.x + cast(f64, out.x) / p.scale) * n.scale);
+                    out.y = hst._round((at.y + cast(f64, out.y) / p.scale) * n.scale);
+                    out.dx = out.dx / p.scale * n.scale;
+                    out.dy = out.dy / p.scale * n.scale;
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Whether a popup of n's window has something to paint or show.
+fn _wanted(hs as *hst.Host, n as *hst.Native) as i32 {
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot && p.present == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// What of p changed, window coordinates: its physical pixels, kept until shown.
+fn _changed(p as *hst.Pop, at as math.rect.Rect, x as f64, y as f64, w as f64, h as f64) as void {
+    let is i64 as x0 = hst._px_down(x - at.x, p.scale);
+    let is i64 as y0 = hst._px_down(y - at.y, p.scale);
+    let is i64 as x1 = hst._px_up(x + w - at.x, p.scale);
+    let is i64 as y1 = hst._px_up(y + h - at.y, p.scale);
+    damage.add(&p.pending, x0, y0, x1 - x0, y1 - y0, p.tw, p.th);
+}
+
+// Every popup of n's window with damage painted into its texture — before
+// the tree's damage is cleared, which the window's frame does.
+fn _paint(hs as *hst.Host, n as *hst.Native, now as i64) as void {
+    let is *app.App as a = hs.a;
+    let is *tree.Tree as t = app.tree(a, n.h);
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot) {
+            _tell_input(t, p);
+            _paint_one(hs, n, t, p, now);
+        }
+        i = i + 1;
+    }
+}
+
+fn _paint_one(hs as *hst.Host, n as *hst.Native, t as *tree.Tree, p as *hst.Pop, now as i64) as void {
+    let is i64 as pw = device.width(&p.win);
+    let is i64 as ph = device.height(&p.win);
+    if (pw <= 0 || ph <= 0) { return; }
+    let is i32 as made with mut = 0;
+    if (p.tex == 0 || p.tw != pw || p.th != ph) {
+        made = 1;
+        if (p.tex != 0) { gpu.texture.destroy(hs.dv, p.tex); }
+        let is gpu.texture.Desc as td = gpu.texture.desc(pw, ph, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+        p.tex = gpu.texture.create(hs.dv, &td);
+        p.tw = pw;
+        p.th = ph;
+        if (p.tex == 0) { return; }
+        damage.whole(&p.pending);
+        damage.history_clear(&p.shown);
+        // All of it, this frame: what is on the new texture is nothing yet.
+        let is math.rect.Rect as all = tree.surface_rect(t, p.s);
+        tree.damage_add_to(t, p.s, &all);
+    }
+    if (tree.surface_damage_count(t, p.s) == 0) { return; }
+    let is math.rect.Rect as at = tree.surface_rect(t, p.s);
+    draw2d.begin(&hs.canvas, cast(f64, pw), cast(f64, ph), p.scale);
+    app.paint_surface(hs.a, n.h, p.s, &hs.canvas, cast(*style.Theme, 0), now, cast(*paint.Stats, 0));
+    gpu.command.begin(hs.dv, hs.cmd);
+    let is math.rect.Rect as sr;
+    let is f64 as sdx with mut = 0.0;
+    let is f64 as sdy with mut = 0.0;
+    if (made == 0 && tree.shift_surface(t) == p.s && tree.shift(t, &sr, &sdx, &sdy) == 1) {
+        let is f64 as s = p.scale;
+        gpu.command.move_region(hs.dv, hs.cmd, p.tex, hst._px(sr.x - at.x, s), hst._px(sr.y - at.y, s), hst._px(sr.w, s),
+                                hst._px(sr.h, s), hst._round(sdx * s), hst._round(sdy * s));
+        _changed(p, at, sr.x, sr.y, sr.w, sr.h);
+        _changed(p, at, sr.x + sdx, sr.y + sdy, sr.w, sr.h);
+    }
+    let is gpu.command.Pass as ps = gpu.command.pass_load(p.tex, 0);
+    gpu.command.begin_pass(hs.dv, hs.cmd, &ps);
+    draw2d.flush(&hs.canvas, hs.cmd);
+    gpu.command.end_pass(hs.dv, hs.cmd);
+    gpu.command.end(hs.dv, hs.cmd);
+    gpu.command.submit(hs.dv, hs.cmd);
+    let is i64 as d with mut = 0;
+    while (d < tree.surface_damage_count(t, p.s)) {
+        let is math.rect.Rect as r = tree.surface_damage_at(t, p.s, d);
+        _changed(p, at, r.x, r.y, r.w, r.h);
+        d = d + 1;
+    }
+    p.present = 1;
+}
+
+// Every popup of n's window with something new shown: what its buffer lacks
+// for its age, as the window's is.
+fn _present(hs as *hst.Host, n as *hst.Native) as void {
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot && p.present == 1 && p.tex != 0) { _present_one(hs, p); }
+        i = i + 1;
+    }
+}
+
+fn _present_one(hs as *hst.Host, p as *hst.Pop) as void {
+    if (device.next_frame(&p.win) == 0) { return; }
+    let is tgt.Target as out = device.acquire(&p.win);
+    let is i64 as pw = p.tw;
+    let is i64 as ph = p.th;
+    if (out.width != pw || out.height != ph || cast(i64, out.color) == 0) { return; }
+    let is damage.List as fix;
+    if (damage.repair(&p.shown, &p.pending, device.buffer_age(&p.win), pw, ph, &fix) == 0) {
+        gpu.texture.read(hs.dv, p.tex, out.color, pw * ph * 4);
+        device.submit(&p.win);
+    } else if (damage.empty(&fix) == 0) {
+        let is i32 as k with mut = 0;
+        while (k < fix.n) {
+            let is *damage.Rect as r = &fix.rects[k];
+            let is *u8 as at = cast(*u8, cast(i64, out.color) + (cast(i64, r.y) * pw + cast(i64, r.x)) * 4);
+            gpu.texture.read_region(hs.dv, p.tex, cast(i64, r.x), cast(i64, r.y), cast(i64, r.w), cast(i64, r.h), at, pw * 4);
+            k = k + 1;
+        }
+        device.submit_region(&p.win, &fix);
+    }
+    damage.push(&p.shown, &p.pending);
+    damage.clear(&p.pending);
+    p.present = 0;
+}
+
+// The pointer's shape, set on the popup it is over; 0 when it is over none.
+fn _shape(hs as *hst.Host, n as *hst.Native, shape as i32) as i32 {
+    let is i64 as slot = _slot(hs, n);
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.slot == slot && p.ptr_in == 1) {
+            if (shape != p.shape) {
+                if (cursor.set(&p.cur, &p.win, shape) == 0) { cursor.set(&p.cur, &p.win, tree.SHAPE_DEFAULT); }
+                p.shape = shape;
+            }
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The desktop's cursor theme, followed by every popup.
+fn _cursor_themes(hs as *hst.Host) as void {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1) { _cursor_theme(hs, p); }
+        i = i + 1;
+    }
+}
+
+// What a popup closed under a held button left held, let go of: it clicks
+// nothing, and a release that does come is no one's.
+fn _settle_lost(hs as *hst.Host, n as *hst.Native, now as i64) as void {
+    if (n.lost == 0) { return; }
+    n.lost = 0;
+    if (n.h == 0 || app.window_valid(hs.a, n.h) == 0) { return; }
+    // Over the window, or a popup of it still up: the release comes there.
+    if (n.ptr_in == 1 || _pointer_in(hs, n) == 1) { return; }
+    let is *router.Router as r = app.router(hs.a, n.h);
+    let is i32 as b with mut = 1;
+    app.begin_dispatch(hs.a);
+    while (b <= 3) {
+        if ((r.buttons & (1 << (b - 1))) != 0) { router.pointer_cancel(app.tree(hs.a, n.h), r, b, now); }
+        b = b + 1;
+    }
+    app.end_dispatch(hs.a);
+}
