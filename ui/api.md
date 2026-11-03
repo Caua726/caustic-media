@@ -286,6 +286,7 @@ the application on the screen.
 - `feed(hs as *Host, h as i64, e as *wevent.Event, now as i64) as void` — One event the platform said of the application's window h, given to it as if it came from there now.
 - `feed_input(hs as *Host, h as i64, e as *ie.Event, now as i64) as void` — And one thing a person did there, as the platform's translator says it.
 - `pointer_shape(hs as *Host, h as i64) as i32` — The pointer's shape over h, as last set; 0 before any.
+- `popup_pointer_shape(hs as *Host, h as i64, s as i64) as i32` — The pointer's shape over the popup of h's surface s, as last set; 0 before any, or when s has no popup.
 - `busy(hs as *Host) as i32` — Whether a window has something to paint or show.
 - `step(hs as *Host, timeout_ms as i64) as i32` — One round: the windows put up and away as the application's are, every event given to it, what was posted run, the timers, the round's callbacks, what changed painted and shown — then asleep until something is to be...
 - `run(hs as *Host) as void` — Rounds until no window is left on the screen and nothing holds the loop, or quit is asked.
