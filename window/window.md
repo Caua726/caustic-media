@@ -613,7 +613,10 @@ where said:
   activated, owned, within the monitor's work area; Wayland an `xdg_popup` of
   the owner's `xdg_surface`, the positioner's numbers in logical pixels
   relative to the owner's window geometry, which the compositor places.
-  `popup_position` says where it went, `reposition` places it again.
+  `popup_position` says where it went, `popup_rect` where and at what size
+  — the positioner's cut (RESIZE_X, RESIZE_Y) or the compositor's, told
+  before the window system's own resize arrives — and `reposition` places it
+  again.
   `Config.grab` takes the pointer and keyboard (`XGrabPointer`/`XGrabKeyboard`,
   the capture and the owner's keys, `xdg_popup.grab` under the owner's last
   press or key); a submenu's grab replaces its menu's and is given back when
