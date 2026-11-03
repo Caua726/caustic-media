@@ -1,0 +1,215 @@
+// ui/host_modal_win32_test.cst — modal dialogs on Windows (here: an isolated
+// Wine, the test fonts standing in for the system's), and what Windows does
+// for a window kept waiting, which the host leaves to it:
+//   sh tools/wine_session.sh sh window/win32/tools/bell_heard.sh build/host_modal_win32_test.exe
+// Run from the repository's root. The user is SendInput's mouse.
+//
+// A dialog modal over a window: that window disabled, the program's other
+// window not; a click on the waiting one — the user having gone to the
+// desktop — brings the dialog to the front, and the program is told nothing
+// of it. A menu open in a window closes as a modal comes over it. A dialog of
+// the whole program's: every other window disabled, each enabled again once
+// it is answered, a click on either bringing it to the front. The bell
+// Windows rings for a click on a disabled window is heard where Wine shows
+// its windows, on its X server (bell_heard.sh).
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "../math/math.cst" as math;
+use "../window/device.cst" as device;
+use "../window/win32/bind/types.cst" as wt;
+use "../window/win32/bind/user32.cst" as u;
+use "../text/fonts/chain.cst" as chain;
+use "system_fonts.cst" as system_fonts;
+use "program.cst" as program;
+use "tree.cst" as tree;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "router.cst" as router;
+use "signal.cst" as signal;
+use "app.cst" as app;
+use "host.cst" as host;
+use "widgets/button.cst" as button;
+use "widgets/menu.cst" as menu;
+use "widgets/dialog.cst" as dialog;
+use "../window/positioner.cst" as positioner;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is *host.Host as hs with mut;
+let is program.Program as prog with mut;
+
+let is i64 as clicks with mut = 0;
+let is i64 as answers with mut = 0;
+fn on_click(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { clicks = clicks + 1; }
+fn on_answer(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { answers = answers + 1; }
+
+fn settle_for(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) { host.step(hs, 15); }
+}
+
+fn settle() as void { settle_for(300); }
+
+// --- The user ---
+
+// The user's mouse at x, y of the screen, with flags.
+fn mouse(x as i64, y as i64, flags as i64) as void {
+    let is wt.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(wt.INPUT));
+    in.c_type = cast(u32, wt.INPUT_MOUSE);
+    let is *wt.MOUSEINPUT as m = cast(*wt.MOUSEINPUT, &in._anon1);
+    let is i64 as sw = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CXSCREEN)));
+    let is i64 as sh = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CYSCREEN)));
+    m.dx = cast(i32, (x * 65536 + sw - 1) / sw);
+    m.dy = cast(i32, (y * 65536 + sh - 1) / sh);
+    m.dwFlags = cast(u32, flags | wt.MOUSEEVENTF_ABSOLUTE | wt.MOUSEEVENTF_MOVE);
+    u.SendInput(1, &in, cast(i32, sizeof(wt.INPUT)));
+}
+
+fn click_at(sx as i64, sy as i64) as void {
+    mouse(sx, sy, 0);
+    settle();
+    mouse(sx, sy, wt.MOUSEEVENTF_LEFTDOWN);
+    settle();
+    mouse(sx, sy, wt.MOUSEEVENTF_LEFTUP);
+    settle();
+}
+
+// --- The program's windows on the screen ---
+
+fn hwnd_of(h as i64) as i64 {
+    let is *device.Window as w = host.native(hs, h);
+    if (cast(i64, w) == 0) { return 0; }
+    return w.win32_win.hwnd;
+}
+
+// The middle of widget w of window h, on the screen.
+fn mid_of(h as i64, w as i64, sx as *i64, sy as *i64) as void {
+    let is wt.POINT as pt;
+    pt.x = 0;
+    pt.y = 0;
+    u.ClientToScreen(hwnd_of(h), &pt);
+    let is f64 as sc = app.scale(program.app(&prog), h);
+    let is math.rect.Rect as r = layout.window_rect(app.tree(program.app(&prog), h), w);
+    *sx = cast(i64, pt.x) + cast(i64, (r.x + r.w / 2.0) * sc);
+    *sy = cast(i64, pt.y) + cast(i64, (r.y + r.h / 2.0) * sc);
+}
+
+// The window in front, waited for to be want a second at most.
+fn in_front(want as i64) as i32 {
+    let is i64 as until = time.now_ms() + 1000;
+    while (u.GetForegroundWindow() != want && time.now_ms() < until) { host.step(hs, 15); }
+    return cast(i32, u.GetForegroundWindow() == want);
+}
+
+// The desktop clicked, where no window is: the user away from the program.
+fn to_desktop() as void {
+    let is i64 as sw = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CXSCREEN)));
+    let is i64 as sh = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CYSCREEN)));
+    click_at(sw - 20, sh - 20);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (program.open(&prog, "text\\testdata\\fonts") == 0) { io.printf("FAIL: not started\n"); return 1; }
+    let is chain.Prefs as fp with mut = chain.defaults();
+    fp.ui = "Caustic Test Sans";
+    fp.sans = "Caustic Test Sans";
+    system_fonts.set_prefs(program.fonts(&prog), &fp);
+    let is *app.App as ap = program.app(&prog);
+    hs = program.host(&prog);
+
+    // Two windows of the program's, apart on the screen, a button in each.
+    let is i64 as main_w = app.window_open(ap, 220.0, 140.0);
+    app.set_title(ap, main_w, "Main", 4);
+    let is *tree.Tree as t = app.tree(ap, main_w);
+    let is *router.Router as r = app.router(ap, main_w);
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    let is i64 as here = button.create(t, col, "Here", 4);
+    signal.connect(t, here, signal.CLICKED, fn_ptr(on_click), cast(*u8, 0));
+    let is i64 as side_w = app.window_open(ap, 220.0, 140.0);
+    app.set_title(ap, side_w, "Side", 4);
+    let is *tree.Tree as st = app.tree(ap, side_w);
+    let is i64 as scol = box.create(st, tree.root(st), box.COLUMN);
+    let is i64 as there = button.create(st, scol, "There", 5);
+    signal.connect(st, there, signal.CLICKED, fn_ptr(on_click), cast(*u8, 0));
+    settle();
+    check("two windows of Windows'", hwnd_of(main_w) != 0 && hwnd_of(side_w) != 0);
+    u.SetWindowPos(hwnd_of(main_w), 0, 40, 40, 0, 0, cast(u32, wt.SWP_NOSIZE | wt.SWP_NOZORDER));
+    u.SetWindowPos(hwnd_of(side_w), 0, 420, 40, 0, 0, cast(u32, wt.SWP_NOSIZE | wt.SWP_NOZORDER));
+    settle();
+    let is i64 as hx with mut = 0;
+    let is i64 as hy with mut = 0;
+    let is i64 as tx with mut = 0;
+    let is i64 as ty with mut = 0;
+
+    // --- A dialog modal over a window ---
+    let is *tree.Tree as dt = dialog.window_tree(t);
+    let is i64 as dg = dialog.message(dt, dialog.QUESTION, "Sure?", 5, "Really.", 7, dialog.OK_CANCEL);
+    signal.connect(dt, dg, signal.ACTIVATED, fn_ptr(on_answer), cast(*u8, 0));
+    let is i64 as dw = app.window_of(ap, dt);
+    dialog.show(dt, router.of(dt), dg, 1);
+    settle();
+    check("the dialog on the screen", hwnd_of(dw) != 0);
+    check("its owner disabled, the other window not", u.IsWindowEnabled(hwnd_of(main_w)) == 0 &&
+          u.IsWindowEnabled(hwnd_of(side_w)) == 1 && u.IsWindowEnabled(hwnd_of(dw)) == 1);
+    to_desktop();
+    check("the user gone to the desktop: the dialog not in front", u.GetForegroundWindow() != hwnd_of(dw));
+    mid_of(main_w, here, &hx, &hy);
+    click_at(hx, hy);
+    check("a click on its owner: the dialog in front", in_front(hwnd_of(dw)) == 1);
+    check("and the owner told nothing", clicks == 0);
+    dialog.respond(dt, dg, dialog.CANCEL);
+    settle();
+    check("answered: its owner enabled again", answers == 1 && u.IsWindowEnabled(hwnd_of(main_w)) == 1);
+    click_at(hx, hy);
+    check("and it hears its clicks again", clicks == 1);
+
+    // --- A menu open in a window: closed as a modal comes over it ---
+    let is i64 as mm = menu.create(t);
+    menu.add_item(t, mm, "One", 3, 1);
+    menu.popup_at(t, r, mm, math.rect.rect(10.0, 10.0, 1.0, 1.0), positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT, 0);
+    settle();
+    check("a menu open in the window", menu.is_open(t, mm) == 1);
+
+    // --- A dialog of the whole program's ---
+    let is *tree.Tree as qt = dialog.app_window_tree(t);
+    let is i64 as qd = dialog.message(qt, dialog.QUESTION, "Quit?", 5, "Every window.", 13, dialog.OK_CANCEL);
+    signal.connect(qt, qd, signal.ACTIVATED, fn_ptr(on_answer), cast(*u8, 0));
+    let is i64 as qw = app.window_of(ap, qt);
+    dialog.show(qt, router.of(qt), qd, 1);
+    settle();
+    check("the program's dialog on the screen, belonging to no window", hwnd_of(qw) != 0 && app.owner(ap, qw) == 0);
+    check("the menu closed as it came", menu.is_open(t, mm) == 0);
+    check("every other window disabled", u.IsWindowEnabled(hwnd_of(main_w)) == 0 && u.IsWindowEnabled(hwnd_of(side_w)) == 0 &&
+          u.IsWindowEnabled(hwnd_of(qw)) == 1);
+    to_desktop();
+    mid_of(side_w, there, &tx, &ty);
+    click_at(tx, ty);
+    check("a click on another window: the dialog in front", in_front(hwnd_of(qw)) == 1);
+    to_desktop();
+    click_at(hx, hy);
+    check("and on the first: in front again", in_front(hwnd_of(qw)) == 1);
+    check("neither told", clicks == 1);
+    dialog.respond(qt, qd, dialog.CANCEL);
+    settle();
+    check("answered: every window enabled again", answers == 2 && u.IsWindowEnabled(hwnd_of(main_w)) == 1 &&
+          u.IsWindowEnabled(hwnd_of(side_w)) == 1);
+
+    program.close(&prog);
+    if (fails == 0) {
+        io.printf("host modal win32: all checks passed\n");
+        return 0;
+    }
+    io.printf("host modal win32: %d failures\n", fails);
+    return 1;
+}

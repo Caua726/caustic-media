@@ -45,6 +45,8 @@ use "icons.cst" as icons;
 use "widgets/button.cst" as button;
 use "widgets/entry.cst" as entry;
 use "widgets/dialog.cst" as dialog;
+use "widgets/menu.cst" as menu;
+use "../window/positioner.cst" as positioner;
 use "widgets/decoration.cst" as decoration;
 use "widgets/titlebar.cst" as titlebar;
 use "widget.cst" as widget;
@@ -224,6 +226,71 @@ fn longs_of(w as i64, p as *u8) as i64 {
     }
     if (cast(i64, _data) != 0) { xlib.XFree(_data); }
     return _n;
+}
+
+// The window h's window is transient for, as the other client reads it; 0
+// for none.
+fn transient_of(h as i64) as i64 {
+    let is i64 as tf with mut = 0;
+    xlib.XSync(other, 0);
+    if (xlib.XGetTransientForHint(other, xid_of(h), cast(*u8, &tf)) == 0) { return 0; }
+    return tf;
+}
+
+// The leader of h's window's group (WM_HINTS window_group, its ninth long);
+// 0 for none said.
+fn group_of(h as i64) as i64 {
+    _data = cast(*u8, 0);
+    xlib.XSync(other, 0);
+    // XA_WM_HINTS, 35.
+    xlib.XGetWindowProperty(other, xid_of(h), 35, 0, 9, 0, 35, cast(*u8, &_type), cast(*u8, &_format), cast(*u8, &_n),
+                            cast(*u8, &_after), cast(*u8, &_data));
+    let is i64 as g with mut = 0;
+    if (cast(i64, _data) != 0 && _n >= 9 && (*cast(*i64, _data) & 64) != 0) { g = *cast(*i64, cast(i64, _data) + 64); }
+    if (cast(i64, _data) != 0) { xlib.XFree(_data); }
+    return g;
+}
+
+// A connection of its own the server tells of every bell rung on it
+// (XkbBellNotify); null without XKB.
+let is i32 as xkb_event with mut = 0;
+
+fn bell_watcher() as *u8 {
+    let is *u8 as watcher = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, watcher) == 0) { return watcher; }
+    let is i32 as xkb_error with mut = 0;
+    let is i32 as major with mut = 1;
+    let is i32 as minor with mut = 0;
+    let is i32 as opcode with mut = 0;
+    if (xkblib.XkbQueryExtension(watcher, cast(*u8, &opcode), cast(*u8, &xkb_event), cast(*u8, &xkb_error),
+                                 cast(*u8, &major), cast(*u8, &minor)) == 0) {
+        xlib.XCloseDisplay(watcher);
+        return cast(*u8, 0);
+    }
+    // XkbUseCoreKbd 0x100, XkbBellNotifyMask 1 << 8.
+    xkblib.XkbSelectEvents(watcher, cast(u32, 256), cast(u32, 256), cast(u32, 256));
+    xlib.XSync(watcher, 0);
+    return watcher;
+}
+
+// Whether the server told watcher of a bell within ms, the host's loop run
+// meanwhile; the watcher closed after.
+fn bell_heard(watcher as *u8, ms as i64) as i32 {
+    if (cast(i64, watcher) == 0) { return 0; }
+    let is i64 as until = time.now_ms() + ms;
+    let is [24]i64 as ev;
+    let is i32 as rung with mut = 0;
+    while (rung == 0 && time.now_ms() < until) {
+        host.step(hs, 10);
+        while (xlib.XPending(watcher) > 0) {
+            xlib.XNextEvent(watcher, cast(*u8, &ev[0]));
+            // XkbAnyEvent: xkb_type after type, serial, send_event, display
+            // and time, at 40 — XkbBellNotify is 8.
+            if (*cast(*i32, &ev[0]) == xkb_event && *cast(*i32, cast(i64, &ev[0]) + 40) == 8) { rung = 1; }
+        }
+    }
+    xlib.XCloseDisplay(watcher);
+    return rung;
 }
 
 // Whether X has the window xid on the screen still: among the root's
@@ -865,9 +932,17 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as owner_xid with mut = 0;
     xlib.XGetTransientForHint(other, xid_of(dw), cast(*u8, &owner_xid));
     check("above its owner's, modal", owner_xid == xid_of(main_w) && modal_of(dw) == 1);
+    let is *u8 as bells = bell_watcher();
+    let is i64 as wroot_m = xlib.XDefaultRootWindow(other);
+    xlib.XSelectInput(other, wroot_m, x.SubstructureNotifyMask);
+    xlib.XSync(other, 0);
     click_on(main_w, b);
     settle();
     check("the window under it told nothing", clicks == 1 && app.blocked(&a, main_w) == 1);
+    check("a press on it: its dialog brought forward", told_wm("_NET_ACTIVE_WINDOW", xid_of(dw)) == 1);
+    check("and the bell rung", bell_heard(bells, 2000) == 1);
+    xlib.XSelectInput(other, wroot_m, 0);
+    xlib.XSync(other, 0);
     close_button(dw);
     settle();
     check("its close button: cancelled, put away", answers == 1 && answered == dialog.CANCEL && host.shown(hs) == 1 &&
@@ -875,6 +950,44 @@ fn main(argc as i64, argv as *u8) as i32 {
     click_on(main_w, b);
     settle();
     check("the window under it going on", clicks == 2);
+
+    // --- The application's own dialog: every window waits on it ---
+    let is i64 as second_w = app.window_open(&a, 160.0, 100.0);
+    settle();
+    let is i64 as mm = menu.create(t);
+    menu.add_item(t, mm, "One", 3, 1);
+    menu.popup_at(t, r, mm, math.rect.rect(10.0, 10.0, 1.0, 1.0), positioner.BOTTOM_LEFT, positioner.BOTTOM_RIGHT, 0);
+    settle();
+    check("a menu open in the window", menu.is_open(t, mm) == 1);
+    let is *tree.Tree as qt = dialog.app_window_tree(t);
+    let is i64 as qd = dialog.message(qt, dialog.QUESTION, "Quit?", 5, "Every window.", 13, dialog.OK_CANCEL);
+    signal.connect(qt, qd, signal.ACTIVATED, fn_ptr(on_answer), cast(*u8, 0));
+    let is i64 as qw = app.window_of(&a, qt);
+    dialog.show(qt, router.of(qt), qd, 1);
+    settle();
+    check("the application's dialog on the screen, modal", xid_of(qw) != 0 && modal_of(qw) == 1);
+    check("transient for the root: for every window of its group", transient_of(qw) == xlib.XDefaultRootWindow(other));
+    check("the program's windows one group", group_of(qw) != 0 && group_of(main_w) == group_of(qw) &&
+          group_of(second_w) == group_of(qw));
+    check("every window waits on it", app.blocked(&a, main_w) == 1 && app.blocked(&a, second_w) == 1 && app.blocked(&a, qw) == 0);
+    check("the menu open in the window closed as it came", menu.is_open(t, mm) == 0);
+    let is *u8 as bells2 = bell_watcher();
+    xlib.XSelectInput(other, wroot_m, x.SubstructureNotifyMask);
+    xlib.XSync(other, 0);
+    button_event(second_w, x.ButtonPress, 20, 20);
+    button_event(second_w, x.ButtonRelease, 20, 20);
+    settle();
+    check("a press on another window: the dialog brought forward", told_wm("_NET_ACTIVE_WINDOW", xid_of(qw)) == 1);
+    check("and the bell rung", bell_heard(bells2, 2000) == 1);
+    xlib.XSelectInput(other, wroot_m, 0);
+    xlib.XSync(other, 0);
+    dialog.respond(qt, qd, dialog.CANCEL);
+    settle();
+    check("answered: every window goes on", answers == 2 && answered == dialog.CANCEL && app.blocked(&a, main_w) == 0 &&
+          app.blocked(&a, second_w) == 0);
+    app.window_close(&a, qw);
+    app.window_close(&a, second_w);
+    settle();
 
     // --- Dragged from one window to another of the program's ---
     let is i64 as side = app.window_open(&a, 200.0, 120.0);

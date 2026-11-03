@@ -368,7 +368,11 @@ inside the window on its layer instead, placed by that positioner within the
 window. `window/` keeps several windows on one connection
 (`window/x11/multi_test.cst`), which is what this needs.
 
-Dialogs are windows with a modal flag and a result. The file dialog is our own
+Dialogs are windows with a modal flag and a result, belonging to the window
+they are for or, for the whole application, to none; modal, what they belong
+to waits — every other window, for the application's own — and a press on a
+waiting window brings the dialog forward with the bell, as GTK and Qt do on
+Linux and Windows does itself for the windows it disabled. The file dialog is our own
 first; the XDG desktop portal on Linux (`window/linux/filechooser.cst`) and the
 system dialog on Windows give users their own.
 
@@ -386,7 +390,10 @@ focus, the size, the place on the screen, the window manager's state, a drag
 from another program, the close button — which goes to the window's widgets
 first (`router.close_request`: a dialog answers it as Escape), then to the
 program (`set_on_close`), and only then closes the window. A window waiting
-on a modal dialog (`app.blocked`) is told nothing of the pointer or the keys.
+on a modal dialog (`app.blocked`) is told nothing of the pointer or the keys;
+a press, a key or the wheel there brings the dialog forward (`app.blocker`)
+and rings the bell, and what was open over the window — a menu, a list, a
+popover, a tooltip — closes as the dialog comes.
 A drag begun in one window and carried over another of the program's is run
 by that window's router, from what the first carries, and the first is told
 what was done there (`router.drag_payload`, `drag_elsewhere`, `drag_finish`).

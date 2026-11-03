@@ -37,9 +37,14 @@ it is active (a change repaints all of it); `app.frame` lays it out at its size
 and collects what to repaint. `app.set_text_service` lends every window, open
 and to come, the application's text service; each window's tree has its
 animator; `app.pointer_shape` says what the pointer looks like in a window,
-for the loop to hand the platform when it changes. It is fed by calls, as the
-router is: the platform loop that opens real windows and presents frames sits
-above it.
+for the loop to hand the platform when it changes. A window can belong to
+another — a dialog's (`dialog_open`) — and be modal: shown, the windows it
+belongs to, up its owners, wait (`blocked`); one belonging to no window is the
+application's own, and shown modal every other window waits, but for those
+that belong to it and another of the application's own; `blocker` says which
+modal a press on a waiting window is to bring forward — the one that waits on
+nothing itself. It is fed by calls, as the router is: the platform loop that
+opens real windows and presents frames sits above it.
 
 **Layout** (`geom.cst`, `layout.cst`, `box.cst`, `grid.cst`, `stack.cst`, each
 with its test): margins, alignment, minimum and maximum, right to left,
@@ -832,10 +837,13 @@ told as a button that expands, expanded while open.
 
 **Dialogs** (`widgets/dialog.cst`, tested by `dialog_test`): a titled frame
 holding what the program puts in it above a row of buttons, one per answer.
-Until `window/` opens dialog windows of their own it is drawn in the middle
-of the window, on a layer above it. Modal, the window behind is dimmed and
-the dialog is the router's modal scope — presses outside go nowhere, the
-window's shortcuts wait; not modal, the window goes on. The buttons stand in
+Where the application can open windows it has one of its own
+(`window_tree`): belonging to the window, or to none (`app_window_tree`), a
+dialog of the whole application's, which shown modal keeps every window of it
+waiting. Where it cannot it is drawn in the middle of the window, on a layer
+above it: modal, the window behind is dimmed and the dialog is the router's
+modal scope — presses outside go nowhere, the window's shortcuts wait; not
+modal, the window goes on. The buttons stand in
 the platform's order (`set_order`): the affirmative answers last at the end,
 as Linux desktops and macOS have them, or first, as Windows does, Help at the start,
 all mirrored right to left. The default answer's button is in the accent,
@@ -898,7 +906,14 @@ under Xvfb with a second client playing the user and the window manager):
 real windows for the application's, titled, painted and shown; X's clicks,
 keys, resizes and close buttons reaching the widgets; the clipboard through
 X; a modal dialog in a window of its own above its owner, the owner told
-nothing meanwhile; a text dragged from one window to another; the loop asleep
+nothing meanwhile — a press, a key or the wheel on it bringing the dialog
+forward (`_NET_ACTIVE_WINDOW`, xdg-activation under the press's own serial)
+and ringing the bell, once for a burst, and Windows doing both itself for the
+owner it disabled (`host_modal_win32_test`, the bell heard on Wine's X
+server); the menus, lists, popovers and tooltip open over a window closed as
+a modal comes over it (`host_x11_test`, `host_popup_wayland_test`); a dialog
+of the whole application's, transient for the root with every window of the
+program in one group on X11, every other window disabled on Windows; a text dragged from one window to another; the loop asleep
 until a timer, a descriptor, another thread or an event wakes it. The
 accessibility bridge runs in it (`atspi/hosted.cst`, `atspi_hosted_test` on a
 private bus). Every window opens with a frame of the toolkit's own — the
