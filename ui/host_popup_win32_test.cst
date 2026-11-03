@@ -1,0 +1,461 @@
+// ui/host_popup_win32_test.cst — menus, lists, popovers and tooltips in
+// popups of their own on Windows (here: an isolated Wine, the test fonts
+// standing in for the system's):
+//   sh window/win32/tools/run_native.sh build/host_popup_win32_test.exe
+// Run from the repository's root. The user is SendInput's mouse and keys;
+// what is on the screen is read back from it.
+//
+// As on X (host_popup_x11_test): a menu taller than its window reaches past
+// its edge and an item there is chosen by a click; a press on the desktop
+// takes it down; a submenu is a popup its menu owns; the pointer reaching
+// another title of a menu bar opens that one; a combo box's list drops past
+// the window's bottom and a row there is chosen; a tooltip reaches past the
+// window's edge, transparent to the pointer, and a press on it goes to what
+// is beneath; a popover points at its button. Each is a tool window never
+// activated, owned, painted.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "../math/math.cst" as math;
+use "../gpu/gpu.cst" as gpu;
+use "../window/device.cst" as device;
+use "../window/win32/bind/types.cst" as wt;
+use "../window/win32/bind/user32.cst" as u;
+use "../window/win32/bind/gdi32.cst" as g;
+use "../text/fonts/chain.cst" as chain;
+use "system_fonts.cst" as system_fonts;
+use "program.cst" as program;
+use "tree.cst" as tree;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "style.cst" as style;
+use "router.cst" as router;
+use "signal.cst" as signal;
+use "text.cst" as text;
+use "model.cst" as model;
+use "app.cst" as app;
+use "host.cst" as host;
+use "host_state.cst" as hst;
+use "popup.cst" as popup;
+use "widgets/button.cst" as button;
+use "widgets/label.cst" as label;
+use "widgets/menu.cst" as menu;
+use "widgets/menubar.cst" as menubar;
+use "widgets/menubutton.cst" as menubutton;
+use "widgets/combo.cst" as combo;
+use "widgets/tooltip.cst" as tooltip;
+use "../window/positioner.cst" as positioner;
+
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is style.Theme as theme with mut;
+let is app.App as a with mut;
+let is *host.Host as hs with mut;
+let is program.Program as prog with mut;
+let is tooltip.Tooltips as tips with mut;
+
+// --- The rows of a combo box: "Row 0" to "Row 14" ---
+
+let is i64 as ROWS with imut = 15;
+let is [16]u8 as rowbuf with mut;
+
+fn rows_count(self as *u8, parent as i64) as i64 {
+    if (parent != 0) { return 0; }
+    return ROWS;
+}
+fn rows_id(self as *u8, parent as i64, index as i64) as i64 {
+    if (parent != 0 || index < 0 || index >= ROWS) { return 0; }
+    return index + 1;
+}
+fn rows_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    if (role != model.TEXT || column != 0) { return 0; }
+    rowbuf[0] = cast(u8, 82); rowbuf[1] = cast(u8, 111); rowbuf[2] = cast(u8, 119); rowbuf[3] = cast(u8, 32);
+    let is i64 as k = id - 1;
+    if (k >= 10) {
+        rowbuf[4] = cast(u8, 49);
+        rowbuf[5] = cast(u8, 48 + k - 10);
+        *out = model.text(cast(*u8, &rowbuf), 6);
+        return 1;
+    }
+    rowbuf[4] = cast(u8, 48 + k);
+    *out = model.text(cast(*u8, &rowbuf), 5);
+    return 1;
+}
+
+// --- What the widgets said ---
+
+let is i64 as chosen with mut = 0;
+let is i64 as closed_n with mut = 0;
+let is i64 as unders with mut = 0;
+fn on_chosen(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { chosen = *cast(*i64, arg); }
+fn on_closed(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { closed_n = closed_n + 1; }
+fn on_under(t as *tree.Tree, w as i64, arg as *u8, user as *u8) as void { unders = unders + 1; }
+
+// --- The loop, the tooltips ticked with it ---
+
+fn tick_tips(user as *u8) as void { tooltip.tick(&tips, time.now_ms()); }
+
+fn settle() as void {
+    let is i64 as until = time.now_ms() + 300;
+    while (time.now_ms() < until) { host.step(hs, 15); }
+}
+
+fn settle_for(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) { host.step(hs, 15); }
+}
+
+// --- The user ---
+
+// The user's mouse at x, y of the screen, with flags.
+fn mouse(x as i64, y as i64, flags as i64) as void {
+    let is wt.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(wt.INPUT));
+    in.c_type = cast(u32, wt.INPUT_MOUSE);
+    let is *wt.MOUSEINPUT as m = cast(*wt.MOUSEINPUT, &in._anon1);
+    let is i64 as sw = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CXSCREEN)));
+    let is i64 as sh = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CYSCREEN)));
+    m.dx = cast(i32, (x * 65536 + sw - 1) / sw);
+    m.dy = cast(i32, (y * 65536 + sh - 1) / sh);
+    m.dwFlags = cast(u32, flags | wt.MOUSEEVENTF_ABSOLUTE | wt.MOUSEEVENTF_MOVE);
+    u.SendInput(1, &in, cast(i32, sizeof(wt.INPUT)));
+}
+
+fn move_to(sx as i64, sy as i64) as void {
+    mouse(sx, sy, 0);
+    settle();
+}
+
+fn click_at(sx as i64, sy as i64) as void {
+    move_to(sx, sy);
+    mouse(sx, sy, wt.MOUSEEVENTF_LEFTDOWN);
+    settle();
+    mouse(sx, sy, wt.MOUSEEVENTF_LEFTUP);
+    settle();
+}
+
+// A key by its virtual key.
+fn key(vk as i64) as void {
+    let is wt.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(wt.INPUT));
+    in.c_type = cast(u32, wt.INPUT_KEYBOARD);
+    let is *wt.KEYBDINPUT as k = cast(*wt.KEYBDINPUT, &in._anon1);
+    k.wVk = cast(u16, vk);
+    if (vk == 35 || vk == 39) { k.dwFlags = cast(u32, 1); }
+    u.SendInput(1, &in, cast(i32, sizeof(wt.INPUT)));
+    k.dwFlags = cast(u32, wt.KEYEVENTF_KEYUP);
+    if (vk == 35 || vk == 39) { k.dwFlags = cast(u32, wt.KEYEVENTF_KEYUP | 1); }
+    u.SendInput(1, &in, cast(i32, sizeof(wt.INPUT)));
+    settle();
+}
+
+// --- What is on the screen ---
+
+let is i64 as main_w with mut = 0;
+let is i64 as wx with mut = 0;    // the window's client on the screen
+let is i64 as wy with mut = 0;
+let is f64 as sc with mut = 1.0;
+
+// A point of the window, logical, on the screen.
+fn sx_of(x as f64) as i64 { return wx + cast(i64, x * sc + 0.5); }
+fn sy_of(y as f64) as i64 { return wy + cast(i64, y * sc + 0.5); }
+
+// The middle of widget w on the screen.
+fn mid_x(t as *tree.Tree, w as i64) as i64 { let is math.rect.Rect as r = layout.window_rect(t, w); return sx_of(r.x + r.w / 2.0); }
+fn mid_y(t as *tree.Tree, w as i64) as i64 { let is math.rect.Rect as r = layout.window_rect(t, w); return sy_of(r.y + r.h / 2.0); }
+
+// How many popups are up, and the one for surface s.
+fn pops() as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        if (hst._pop(hs, i).used == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Whether w's popup holds the grab; 0 for no popup.
+fn grabbing_of(t as *tree.Tree, w as i64) as i32 {
+    let is *hst.Pop as p = pop_of(tree.surface_index(t, w));
+    if (cast(i64, p) == 0) { return 0; }
+    return device.grabbing(&p.win);
+}
+
+fn pop_of(s as i64) as *hst.Pop {
+    let is i64 as i with mut = 0;
+    while (i < hst.MAX_POPUPS) {
+        let is *hst.Pop as p = hst._pop(hs, i);
+        if (p.used == 1 && p.s == s) { return p; }
+        i = i + 1;
+    }
+    return cast(*hst.Pop, 0);
+}
+
+fn hwnd_of_pop(t as *tree.Tree, w as i64) as i64 {
+    let is i64 as s = tree.surface_index(t, w);
+    if (s < 0) { return 0; }
+    let is *hst.Pop as p = pop_of(s);
+    if (cast(i64, p) == 0) { return 0; }
+    return p.win.win32_win.hwnd;
+}
+
+// Where window hwnd's client is on the screen, and its size.
+fn geometry(hwnd as i64, ox as *i64, oy as *i64, ow as *i64, oh as *i64) as void {
+    let is wt.POINT as pt; pt.x = 0; pt.y = 0;
+    u.ClientToScreen(hwnd, &pt);
+    let is wt.RECT as rc;
+    u.GetClientRect(hwnd, &rc);
+    *ox = cast(i64, pt.x);
+    *oy = cast(i64, pt.y);
+    *ow = cast(i64, rc.right - rc.left);
+    *oh = cast(i64, rc.bottom - rc.top);
+}
+
+// What the screen shows at x, y, as 0xRRGGBB.
+fn screen_pixel(x as i64, y as i64) as i64 {
+    let is i64 as dc = u.GetDC(0);
+    let is i64 as v = cast(i64, g.GetPixel(dc, cast(i32, x), cast(i32, y)));
+    u.ReleaseDC(0, dc);
+    return ((v & 255) << 16) | (v & 65280) | ((v >> 16) & 255);
+}
+
+fn shows(x as i64, y as i64, colour as i64) as i32 {
+    let is i64 as until = time.now_ms() + 1000;
+    while (time.now_ms() < until) {
+        if (near_rgb(screen_pixel(x, y), colour) == 1) { return 1; }
+        host.step(hs, 15);
+    }
+    io.printf("  at %d,%d: %x, want %x\n", cast(i32, x), cast(i32, y), cast(i32, screen_pixel(x, y)), cast(i32, colour));
+    return 0;
+}
+
+fn style_of(hwnd as i64) as i64 { return u.GetWindowLongPtrW(hwnd, cast(i32, wt.GWL_STYLE)); }
+fn ex_of(hwnd as i64) as i64 { return u.GetWindowLongPtrW(hwnd, cast(i32, wt.GWL_EXSTYLE)); }
+fn owner_of(hwnd as i64) as i64 { return u.GetWindow(hwnd, cast(u32, wt.GW_OWNER)); }
+
+fn rgb(c as math.color.Color) as i64 {
+    let is i64 as r = cast(i64, c.r * 255.0 + 0.5);
+    let is i64 as g = cast(i64, c.g * 255.0 + 0.5);
+    let is i64 as b = cast(i64, c.b * 255.0 + 0.5);
+    return (r << 16) | (g << 8) | b;
+}
+
+fn near_rgb(v as i64, want as i64) as i32 {
+    let is i64 as dr with mut = ((v >> 16) & 255) - ((want >> 16) & 255);
+    let is i64 as dg with mut = ((v >> 8) & 255) - ((want >> 8) & 255);
+    let is i64 as db with mut = (v & 255) - (want & 255);
+    if (dr < 0) { dr = 0 - dr; }
+    if (dg < 0) { dg = 0 - dg; }
+    if (db < 0) { db = 0 - db; }
+    return cast(i32, dr <= 3 && dg <= 3 && db <= 3);
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (program.open(&prog, "text\\testdata\\fonts") == 0) { io.printf("FAIL: not started\n"); return 1; }
+    let is chain.Prefs as fp with mut = chain.defaults();
+    fp.ui = "Caustic Test Sans";
+    fp.sans = "Caustic Test Sans";
+    system_fonts.set_prefs(program.fonts(&prog), &fp);
+    let is *app.App as ap = program.app(&prog);
+    hs = program.host(&prog);
+    theme = *app.theme(ap);
+    main_w = app.window_open(ap, 240.0, 150.0);
+    app.set_title(ap, main_w, "Popups", 6);
+    let is *tree.Tree as t = app.tree(ap, main_w);
+    let is *router.Router as r = app.router(ap, main_w);
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    layout.set_align(t, col, layout.FILL, layout.START);
+
+    // A menu bar of two titles.
+    let is i64 as bar = menubar.create(t, col);
+    let is i64 as m_file = menu.create(t);
+    menu.add_item(t, m_file, "Open", 4, 501);
+    menu.add_item(t, m_file, "Save", 4, 502);
+    let is i64 as m_edit = menu.create(t);
+    menu.add_item(t, m_edit, "Copy", 4, 601);
+    menubar.add(t, bar, "_File", 5, m_file);
+    menubar.add(t, bar, "_Edit", 5, m_edit);
+
+    // A row: a menu button with a long menu, one with a popover.
+    let is i64 as row = box.create(t, col, box.ROW);
+    let is i64 as mb = menubutton.create(t, row, "Long", 4);
+    let is i64 as m_long = menu.create(t);
+    let is i64 as k with mut = 1;
+    let is [8]u8 as nb;
+    while (k <= 20) {
+        nb[0] = cast(u8, 73); nb[1] = cast(u8, 116); nb[2] = cast(u8, 32);
+        nb[3] = cast(u8, 48 + k / 10); nb[4] = cast(u8, 48 + k % 10);
+        menu.add_item(t, m_long, cast(*u8, &nb), 5, k);
+        k = k + 1;
+    }
+    let is i64 as sub = menu.add_submenu(t, m_long, "More", 4);
+    menu.add_item(t, sub, "Sub one", 7, 101);
+    menu.add_item(t, sub, "Sub two", 7, 102);
+    menubutton.set_menu(t, mb, m_long);
+    let is i64 as pb = menubutton.create(t, row, "Pop", 3);
+    let is i64 as pop = popup.create(t);
+    popup.set_arrow(t, pop, 1);
+    let is i64 as inside = button.create(t, pop, "Inside", 6);
+    menubutton.set_popover(t, pb, pop);
+    // A label with a tip at the end of the row, a button under it.
+    let is i64 as tipped = label.create(t, row, "Tipped", 6);
+    layout.set_stretch(t, tipped, 1.0, 0.0);
+    label.set_align(t, tipped, 1);
+    let is i64 as under = button.create(t, col, "Under the tip, along the row", 28);
+    layout.set_align(t, under, layout.FILL, layout.START);
+    signal.connect(t, under, signal.CLICKED, fn_ptr(on_under), cast(*u8, 0));
+    // A combo box at the window's bottom.
+    let is model.Model as rows = model.make(cast(*u8, 0), fn_ptr(rows_count), fn_ptr(rows_id), fn_ptr(rows_cell));
+    let is i64 as cb = combo.create(t, col, &rows);
+    signal.connect(t, m_long, signal.ACTIVATED, fn_ptr(on_chosen), cast(*u8, 0));
+    signal.connect(t, m_long, signal.CLOSED, fn_ptr(on_closed), cast(*u8, 0));
+    signal.connect(t, m_file, signal.CLOSED, fn_ptr(on_closed), cast(*u8, 0));
+
+    tips = tooltip.open(t, r);
+    tooltip.set(&tips, tipped, "A tip that reaches well past the window's edge", 46);
+    host.every_round(hs, fn_ptr(tick_tips), cast(*u8, 0));
+    settle();
+    let is *device.Window as nw = host.native(hs, main_w);
+    check("a window of Windows'", cast(i64, nw) != 0 && nw.backend == device.WIN32);
+    if (cast(i64, nw) == 0) { return 1; }
+    let is i64 as mh = nw.win32_win.hwnd;
+    u.SetWindowPos(mh, 0, 60, 60, 0, 0, cast(u32, wt.SWP_NOSIZE | wt.SWP_NOZORDER));
+    device.activate(nw);
+    settle();
+    device.position(nw, &wx, &wy);
+    sc = app.scale(ap, main_w);
+    let is f64 as win_h = 150.0;
+
+    // --- A menu taller than its window: past its edge, an item there chosen ---
+    click_at(mid_x(t, mb), mid_y(t, mb));
+    check("opened by a click: in a popup of its own", menu.is_open(t, m_long) == 1 && tree.surface_index(t, m_long) >= 0 && pops() == 1);
+    let is i64 as lx = hwnd_of_pop(t, m_long);
+    let is i64 as gx with mut = 0;
+    let is i64 as gy with mut = 0;
+    let is i64 as gw with mut = 0;
+    let is i64 as gh with mut = 0;
+    geometry(lx, &gx, &gy, &gw, &gh);
+    check("a popup's style, a tool window never activated, its window's", (style_of(lx) & wt.WS_POPUP) != 0 &&
+          (ex_of(lx) & wt.WS_EX_NOACTIVATE) != 0 && owner_of(lx) == mh);
+    check("grabbing: the capture its", grabbing_of(t, m_long) == 1 && u.GetCapture() == lx);
+    check("reaching past the window's edge", gy < wy || gy + gh > wy + cast(i64, win_h * sc));
+    let is math.rect.Rect as mr = tree.surface_rect(t, tree.surface_index(t, m_long));
+    check("where the tree says it is", gx == sx_of(mr.x) && gy == sy_of(mr.y));
+    check("painted: its colour inside it", shows(gx + gw / 2, gy + gh - 4, rgb(theme.palette.popover_bg)) == 1);
+    // An item past the window's edge: the first there is.
+    let is i64 as far with mut = 0;
+    let is i64 as fi with mut = 0;
+    while (far == 0 && fi < 20) {
+        let is math.rect.Rect as cand = layout.window_rect(t, tree.child_at(t, m_long, fi));
+        if (cand.y + cand.h <= 0.0 || cand.y >= win_h) { far = fi + 1; }
+        fi = fi + 1;
+    }
+    check("an item past the window's edge", far != 0);
+    let is math.rect.Rect as ir = layout.window_rect(t, tree.child_at(t, m_long, far - 1));
+    chosen = 0;
+    click_at(sx_of(ir.x + ir.w / 2.0), sy_of(ir.y + ir.h / 2.0));
+    check("chosen by a click there", chosen == far);
+    check("and closed, its window gone", menu.is_open(t, m_long) == 0 && pops() == 0 && tree.surface_index(t, m_long) < 0);
+
+    // --- A press on the desktop takes it down ---
+    let is i64 as was_closed = closed_n;
+    click_at(mid_x(t, mb), mid_y(t, mb));
+    check("open again", menu.is_open(t, m_long) == 1 && pops() == 1);
+    click_at(2, 2);
+    check("a press on the desktop: taken down", menu.is_open(t, m_long) == 0 && pops() == 0 && closed_n == was_closed + 1);
+
+    // --- A submenu, a popup of its menu's ---
+    click_at(mid_x(t, mb), mid_y(t, mb));
+    key(35);   // End: "More"
+    key(39);   // Right: its submenu, its first item chosen
+    check("a submenu: a second popup", menu.is_open(t, sub) == 1 && tree.surface_index(t, sub) >= 0 && pops() == 2);
+    check("its menu's, to the tree", tree.surface_owner(t, tree.surface_index(t, sub)) == tree.surface_index(t, m_long));
+    check("and to Windows", owner_of(hwnd_of_pop(t, sub)) == hwnd_of_pop(t, m_long));
+    let is i64 as sub2 = tree.child_at(t, sub, 1);
+    chosen = 0;
+    click_at(mid_x(t, sub2), mid_y(t, sub2));
+    check("a submenu's item chosen by a click", chosen == 102 && pops() == 0 && menu.is_open(t, m_long) == 0);
+
+    // --- A menu bar: the pointer onto another title opens that one ---
+    let is i64 as t_file = menubar.title(t, bar, 0);
+    let is i64 as t_edit = menubar.title(t, bar, 1);
+    click_at(mid_x(t, t_file), mid_y(t, t_file));
+    check("a title's menu up", menu.is_open(t, m_file) == 1 && tree.surface_index(t, m_file) >= 0);
+    move_to(mid_x(t, t_edit), mid_y(t, t_edit));
+    check("the pointer on the next title: its menu instead", menu.is_open(t, m_edit) == 1 && menu.is_open(t, m_file) == 0 &&
+          tree.surface_index(t, m_edit) >= 0 && pops() == 1);
+    key(27);   // Escape
+    check("closed by Escape", menu.is_open(t, m_edit) == 0 && pops() == 0);
+
+    // --- A combo box's list past the window's bottom, a row chosen there ---
+    click_at(mid_x(t, cb), mid_y(t, cb));
+    let is i64 as cpop = combo.popup_of(t, cb);
+    check("its list in a popup of its own", combo.is_open(t, cb) == 1 && tree.surface_index(t, cpop) >= 0);
+    let is i64 as cx = hwnd_of_pop(t, cpop);
+    geometry(cx, &gx, &gy, &gw, &gh);
+    check("past the window's bottom", gy + gh > wy + cast(i64, win_h * sc));
+    let is i64 as lv = combo.list_of(t, cb);
+    let is math.rect.Rect as lr = layout.window_rect(t, lv);
+    // The rows' height from the list's: row 8 near its bottom.
+    let is f64 as rh = lr.h / 8.0;
+    click_at(sx_of(lr.x + 10.0), sy_of(lr.y + lr.h - rh / 2.0));
+    check("a row there chosen", combo.is_open(t, cb) == 0 && combo.selected(t, cb) >= 6 && pops() == 0);
+
+    // --- A tooltip past the window's edge; a press on it what is beneath's ---
+    let is math.rect.Rect as tr = layout.window_rect(t, tipped);
+    move_to(sx_of(tr.x + tr.w / 2.0), sy_of(tr.y + tr.h / 2.0));
+    settle_for(900);
+    let is i64 as bubble = tooltip.shown(&tips);
+    check("a tooltip shown", bubble != 0 && tree.surface_index(t, bubble) >= 0 && pops() == 1);
+    let is i64 as tx = hwnd_of_pop(t, bubble);
+    check("transparent to the pointer", (ex_of(tx) & wt.WS_EX_TRANSPARENT) != 0);
+    geometry(tx, &gx, &gy, &gw, &gh);
+    check("past the window's edge", gx + gw > wx + cast(i64, 240.0 * sc));
+    check("painted in the tooltip's colour", shows(gx + gw - 6, gy + gh / 2, rgb(theme.palette.tooltip_bg)) == 1);
+    // A press on its part over the window: the button beneath's.
+    let is i64 as ux = gx + 4;
+    let is i64 as uy = gy + 4;
+    let is math.rect.Rect as ur = layout.window_rect(t, under);
+    check("part of it over the button under it", ux < wx + cast(i64, (ur.x + ur.w) * sc) && uy >= sy_of(ur.y) &&
+          uy < sy_of(ur.y + ur.h));
+    unders = 0;
+    click_at(ux, uy);
+    check("a press on it: the button's beneath", unders == 1);
+    settle();
+    check("and it hidden by the press", tooltip.shown(&tips) == 0);
+
+    // --- A popover points at its button ---
+    move_to(2, 2);
+    settle();
+    click_at(mid_x(t, pb), mid_y(t, pb));
+    check("a popover in a popup of its own", popup.is_open(t, pop) == 1 && tree.surface_index(t, pop) >= 0);
+    check("its arrow towards its button", popup.arrow_side(t, pop) == positioner.TOP);
+    check("its first control focused", router.focused(t, r) == inside);
+    let is math.rect.Rect as frame = popup.placed(t, pop);
+    let is math.rect.Rect as pbr = layout.window_rect(t, pb);
+    check("its frame below its button", frame.y >= pbr.y + pbr.h - 1.0);
+    check("painted: its colour round what it holds", shows(sx_of(frame.x + 3.0), sy_of(frame.y + frame.h - 3.0),
+          rgb(theme.palette.popover_bg)) == 1);
+    key(27);
+    check("closed by Escape, the focus back", popup.is_open(t, pop) == 0 && pops() == 0);
+
+    tooltip.close(&tips);
+    program.close(&prog);
+    if (fails == 0) {
+        io.printf("host popups win32: all checks passed\n");
+        return 0;
+    }
+    io.printf("host popups win32: %d failures\n", fails);
+    return 1;
+}
