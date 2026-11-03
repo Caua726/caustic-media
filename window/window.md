@@ -702,6 +702,16 @@ where said:
   on Windows the system's style is kept with its frame taken into the client
   and DWM's shadow and corners (`win32/win32.md`), its own maximize button
   told the system (`set_maximize_button`) for the snap layouts.
+- A dialog's window (`Config.owner`, `dialog`, `modal`; `set_modal` once
+  open): above its owner and transient for it, a dialog to the window manager;
+  modal, its owner waits — `_NET_WM_STATE_MODAL` on X11, `xdg_dialog_v1`'s
+  modal on Wayland (which needs a parent), the owner disabled on Windows.
+  Modal with no owner it is the whole program's: on X11 transient for the root,
+  every window of the program in one group (WM_HINTS window_group, led by a
+  never-mapped window of the connection's own), which EWMH reads as modal over
+  the group. `set_blocked` tells Windows that a window waits on a modal of the
+  program's — disabled, the system beeping at a press on it and bringing the
+  modal forward — and is 0 elsewhere, where the program keeps the input from it.
 - The smallest and largest a window may be made (`set_min_size`, `min_size`,
   `set_max_size`): asked again whenever they change — what a layout cannot
   fit into changes after the window is open — as `WM_NORMAL_HINTS`, floor and
