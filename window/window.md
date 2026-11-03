@@ -634,7 +634,12 @@ where said:
   beneath gets it, or a grab takes the popup down — the same on all three. A
   tooltip takes no input at all: its presses go through it to whatever is
   beneath, another program's too (an empty input shape, an empty
-  `wl_region`, `WS_EX_TRANSPARENT`). Tested by `popup_x11_test` (XTest, a second
+  `wl_region`, `WS_EX_TRANSPARENT`). A popup's scale (`scale_120`) is its
+  own: its owner's where it opens, the output's or monitor's it lands on as
+  it moves — a Wayland surface entering an output of another scale, a
+  Windows popup told `WM_DPICHANGED` — with `RESIZE` and `SETTINGS` as a
+  window has them; X11's one DPI is every window's. Its positioner and
+  `popup_rect` stay in the owner's physical pixels. Tested by `popup_x11_test` (XTest, a second
   client checking type, owner and grab), `popup_wayland_test` (kiosk Weston,
   headless and seated with XTest) and `popup_win32_test` (SendInput, isolated
   Wine, 96 and 144 dpi).

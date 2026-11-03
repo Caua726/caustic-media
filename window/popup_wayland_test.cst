@@ -11,6 +11,11 @@
 //       sh window/wayland/tools/run_wayland.sh ./build/popup_wayland_test seated
 // a press gives the serial a grab is asked under, the popup takes the keys,
 // its own presses are its, and a press outside takes it down (popup_done).
+// With WESTON_SCALE=2 the popup is at its owner's scale, its numbers the
+// owner's physical pixels. With "scales", on two outputs at scales 1 and 2
+// (testdata/two-scales.ini, WESTON_OUTPUTS=2, the desktop shell), the owner
+// is dragged with a popup open from the first to the second, and the popup
+// takes the new scale with it.
 use "std/io.cst" as io;
 use "std/env.cst" as env;
 use "std/time.cst" as time;
@@ -167,9 +172,160 @@ fn key_a() as void {
     xlib.XFlush(xd);
 }
 
+fn pixel(x as i64, y as i64) as i64 {
+    let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, x), cast(i32, y), cast(u32, 1), cast(u32, 1), 0 - 1, 2);
+    if (cast(i64, img) == 0) { return 0 - 1; }
+    let is i64 as v = xlib.XGetPixel(img, 0, 0) & 16777215;
+    xlib.XDestroyImage(img);
+    return v;
+}
+
+// The X window Weston shows the output named name in.
+fn output_window(name as *u8) as i64 {
+    let is i64 as root_ret with mut = 0;
+    let is i64 as parent_ret with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is i32 as n with mut = 0;
+    xlib.XQueryTree(xd, xlib.XDefaultRootWindow(xd), cast(*u8, &root_ret), cast(*u8, &parent_ret), cast(*u8, &kids), cast(*u8, &n));
+    let is i64 as found with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n && found == 0) {
+        let is *u8 as title with mut = cast(*u8, 0);
+        let is i64 as ty with mut = 0;
+        let is i32 as fmt with mut = 0;
+        let is i64 as k with mut = 0;
+        let is i64 as after with mut = 0;
+        xlib.XGetWindowProperty(xd, kids[i], xlib.XInternAtom(xd, "_NET_WM_NAME", 0), 0, 64, 0, 0, cast(*u8, &ty),
+                                cast(*u8, &fmt), cast(*u8, &k), cast(*u8, &after), cast(*u8, &title));
+        if (cast(i64, title) != 0) {
+            let is i64 as m with mut = 0;
+            while (name[m] != 0) { m = m + 1; }
+            if (k >= m && title[k - m] == name[0] && title[k - 1] == name[m - 1]) { found = kids[i]; }
+            xlib.XFree(title);
+        }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+// Whether owner and popup both reach scale120 within three seconds, the
+// popup pw physical pixels of its own wide.
+fn until_scale(scale120 as i32, pw as i64) as i32 {
+    let is i64 as until = time.now_ms() + 3000;
+    while (time.now_ms() < until) {
+        pump_all();
+        if (device.scale_120(&owner) == scale120 && device.scale_120(&menu) == scale120 && device.width(&menu) == pw) { return 1; }
+        time.sleep_ms(10);
+    }
+    io.printf("  scales %d and %d, popup %d wide\n", device.scale_120(&owner), device.scale_120(&menu), device.width(&menu));
+    return 0;
+}
+
+let is u32 as BLUE with imut = 4294901760;
+let is i64 as X_BLUE with imut = 255;
+
+// The owner dragged, a popup of its open, from an output at scale 1 to one
+// at scale 2.
+fn scales() as void {
+    let is i64 as x2 = output_window("X2");
+    check("the second output's window", x2 != 0 && output_window("X1") != 0);
+    xlib.XMoveWindow(xd, x2, 640, 0);
+    xlib.XSync(xd, 0);
+    let is i32 as tries with mut = 0;
+    let is i32 as placed with mut = 0;
+    while (tries < 3 && placed == 0) {
+        XTestFakeMotionEvent(xd, 0 - 1, 320, 240, cast(u64, 0));
+        xlib.XFlush(xd);
+        time.sleep_ms(200);
+        owner = device.open("owner", 300, 200);
+        if (device.is_open(&owner) == 0) { io.printf("FAIL: no owner\n"); fails = fails + 1; return; }
+        show(&owner, BLUE);
+        settle(400);
+        if (device.scale_120(&owner) == 120) { placed = 1; } else { device.close(&owner); }
+        tries = tries + 1;
+    }
+    check("the owner on the first output", placed == 1);
+    if (placed == 0) { return; }
+    // A list, no grab: the owner can still be pressed on and moved.
+    let is device.Config as lc with mut = popup_config(device.POPUP_LIST, 0, 100, 60, math.rect.rect(20.0, 20.0, 10.0, 10.0),
+                                                       positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
+    menu = device.open_config(&lc);
+    show(&menu, cast(u32, 4278190335));
+    check("the popup at the first output's scale", until_scale(120, 100) == 1);
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    let is i64 as pw with mut = 0;
+    let is i64 as ph with mut = 0;
+    check("its rectangle at scale 1", device.popup_rect(&menu, &px, &py, &pw, &ph) == 1 && px == 30 && py == 30 &&
+          pw == 100 && ph == 60);
+    // Where the shell put the owner: its top left, BLUE, on the first output.
+    let is i64 as ox with mut = 0 - 1;
+    let is i64 as oy with mut = 0 - 1;
+    let is i64 as until = time.now_ms() + 2000;
+    while (ox < 0 && time.now_ms() < until) {
+        pump_all();
+        let is i64 as y with mut = 0;
+        while (y < 480 && ox < 0) {
+            let is i64 as x with mut = 0;
+            while (x < 640 && ox < 0) {
+                if (pixel(x, y) == X_BLUE) { ox = x; oy = y; }
+                x = x + 8;
+            }
+            y = y + 8;
+        }
+        time.sleep_ms(20);
+    }
+    while (ox > 0 && pixel(ox - 1, oy) == X_BLUE) { ox = ox - 1; }
+    while (oy > 0 && pixel(ox, oy - 1) == X_BLUE) { oy = oy - 1; }
+    check("the owner shown on the first output", ox >= 0);
+    // Pressed by its left edge, clear of the popup, and dragged so that both
+    // land wholly on the second output.
+    XTestFakeMotionEvent(xd, 0 - 1, cast(i32, ox + 10), cast(i32, oy + 150), cast(u64, 0));
+    xlib.XFlush(xd);
+    settle(200);
+    XTestFakeButtonEvent(xd, cast(u32, 1), 1, cast(u64, 0));
+    xlib.XFlush(xd);
+    let is ie.Event as in;
+    check("pressed", next_input(&owner, ie.BUTTON_DOWN, &in) == 1);
+    check("a move asked", device.begin_move_resize(&owner, 10, 150, device.MOVE, 1) == 1);
+    let is i64 as step with mut = 1;
+    while (step <= 10) {
+        // To root 760, 300 — the second output's window pixel 120, 300:
+        // logical 700, 150, the owner's top left at 690, 0.
+        let is i64 as tx = ox + 10 + (760 - (ox + 10)) * step / 10;
+        let is i64 as ty = oy + 150 + (300 - (oy + 150)) * step / 10;
+        XTestFakeMotionEvent(xd, 0 - 1, cast(i32, tx), cast(i32, ty), cast(u64, 0));
+        xlib.XFlush(xd);
+        settle(30);
+        step = step + 1;
+    }
+    XTestFakeButtonEvent(xd, cast(u32, 1), 0, cast(u64, 0));
+    xlib.XFlush(xd);
+    drain_events(&menu);
+    check("moved to the second output: the popup at its scale with it", until_scale(240, 200) == 1);
+    check("its buffer at it", device.width(&menu) == 200 && device.height(&menu) == 120);
+    check("its rectangle in the owner's pixels at scale 2", device.popup_rect(&menu, &px, &py, &pw, &ph) == 1 && px == 60 &&
+          py == 60 && pw == 200 && ph == 120);
+    device.close(&menu);
+    menu.ok = 0;
+    device.close(&owner);
+}
+
 fn main(argc as i64, argv as *u8) as i32 {
     env.init(argc, argv);
     let is i32 as seated = cast(i32, env.argc() > 1);
+    if (env.argc() > 1 && env.argv(1)[0] == cast(u8, 115) && env.argv(1)[1] == cast(u8, 99)) {
+        xd = xlib.XOpenDisplay(cast(*u8, 0));
+        if (cast(i64, xd) == 0) { io.printf("FAIL: no X screen\n"); return 1; }
+        menu.ok = 0;
+        sub.ok = 0;
+        scales();
+        xlib.XCloseDisplay(xd);
+        if (fails == 0) { io.printf("window popups wayland across scales: all checks passed\n"); return 0; }
+        io.printf("window popups wayland across scales: %d failures\n", fails);
+        return 1;
+    }
     menu.ok = 0;
     sub.ok = 0;
     owner = device.open("owner", 400, 300);
@@ -177,7 +333,9 @@ fn main(argc as i64, argv as *u8) as i32 {
     show(&owner, cast(u32, 4282400832));
     let is i64 as ow = device.width(&owner);
     let is i64 as oh = device.height(&owner);
-    check("the kiosk's owner fills the output", ow == 1280 && oh == 1024);
+    // The output is 1280 by 1024 logical pixels: physical ones at its scale.
+    let is i64 as k = cast(i64, device.scale_120(&owner)) / 120;
+    check("the kiosk's owner fills the output", ow == 1280 * k && oh == 1024 * k);
 
     // --- No owner, no popup ---
     let is device.Config as orphan with mut = popup_config(device.POPUP_MENU, 0, 100, 80, math.rect.rect(0.0, 0.0, 10.0, 10.0),
@@ -187,7 +345,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     check("a popup needs an owner", device.is_open(&none) == 0 && device.last_error(&none) == device.BAD_ARGUMENT);
 
     // --- Placed by the compositor: flipped at the output's corner ---
-    let is device.Config as mc with mut = popup_config(device.POPUP_MENU, 0, 200, 150, math.rect.rect(1200.0, 950.0, 20.0, 20.0),
+    let is device.Config as mc with mut = popup_config(device.POPUP_MENU, 0, 200, 150,
+                                                       math.rect.rect(cast(f64, ow - 80), cast(f64, oh - 74), 20.0, 20.0),
                                                        positioner.BOTTOM_RIGHT, positioner.BOTTOM_RIGHT);
     menu = device.open_config(&mc);
     check("a popup opens", device.is_open(&menu) == 1);
@@ -197,8 +356,9 @@ fn main(argc as i64, argv as *u8) as i32 {
     let is i64 as py with mut = 0;
     check("placed as the toolkit's positioner places it", device.popup_position(&menu, &px, &py) == 1 &&
           px == cast(i64, want.x) && py == cast(i64, want.y));
-    check("flipped above and to the left of its anchor", px + 200 <= 1200 && py + 150 <= 950);
+    check("flipped above and to the left of its anchor", px + 200 <= ow - 80 && py + 150 <= oh - 74);
     check("the size asked", device.width(&menu) == 200 && device.height(&menu) == 150);
+    check("at its owner's scale", device.scale_120(&menu) == device.scale_120(&owner));
     check("seen through, as every Wayland surface can be", device.transparent(&menu) == 1);
 
     // Slid back inside where flipping would not fit either.
