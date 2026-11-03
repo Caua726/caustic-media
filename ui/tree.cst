@@ -20,6 +20,8 @@ use "style.cst" as style;
 use "tree_state.cst" as tst;
 use "tree_draw.cst" as tdraw;
 use "tree_lent.cst" as tlent;
+use "tree_surface.cst" as tsurf;
+use "../window/positioner.cst" as positioner;
 
 // What the parts declare, under the names it always had here.
 let is i32 as OK with imut = tst.OK;
@@ -202,6 +204,10 @@ fn open(l as *tst.Limits) as tst.Tree {
     t.watch_user = cast(*u8, 0);
     t.text_change = cast(*tst.TextChange, 0);
     t.language = 0;
+    t.surfaces = cast(*u8, 0);
+    t.surf_fn = cast(tst.SurfaceFn, 0);
+    t.surf_user = cast(*u8, 0);
+    t.shift_surf = 0 - 1;
     t.cap = 0;
     t.live = 0;
     t.next_free = 0;
@@ -221,7 +227,8 @@ fn open(l as *tst.Limits) as tst.Tree {
     if (l.connections < 0) { t.err = BAD_ARGUMENT; return t; }
     t.conn_cap = l.connections;
     let is i64 as conn_bytes = t.conn_cap * sizeof(tst.Connection);
-    let is i64 as total = node_bytes + data_bytes + t.scratch_bytes + conn_bytes;
+    let is i64 as surface_bytes = tst.MAX_SURFACES * sizeof(tst.Surface);
+    let is i64 as total = node_bytes + data_bytes + t.scratch_bytes + conn_bytes + surface_bytes;
     let is *u8 as block = mem.core.mmap_anon(total);
     if (cast(i64, block) == 0) { t.err = OUT_OF_MEMORY; return t; }
     mem.core.memzero(block, total);
@@ -231,6 +238,7 @@ fn open(l as *tst.Limits) as tst.Tree {
     t.data = cast(*u8, cast(i64, block) + node_bytes);
     t.scratch = cast(*u8, cast(i64, block) + node_bytes + data_bytes);
     t.conns = cast(*u8, cast(i64, t.scratch) + t.scratch_bytes);
+    t.surfaces = cast(*u8, cast(i64, t.conns) + conn_bytes);
 
     // Eras start at 1 so the null handle can never match slot 0.
     let is i64 as i with mut = 0;
@@ -352,8 +360,10 @@ fn _release(t as *tst.Tree, i as i64) as void {
     let is *tst.Node as n = tst._node(t, i);
     // Where it was is uncovered now. Every node of a destroyed subtree adds its
     // own: a child is normally inside its parent and adds nothing, but not
-    // always.
-    tdraw.damage_add(t, &n.painted);
+    // always. In the window, or in the surface it is drawn in.
+    tdraw.damage_add_to(t, tsurf.surface_of_slot(t, i), &n.painted);
+    // A widget shown in a window of its own: that window goes with it.
+    tsurf.close(t, tst._handle(t, i));
     if (n.layer > 0) { t.layered = t.layered - 1; }
     n.layer = 0;
     if (cast(i64, n.kind) != 0 && cast(i64, n.kind.destroy) != 0) {
@@ -512,6 +522,9 @@ fn insert(t as *tst.Tree, w as i64, parent as i64, before as i64) as i32 {
     let is i64 as b = _place_of(t, p, before);
     if (b == 0 - 2) { return 0; }
     if (b == i) { return 1; }
+    // Shown in a window of its own as a child of the root: moved anywhere
+    // else, it is shown inside the window again.
+    if (p != t.root) { surface_close(t, w); }
     let is i64 as old = tst._node(t, i).parent;
     tlent.notify(t, w, WATCH_REMOVED);
     _unlink(t, i);
@@ -939,7 +952,7 @@ fn set_layer(t as *tst.Tree, w as i64, layer as i64) as void {
     if (layer > 0) { t.layered = t.layered + 1; }
     n.layer = layer;
     // Where it was drawn under the old clip, and the whole of it under the new.
-    tdraw.damage_add(t, &n.painted);
+    tdraw.damage_add_to(t, tsurf.surface_of_slot(t, i), &n.painted);
     _mark_paint(t, i);
     n.placed = math.rect.rect_zero();
     // On a layer it floats: what holds it measures without it.
@@ -999,7 +1012,7 @@ fn set_opacity(t as *tst.Tree, w as i64, a as f64) as void {
     if (n.opacity >= 1.0) { n.flags = n.flags | F_CACHE_DIRTY; }
     n.opacity = v;
     if (n.parent != 0 - 1) { _stale_from(t, n.parent); }
-    tdraw.damage_add(t, &n.painted);
+    tdraw.damage_add_to(t, tsurf.surface_of_slot(t, i), &n.painted);
 }
 
 // --- Walking the tree ---
@@ -1066,6 +1079,92 @@ fn layer(t as *Tree, w as i64) as i64 { return tdraw.layer(t, w); }
 // How many widgets are on a layer above 0; with none, painting and
 // hit-testing skip looking for them.
 fn layered_count(t as *Tree) as i64 { return tdraw.layered_count(t); }
+
+// --- Surfaces ---
+//
+// A child of the root on a layer — a menu, a list dropping down, a tooltip —
+// shown in a platform window of its own, a popup that can reach past the
+// window's edges, while it stays a widget of this tree: tree_state.cst says
+// how. The host lends the function it is asked through (set_surfaces); with
+// none, every widget stays inside the window, as a tree starts.
+let is i64 as MAX_SURFACES with imut = tst.MAX_SURFACES;
+let is i32 as SURFACE_MENU    with imut = tst.SURFACE_MENU;
+let is i32 as SURFACE_LIST    with imut = tst.SURFACE_LIST;
+let is i32 as SURFACE_TOOLTIP with imut = tst.SURFACE_TOOLTIP;
+let is i32 as SURFACE_OPEN  with imut = tst.SURFACE_OPEN;
+let is i32 as SURFACE_MOVE  with imut = tst.SURFACE_MOVE;
+let is i32 as SURFACE_CLOSE with imut = tst.SURFACE_CLOSE;
+type SurfaceFn = tst.SurfaceFn;
+
+fn set_surfaces(t as *Tree, cb as SurfaceFn, user as *u8) as void { tsurf.set_surfaces(t, cb, user); }
+fn has_surfaces(t as *Tree) as i32 { return tsurf.has_surfaces(t); }
+
+// w shown in a window of its own — see tree_surface.cst's open — laid out
+// and painted there from now on: its surface, or -1 when it stays in the
+// window.
+fn surface_open(t as *Tree, w as i64, kind as i32, grab as i32, from as i64, place as *positioner.Positioner) as i64 {
+    let is i64 as i = tst._index(t, w);
+    if (i < 0) { return 0 - 1; }
+    let is i32 as was_in = cast(i32, tsurf.index(t, w) < 0);
+    let is math.rect.Rect as had = tst._node(t, i).painted;
+    let is i64 as s = tsurf.open(t, w, kind, grab, from, place);
+    if (s < 0) { return s; }
+    // Painted inside the window until now: the window shows what was under it.
+    if (was_in == 1) { tdraw.damage_add(t, &had); }
+    invalidate_layout(t, w);
+    invalidate_paint_subtree(t, w);
+    return s;
+}
+
+// Its window put away; shown again, it is inside the window.
+fn surface_close(t as *Tree, w as i64) as void {
+    if (tsurf.close(t, w) == 0) { return; }
+    invalidate_layout(t, w);
+    invalidate_paint_subtree(t, w);
+}
+
+// The surface w is the widget of, -1 for none.
+fn surface_index(t as *Tree, w as i64) as i64 { return tsurf.index(t, w); }
+// The surface w is drawn in, -1 for the window.
+fn surface_of(t as *Tree, w as i64) as i64 { return tsurf.surface_of(t, w); }
+fn surface_widget(t as *Tree, s as i64) as i64 { return tsurf.widget(t, s); }
+fn surface_kind(t as *Tree, s as i64) as i32 { return tsurf.kind(t, s); }
+fn surface_grab(t as *Tree, s as i64) as i32 { return tsurf.grab(t, s); }
+// The surface it opened against, -1 for the window.
+fn surface_owner(t as *Tree, s as i64) as i64 { return tsurf.owner(t, s); }
+// Against what of the window — its anchor rectangle in window coordinates,
+// logical pixels — and how, its size the widget's own.
+fn surface_place(t as *Tree, s as i64) as positioner.Positioner { return tsurf.place(t, s); }
+// Where the platform put it, window coordinates: outside the window, larger
+// than it, as the platform allows.
+fn surface_rect(t as *Tree, s as i64) as math.rect.Rect { return tsurf.rect(t, s); }
+// The host says where it went; laid out and painted there.
+fn surface_set_rect(t as *Tree, s as i64, r as math.rect.Rect) as void {
+    if (tsurf.set_rect(t, s, r) == 0) { return; }
+    let is i64 as w = tsurf.widget(t, s);
+    invalidate_layout(t, w);
+    invalidate_paint_subtree(t, w);
+}
+fn surface_native(t as *Tree, s as i64) as i64 { return tsurf.native(t, s); }
+fn surface_set_native(t as *Tree, s as i64, n as i64) as void { tsurf.set_native(t, s, n); }
+// Whether what it leaves unpainted shows what is behind it — rounded
+// corners, a shadow — as the host says its window allows.
+fn surface_see_through(t as *Tree, s as i64) as i32 { return tsurf.see_through(t, s); }
+fn surface_set_see_through(t as *Tree, s as i64, on as i32) as void {
+    if (tsurf.widget(t, s) == 0 || tsurf.see_through(t, s) == on) { return; }
+    tsurf.set_see_through(t, s, on);
+    invalidate_layout(t, tsurf.widget(t, s));
+    invalidate_paint_subtree(t, tsurf.widget(t, s));
+}
+
+// Surface s's own damage region, as the window's is: window coordinates.
+fn surface_damage_count(t as *Tree, s as i64) as i64 { return tdraw.surface_damage_count(t, s); }
+fn surface_damage_at(t as *Tree, s as i64, i as i64) as math.rect.Rect { return tdraw.surface_damage_at(t, s, i); }
+fn surface_damage_clip(t as *Tree, s as i64, r as math.rect.Rect) as void { tdraw.surface_damage_clip(t, s, r); }
+// r to repaint in surface s — the window for -1.
+fn damage_add_to(t as *Tree, s as i64, r as *math.rect.Rect) as void { tdraw.damage_add_to(t, s, r); }
+// r to repaint wherever w is drawn.
+fn damage_add_for(t as *Tree, w as i64, r as *math.rect.Rect) as void { tdraw.damage_add_to(t, tsurf.surface_of(t, w), r); }
 fn text_service(t as *Tree) as *u8 { return tlent.text_service(t); }
 
 // The window's animator (anim.cst), for widgets that move on their own — a
