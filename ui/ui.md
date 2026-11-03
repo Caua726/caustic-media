@@ -405,6 +405,41 @@ a window forward, as a later start of the program asks (`instance.cst`),
 with the token that start came with (`instance.token`): an xdg-activation
 token on Wayland, a startup ID on X11 (its feedback ended, its click's time
 given to the window manager).
+What goes on the clipboard or in a drag beyond text is `ui/clip.cst`'s `Content`:
+text, HTML, an image's pixels or a PNG's bytes, files and a program's own types by
+MIME name, each its bytes or made on demand by the program's provider, which then
+stays the program's to keep while the clipboard is its own. `tree.copy_content`
+gives it to the host, `host_clip.cst`, which keeps a copy per window and selection
+and puts it on the platform as `transfer.Offer`, with what the platform wants beside
+it: the image's PNG, encoded when first asked for and once, and on Windows the DIB
+made from that PNG. A paste says the formats it takes (`tree.request_paste_as`): the
+host asks the clipboard which it has and fetches the first of them in a fixed
+order — the program's own type, HTML, an image, text — so that a widget is never
+handed a format it did not ask for, and an image only there as CF_DIBV5 comes as
+a PNG. A text field asks `clip.PLAIN`: the clipboard's text, or the text of its HTML
+when that is all it has (`clip.html_text`); and its Paste is enabled by
+`tree.clipboard_has`, which is what the last `CLIPBOARD_CHANGED` said — anything,
+until the platform has said. A program outside any widget has
+`app.clipboard_set`, `app.clipboard_get` (the answer later, one at a time) and
+`app.on_clipboard_changed`, all through the active window.
+
+A drag is the router's while the pointer is over the program's windows and the
+platform's after: `host_drag.cst` shows its image — the program's (`dnd.set_image`),
+none (`dnd.set_no_image`), or by default the widget it began from, or the part of
+it `dnd.set_image_rect` says, painted once into a texture, read back and made
+see-through — as a widget above everything in the window the pointer is over, and
+the moment the pointer leaves them all it hands the drag over (`device.drag_begin`),
+if it carries anything but an item of a widget here. That keeps the program's own
+drags, across its windows too, in the router, with no round trip through the
+platform and no dependence on a platform's modal loop; on Windows `DoDragDrop` runs
+to its end inside that one call. Back over a window of the program's the platform says
+`DND_*` as for any drag; the host knows it for its own and runs it from what it
+carries, not from what the platform would bring, and its source hears `DRAG_END` when
+the platform says it ended. From another program, what it offers is said as `dnd`
+bits, and what a widget returns from `DRAG_OVER` becomes the format the platform is
+told to bring, a named type by `dnd.take_named`; the target reads any of it with
+`dnd.bytes_of`. A list's or table's rows go out by `set_drag_content`.
+
 The clipboard and the primary selection are the platform's through the
 trees' `set_clipboard` and `set_paste`: copied text goes out as an offer,
 a paste asks for text and is answered when it comes, however large; a drop

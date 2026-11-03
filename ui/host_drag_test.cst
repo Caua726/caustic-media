@@ -1,0 +1,633 @@
+// ui/host_drag_test.cst — a drag of the toolkit's between the program and
+// another: GTK 3 (window/tools/gtk_dnd_peer.py) on X11 and on a KWin of its own,
+// window/win32/tools/ole_dnd_peer.c on Windows; the pointer XTest's, KWin's fake
+// input, SendInput's, from a thread of its own — on Windows a drag out runs to
+// its end inside the program's loop:
+//   sh window/x11/tools/run_headless.sh ./build/host_drag_test
+//   sh window/wayland/tools/run_kwin.sh ./build/host_drag_test
+//   sh window/win32/tools/run_ole_dnd.sh build/ole_dnd_peer.exe build/host_drag_test.exe types
+//
+// A widget's drag shows its image over the window, the widget painted see-through,
+// or the program's, or none. Past the window's edge it is the platform's, the
+// content going to what takes it there, its source told what was done. Back over
+// a window of the program's it runs from what it carries; an item of a widget
+// goes nowhere else; a list's rows go out as their content. Into the program:
+// another program's HTML, PNG and own type taken by what asks for them.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os.cst" as os;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/thread.cst" as thread;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "../math/math.cst" as math;
+use "../sys/file.cst" as file;
+use "../sys/linux.cst" as sys;
+use "../input/event.cst" as ie;
+use "../window/device.cst" as device;
+use "../window/x11/x11.cst" as x11;
+use "../window/x11/bind/xlib.cst" as xlib;
+use "../window/win32/bind/types.cst" as wt;
+use "../window/win32/bind/user32.cst" as u;
+use "../window/wayland/kwin_input.cst" as kwin_input;
+use "../text/fonts/chain.cst" as chain;
+use "system_fonts.cst" as system_fonts;
+use "program.cst" as program;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "event.cst" as event;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "router.cst" as router;
+use "app.cst" as app;
+use "host.cst" as host;
+use "host_state.cst" as hst;
+use "model.cst" as model;
+use "clip.cst" as clip;
+use "dnd.cst" as dnd;
+use "painter.cst" as painter;
+use "../render/shapes2d.cst" as shapes;
+use "widgets/listview.cst" as listview;
+
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeButtonEvent(display as *u8, button as u32, is_press as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is *host.Host as hs with mut;
+let is program.Program as prog with mut;
+let is *device.Window as dw with mut;
+let is *hst.Native as nat with mut;
+
+fn step_for(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) { host.step(hs, 5); }
+}
+
+fn on_windows() as i32 { return cast(i32, os.current() == os.OS_WINDOWS); }
+fn on_wayland() as i32 { return cast(i32, on_windows() == 0 && dw.backend == device.WAYLAND); }
+fn on_x11() as i32 { return cast(i32, on_windows() == 0 && dw.backend == device.X11); }
+
+// --- The user, on a thread of its own ---
+
+let is *u8 as xd with mut;
+
+fn user_move(x as i64, y as i64) as void {
+    if (on_windows() == 1) {
+        _mouse(x, y, 0);
+    } else if (on_wayland() == 1) {
+        kwin_input.move(cast(f64, x), cast(f64, y));
+    } else {
+        _x_move(x, y);
+    }
+}
+
+fn _x_move(x as i64, y as i64) as void {
+    XTestFakeMotionEvent(xd, 0 - 1, cast(i32, x), cast(i32, y), cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+fn _x_button(down as i32) as void {
+    XTestFakeButtonEvent(xd, cast(u32, 1), down, cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+fn _mouse(x as i64, y as i64, flags as i64) as void {
+    let is wt.INPUT as in;
+    mem.memzero(cast(*u8, &in), sizeof(wt.INPUT));
+    in.c_type = cast(u32, wt.INPUT_MOUSE);
+    let is *wt.MOUSEINPUT as m = cast(*wt.MOUSEINPUT, &in._anon1);
+    let is i64 as sw = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CXSCREEN)));
+    let is i64 as sh = cast(i64, u.GetSystemMetrics(cast(i32, wt.SM_CYSCREEN)));
+    m.dx = cast(i32, (x * 65536 + sw - 1) / sw);
+    m.dy = cast(i32, (y * 65536 + sh - 1) / sh);
+    m.dwFlags = cast(u32, flags | wt.MOUSEEVENTF_ABSOLUTE | wt.MOUSEEVENTF_MOVE);
+    u.SendInput(1, &in, cast(i32, sizeof(wt.INPUT)));
+}
+
+fn user_button(x as i64, y as i64, down as i32) as void {
+    if (on_windows() == 1) {
+        let is i64 as f with mut = wt.MOUSEEVENTF_LEFTUP;
+        if (down == 1) { f = wt.MOUSEEVENTF_LEFTDOWN; }
+        _mouse(x, y, f);
+    } else if (on_wayland() == 1) {
+        kwin_input.button(kwin_input.BTN_LEFT, down);
+    } else {
+        _x_button(down);
+    }
+}
+
+fn glide(x0 as i64, y0 as i64, x1 as i64, y1 as i64) as void {
+    let is i64 as k with mut = 1;
+    while (k <= 20) {
+        user_move(x0 + (x1 - x0) * k / 20, y0 + (y1 - y0) * k / 20);
+        time.sleep_ms(20);
+        k = k + 1;
+    }
+}
+
+// A path the thread goes along: pressed at the first point, on past the
+// threshold to the second, there waiting for the program to look; on to the
+// third, waiting again if asked; to the fourth, and let go. Moves between
+// programs are the platform's, so nothing the thread does waits on the host.
+struct Path {
+    x as [4]i64;
+    y as [4]i64;
+    hold_at_third as i32;
+    _pad as i32;
+}
+
+let is Path as path with mut;
+let is i32 as at with mut = 0;    // how far it has got: 1 at the second point, 2 at the third, 3 let go
+let is i32 as go with mut = 0;    // the program has looked, how far it may go on: 1 past the second, 2 past the third
+
+fn walker(arg as i64) as i64 {
+    user_move(path.x[0], path.y[0]);
+    time.sleep_ms(250);
+    user_button(path.x[0], path.y[0], 1);
+    time.sleep_ms(150);
+    glide(path.x[0], path.y[0], path.x[1], path.y[1]);
+    time.sleep_ms(100);
+    at = 1;
+    while (go < 1) { time.sleep_ms(5); }
+    glide(path.x[1], path.y[1], path.x[2], path.y[2]);
+    time.sleep_ms(100);
+    at = 2;
+    if (path.hold_at_third == 1) {
+        while (go < 2) { time.sleep_ms(5); }
+    }
+    glide(path.x[2], path.y[2], path.x[3], path.y[3]);
+    time.sleep_ms(100);
+    user_button(path.x[3], path.y[3], 0);
+    time.sleep_ms(100);
+    at = 3;
+    return 0;
+}
+
+let is thread.Thread as walking with mut;
+
+fn walk(x0 as i64, y0 as i64, x1 as i64, y1 as i64, x2 as i64, y2 as i64, x3 as i64, y3 as i64, hold as i32) as void {
+    path.x[0] = x0; path.y[0] = y0;
+    path.x[1] = x1; path.y[1] = y1;
+    path.x[2] = x2; path.y[2] = y2;
+    path.x[3] = x3; path.y[3] = y3;
+    path.hold_at_third = hold;
+    at = 0;
+    go = 0;
+    thread.spawn(&walking, cast(*u8, fn_ptr(walker)), 0);
+}
+
+fn until_at(k as i32) as i32 {
+    let is i64 as until = time.now_ms() + 15000;
+    while (at < k && time.now_ms() < until) { host.step(hs, 5); }
+    step_for(50);
+    return cast(i32, at >= k);
+}
+
+fn walked() as void {
+    until_at(3);
+    thread.join(&walking);
+    step_for(300);
+}
+
+// --- The other program ---
+
+let is i64 as peer with mut = 0;
+
+fn log_read(out as *u8, cap as i64) as i64 {
+    if (on_windows() == 1) { return file.read("build\\ole-peer.log", out, cap); }
+    return file.read("build/dnd-peer.log", out, cap);
+}
+
+fn log_has(s as *u8, ms as i64) as i32 {
+    let is [65536]u8 as b;
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        step_for(20);
+        let is i64 as got = log_read(&b[0], 65536);
+        let is i64 as i with mut = 0;
+        while (i + n <= got) {
+            if (mem.memcmp(cast(*u8, cast(i64, &b[0]) + i), s, n) == 0) { return 1; }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+fn run_sh(cmd as *u8) as i32 {
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd); argv[3] = 0;
+    let is i64 as pid = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (pid <= 0) { return 0 - 1; }
+    let is i32 as status with mut = 0;
+    let is i64 as until = time.now_ms() + 20000;
+    while (time.now_ms() < until) {
+        host.step(hs, 2);
+        if (linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) { return process.exit_code_of(status); }
+    }
+    return 0 - 1;
+}
+
+// The GTK peer started (on Windows the run script has done it, once).
+fn start_peer(args as *u8) as i32 {
+    if (on_windows() == 1) { return 1; }
+    let is [512]u8 as cmd with mut;
+    let is *u8 as head with mut = "rm -f build/dnd-peer.log.*; exec env NO_AT_BRIDGE=1 GTK_MODULES= XDG_CONFIG_HOME=/nonexistent python3 window/tools/gtk_dnd_peer.py ";
+    if (on_wayland() == 1) { head = "rm -f build/dnd-peer.log.*; exec env GDK_BACKEND=wayland NO_AT_BRIDGE=1 GTK_MODULES= XDG_CONFIG_HOME=/nonexistent python3 window/tools/gtk_dnd_peer.py "; }
+    let is i64 as n with mut = 0;
+    while (head[n] != 0) { cmd[n] = head[n]; n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (args[i] != 0 && n < 510) { cmd[n] = args[i]; n = n + 1; i = i + 1; }
+    cmd[n] = 0;
+    linux.unlink("build/dnd-peer.log");
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, &cmd[0]); argv[3] = 0;
+    peer = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (peer <= 0 || log_has("ready", 10000) == 0) { return 0; }
+    if (on_wayland() == 1 && run_sh("sh window/wayland/tools/kwin_script.sh window/wayland/testdata/kwin/place-dnd.js") != 0) { return 0; }
+    step_for(400);
+    return 1;
+}
+
+fn stop_peer() as void {
+    if (peer > 0) {
+        sys.kill(peer, 15);
+        let is i32 as st with mut = 0;
+        linux.wait4(peer, &st, 0, cast(*u8, 0));
+        peer = 0;
+    }
+    step_for(100);
+}
+
+// --- A widget that begins drags, or takes them ---
+
+struct Probe {
+    takes  as i32;
+    begins as i32;
+    drops  as i64;
+    ends   as i64;
+    end_as as i64;
+    drop_format as i32;
+    _pad   as i32;
+    len    as i64;
+    bytes  as [65536]u8;
+}
+
+let is tree.Kind as probe_kind with mut;
+let is dnd.Payload as moving with mut;
+let is *u8 as want_name with mut;
+let is i64 as want_n with mut = 0;
+
+fn probe_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    out.min_w = 120.0;
+    out.min_h = 60.0;
+    out.pref_w = 120.0;
+    out.pref_h = 60.0;
+}
+
+fn probe_paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void {
+    shapes.fill_rect(p.canvas, p.rect.x, p.rect.y, p.rect.w, p.rect.h, math.color.rgba(0.0, 0.5, 1.0, 1.0));
+}
+
+fn probe_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Probe as d = cast(*Probe, data);
+    if (e.kind == event.POINTER_DOWN) { return cast(i64, d.begins == 1); }
+    if (e.kind == event.DRAG_START && d.begins == 1) {
+        router.begin_drag(t, router.of(t), w, &moving);
+        return 1;
+    }
+    if (e.kind == event.DRAG_OVER) {
+        let is *dnd.Payload as p = cast(*dnd.Payload, e.drag);
+        let is i32 as k = d.takes & e.which;
+        if ((k & dnd.NAMED) != 0 && want_n > 0) { dnd.take_named(p, want_name, want_n); }
+        return cast(i64, k);
+    }
+    if (e.kind == event.DROP) {
+        let is *dnd.Payload as p = cast(*dnd.Payload, e.drag);
+        d.drops = d.drops + 1;
+        d.len = 0;
+        // The first of what it takes that has bytes: as the widget would ask.
+        let is i64 as n with mut = 0;
+        let is *u8 as b with mut = cast(*u8, 0);
+        d.drop_format = 0;
+        if ((d.takes & dnd.NAMED) != 0) {
+            b = dnd.bytes_of(p, dnd.NAMED, want_name, want_n, &n);
+            if (cast(i64, b) != 0) { d.drop_format = dnd.NAMED; }
+        }
+        if (cast(i64, b) == 0 && (d.takes & dnd.HTML) != 0) {
+            b = dnd.bytes_of(p, dnd.HTML, cast(*u8, 0), 0, &n);
+            if (cast(i64, b) != 0) { d.drop_format = dnd.HTML; }
+        }
+        if (cast(i64, b) == 0 && (d.takes & dnd.PNG) != 0) {
+            b = dnd.bytes_of(p, dnd.PNG, cast(*u8, 0), 0, &n);
+            if (cast(i64, b) != 0) { d.drop_format = dnd.PNG; }
+        }
+        if (cast(i64, b) == 0 && (d.takes & dnd.TEXT) != 0) {
+            b = dnd.bytes_of(p, dnd.TEXT, cast(*u8, 0), 0, &n);
+            if (cast(i64, b) != 0) { d.drop_format = dnd.TEXT; }
+        }
+        if (cast(i64, b) != 0 && n > 0 && n <= 65536) {
+            mem.memcpy(&d.bytes[0], b, n);
+            d.len = n;
+        }
+        return cast(i64, e.which);
+    }
+    if (e.kind == event.DRAG_END) {
+        d.ends = d.ends + 1;
+        d.end_as = cast(i64, e.which);
+    }
+    return 0;
+}
+
+fn pd(t as *tree.Tree, w as i64) as *Probe { return cast(*Probe, tree.data(t, w)); }
+
+// The middle of widget w, on the screen.
+fn sx_of(t as *tree.Tree, w as i64) as i64 {
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    device.position(dw, &px, &py);
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    return px + cast(i64, (r.x + r.w / 2.0) * nat.scale);
+}
+
+fn sy_of(t as *tree.Tree, w as i64) as i64 {
+    let is i64 as px with mut = 0;
+    let is i64 as py with mut = 0;
+    device.position(dw, &px, &py);
+    let is math.rect.Rect as r = layout.window_rect(t, w);
+    return py + cast(i64, (r.y + r.h / 2.0) * nat.scale);
+}
+
+// Its opacity at most, over the image's pixels.
+fn most_alpha() as i64 {
+    let is i64 as most with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < nat.drag.iw * nat.drag.ih) {
+        let is i64 as a = (cast(i64, *cast(*u32, cast(i64, nat.drag.argb) + k * 4)) >> 24) & 255;
+        if (a > most) { most = a; }
+        k = k + 1;
+    }
+    return most;
+}
+
+// The list's rows.
+fn m_count(self as *u8, parent as i64) as i64 { return 3; }
+fn m_row_id(self as *u8, parent as i64, index as i64) as i64 { return index + 1; }
+fn m_cell(self as *u8, id as i64, column as i64, role as i32, out as *model.Value) as i64 {
+    if (role != model.DISPLAY) { return 0; }
+    model.set_text(out, "row", 3);
+    return 1;
+}
+
+let is i64 as row_asked with mut = 0 - 1;
+
+fn row_content(t as *tree.Tree, w as i64, row as i64, c as *clip.Content, user as *u8) as i32 {
+    row_asked = row;
+    clip.add_text(c, "row dragged", 11);
+    clip.add_named(c, "application/x-caustic-test", 26, "row bytes", 9);
+    return 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as fonts with mut = "text/testdata/fonts";
+    if (os.current() == os.OS_WINDOWS) { fonts = "text\\testdata\\fonts"; }
+    if (program.open(&prog, fonts) == 0) { io.printf("FAIL: not started\n"); return 1; }
+    let is chain.Prefs as fp with mut = chain.defaults();
+    fp.ui = "Caustic Test Sans";
+    fp.sans = "Caustic Test Sans";
+    system_fonts.set_prefs(program.fonts(&prog), &fp);
+    let is *app.App as ap = program.app(&prog);
+    hs = program.host(&prog);
+    probe_kind = widget.kind("probe", sizeof(Probe));
+    probe_kind.measure = fn_ptr(probe_measure);
+    probe_kind.paint = fn_ptr(probe_paint);
+    probe_kind.event = fn_ptr(probe_event);
+    want_name = "application/x-caustic-test";
+    want_n = 26;
+
+    let is i64 as h = app.window_open(ap, 300.0, 300.0);
+    app.set_title(ap, h, "dnd-ours", 8);
+    let is *tree.Tree as t = app.tree(ap, h);
+    let is *router.Router as r = app.router(ap, h);
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    let is i64 as src = tree.create(t, &probe_kind, col);
+    pd(t, src).begins = 1;
+    let is i64 as dst = tree.create(t, &probe_kind, col);
+    pd(t, dst).takes = dnd.TEXT | dnd.HTML | dnd.PNG | dnd.NAMED;
+    let is model.Model as rows with mut = model.make(cast(*u8, 0));
+    rows.count = fn_ptr(m_count);
+    rows.row_id = fn_ptr(m_row_id);
+    rows.cell = fn_ptr(m_cell);
+    let is i64 as list = listview.create(t, col, &rows);
+    layout.set_min_size(t, list, 200.0, 100.0);
+    step_for(400);
+    dw = host.native(hs, h);
+    nat = hst._native(hs, 0);
+    if (on_wayland() == 1) {
+        if (kwin_input.open() == 0) { io.printf("FAIL: no fake input of KWin's\n"); return 1; }
+    } else if (on_x11() == 1) {
+        xd = xlib.XOpenDisplay(cast(*u8, 0));
+        x11.move_to(&dw.x11_win, 0, 0);
+    } else {
+        u.SetWindowPos(dw.win32_win.hwnd, 0, 0, 0, 0, 0, cast(u32, wt.SWP_NOSIZE | wt.SWP_NOZORDER));
+    }
+    step_for(300);
+    let is [65536]u8 as file_buf;
+
+    // --- Content out, to what takes it ---
+    let is clip.Content as c with mut;
+    clip.init(&c);
+    clip.add_text(&c, "text out", 8);
+    clip.add_named(&c, "application/x-caustic-test", 26, "own out", 7);
+    moving = dnd.content(&c, dnd.COPY);
+    check("a target", start_peer("target build/dnd-peer.log --types=application/x-caustic-test") == 1);
+    if (on_windows() == 1) { check("the peer ready", log_has("ready", 20000) == 1); }
+    let is i64 as ax = sx_of(t, src);
+    let is i64 as ay = sy_of(t, src);
+    walk(ax, ay, ax + 30, ay + 5, 450, 120, 750, 250, 1);
+    check("over the window", until_at(1) == 1);
+    check("the drag is the router's, seen", nat.drag.live == 1 && nat.drag.out == 0 && cast(i64, router.drag_payload(r)) != 0);
+    check("its image: the widget, painted", cast(i64, nat.drag.argb) != 0 && nat.drag.tex != 0 &&
+          nat.drag.iw == cast(i64, 120.0 * nat.scale + 0.999) && nat.drag.ih == cast(i64, 60.0 * nat.scale + 0.999));
+    check("see-through", most_alpha() > 100 && most_alpha() < 200);
+    check("the pointer where it was on it", nat.drag.hx > 0 && nat.drag.hx < nat.drag.iw && nat.drag.hy > 0 && nat.drag.hy < nat.drag.ih);
+    check("shown over the window, taking no input", nat.drag.over != 0 && tree.is_valid(t, nat.drag.over) == 1 && tree.layer(t, nat.drag.over) > 1000);
+    let is f64 as was_x = nat.drag.at_x;
+    go = 1;
+    check("past the window's edge", until_at(2) == 1);
+    check("the platform's now", nat.drag.out == 1 && router.drag_is_out(r) == 1 && hs.drag_out == 1);
+    check("nothing shown here: the platform carries it", nat.drag.over == 0 && nat.drag.over_slot == 0);
+    if (on_x11() == 1) { check("a window of its own for the image", dw.x11_win.drop.icon != 0); }
+    if (on_wayland() == 1) { check("its icon surface", dw.wayland_win.drag_icon != 0); }
+    go = 2;
+    walked();
+    check("its source told it was done", pd(t, src).ends == 1 && pd(t, src).end_as != 0);
+    check("nothing left of it", nat.drag.live == 0 && nat.drag.out == 0 && cast(i64, nat.drag.argb) == 0 && nat.drag.tex == 0 && hs.drag_out == 0 &&
+          cast(i64, router.drag_payload(r)) == 0);
+    if (on_x11() == 1) { check("the image's window gone", dw.x11_win.drop.icon == 0); }
+    if (on_wayland() == 1) { check("its icon surface gone", dw.wayland_win.drag_icon == 0); }
+    if (on_windows() == 1) {
+        check("the peer took it", log_has("drop own copy", 5000) == 1);
+        let is i64 as got = file.read("build\\ole-peer.log.1", &file_buf[0], 65536);
+        check("its own, its bytes", got >= 7 && mem.memcmp(&file_buf[0], "own out", 7) == 0);
+    } else {
+        check("GTK took it", log_has("drop application/x-caustic-test copy 7", 5000) == 1);
+        let is i64 as got = file.read("build/dnd-peer.log.1", &file_buf[0], 65536);
+        check("its own, its bytes", got == 7 && mem.memcmp(&file_buf[0], "own out", 7) == 0);
+    }
+
+    // --- Out, and back over its own window: run from what it carries ---
+    pd(t, src).ends = 0;
+    pd(t, dst).drops = 0;
+    moving = dnd.text("carried", 7, dnd.COPY);
+    ax = sx_of(t, src);
+    ay = sy_of(t, src);
+    let is i64 as bx = sx_of(t, dst);
+    let is i64 as by = sy_of(t, dst);
+    walk(ax, ay, ax + 30, ay + 5, 500, 500, bx, by, 1);
+    check("over the window again", until_at(1) == 1);
+    go = 1;
+    check("out", until_at(2) == 1 && nat.drag.out == 1);
+    go = 2;
+    walked();
+    check("taken here, from what it carries", pd(t, dst).drops == 1 && pd(t, dst).drop_format == dnd.TEXT && pd(t, dst).len == 7 &&
+          mem.memcmp(&pd(t, dst).bytes[0], "carried", 7) == 0);
+    check("its source told", pd(t, src).ends == 1 && pd(t, src).end_as != 0);
+    check("nothing left of that", nat.drag.live == 0 && hs.drag_out == 0);
+
+    // --- Let go over nothing, out ---
+    pd(t, src).ends = 0;
+    moving = dnd.text("nowhere", 7, dnd.COPY);
+    ax = sx_of(t, src);
+    ay = sy_of(t, src);
+    walk(ax, ay, ax + 30, ay + 5, 500, 550, 480, 560, 0);
+    check("over the window, once more", until_at(1) == 1);
+    go = 1;
+    walked();
+    check("let go over nothing: its source told nothing was done", pd(t, src).ends == 1 && pd(t, src).end_as == 0);
+    check("over", nat.drag.live == 0 && hs.drag_out == 0);
+    stop_peer();
+
+    // --- An item goes nowhere else ---
+    pd(t, src).ends = 0;
+    moving = dnd.item(t, src, 1, dnd.MOVE);
+    ax = sx_of(t, src);
+    ay = sy_of(t, src);
+    walk(ax, ay, ax + 30, ay + 5, 500, 500, 510, 510, 1);
+    check("an item: over the window", until_at(1) == 1 && nat.drag.tex != 0);
+    go = 1;
+    check("past its edge", until_at(2) == 1);
+    check("still the router's", nat.drag.out == 0 && router.drag_is_out(r) == 0 && cast(i64, router.drag_payload(r)) != 0);
+    go = 2;
+    walked();
+    check("let go there: nothing done", pd(t, src).ends == 1 && pd(t, src).end_as == 0 && nat.drag.live == 0);
+
+    // --- The program's image, and none ---
+    pd(t, src).ends = 0;
+    let is [1024]u32 as argb with mut;
+    let is i64 as i with mut = 0;
+    while (i < 1024) { argb[i] = cast(u32, 2164195328); i = i + 1; }   // half-opaque red
+    moving = dnd.text("imaged", 6, dnd.COPY);
+    dnd.set_image(&moving, cast(*u8, &argb[0]), 32, 32, 3, 4);
+    ax = sx_of(t, src);
+    ay = sy_of(t, src);
+    walk(ax, ay, ax + 30, ay + 5, ax + 40, ay + 5, ax, ay, 0);
+    check("the program's image", until_at(1) == 1 && nat.drag.iw == 32 && nat.drag.ih == 32 && nat.drag.hx == 3 && nat.drag.hy == 4 && nat.drag.tex != 0);
+    check("as it gave it", *cast(*u32, nat.drag.argb) == cast(u32, 2164195328));
+    go = 1;
+    walked();
+    check("over", pd(t, src).ends == 1 && nat.drag.live == 0);
+    pd(t, src).ends = 0;
+    moving = dnd.text("bare", 4, dnd.COPY);
+    dnd.set_no_image(&moving);
+    ax = sx_of(t, src);
+    ay = sy_of(t, src);
+    walk(ax, ay, ax + 30, ay + 5, ax + 40, ay + 5, ax, ay, 0);
+    check("none: nothing made", until_at(1) == 1 && nat.drag.live == 1 && cast(i64, nat.drag.argb) == 0 && nat.drag.tex == 0 && nat.drag.over == 0);
+    go = 1;
+    walked();
+    check("over too", pd(t, src).ends == 1);
+
+    // --- A list's row: its image the row, its content going out ---
+    listview.set_drag_content(t, list, fn_ptr(row_content), dnd.COPY, cast(*u8, 0));
+    check("a target of the row's own", start_peer("target build/dnd-peer.log --types=application/x-caustic-test") == 1);
+    ax = sx_of(t, list);
+    ay = sy_of(t, list) - cast(i64, listview.row_height(t, list) * nat.scale);
+    let is i64 as pressed_row = listview.row_at(t, list, cast(f64, ax) / nat.scale, cast(f64, ay) / nat.scale);
+    walk(ax, ay, ax + 30, ay + 3, 450, 120, 750, 250, 1);
+    check("a row: over the window", until_at(1) == 1);
+    check("the row asked what it is", row_asked == pressed_row && pressed_row >= 0);
+    check("its image the row", nat.drag.ih == cast(i64, listview.row_height(t, list) * nat.scale + 0.999));
+    go = 1;
+    check("a row: past the edge", until_at(2) == 1 && nat.drag.out == 1);
+    go = 2;
+    walked();
+    if (on_windows() == 1) {
+        check("the peer took the row's bytes", log_has("drop html copy", 200) == 0 && log_has("drop own copy", 5000) == 1);
+    } else {
+        check("GTK took the row's bytes", log_has("drop application/x-caustic-test copy 9", 5000) == 1);
+        let is i64 as got = file.read("build/dnd-peer.log.1", &file_buf[0], 65536);
+        check("the row's bytes", got == 9 && mem.memcmp(&file_buf[0], "row bytes", 9) == 0);
+    }
+    stop_peer();
+
+    // --- Into the program: by what is taken ---
+    if (on_windows() == 0) {
+        // GTK's drag of its types, its own taken.
+        pd(t, dst).takes = dnd.NAMED;
+        pd(t, dst).drops = 0;
+        check("a source of its types", start_peer("source build/dnd-peer.log types --types=application/x-caustic-test,text/html") == 1);
+        bx = sx_of(t, dst);
+        by = sy_of(t, dst);
+        walk(750, 250, 700, 240, 300, 200, bx, by, 0);
+        check("GTK's drag started", until_at(1) == 1);
+        go = 1;
+        walked();
+        check("taken by name", pd(t, dst).drops == 1 && pd(t, dst).drop_format == dnd.NAMED && pd(t, dst).len == 31 &&
+              mem.memcmp(&pd(t, dst).bytes[0], "own: application/x-caustic-test", 31) == 0);
+        stop_peer();
+        pd(t, dst).takes = dnd.HTML;
+        pd(t, dst).drops = 0;
+        check("a source again", start_peer("source build/dnd-peer.log types --types=application/x-caustic-test,text/html") == 1);
+        walk(750, 250, 700, 240, 300, 200, bx, by, 0);
+        check("GTK's drag again", until_at(1) == 1);
+        go = 1;
+        walked();
+        check("taken as HTML", pd(t, dst).drops == 1 && pd(t, dst).drop_format == dnd.HTML && pd(t, dst).len == 15 &&
+              mem.memcmp(&pd(t, dst).bytes[0], "<b>from gtk</b>", 15) == 0);
+        stop_peer();
+    } else {
+        // The peer's source, its text band: the type asked for by order of take.
+        pd(t, dst).takes = dnd.HTML;
+        pd(t, dst).drops = 0;
+        bx = sx_of(t, dst);
+        by = sy_of(t, dst);
+        walk(750, 600, 700, 590, 300, 200, bx, by, 0);
+        check("the peer's drag started", until_at(1) == 1);
+        go = 1;
+        walked();
+        check("taken as HTML, the fragment", pd(t, dst).drops == 1 && pd(t, dst).drop_format == dnd.HTML && pd(t, dst).len == 10 &&
+              mem.memcmp(&pd(t, dst).bytes[0], "<i>ole</i>", 10) == 0);
+    }
+
+    clip.free(&c);
+    if (cast(i64, xd) != 0) { xlib.XCloseDisplay(xd); }
+    if (fails > 0) {
+        io.printf("host drags: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("host drags: all checks passed\n");
+    return 0;
+}

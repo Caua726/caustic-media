@@ -1,0 +1,310 @@
+// window/wayland/named_test.cst — formats by name against another program,
+// wl-copy and wl-paste, on a KWin of its own, as selection_test:
+//   sh window/wayland/tools/run_kwin.sh ./build/wayland_named_test
+// Owned here and read by wl-paste: text/html and a program's own type, listed
+// among the types; what is made on demand, only when asked for, and once. Owned
+// by wl-copy and asked for here: by name, the names known. And the change heard
+// as each takes the clipboard, with what it offers.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "backend.cst" as wayland;
+use "state.cst" as wayland_state;
+use "../../sys/linux.cst" as sys;
+use "../transfer.cst" as transfer;
+use "../../gpu/software/target.cst" as tgt;
+use "kwin_input.cst" as kwin_input;
+
+
+use "../event.cst" as event;
+use "../../input/event.cst" as ie;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+let is wayland_state.Window as win with mut;
+
+// The last change heard of a selection, by which: its formats; -1 for none yet.
+let is [2]i32 as changed with mut;
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        wayland.pump(&win);
+        let is event.Event as e;
+        while (wayland.poll_event(&win, &e) == 1) {
+            if (e.kind == event.CLIPBOARD_CHANGED && e.state >= 0 && e.state <= 1) { changed[e.state] = e.drop; }
+        }
+        let is ie.Event as i;
+        while (wayland.poll_input(&win, &i) == 1) { }
+        time.sleep_ms(2);
+    }
+}
+
+// Owned as Ctrl+C would: Control and C pressed and let go, the selection set
+// by the press's serial.
+fn own(which as i32, o as *transfer.Offer) as i32 {
+    let is u32 as was = win.input_serial;
+    kwin_input.key_sym(65507, 1);
+    kwin_input.key_sym(99, 1);
+    kwin_input.key_sym(99, 0);
+    kwin_input.key_sym(65507, 0);
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until && win.input_serial == was) { pump(5); }
+    pump(20);
+    return wayland.clipboard_set(&win, which, o);
+}
+
+// Owned as a selection made with the mouse is: pressed in the window (placed
+// at the top left by testdata/kwin/place-selections.js), the selection set
+// by the press's serial.
+fn own_by_click(which as i32, o as *transfer.Offer) as i32 {
+    let is u32 as was = win.input_serial;
+    kwin_input.move(100.0, 90.0);
+    kwin_input.button(kwin_input.BTN_LEFT, 1);
+    let is i64 as until = time.now_ms() + 2000;
+    while (time.now_ms() < until && win.input_serial == was) { pump(5); }
+    let is i32 as set = wayland.clipboard_set(&win, which, o);
+    kwin_input.button(kwin_input.BTN_LEFT, 0);
+    pump(20);
+    return set;
+}
+
+// sh -c cmd, the window pumped meanwhile: the exit status, -1 when it took
+// longer than 20 seconds.
+fn run(cmd as *u8) as i32 {
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd); argv[3] = 0;
+    let is i64 as pid = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (pid <= 0) { return 0 - 1; }
+    let is i32 as status with mut = 0;
+    let is i64 as until = time.now_ms() + 20000;
+    while (time.now_ms() < until) {
+        wayland.pump(&win);
+        if (linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) { return process.exit_code_of(status); }
+        time.sleep_ms(2);
+    }
+    return 0 - 1;
+}
+
+// sh -c "exec cmd", left running: its process.
+fn spawn_owner(cmd as *u8) as i64 {
+    let is [96]u8 as line with mut;
+    let is *u8 as head = "exec ";
+    let is i64 as n with mut = 0;
+    while (head[n] != 0) { line[n] = head[n]; n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (cmd[i] != 0 && n < 94) { line[n] = cmd[i]; n = n + 1; i = i + 1; }
+    line[n] = 0;
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, &line[0]); argv[3] = 0;
+    return process.spawnp("sh", cast(*u8, &argv[0]));
+}
+
+fn stop(pid as i64) as void {
+    sys.kill(pid, 15);
+    let is i32 as status with mut = 0;
+    linux.wait4(pid, &status, 0, cast(*u8, 0));
+}
+
+// The descriptors this process holds open (fcntl F_GETFD answers).
+fn open_fds() as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as fd with mut = 0;
+    while (fd < 1024) {
+        if (syscall(72, fd, 1) >= 0) { n = n + 1; }
+        fd = fd + 1;
+    }
+    return n;
+}
+
+fn read_file(path as *u8, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is [65536]u8 as buf with mut;
+    while (1 == 1) {
+        let is i64 as n = linux.read(fd, &buf[0], 65536);
+        if (n <= 0) { break; }
+        transfer.append(out, &buf[0], n);
+    }
+    linux.close(fd);
+    return 1;
+}
+
+fn write_file(path as *u8, p as *u8, n as i64) as void {
+    let is i64 as fd = linux.open(path, 577, 420);
+    if (fd < 0) { return; }
+    let is i64 as at with mut = 0;
+    while (at < n) {
+        let is i64 as w = linux.write(fd, cast(*u8, cast(i64, p) + at), n - at);
+        if (w <= 0) { break; }
+        at = at + w;
+    }
+    linux.close(fd);
+}
+
+fn same(b as *transfer.Bytes, p as *u8, n as i64) as i32 {
+    if (b.len != n) { io.printf("  %d bytes, want %d\n", b.len, n); return 0; }
+    return cast(i32, mem.memcmp(b.data, p, n) == 0);
+}
+
+fn contains(b as *transfer.Bytes, s as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= b.len) {
+        if (mem.memcmp(cast(*u8, cast(i64, b.data) + i), s, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The selection asked for as format, waited for: what came, into out; the
+// format that came.
+fn ask(which as i32, format as i32, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    if (wayland.clipboard_request(&win, which, format) == 0) { return 0 - 1; }
+    let is i64 as until = time.now_ms() + 15000;
+    while (time.now_ms() < until && wayland.clipboard_ready(&win) == 0) {
+        wayland.pump(&win);
+        time.sleep_ms(2);
+    }
+    if (wayland.clipboard_ready(&win) == 0) { return 0 - 2; }
+    transfer.bytes_set(out, wayland.clipboard_data(&win), wayland.clipboard_length(&win));
+    return wayland.clipboard_format(&win);
+}
+
+// The selection which offered by another program, as this window hears it.
+fn offered_by_them(which as i32) as i32 {
+    let is i64 as until = time.now_ms() + 3000;
+    while (time.now_ms() < until) {
+        pump(20);
+        if (win.selection_offer[which] != 0 && win.selection_source[which] == 0) { return 1; }
+    }
+    return 0;
+}
+
+fn big_text(out as *transfer.Bytes) as void {
+    transfer.bytes_clear(out);
+    let is *u8 as line = "caustic ação — 3 MB through a pipe ✓ ";
+    let is i64 as n with mut = 0;
+    while (line[n] != 0) { n = n + 1; }
+    while (out.len < 3145728) { transfer.append(out, line, n); }
+}
+
+// What makes a format on demand: how many times it was asked, and which.
+let is i32 as made with mut = 0;
+let is i32 as made_format with mut = 0;
+
+fn provide(user as *u8, format as i32, name as *u8, n as i64, out as *transfer.Bytes) as i32 {
+    made = made + 1;
+    made_format = format;
+    if (format == transfer.PNG) { return read_file("image/testdata/rgba.png", out); }
+    if (format == transfer.NAMED) { return transfer.bytes_set(out, "made now", 8); }
+    return transfer.bytes_set(out, "text made now", 13);
+}
+
+// The format named name asked for: the format that came.
+fn ask_named(which as i32, name as *u8, n as i64, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    if (wayland.clipboard_request_named(&win, which, name, n) == 0) { return 0; }
+    let is i64 as until = time.now_ms() + 5000;
+    while (wayland.clipboard_pending(&win) == 1 && time.now_ms() < until) { pump(2); }
+    let is i32 as f = wayland.clipboard_format(&win);
+    if (f != 0) { transfer.bytes_set(out, wayland.clipboard_data(&win), wayland.clipboard_length(&win)); }
+    return f;
+}
+
+fn change_of(which as i32) as i32 {
+    let is i64 as until = time.now_ms() + 5000;
+    while (changed[which] < 0 && time.now_ms() < until) { pump(5); }
+    return changed[which];
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (kwin_input.open() == 0) { io.printf("FAIL: no fake input of KWin's to press keys with\n"); return 1; }
+    if (wayland.open(&win, "selections", 200, 100) == 0) { io.printf("FAIL: no window\n"); return 1; }
+    let is tgt.Target as t = wayland.acquire(&win);
+    if (cast(i64, t.color) != 0) { wayland.submit(&win); }
+    let is i64 as until = time.now_ms() + 5000;
+    while (time.now_ms() < until && win.keyboard_focus == 0) { pump(20); }
+    check("the keyboard's focus", win.keyboard_focus == 1);
+    check("placed", run("sh window/wayland/tools/kwin_script.sh window/wayland/testdata/kwin/place-selections.js") == 0);
+    pump(200);
+    linux.mkdir("build/selection-test", 493);
+    let is transfer.Bytes as got with mut;
+    transfer.bytes_init(&got);
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    let is *u8 as own_type = "application/x-caustic-test";
+
+    // --- Owned here ---
+    check("named: kept", transfer.offer_text(&o, "plain", 5) == 1 && transfer.offer_named(&o, transfer.MIME_HTML, 9, "<i>rich</i>", 11) == 1 &&
+          transfer.offer_named(&o, own_type, 26, "own bytes", 9) == 1);
+    changed[0] = 0 - 1;
+    check("owned", wayland.clipboard_set(&win, 0, &o) == 1);
+    pump(200);
+    check("the types listed", run("wl-paste --list-types > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && contains(&got, "text/html") == 1 && contains(&got, own_type) == 1);
+    check("the HTML read", run("wl-paste --no-newline --type text/html > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, "<i>rich</i>", 11) == 1);
+    check("the program's own read", run("wl-paste --no-newline --type application/x-caustic-test > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, "own bytes", 9) == 1);
+    check("the text beside them", run("wl-paste --no-newline --type text/plain > build/selection-test/a") == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && same(&got, "plain", 5) == 1);
+
+    // --- Made on demand ---
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    transfer.offer_lazy(&o, transfer.PNG | transfer.TEXT, fn_ptr(provide), cast(*u8, 0));
+    check("named on demand: said", transfer.offer_lazy_named(&o, own_type, 26, fn_ptr(provide), cast(*u8, 0)) == 1);
+    made = 0;
+    check("owned, nothing made", own(0, &o) == 1 && made == 0);
+    pump(100);
+    check("listed: still nothing made", run("wl-paste --list-types > build/selection-test/a") == 0 && made == 0 &&
+          read_file("build/selection-test/a", &got) == 1 && contains(&got, "image/png") == 1 && contains(&got, own_type) == 1);
+    let is transfer.Bytes as png with mut;
+    transfer.bytes_init(&png);
+    read_file("image/testdata/rgba.png", &png);
+    check("the PNG asked for: made", run("wl-paste --type image/png > build/selection-test/a") == 0 && made == 1 &&
+          made_format == transfer.PNG && read_file("build/selection-test/a", &got) == 1 && same(&got, png.data, png.len) == 1);
+    check("and again: made once", run("wl-paste --type image/png > build/selection-test/a") == 0 && made == 1);
+    check("the program's own asked for: made", run("wl-paste --no-newline --type application/x-caustic-test > build/selection-test/a") == 0 &&
+          made == 2 && made_format == transfer.NAMED && read_file("build/selection-test/a", &got) == 1 && same(&got, "made now", 8) == 1);
+
+    // --- Owned by wl-copy ---
+    write_file("build/selection-test/in", "<u>theirs</u>", 13);
+    changed[0] = 0 - 1;
+    check("wl-copy takes it with HTML", run("wl-copy --type text/html < build/selection-test/in") == 0);
+    let is i32 as ch with mut = change_of(0);
+    check("said: another program took it, HTML there", ch >= 0 && (ch & transfer.NAMED) != 0 && (ch & transfer.HTML) != 0);
+    check("offered here", offered_by_them(0) == 1);
+    check("the names known", ask(0, 0, &got) == 0 && (wayland.clipboard_offered(&win) & transfer.NAMED) != 0 &&
+          transfer.names_has(wayland.clipboard_offered_names(&win), transfer.MIME_HTML, 9) == 1);
+    check("asked for by name", ask_named(0, transfer.MIME_HTML, 9, &got) == transfer.NAMED && same(&got, "<u>theirs</u>", 13) == 1);
+    check("a name not there: none", ask_named(0, "application/x-absent", 20, &got) == 0 && got.len == 0);
+    write_file("build/selection-test/in", "their own", 9);
+    changed[0] = 0 - 1;
+    check("wl-copy takes it with its own type", run("wl-copy --type application/x-caustic-test < build/selection-test/in") == 0);
+    change_of(0);
+    check("its own asked for by name", ask_named(0, own_type, 26, &got) == transfer.NAMED && same(&got, "their own", 9) == 1);
+
+    // --- Emptied: said, nothing offered ---
+    changed[0] = 0 - 1;
+    check("wl-copy clears it", run("wl-copy --clear") == 0);
+    check("said: nothing offered", change_of(0) == 0);
+
+    transfer.offer_free(&o);
+    wayland.close(&win);
+    if (fails == 0) { io.printf("wayland named formats: all checks passed\n"); return 0; }
+    io.printf("wayland named formats: %d failures\n", fails);
+    return 1;
+}

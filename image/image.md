@@ -134,6 +134,17 @@ byte by `tools/make_pngs.py`, pixels known exactly. The three libraries this
 repository builds on are also built for Windows and run under wine
 (`caustic-mk run test-win32`).
 
+**Writing** is through caustic-image too, whose encoder uses caustic-compact's
+deflate: `save.png` makes a PNG of an RGBA8, RGB8 or R8 image, its rows borrowed,
+into a caustic-compact `Bytes`. `save_test` decodes what it wrote back through
+the library and, as a black box, through Pillow (`tools/png_read.py`). `dib.cst`
+is Windows' other image on the clipboard: `dib_from_png` a PNG as a 32-bit DIB,
+a BMP file without its fourteen-byte header; `png_from_dib` a CF_DIB's or
+CF_DIBV5's bytes as a PNG — the file header put back, a 32-bit `BI_BITFIELDS` with
+the usual masks being the same bytes as `BI_RGB`, which is all caustic-image's BMP
+reader takes; other masks refused rather than shown wrong. It is the toolkit that
+converts (`ui/host_clip.cst`): `window/` only carries the bytes.
+
 Mutation-tested: every mutant killed but those that cannot be — the skyline's
 merging of steps of one height and its handling of a step ending at a
 rectangle's edge change no placement, and a copy of no width copies nothing

@@ -1,19 +1,39 @@
 // ui/dnd.cst — what a drag carries.
 //
-// A drag offers one or more things — files, text, an item of a widget of
-// this program's — and says what may be done with them: copied, moved. The
-// router runs it (router.begin_drag, drag_enter and the rest): which widget
-// under the pointer takes what, and what was done once it is let go.
+// A drag offers one or more things — files, text, an image, HTML, a program's
+// own types, an item of a widget of this program's — and says what may be
+// done with them: copied, moved. The router runs it (router.begin_drag,
+// drag_enter and the rest): which widget under the pointer takes what, and
+// what was done once it is let go.
+//
+// Content (ui/clip.cst's, content or add_content) is what goes on to other
+// programs when the pointer leaves the program's windows: the platform's loop
+// hands the drag over there (host_drag.cst), text and files as they are, a
+// drag of nothing but an item staying inside. The widget it began from, or the
+// part of it set_image_rect says, painted translucent is its image under the
+// pointer, unless the program gives one (set_image) or none (set_no_image).
+//
+// A target reads what came with bytes_of, whichever way it came: from a drag
+// here its content, made now if on demand; from outside what the platform
+// brought. Of the named types a drag from outside offers, a widget chooses with
+// has_named and take_named as it answers DRAG_OVER (NAMED then in what it
+// returns); a drop target of the program's takes the first.
 //
 // The bytes are the drag's maker's: a widget beginning one keeps what it
 // points at until it hears DRAG_END; the platform's loop keeps a drop from
 // outside until the router is done with it. Nothing here copies them.
+use "std/mem.cst" as mem;
 use "tree.cst" as tree;
+use "clip.cst" as clip;
+use "../window/transfer.cst" as transfer;
 
 // What a drag offers, what a widget takes: bits.
 let is i32 as FILES with imut = 1;   // paths: files from a file manager
 let is i32 as TEXT  with imut = 2;   // UTF-8
 let is i32 as ITEM  with imut = 4;   // an item of a widget here: a list's row
+let is i32 as PNG   with imut = 8;   // a PNG file's bytes
+let is i32 as HTML  with imut = 16;  // text/html, UTF-8
+let is i32 as NAMED with imut = 32;  // a program's own type, by its MIME name
 
 // What may be done, what was: bits.
 let is i32 as COPY with imut = 1;
@@ -29,6 +49,25 @@ struct Payload {
     tree     as *tree.Tree;   // ITEM: the widget it is of, and which
     widget   as i64;
     item     as i64;
+    content  as *clip.Content;   // what it offers by format; the maker's until DRAG_END
+    data     as *u8;          // a drop from outside: PNG's, HTML's or NAMED's bytes
+    data_len as i64;
+    name     as *u8;          // NAMED's name, as it came
+    name_len as i64;
+    names    as *transfer.Names;   // a drag from outside: the named types it offers
+    data_format as i32;       // which of them data is; 0 for none
+    no_image as i32;          // nothing under the pointer: set_no_image
+    image    as *u8;          // set_image's: 0xAARRGGBB pixels, the maker's; null: the widget, painted
+    image_w  as i64;
+    image_h  as i64;
+    image_hx as i64;
+    image_hy as i64;
+    rect_x   as f64;          // set_image_rect's: the part of the widget painted; 0 wide: all of it
+    rect_y   as f64;
+    rect_w   as f64;
+    rect_h   as f64;
+    want_n   as i64;          // take_named's type
+    want     as [128]u8;
 }
 
 fn _empty(actions as i32) as Payload {
@@ -42,6 +81,25 @@ fn _empty(actions as i32) as Payload {
     p.tree = cast(*tree.Tree, 0);
     p.widget = 0;
     p.item = 0;
+    p.content = cast(*clip.Content, 0);
+    p.data = cast(*u8, 0);
+    p.data_len = 0;
+    p.name = cast(*u8, 0);
+    p.name_len = 0;
+    p.names = cast(*transfer.Names, 0);
+    p.data_format = 0;
+    p.no_image = 0;
+    p.image = cast(*u8, 0);
+    p.image_w = 0;
+    p.image_h = 0;
+    p.image_hx = 0;
+    p.image_hy = 0;
+    p.rect_x = 0.0;
+    p.rect_y = 0.0;
+    p.rect_w = 0.0;
+    p.rect_h = 0.0;
+    p.want_n = 0;
+    p.want[0] = 0;
     return p;
 }
 
@@ -85,4 +143,148 @@ fn file_at(p as *Payload, i as i64) as *u8 {
         k = k + 1;
     }
     return cast(*u8, cast(i64, p.files) + at);
+}
+
+// c's formats offered too, c the maker's until DRAG_END. Text and files there
+// to be had now are the payload's own; text made on demand when it is dropped.
+fn add_content(p as *Payload, c as *clip.Content) as void {
+    p.content = c;
+    let is i32 as f = clip.formats(c);
+    if ((f & clip.FILES) != 0) {
+        p.offers = p.offers | FILES;
+        p.files = c.offer.paths.data;
+        p.files_n = c.offer.count;
+    }
+    if ((f & clip.TEXT) != 0) {
+        p.offers = p.offers | TEXT;
+        if (transfer.offer_is_lazy(&c.offer, transfer.TEXT, 0 - 1) == 0) {
+            p.text = c.offer.text.data;
+            p.text_len = c.offer.text.len;
+        }
+    }
+    if ((f & clip.PNG) != 0) { p.offers = p.offers | PNG; }
+    if ((f & clip.HTML) != 0) { p.offers = p.offers | HTML; }
+    if ((f & clip.NAMED) != 0) { p.offers = p.offers | NAMED; }
+}
+
+// Content of several formats, c the maker's until DRAG_END, to be done with
+// as actions says.
+fn content(c as *clip.Content, actions as i32) as Payload {
+    let is Payload as p = _empty(actions);
+    add_content(&p, c);
+    return p;
+}
+
+// The image under the pointer: argb, w by h pixels of 0xAARRGGBB, the
+// maker's until the drag begins, the pointer at hx, hy of it.
+fn set_image(p as *Payload, argb as *u8, w as i64, h as i64, hx as i64, hy as i64) as void {
+    p.image = argb;
+    p.image_w = w;
+    p.image_h = h;
+    p.image_hx = hx;
+    p.image_hy = hy;
+    p.no_image = 0;
+}
+
+// No image under the pointer.
+fn set_no_image(p as *Payload) as void {
+    p.image = cast(*u8, 0);
+    p.no_image = 1;
+}
+
+// The part of the widget its image shows, in the widget's own coordinates: a
+// list's row.
+fn set_image_rect(p as *Payload, x as f64, y as f64, w as f64, h as f64) as void {
+    p.rect_x = x;
+    p.rect_y = y;
+    p.rect_w = w;
+    p.rect_h = h;
+}
+
+// Text made on demand made now, as it is let go.
+fn fill(p as *Payload) as void {
+    let is *clip.Content as c = p.content;
+    if (cast(i64, c) == 0 || (p.offers & TEXT) == 0 || cast(i64, p.text) != 0) { return; }
+    if ((c.offer.formats & transfer.TEXT) == 0) { return; }
+    let is *clip.Bytes as b = clip.text_of(c);
+    p.text = b.data;
+    p.text_len = b.len;
+}
+
+// The bytes of format — TEXT, PNG, HTML, NAMED by name, n bytes — of what was
+// let go, *len of them, wherever they came from; null for none of it. Those of
+// the content made now when on demand.
+fn bytes_of(p as *Payload, format as i32, name as *u8, n as i64, len as *i64) as *u8 {
+    *len = 0;
+    if (format == TEXT) {
+        fill(p);
+        *len = p.text_len;
+        return p.text;
+    }
+    if (p.data_format == format && cast(i64, p.data) != 0) {
+        if (format != NAMED || (p.name_len == n && mem.memcmp(p.name, name, n) == 0)) {
+            *len = p.data_len;
+            return p.data;
+        }
+    }
+    let is *clip.Content as c = p.content;
+    if (cast(i64, c) == 0) { return cast(*u8, 0); }
+    let is *clip.Bytes as b with mut = cast(*clip.Bytes, 0);
+    if (format == PNG) { b = clip.png_of(c); }
+    if (format == HTML) { b = clip.html_of(c); }
+    if (format == NAMED) { b = clip.named_of(c, name, n); }
+    if (cast(i64, b) == 0 || b.len == 0) { return cast(*u8, 0); }
+    *len = b.len;
+    return b.data;
+}
+
+// Whether it offers the type named name, n bytes.
+fn has_named(p as *Payload, name as *u8, n as i64) as i32 {
+    if (cast(i64, p.names) != 0 && transfer.names_has(p.names, name, n) == 1) { return 1; }
+    if (cast(i64, p.content) != 0 && transfer.offer_find(&p.content.offer, name, n) >= 0) { return 1; }
+    return 0;
+}
+
+// The named type a target takes of it, as it answers DRAG_OVER with NAMED.
+fn take_named(p as *Payload, name as *u8, n as i64) as void {
+    if (n <= 0 || n > 127) { return; }
+    mem.memcpy(&p.want[0], name, n);
+    p.want[n] = 0;
+    p.want_n = n;
+}
+
+// The named type taken — take_named's, else the first it offers but text/html
+// — zero-terminated, *n its length; null for none.
+fn named_taken(p as *Payload, n as *i64) as *u8 {
+    *n = 0;
+    if (p.want_n > 0) {
+        *n = p.want_n;
+        return &p.want[0];
+    }
+    let is i64 as i with mut = 0;
+    if (cast(i64, p.names) != 0) {
+        while (i < p.names.n) {
+            let is *u8 as z = transfer.names_at(p.names, i);
+            let is i64 as k with mut = 0;
+            while (z[k] != 0) { k = k + 1; }
+            if (transfer._named_is(transfer.MIME_HTML, z, k) == 0) {
+                *n = k;
+                return z;
+            }
+            i = i + 1;
+        }
+    }
+    if (cast(i64, p.content) != 0) {
+        i = 0;
+        while (i < p.content.offer.named_n) {
+            let is *u8 as z = transfer.named_name(&p.content.offer, i);
+            let is i64 as k = transfer.named_length(&p.content.offer, i);
+            if (transfer._named_is(transfer.MIME_HTML, z, k) == 0) {
+                *n = k;
+                return z;
+            }
+            i = i + 1;
+        }
+    }
+    return cast(*u8, 0);
 }

@@ -18,32 +18,10 @@ use "host_state.cst" as hst;
 use "host_settings.cst" as hset;
 use "host_windows.cst" as hwin;
 use "host_popups.cst" as hpop;
+use "host_clip.cst" as hclip;
+use "host_drag.cst" as hdrag;
 
 // --- What the platform says ---
-
-fn _payload(n as *hst.Native, offers as i32, with_data as i32) as dnd.Payload {
-    let is dnd.Payload as p with mut = dnd.files(cast(*u8, 0), 0);
-    p.offers = 0;
-    if ((offers & wevent.DROP_FILES) != 0) { p.offers = p.offers | dnd.FILES; }
-    if ((offers & wevent.DROP_TEXT) != 0) { p.offers = p.offers | dnd.TEXT; }
-    if (with_data == 1) {
-        let is i64 as nf = device.dropped_files(&n.win);
-        if (nf > 0) {
-            p.files = device.dropped_file(&n.win, 0);
-            p.files_n = nf;
-        }
-        p.text = device.dropped_text(&n.win);
-        p.text_len = device.dropped_text_length(&n.win);
-    }
-    return p;
-}
-
-fn _answer(n as *hst.Native, takes as i32) as void {
-    let is i32 as w with mut = 0;
-    if ((takes & dnd.FILES) != 0) { w = w | wevent.DROP_FILES; }
-    if ((takes & dnd.TEXT) != 0) { w = w | wevent.DROP_TEXT; }
-    device.drop_answer(&n.win, w, 0);
-}
 
 // Another window of the program's under the point x, y of n's window
 // (physical pixels): its slot, and the point in it, at *ox, *oy; -1 for none.
@@ -89,11 +67,15 @@ fn _drag_across(hs as *hst.Host, n as *hst.Native, e as *ie.Event, now as i64) a
         n.over = 0;
         return 0;
     }
+    // The platform's now: it says where it goes.
+    if (n.drag.out == 1) { return 0; }
     let is i64 as ox with mut = 0;
     let is i64 as oy with mut = 0;
     let is i64 as o = _other_under(hs, n, e.x, e.y, &ox, &oy);
     if (o < 0) {
         _drag_back(hs, n, now);
+        // Over none of them: another program's to take, if it may be.
+        if (e.kind == ie.MOTION) { return hdrag._go_out(hs, n, e.x, e.y, now); }
         return 0;
     }
     let is *hst.Native as m = hst._native(hs, o);
@@ -349,6 +331,7 @@ fn _feed_one(hs as *hst.Host, n as *hst.Native, e as *wevent.Event, now as i64) 
     let is f64 as y = cast(f64, e.y) / s;
     if (app.blocked(a, h) == 1 && e.kind == wevent.CLOSE) { device.keep_open(&n.win); }
     let is i32 as k = e.kind;
+    if (k == wevent.CLIPBOARD_CHANGED) { hclip._changed(hs, e.state, e.drop); return; }
     if (k == wevent.FOCUS_IN || k == wevent.FOCUS_OUT) {
         n.focus_main = cast(i32, k == wevent.FOCUS_IN);
         // Active while it, or a popup of it, has the keyboard.
@@ -405,21 +388,31 @@ fn _feed_one(hs as *hst.Host, n as *hst.Native, e as *wevent.Event, now as i64) 
         hset._recomposite(hs);
         return;
     }
+    if (k == wevent.DRAG_DONE) {
+        hdrag._done(hs, n, e.action, now);
+        return;
+    }
     if (k == wevent.DND_ENTER) {
-        let is dnd.Payload as p = _payload(n, e.drop, 0);
-        _answer(n, router.drag_enter(t, r, &p, x, y, now));
+        if (hdrag._own_over(hs, n, x, y, 1, now) == 1) { return; }
+        let is dnd.Payload as p = hdrag._payload(n, e.drop, 0);
+        let is i32 as takes = router.drag_enter(t, r, &p, x, y, now);
+        hdrag._answer(n, router.drag_carried(r), takes);
         return;
     }
     if (k == wevent.DND_MOVE) {
-        _answer(n, router.drag_move(t, r, x, y, now));
+        if (hdrag._own_over(hs, n, x, y, 0, now) == 1) { return; }
+        let is i32 as takes = router.drag_move(t, r, x, y, now);
+        hdrag._answer(n, router.drag_carried(r), takes);
         return;
     }
     if (k == wevent.DND_LEAVE) {
+        if (hdrag._own_leave(hs, n, now) == 1) { return; }
         router.drag_leave(t, r, now);
         return;
     }
     if (k == wevent.DND_DROP) {
-        let is dnd.Payload as got = _payload(n, e.drop, 1);
+        if (hdrag._own_drop(hs, n, x, y, now) == 1) { return; }
+        let is dnd.Payload as got = hdrag._payload(n, e.drop, 1);
         router.drag_update(r, &got);
         router.drag_drop(t, r, x, y, now);
         device.clear_drop(&n.win);
@@ -501,18 +494,10 @@ fn _events(hs as *hst.Host, now as i64) as void {
             while (n.h != 0 && hpop._next_input(hs, n, &in) == 1) { _feed_input(hs, n, &in, now); }
             if (n.h != 0) { hpop._settle_lost(hs, n, now); }
             if (n.h != 0) { _modal_round(hs, n, now); }
-            if (n.h != 0 && n.paste_on == 1 && device.clipboard_pending(&n.win) == 0 && app.window_valid(hs.a, n.h) == 1) {
-                // The window's bytes, until it is asked again: text, or none.
-                let is i64 as got with mut = 0;
-                if (device.clipboard_format(&n.win) == transfer.TEXT) { got = device.clipboard_length(&n.win); }
-                let is *u8 as text with mut = device.clipboard_data(&n.win);
-                if (got == 0) { text = ""; }
-                n.paste_on = 0;
-                app.begin_dispatch(hs.a);
-                router.paste(app.tree(hs.a, n.h), app.router(hs.a, n.h), n.paste_w, n.paste_which, text, got, now);
-                app.end_dispatch(hs.a);
-            }
+            if (n.h != 0) { hclip._round(hs, n, now); }
+            if (n.h != 0 && app.window_valid(hs.a, n.h) == 1) { hdrag._round(hs, n); }
         }
         i = i + 1;
     }
+    hclip._notice(hs);
 }

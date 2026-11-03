@@ -1,0 +1,353 @@
+// window/x11/dnd_named_test.cst — a drag's formats by name, and its image,
+// with another program, GTK 3 (window/tools/gtk_dnd_peer.py), under Xvfb, the
+// pointer XTest's:
+//   sh window/x11/tools/run_headless.sh ./build/x11_dnd_named_test
+// Into this window: text/html, a PNG, a program's own type, each taken alone by
+// what is answered. Out of it: the same to GTK's window, one made on demand.
+// And the drag's image: a window of its own under the pointer as it goes, of
+// the image's colour there, gone when it ends; and none without one.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "bind/xlib.cst" as xlib;
+use "../../sys/linux.cst" as sys;
+use "x11.cst" as x11;
+use "events.cst" as events;
+use "../../input/event.cst" as ie;
+use "../transfer.cst" as transfer;
+
+extern "libXtst.so.6" fn XTestFakeMotionEvent(display as *u8, screen as i32, x as i32, y as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeButtonEvent(display as *u8, button as u32, is_press as i32, delay as u64) as i32;
+extern "libXtst.so.6" fn XTestFakeKeyEvent(display as *u8, keycode as u32, is_press as i32, delay as u64) as i32;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) { fails = fails + 1; io.printf("FAIL: %s\n", name); }
+}
+
+let is x11.window.Window as win with mut;
+let is *u8 as xd with mut;
+
+// What the window heard of drags, as it came.
+let is [64]events.Event as heard;
+let is i32 as nheard with mut = 0;
+let is i32 as taken with mut = 0;   // BUTTON_UP, taken by a drag
+
+fn pump(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) {
+        x11.pump(&win);
+        let is events.Event as e;
+        while (x11.poll_event(&win, &e) == 1) {
+            if (((e.kind >= events.DND_ENTER && e.kind <= events.DND_DROP) || e.kind == events.DRAG_DONE) && nheard < 64) {
+                heard[nheard] = e;
+                nheard = nheard + 1;
+            }
+        }
+        let is ie.Event as i;
+        while (x11.poll_input(&win, &i) == 1) {
+            if (i.kind == ie.BUTTON_UP && i.detail == ie.BUTTON_TAKEN) { taken = taken + 1; }
+        }
+        time.sleep_ms(2);
+    }
+}
+
+// The last event of kind k heard: its index, -1 for none.
+fn last(k as i32) as i32 {
+    let is i32 as i with mut = nheard - 1;
+    while (i >= 0) {
+        if (heard[i].kind == k) { return i; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+fn until_heard(k as i32, ms as i64) as i32 {
+    let is i64 as end = time.now_ms() + ms;
+    while (time.now_ms() < end && last(k) < 0) { pump(10); }
+    return last(k);
+}
+
+fn move_to(x as i64, y as i64) as void {
+    XTestFakeMotionEvent(xd, 0 - 1, cast(i32, x), cast(i32, y), cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+// The pointer from x0, y0 to x1, y1 in steps, both sides pumped between.
+fn glide(x0 as i64, y0 as i64, x1 as i64, y1 as i64) as void {
+    let is i64 as k with mut = 1;
+    while (k <= 24) {
+        move_to(x0 + (x1 - x0) * k / 24, y0 + (y1 - y0) * k / 24);
+        pump(25);
+        k = k + 1;
+    }
+}
+
+fn button(down as i32) as void {
+    XTestFakeButtonEvent(xd, cast(u32, 1), down, cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+fn key(keysym as i64, down as i32) as void {
+    XTestFakeKeyEvent(xd, cast(u32, xlib.XKeysymToKeycode(xd, keysym)), down, cast(u64, 0));
+    xlib.XFlush(xd);
+}
+
+// --- The peer ---
+
+let is i64 as peer with mut = 0;
+let is transfer.Bytes as logb with mut;
+
+fn start_peer(args as *u8) as i32 {
+    let is [256]u8 as cmd with mut;
+    let is *u8 as head = "rm -f build/dnd-peer.log.*; exec env NO_AT_BRIDGE=1 GTK_MODULES= XDG_CONFIG_HOME=/nonexistent python3 window/tools/gtk_dnd_peer.py ";
+    let is i64 as n with mut = 0;
+    while (head[n] != 0) { cmd[n] = head[n]; n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (args[i] != 0 && n < 254) { cmd[n] = args[i]; n = n + 1; i = i + 1; }
+    cmd[n] = 0;
+    linux.unlink("build/dnd-peer.log");
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, &cmd[0]); argv[3] = 0;
+    peer = process.spawnp("sh", cast(*u8, &argv[0]));
+    return cast(i32, peer > 0 && log_has("ready", 10000) == 1);
+}
+
+fn stop_peer() as void {
+    if (peer > 0) {
+        sys.kill(peer, 15);
+        let is i32 as st with mut = 0;
+        linux.wait4(peer, &st, 0, cast(*u8, 0));
+        peer = 0;
+    }
+    pump(100);
+}
+
+fn read_file(path as *u8, out as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(out);
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    let is [65536]u8 as buf with mut;
+    while (1 == 1) {
+        let is i64 as n = linux.read(fd, &buf[0], 65536);
+        if (n <= 0) { break; }
+        transfer.append(out, &buf[0], n);
+    }
+    linux.close(fd);
+    return 1;
+}
+
+fn contains(b as *transfer.Bytes, s as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    let is i64 as i with mut = 0;
+    while (i + n <= b.len) {
+        if (mem.memcmp(cast(*u8, cast(i64, b.data) + i), s, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Whether the peer's log says line within ms, both sides pumped.
+fn log_has(line as *u8, ms as i64) as i32 {
+    let is i64 as end = time.now_ms() + ms;
+    while (time.now_ms() < end) {
+        pump(20);
+        if (read_file("build/dnd-peer.log", &logb) == 1 && contains(&logb, line) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn same(b as *transfer.Bytes, p as *u8, n as i64) as i32 {
+    if (b.len != n) { io.printf("  %d bytes, want %d\n", b.len, n); return 0; }
+    return cast(i32, mem.memcmp(b.data, p, n) == 0);
+}
+
+fn str_same(a as *u8, b as *u8) as i32 {
+    if (cast(i64, a) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (b[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i32, a[i] == b[i]);
+}
+
+// A drag begun here: pressed at 150, 150 and handed to the platform with o.
+fn begin_here(o as *transfer.Offer) as i32 {
+    move_to(150, 150);
+    pump(100);
+    button(1);
+    pump(150);
+    taken = 0;
+    return x11.drag_begin(&win, o, transfer.COPY | transfer.MOVE);
+}
+
+// GTK's drag of its types coming over this window, stopped before it is let go.
+fn drag_in_halfway() as void {
+    move_to(750, 250);
+    pump(100);
+    button(1);
+    pump(100);
+    nheard = 0;
+    glide(750, 250, 280, 200);
+}
+
+// On to the middle of it, and let go: the drop heard, or -1.
+fn drag_in_rest() as i32 {
+    glide(280, 200, 150, 150);
+    button(0);
+    return until_heard(events.DND_DROP, 5000);
+}
+
+// What makes a format on demand.
+let is i32 as made with mut = 0;
+
+fn provide(user as *u8, format as i32, name as *u8, n as i64, out as *transfer.Bytes) as i32 {
+    made = made + 1;
+    return transfer.bytes_set(out, "<b>made now</b>", 15);
+}
+
+// A pixel of the screen at x, y, as 0xRRGGBB.
+fn screen_pixel(x as i64, y as i64) as i64 {
+    let is *u8 as img = xlib.XGetImage(xd, xlib.XDefaultRootWindow(xd), cast(i32, x), cast(i32, y), cast(u32, 1), cast(u32, 1),
+                                       cast(u64, 0 - 1), 2);
+    if (cast(i64, img) == 0) { return 0 - 1; }
+    let is i64 as p = xlib.XGetPixel(img, 0, 0) & 16777215;
+    xlib.XDestroyImage(img);
+    return p;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    transfer.bytes_init(&logb);
+    xd = xlib.XOpenDisplay(cast(*u8, 0));
+    if (cast(i64, xd) == 0) { io.printf("FAIL: no X display\n"); return 1; }
+    win = x11.open("dnd", 300, 300);
+    if (x11.is_open(&win) == 0) { io.printf("FAIL: no window\n"); return 1; }
+    x11.move_to(&win, 0, 0);
+    pump(300);
+    let is transfer.Bytes as got with mut;
+    transfer.bytes_init(&got);
+    let is transfer.Bytes as png with mut;
+    transfer.bytes_init(&png);
+    read_file("image/testdata/rgba.png", &png);
+    let is *u8 as own = "application/x-caustic-test";
+    let is *u8 as types = "source build/dnd-peer.log types --types=application/x-caustic-test,text/html,image/png";
+
+    // --- In: each taken alone ---
+    check("a GTK source of its types", start_peer(types) == 1);
+    drag_in_halfway();
+    let is i32 as en with mut = last(events.DND_ENTER);
+    check("in: named and a PNG offered", en >= 0 && (heard[en].drop & transfer.NAMED) != 0 && (heard[en].drop & transfer.PNG) != 0);
+    let is *transfer.Names as names = x11.drop_offered_names(&win);
+    check("in: the names", cast(i64, names) != 0 && transfer.names_has(names, own, 26) == 1 &&
+          transfer.names_has(names, transfer.MIME_HTML, 9) == 1);
+    check("in: its own type taken", x11.drop_answer_named(&win, own, 26, 0) == 1);
+    let is i32 as dr with mut = drag_in_rest();
+    check("in: dropped, named", dr >= 0 && heard[dr].drop == transfer.NAMED);
+    check("in: its bytes, its name", str_same(x11.dropped_name(&win), own) == 1 && x11.dropped_data_length(&win) == 31 &&
+          mem.memcmp(x11.dropped_data(&win), "own: application/x-caustic-test", 31) == 0);
+    x11.clear_drop(&win);
+    stop_peer();
+
+    check("a GTK source again", start_peer(types) == 1);
+    drag_in_halfway();
+    check("in: HTML taken", x11.drop_answer_named(&win, transfer.MIME_HTML, 9, 0) == 1);
+    dr = drag_in_rest();
+    check("in: dropped, HTML", dr >= 0 && heard[dr].drop == transfer.NAMED && str_same(x11.dropped_name(&win), "text/html") == 1 &&
+          x11.dropped_data_length(&win) == 15 && mem.memcmp(x11.dropped_data(&win), "<b>from gtk</b>", 15) == 0);
+    x11.clear_drop(&win);
+    stop_peer();
+
+    check("a GTK source once more", start_peer(types) == 1);
+    drag_in_halfway();
+    check("in: a PNG taken", x11.drop_answer(&win, transfer.PNG, 0) == 1);
+    dr = drag_in_rest();
+    check("in: dropped, a PNG, whole", dr >= 0 && heard[dr].drop == transfer.PNG && x11.dropped_data_length(&win) == png.len &&
+          mem.memcmp(x11.dropped_data(&win), png.data, png.len) == 0);
+    x11.clear_drop(&win);
+    stop_peer();
+
+    // --- Out ---
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, "plain", 5);
+    transfer.offer_named(&o, own, 26, "own out", 7);
+    transfer.offer_png(&o, png.data, png.len);
+    check("a GTK target of its own type", start_peer("target build/dnd-peer.log --types=application/x-caustic-test") == 1);
+    nheard = 0;
+    check("out: begun", begin_here(&o) == 1);
+    glide(150, 150, 750, 250);
+    button(0);
+    let is i32 as done with mut = until_heard(events.DRAG_DONE, 5000);
+    check("out: done", done >= 0 && heard[done].action != 0);
+    check("out: GTK received its own type", log_has("drop application/x-caustic-test copy 7", 3000) == 1 &&
+          read_file("build/dnd-peer.log.1", &got) == 1 && same(&got, "own out", 7) == 1);
+    stop_peer();
+    check("a GTK target of PNGs", start_peer("target build/dnd-peer.log --types=image/png") == 1);
+    nheard = 0;
+    check("out: begun again", begin_here(&o) == 1);
+    glide(150, 150, 750, 250);
+    button(0);
+    done = until_heard(events.DRAG_DONE, 5000);
+    check("out: GTK received the PNG, whole", done >= 0 && log_has("drop image/png", 3000) == 1 &&
+          read_file("build/dnd-peer.log.1", &got) == 1 && same(&got, png.data, png.len) == 1);
+    stop_peer();
+
+    // --- Out: made on demand, when GTK asks ---
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    made = 0;
+    check("on demand: said", transfer.offer_lazy_named(&o, transfer.MIME_HTML, 9, fn_ptr(provide), cast(*u8, 0)) == 1);
+    check("a GTK target of HTML", start_peer("target build/dnd-peer.log --types=text/html") == 1);
+    nheard = 0;
+    check("out: begun, nothing made", begin_here(&o) == 1 && made == 0);
+    glide(150, 150, 750, 250);
+    check("over it: still nothing made", made == 0);
+    button(0);
+    done = until_heard(events.DRAG_DONE, 5000);
+    check("let go: made, and received", done >= 0 && made == 1 && log_has("drop text/html copy 15", 3000) == 1 &&
+          read_file("build/dnd-peer.log.1", &got) == 1 && same(&got, "<b>made now</b>", 15) == 1);
+    stop_peer();
+
+    // --- The image ---
+    let is [1024]u32 as argb with mut;
+    let is i64 as i with mut = 0;
+    while (i < 1024) { argb[i] = cast(u32, 4294901760); i = i + 1; }   // opaque red
+    transfer.offer_free(&o);
+    transfer.offer_init(&o);
+    transfer.offer_text(&o, "imaged", 6);
+    check("an image kept", x11.drag_set_image(&win, cast(*u8, &argb[0]), 32, 32, 16, 16) == 1);
+    nheard = 0;
+    check("with an image: begun", begin_here(&o) == 1);
+    glide(150, 150, 400, 400);
+    pump(100);
+    check("a window of its own for it", win.drop.icon != 0);
+    check("its colour under the pointer", screen_pixel(392, 392) == 16711680);
+    check("nothing of it past its edge", screen_pixel(420, 420) != 16711680);
+    glide(400, 400, 450, 420);
+    pump(100);
+    check("it goes with the pointer", screen_pixel(442, 412) == 16711680 && screen_pixel(392, 392) != 16711680);
+    button(0);
+    done = until_heard(events.DRAG_DONE, 5000);
+    pump(100);
+    check("let go over nothing: done, gone", done >= 0 && heard[done].action == 0 && win.drop.icon == 0 &&
+          screen_pixel(442, 412) != 16711680);
+    check("no image for the next", x11.drag_set_image(&win, cast(*u8, 0), 0, 0, 0, 0) == 1);
+    nheard = 0;
+    check("with none: begun", begin_here(&o) == 1);
+    glide(150, 150, 400, 400);
+    check("no window for it", win.drop.icon == 0);
+    button(0);
+    done = until_heard(events.DRAG_DONE, 5000);
+    check("done", done >= 0);
+
+    transfer.offer_free(&o);
+    x11.close(&win);
+    xlib.XCloseDisplay(xd);
+    if (fails == 0) { io.printf("x11 drag formats and image: all checks passed\n"); return 0; }
+    io.printf("x11 drag formats and image: %d failures\n", fails);
+    return 1;
+}

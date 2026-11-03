@@ -604,6 +604,52 @@ where said:
   (`x11/selection_test`, `x11/dnd_gtk_test`), wl-copy/wl-paste and GTK 3 on
   KWin (`wayland/selection_test`, `wayland/dnd_test`), mingw-built peers
   under Wine (`win32/selection_test`, `win32/dnd_test`).
+
+  Beyond those three, formats by name — a MIME type: `text/html`, a program's
+  own `application/x-…` — `transfer.NAMED`, up to `MAX_NAMED` an offer, each its
+  name and bytes (`offer_named`): an X atom of the name, the name itself on
+  Wayland, a clipboard format `RegisterClipboardFormat`ed by it on Windows,
+  `text/html` there the `"HTML Format"` Windows' programs read — its header of
+  offsets written and, reading another's, taken off (`cf_html_wrap`,
+  `cf_html_unwrap`). `clipboard_request_named(w, which, name, n)` asks for one
+  (`clipboard_format` then `NAMED`, or 0); `clipboard_offered_names`, after an
+  answer to format 0, says which there are. A drag the same:
+  `drop_offered_names` at `DND_ENTER`, `drop_answer_named` to take one alone, and
+  a `DND_DROP` of `transfer.PNG` or `NAMED` read with `dropped_data`,
+  `dropped_data_length` and `dropped_name`. Windows' image beside a PNG,
+  `transfer.DIB` — CF_DIB's bytes, offered with `offer_dib`, read from CF_DIBV5
+  or CF_DIB — is only carried here: the toolkit makes it from the PNG and back
+  (`image/dib.cst`), so that this directory depends on no image library.
+
+  A format may be offered on demand (`offer_lazy`, `offer_lazy_named`): nothing
+  made until another program asks, then once, by the function given. X11 asks
+  the owner; a Wayland source is handed a descriptor; Windows puts the format off
+  (`SetClipboardData` with no data) and asks `WM_RENDERFORMAT`, and
+  `WM_RENDERALLFORMATS` as the owner's window goes.
+
+  The clipboard followed (`clipboard_watch.cst`'s `follow`, kept apart so that a
+  program that never asks need not link `libXfixes`): `CLIPBOARD_CHANGED` on each
+  change of hands, `state` which selection, `drop` the formats it now offers,
+  `transfer.HTML` with `NAMED` when `text/html` is among them. XFixes and a
+  `TARGETS` of the new owner on X11, `data_device.selection` on Wayland,
+  `AddClipboardFormatListener` on Windows.
+
+  What X11 owns outlives its window where the desktop has a clipboard manager:
+  as the window closes `SAVE_TARGETS` is asked of `CLIPBOARD_MANAGER`, which
+  fetches everything by `MULTIPLE` while `close` serves it, for up to three
+  seconds; with no manager closing does not wait. Proved against a manager of
+  the test's own (`x11/clipmanager_test`).
+
+  A drag's image: `drag_set_image(w, argb, iw, ih, hx, hy)`, straight
+  0xAARRGGBB, the pointer at hx, hy of it, kept for the next `drag_begin` — an
+  ARGB override-redirect window following the pointer on X11, the input going
+  through it and, with no compositor, cut to the pixels more than half opaque
+  (XShape); `start_drag`'s icon surface on Wayland; `IDragSourceHelper` on
+  Windows, the shell's to show. Named formats, what is made on demand, the change
+  and the image proved against the same programs (`x11/named_test`,
+  `x11/dnd_named_test`, `wayland/named_test`, `wayland/dnd_named_test`,
+  `win32/named_test`, `win32/dnd_named_test`), the image read back from the screen
+  on X11 and KWin.
 - Popups (`Config.popup`: `POPUP_MENU`, `POPUP_LIST`, `POPUP_TOOLTIP`), which
   must have an owner and are never put at a point of the screen: `Config.place`
   is a `positioner.cst` positioner against a rectangle of the owner's client,

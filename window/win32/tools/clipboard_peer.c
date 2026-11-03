@@ -16,6 +16,20 @@
  *   clipboard_peer.exe formats <out>        the formats there, a line each:
  *                                           CF_UNICODETEXT, CF_TEXT, PNG, or
  *                                           the number
+ *   clipboard_peer.exe put-named <name> <file>   the clipboard emptied and
+ *                                           owned: the format registered as
+ *                                           name, the file's bytes as they are
+ *   clipboard_peer.exe get-named <name> <out>    the format registered as name
+ *                                           written to out; exit 3 when not
+ *                                           there
+ *   clipboard_peer.exe put-html <file>      "HTML Format" of the file's
+ *                                           fragment, inside a page, with the
+ *                                           header of offsets Windows' programs
+ *                                           write
+ *   clipboard_peer.exe put-cf <n> <file>    format number n (17: CF_DIBV5),
+ *                                           the file's bytes
+ *   clipboard_peer.exe get-cf <n> <out>     format number n written to out;
+ *                                           exit 3 when not there
  *
  * Exit 0 when done, 1 when the clipboard could not be had. */
 #include <windows.h>
@@ -119,6 +133,42 @@ int main(int argc, char **argv) {
             if (!write_all(argv[2], GlobalLock(h), GlobalSize(h))) status = 1;
             GlobalUnlock(h);
         }
+    } else if (strcmp(argv[1], "put-html") == 0) {
+        size_t n = 0;
+        char *frag = read_all(argv[2], &n);
+        if (!frag) {
+            status = 1;
+        } else {
+            static const char pre[] = "<html><body><!--StartFragment-->";
+            static const char post[] = "<!--EndFragment--></body></html>";
+            static const char fmt[] = "Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n";
+            int head = snprintf(NULL, 0, fmt, 0, 0, 0, 0);
+            size_t all = head + (sizeof pre - 1) + n + (sizeof post - 1);
+            char *b = malloc(all + 1);
+            int start = head + (int)(sizeof pre - 1);
+            snprintf(b, head + 1, fmt, head, (int)all, start, start + (int)n);
+            memcpy(b + head, pre, sizeof pre - 1);
+            memcpy(b + start, frag, n);
+            memcpy(b + start + n, post, sizeof post);
+            if (!EmptyClipboard() || !SetClipboardData(RegisterClipboardFormatA("HTML Format"), global_of(b, all + 1))) status = 1;
+            free(b);
+            free(frag);
+        }
+    } else if ((strcmp(argv[1], "put-named") == 0 || strcmp(argv[1], "put-cf") == 0) && argc >= 4) {
+        UINT cf = strcmp(argv[1], "put-cf") == 0 ? (UINT)atoi(argv[2]) : RegisterClipboardFormatA(argv[2]);
+        size_t n = 0;
+        char *b = read_all(argv[3], &n);
+        if (!b || !EmptyClipboard() || !SetClipboardData(cf, global_of(b, n))) status = 1;
+        free(b);
+    } else if ((strcmp(argv[1], "get-named") == 0 || strcmp(argv[1], "get-cf") == 0) && argc >= 4) {
+        UINT cf = strcmp(argv[1], "get-cf") == 0 ? (UINT)atoi(argv[2]) : RegisterClipboardFormatA(argv[2]);
+        HANDLE h = GetClipboardData(cf);
+        if (!h) {
+            status = 3;
+        } else {
+            if (!write_all(argv[3], GlobalLock(h), GlobalSize(h))) status = 1;
+            GlobalUnlock(h);
+        }
     } else if (strcmp(argv[1], "formats") == 0) {
         FILE *f = fopen(argv[2], "w");
         if (!f) {
@@ -128,7 +178,11 @@ int main(int argc, char **argv) {
                 if (cf == CF_UNICODETEXT) fprintf(f, "CF_UNICODETEXT\n");
                 else if (cf == CF_TEXT) fprintf(f, "CF_TEXT\n");
                 else if (cf == png) fprintf(f, "PNG\n");
-                else fprintf(f, "%u\n", cf);
+                else {
+                    char name[128];
+                    if (GetClipboardFormatNameA(cf, name, sizeof name) > 0) fprintf(f, "%s\n", name);
+                    else fprintf(f, "%u\n", cf);
+                }
             }
             fclose(f);
         }

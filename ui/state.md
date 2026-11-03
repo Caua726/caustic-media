@@ -16,7 +16,10 @@ invalidation that climbs to the root. It carries what the application lends
 its widgets: the text service (`set_text_service`, a bare pointer so that the
 tree does not bring the text stack into programs that show none), the
 program's function for text copied to the clipboard or the primary selection
-(`set_clipboard`, `copy`), which widget names which (`set_labelled_by`,
+(`set_clipboard`, `copy`) and content of several formats (`set_clipboard_content`,
+`copy_content`), a paste in the formats a widget takes (`set_paste_as`,
+`request_paste_as`, `request_paste_plain`) and what the clipboard offers
+(`set_clipboard_offered`, `clipboard_has`), which widget names which (`set_labelled_by`,
 forgotten when the label goes), the window's animator (`set_animator`) and the
 application's timers (`set_timers`), for a widget that acts after a pause, and
 the window's router (`set_router`), for a widget that opens a popup of its own.
@@ -180,9 +183,11 @@ nothing), a pen too (its tip button 1, barrel buttons 3 and 2), and a
 touchpad's gestures go to the widget under the pointer as `GESTURE`
 (`router.gesture`) — a scroll area stops a fling when fingers rest on the
 touchpad. The router is fed by plain calls — `pointer_move`,
-`pointer_button`, `key` and `text` — which `input/` calls, `paste`, giving a
-widget the text it asked the clipboard for (`tree.request_paste`, answered by
-the program), `preedit`, the input method's composition with its caret, and
+`pointer_button`, `key` and `text` — which `input/` calls, `paste` and
+`paste_as`, giving a widget what it asked the clipboard for (`tree.request_paste`,
+`request_paste_as`, answered by the program) as `PASTE` with `event.format` saying
+which format came and `event.name` its name, `preedit`, the input method's
+composition with its caret, and
 `delete_surrounding`, its byte counts around the caret, to the focused widget.
 The host feeds the platform input method's `TEXT`, `PREEDIT` and
 `DELETE_SURROUNDING` events into these routes on all three platforms, places
@@ -905,7 +910,13 @@ who made it and the licence in their place.
 under Xvfb with a second client playing the user and the window manager):
 real windows for the application's, titled, painted and shown; X's clicks,
 keys, resizes and close buttons reaching the widgets; the clipboard through
-X; a modal dialog in a window of its own above its owner, the owner told
+X — and, with `ui/clip.cst`, content of several formats made when asked for,
+against xclip, wl-paste and a mingw peer, an image's PNG and on Windows its DIB
+beside it, HTML's text where a text field is pasted into, a change heard once
+whatever the windows (`host_clip_test`); a widget's drag shown over the window as
+the widget painted see-through and handed to the platform past its edge, to GTK and
+an OLE peer, run again from what it carries back over the program's windows, a
+list's rows going out as content (`host_drag_test`); a modal dialog in a window of its own above its owner, the owner told
 nothing meanwhile — a press, a key or the wheel on it bringing the dialog
 forward (`_NET_ACTIVE_WINDOW`, xdg-activation under the press's own serial)
 and ringing the bell, once for a burst, and Windows doing both itself for the

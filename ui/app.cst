@@ -29,6 +29,7 @@
 use "std/mem.cst" as mem;
 use "../math/math.cst" as math;
 use "tree.cst" as tree;
+use "clip.cst" as clip;
 use "layout.cst" as layout;
 use "router.cst" as router;
 use "timer.cst" as timer;
@@ -96,6 +97,15 @@ struct Window {
     see_through as i32;  // its frame's shadow lies over what is behind the window
 }
 
+// The clipboard (which 0) or the primary selection (1) changed hands:
+// cb(user, which, formats), clip bits. See on_clipboard_changed.
+type ClipboardChangedFn = fn(*u8, i32, i32) as void;
+
+// What a clipboard_get asked came: cb(user, format, name, n, data, len) —
+// format clip's, 0 for nothing; name the type's for NAMED; the bytes the
+// call's own.
+type ClipboardAnswerFn = fn(*u8, i32, *u8, i64, *u8, i64) as void;
+
 struct App {
     settings    as router.Settings;
     timers      as timer.Timers;
@@ -121,6 +131,12 @@ struct App {
     icon        as *u32;     // every window's icon, the program's pixels; null for none
     icon_size   as i64;
     icon_gen    as i64;      // counts changes, for the platform's loop to follow
+    clip_changed_fn as ClipboardChangedFn;  // the program's, null for none; see on_clipboard_changed
+    clip_changed_user as *u8;
+    clip_get_fn as ClipboardAnswerFn;       // a clipboard_get awaited; null for none
+    clip_get_user as *u8;
+    clip_formats as i32;     // what the clipboard offers, clip bits
+    clip_known  as i32;      // 1 once the platform's loop said
 }
 
 fn _win(a as *App, i as i64) as *Window {
@@ -171,6 +187,12 @@ fn open(l as *Limits) as App {
     a.icon = cast(*u32, 0);
     a.icon_size = 0;
     a.icon_gen = 0;
+    a.clip_changed_fn = cast(ClipboardChangedFn, 0);
+    a.clip_changed_user = cast(*u8, 0);
+    a.clip_get_fn = cast(ClipboardAnswerFn, 0);
+    a.clip_get_user = cast(*u8, 0);
+    a.clip_formats = 0;
+    a.clip_known = 0;
     if (l.windows < 1) { a.err = BAD_ARGUMENT; return a; }
     a.cap = l.windows;
     a.block_bytes = _theme_bytes() + _desktop_bytes() + a.cap * sizeof(Window);
@@ -224,6 +246,7 @@ fn window_open(a as *App, width as f64, height as f64) as i64 {
     if (tree.is_open(&w.tree) == 0) { a.err = TREE_FAILED; return 0; }
     tree.set_theme(&w.tree, a.theme);
     tree.set_text_service(&w.tree, a.text);
+    if (a.clip_known == 1) { tree.set_clipboard_offered(&w.tree, a.clip_formats); }
     _speak(a, &w.tree);
     w.router = router.init(a.settings);
     w.anim = anim.init(&w.tree);
@@ -577,6 +600,93 @@ fn _host(user as *u8, window as i64, op as i32, arg as i64) as i64 {
         return 1;
     }
     return 0;
+}
+
+// --- The clipboard, for the program ---
+//
+// What a program does with the clipboard outside any widget: through the
+// active window — else the first open with a platform under it — as the
+// clipboard belongs to a window on every platform. What the program offers
+// stays offered as long as that window lives.
+
+// The window to ask through: its tree, null for none on the platform.
+fn _clipboard_tree(a as *App) as *tree.Tree {
+    let is i64 as h with mut = next_window(a, 0);
+    let is *tree.Tree as first with mut = cast(*tree.Tree, 0);
+    while (h != 0) {
+        let is *tree.Tree as t = &_win(a, _index(a, h)).tree;
+        if (tree.clipboard_lent(t) == 1) {
+            if (is_active(a, h) == 1) { return t; }
+            if (cast(i64, first) == 0) { first = t; }
+        }
+        h = next_window(a, h);
+    }
+    return first;
+}
+
+// c on which, tree.CLIPBOARD or PRIMARY, copied: 1, or 0 with no window on
+// the platform to put it there. A provider of c's stays the program's to keep
+// while the clipboard is its own.
+fn clipboard_set(a as *App, which as i32, c as *clip.Content) as i32 {
+    let is *tree.Tree as t = _clipboard_tree(a);
+    if (cast(i64, t) == 0) { return 0; }
+    tree.copy_content(t, which, c);
+    return 1;
+}
+
+// What which holds, in one of formats (clip bits; NAMED: the type named
+// name, n bytes), asked for: cb hears the answer later, with format 0 when
+// there was none of them. 1 when asked; 0 — no call to cb — while another is
+// awaited or with no window on the platform to ask through.
+fn clipboard_get(a as *App, which as i32, formats as i32, name as *u8, n as i64, cb as ClipboardAnswerFn, user as *u8) as i32 {
+    if (cast(i64, a.clip_get_fn) != 0) { return 0; }
+    let is *tree.Tree as t = _clipboard_tree(a);
+    if (cast(i64, t) == 0) { return 0; }
+    a.clip_get_fn = cb;
+    a.clip_get_user = user;
+    tree.request_paste_as(t, which, 0, formats, name, n);
+    return 1;
+}
+
+// A clipboard_get's answer, from the platform's loop.
+fn clipboard_answer(a as *App, format as i32, name as *u8, n as i64, data as *u8, len as i64) as void {
+    let is ClipboardAnswerFn as cb = a.clip_get_fn;
+    if (cast(i64, cb) == 0) { return; }
+    a.clip_get_fn = cast(ClipboardAnswerFn, 0);
+    call(cb, a.clip_get_user, format, name, n, data, len);
+}
+
+// cb hears each change of the clipboard and the primary selection, by another
+// program or this one. Null for no more.
+fn on_clipboard_changed(a as *App, cb as ClipboardChangedFn, user as *u8) as void {
+    a.clip_changed_fn = cb;
+    a.clip_changed_user = user;
+}
+
+// What the clipboard offers, from the platform's loop: every window's
+// tree.clipboard_has answers by it.
+fn clipboard_offered(a as *App, formats as i32) as void {
+    a.clip_formats = formats;
+    a.clip_known = 1;
+    let is i64 as h with mut = next_window(a, 0);
+    while (h != 0) {
+        tree.set_clipboard_offered(&_win(a, _index(a, h)).tree, formats);
+        h = next_window(a, h);
+    }
+}
+
+// A change, from the platform's loop: which, 0 the clipboard and 1 the primary
+// selection, offers formats now.
+fn clipboard_changed(a as *App, which as i32, formats as i32) as void {
+    if (which == 0) { clipboard_offered(a, formats); }
+    if (cast(i64, a.clip_changed_fn) != 0) { call(a.clip_changed_fn, a.clip_changed_user, which, formats); }
+}
+
+// Whether the clipboard offers format (clip bits: any of them); 1 while the
+// platform's loop has not said — a paste then finds out.
+fn clipboard_has(a as *App, format as i32) as i32 {
+    if (a.clip_known == 0) { return 1; }
+    return cast(i32, (a.clip_formats & format) != 0);
 }
 
 // --- What the platform says about a window ---

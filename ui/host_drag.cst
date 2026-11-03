@@ -1,0 +1,490 @@
+// ui/host_drag.cst — a drag between the program and the platform.
+//
+// A drag begun by a widget (router.begin_drag) is the router's while the
+// pointer is over the program's windows. This shows its image there — the
+// program's, or the widget it began from painted translucent, once — as a
+// widget above everything in the window the pointer is over, and hands the
+// drag to the platform (device.drag_begin, with that image) the moment the
+// pointer leaves them all, if it carries anything another program could take.
+//
+// The platform takes the press and says when it ended (DRAG_DONE). Back over a
+// window of the program's meanwhile the platform says DND_* as for any drag:
+// that drag is known for this program's own and run from what it carries, not
+// from what the platform would bring.
+//
+// A drag from another program: what it offers said to the router as dnd bits,
+// and what the widget there took said to the platform as the format to bring.
+use "std/mem.cst" as mem;
+use "std/math.cst" as fm;
+use "../gpu/gpu.cst" as gpu;
+use "../math/math.cst" as math;
+use "../render/draw2d.cst" as draw2d;
+use "../window/device.cst" as device;
+use "../window/event.cst" as wevent;
+use "../window/transfer.cst" as transfer;
+use "app.cst" as app;
+use "tree.cst" as tree;
+use "router.cst" as router;
+use "layout.cst" as layout;
+use "paint.cst" as paint;
+use "style.cst" as style;
+use "dnd.cst" as dnd;
+use "widgets/image.cst" as wimage;
+use "host_state.cst" as hst;
+use "host_clip.cst" as hclip;
+
+// Above everything else in a window, a tooltip's layer too.
+let is i64 as LAYER with imut = 1100;
+
+// The most of a widget its image shows, logical pixels: a drag from a long
+// list is no window's size.
+let is f64 as MAX_IMAGE with imut = 480.0;
+
+// How opaque a widget's painted image is, of 256.
+let is i64 as ALPHA with imut = 166;
+
+fn _slot_of(hs as *hst.Host, n as *hst.Native) as i64 {
+    return (cast(i64, n) - cast(i64, hs.natives)) / sizeof(hst.Native);
+}
+
+// --- Its image ---
+
+fn _image_free(hs as *hst.Host, d as *hst.Drag) as void {
+    if (cast(i64, d.argb) != 0) { mem.core.munmap(d.argb, d.iw * d.ih * 4); }
+    d.argb = cast(*u8, 0);
+    if (d.tex != 0) { gpu.texture.destroy(hs.dv, d.tex); }
+    d.tex = 0;
+}
+
+// px, iw by ih R, G, B, A bytes with their colours carrying their alpha, the
+// image from now on: as the platform takes it, 0xAARRGGBB straight, and as a
+// texture to show here. px changed. 1 when both are had.
+fn _take_pixels(hs as *hst.Host, d as *hst.Drag, px as *u8, iw as i64, ih as i64) as i32 {
+    let is i64 as bytes = iw * ih * 4;
+    let is *u8 as argb = mem.core.mmap_anon(bytes);
+    if (cast(i64, argb) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < iw * ih) {
+        let is *u8 as c = cast(*u8, cast(i64, px) + k * 4);
+        let is i64 as a = cast(i64, c[3]) & 255;
+        let is i64 as r with mut = 0;
+        let is i64 as g with mut = 0;
+        let is i64 as b with mut = 0;
+        if (a > 0) {
+            r = (cast(i64, c[0]) & 255) * 255 / a;
+            g = (cast(i64, c[1]) & 255) * 255 / a;
+            b = (cast(i64, c[2]) & 255) * 255 / a;
+            if (r > 255) { r = 255; }
+            if (g > 255) { g = 255; }
+            if (b > 255) { b = 255; }
+        }
+        *cast(*u32, cast(i64, argb) + k * 4) = cast(u32, (a << 24) | (r << 16) | (g << 8) | b);
+        k = k + 1;
+    }
+    let is gpu.texture.Desc as td = gpu.texture.desc(iw, ih, gpu.texture.RGBA8, gpu.texture.SAMPLED);
+    let is i64 as tex = gpu.texture.create(hs.dv, &td);
+    if (tex == 0) {
+        mem.core.munmap(argb, bytes);
+        return 0;
+    }
+    gpu.texture.upload(hs.dv, tex, px, bytes);
+    d.argb = argb;
+    d.iw = iw;
+    d.ih = ih;
+    d.tex = tex;
+    return 1;
+}
+
+// All of px made as see-through as a widget's painted image is.
+fn _translucent(px as *u8, bytes as i64) as void {
+    let is i64 as k with mut = 0;
+    while (k < bytes) {
+        px[k] = cast(u8, ((cast(i64, px[k]) & 255) * ALPHA) >> 8);
+        k = k + 1;
+    }
+}
+
+// The program's image: its 0xAARRGGBB straight pixels as the image is had.
+fn _given(hs as *hst.Host, d as *hst.Drag, p as *dnd.Payload) as i32 {
+    if (p.image_w <= 0 || p.image_h <= 0) { return 0; }
+    let is i64 as bytes = p.image_w * p.image_h * 4;
+    let is *u8 as px = mem.core.mmap_anon(bytes);
+    if (cast(i64, px) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < p.image_w * p.image_h) {
+        let is u32 as c = *cast(*u32, cast(i64, p.image) + k * 4);
+        let is i64 as a = cast(i64, (c >> 24) & cast(u32, 255));
+        let is *u8 as o = cast(*u8, cast(i64, px) + k * 4);
+        o[0] = cast(u8, (cast(i64, (c >> 16) & cast(u32, 255)) * a + 127) / 255);
+        o[1] = cast(u8, (cast(i64, (c >> 8) & cast(u32, 255)) * a + 127) / 255);
+        o[2] = cast(u8, (cast(i64, c & cast(u32, 255)) * a + 127) / 255);
+        o[3] = cast(u8, a);
+        k = k + 1;
+    }
+    let is i32 as ok = _take_pixels(hs, d, px, p.image_w, p.image_h);
+    mem.core.munmap(px, bytes);
+    if (ok == 1) {
+        d.hx = p.image_hx;
+        d.hy = p.image_hy;
+    }
+    return ok;
+}
+
+// The widget the drag began from painted — the part of it the payload says —
+// as the image, the pointer where it was on it.
+fn _painted(hs as *hst.Host, n as *hst.Native, d as *hst.Drag, p as *dnd.Payload, src as i64) as i32 {
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is *router.Router as r = app.router(hs.a, n.h);
+    if (tree.is_valid(t, src) == 0) { return 0; }
+    let is math.rect.Rect as wr = layout.window_rect(t, src);
+    let is f64 as x with mut = 0.0;
+    let is f64 as y with mut = 0.0;
+    let is f64 as w with mut = wr.w;
+    let is f64 as h with mut = wr.h;
+    if (p.rect_w > 0.0 && p.rect_h > 0.0) {
+        x = p.rect_x;
+        y = p.rect_y;
+        w = p.rect_w;
+        h = p.rect_h;
+    }
+    // The pointer on it, its image no larger than it may be but around it.
+    let is f64 as on_x with mut = router.drag_x(r) - wr.x - x;
+    let is f64 as on_y with mut = router.drag_y(r) - wr.y - y;
+    if (w > MAX_IMAGE) {
+        let is f64 as cut with mut = on_x - MAX_IMAGE / 2.0;
+        if (cut < 0.0) { cut = 0.0; }
+        if (cut > w - MAX_IMAGE) { cut = w - MAX_IMAGE; }
+        x = x + cut;
+        on_x = on_x - cut;
+        w = MAX_IMAGE;
+    }
+    if (h > MAX_IMAGE) {
+        let is f64 as cut with mut = on_y - MAX_IMAGE / 2.0;
+        if (cut < 0.0) { cut = 0.0; }
+        if (cut > h - MAX_IMAGE) { cut = h - MAX_IMAGE; }
+        y = y + cut;
+        on_y = on_y - cut;
+        h = MAX_IMAGE;
+    }
+    let is f64 as s = n.scale;
+    let is i64 as pw = cast(i64, fm.ceil(w * s));
+    let is i64 as ph = cast(i64, fm.ceil(h * s));
+    if (pw <= 0 || ph <= 0) { return 0; }
+    let is gpu.texture.Desc as td = gpu.texture.desc(pw, ph, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    let is i64 as tex = gpu.texture.create(hs.dv, &td);
+    if (tex == 0) { return 0; }
+    let is paint.Options as o = paint.options(cast(*style.Theme, 0));
+    draw2d.begin(&hs.canvas, cast(f64, pw), cast(f64, ph), s);
+    paint.subtree(t, src, x, y, w, h, &hs.canvas, &o);
+    gpu.command.begin(hs.dv, hs.cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass(tex, 0, math.color.rgba(0.0, 0.0, 0.0, 0.0));
+    gpu.command.begin_pass(hs.dv, hs.cmd, &ps);
+    draw2d.flush(&hs.canvas, hs.cmd);
+    gpu.command.end_pass(hs.dv, hs.cmd);
+    gpu.command.end(hs.dv, hs.cmd);
+    gpu.command.submit(hs.dv, hs.cmd);
+    let is i64 as bytes = pw * ph * 4;
+    let is *u8 as px = mem.core.mmap_anon(bytes);
+    let is i32 as ok with mut = 0;
+    if (cast(i64, px) != 0) {
+        if (gpu.texture.read(hs.dv, tex, px, bytes) == 1) {
+            _translucent(px, bytes);
+            ok = _take_pixels(hs, d, px, pw, ph);
+        }
+        mem.core.munmap(px, bytes);
+    }
+    gpu.texture.destroy(hs.dv, tex);
+    if (ok == 1) {
+        d.hx = cast(i64, on_x * s);
+        d.hy = cast(i64, on_y * s);
+        if (d.hx < 0) { d.hx = 0; }
+        if (d.hy < 0) { d.hy = 0; }
+        if (d.hx >= pw) { d.hx = pw - 1; }
+        if (d.hy >= ph) { d.hy = ph - 1; }
+    }
+    return ok;
+}
+
+// --- Shown, in the program's windows ---
+
+fn _unshow(hs as *hst.Host, d as *hst.Drag) as void {
+    if (d.over_slot != 0) {
+        let is *hst.Native as m = hst._native(hs, d.over_slot - 1);
+        if (m.h != 0 && app.window_valid(hs.a, m.h) == 1) {
+            let is *tree.Tree as t = app.tree(hs.a, m.h);
+            if (tree.is_valid(t, d.over) == 1) { tree.destroy(t, d.over); }
+        }
+    }
+    d.over = 0;
+    d.over_slot = 0;
+}
+
+// The image shown where the pointer is, whichever of the windows that is.
+fn _place(hs as *hst.Host, n as *hst.Native) as void {
+    let is *hst.Drag as d = &n.drag;
+    if (d.tex == 0) { return; }
+    let is i64 as slot with mut = _slot_of(hs, n);
+    if (n.over != 0) { slot = n.over - 1; }
+    let is *hst.Native as m = hst._native(hs, slot);
+    if (m.h == 0 || app.window_valid(hs.a, m.h) == 0) { return; }
+    let is *tree.Tree as t = app.tree(hs.a, m.h);
+    let is *router.Router as r = app.router(hs.a, m.h);
+    let is f64 as s = m.scale;
+    if (d.over_slot != slot + 1) {
+        _unshow(hs, d);
+        let is i64 as im = wimage.create(t, tree.root(t), d.tex, cast(f64, d.iw) / s, cast(f64, d.ih) / s);
+        if (im == 0) { return; }
+        wimage.set_premultiplied(t, im, 1);
+        tree.set_layer(t, im, LAYER);
+        // The pointer goes through it to what lies beneath.
+        tree.set_flag(t, im, tree.F_NO_INPUT, 1);
+        // At the window's coordinates whatever its direction.
+        if (layout.direction(t, im) == layout.RTL) {
+            layout.set_align(t, im, layout.END, layout.START);
+        } else {
+            layout.set_align(t, im, layout.START, layout.START);
+        }
+        d.over = im;
+        d.over_slot = slot + 1;
+        d.at_x = 0.0 - 1.0;
+        d.at_y = 0.0 - 1.0;
+    }
+    if (tree.is_valid(t, d.over) == 0) { return; }
+    let is f64 as x with mut = router.drag_x(r) - cast(f64, d.hx) / s;
+    let is f64 as y with mut = router.drag_y(r) - cast(f64, d.hy) / s;
+    if (x < 0.0) { x = 0.0; }
+    if (y < 0.0) { y = 0.0; }
+    if (x != d.at_x || y != d.at_y) {
+        layout.set_margin(t, d.over, x, y, 0.0, 0.0);
+        d.at_x = x;
+        d.at_y = y;
+    }
+}
+
+// Over: nothing of it left.
+fn _finish(hs as *hst.Host, n as *hst.Native) as void {
+    let is *hst.Drag as d = &n.drag;
+    _unshow(hs, d);
+    _image_free(hs, d);
+    hclip._forget(&d.held);
+    if (d.out == 1 && hs.drag_out == _slot_of(hs, n) + 1) { hs.drag_out = 0; }
+    d.live = 0;
+    d.out = 0;
+}
+
+// Each round, for each window: a drag begun here seen, followed, ended.
+fn _round(hs as *hst.Host, n as *hst.Native) as void {
+    let is *hst.Drag as d = &n.drag;
+    let is *router.Router as r = app.router(hs.a, n.h);
+    let is *dnd.Payload as p = router.drag_payload(r);
+    if (cast(i64, p) == 0) {
+        if (d.live == 1) { _finish(hs, n); }
+        return;
+    }
+    if (d.live == 0) {
+        d.live = 1;
+        d.hx = 0;
+        d.hy = 0;
+        if (p.no_image == 0) {
+            if (cast(i64, p.image) != 0) {
+                _given(hs, d, p);
+            } else {
+                _painted(hs, n, d, p, router.drag_source(r));
+            }
+        }
+    }
+    if (d.out == 0) { _place(hs, n); }
+}
+
+// --- To the platform ---
+
+// The pointer at x, y of n's window (physical pixels), over none of the
+// program's windows: the drag handed to the platform if something other than
+// an item of a widget here is carried. 1 when it was.
+fn _go_out(hs as *hst.Host, n as *hst.Native, x as i64, y as i64, now as i64) as i32 {
+    let is *hst.Drag as d = &n.drag;
+    if (d.out == 1) { return 1; }
+    if (x >= 0 && y >= 0 && x < device.width(&n.win) && y < device.height(&n.win)) { return 0; }
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is *router.Router as r = app.router(hs.a, n.h);
+    let is *dnd.Payload as p = router.drag_payload(r);
+    if (cast(i64, p) == 0 || (p.offers & (0 - 1 - dnd.ITEM)) == 0) { return 0; }
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    let is i32 as ok with mut = 1;
+    if (cast(i64, p.content) != 0) {
+        ok = hclip._offer_of(&d.held, p.content, &o);
+    } else {
+        if ((p.offers & dnd.TEXT) != 0) { ok = transfer.offer_text(&o, p.text, p.text_len); }
+        if (ok == 1 && (p.offers & dnd.FILES) != 0) { ok = transfer.offer_files(&o, p.files, p.files_n); }
+    }
+    if (ok == 0) {
+        transfer.offer_free(&o);
+        return 0;
+    }
+    if (cast(i64, d.argb) != 0) { device.drag_set_image(&n.win, d.argb, d.iw, d.ih, d.hx, d.hy); }
+    else { device.drag_set_image(&n.win, cast(*u8, 0), 0, 0, 0, 0); }
+    _unshow(hs, d);
+    router.drag_gone_out(t, r, now);
+    d.out = 1;
+    hs.drag_out = _slot_of(hs, n) + 1;
+    // On Windows it runs to its end here: DRAG_DONE by the time it returns.
+    if (device.drag_begin(&n.win, &o, p.actions) == 0) {
+        d.out = 0;
+        hs.drag_out = 0;
+        router.drag_stayed(r);
+        transfer.offer_free(&o);
+        return 0;
+    }
+    transfer.offer_free(&o);
+    return 1;
+}
+
+// DRAG_DONE: the drag it had was over, action what was done with it.
+fn _done(hs as *hst.Host, n as *hst.Native, action as i32, now as i64) as void {
+    if (n.drag.out == 0) { return; }
+    router.drag_out_done(app.tree(hs.a, n.h), app.router(hs.a, n.h), action, now);
+    _finish(hs, n);
+}
+
+// --- From the platform ---
+
+// What a drag over n offers, transfer's bits, as a payload: with what it
+// brought when let go.
+fn _payload(n as *hst.Native, offers as i32, with_data as i32) as dnd.Payload {
+    let is dnd.Payload as p with mut = dnd.files(cast(*u8, 0), 0);
+    p.offers = 0;
+    if ((offers & wevent.DROP_FILES) != 0) { p.offers = p.offers | dnd.FILES; }
+    if ((offers & wevent.DROP_TEXT) != 0) { p.offers = p.offers | dnd.TEXT; }
+    if ((offers & transfer.PNG) != 0) { p.offers = p.offers | dnd.PNG; }
+    if (with_data == 0 && (offers & transfer.NAMED) != 0) {
+        let is *transfer.Names as names = device.drop_offered_names(&n.win);
+        if (cast(i64, names) != 0) {
+            p.names = names;
+            let is i64 as i with mut = 0;
+            while (i < names.n) {
+                let is *u8 as z = transfer.names_at(names, i);
+                let is i64 as k with mut = 0;
+                while (z[k] != 0) { k = k + 1; }
+                if (transfer._named_is(transfer.MIME_HTML, z, k) == 1) { p.offers = p.offers | dnd.HTML; }
+                else { p.offers = p.offers | dnd.NAMED; }
+                i = i + 1;
+            }
+        }
+    }
+    if (with_data == 1) {
+        let is i64 as nf = device.dropped_files(&n.win);
+        if (nf > 0) {
+            p.files = device.dropped_file(&n.win, 0);
+            p.files_n = nf;
+        }
+        p.text = device.dropped_text(&n.win);
+        p.text_len = device.dropped_text_length(&n.win);
+        if ((offers & (transfer.PNG | transfer.NAMED)) != 0) {
+            p.data = device.dropped_data(&n.win);
+            p.data_len = device.dropped_data_length(&n.win);
+            p.data_format = dnd.PNG;
+            if ((offers & transfer.NAMED) != 0) {
+                let is *u8 as z = device.dropped_name(&n.win);
+                let is i64 as k with mut = 0;
+                if (cast(i64, z) != 0) {
+                    while (z[k] != 0) { k = k + 1; }
+                }
+                p.name = z;
+                p.name_len = k;
+                p.data_format = dnd.NAMED;
+                if (k > 0 && transfer._named_is(transfer.MIME_HTML, z, k) == 1) { p.data_format = dnd.HTML; }
+            }
+        }
+    }
+    return p;
+}
+
+// What was taken there, dnd bits, said to the platform as what to bring: a
+// named type alone; what is left of the rest as they are.
+fn _answer(n as *hst.Native, p as *dnd.Payload, takes as i32) as void {
+    if ((takes & dnd.NAMED) != 0) {
+        let is i64 as k with mut = 0;
+        let is *u8 as z = dnd.named_taken(p, &k);
+        if (cast(i64, z) != 0) {
+            device.drop_answer_named(&n.win, z, k, 0);
+            return;
+        }
+    }
+    if ((takes & dnd.HTML) != 0) {
+        device.drop_answer_named(&n.win, transfer.MIME_HTML, 9, 0);
+        return;
+    }
+    let is i32 as w with mut = 0;
+    if ((takes & dnd.FILES) != 0) { w = w | wevent.DROP_FILES; }
+    if ((takes & dnd.TEXT) != 0) { w = w | wevent.DROP_TEXT; }
+    if ((takes & dnd.PNG) != 0) { w = w | transfer.PNG; }
+    device.drop_answer(&n.win, w, 0);
+}
+
+// The program's own drag back over n, taken there or not: the platform told to
+// bring whatever of it, since what is used is what the drag carries.
+fn _answer_own(n as *hst.Native, p as *dnd.Payload, takes as i32) as void {
+    if (takes == 0) {
+        device.drop_answer(&n.win, 0, 0);
+        return;
+    }
+    let is i32 as any with mut = takes;
+    if ((p.offers & dnd.TEXT) != 0) { any = dnd.TEXT; }
+    else if ((p.offers & dnd.FILES) != 0) { any = dnd.FILES; }
+    else if ((p.offers & dnd.PNG) != 0) { any = dnd.PNG; }
+    else if ((p.offers & dnd.HTML) != 0) { any = dnd.HTML; }
+    else { any = dnd.NAMED; }
+    _answer(n, p, any);
+}
+
+// DND_ENTER, DND_MOVE. The drag the program's own, gone out and come back: run
+// from what it carries. 1 when it was.
+fn _own_over(hs as *hst.Host, n as *hst.Native, x as f64, y as f64, first as i32, now as i64) as i32 {
+    if (hs.drag_out == 0) { return 0; }
+    let is *hst.Native as src = hst._native(hs, hs.drag_out - 1);
+    if (src.h == 0) { return 0; }
+    let is *dnd.Payload as p = router.drag_payload(app.router(hs.a, src.h));
+    if (cast(i64, p) == 0) { return 0; }
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is *router.Router as r = app.router(hs.a, n.h);
+    let is i32 as takes with mut = 0;
+    if (cast(i64, src) == cast(i64, n)) {
+        takes = router.drag_back_over(t, r, x, y, now);
+    } else if (first == 1) {
+        takes = router.drag_enter(t, r, p, x, y, now);
+    } else {
+        takes = router.drag_move(t, r, x, y, now);
+    }
+    _answer_own(n, p, takes);
+    return 1;
+}
+
+// DND_LEAVE: 1 when it was the program's own.
+fn _own_leave(hs as *hst.Host, n as *hst.Native, now as i64) as i32 {
+    if (hs.drag_out == 0) { return 0; }
+    let is *hst.Native as src = hst._native(hs, hs.drag_out - 1);
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is *router.Router as r = app.router(hs.a, n.h);
+    if (cast(i64, src) == cast(i64, n)) {
+        router.drag_elsewhere(t, r, now);
+    } else {
+        router.drag_leave(t, r, now);
+    }
+    return 1;
+}
+
+// DND_DROP: 1 when it was the program's own, let go at x, y.
+fn _own_drop(hs as *hst.Host, n as *hst.Native, x as f64, y as f64, now as i64) as i32 {
+    if (hs.drag_out == 0) { return 0; }
+    let is *hst.Native as src = hst._native(hs, hs.drag_out - 1);
+    let is *tree.Tree as t = app.tree(hs.a, n.h);
+    let is *router.Router as r = app.router(hs.a, n.h);
+    if (cast(i64, src) == cast(i64, n)) {
+        router.drag_back_drop(t, r, x, y, now);
+    } else {
+        router.drag_drop(t, r, x, y, now);
+    }
+    device.clear_drop(&n.win);
+    return 1;
+}

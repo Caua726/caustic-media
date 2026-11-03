@@ -51,6 +51,7 @@ use "../signal.cst" as signal;
 use "../scroll.cst" as scroll;
 use "../model.cst" as model;
 use "../dnd.cst" as dnd;
+use "../clip.cst" as clip;
 use "label.cst" as label;
 use "image.cst" as image;
 
@@ -123,7 +124,17 @@ struct Data {
     drop    as i64;          // where a row dragged over it would go, -1 for nowhere
     columns as i64;          // told as a table: its columns, and what heads them
     headers as i64;
+    drag_fn as DragContentFn;   // what a row dragged out is; null for rows that stay
+    drag_user as *u8;
+    drag_content as *clip.Content;   // what it filled in, kept until the next drag
+    drag_actions as i32;
+    _pad_drag as i32;
 }
+
+// What a row dragged out of the list is, to other programs and to what takes
+// it here: cb(t, w, row, c, user) fills c — 1, or 0 for a row that is not
+// dragged. See set_drag_content.
+type DragContentFn = fn(*tree.Tree, i64, i64, *clip.Content, *u8) as i32;
 
 // A row dragged to another place: from, to go before to (d.n for the end).
 struct Moved {
@@ -211,6 +222,12 @@ fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
     if (cast(i64, d.sel) != 0) { mem.core.munmap(cast(*u8, d.sel), d.capsel * sizeof(Range)); }
     if (cast(i64, d.rows) != 0) { mem.core.munmap(cast(*u8, d.rows), d.caprows * 8); }
     if (cast(i64, d.search) != 0) { mem.core.munmap(cast(*u8, d.search), sizeof(Search)); }
+    if (cast(i64, d.drag_content) != 0) {
+        // A drag of it still going goes on with what it carries by itself.
+        router.drag_forget_content(_router(t), d.drag_content);
+        clip.free(d.drag_content);
+        mem.core.munmap(cast(*u8, d.drag_content), sizeof(clip.Content));
+    }
 }
 
 fn _data(t as *tree.Tree, w as i64) as *Data {
@@ -642,6 +659,53 @@ fn row_at(t as *tree.Tree, w as i64, x as f64, y as f64) as i64 {
     let is i64 as i = cast(i64, fm.floor((y - b.y) / d.row_h));
     if (i < 0 || i >= d.n) { return 0 - 1; }
     return i;
+}
+
+// --- Rows dragged out ---
+
+// A row pressed and dragged is cb's content from now on (see DragContentFn),
+// to be done with as actions says: dropped on what takes it here, and on
+// other programs once it leaves the program's windows. Its image is the row.
+// Null for rows that stay. 1, or 0 for no list or no memory.
+fn set_drag_content(t as *tree.Tree, w as i64, cb as DragContentFn, actions as i32, user as *u8) as i32 {
+    let is *Data as d = _data(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    if (cast(i64, cb) != 0 && cast(i64, d.drag_content) == 0) {
+        let is *clip.Content as c = cast(*clip.Content, mem.core.mmap_anon(sizeof(clip.Content)));
+        if (cast(i64, c) == 0) { return 0; }
+        clip.init(c);
+        d.drag_content = c;
+    }
+    d.drag_fn = cb;
+    d.drag_user = user;
+    d.drag_actions = actions;
+    return 1;
+}
+
+// The drag of row d.pressed begun, as what it is: an item here when it may go
+// to another place, its content when it may go out.
+fn _begin_row_drag(t as *tree.Tree, w as i64, d as *Data) as i64 {
+    if (d.pressed < 0 || d.pressed >= d.n) { return 0; }
+    let is i32 as lends = cast(i32, cast(i64, d.drag_fn) != 0);
+    if (d.reorder == 0 && lends == 0) { return 0; }
+    let is i32 as actions with mut = dnd.MOVE;
+    if (lends == 1) {
+        actions = d.drag_actions;
+        if (d.reorder == 1) { actions = actions | dnd.MOVE; }
+    }
+    let is dnd.Payload as p with mut = dnd.item(t, w, d.pressed, actions);
+    if (lends == 1) {
+        clip.clear(d.drag_content);
+        if (call(d.drag_fn, t, w, d.pressed, d.drag_content, d.drag_user) == 1) {
+            dnd.add_content(&p, d.drag_content);
+        } else if (d.reorder == 0) {
+            return 0;
+        }
+    }
+    let is math.rect.Rect as wr = layout.window_rect(t, w);
+    let is math.rect.Rect as b = layout.window_rect(t, d.body);
+    dnd.set_image_rect(&p, b.x - wr.x, b.y - wr.y + cast(f64, d.pressed) * d.row_h, b.w, d.row_h);
+    return cast(i64, router.begin_drag(t, _router(t), w, &p));
 }
 
 // --- Rows dragged to another place ---
@@ -1333,12 +1397,8 @@ fn _event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
         // The right button goes on, for whoever shows a menu.
         return cast(i64, e.button == 1);
     }
-    // The row pressed, dragged: to another place in it.
-    if (e.kind == event.DRAG_START) {
-        if (d.reorder == 0 || d.pressed < 0 || d.pressed >= d.n) { return 0; }
-        let is dnd.Payload as p = dnd.item(t, w, d.pressed, dnd.MOVE);
-        return cast(i64, router.begin_drag(t, _router(t), w, &p));
-    }
+    // The row pressed, dragged: to another place in it, or out of it.
+    if (e.kind == event.DRAG_START) { return _begin_row_drag(t, w, d); }
     if (e.kind == event.DRAG_OVER) { return _drag_over(t, d, e); }
     if (e.kind == event.DRAG_LEAVE) {
         _set_drop(t, d, 0 - 1);

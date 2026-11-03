@@ -15,7 +15,11 @@
 //
 // An Offer is what this program puts on the clipboard or drags: a copy of the
 // data of each format offered, kept by the window until another offer takes
-// its place. Bytes grow as data arrives — a selection's chunks, a pipe's
+// its place — or, for a format offered on demand (offer_lazy,
+// offer_lazy_named), none until another program asks for it: then the
+// program's function makes it (offer_fill), once, as X11 asks the owner, a
+// Wayland source is sent a descriptor, Windows asks a window that put a
+// format off (WM_RENDERFORMAT). Bytes grow as data arrives — a selection's chunks, a pipe's
 // reads — up to MAX_BYTES, beyond which a transfer is refused rather than cut
 // short.
 use "std/mem.cst" as mem;
@@ -25,6 +29,9 @@ let is i32 as TEXT  with imut = 2;
 let is i32 as PNG   with imut = 4;
 let is i32 as NAMED with imut = 8;
 let is i32 as DIB   with imut = 16;
+// Only in what a clipboard's change says it offers (event.CLIPBOARD_CHANGED):
+// text/html among its named formats, NAMED with it.
+let is i32 as HTML  with imut = 32;
 
 // The most named formats an offer holds, and the longest name (bytes, its
 // zero not counted).
@@ -95,7 +102,14 @@ struct Named {
     name as [128]u8;
     n    as i64;
     data as Bytes;
+    lazy as i32;        // made on demand, not yet: offer_fill makes it
+    _pad as i32;
 }
+
+// What makes a format offered on demand: cb(user, format, name, n, out) —
+// format one of the bits (NAMED: name, n bytes, which), its bytes into out —
+// 1 when made.
+type ProvideFn = fn(*u8, i32, *u8, i64, *Bytes) as i32;
 
 struct Offer {
     formats as i32;     // the formats it has, bits
@@ -107,6 +121,10 @@ struct Offer {
     named   as [8]Named;   // NAMED: each by its name
     named_n as i64;
     dib     as Bytes;   // DIB: a BITMAPINFOHEADER (or V5), then the rows
+    lazy    as i32;     // the formats made on demand, not yet made: TEXT, PNG, DIB bits
+    _pad_lazy as i32;
+    provide as ProvideFn;   // what makes them; null for none
+    provide_user as *u8;
 }
 
 fn offer_init(o as *Offer) as void {
@@ -118,10 +136,14 @@ fn offer_init(o as *Offer) as void {
         o.named[k].name[0] = 0;
         o.named[k].n = 0;
         bytes_init(&o.named[k].data);
+        o.named[k].lazy = 0;
         k = k + 1;
     }
     o.named_n = 0;
     bytes_init(&o.dib);
+    o.lazy = 0;
+    o.provide = cast(ProvideFn, 0);
+    o.provide_user = cast(*u8, 0);
 }
 
 fn offer_free(o as *Offer) as void {
@@ -132,10 +154,76 @@ fn offer_free(o as *Offer) as void {
         bytes_free(&o.named[k].data);
         o.named[k].name[0] = 0;
         o.named[k].n = 0;
+        o.named[k].lazy = 0;
         k = k + 1;
     }
     o.named_n = 0;
     o.formats = 0; o.count = 0;
+    o.lazy = 0;
+    o.provide = cast(ProvideFn, 0);
+    o.provide_user = cast(*u8, 0);
+}
+
+// Formats — TEXT, PNG, DIB bits — offered on demand, made by cb(user, …)
+// when asked for: what makes every lazy format of the offer, one cb an offer.
+fn offer_lazy(o as *Offer, formats as i32, cb as ProvideFn, user as *u8) as void {
+    let is i32 as f = formats & (TEXT | PNG | DIB);
+    o.provide = cb;
+    o.provide_user = user;
+    o.lazy = o.lazy | f;
+    o.formats = o.formats | f;
+}
+
+// The format named name (n bytes) offered on demand, by the offer's cb
+// (offer_lazy's): 1, or 0 for no room or a name too long.
+fn offer_lazy_named(o as *Offer, name as *u8, n as i64, cb as ProvideFn, user as *u8) as i32 {
+    if (n <= 0 || n > MAX_NAME) { return 0; }
+    let is i64 as k with mut = offer_find(o, name, n);
+    if (k < 0) {
+        if (o.named_n >= MAX_NAMED) { return 0; }
+        k = o.named_n;
+        o.named_n = o.named_n + 1;
+    }
+    bytes_clear(&o.named[k].data);
+    mem.memcpy(&o.named[k].name[0], name, n);
+    o.named[k].name[n] = 0;
+    o.named[k].n = n;
+    o.named[k].lazy = 1;
+    o.provide = cb;
+    o.provide_user = user;
+    o.formats = o.formats | NAMED;
+    return 1;
+}
+
+// Format f's bytes made now when it was offered on demand and not made yet
+// (NAMED: the i-th named one): 1 when they are there, made or not lazy; 0
+// when making them failed, the format then empty.
+fn offer_fill(o as *Offer, f as i32, i as i64) as i32 {
+    if (f == NAMED) {
+        if (i < 0 || i >= o.named_n) { return 0; }
+        if (o.named[i].lazy == 0) { return 1; }
+        o.named[i].lazy = 0;
+        if (cast(i64, o.provide) == 0) { return 0; }
+        bytes_clear(&o.named[i].data);
+        return call(o.provide, o.provide_user, NAMED, &o.named[i].name[0], o.named[i].n, &o.named[i].data);
+    }
+    if ((o.lazy & f) == 0) { return 1; }
+    o.lazy = o.lazy & (0 - 1 - f);
+    if (cast(i64, o.provide) == 0) { return 0; }
+    let is *Bytes as b with mut = &o.text;
+    if (f == PNG) { b = &o.png; }
+    if (f == DIB) { b = &o.dib; }
+    bytes_clear(b);
+    return call(o.provide, o.provide_user, f, cast(*u8, 0), 0, b);
+}
+
+// Whether a format is offered on demand and not made yet.
+fn offer_is_lazy(o as *Offer, f as i32, i as i64) as i32 {
+    if (f == NAMED) {
+        if (i < 0 || i >= o.named_n) { return 0; }
+        return o.named[i].lazy;
+    }
+    return cast(i32, (o.lazy & f) != 0);
 }
 
 // Whether name, n bytes, is the one zero-terminated at z.
@@ -186,9 +274,10 @@ fn named_length(o as *Offer, i as i64) as i64 {
     return o.named[i].n;
 }
 
-// Its bytes; null past the last.
+// Its bytes — made now when offered on demand; null past the last.
 fn named_bytes(o as *Offer, i as i64) as *Bytes {
     if (i < 0 || i >= o.named_n) { return cast(*Bytes, 0); }
+    offer_fill(o, NAMED, i);
     return &o.named[i].data;
 }
 
@@ -197,16 +286,22 @@ fn named_bytes(o as *Offer, i as i64) as *Bytes {
 fn offer_copy(dst as *Offer, src as *Offer) as i32 {
     offer_free(dst);
     offer_init(dst);
-    if ((src.formats & TEXT) != 0 && offer_text(dst, src.text.data, src.text.len) == 0) { offer_free(dst); return 0; }
-    if ((src.formats & PNG) != 0 && offer_png(dst, src.png.data, src.png.len) == 0) { offer_free(dst); return 0; }
-    if ((src.formats & FILES) != 0 && offer_files(dst, src.paths.data, src.count) == 0) { offer_free(dst); return 0; }
-    if ((src.formats & DIB) != 0 && offer_dib(dst, src.dib.data, src.dib.len) == 0) { offer_free(dst); return 0; }
+    let is i32 as eager = src.formats & (0 - 1 - src.lazy);
+    if ((eager & TEXT) != 0 && offer_text(dst, src.text.data, src.text.len) == 0) { offer_free(dst); return 0; }
+    if ((eager & PNG) != 0 && offer_png(dst, src.png.data, src.png.len) == 0) { offer_free(dst); return 0; }
+    if ((eager & FILES) != 0 && offer_files(dst, src.paths.data, src.count) == 0) { offer_free(dst); return 0; }
+    if ((eager & DIB) != 0 && offer_dib(dst, src.dib.data, src.dib.len) == 0) { offer_free(dst); return 0; }
+    // What is made on demand: said so again, made by the same function.
+    if (src.lazy != 0) { offer_lazy(dst, src.lazy, src.provide, src.provide_user); }
     let is i64 as k with mut = 0;
     while (k < src.named_n) {
-        if (offer_named(dst, &src.named[k].name[0], src.named[k].n, src.named[k].data.data, src.named[k].data.len) == 0) {
-            offer_free(dst);
-            return 0;
+        let is i32 as ok with mut = 0;
+        if (src.named[k].lazy == 1) {
+            ok = offer_lazy_named(dst, &src.named[k].name[0], src.named[k].n, src.provide, src.provide_user);
+        } else {
+            ok = offer_named(dst, &src.named[k].name[0], src.named[k].n, src.named[k].data.data, src.named[k].data.len);
         }
+        if (ok == 0) { offer_free(dst); return 0; }
         k = k + 1;
     }
     return 1;
@@ -296,6 +391,7 @@ fn _absolute(p as *u8, len as i64) as i32 {
 // The bytes of format f as they go out: text, the PNG, the uri-list. A named
 // one's by named_bytes.
 fn offer_bytes(o as *Offer, f as i32) as *Bytes {
+    offer_fill(o, f, 0 - 1);
     if (f == PNG) { return &o.png; }
     if (f == DIB) { return &o.dib; }
     if (f == FILES) { return &o.uris; }

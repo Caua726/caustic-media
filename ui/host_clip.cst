@@ -1,0 +1,363 @@
+// ui/host_clip.cst — the windows' clipboard: text and content of several
+// formats copied, a paste in the formats a widget or the program takes, the
+// clipboard followed.
+//
+// Content copied is kept per window and selection (hst.Held) as long as it is
+// that window's to serve: whatever is not there yet is made when another
+// program asks — by the program's provider, or here: an image's PNG, encoded
+// once (image/save.cst), and on Windows the DIB its programs read, made from
+// that PNG (image/dib.cst). A paste of several formats asks the clipboard which
+// it has first, then the first of those the asker takes (see ui/clip.cst); on
+// Windows an image only there as a DIB comes as a PNG made from it.
+//
+// A paste asked with no widget (w 0) is the program's: app.clipboard_get, its
+// answer through app.clipboard_answer.
+use "std/mem.cst" as mem;
+use "std/os.cst" as os;
+use "std/time.cst" as time;
+use "../window/device.cst" as device;
+use "../window/transfer.cst" as transfer;
+use "../window/clipboard_watch.cst" as watch;
+use "../image/buffer.cst" as buffer;
+use "../image/save.cst" as save;
+use "../image/dib.cst" as dib;
+use "caustic-compact/core/bytes.cst" as cb;
+use "app.cst" as app;
+use "tree.cst" as tree;
+use "router.cst" as router;
+use "clip.cst" as clip;
+use "host_state.cst" as hst;
+
+// What Native.paste_on says.
+let is i32 as AWAIT_DATA  with imut = 1;   // the bytes of what was chosen
+let is i32 as AWAIT_LIST  with imut = 2;   // which formats it offers, to choose
+let is i32 as AWAIT_LEARN with imut = 3;   // which formats it offers, to know: nothing to give anyone
+
+fn _sel(which as i32) as i32 {
+    if (which == tree.PRIMARY) { return device.PRIMARY; }
+    return device.CLIPBOARD;
+}
+
+fn _held_of(n as *hst.Native, which as i32) as *hst.Held {
+    if (which == tree.PRIMARY) { return &n.held[1]; }
+    return &n.held[0];
+}
+
+// What was held for the platform let go.
+fn _forget(hd as *hst.Held) as void {
+    clip.free(&hd.content);
+    transfer.bytes_free(&hd.png);
+    hd.made = 0;
+}
+
+// --- Copied ---
+
+// The image's PNG, made once: from its pixels, the program's maker or what
+// the content already had. Empty when it could not be.
+fn _png(hd as *hst.Held) as *transfer.Bytes {
+    if (hd.made == 1) { return &hd.png; }
+    hd.made = 1;
+    transfer.bytes_clear(&hd.png);
+    let is *transfer.Offer as o = clip.offer(&hd.content);
+    if (hd.content.has_image == 1) {
+        _encode(&hd.content.image, &hd.png);
+    } else if (transfer.offer_is_lazy(o, transfer.PNG, 0 - 1) == 1) {
+        if (clip.ask(hd.content.provide, hd.content.provide_user, transfer.PNG, cast(*u8, 0), 0, &hd.png) == 0) {
+            transfer.bytes_clear(&hd.png);
+        }
+    } else if ((o.formats & transfer.PNG) != 0) {
+        transfer.bytes_set(&hd.png, o.png.data, o.png.len);
+    }
+    return &hd.png;
+}
+
+// What an offer of ours is asked to make, another program wanting it.
+fn _provide(user as *u8, format as i32, name as *u8, n as i64, out as *transfer.Bytes) as i32 {
+    let is *hst.Held as hd = cast(*hst.Held, user);
+    if (format == transfer.PNG) {
+        let is *transfer.Bytes as p = _png(hd);
+        if (p.len == 0) { return 0; }
+        return transfer.bytes_set(out, p.data, p.len);
+    }
+    if (format == transfer.DIB) {
+        let is *transfer.Bytes as p = _png(hd);
+        if (p.len == 0) { return 0; }
+        let is cb.Bytes as b with mut = save.new_bytes();
+        let is i64 as m = dib.dib_from_png(p.data, p.len, &b);
+        let is i32 as ok with mut = 0;
+        if (m > 0) { ok = transfer.bytes_set(out, b.ptr, m); }
+        save.free_bytes(&b);
+        return ok;
+    }
+    return clip.ask(hd.content.provide, hd.content.provide_user, format, name, n, out);
+}
+
+// tree.copy's: n bytes of UTF-8, what was held for that selection let go.
+fn _copy(user as *u8, which as i32, s as *u8, n as i64) as void {
+    let is *hst.Native as nt = cast(*hst.Native, user);
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    if (transfer.offer_text(&o, s, n) == 1 && device.clipboard_set(&nt.win, _sel(which), &o) == 1) {
+        _forget(_held_of(nt, which));
+    }
+    transfer.offer_free(&o);
+}
+
+// o, just made, the offer of a copy of c kept in hd to serve from: its maker
+// _provide, with what the platform wants beside what c has. 1, or 0 when it
+// could not be made.
+fn _offer_of(hd as *hst.Held, c as *clip.Content, o as *transfer.Offer) as i32 {
+    if (clip.copy(&hd.content, c) == 0) { return 0; }
+    hd.made = 0;
+    transfer.bytes_clear(&hd.png);
+    if (transfer.offer_copy(o, clip.offer(&hd.content)) == 0) { return 0; }
+    if (cast(i64, o.provide) != 0) {
+        o.provide = fn_ptr(_provide);
+        o.provide_user = cast(*u8, hd);
+    }
+    if (hd.content.has_image == 1 && (o.formats & transfer.PNG) == 0) {
+        transfer.offer_lazy(o, transfer.PNG, fn_ptr(_provide), cast(*u8, hd));
+    }
+    if (os.current() == os.OS_WINDOWS && (o.formats & transfer.PNG) != 0) {
+        transfer.offer_lazy(o, transfer.DIB, fn_ptr(_provide), cast(*u8, hd));
+    }
+    return 1;
+}
+
+// tree.copy_content's: the platform given c's formats, a copy of it kept to
+// serve from.
+fn _copy_content(user as *u8, which as i32, c as *clip.Content) as void {
+    let is *hst.Native as nt = cast(*hst.Native, user);
+    let is transfer.Offer as o with mut;
+    transfer.offer_init(&o);
+    if (_offer_of(_held_of(nt, which), c, &o) == 1) { device.clipboard_set(&nt.win, _sel(which), &o); }
+    transfer.offer_free(&o);
+}
+
+// What makes a PNG of a content's pixels (clip.set_encoder).
+fn _encode(img as *buffer.Image, out as *transfer.Bytes) as i32 {
+    let is cb.Bytes as b with mut = save.new_bytes();
+    let is i64 as m = save.png(img, &b);
+    let is i32 as ok with mut = 0;
+    if (m > 0) { ok = transfer.bytes_set(out, b.ptr, m); }
+    save.free_bytes(&b);
+    return ok;
+}
+
+// --- Pasted ---
+
+// What was asked comes to who asked — a widget, or the program for none — and
+// nothing is awaited any more. format 0: nothing came.
+fn _deliver(hs as *hst.Host, n as *hst.Native, format as i32, data as *u8, len as i64, now as i64) as void {
+    let is i64 as w = n.paste_w;
+    let is i32 as which = n.paste_which;
+    n.paste_on = 0;
+    let is i32 as f with mut = format;
+    let is *u8 as s with mut = data;
+    let is i64 as k with mut = len;
+    if (f == 0 || k <= 0) { f = 0; s = ""; k = 0; }
+    let is *u8 as name with mut = cast(*u8, 0);
+    let is i64 as nn with mut = 0;
+    if (f == clip.NAMED) { name = &n.paste_name[0]; nn = n.paste_name_n; }
+    app.begin_dispatch(hs.a);
+    if (w == 0) {
+        app.clipboard_answer(hs.a, f, name, nn, s, k);
+    } else {
+        router.paste_as(app.tree(hs.a, n.h), app.router(hs.a, n.h), w, which, f, name, nn, s, k, now);
+    }
+    app.end_dispatch(hs.a);
+}
+
+// A paste of the program's still awaited here, taken over by another or the
+// window going: answered with nothing, so it asks again.
+fn _settle(hs as *hst.Host, n as *hst.Native) as void {
+    if ((n.paste_on == AWAIT_DATA || n.paste_on == AWAIT_LIST) && n.paste_w == 0) {
+        _deliver(hs, n, 0, "", 0, time.now_ms());
+    }
+}
+
+// tree.request_paste's: text, asked at once.
+fn _paste(user as *u8, which as i32, w as i64) as void {
+    let is *hst.Native as nt = cast(*hst.Native, user);
+    _settle(nt.hs, nt);
+    nt.paste_w = w;
+    nt.paste_which = which;
+    nt.paste_got = clip.TEXT;
+    nt.paste_dib = 0;
+    nt.paste_strip = 0;
+    nt.paste_on = 0;
+    if (device.clipboard_request(&nt.win, _sel(which), transfer.TEXT) == 1) {
+        nt.paste_on = AWAIT_DATA;
+    } else {
+        // Nobody to ask: nothing pasted.
+        _deliver(nt.hs, nt, 0, "", 0, time.now_ms());
+    }
+}
+
+// tree.request_paste_as's: which formats it offers first, then the first of
+// those w takes (_choose).
+fn _paste_as(user as *u8, which as i32, w as i64, formats as i32, name as *u8, n as i64) as void {
+    if (formats == clip.TEXT) { _paste(user, which, w); return; }
+    let is *hst.Native as nt = cast(*hst.Native, user);
+    _settle(nt.hs, nt);
+    nt.paste_w = w;
+    nt.paste_which = which;
+    nt.paste_formats = formats;
+    nt.paste_dib = 0;
+    nt.paste_strip = 0;
+    nt.paste_name_n = 0;
+    if ((formats & clip.NAMED) != 0 && n > 0 && n < 128) {
+        mem.memcpy(&nt.paste_name[0], name, n);
+        nt.paste_name[n] = 0;
+        nt.paste_name_n = n;
+    }
+    nt.paste_on = 0;
+    if (device.clipboard_request(&nt.win, _sel(which), 0) == 1) {
+        nt.paste_on = AWAIT_LIST;
+    } else {
+        _deliver(nt.hs, nt, 0, "", 0, time.now_ms());
+    }
+}
+
+// The formats are known: the first of them taken, in clip.cst's order, asked
+// for; nothing delivered when there is none.
+fn _choose(hs as *hst.Host, n as *hst.Native, now as i64) as void {
+    let is i32 as offered = device.clipboard_offered(&n.win);
+    let is *transfer.Names as names = device.clipboard_offered_names(&n.win);
+    let is i32 as has_names = cast(i32, cast(i64, names) != 0);
+    let is i32 as f = n.paste_formats;
+    let is i32 as sel = _sel(n.paste_which);
+    let is i32 as asked with mut = 0;
+    if ((f & clip.PLAIN) != 0) {
+        n.paste_got = clip.TEXT;
+        if ((offered & transfer.TEXT) != 0) {
+            asked = device.clipboard_request(&n.win, sel, transfer.TEXT);
+        } else if (has_names == 1 && transfer.names_has(names, transfer.MIME_HTML, 9) == 1) {
+            n.paste_strip = 1;
+            asked = device.clipboard_request_named(&n.win, sel, transfer.MIME_HTML, 9);
+        }
+    } else if ((f & clip.NAMED) != 0 && n.paste_name_n > 0 && has_names == 1 &&
+        transfer.names_has(names, &n.paste_name[0], n.paste_name_n) == 1) {
+        n.paste_got = clip.NAMED;
+        asked = device.clipboard_request_named(&n.win, sel, &n.paste_name[0], n.paste_name_n);
+    } else if ((f & clip.HTML) != 0 && has_names == 1 && transfer.names_has(names, transfer.MIME_HTML, 9) == 1) {
+        n.paste_got = clip.HTML;
+        asked = device.clipboard_request_named(&n.win, sel, transfer.MIME_HTML, 9);
+    } else if ((f & clip.PNG) != 0 && (offered & transfer.PNG) != 0) {
+        n.paste_got = clip.PNG;
+        asked = device.clipboard_request(&n.win, sel, transfer.PNG);
+    } else if ((f & clip.PNG) != 0 && (offered & transfer.DIB) != 0) {
+        n.paste_got = clip.PNG;
+        n.paste_dib = 1;
+        asked = device.clipboard_request(&n.win, sel, transfer.DIB);
+    } else if ((f & clip.TEXT) != 0 && (offered & transfer.TEXT) != 0) {
+        n.paste_got = clip.TEXT;
+        asked = device.clipboard_request(&n.win, sel, transfer.TEXT);
+    }
+    if (asked == 1) {
+        n.paste_on = AWAIT_DATA;
+    } else {
+        _deliver(hs, n, 0, "", 0, now);
+    }
+}
+
+// Each round, an answer that came.
+fn _round(hs as *hst.Host, n as *hst.Native, now as i64) as void {
+    if (n.paste_on == 0 || device.clipboard_pending(&n.win) == 1) { return; }
+    if (app.window_valid(hs.a, n.h) == 0) { n.paste_on = 0; return; }
+    if (n.paste_on == AWAIT_LEARN) {
+        n.paste_on = 0;
+        // Said to the trees only: nothing changed, it is only known now. A
+        // change heard since says it better.
+        if (hs.clip_changed[0] == 0) {
+            app.clipboard_offered(hs.a, _clip_bits(device.clipboard_offered(&n.win), device.clipboard_offered_names(&n.win)));
+        }
+        return;
+    }
+    if (n.paste_on == AWAIT_LIST) {
+        _choose(hs, n, now);
+        // Answered at once, on Windows: no event would say it came.
+        if (n.paste_on != AWAIT_DATA || device.clipboard_pending(&n.win) == 1) { return; }
+    }
+    // The window's bytes, until it is asked again.
+    let is i32 as format with mut = 0;
+    if (device.clipboard_format(&n.win) != 0) { format = n.paste_got; }
+    let is *u8 as data with mut = device.clipboard_data(&n.win);
+    let is i64 as got with mut = device.clipboard_length(&n.win);
+    if (format != 0 && n.paste_strip == 1) {
+        // HTML is all there was: its text.
+        format = 0;
+        if (clip.html_text(data, got, &n.paste_png) == 1) {
+            format = clip.TEXT;
+            data = n.paste_png.data;
+            got = n.paste_png.len;
+        }
+    }
+    if (format != 0 && n.paste_dib == 1) {
+        // An image only there as a DIB: a PNG made from it.
+        let is cb.Bytes as b with mut = save.new_bytes();
+        let is i64 as m = dib.png_from_dib(data, got, &b);
+        format = 0;
+        if (m > 0 && transfer.bytes_set(&n.paste_png, b.ptr, m) == 1) {
+            format = clip.PNG;
+            data = n.paste_png.data;
+            got = n.paste_png.len;
+        }
+        save.free_bytes(&b);
+    }
+    _deliver(hs, n, format, data, got, now);
+}
+
+// --- Followed ---
+
+// transfer's bits, as a change or an answer says them, in clip's.
+fn _clip_bits(drop as i32, names as *transfer.Names) as i32 {
+    let is i32 as b with mut = 0;
+    if ((drop & transfer.TEXT) != 0) { b = b | clip.TEXT; }
+    if ((drop & (transfer.PNG | transfer.DIB)) != 0) { b = b | clip.PNG; }
+    if ((drop & transfer.FILES) != 0) { b = b | clip.FILES; }
+    if ((drop & transfer.NAMED) != 0) { b = b | clip.NAMED; }
+    if ((drop & transfer.HTML) != 0) { b = b | clip.HTML; }
+    if (cast(i64, names) != 0 && transfer.names_has(names, transfer.MIME_HTML, 9) == 1) { b = b | clip.HTML; }
+    return b;
+}
+
+// A window opened: its clipboard followed, and the first of them asks what
+// the clipboard offers now, as no change will say it.
+fn _follow(hs as *hst.Host, n as *hst.Native) as void {
+    if (watch.follow(&n.win) == 0 || hs.clip_learnt == 1) { return; }
+    hs.clip_learnt = 1;
+    if (device.clipboard_request(&n.win, device.CLIPBOARD, 0) == 1) { n.paste_on = AWAIT_LEARN; }
+}
+
+// CLIPBOARD_CHANGED, on whichever window heard it: kept for the round's end,
+// so that windows each hearing the one change say it once.
+fn _changed(hs as *hst.Host, which as i32, drop as i32) as void {
+    if (which != 0 && which != 1) { return; }
+    hs.clip_changed[which] = 1;
+    hs.clip_bits[which] = _clip_bits(drop, cast(*transfer.Names, 0));
+}
+
+// The round's end: the changes said to the trees and the program.
+fn _notice(hs as *hst.Host) as void {
+    let is i32 as w with mut = 0;
+    while (w < 2) {
+        if (hs.clip_changed[w] == 1) {
+            hs.clip_changed[w] = 0;
+            app.begin_dispatch(hs.a);
+            app.clipboard_changed(hs.a, w, hs.clip_bits[w]);
+            app.end_dispatch(hs.a);
+        }
+        w = w + 1;
+    }
+}
+
+// The window going: what it awaited and what it held for the platform, after
+// the platform let go of it.
+fn _settle_closing(hs as *hst.Host, n as *hst.Native) as void { _settle(hs, n); n.paste_on = 0; }
+
+fn _release(n as *hst.Native) as void {
+    _forget(&n.held[0]);
+    _forget(&n.held[1]);
+    transfer.bytes_free(&n.paste_png);
+}

@@ -5,7 +5,13 @@
  *   x86_64-w64-mingw32-gcc -O2 -o build/ole_dnd_peer.exe \
  *       window/win32/tools/ole_dnd_peer.c -lole32 -lshell32 -luuid -lgdi32
  *
- *   ole_dnd_peer.exe <log>
+ *   ole_dnd_peer.exe <log> [types]
+ *
+ * With "types": its source offers a registered format of the program's own
+ * ("application/x-caustic-test"), "HTML Format" and "PNG" (the file
+ * image/testdata/rgba.png) in each band, and its target takes those, one for
+ * each drop in that order: logged "drop own|html|png copy|move <bytes>",
+ * <log>.<n> the format's bytes as they came.
  *
  * Two undecorated windows of 300 by 300: a drop target at 600, 100 and a
  * drag source at 600, 450. The target takes CF_HDROP and CF_UNICODETEXT,
@@ -66,6 +72,12 @@ typedef struct {
     DWORD last;   /* the effect said last */
 } Target;
 
+static int types;
+static UINT type_cf(int i) {
+    static const char *names[3] = {"application/x-caustic-test", "HTML Format", "PNG"};
+    return RegisterClipboardFormatA(names[i]);
+}
+
 static FORMATETC fmt_of(CLIPFORMAT cf) {
     FORMATETC f = {cf, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     return f;
@@ -95,6 +107,11 @@ static HRESULT STDMETHODCALLTYPE t_enter(IDropTarget *self, IDataObject *data, D
     FORMATETC ff = fmt_of(CF_HDROP), ft = fmt_of(CF_UNICODETEXT);
     t->has_files = IDataObject_QueryGetData(data, &ff) == S_OK;
     t->has_text = IDataObject_QueryGetData(data, &ft) == S_OK;
+    if (types) {
+        FORMATETC fn = fmt_of((CLIPFORMAT)type_cf(drops % 3));
+        t->has_text = IDataObject_QueryGetData(data, &fn) == S_OK;
+        t->has_files = 0;
+    }
     *effect = (t->has_files || t->has_text) ? choose(keys, *effect) : DROPEFFECT_NONE;
     t->last = *effect;
     return S_OK;
@@ -117,6 +134,21 @@ static HRESULT STDMETHODCALLTYPE t_drop(IDropTarget *self, IDataObject *data, DW
     const char *how = chosen == DROPEFFECT_MOVE ? "move" : "copy";
     STGMEDIUM m;
     char line[128];
+    if (types) {
+        static const char *said[3] = {"own", "html", "png"};
+        int which = drops % 3;
+        FORMATETC fn = fmt_of((CLIPFORMAT)type_cf(which));
+        if (IDataObject_GetData(data, &fn, &m) == S_OK) {
+            size_t n = GlobalSize(m.hGlobal);
+            dump(GlobalLock(m.hGlobal), n);
+            GlobalUnlock(m.hGlobal);
+            ReleaseStgMedium(&m);
+            snprintf(line, sizeof line, "drop %s %s %zu", said[which], how, n);
+            say(line);
+            *effect = chosen;
+            return S_OK;
+        }
+    }
     if (t->has_files) {
         FORMATETC ff = fmt_of(CF_HDROP);
         if (IDataObject_GetData(data, &ff, &m) == S_OK) {
@@ -174,7 +206,7 @@ typedef struct {
     IDataObject iface;
     LONG refs;
     int count;
-    FORMATETC formats[2];
+    FORMATETC formats[4];
     HGLOBAL blocks[2];
 } Data;
 
@@ -266,6 +298,22 @@ static Data *data_of(int band) {
     Data *d = calloc(1, sizeof(Data));
     d->iface.lpVtbl = &data_vtbl;
     d->refs = 1;
+    if (types) {
+        static const char own[] = "own from ole";
+        add(d, type_cf(0), global_of(own, sizeof own - 1));
+        static const char html[] =
+            "Version:0.9\r\nStartHTML:0000000097\r\nEndHTML:0000000170\r\nStartFragment:0000000129\r\nEndFragment:0000000138\r\n"
+            "<html><body><!--StartFragment--><i>ole</i><!--EndFragment--></body></html>";
+        add(d, type_cf(1), global_of(html, sizeof html));
+        FILE *f = fopen("image/testdata/rgba.png", "rb");
+        if (f) {
+            static char png[1048576];
+            size_t n = fread(png, 1, sizeof png, f);
+            fclose(f);
+            add(d, type_cf(2), global_of(png, n));
+        }
+        return d;
+    }
     if (band == 0) {
         static const WCHAR paths[] = L"C:\\peer one.txt\0C:\\peer-two\0";
         size_t n = sizeof(DROPFILES) + sizeof paths;
@@ -359,6 +407,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     log_path = argv[1];
+    types = argc > 2 && strcmp(argv[2], "types") == 0;
     logf = fopen(log_path, "w");
     if (!logf) return 1;
     if (OleInitialize(NULL) != S_OK) return 1;

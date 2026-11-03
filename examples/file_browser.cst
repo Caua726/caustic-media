@@ -18,7 +18,9 @@
 //   - a splitter between them, a toolbar, an entry, a status bar;
 //   - menus with a check item (hidden files shown or not) and the window's
 //     shortcuts: Alt+Up, Ctrl+L, Ctrl+H;
-//   - a message box when a folder cannot be read, the about dialog.
+//   - a message box when a folder cannot be read, the about dialog;
+//   - its rows dragged out as files, for a file manager to take, the row or
+//     all that are selected with it; files dragged in from one copied here.
 //
 // --check drives it over a folder made in build/, the file it opens handed
 // to a stand-in xdg-open (ui/testdata/bin, first on the path) — on Windows
@@ -351,6 +353,76 @@ fn activate(i as i64) as void {
 
 fn _row_activated(t as *ui.tree.Tree, l as i64, arg as *u8, user as *u8) as void { activate(ui.listview.cursor(t, l)); }
 
+// --- Dragged out, dragged in ---
+
+let is i64 as DRAG_PATHS with imut = 262144;
+let is [262144]u8 as drag_paths with mut;
+
+// What a row dragged out is: its file, and those of the others selected when
+// it is one of them.
+fn _row_files(t as *ui.tree.Tree, l as i64, row as i64, c as *ui.clip.Content, user as *u8) as i32 {
+    let is i32 as many = ui.listview.is_selected(t, l, row);
+    let is i64 as at with mut = 0;
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < ui.dirmodel.count(br.dir)) {
+        if (i == row || (many == 1 && ui.listview.is_selected(t, l, i) == 1)) {
+            if (DRAG_PATHS - at < 4097) { break; }
+            let is i64 as k = ui.dirmodel.full_path(br.dir, i, &drag_paths[at], 4096);
+            if (k > 0) {
+                drag_paths[at + k] = cast(u8, 0);
+                at = at + k + 1;
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (n == 0) { return 0; }
+    return ui.clip.add_files(c, &drag_paths[0], n);
+}
+
+// The file at from copied into the folder shown, by its name: 1 when it was.
+// A folder, or a file already here, stays where it is.
+fn _copy_in(from as *u8) as i32 {
+    let is file.Info as info;
+    if (file.stat(from, &info) == 0 || info.kind != file.FILE) { return 0; }
+    let is i64 as n = ui.len(from);
+    let is i64 as base with mut = n;
+    while (base > 0 && from[base - 1] != 47 && from[base - 1] != 92) { base = base - 1; }
+    let is [4096]u8 as to;
+    let is i64 as dn = ui.dirmodel.path_length(br.dir);
+    if (dn + 1 + n - base >= 4096) { return 0; }
+    mem.memcpy(&to[0], ui.dirmodel.path(br.dir), dn);
+    to[dn] = cast(u8, 47);
+    mem.memcpy(&to[dn + 1], cast(*u8, cast(i64, from) + base), n - base);
+    let is i64 as tn = dn + 1 + n - base;
+    to[tn] = cast(u8, 0);
+    if (tn == n && mem.memcmp(&to[0], from, n) == 0) { return 0; }
+    let is i64 as cap = info.size + 1;
+    let is *u8 as buf = mem.core.mmap_anon(cap);
+    if (cast(i64, buf) == 0) { return 0; }
+    let is i64 as got = file.read(from, buf, cap);
+    let is i32 as ok with mut = 0;
+    if (got >= 0) { ok = file.write_atomic(&to[0], buf, got, 0); }
+    mem.core.munmap(buf, cap);
+    return ok;
+}
+
+// Files let go over the table: copied here, and shown.
+fn _files_dropped(t as *ui.tree.Tree, w as i64, arg as *u8, user as *u8) as void {
+    let is *ui.dnd.Payload as p = cast(*ui.dnd.Payload, arg);
+    let is i64 as copied with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < p.files_n) {
+        copied = copied + cast(i64, _copy_in(ui.dnd.file_at(p, i)));
+        i = i + 1;
+    }
+    if (copied > 0) {
+        ui.dirmodel.reload(br.dir);
+        _shown();
+    }
+}
+
 // A folder chosen in the tree: shown in the table.
 fn _folder_chosen(t as *ui.tree.Tree, l as i64, arg as *u8, user as *u8) as void {
     let is i64 as i = ui.listview.cursor(t, l);
@@ -464,6 +536,10 @@ fn build(start as *u8, n as i64) as void {
     ui.column(t, br.table, "Modified", 150.0);
     br.list = ui.tableview.list(t, br.table);
     ui.on(t, br.list, ui.signal.ACTIVATED, fn_ptr(_row_activated));
+    // Its rows go out as files; files come in on it.
+    ui.tableview.set_drag_content(t, br.table, fn_ptr(_row_files), ui.dnd.COPY, cast(*u8, 0));
+    ui.router.add_drop_target(br.r, br.table, ui.dnd.FILES);
+    ui.on(t, br.table, ui.signal.DROPPED, fn_ptr(_files_dropped));
     ui.splitter.set_position(t, split, 0, 200.0);
 
     br.status = ui.statusbar.create(t, col);
@@ -669,6 +745,37 @@ fn drive() as void {
         while (xin.in_front(&xs) == 0 && time.now_ms() < until) { rounds(1); }
         expect("the program it opened in closed: the browser in front again", xin.in_front(&xs) == 1);
     }
+    // A row dragged out: its file, as a file manager takes it.
+    let is ui.clip.Content as out with mut;
+    ui.clip.init(&out);
+    let is i64 as dragged = row_named("b c.txt");
+    expect("a row dragged out: its file", _row_files(br.t, br.list, dragged, &out, cast(*u8, 0)) == 1 &&
+           ui.clip.has(&out, ui.clip.FILES) == 1 && out.offer.count == 1 &&
+           ends_with(cast(*u8, &drag_paths), ui.len(cast(*u8, &drag_paths)), "/b c.txt") == 1 &&
+           ends_with(out.offer.uris.data, out.offer.uris.len, "/b%20c.txt\r\n") == 1);
+    ui.clip.free(&out);
+    // A file dragged in from elsewhere: taken over the table, copied here.
+    let is [4096]u8 as from;
+    let is i64 as fn0 = ui.dirmodel.path_length(br.dir);
+    mem.memcpy(&from[0], ui.dirmodel.path(br.dir), fn0);
+    mem.memcpy(&from[fn0], "/a/inner/from outside.txt\x00", 26);
+    file.write_atomic(&from[0], "dropped", 7, 0);
+    let is ui.dnd.Payload as in = ui.dnd.files(&from[0], 1);
+    let is math.rect.Rect as tr = ui.layout.window_rect(br.t, br.table);
+    let is i32 as over = ui.router.drag_enter(br.t, br.r, &in, tr.x + tr.w / 2.0, tr.y + tr.h / 2.0, time.now_ms());
+    expect("files dragged over the table: taken", over == ui.dnd.FILES);
+    expect("let go: a copy", ui.router.drag_drop(br.t, br.r, tr.x + tr.w / 2.0, tr.y + tr.h / 2.0, time.now_ms()) == ui.dnd.COPY);
+    rounds(2);
+    expect("the file copied here, and shown", row_named("from outside.txt") >= 0);
+    let is [64]u8 as back;
+    let is [4096]u8 as here;
+    mem.memcpy(&here[0], ui.dirmodel.path(br.dir), fn0);
+    mem.memcpy(&here[fn0], "/from outside.txt\x00", 18);
+    expect("what it holds what it held", file.read(&here[0], &back[0], 64) == 7 && mem.memcmp(&back[0], "dropped", 7) == 0);
+    file.remove(&here[0]);
+    file.remove(&from[0]);
+    ui.dirmodel.reload(br.dir);
+    rounds(1);
     show_about();
     rounds(2);
     expect("its about dialog", ui.dialog.ref_valid(&br.about) == 1 && ui.dialog.is_shown(br.about.t, br.about.w) == 1);

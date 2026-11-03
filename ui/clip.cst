@@ -1,0 +1,436 @@
+// ui/clip.cst — what a program puts on the clipboard: content of several
+// formats at once, each its bytes or made only when another program asks.
+//
+// A Content holds text, HTML, a PNG's bytes, an image's pixels, files and a
+// program's own types by MIME name (application/x-…). Each is added with its
+// data, or added as made on demand (add_lazy, add_lazy_named): then the
+// provider (set_provider) makes it the first time another program asks,
+// cb(user, format, name, n, out) putting the bytes into out (put). The tree
+// hands the content to the host (tree.copy_content), which puts it on the
+// platform's clipboard as it is — window/transfer.cst's Offer — with what
+// the platform wants beside it: an image's PNG, encoded when asked for, and
+// on Windows the DIB its programs read, made from the PNG (image/dib.cst).
+// The host keeps a copy; the provider and its user stay the program's to
+// keep while the clipboard is its own.
+//
+// A paste asks for the formats a widget takes (tree.request_paste_as): the
+// host asks the clipboard which it has and takes the first of those it has,
+// in this order — the program's own type, HTML, an image (a PNG; on Windows
+// one made from a DIB), text — and the widget hears PASTE with event.format
+// saying which came (event.name for the program's own type). A plain text
+// paste (tree.request_paste) is TEXT; what a text field pastes
+// (tree.request_paste_plain) is PLAIN: the clipboard's text, or its HTML with
+// the markup taken out (html_text) when it has only that, heard as TEXT.
+use "std/mem.cst" as mem;
+use "../window/transfer.cst" as transfer;
+use "../image/buffer.cst" as buffer;
+
+// The formats, bits.
+let is i32 as FILES with imut = 1;    // paths
+let is i32 as TEXT  with imut = 2;    // UTF-8
+let is i32 as PNG   with imut = 4;    // a PNG file's bytes; an image's pixels, add_image
+let is i32 as NAMED with imut = 8;    // a program's own type, by its MIME name
+let is i32 as HTML  with imut = 32;   // text/html, UTF-8
+let is i32 as PLAIN with imut = 64;   // asked only: text, from HTML if that is all there is
+
+type Bytes = transfer.Bytes;
+
+// What makes a PNG of an image's pixels, the host's (image/save.cst, which
+// the toolkit's core does without): out emptied first, 1 when made.
+type EncodeFn = fn(*buffer.Image, *Bytes) as i32;
+let is EncodeFn as _encoder with mut = cast(EncodeFn, 0);
+
+fn set_encoder(cb as EncodeFn) as void { _encoder = cb; }
+
+// What makes a format added on demand: cb(user, format, name, n, out) —
+// format TEXT, PNG, HTML or NAMED (name, n bytes, which) — its bytes into
+// out (put): 1 when made.
+type ProvideFn = fn(*u8, i32, *u8, i64, *Bytes) as i32;
+
+struct Content {
+    offer    as transfer.Offer;   // the formats with their bytes, or made on demand
+    image    as buffer.Image;     // add_image's pixels, a copy; the host makes the PNG
+    has_image as i32;
+    _pad     as i32;
+    provide  as ProvideFn;        // the program's: what makes what is added on demand
+    provide_user as *u8;
+}
+
+fn init(c as *Content) as void {
+    transfer.offer_init(&c.offer);
+    c.image.pixels = cast(*u8, 0);
+    c.image.width = 0;
+    c.image.height = 0;
+    c.has_image = 0;
+    c.provide = cast(ProvideFn, 0);
+    c.provide_user = cast(*u8, 0);
+}
+
+fn free(c as *Content) as void {
+    transfer.offer_free(&c.offer);
+    if (c.has_image == 1) { buffer.destroy(&c.image); }
+    init(c);
+}
+
+// Emptied, ready to be filled again.
+fn clear(c as *Content) as void { free(c); }
+
+// Which formats it has, bits.
+fn formats(c as *Content) as i32 {
+    let is i32 as f with mut = c.offer.formats & (FILES | TEXT | PNG);
+    if (c.has_image == 1) { f = f | PNG; }
+    let is i64 as k with mut = 0;
+    while (k < c.offer.named_n) {
+        if (_is_html(transfer.named_name(&c.offer, k), transfer.named_length(&c.offer, k)) == 1) { f = f | HTML; }
+        else { f = f | NAMED; }
+        k = k + 1;
+    }
+    return f;
+}
+
+fn has(c as *Content, format as i32) as i32 { return cast(i32, (formats(c) & format) != 0); }
+
+fn _is_html(name as *u8, n as i64) as i32 {
+    return cast(i32, n == 9 && mem.memcmp(name, transfer.MIME_HTML, 9) == 0);
+}
+
+// n bytes of UTF-8 at s: 1, or 0 when they could not be kept.
+fn add_text(c as *Content, s as *u8, n as i64) as i32 { return transfer.offer_text(&c.offer, s, n); }
+
+// An HTML fragment, n bytes of UTF-8 — text added beside it is what a
+// program that reads no HTML pastes.
+fn add_html(c as *Content, s as *u8, n as i64) as i32 { return transfer.offer_named(&c.offer, transfer.MIME_HTML, 9, s, n); }
+
+// The content's image gone, as pixels or as a PNG: one takes the other's place.
+fn _drop_image(c as *Content) as void {
+    if (c.has_image == 1) { buffer.destroy(&c.image); c.has_image = 0; }
+    c.offer.formats = c.offer.formats & (0 - 1 - transfer.PNG);
+    c.offer.lazy = c.offer.lazy & (0 - 1 - transfer.PNG);
+    transfer.bytes_clear(&c.offer.png);
+}
+
+// A PNG file's n bytes, in place of an image added before.
+fn add_png(c as *Content, p as *u8, n as i64) as i32 {
+    _drop_image(c);
+    return transfer.offer_png(&c.offer, p, n);
+}
+
+// An image's pixels, copied: the host encodes them as a PNG when another
+// program asks for one. In place of a PNG added before.
+fn add_image(c as *Content, img as *buffer.Image) as i32 {
+    if (cast(i64, img.pixels) == 0 || img.width <= 0 || img.height <= 0) { return 0; }
+    _drop_image(c);
+    c.image = buffer.clone(img);
+    if (cast(i64, c.image.pixels) == 0) { return 0; }
+    c.has_image = 1;
+    return 1;
+}
+
+// n absolute paths, back to back at paths, each zero-terminated.
+fn add_files(c as *Content, paths as *u8, n as i64) as i32 { return transfer.offer_files(&c.offer, paths, n); }
+
+// The program's own type named name (n bytes, a MIME type), len bytes at p.
+fn add_named(c as *Content, name as *u8, n as i64, p as *u8, len as i64) as i32 {
+    return transfer.offer_named(&c.offer, name, n, p, len);
+}
+
+// What makes what is added on demand, and its user.
+fn set_provider(c as *Content, cb as ProvideFn, user as *u8) as void {
+    c.provide = cb;
+    c.provide_user = user;
+}
+
+// The provider cb asked for a format as the platform asks: text/html by
+// name heard as HTML. 0 without one.
+fn ask(cb as ProvideFn, user as *u8, format as i32, name as *u8, n as i64, out as *Bytes) as i32 {
+    if (cast(i64, cb) == 0) { return 0; }
+    let is i32 as f with mut = format;
+    if (format == NAMED && _is_html(name, n) == 1) { f = HTML; }
+    return call(cb, user, f, name, n, out);
+}
+
+// The offer's own maker, the content its user: the program's, asked.
+fn _provide(user as *u8, format as i32, name as *u8, n as i64, out as *Bytes) as i32 {
+    let is *Content as c = cast(*Content, user);
+    return ask(c.provide, c.provide_user, format, name, n, out);
+}
+
+// Formats — TEXT, PNG, HTML bits — added to be made on demand by the
+// provider.
+fn add_lazy(c as *Content, f as i32) as i32 {
+    if (cast(i64, c.provide) == 0) { return 0; }
+    let is i32 as plain = f & (TEXT | PNG);
+    if (plain != 0) { transfer.offer_lazy(&c.offer, plain, fn_ptr(_provide), cast(*u8, c)); }
+    if ((f & HTML) != 0 && transfer.offer_lazy_named(&c.offer, transfer.MIME_HTML, 9, fn_ptr(_provide), cast(*u8, c)) == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+// The program's own type named name (n bytes) made on demand.
+fn add_lazy_named(c as *Content, name as *u8, n as i64) as i32 {
+    if (cast(i64, c.provide) == 0) { return 0; }
+    return transfer.offer_lazy_named(&c.offer, name, n, fn_ptr(_provide), cast(*u8, c));
+}
+
+// n bytes at p into out, a provider's answer: 1, or 0 for no room.
+fn put(out as *Bytes, p as *u8, n as i64) as i32 { return transfer.bytes_set(out, p, n); }
+
+// What the platform's clipboard is handed: the content's offer, its
+// formats with their bytes and those made on demand. An image's PNG and
+// Windows' DIB the host's to add (host_clip).
+fn offer(c as *Content) as *transfer.Offer { return &c.offer; }
+
+// dst made a copy of src: 1, or 0 (dst then empty).
+fn copy(dst as *Content, src as *Content) as i32 {
+    free(dst);
+    if (transfer.offer_copy(&dst.offer, &src.offer) == 0) { return 0; }
+    dst.provide = src.provide;
+    dst.provide_user = src.provide_user;
+    // What is made on demand made through the copy.
+    if (cast(i64, dst.offer.provide) != 0) { dst.offer.provide_user = cast(*u8, dst); }
+    if (src.has_image == 1) {
+        dst.image = buffer.clone(&src.image);
+        if (cast(i64, dst.image.pixels) == 0) { free(dst); return 0; }
+        dst.has_image = 1;
+    }
+    return 1;
+}
+
+// --- Content's bytes, read back (tests, a drop of this program's own) ---
+
+fn text_of(c as *Content) as *Bytes { return transfer.offer_bytes(&c.offer, transfer.TEXT); }
+
+// The PNG — an image's pixels encoded now, once, where there is what does
+// (set_encoder).
+fn png_of(c as *Content) as *Bytes {
+    if (c.has_image == 1 && (c.offer.formats & transfer.PNG) == 0 && cast(i64, _encoder) != 0) {
+        if (call(_encoder, &c.image, &c.offer.png) == 1) { c.offer.formats = c.offer.formats | transfer.PNG; }
+    }
+    return transfer.offer_bytes(&c.offer, transfer.PNG);
+}
+
+// The bytes of the type named name (n bytes) — made now when on demand —
+// null when it has none by that name.
+fn named_of(c as *Content, name as *u8, n as i64) as *Bytes {
+    let is i64 as k = transfer.offer_find(&c.offer, name, n);
+    if (k < 0) { return cast(*Bytes, 0); }
+    return transfer.named_bytes(&c.offer, k);
+}
+
+fn html_of(c as *Content) as *Bytes { return named_of(c, transfer.MIME_HTML, 9); }
+
+// --- HTML as plain text ---
+
+fn _is_space(c as i64) as i32 { return cast(i32, c == 32 || c == 9 || c == 10 || c == 13 || c == 12); }
+
+// Whether the n bytes of name, lower case, begin at p (limit bytes there),
+// whatever their case, and end there — what follows no letter or digit.
+fn _word_at(p as *u8, limit as i64, name as *u8, n as i64) as i32 {
+    if (limit < n) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as c with mut = cast(i64, p[i]) & 255;
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != (cast(i64, name[i]) & 255)) { return 0; }
+        i = i + 1;
+    }
+    if (limit == n) { return 1; }
+    let is i64 as d = cast(i64, p[n]) & 255;
+    if ((d >= 97 && d <= 122) || (d >= 65 && d <= 90) || (d >= 48 && d <= 57)) { return 0; }
+    return 1;
+}
+
+// Code point v as UTF-8 after what out has: 1, or 0 for none it could hold.
+fn _put_utf8(out as *Bytes, v as i64) as i32 {
+    let is [4]u8 as b;
+    if (v <= 0 || v > 1114111 || (v >= 55296 && v <= 57343)) { return 0; }
+    if (v < 128) { b[0] = cast(u8, v); return transfer.append(out, &b[0], 1); }
+    if (v < 2048) {
+        b[0] = cast(u8, 192 | (v >> 6));
+        b[1] = cast(u8, 128 | (v & 63));
+        return transfer.append(out, &b[0], 2);
+    }
+    if (v < 65536) {
+        b[0] = cast(u8, 224 | (v >> 12));
+        b[1] = cast(u8, 128 | ((v >> 6) & 63));
+        b[2] = cast(u8, 128 | (v & 63));
+        return transfer.append(out, &b[0], 3);
+    }
+    b[0] = cast(u8, 240 | (v >> 18));
+    b[1] = cast(u8, 128 | ((v >> 12) & 63));
+    b[2] = cast(u8, 128 | ((v >> 6) & 63));
+    b[3] = cast(u8, 128 | (v & 63));
+    return transfer.append(out, &b[0], 4);
+}
+
+// The entity at s[i] ("&…;"): its code point, *len its bytes; 0 when it is
+// none of the usual ones — its '&' then plain text.
+fn _entity(s as *u8, i as i64, n as i64, len as *i64) as i64 {
+    let is i64 as e with mut = i + 1;
+    while (e < n && e - i < 12 && s[e] != 59 && s[e] != 38 && _is_space(cast(i64, s[e]) & 255) == 0) { e = e + 1; }
+    if (e >= n || s[e] != 59) { return 0; }
+    *len = e + 1 - i;
+    let is *u8 as p = cast(*u8, cast(i64, s) + i + 1);
+    let is i64 as k = e - i - 1;
+    if (k >= 2 && p[0] == 35) {
+        let is i64 as v with mut = 0;
+        let is i64 as at with mut = 1;
+        let is i32 as hex = cast(i32, p[1] == 120 || p[1] == 88);
+        if (hex == 1) { at = 2; }
+        if (at >= k) { return 0; }
+        while (at < k) {
+            let is i64 as c = cast(i64, p[at]) & 255;
+            let is i64 as d with mut = 0 - 1;
+            if (c >= 48 && c <= 57) { d = c - 48; }
+            else if (hex == 1 && c >= 97 && c <= 102) { d = c - 87; }
+            else if (hex == 1 && c >= 65 && c <= 70) { d = c - 55; }
+            if (d < 0 || v > 1114111) { return 0; }
+            if (hex == 1) { v = v * 16 + d; } else { v = v * 10 + d; }
+            at = at + 1;
+        }
+        return v;
+    }
+    if (k == 3 && mem.memcmp(p, "amp", 3) == 0) { return 38; }
+    if (k == 2 && mem.memcmp(p, "lt", 2) == 0) { return 60; }
+    if (k == 2 && mem.memcmp(p, "gt", 2) == 0) { return 62; }
+    if (k == 4 && mem.memcmp(p, "quot", 4) == 0) { return 34; }
+    if (k == 4 && mem.memcmp(p, "apos", 4) == 0) { return 39; }
+    if (k == 4 && mem.memcmp(p, "nbsp", 4) == 0) { return 160; }
+    return 0;
+}
+
+// Past the first case-blind "</name" at or after s[i], its '>' too: n when
+// there is none.
+fn _past_close(s as *u8, i as i64, n as i64, name as *u8, k as i64) as i64 {
+    let is i64 as at with mut = i;
+    while (at + 2 + k <= n) {
+        if (s[at] == 60 && s[at + 1] == 47 && _word_at(cast(*u8, cast(i64, s) + at + 2), n - at - 2, name, k) == 1) {
+            let is i64 as e with mut = at + 2 + k;
+            while (e < n && s[e] != 62) { e = e + 1; }
+            if (e < n) { return e + 1; }
+            return n;
+        }
+        at = at + 1;
+    }
+    return n;
+}
+
+// Past the "-->" at or after s[i]: n when there is none.
+fn _past_comment(s as *u8, i as i64, n as i64) as i64 {
+    let is i64 as at with mut = i;
+    while (at + 2 < n) {
+        if (s[at] == 45 && s[at + 1] == 45 && s[at + 2] == 62) { return at + 3; }
+        at = at + 1;
+    }
+    return n;
+}
+
+// Whether the tag named at p (limit bytes there) ends a line of the text: a
+// line break, or a block's end or start.
+fn _breaks_line(p as *u8, limit as i64) as i32 {
+    if (_word_at(p, limit, "br", 2) == 1 || _word_at(p, limit, "p", 1) == 1 || _word_at(p, limit, "div", 3) == 1 ||
+        _word_at(p, limit, "li", 2) == 1 || _word_at(p, limit, "tr", 2) == 1 || _word_at(p, limit, "ul", 2) == 1 ||
+        _word_at(p, limit, "ol", 2) == 1 || _word_at(p, limit, "table", 5) == 1 || _word_at(p, limit, "pre", 3) == 1 ||
+        _word_at(p, limit, "blockquote", 10) == 1 || _word_at(p, limit, "hr", 2) == 1) { return 1; }
+    if (limit >= 2 && (p[0] == 104 || p[0] == 72) && p[1] >= 49 && p[1] <= 54 && (limit == 2 || p[2] == 62 || _is_space(cast(i64, p[2]) & 255) == 1)) {
+        return 1;
+    }
+    return 0;
+}
+
+// The text of an HTML fragment, n bytes of UTF-8, into out (emptied first):
+// its tags out, the content of style, script, head, title and comments with
+// them, the usual entities said, runs of white space one space but in pre, a
+// line feed for a line break or a block's end, a tab between a table's cells.
+// 1, or 0 for no room.
+fn html_text(s as *u8, n as i64, out as *Bytes) as i32 {
+    transfer.bytes_clear(out);
+    if (transfer.reserve(out, 16) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    let is i32 as pre with mut = 0;
+    // What was last put, for white space: 1 a space or line start, 0 else.
+    let is i32 as blank with mut = 1;
+    let is i64 as tabs with mut = 0;   // cells seen in the row, a tab before the next
+    while (i < n) {
+        let is i64 as c = cast(i64, s[i]) & 255;
+        if (c == 60) {
+            if (i + 3 < n && s[i + 1] == 33 && s[i + 2] == 45 && s[i + 3] == 45) {
+                i = _past_comment(s, i + 4, n);
+                continue;
+            }
+            let is i32 as closing = cast(i32, i + 1 < n && s[i + 1] == 47);
+            let is i64 as at with mut = i + 1;
+            if (closing == 1) { at = i + 2; }
+            let is *u8 as p = cast(*u8, cast(i64, s) + at);
+            let is i64 as limit = n - at;
+            // Not a tag at all: a '<' of the text.
+            let is i64 as lead with mut = 0;
+            if (limit > 0) { lead = cast(i64, p[0]) & 255; }
+            let is i32 as tag = cast(i32, (lead >= 97 && lead <= 122) || (lead >= 65 && lead <= 90) || lead == 33 || lead == 63);
+            if (tag == 0) {
+                if (transfer.append(out, "<", 1) == 0) { return 0; }
+                blank = 0;
+                i = i + 1;
+                continue;
+            }
+            let is i64 as e with mut = at;
+            while (e < n && s[e] != 62) { e = e + 1; }
+            let is i64 as next with mut = n;
+            if (e < n) { next = e + 1; }
+            if (closing == 0) {
+                if (_word_at(p, limit, "style", 5) == 1) { i = _past_close(s, next, n, "style", 5); continue; }
+                if (_word_at(p, limit, "script", 6) == 1) { i = _past_close(s, next, n, "script", 6); continue; }
+                if (_word_at(p, limit, "title", 5) == 1) { i = _past_close(s, next, n, "title", 5); continue; }
+                if (_word_at(p, limit, "head", 4) == 1) { i = _past_close(s, next, n, "head", 4); continue; }
+            }
+            if (_word_at(p, limit, "pre", 3) == 1) { pre = cast(i32, closing == 0); }
+            if (_word_at(p, limit, "tr", 2) == 1) { tabs = 0; }
+            if (_word_at(p, limit, "td", 2) == 1 || _word_at(p, limit, "th", 2) == 1) {
+                if (closing == 0) {
+                    if (tabs > 0 && transfer.append(out, "\t", 1) == 0) { return 0; }
+                    tabs = tabs + 1;
+                    blank = 1;
+                }
+            } else if (_breaks_line(p, limit) == 1) {
+                // A line feed once: blocks in a row make no empty lines, but
+                // for line breaks, each its own.
+                let is i32 as is_br = _word_at(p, limit, "br", 2);
+                if (out.len > 0 && (is_br == 1 || out.data[out.len - 1] != 10)) {
+                    if (transfer.append(out, "\n", 1) == 0) { return 0; }
+                }
+                blank = 1;
+            }
+            i = next;
+            continue;
+        }
+        if (c == 38) {
+            let is i64 as len with mut = 0;
+            let is i64 as v = _entity(s, i, n, &len);
+            if (v > 0 && _put_utf8(out, v) == 1) {
+                blank = 0;
+                i = i + len;
+                continue;
+            }
+            if (transfer.append(out, "&", 1) == 0) { return 0; }
+            blank = 0;
+            i = i + 1;
+            continue;
+        }
+        if (pre == 0 && _is_space(c) == 1) {
+            if (blank == 0) {
+                if (transfer.append(out, " ", 1) == 0) { return 0; }
+                blank = 1;
+            }
+            i = i + 1;
+            continue;
+        }
+        if (transfer.append(out, cast(*u8, cast(i64, s) + i), 1) == 0) { return 0; }
+        blank = cast(i32, c == 10 && pre == 1);
+        i = i + 1;
+    }
+    // Nothing after the last word: its space, its block's line feed.
+    while (out.len > 0 && (out.data[out.len - 1] == 10 || out.data[out.len - 1] == 32)) { out.len = out.len - 1; }
+    if (cast(i64, out.data) != 0) { out.data[out.len] = 0; }
+    return 1;
+}

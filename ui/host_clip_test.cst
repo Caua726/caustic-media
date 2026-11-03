@@ -1,0 +1,471 @@
+// ui/host_clip_test.cst — the toolkit's clipboard on a real one, against
+// another program: xclip on X11, wl-copy and wl-paste on a KWin of its own,
+// window/win32/tools/clipboard_peer.c on Windows:
+//   sh window/x11/tools/run_headless.sh ./build/host_clip_test
+//   sh window/wayland/tools/run_kwin.sh ./build/host_clip_test
+//   sh window/win32/tools/run_native.sh build/host_clip_test.exe
+//
+// What a program copies: text, HTML and a type of its own read back by the other
+// program; an image's pixels as the PNG made of them, on Windows the DIB beside
+// it; what is made on demand made when asked for. What another program copies:
+// the change heard, once, however many windows; a text field's Paste as what is
+// offered allows it, HTML with nothing beside it pasted as its text; a widget
+// asking in the formats it takes given the first there is, as that; an image
+// only there as CF_DIBV5 given as a PNG; the program's own asking answered.
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/os.cst" as os;
+use "std/time.cst" as time;
+use "std/env.cst" as env;
+use "std/process.cst" as process;
+use "std/os/linux.cst" as linux;
+use "../sys/file.cst" as file;
+use "../window/device.cst" as device;
+use "../window/win32/bind/types.cst" as wt;
+use "../window/win32/bind/kernel32.cst" as k32;
+use "../window/wayland/kwin_input.cst" as kwin_input;
+use "../image/buffer.cst" as buffer;
+use "../image/load.cst" as load;
+use "../text/fonts/chain.cst" as chain;
+use "system_fonts.cst" as system_fonts;
+use "program.cst" as program;
+use "tree.cst" as tree;
+use "widget.cst" as widget;
+use "geom.cst" as geom;
+use "event.cst" as event;
+use "layout.cst" as layout;
+use "box.cst" as box;
+use "router.cst" as router;
+use "app.cst" as app;
+use "host.cst" as host;
+use "clip.cst" as clip;
+use "widgets/entry.cst" as entry;
+use "widgets/textedit.cst" as textedit;
+
+let is i32 as fails with mut = 0;
+
+fn check(what as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", what);
+        fails = fails + 1;
+    }
+}
+
+let is *host.Host as hs with mut;
+let is program.Program as prog with mut;
+let is *device.Window as dw with mut;
+
+fn settle(ms as i64) as void {
+    let is i64 as until = time.now_ms() + ms;
+    while (time.now_ms() < until) { host.step(hs, 5); }
+}
+
+fn on_windows() as i32 { return cast(i32, os.current() == os.OS_WINDOWS); }
+fn on_wayland() as i32 { return cast(i32, on_windows() == 0 && dw.backend == device.WAYLAND); }
+
+// --- The other program ---
+
+let is *u8 as OWN with imut = "application/x-caustic-test";
+let is *u8 as A with imut = "build/host-clip-a";
+let is *u8 as IN with imut = "build/host-clip-in";
+
+fn len_of(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// a, b and c as one line, zero-terminated, in out.
+fn joined(out as *u8, a as *u8, b as *u8, c as *u8) as *u8 {
+    let is i64 as n with mut = 0;
+    mem.memcpy(out, a, len_of(a));
+    n = len_of(a);
+    mem.memcpy(cast(*u8, cast(i64, out) + n), b, len_of(b));
+    n = n + len_of(b);
+    mem.memcpy(cast(*u8, cast(i64, out) + n), c, len_of(c));
+    n = n + len_of(c);
+    out[n] = 0;
+    return out;
+}
+
+// sh -c cmd, the host stepped meanwhile: its exit status, -1 after 20 seconds.
+fn run_sh(cmd as *u8) as i32 {
+    let is [4]i64 as argv;
+    argv[0] = cast(i64, "sh"); argv[1] = cast(i64, "-c"); argv[2] = cast(i64, cmd); argv[3] = 0;
+    let is i64 as pid = process.spawnp("sh", cast(*u8, &argv[0]));
+    if (pid <= 0) { return 0 - 1; }
+    let is i32 as status with mut = 0;
+    let is i64 as until = time.now_ms() + 20000;
+    while (time.now_ms() < until) {
+        host.step(hs, 2);
+        if (linux.wait4(pid, &status, 1, cast(*u8, 0)) == pid) { return process.exit_code_of(status); }
+    }
+    return 0 - 1;
+}
+
+// build\clipboard_peer.exe args, the host stepped meanwhile: its exit code.
+fn run_peer(args as *u8) as i32 {
+    let is [512]u8 as line;
+    joined(&line[0], "build\\clipboard_peer.exe ", args, "");
+    let is [512]u16 as cmd;
+    let is i64 as j with mut = 0;
+    while (line[j] != 0) {
+        cmd[j] = cast(u16, line[j]);
+        j = j + 1;
+    }
+    cmd[j] = cast(u16, 0);
+    let is wt.STARTUPINFOW as si;
+    mem.memzero(cast(*u8, &si), sizeof(wt.STARTUPINFOW));
+    si.cb = cast(u32, sizeof(wt.STARTUPINFOW));
+    let is wt.PROCESS_INFORMATION as pi;
+    mem.memzero(cast(*u8, &pi), sizeof(wt.PROCESS_INFORMATION));
+    if (k32.CreateProcessW(cast(*u16, 0), &cmd[0], cast(*u8, 0), cast(*u8, 0), 0, cast(u32, 0), cast(*u8, 0),
+                           cast(*u16, 0), &si, &pi) == 0) { return 0 - 1; }
+    let is i64 as until = time.now_ms() + 20000;
+    let is i32 as code with mut = 0 - 1;
+    while (time.now_ms() < until) {
+        host.step(hs, 2);
+        if (k32.WaitForSingleObject(pi.hProcess, cast(u32, 2)) == cast(u32, 0)) {
+            let is u32 as status with mut = cast(u32, 0);
+            k32.GetExitCodeProcess(pi.hProcess, &status);
+            code = cast(i32, status);
+            break;
+        }
+    }
+    if (code < 0) { k32.TerminateProcess(pi.hProcess, cast(u32, 9)); }
+    k32.CloseHandle(pi.hThread);
+    k32.CloseHandle(pi.hProcess);
+    return code;
+}
+
+// What the other program reads of the clipboard as MIME type, into build's A:
+// its exit status.
+fn peer_read(mime as *u8) as i32 {
+    let is [512]u8 as line;
+    if (on_windows() == 1) {
+        if (mem.memcmp(mime, "text/plain", 11) == 0) { return run_peer("get-text build\\host-clip-a"); }
+        if (mem.memcmp(mime, "text/html", 10) == 0) { return run_peer("get-named \"HTML Format\" build\\host-clip-a"); }
+        if (mem.memcmp(mime, "image/png", 10) == 0) { return run_peer("get-named PNG build\\host-clip-a"); }
+        return run_peer(joined(&line[0], "get-named ", mime, " build\\host-clip-a"));
+    }
+    if (on_wayland() == 1) { return run_sh(joined(&line[0], "wl-paste --no-newline --type ", mime, " > build/host-clip-a")); }
+    return run_sh(joined(&line[0], "xclip -o -selection clipboard -t ", mime, " > build/host-clip-a"));
+}
+
+// The clipboard taken by the other program, holding n bytes at p as MIME type.
+fn peer_own(mime as *u8, p as *u8, n as i64) as i32 {
+    file.write_atomic(IN, p, n, 0);
+    let is [512]u8 as line;
+    if (on_windows() == 1) {
+        if (mem.memcmp(mime, "text/plain", 11) == 0) { return run_peer("put build\\host-clip-in"); }
+        if (mem.memcmp(mime, "text/html", 10) == 0) { return run_peer("put-html build\\host-clip-in"); }
+        if (mem.memcmp(mime, "image/png", 10) == 0) { return run_peer("put - build\\host-clip-in"); }
+        return run_peer(joined(&line[0], "put-named ", mime, " build\\host-clip-in"));
+    }
+    if (on_wayland() == 1) { return run_sh(joined(&line[0], "wl-copy --type ", mime, " < build/host-clip-in")); }
+    return run_sh(joined(&line[0], "xclip -i -selection clipboard -t ", mime, " build/host-clip-in > /dev/null 2>&1"));
+}
+
+let is [1048576]u8 as read_buf with mut;
+
+// What the other program read: its length, in read_buf.
+fn read_back() as i64 { return file.read(A, &read_buf[0], 1048576); }
+
+fn read_holds(s as *u8) as i32 {
+    let is i64 as got = read_back();
+    let is i64 as n = len_of(s);
+    let is i64 as i with mut = 0;
+    while (i + n <= got) {
+        if (mem.memcmp(cast(*u8, cast(i64, &read_buf[0]) + i), s, n) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// On Wayland the clipboard is taken by an input's serial: a key's, just now.
+fn fresh() as void {
+    if (on_wayland() == 0) { return; }
+    kwin_input.key_sym(65505, 1);
+    kwin_input.key_sym(65505, 0);
+    settle(100);
+}
+
+// --- What a program hears ---
+
+let is i64 as changes with mut = 0;
+let is i32 as change_formats with mut = 0;
+
+fn on_changed(user as *u8, which as i32, formats as i32) as void {
+    if (which != 0) { return; }
+    changes = changes + 1;
+    change_formats = formats;
+}
+
+// A change heard since seen was the count: within 5 seconds.
+fn changed_since(seen as i64) as i32 {
+    let is i64 as until = time.now_ms() + 5000;
+    while (changes == seen && time.now_ms() < until) { host.step(hs, 5); }
+    return cast(i32, changes != seen);
+}
+
+let is i32 as made with mut = 0;
+
+fn provide(user as *u8, format as i32, name as *u8, n as i64, out as *clip.Bytes) as i32 {
+    made = made + 1;
+    if (format == clip.HTML) { return clip.put(out, "<b>made</b>", 11); }
+    return clip.put(out, "text made", 9);
+}
+
+let is i64 as answers with mut = 0;
+let is i32 as answer_format with mut = 0 - 1;
+let is [64]u8 as answer with mut;
+let is i64 as answer_len with mut = 0;
+
+fn on_answer(user as *u8, format as i32, name as *u8, n as i64, data as *u8, len as i64) as void {
+    answers = answers + 1;
+    answer_format = format;
+    answer_len = len;
+    if (len > 0 && len <= 64) { mem.memcpy(&answer[0], data, len); }
+}
+
+// --- A widget that takes what it is given ---
+
+struct Sink {
+    pastes  as i64;
+    format  as i32;
+    _pad    as i32;
+    name_n  as i64;
+    len     as i64;
+    name    as [128]u8;
+    bytes   as [65536]u8;
+}
+
+let is tree.Kind as sink_kind with mut;
+
+fn sink_measure(t as *tree.Tree, w as i64, data as *u8, c as *geom.Constraint, out as *geom.Size) as void {
+    out.min_w = 100.0;
+    out.min_h = 40.0;
+    out.pref_w = 100.0;
+    out.pref_h = 40.0;
+}
+
+fn sink_event(t as *tree.Tree, w as i64, data as *u8, e as *event.Event) as i64 {
+    let is *Sink as d = cast(*Sink, data);
+    if (e.kind != event.PASTE) { return 0; }
+    d.pastes = d.pastes + 1;
+    d.format = e.format;
+    d.len = e.text_len;
+    if (e.text_len > 0 && e.text_len <= 65536) { mem.memcpy(&d.bytes[0], e.text, e.text_len); }
+    d.name_n = e.name_len;
+    if (e.name_len > 0 && e.name_len < 128) { mem.memcpy(&d.name[0], e.name, e.name_len); }
+    return 1;
+}
+
+// w asking which formats it takes: heard within 5 seconds.
+fn asked_for(t as *tree.Tree, s as i64, formats as i32, name as *u8, n as i64) as *Sink {
+    let is *Sink as d = cast(*Sink, tree.data(t, s));
+    let is i64 as was = d.pastes;
+    tree.request_paste_as(t, tree.CLIPBOARD, s, formats, name, n);
+    let is i64 as until = time.now_ms() + 5000;
+    while (d.pastes == was && time.now_ms() < until) { host.step(hs, 5); }
+    check("a paste asked for: answered", d.pastes == was + 1);
+    return d;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is *u8 as fonts with mut = "text/testdata/fonts";
+    if (os.current() == os.OS_WINDOWS) { fonts = "text\\testdata\\fonts"; }
+    if (program.open(&prog, fonts) == 0) { io.printf("FAIL: not started\n"); return 1; }
+    let is chain.Prefs as fp with mut = chain.defaults();
+    fp.ui = "Caustic Test Sans";
+    fp.sans = "Caustic Test Sans";
+    system_fonts.set_prefs(program.fonts(&prog), &fp);
+    let is *app.App as ap = program.app(&prog);
+    hs = program.host(&prog);
+    sink_kind = widget.kind("sink", sizeof(Sink));
+    sink_kind.measure = fn_ptr(sink_measure);
+    sink_kind.event = fn_ptr(sink_event);
+
+    let is i64 as h = app.window_open(ap, 360.0, 200.0);
+    app.set_title(ap, h, "clipboard", 9);
+    let is *tree.Tree as t = app.tree(ap, h);
+    let is *router.Router as r = app.router(ap, h);
+    let is i64 as col = box.create(t, tree.root(t), box.COLUMN);
+    let is i64 as en = entry.create(t, col);
+    let is i64 as sink = tree.create(t, &sink_kind, col);
+    app.on_clipboard_changed(ap, fn_ptr(on_changed), cast(*u8, 0));
+    settle(300);
+    dw = host.native(hs, h);
+    if (on_wayland() == 1 && kwin_input.open() == 0) { io.printf("FAIL: no fake input of KWin's\n"); return 1; }
+    // Its keyboard, for the clipboard's sake on Wayland.
+    let is i64 as until with mut = time.now_ms() + 5000;
+    while (app.is_active(ap, h) == 0 && time.now_ms() < until) { host.step(hs, 10); }
+    check("the window active", app.is_active(ap, h) == 1);
+    settle(200);
+    router.focus(t, r, en, 0);
+    check("what it offers known at the start", tree.clipboard_lent(t) == 1);
+
+    // --- Text, HTML and a type of its own ---
+    let is clip.Content as c with mut;
+    clip.init(&c);
+    clip.add_text(&c, "plain", 5);
+    clip.add_html(&c, "<i>rich</i>", 11);
+    clip.add_named(&c, OWN, 26, "own bytes", 9);
+    let is i64 as seen with mut = changes;
+    fresh();
+    check("put through the app", app.clipboard_set(ap, tree.CLIPBOARD, &c) == 1);
+    check("its taking it heard", changed_since(seen) == 1 && (change_formats & clip.TEXT) != 0 && (change_formats & clip.HTML) != 0);
+    check("what the tree knows", tree.clipboard_has(t, clip.TEXT) == 1 && tree.clipboard_has(t, clip.HTML) == 1 && tree.clipboard_has(t, clip.PNG) == 0);
+    check("the text read", peer_read("text/plain") == 0 && read_holds("plain") == 1);
+    check("the HTML read", peer_read("text/html") == 0 && read_holds("<i>rich</i>") == 1);
+    check("its own read", peer_read(OWN) == 0 && read_holds("own bytes") == 1);
+    clip.free(&c);
+
+    // --- An image's pixels ---
+    clip.init(&c);
+    let is buffer.Image as img with mut = buffer.create(3, 2, buffer.RGBA8);
+    let is i64 as p with mut = 0;
+    while (p < 24) {
+        img.pixels[p] = cast(u8, p * 10 + 5);
+        p = p + 1;
+    }
+    clip.add_image(&c, &img);
+    seen = changes;
+    fresh();
+    check("the image put", app.clipboard_set(ap, tree.CLIPBOARD, &c) == 1);
+    check("a PNG offered", changed_since(seen) == 1 && (change_formats & clip.PNG) != 0);
+    check("the PNG made and read", peer_read("image/png") == 0);
+    let is i64 as got = read_back();
+    let is buffer.Image as back with mut = load.bytes(&read_buf[0], got);
+    check("decoded: the same size", back.width == 3 && back.height == 2);
+    check("the same pixels", back.width == 3 && back.format == buffer.RGBA8 && mem.memcmp(back.pixels, img.pixels, 24) == 0);
+    buffer.destroy(&back);
+    if (on_windows() == 1) {
+        check("the DIB beside it", run_peer("get-cf 8 build\\host-clip-a") == 0);
+        got = read_back();
+        check("a 32-bit one of its size", got >= 64 && read_buf[0] == cast(u8, 40) && read_buf[4] == cast(u8, 3) && read_buf[8] == cast(u8, 2) &&
+              read_buf[14] == cast(u8, 32));
+    }
+    clip.free(&c);
+    buffer.destroy(&img);
+
+    // --- Made on demand ---
+    clip.init(&c);
+    clip.set_provider(&c, fn_ptr(provide), cast(*u8, 0));
+    clip.add_lazy(&c, clip.TEXT | clip.HTML);
+    made = 0;
+    seen = changes;
+    fresh();
+    check("on demand: put, nothing made", app.clipboard_set(ap, tree.CLIPBOARD, &c) == 1 && made == 0);
+    // The program's content may go: the host keeps what it was told.
+    clip.free(&c);
+    check("said", changed_since(seen) == 1 && made == 0);
+    check("the text asked for: made", peer_read("text/plain") == 0 && read_holds("text made") == 1 && made == 1);
+    check("the HTML asked for: made", peer_read("text/html") == 0 && read_holds("<b>made</b>") == 1 && made == 2);
+    check("asked again: not made again", peer_read("text/html") == 0 && made == 2);
+
+    // --- Another program's: HTML alone ---
+    seen = changes;
+    check("the other program takes it with HTML", peer_own("text/html", "<p>a &amp; b</p>", 16) == 0);
+    check("heard, once", changed_since(seen) == 1);
+    settle(200);
+    check("HTML there, no text", changes == seen + 1 && tree.clipboard_has(t, clip.HTML) == 1 && tree.clipboard_has(t, clip.TEXT) == 0);
+    check("Paste there: its text can be taken", entry.can(t, en, textedit.PASTE) == 1);
+    check("Paste chosen", entry.act(t, en, textedit.PASTE) == 1);
+    until = time.now_ms() + 5000;
+    while (entry.length(t, en) == 0 && time.now_ms() < until) { host.step(hs, 5); }
+    check("HTML's text pasted", entry.length(t, en) == 5 && mem.memcmp(entry.text(t, en), "a & b", 5) == 0);
+
+    // --- In the formats a widget takes ---
+    let is *Sink as d with mut = asked_for(t, sink, clip.HTML | clip.TEXT, cast(*u8, 0), 0);
+    check("given as HTML, a fragment", d.format == clip.HTML && d.len >= 16 && mem.memcmp(&d.bytes[0], "<p>a &amp; b</p>", 16) == 0);
+    d = asked_for(t, sink, clip.PNG, cast(*u8, 0), 0);
+    check("nothing it takes: nothing", d.format == 0 && d.len == 0);
+    seen = changes;
+    check("the other program takes it with a type of its own", peer_own(OWN, "their own", 9) == 0);
+    check("heard", changed_since(seen) == 1 && tree.clipboard_has(t, clip.NAMED) == 1);
+    d = asked_for(t, sink, clip.NAMED | clip.TEXT, OWN, 26);
+    check("given as its own, by its name", d.format == clip.NAMED && d.len >= 9 && mem.memcmp(&d.bytes[0], "their own", 9) == 0 &&
+          d.name_n == 26 && mem.memcmp(&d.name[0], OWN, 26) == 0);
+    d = asked_for(t, sink, clip.NAMED, "application/x-absent", 20);
+    check("another's: nothing", d.format == 0);
+    seen = changes;
+    check("the other program takes it with text", peer_own("text/plain", "their text", 10) == 0);
+    check("heard, text", changed_since(seen) == 1 && tree.clipboard_has(t, clip.TEXT) == 1);
+    d = asked_for(t, sink, clip.HTML | clip.TEXT, cast(*u8, 0), 0);
+    check("no HTML: the text", d.format == clip.TEXT && d.len == 10 && mem.memcmp(&d.bytes[0], "their text", 10) == 0);
+
+    // --- An image ---
+    let is [1048576]u8 as png_file;
+    let is i64 as pn = file.read("image/testdata/rgba.png", &png_file[0], 1048576);
+    seen = changes;
+    check("the other program takes it with a PNG", pn > 8 && peer_own("image/png", &png_file[0], pn) == 0);
+    check("heard, an image", changed_since(seen) == 1 && tree.clipboard_has(t, clip.PNG) == 1);
+    d = asked_for(t, sink, clip.PNG | clip.TEXT, cast(*u8, 0), 0);
+    check("given as a PNG, whole", d.format == clip.PNG && d.len == pn && mem.memcmp(&d.bytes[0], &png_file[0], pn) == 0);
+    if (on_windows() == 1) {
+        // CF_DIBV5 alone: 2 by 1, BI_BITFIELDS, blue then red.
+        let is [132]u8 as v5 with mut;
+        mem.memzero(&v5[0], 132);
+        v5[0] = cast(u8, 124);
+        v5[4] = cast(u8, 2);
+        v5[8] = cast(u8, 1);
+        v5[12] = cast(u8, 1);
+        v5[14] = cast(u8, 32);
+        v5[16] = cast(u8, 3);
+        v5[42] = cast(u8, 255);
+        v5[45] = cast(u8, 255);
+        v5[48] = cast(u8, 255);
+        v5[55] = cast(u8, 255);
+        v5[124] = cast(u8, 255);
+        v5[127] = cast(u8, 255);
+        v5[130] = cast(u8, 255);
+        v5[131] = cast(u8, 255);
+        file.write_atomic(IN, &v5[0], 132, 0);
+        seen = changes;
+        check("the other program takes it with CF_DIBV5", run_peer("put-cf 17 build\\host-clip-in") == 0);
+        check("heard, an image", changed_since(seen) == 1 && tree.clipboard_has(t, clip.PNG) == 1);
+        d = asked_for(t, sink, clip.PNG, cast(*u8, 0), 0);
+        check("given as a PNG made of it", d.format == clip.PNG && d.len > 8 && d.bytes[1] == cast(u8, 80));
+        let is buffer.Image as made_png with mut = load.bytes(&d.bytes[0], d.len);
+        check("its pixels", made_png.width == 2 && made_png.height == 1 && made_png.pixels[2] == cast(u8, 255) && made_png.pixels[4] == cast(u8, 255));
+        buffer.destroy(&made_png);
+    }
+
+    // --- The program asking ---
+    seen = changes;
+    check("the other program takes it with text again", peer_own("text/plain", "for you", 7) == 0);
+    check("heard", changed_since(seen) == 1);
+    answers = 0;
+    check("asked by the program", app.clipboard_get(ap, tree.CLIPBOARD, clip.PNG | clip.TEXT, cast(*u8, 0), 0, fn_ptr(on_answer), cast(*u8, 0)) == 1);
+    check("one at a time", app.clipboard_get(ap, tree.CLIPBOARD, clip.TEXT, cast(*u8, 0), 0, fn_ptr(on_answer), cast(*u8, 0)) == 0);
+    until = time.now_ms() + 5000;
+    while (answers == 0 && time.now_ms() < until) { host.step(hs, 5); }
+    check("answered, as text", answers == 1 && answer_format == clip.TEXT && answer_len == 7 && mem.memcmp(&answer[0], "for you", 7) == 0);
+    answers = 0;
+    check("asked for what is not there", app.clipboard_get(ap, tree.CLIPBOARD, clip.PNG, cast(*u8, 0), 0, fn_ptr(on_answer), cast(*u8, 0)) == 1);
+    until = time.now_ms() + 5000;
+    while (answers == 0 && time.now_ms() < until) { host.step(hs, 5); }
+    check("answered: nothing", answers == 1 && answer_format == 0 && answer_len == 0);
+
+    // --- Two windows: a change said once, known to both ---
+    let is i64 as h2 = app.window_open(ap, 200.0, 120.0);
+    app.set_title(ap, h2, "second", 6);
+    settle(300);
+    let is *tree.Tree as t2 = app.tree(ap, h2);
+    check("a window to come knows what is offered", tree.clipboard_has(t2, clip.TEXT) == 1 && tree.clipboard_has(t2, clip.PNG) == 0);
+    seen = changes;
+    check("the other program takes it with HTML again", peer_own("text/html", "<u>x</u>", 8) == 0);
+    check("heard", changed_since(seen) == 1);
+    settle(300);
+    check("once", changes == seen + 1);
+    check("both know", tree.clipboard_has(t, clip.HTML) == 1 && tree.clipboard_has(t2, clip.HTML) == 1);
+
+    if (fails > 0) {
+        io.printf("host clipboard: %d failures\n", cast(i64, fails));
+        return 1;
+    }
+    io.printf("host clipboard: all checks passed\n");
+    return 0;
+}

@@ -116,11 +116,19 @@ the application: its windows, each with its own tree, and what they share.
 - `show(a as *App, h as i64) as void` — Shown or hidden: what the platform's loop opens or puts away.
 - `hide(a as *App, h as i64) as void`
 - `is_shown(a as *App, h as i64) as i32`
-- `blocked(a as *App, h as i64) as i32` — Whether h waits on a modal window shown above it — one belonging to it, or to one that does.
+- `blocked(a as *App, h as i64) as i32` — Whether h waits on a modal window shown above it — one belonging to it, or to one that does, or the application's own.
+- `blocker(a as *App, h as i64) as i64` — The modal window h waits on that waits on nothing itself — the one a person pressing on h is to be shown — or 0 when h waits on none.
 - `set_title(a as *App, h as i64, s as *u8, n as i64) as void` — The window's title, s n bytes, copied: what the platform shows for it.
 - `title(a as *App, h as i64) as *u8` — Its title, zero-terminated; title_length bytes.
 - `title_length(a as *App, h as i64) as i64`
 - `window_of(a as *App, t as *tree.Tree) as i64` — The window whose tree t is, 0 for none.
+- `clipboard_set(a as *App, which as i32, c as *clip.Content) as i32` — c on which, tree.CLIPBOARD or PRIMARY, copied: 1, or 0 with no window on the platform to put it there.
+- `clipboard_get(a as *App, which as i32, formats as i32, name as *u8, n as i64, cb as ClipboardAnswerFn, user as *u8) as i32` — What which holds, in one of formats (clip bits; NAMED: the type named name, n bytes), asked for: cb hears the answer later, with format 0 when there was none of them.
+- `clipboard_answer(a as *App, format as i32, name as *u8, n as i64, data as *u8, len as i64) as void` — A clipboard_get's answer, from the platform's loop.
+- `on_clipboard_changed(a as *App, cb as ClipboardChangedFn, user as *u8) as void` — cb hears each change of the clipboard and the primary selection, by another program or this one.
+- `clipboard_offered(a as *App, formats as i32) as void` — What the clipboard offers, from the platform's loop: every window's tree.clipboard_has answers by it.
+- `clipboard_changed(a as *App, which as i32, formats as i32) as void` — A change, from the platform's loop: which, 0 the clipboard and 1 the primary selection, offers formats now.
+- `clipboard_has(a as *App, format as i32) as i32` — Whether the clipboard offers format (clip bits: any of them); 1 while the platform's loop has not said — a paste then finds out.
 - `resize(a as *App, h as i64, width as f64, height as f64) as void` — The window's size in logical pixels — the platform's physical size over the scale.
 - `set_icon(a as *App, px as *u32, size as i64) as void` — Every window's icon from now on: size by size pixels, 0xAARRGGBB each (icons.rasterize makes one of the toolkit's), kept by the program while it is the icon.
 - `icon(a as *App, size as *i64) as *u32`
@@ -172,6 +180,35 @@ a row or a column of widgets.
 - `set_padding(t as *tree.Tree, w as i64, left as f64, top as f64, right as f64, bottom as f64) as void`
 - `set_homogeneous(t as *tree.Tree, w as i64, on as i32) as void` — Every visible child gets the same share of the main axis, whatever it prefers — a row of buttons that should match.
 
+## `ui/clip.cst`
+
+what a program puts on the clipboard: content of several formats at once, each its bytes or made only when another program asks.
+
+- `set_encoder(cb as EncodeFn) as void`
+- `init(c as *Content) as void`
+- `free(c as *Content) as void`
+- `clear(c as *Content) as void` — Emptied, ready to be filled again.
+- `formats(c as *Content) as i32` — Which formats it has, bits.
+- `has(c as *Content, format as i32) as i32`
+- `add_text(c as *Content, s as *u8, n as i64) as i32` — n bytes of UTF-8 at s: 1, or 0 when they could not be kept.
+- `add_html(c as *Content, s as *u8, n as i64) as i32` — An HTML fragment, n bytes of UTF-8 — text added beside it is what a program that reads no HTML pastes.
+- `add_png(c as *Content, p as *u8, n as i64) as i32` — A PNG file's n bytes, in place of an image added before.
+- `add_image(c as *Content, img as *buffer.Image) as i32` — An image's pixels, copied: the host encodes them as a PNG when another program asks for one.
+- `add_files(c as *Content, paths as *u8, n as i64) as i32` — n absolute paths, back to back at paths, each zero-terminated.
+- `add_named(c as *Content, name as *u8, n as i64, p as *u8, len as i64) as i32` — The program's own type named name (n bytes, a MIME type), len bytes at p.
+- `set_provider(c as *Content, cb as ProvideFn, user as *u8) as void` — What makes what is added on demand, and its user.
+- `ask(cb as ProvideFn, user as *u8, format as i32, name as *u8, n as i64, out as *Bytes) as i32` — The provider cb asked for a format as the platform asks: text/html by name heard as HTML.
+- `add_lazy(c as *Content, f as i32) as i32` — Formats — TEXT, PNG, HTML bits — added to be made on demand by the provider.
+- `add_lazy_named(c as *Content, name as *u8, n as i64) as i32` — The program's own type named name (n bytes) made on demand.
+- `put(out as *Bytes, p as *u8, n as i64) as i32` — n bytes at p into out, a provider's answer: 1, or 0 for no room.
+- `offer(c as *Content) as *transfer.Offer` — What the platform's clipboard is handed: the content's offer, its formats with their bytes and those made on demand.
+- `copy(dst as *Content, src as *Content) as i32` — dst made a copy of src: 1, or 0 (dst then empty).
+- `text_of(c as *Content) as *Bytes`
+- `png_of(c as *Content) as *Bytes` — The PNG — an image's pixels encoded now, once, where there is what does (set_encoder).
+- `named_of(c as *Content, name as *u8, n as i64) as *Bytes` — The bytes of the type named name (n bytes) — made now when on demand — null when it has none by that name.
+- `html_of(c as *Content) as *Bytes`
+- `html_text(s as *u8, n as i64, out as *Bytes) as i32` — The text of an HTML fragment, n bytes of UTF-8, into out (emptied first): its tags out, the content of style, script, head, title and comments with them, the usual entities said, runs of white space one space but in p...
+
 ## `ui/damage.cst`
 
 what has to be repainted, found from the tree.
@@ -220,6 +257,16 @@ what a drag carries.
 - `files(s as *u8, n as i64) as Payload` — n paths, back to back at s, each zero-terminated: files from outside, which are only ever copied.
 - `item(t as *tree.Tree, w as i64, i as i64, actions as i32) as Payload` — Item i of widget w in t — a row of a list — to be done with as actions says.
 - `file_at(p as *Payload, i as i64) as *u8` — The i-th path, zero-terminated; null for none.
+- `add_content(p as *Payload, c as *clip.Content) as void` — c's formats offered too, c the maker's until DRAG_END.
+- `content(c as *clip.Content, actions as i32) as Payload` — Content of several formats, c the maker's until DRAG_END, to be done with as actions says.
+- `set_image(p as *Payload, argb as *u8, w as i64, h as i64, hx as i64, hy as i64) as void` — The image under the pointer: argb, w by h pixels of 0xAARRGGBB, the maker's until the drag begins, the pointer at hx, hy of it.
+- `set_no_image(p as *Payload) as void` — No image under the pointer.
+- `set_image_rect(p as *Payload, x as f64, y as f64, w as f64, h as f64) as void` — The part of the widget its image shows, in the widget's own coordinates: a list's row.
+- `fill(p as *Payload) as void` — Text made on demand made now, as it is let go.
+- `bytes_of(p as *Payload, format as i32, name as *u8, n as i64, len as *i64) as *u8` — The bytes of format — TEXT, PNG, HTML, NAMED by name, n bytes — of what was let go, *len of them, wherever they came from; null for none of it.
+- `has_named(p as *Payload, name as *u8, n as i64) as i32` — Whether it offers the type named name, n bytes.
+- `take_named(p as *Payload, name as *u8, n as i64) as void` — The named type a target takes of it, as it answers DRAG_OVER with NAMED.
+- `named_taken(p as *Payload, n as *i64) as *u8` — The named type taken — take_named's, else the first it offers but text/html — zero-terminated, *n its length; null for none.
 
 ## `ui/event.cst`
 
@@ -290,6 +337,16 @@ the application on the screen.
 - `busy(hs as *Host) as i32` — Whether a window has something to paint or show.
 - `step(hs as *Host, timeout_ms as i64) as i32` — One round: the windows put up and away as the application's are, every event given to it, what was posted run, the timers, the round's callbacks, what changed painted and shown — then asleep until something is to be...
 - `run(hs as *Host) as void` — Rounds until no window is left on the screen and nothing holds the loop, or quit is asked.
+
+## `ui/host_clip.cst`
+
+the windows' clipboard: text and content of several formats copied, a paste in the formats a widget or the program takes, the clipboard followed.
+
+
+## `ui/host_drag.cst`
+
+a drag between the program and the platform.
+
 
 ## `ui/host_paint.cst`
 
@@ -435,6 +492,7 @@ drawing the tree, region by region, through render/'s 2D family.
 - `cache_close(cc as *Cache) as void`
 - `cache_used(cc as *Cache, t as *tree.Tree) as i64` — How many entries hold a texture for a widget still alive.
 - `options(theme as *style.Theme) as Options`
+- `subtree(t as *tree.Tree, w as i64, x as f64, y as f64, rw as f64, rh as f64, c as *draw2d.Canvas, o as *Options) as void` — w and what it holds painted on c, which the caller has begun at rw by rh: the rectangle at x, y of w, in its own coordinates, at c's corner — what a drag shows of the widget it began from.
 - `frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of the tree's damage region on c, which the caller has begun.
 - `frame_surface(t as *tree.Tree, sf as i64, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of surface s's damage region — a widget shown in a window of its own (tree.surface_open) — on c, which the caller has begun at the surface's size: what is at the surface's corner in the wind...
 
@@ -511,6 +569,7 @@ where each event goes.
 - `text(t as *tree.Tree, r as *Router, s as *u8, len as i64, time as i64) as i32` — Text the user typed, UTF-8 and already composed — dead keys and input methods have done their work below.
 - `close_request(t as *tree.Tree, r as *Router, time as i64) as i32` — The platform asked the window to close: CLOSE_REQUEST to the focused widget, bubbling, then to each widget of the window until one takes it — a dialog, which answers as Escape.
 - `paste(t as *tree.Tree, r as *Router, w as i64, which as i32, s as *u8, len as i64, time as i64) as i32` — Text asked of the clipboard (tree.request_paste) for widget w, given to it as PASTE when it is still there.
+- `paste_as(t as *tree.Tree, r as *Router, w as i64, which as i32, format as i32, name as *u8, n as i64,` — What was asked of the clipboard in one of several formats (tree.request_paste_as) for widget w, given to it as PASTE when it is still there: format the one that came (ui/clip.cst's bits; 0 for none), for NAMED its nam...
 - `preedit(t as *tree.Tree, r as *Router, s as *u8, len as i64, cursor as i64, time as i64) as i32` — The input method's composition — s, len bytes, its caret cursor bytes in; empty when it is over — to the focused widget as PREEDIT.
 - `preedit_segment(t as *tree.Tree, r as *Router, s as *u8, len as i64, cursor as i64,` — The same, with the part the method is converting — its target segment, seg_start to seg_end bytes in (equal for none) — which the widget shows as selected within the composition.
 - `delete_surrounding(t as *tree.Tree, r as *Router, before as i64, after as i64, time as i64) as i32` — An input method can revise text immediately around its caret (for example, autocorrect replacing a just-committed word).
@@ -529,7 +588,17 @@ where each event goes.
 - `drag_payload(r as *Router) as *dnd.Payload` — What a drag begun here carries; null for none.
 - `drag_elsewhere(t as *tree.Tree, r as *Router, time as i64) as void` — The drag begun here went over another window: what took it here left.
 - `drag_finish(t as *tree.Tree, r as *Router, done as i32, time as i64) as i32` — It was let go over another window, which did done with it (dnd bits, 0 for nothing): over here as if let go here, its source told.
+- `drag_gone_out(t as *tree.Tree, r as *Router, time as i64) as void` — Gone: what took it here left, and the pointer no longer runs it.
+- `drag_stayed(r as *Router) as void` — The platform would not have it: the pointer's again.
+- `drag_is_out(r as *Router) as i32`
+- `drag_back_over(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as i32` — Back over this window, at x, y: what is taken there.
+- `drag_back_drop(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as i32` — Let go over this window, at x, y: what was done with it.
+- `drag_out_done(t as *tree.Tree, r as *Router, done as i32, time as i64) as i32` — The platform says it ended, done (dnd bits, 0 for nothing): its source told.
+- `drag_x(r as *Router) as f64` — Where the drag is over this window.
+- `drag_y(r as *Router) as f64`
 - `drag_active(r as *Router) as i32`
+- `drag_forget_content(r as *Router, c as *clip.Content) as void` — What made c going away: a drag still carrying it goes on without it, offering what it has left of its own.
+- `drag_carried(r as *Router) as *dnd.Payload` — What a drag over the window carries, whoever began it.
 - `drag_source(r as *Router) as i64` — The widget a drag over the window began from, 0 for one from outside.
 - `drag_target(r as *Router) as i64` — What takes it where it is, 0 for nothing; and what of it.
 - `drag_takes(r as *Router) as i32`
@@ -988,6 +1057,14 @@ widgets as nodes in a window's tree, and the handles to them.
 - `copy(t as *Tree, which as i32, text as *u8, n as i64) as void` — n bytes of UTF-8 at text to which, CLIPBOARD or PRIMARY; the program copies them before it returns.
 - `set_paste(t as *Tree, cb as PasteFn, user as *u8) as void` — Text a widget wants pasted is asked of the program, which fetches it — a clipboard answers when it answers — and hands it to the router (router.paste), which gives it to the widget as PASTE.
 - `request_paste(t as *Tree, which as i32, w as i64) as void` — w wants the text of which, CLIPBOARD or PRIMARY.
+- `set_clipboard_content(t as *Tree, cb as ContentFn, user as *u8) as void` — Content of several formats — ui/clip.cst's: text, HTML, an image, files, a program's own types, each its bytes or made on demand — is handed to the program, which puts it on the platform's clipboard, copied before...
+- `copy_content(t as *Tree, which as i32, c as *clip.Content) as void` — c to which, CLIPBOARD or PRIMARY.
+- `set_paste_as(t as *Tree, cb as PasteAsFn, user as *u8) as void` — A paste in one of several formats is asked of the program, which asks the clipboard which it has, fetches the first it has of those — the program's own type, HTML, an image, text — and hands it to the router (rout...
+- `request_paste_as(t as *Tree, which as i32, w as i64, formats as i32, name as *u8, n as i64) as void` — w wants which in one of formats, clip bits (NAMED: the type named name, n bytes).
+- `request_paste_plain(t as *Tree, which as i32, w as i64) as void` — w, a text field, wants which as text: the text it holds, else the text of the HTML it holds (clip.PLAIN), heard as TEXT.
+- `clipboard_lent(t as *Tree) as i32` — Whether the platform's clipboard is there behind it: functions set.
+- `set_clipboard_offered(t as *Tree, formats as i32) as void` — What the clipboard offers, said by the program as it changes (clip bits).
+- `clipboard_has(t as *Tree, format as i32) as i32` — Whether the clipboard offers format (clip bits: any of them); 1 while the program has not said — a paste then finds out.
 - `set_text_area(t as *Tree, w as i64, r as math.rect.Rect) as void` — The widget text is being typed into says where its caret is, in the window: the input method puts its candidates there (an X input method's spot, text-input-v3's cursor rectangle, IMM32's composition window), and know...
 - `text_area(t as *Tree) as i64` — The widget text is typed into, 0 for none — also once it is gone.
 - `text_area_rect(t as *Tree) as math.rect.Rect`
@@ -1066,6 +1143,12 @@ what the tree is lent and keeps for its widgets: the theme, the application's se
 - `copy(t as *Tree, which as i32, text as *u8, n as i64) as void`
 - `set_paste(t as *Tree, cb as PasteFn, user as *u8) as void`
 - `request_paste(t as *Tree, which as i32, w as i64) as void`
+- `set_clipboard_content(t as *Tree, cb as ContentFn, user as *u8) as void`
+- `copy_content(t as *Tree, which as i32, c as *clip.Content) as void`
+- `set_paste_as(t as *Tree, cb as PasteAsFn, user as *u8) as void`
+- `request_paste_as(t as *Tree, which as i32, w as i64, formats as i32, name as *u8, n as i64) as void`
+- `set_clipboard_offered(t as *Tree, formats as i32) as void`
+- `clipboard_has(t as *Tree, format as i32) as i32`
 - `set_text_area(t as *Tree, w as i64, r as math.rect.Rect) as void`
 - `text_area(t as *Tree) as i64`
 - `text_area_rect(t as *Tree) as math.rect.Rect`
@@ -1302,6 +1385,7 @@ a question put to the user, with buttons to answer.
 
 - `set_order(order as i32) as void` — The buttons' order for every dialog from now on.
 - `window_tree(t as *tree.Tree) as *tree.Tree` — The tree a new dialog for t's window is made in: a window of its own, belonging to t's, when the application can open one; t itself otherwise, the dialog then drawn inside the window.
+- `app_window_tree(t as *tree.Tree) as *tree.Tree` — The same for a dialog of the whole application's: a window of its own belonging to no window — shown modal, every window of the application waits on it, not only t's.
 - `ref(t as *tree.Tree, w as i64) as Ref`
 - `ref_valid(r as *Ref) as i32` — Whether it is still that dialog, in that window.
 - `dispose(r as *Ref) as void` — Gone: its window closed when it has one of its own, destroyed otherwise.
@@ -1504,6 +1588,7 @@ rows read from a model, only those seen made.
 - `scroll_to_row(t as *tree.Tree, w as i64, index as i64) as void` — Row index at the top of the view, or as near as it goes.
 - `row_height(t as *tree.Tree, w as i64) as f64`
 - `row_at(t as *tree.Tree, w as i64, x as f64, y as f64) as i64` — The row at window x, y, -1 for none.
+- `set_drag_content(t as *tree.Tree, w as i64, cb as DragContentFn, actions as i32, user as *u8) as i32` — A row pressed and dragged is cb's content from now on (see DragContentFn), to be done with as actions says: dropped on what takes it here, and on other programs once it leaves the program's windows.
 - `set_reorderable(t as *tree.Tree, w as i64, on as i32) as void`
 - `reorderable(t as *tree.Tree, w as i64) as i32`
 - `drop_at(t as *tree.Tree, w as i64) as i64` — Where a row dragged over it would go, before which row (count() for the end); -1 when none is.
@@ -1654,6 +1739,7 @@ a model's rows in columns, under a header.
 
 - `create(t as *tree.Tree, parent as i64, m as *model.Model) as i64` — A new table view of m's rows, with no columns yet, as the last child of parent.
 - `list(t as *tree.Tree, w as i64) as i64` — The list view its rows are in: its selection, its cursor, its rows.
+- `set_drag_content(t as *tree.Tree, w as i64, cb as listview.DragContentFn, actions as i32, user as *u8) as i32` — A row pressed and dragged is cb's content from now on, as a list's rows are (listview.set_drag_content), the row of the list under its headers.
 - `add_column(t as *tree.Tree, w as i64, s as *u8, n as i64, width as f64) as i64` — A column titled s, n bytes, width wide, at the end; its index, or -1.
 - `column_count(t as *tree.Tree, w as i64) as i64`
 - `column_width(t as *tree.Tree, w as i64, col as i64) as f64`
@@ -1702,7 +1788,7 @@ what the entry and the text view share.
 - `whole(s as *u8, i as i64, n as i64, k as i64) as i32` — Whether the k bytes from i of s, n long, are one well-formed sequence, as Unicode's table 3-7 has them.
 - `accept(s as *u8, n as i64, room as i64, f as FilterFn, user as *u8, lines as i32, out as *u8) as i64` — What goes in of s, n bytes, into out — room for n bytes there: what is no UTF-8 left out, each character f says no to left out (f null lets all in), at most room characters (below 0: any number), and each line end a...
 - `context_menu(t as *tree.Tree, items as *i64) as i64` — A new context menu of an editable text, its items into items by id — room for SELECT_ALL + 1.
-- `can(id as i64, editable as i32, seen as i32, selected as i32, undo as i32, redo as i32, any as i32) as i32` — Whether action id can be done: editable, the text seen — no password — something selected, something to undo or redo, any text.
+- `can(id as i64, editable as i32, seen as i32, selected as i32, undo as i32, redo as i32, any as i32, paste as i32) as i32` — Whether action id can be done: editable, the text seen — no password — something selected, something to undo or redo, any text, something on the clipboard to paste.
 - `offer(t as *tree.Tree, items as *i64, editable as i32, seen as i32, selected as i32, undo as i32, redo as i32,` — Its items enabled as what they do can be done (can).
 
 ## `ui/widgets/textview.cst`

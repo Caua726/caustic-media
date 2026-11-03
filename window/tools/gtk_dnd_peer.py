@@ -8,9 +8,14 @@
 #       takes text/uri-list and text by copy or move; logs "ready", then
 #       "drop <target> <action> <bytes>" per drop, its bytes written to
 #       <log>.<n>, n counting the drops from 1
-#   gtk_dnd_peer.py source <log> files|text|bigtext [x y]
+#   gtk_dnd_peer.py source <log> files|text|bigtext|types [x y]
 #       drags what it is told from a press inside it; logs "ready", then
 #       "get <target>" per request and "end <action>" when the drag ends
+#
+# --types=a,b among the arguments: those MIME types too, first — a target
+# takes them before the rest; a source of "types" offers only them, each
+# "<b>from gtk</b>" for text/html, image/testdata/rgba.png's bytes for
+# image/png, "own: <the type>" for any other.
 #
 # The window is 300 by 300 at x, y (600, 100 when not said), undecorated.
 import sys
@@ -23,7 +28,8 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 mode = sys.argv[1]
 log = open(sys.argv[2], "w", buffering=1)
-args = sys.argv[3:]
+args = [a for a in sys.argv[3:] if not a.startswith("--types=")]
+types = [t for a in sys.argv[3:] if a.startswith("--types=") for t in a[8:].split(",")]
 what = None
 if mode == "source":
     what = args.pop(0)
@@ -58,7 +64,18 @@ targets = [
     Gtk.TargetEntry.new("UTF8_STRING", 0, 2),
     Gtk.TargetEntry.new("text/plain;charset=utf-8", 0, 3),
 ]
+targets = [Gtk.TargetEntry.new(t, 0, 10 + i) for i, t in enumerate(types)] + targets
 actions = Gdk.DragAction.COPY | Gdk.DragAction.MOVE
+
+
+def typed(name):
+    if name == "text/html":
+        return b"<b>from gtk</b>"
+    if name == "image/png":
+        with open("image/testdata/rgba.png", "rb") as f:
+            return f.read()
+    return ("own: %s" % name).encode()
+
 
 if mode == "target":
     box.drag_dest_set(Gtk.DestDefaults.ALL, targets, actions)
@@ -73,7 +90,10 @@ if mode == "target":
 
     box.connect("drag-data-received", received)
 else:
-    src_targets = targets[:1] if what == "files" else targets[1:]
+    plain = targets[len(types):]
+    src_targets = plain[:1] if what == "files" else plain[1:]
+    if what == "types":
+        src_targets = targets[: len(types)]
     box.drag_source_set(Gdk.ModifierType.BUTTON1_MASK, src_targets, actions)
 
     def payload():
@@ -87,6 +107,9 @@ else:
     def get(widget, context, data, info, time):
         name = data.get_target().name()
         say("get %s" % name)
+        if what == "types":
+            data.set(data.get_target(), 8, typed(name))
+            return
         raw = payload()
         if what == "files" and name != "text/uri-list":
             return
