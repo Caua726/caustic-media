@@ -9,9 +9,10 @@
 //
 // Three selections are served here: CLIPBOARD (Ctrl+C), PRIMARY (what is
 // selected) and XdndSelection (what this program drags, dnd.cst's). Each owns
-// a transfer.Offer — text, a PNG, files — answered by target: TARGETS;
-// UTF8_STRING, text/plain;charset=utf-8, text/plain, TEXT and STRING
-// (Latin-1, as ICCCM has it) for text; image/png; text/uri-list.
+// a transfer.Offer — text, a PNG, files, formats by name — answered by
+// target: TARGETS; UTF8_STRING, text/plain;charset=utf-8, text/plain, TEXT
+// and STRING (Latin-1, as ICCCM has it) for text; image/png; text/uri-list;
+// a named format by the atom of its name (text/html, a program's own).
 //
 // **Answering is not optional.** A SelectionRequest this program ignores leaves
 // the client that sent it waiting. So ../window.cst's pump services it before
@@ -24,10 +25,17 @@
 // PropertyNotify comes to this connection — the pump hands events for windows
 // of no one here to foreign()), incoming ones this window's property.
 //
+// **A clipboard manager keeps it.** Closing the window that owns CLIPBOARD,
+// its offer is handed to the desktop's clipboard manager first, as ICCCM's
+// clipboard manager protocol has it (save_to_manager): SAVE_TARGETS asked of
+// CLIPBOARD_MANAGER, the manager's requests for the targets answered —
+// MULTIPLE included — until it says it has them, or SAVE_MS pass.
+//
 // **Asking is asynchronous.** request() sends a request and returns; the
-// answer arrives with the events, into one of two slots: PASTE (the clipboard
-// or the primary selection, asked for by the program) and DROP (a drop's
-// data, asked for by dnd.cst). An answer that stops coming — an owner that
+// answer arrives with the events, into one of three slots: PASTE (the
+// clipboard or the primary selection, asked for by the program), DROP (a
+// drop's data, asked for by dnd.cst) and WATCH (the TARGETS of a selection
+// that changed hands, asked for as XFixes says it did: clipwatch.cst). An answer that stops coming — an owner that
 // died mid-INCR — is given up after TIMEOUT_MS: ready, empty.
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
@@ -44,8 +52,10 @@ let is i32 as XDND      with imut = 2;
 // Which answer slot.
 let is i32 as PASTE with imut = 0;
 let is i32 as DROP  with imut = 1;
+let is i32 as WATCH with imut = 2;
 
 let is i64 as TIMEOUT_MS with imut = 10000;
+let is i64 as SAVE_MS with imut = 3000;
 let is i32 as MAX_OUT with imut = 8;
 
 // An incoming slot's state.
@@ -55,7 +65,7 @@ let is i32 as _INCR    with imut = 2;
 let is i32 as _READY   with imut = 3;
 
 // The selection each slot last asked, for a refused text target's next try.
-let is [2]i64 as _current_selection with mut;
+let is [3]i64 as _current_selection with mut;
 
 struct Atoms {
     clipboard    as i64;
@@ -73,8 +83,13 @@ struct Atoms {
     incr         as i64;
     atom         as i64;
     integer      as i64;
+    manager      as i64;   // CLIPBOARD_MANAGER
+    save_targets as i64;   // SAVE_TARGETS
+    atom_pair    as i64;   // ATOM_PAIR, MULTIPLE's property type
+    save_prop    as i64;   // what SAVE_TARGETS is asked with, on our window
     paste_prop   as i64;   // where answers to PASTE land on our window
     drop_prop    as i64;   // and to DROP
+    watch_prop   as i64;   // and to WATCH
 }
 
 // One answer asked for. A format asked for of the clipboard or the primary
@@ -83,7 +98,7 @@ struct Atoms {
 // what it has (xclip does), so asking blind would hand text over as a PNG.
 struct Incoming {
     state    as i32;
-    format   as i32;      // what is asked: transfer.TEXT, PNG, FILES; 0 for TARGETS
+    format   as i32;      // what is asked: transfer.TEXT, PNG, FILES, NAMED; 0 for TARGETS
     target   as i64;      // the target asked for now
     fallback as i32;      // TEXT asked blind: how many of the text targets were refused
     probing  as i32;      // TARGETS asked first, for format
@@ -91,6 +106,8 @@ struct Incoming {
     offered  as i32;      // TARGETS: the formats offered, bits
     data     as transfer.Bytes;
     last_ms  as i64;      // when it was asked or last progressed
+    named    as i64;      // NAMED: the atom of the name asked for
+    names    as transfer.Names;   // TARGETS: the names of the formats offered beyond the three
 }
 
 // One INCR answer being sent.
@@ -110,7 +127,8 @@ struct Selection {
     at    as Atoms;
     own   as [3]transfer.Offer;
     owned as [3]i32;
-    in    as [2]Incoming;
+    own_atoms as [24]i64;   // each selection's named formats' atoms, 8 a selection
+    in    as [3]Incoming;
     out   as [8]Outgoing;
     chunk as i64;         // the most bytes put in one property; more goes INCR
 }
@@ -133,12 +151,18 @@ fn init(s as *Selection, d as *u8) as void {
     s.at.integer     = xlib.XInternAtom(d, "INTEGER", 0);
     s.at.paste_prop  = xlib.XInternAtom(d, "CAUSTIC_SELECTION", 0);
     s.at.drop_prop   = xlib.XInternAtom(d, "CAUSTIC_DND", 0);
+    s.at.watch_prop  = xlib.XInternAtom(d, "CAUSTIC_WATCH", 0);
+    s.at.manager     = xlib.XInternAtom(d, "CLIPBOARD_MANAGER", 0);
+    s.at.save_targets = xlib.XInternAtom(d, "SAVE_TARGETS", 0);
+    s.at.atom_pair   = xlib.XInternAtom(d, "ATOM_PAIR", 0);
+    s.at.save_prop   = xlib.XInternAtom(d, "CAUSTIC_SAVE", 0);
     let is i32 as k with mut = 0;
     while (k < 3) { transfer.offer_init(&s.own[k]); s.owned[k] = 0; k = k + 1; }
     k = 0;
-    while (k < 2) {
+    while (k < 3) {
         mem.memzero(cast(*u8, &s.in[k]), sizeof(Incoming));
         transfer.bytes_init(&s.in[k].data);
+        transfer.names_init(&s.in[k].names);
         k = k + 1;
     }
     k = 0;
@@ -160,7 +184,12 @@ fn close(s as *Selection, d as *u8) as void {
     let is i32 as k with mut = 0;
     while (k < 3) { transfer.offer_free(&s.own[k]); s.owned[k] = 0; k = k + 1; }
     k = 0;
-    while (k < 2) { transfer.bytes_free(&s.in[k].data); s.in[k].state = _IDLE; k = k + 1; }
+    while (k < 3) {
+        transfer.bytes_free(&s.in[k].data);
+        transfer.names_free(&s.in[k].names);
+        s.in[k].state = _IDLE;
+        k = k + 1;
+    }
     k = 0;
     while (k < MAX_OUT) { _out_end(s, d, k); k = k + 1; }
 }
@@ -186,12 +215,17 @@ fn set(s as *Selection, d as *u8, win as i64, which as i32, o as *transfer.Offer
     if (which < 0 || which > 2) { return 0; }
     let is transfer.Offer as copy with mut;
     transfer.offer_init(&copy);
-    if ((o.formats & transfer.TEXT) != 0 && transfer.offer_text(&copy, o.text.data, o.text.len) == 0) { transfer.offer_free(&copy); return 0; }
-    if ((o.formats & transfer.PNG) != 0 && transfer.offer_png(&copy, o.png.data, o.png.len) == 0) { transfer.offer_free(&copy); return 0; }
-    if ((o.formats & transfer.FILES) != 0 && transfer.offer_files(&copy, o.paths.data, o.count) == 0) { transfer.offer_free(&copy); return 0; }
+    if (transfer.offer_copy(&copy, o) == 0) { return 0; }
     transfer.offer_free(&s.own[which]);
     s.own[which] = copy;
     s.owned[which] = 1;
+    // Each named format by the atom of its name.
+    let is i64 as k with mut = 0;
+    while (k < 8) {
+        s.own_atoms[which * 8 + k] = 0;
+        if (k < copy.named_n) { s.own_atoms[which * 8 + k] = xlib.XInternAtom(d, transfer.named_name(&copy, k), 0); }
+        k = k + 1;
+    }
     xlib.XSetSelectionOwner(d, _sel_atom(s, which), win, time_ms);
     // The server is the authority on who owns it, so ask rather than assume:
     // a race with a clipboard manager is real and losing it silently is worse
@@ -221,9 +255,19 @@ fn disown(s as *Selection, d as *u8, win as i64, which as i32) as void {
 
 // --- Answering, from inside the pump ---
 
-// The bytes for target out of offer o, with the type they are written as;
-// 0 when the offer has nothing for it.
-fn _convert(s as *Selection, o as *transfer.Offer, target as i64, out as *transfer.Bytes, type_out as *i64) as i32 {
+// The bytes for target out of selection which's offer, with the type they
+// are written as; 0 when the offer has nothing for it.
+fn _convert(s as *Selection, which as i32, target as i64, out as *transfer.Bytes, type_out as *i64) as i32 {
+    let is *transfer.Offer as o = &s.own[which];
+    let is i64 as k with mut = 0;
+    while (k < o.named_n) {
+        if (target == s.own_atoms[which * 8 + k]) {
+            *type_out = target;
+            let is *transfer.Bytes as nb = transfer.named_bytes(o, k);
+            return transfer.bytes_set(out, nb.data, nb.len);
+        }
+        k = k + 1;
+    }
     if (target == s.at.png && (o.formats & transfer.PNG) != 0) {
         *type_out = target;
         return transfer.bytes_set(out, o.png.data, o.png.len);
@@ -272,8 +316,10 @@ fn _latin1(p as *u8, n as i64, out as *transfer.Bytes) as i32 {
     return 1;
 }
 
-// The targets offer o can be had as, TARGETS first: into t, how many.
-fn _targets(s as *Selection, o as *transfer.Offer, t as *i64) as i32 {
+// The targets selection which's offer can be had as, TARGETS first: into t
+// (room for 24), how many.
+fn _targets(s as *Selection, which as i32, t as *i64) as i32 {
+    let is *transfer.Offer as o = &s.own[which];
     let is i32 as n with mut = 0;
     t[n] = s.at.targets; n = n + 1;
     if ((o.formats & transfer.TEXT) != 0) {
@@ -285,6 +331,12 @@ fn _targets(s as *Selection, o as *transfer.Offer, t as *i64) as i32 {
     }
     if ((o.formats & transfer.PNG) != 0) { t[n] = s.at.png; n = n + 1; }
     if ((o.formats & transfer.FILES) != 0) { t[n] = s.at.uri_list; n = n + 1; }
+    let is i64 as k with mut = 0;
+    while (k < o.named_n) {
+        t[n] = s.own_atoms[which * 8 + k];
+        n = n + 1;
+        k = k + 1;
+    }
     return n;
 }
 
@@ -312,19 +364,22 @@ fn _serve(s as *Selection, d as *u8, rq as *xev.XSelectionRequestEvent) as void 
     let is i64 as prop with mut = rq.property;
     if (prop == x.None) { prop = rq.target; }
     if (which < 0 || s.owned[which] == 0) { _notify(d, rq, x.None); return; }
-    let is *transfer.Offer as o = &s.own[which];
     if (rq.target == s.at.targets) {
-        let is [12]i64 as t;
-        let is i32 as n = _targets(s, o, &t[0]);
+        let is [24]i64 as t;
+        let is i32 as n = _targets(s, which, &t[0]);
         xlib.XChangeProperty(d, rq.requestor, prop, s.at.atom, 32, x.PropModeReplace, cast(*u8, &t[0]), n);
         _notify(d, rq, prop);
+        return;
+    }
+    if (rq.target == s.at.multiple) {
+        _serve_multiple(s, d, rq, which, prop);
         return;
     }
     // A slot of its own: a copy of what is sent, written now or chunk by chunk.
     let is i32 as k = _out_slot(s, d);
     let is *Outgoing as og = &s.out[k];
     let is i64 as ptype with mut = 0;
-    if (_convert(s, o, rq.target, &og.data, &ptype) == 0) { _notify(d, rq, x.None); return; }
+    if (_convert(s, which, rq.target, &og.data, &ptype) == 0) { _notify(d, rq, x.None); return; }
     if (og.data.len <= s.chunk) {
         xlib.XChangeProperty(d, rq.requestor, prop, ptype, 8, x.PropModeReplace, og.data.data, cast(i32, og.data.len));
         transfer.bytes_clear(&og.data);
@@ -348,6 +403,95 @@ fn _serve(s as *Selection, d as *u8, rq as *xev.XSelectionRequestEvent) as void 
     let is i64 as size = og.data.len;
     xlib.XChangeProperty(d, rq.requestor, prop, s.at.incr, 32, x.PropModeReplace, cast(*u8, &size), 1);
     _notify(d, rq, prop);
+}
+
+// MULTIPLE: the requestor's property a list of (target, property) pairs, each
+// target written to its property — a whole one, never INCR — or the pair's
+// target made None where it could not be, the list written back so.
+fn _serve_multiple(s as *Selection, d as *u8, rq as *xev.XSelectionRequestEvent, which as i32, prop as i64) as void {
+    let is i64 as ty with mut = 0;
+    let is i32 as fmt with mut = 0;
+    let is i64 as nitems with mut = 0;
+    let is i64 as after with mut = 0;
+    let is *u8 as data with mut = cast(*u8, 0);
+    if (xlib.XGetWindowProperty(d, rq.requestor, prop, 0, 256, 0, 0, cast(*u8, &ty), cast(*u8, &fmt),
+                                cast(*u8, &nitems), cast(*u8, &after), cast(*u8, &data)) != x.Success ||
+        cast(i64, data) == 0 || fmt != 32) {
+        if (cast(i64, data) != 0) { xlib.XFree(data); }
+        _notify(d, rq, x.None);
+        return;
+    }
+    let is [128]i64 as pairs;
+    let is i64 as n with mut = nitems;
+    if (n > 128) { n = 128; }
+    let is i64 as k with mut = 0;
+    while (k < n) { pairs[k] = *cast(*i64, cast(i64, data) + k * 8); k = k + 1; }
+    xlib.XFree(data);
+    let is transfer.Bytes as b with mut;
+    transfer.bytes_init(&b);
+    k = 0;
+    while (k + 1 < n) {
+        let is i64 as target = pairs[k];
+        let is i64 as into = pairs[k + 1];
+        let is i64 as ptype with mut = 0;
+        if (target == s.at.targets) {
+            let is [24]i64 as t;
+            let is i32 as tn = _targets(s, which, &t[0]);
+            xlib.XChangeProperty(d, rq.requestor, into, s.at.atom, 32, x.PropModeReplace, cast(*u8, &t[0]), tn);
+        } else if (_convert(s, which, target, &b, &ptype) == 1 && b.len <= s.chunk) {
+            xlib.XChangeProperty(d, rq.requestor, into, ptype, 8, x.PropModeReplace, b.data, cast(i32, b.len));
+        } else {
+            pairs[k] = x.None;
+        }
+        k = k + 2;
+    }
+    transfer.bytes_free(&b);
+    xlib.XChangeProperty(d, rq.requestor, prop, s.at.atom_pair, 32, x.PropModeReplace, cast(*u8, &pairs[0]), cast(i32, n));
+    _notify(d, rq, prop);
+}
+
+// What CLIPBOARD offers handed to the desktop's clipboard manager before win
+// goes, as ICCCM's clipboard manager protocol has it: when win owns
+// CLIPBOARD and a manager owns CLIPBOARD_MANAGER, SAVE_TARGETS asked of it
+// with the targets to keep, and every request of its for them answered here
+// until it says it has them or SAVE_MS pass. 1 when the manager took them, 0
+// when there was nothing to give or no one to take it.
+fn save_to_manager(s as *Selection, d as *u8, win as i64) as i32 {
+    if (s.owned[CLIPBOARD] == 0 || xlib.XGetSelectionOwner(d, s.at.clipboard) != win) { return 0; }
+    if (xlib.XGetSelectionOwner(d, s.at.manager) == x.None) { return 0; }
+    let is [24]i64 as t;
+    let is i32 as n = _targets(s, CLIPBOARD, &t[0]);
+    // TARGETS itself not among what is kept.
+    xlib.XChangeProperty(d, win, s.at.save_prop, s.at.atom, 32, x.PropModeReplace, cast(*u8, &t[1]), n - 1);
+    xlib.XConvertSelection(d, s.at.manager, s.at.save_targets, s.at.save_prop, win, x.CurrentTime);
+    xlib.XFlush(d);
+    // Only the selections' events taken off the queue — the connection is
+    // every window's, and the rest is theirs, left for their pump.
+    let is i64 as until = time.now_ms() + SAVE_MS;
+    let is xev.XEvent as e;
+    while (time.now_ms() < until) {
+        let is i32 as any with mut = 0;
+        while (xlib.XCheckTypedEvent(d, x.SelectionRequest, cast(*u8, &e)) != 0) {
+            _serve(s, d, xev.selection_request(&e));
+            any = 1;
+        }
+        // An INCR answer under way: its requestor deleting the property.
+        while (xlib.XCheckTypedEvent(d, x.PropertyNotify, cast(*u8, &e)) != 0) {
+            if (foreign(s, d, &e) == 0) { xlib.XPutBackEvent(d, cast(*u8, &e)); break; }
+            any = 1;
+        }
+        while (xlib.XCheckTypedWindowEvent(d, win, x.SelectionNotify, cast(*u8, &e)) != 0) {
+            let is *xev.XSelectionEvent as sn = xev.selection(&e);
+            if (sn.selection == s.at.manager && sn.target == s.at.save_targets) {
+                xlib.XDeleteProperty(d, win, s.at.save_prop);
+                return cast(i32, sn.property != x.None);
+            }
+        }
+        if (any == 0) { time.sleep_ms(5); }
+        xlib.XFlush(d);
+    }
+    xlib.XDeleteProperty(d, win, s.at.save_prop);
+    return 0;
 }
 
 // A free outgoing slot — or, all busy, the one waiting longest, ended.
@@ -409,7 +553,8 @@ fn foreign(s as *Selection, d as *u8, e as *xev.XEvent) as i32 {
 }
 
 // Feeds one event of win's. 1 when it was the selections' and the program is
-// not to see it; 2 when a DROP answer just came (dnd.cst finishes the drop).
+// not to see it; 2 when a DROP answer just came (dnd.cst finishes the drop);
+// 3 when a WATCH answer came (the program is told the selection changed).
 fn answer(s as *Selection, d as *u8, win as i64, e as *xev.XEvent) as i32 {
     let is i32 as ty = xev.kind(e);
 
@@ -430,6 +575,8 @@ fn answer(s as *Selection, d as *u8, win as i64, e as *xev.XEvent) as i32 {
         let is i32 as slot with mut = 0 - 1;
         if (sn.property == s.at.paste_prop || (sn.property == x.None && s.in[PASTE].state == _WAITING && sn.target == s.in[PASTE].target)) { slot = PASTE; }
         if (sn.property == s.at.drop_prop || (sn.property == x.None && s.in[DROP].state == _WAITING && sn.target == s.in[DROP].target)) { slot = DROP; }
+        if (sn.property == s.at.watch_prop || (sn.property == x.None && s.in[WATCH].state == _WAITING && sn.target == s.in[WATCH].target &&
+                                               sn.selection == _current_selection[WATCH])) { slot = WATCH; }
         if (slot < 0) { return 0; }
         let is *Incoming as in = &s.in[slot];
         if (in.state != _WAITING || sn.target != in.target) { return 1; }   // an answer to an older question
@@ -447,6 +594,7 @@ fn answer(s as *Selection, d as *u8, win as i64, e as *xev.XEvent) as i32 {
         let is i32 as slot with mut = 0 - 1;
         if (pe.atom == s.at.paste_prop) { slot = PASTE; }
         if (pe.atom == s.at.drop_prop) { slot = DROP; }
+        if (pe.atom == s.at.watch_prop) { slot = WATCH; }
         if (slot < 0 || s.in[slot].state != _INCR) { return 0; }
         return _chunk(s, d, win, slot);
     }
@@ -455,11 +603,13 @@ fn answer(s as *Selection, d as *u8, win as i64, e as *xev.XEvent) as i32 {
 
 fn _finished(slot as i32) as i32 {
     if (slot == DROP) { return 2; }
+    if (slot == WATCH) { return 3; }
     return 1;
 }
 
 fn _prop_of(s as *Selection, slot as i32) as i64 {
     if (slot == DROP) { return s.at.drop_prop; }
+    if (slot == WATCH) { return s.at.watch_prop; }
     return s.at.paste_prop;
 }
 
@@ -481,7 +631,7 @@ fn _fallback(s as *Selection, d as *u8, win as i64, slot as i32) as i32 {
     if (in.probing == 1) {
         in.probing = 0;
         if (in.format == 0) { return 0; }
-        _ask(s, d, win, slot, _blind(s, in.format));
+        _ask(s, d, win, slot, _blind(s, slot, in.format));
         return 1;
     }
     if (in.format != transfer.TEXT) { return 0; }
@@ -493,7 +643,8 @@ fn _fallback(s as *Selection, d as *u8, win as i64, slot as i32) as i32 {
 }
 
 // The target a format is asked for by without knowing the owner's.
-fn _blind(s as *Selection, format as i32) as i64 {
+fn _blind(s as *Selection, slot as i32, format as i32) as i64 {
+    if (format == transfer.NAMED) { return s.in[slot].named; }
     if (format == transfer.PNG) { return s.at.png; }
     if (format == transfer.FILES) { return s.at.uri_list; }
     return s.at.utf8_string;
@@ -588,19 +739,38 @@ fn _arrived(s as *Selection, d as *u8, win as i64, slot as i32, ptype as i64) as
     let is *Incoming as in = &s.in[slot];
     if (in.format == 0 || in.probing == 1) {
         in.offered = 0;
+        transfer.names_clear(&in.names);
         let is i64 as text with mut = 0;   // the best text target offered
         let is i32 as rank with mut = 9;
+        let is i32 as has_named with mut = 0;
         let is i64 as k with mut = 0;
         while (k + 8 <= in.data.len) {
             let is i64 as t = *cast(*i64, cast(i64, in.data.data) + k);
-            if (t == s.at.png) { in.offered = in.offered | transfer.PNG; }
-            if (t == s.at.uri_list) { in.offered = in.offered | transfer.FILES; }
             let is i32 as r = _text_rank(s, t);
-            if (r < 9) { in.offered = in.offered | transfer.TEXT; }
+            if (t == s.at.png) { in.offered = in.offered | transfer.PNG; }
+            else if (t == s.at.uri_list) { in.offered = in.offered | transfer.FILES; }
+            else if (r < 9) { in.offered = in.offered | transfer.TEXT; }
+            else if (t != s.at.targets && t != s.at.multiple && t != s.at.text && t != 0 && in.format == 0) {
+                // Another by its name: asked of the server, which keeps them.
+                let is *u8 as nm = xlib.XGetAtomName(d, t);
+                if (cast(i64, nm) != 0) {
+                    let is i64 as nn with mut = 0;
+                    while (nm[nn] != 0) { nn = nn + 1; }
+                    if (transfer.names_add(&in.names, nm, nn) == 1) { in.offered = in.offered | transfer.NAMED; }
+                    xlib.XFree(nm);
+                }
+            }
+            if (in.format == transfer.NAMED && t == in.named) { has_named = 1; }
             if (r < rank) { rank = r; text = t; }
             k = k + 8;
         }
         transfer.bytes_clear(&in.data);
+        if (in.format == transfer.NAMED) {
+            if (has_named == 0) { _done(in, 0); return 1; }
+            in.probing = 0;
+            _ask(s, d, win, slot, in.named);
+            return 0;
+        }
         if (in.format == 0 || (in.offered & in.format) == 0) { _done(in, 0); return 1; }
         in.probing = 0;
         let is i64 as target with mut = text;
@@ -642,6 +812,37 @@ fn _text_rank(s as *Selection, t as i64) as i32 {
 
 // --- Asking ---
 
+// Which selection a slot last asked: CLIPBOARD or PRIMARY (or XDND).
+fn asked_of(s as *Selection, slot as i32) as i32 { return _which(s, _current_selection[slot]); }
+
+// The same as request for the format named name (n bytes): its atom asked
+// for, known or looked for among the owner's TARGETS first.
+fn request_named(s as *Selection, d as *u8, win as i64, slot as i32, which as i32, name as *u8, n as i64, known as i64,
+                 time_ms as i64) as i32 {
+    if (slot < 0 || slot > 1 || which < 0 || which > 2 || n <= 0 || n > transfer.MAX_NAME) { return 0; }
+    let is [128]u8 as z;
+    mem.memcpy(&z[0], name, n);
+    z[n] = 0;
+    let is *Incoming as in = &s.in[slot];
+    in.named = xlib.XInternAtom(d, &z[0], 0);
+    let is i64 as target with mut = s.at.targets;
+    in.probing = 1;
+    if (known != 0) { target = known; in.probing = 0; }
+    xlib.XDeleteProperty(d, win, _prop_of(s, slot));
+    transfer.bytes_clear(&in.data);
+    in.state = _WAITING;
+    in.format = transfer.NAMED;
+    in.target = target;
+    in.fallback = 0;
+    in.got = 0;
+    in.offered = 0;
+    in.last_ms = time.now_ms();
+    _current_selection[slot] = _sel_atom(s, which);
+    xlib.XConvertSelection(d, _sel_atom(s, which), target, _prop_of(s, slot), win, time_ms);
+    xlib.XFlush(d);
+    return 1;
+}
+
 // The selection which (CLIPBOARD, PRIMARY, XDND) asked for as format —
 // transfer.TEXT, PNG, FILES, or 0 for which formats it offers — into slot,
 // at time (CurrentTime, or the drop's). known: the target to ask by, when the
@@ -649,7 +850,7 @@ fn _text_rank(s as *Selection, t as i64) as i32 {
 // for the best among its TARGETS first. Whatever slot was waiting for is
 // forgotten. 1 when asked.
 fn request(s as *Selection, d as *u8, win as i64, slot as i32, which as i32, format as i32, known as i64, time_ms as i64) as i32 {
-    if (slot < 0 || slot > 1 || which < 0 || which > 2) { return 0; }
+    if (slot < 0 || slot > 2 || which < 0 || which > 2) { return 0; }
     if (format != 0 && format != transfer.TEXT && format != transfer.PNG && format != transfer.FILES) { return 0; }
     let is *Incoming as in = &s.in[slot];
     let is i64 as target with mut = s.at.targets;
@@ -692,11 +893,11 @@ fn tick(s as *Selection, d as *u8) as void {
 fn due(s as *Selection) as i64 {
     let is i64 as best with mut = 0 - 1;
     let is i32 as k with mut = 0;
-    while (k < 2 + MAX_OUT) {
+    while (k < 3 + MAX_OUT) {
         let is i64 as since with mut = 0 - 1;
-        if (k < 2) {
+        if (k < 3) {
             if (s.in[k].state == _WAITING || s.in[k].state == _INCR) { since = s.in[k].last_ms; }
-        } else if (s.out[k - 2].active == 1) { since = s.out[k - 2].last_ms; }
+        } else if (s.out[k - 3].active == 1) { since = s.out[k - 3].last_ms; }
         if (since >= 0) {
             let is i64 as left with mut = TIMEOUT_MS + 1 - (time.now_ms() - since);
             if (left < 0) { left = 0; }
@@ -740,6 +941,9 @@ fn offered(s as *Selection, slot as i32) as i32 {
     if (s.in[slot].state != _READY) { return 0; }
     return s.in[slot].offered;
 }
+
+// And the names of those beyond the three (NAMED in offered).
+fn offered_names(s as *Selection, slot as i32) as *transfer.Names { return &s.in[slot].names; }
 
 // The slot's answer, once read, let go: idle again.
 fn forget(s as *Selection, slot as i32) as void {

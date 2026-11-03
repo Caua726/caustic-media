@@ -944,6 +944,10 @@ fn close(w as *Window) as void {
     text.close(&w.txt);
     dnd.close(&w.drop, w.display);
     framesync.close(&w.fsync, w.display);
+    // What it put on the clipboard outlives it: kept by the desktop's
+    // clipboard manager, when there is one, before the selection dies with
+    // the window.
+    clipboard.save_to_manager(&w.clip, w.display, w.xid);
     clipboard.close(&w.clip, w.display);
     surface.close(&w.back, w.display);
     if (cast(i64, w.ring) != 0) {
@@ -1053,6 +1057,7 @@ fn _display_release() as void {
         // Followed on that connection only: the next one is followed anew.
         _cm_event = 0;
         _cm_selection = 0;
+        _clip_event = 0;
         // The input method is the connection's: closed with it.
         text.close_display(_display);
         xlib.XCloseDisplay(_display);
@@ -1386,6 +1391,17 @@ fn _deliver(w as *Window, e as *xev.XEvent) as void {
         if (surface.complete(&w.back, e) == 1) { return; }
         let is i32 as selected = clipboard.answer(&w.clip, w.display, w.xid, e);
         if (selected == 2 && dnd.landed(&w.drop, &w.clip, w.display, w.xid, &_dnd_note) == 2) { _ring_push(w, &_dnd_note); }
+        if (selected == 3 && clipboard.ready(&w.clip, clipboard.WATCH) == 1) {
+            let is xev.XEvent as cn;
+            xev.clear(&cn);
+            let is *xev.XClientMessageEvent as c = xev.client(&cn);
+            c.kind = events.CLIPBOARD_NOTE;
+            c.data[0] = 0;
+            if (clipboard.asked_of(&w.clip, clipboard.WATCH) == clipboard.PRIMARY) { c.data[0] = 1; }
+            c.data[1] = cast(i64, clipboard.offered(&w.clip, clipboard.WATCH));
+            clipboard.forget(&w.clip, clipboard.WATCH);
+            _ring_push(w, &cn);
+        }
         if (selected != 0) { return; }
 
         // 6. Queue it. WM_DELETE_WINDOW is folded above AND pushed here,
@@ -1436,6 +1452,32 @@ fn follow_compositor(event_type as i32, selection as i64) as void {
 // Whether the connection's compositing manager is followed already.
 fn following_compositor() as i32 { return cast(i32, _cm_event != 0); }
 
+// The clipboard and the primary selection changing hands, as XFixes reports
+// it once clipwatch.cst asked: the event type and the two selections' atoms.
+// Each change has what the selection now offers asked for (clipboard.cst's
+// WATCH), and its answer becomes a CLIPBOARD_CHANGED for the window pumping.
+let is i32 as _clip_event with mut = 0;
+let is i64 as _clip_clipboard with mut = 0;
+let is i64 as _clip_primary with mut = 0;
+
+fn follow_clipboard(event_type as i32, clipboard_atom as i64, primary_atom as i64) as void {
+    _clip_event = event_type;
+    _clip_clipboard = clipboard_atom;
+    _clip_primary = primary_atom;
+}
+
+fn following_clipboard() as i32 { return cast(i32, _clip_event != 0); }
+
+// Which selection an XFixesSelectionNotify is about: 0 the clipboard, 1 the
+// primary, -1 neither (or not one).
+fn _clip_changed(e as *xev.XEvent) as i32 {
+    if (_clip_event == 0 || xev.kind(e) != _clip_event) { return 0 - 1; }
+    let is i64 as sel = *cast(*i64, cast(i64, e) + 56);
+    if (sel == _clip_clipboard) { return 0; }
+    if (sel == _clip_primary) { return 1; }
+    return 0 - 1;
+}
+
 // XFixesSelectionNotifyEvent's selection, after type, serial, send_event,
 // display, window, subtype and owner.
 fn _cm_changed(e as *xev.XEvent) as i32 {
@@ -1466,6 +1508,13 @@ fn _pump(w as *Window, block as i32) as void {
             xev.clear(&cm);
             xev.any(&cm).kind = events.COMPOSITOR_NOTE;
             _ring_push(w, &cm);
+            continue;
+        }
+        // The clipboard or the primary changing hands: what it offers asked
+        // for, the answer the program's note.
+        let is i32 as clip_which = _clip_changed(&_scratch);
+        if (clip_which >= 0) {
+            clipboard.request(&w.clip, w.display, w.xid, clipboard.WATCH, clip_which, 0, 0, x.CurrentTime);
             continue;
         }
 
@@ -1957,6 +2006,14 @@ fn selection_data(w as *Window) as *u8 { return clipboard.data(&w.clip, clipboar
 fn selection_length(w as *Window) as i64 { return clipboard.length(&w.clip, clipboard.PASTE); }
 // The formats offered, when what was asked was which (format 0).
 fn selection_offered(w as *Window) as i32 { return clipboard.offered(&w.clip, clipboard.PASTE); }
+// The format named name (n bytes) asked for: selection_format NAMED once it
+// came, 0 when it was not offered.
+fn selection_request_named(w as *Window, which as i32, name as *u8, n as i64) as i32 {
+    if (w.ok == 0 || (which != clipboard.CLIPBOARD && which != clipboard.PRIMARY)) { return 0; }
+    return clipboard.request_named(&w.clip, w.display, w.xid, clipboard.PASTE, which, name, n, 0, x.CurrentTime);
+}
+// The names of the formats offered beyond the three, when format 0 was asked.
+fn selection_offered_names(w as *Window) as *transfer.Names { return clipboard.offered_names(&w.clip, clipboard.PASTE); }
 
 // --- Window state, through the window manager ---
 //
@@ -2237,11 +2294,28 @@ fn drop_answer(w as *Window, takes as i32, action as i32) as i32 {
     return dnd.answer(&w.drop, w.display, w.xid, takes, action);
 }
 fn drop_offered(w as *Window) as i32 { return dnd.offered(&w.drop); }
+// The format named name (n bytes) taken alone, as drop_answer takes; the
+// names beyond the three the drag offers; a PNG's or a named format's bytes
+// dropped, and that format's name.
+fn drop_answer_named(w as *Window, name as *u8, n as i64, action as i32) as i32 {
+    if (w.ok == 0) { return 0; }
+    return dnd.answer_named(&w.drop, w.display, w.xid, name, n, action);
+}
+fn drop_offered_names(w as *Window) as *transfer.Names { return dnd.offered_names(&w.drop); }
+fn dropped_data(w as *Window) as *u8 { return dnd.data(&w.drop); }
+fn dropped_data_length(w as *Window) as i64 { return dnd.data_length(&w.drop); }
+fn dropped_name(w as *Window) as *u8 { return dnd.data_name(&w.drop); }
 fn dropped_file(w as *Window, i as i64) as *u8 { return dnd.path_at(&w.drop, i); }
 fn clear_drop(w as *Window) as void { dnd.clear(&w.drop); }
 fn dragging(w as *Window) as i32 { return dnd.dragging(&w.drop); }
 fn drag_x(w as *Window) as i64 { return dnd.pointer_x(&w.drop); }
 fn drag_y(w as *Window) as i64 { return dnd.pointer_y(&w.drop); }
+
+// The image the next drag carries under the pointer (dnd.set_image).
+fn drag_set_image(w as *Window, argb as *u8, iw as i64, ih as i64, hx as i64, hy as i64) as i32 {
+    if (w.ok == 0) { return 0; }
+    return dnd.set_image(&w.drop, argb, iw, ih, hx, hy);
+}
 
 // A drag out of the window of what o offers, the actions allowed
 // (transfer.COPY, MOVE), begun while a button is held: 1 when it began. Its

@@ -12,7 +12,8 @@
 //                 it came, with the action done
 //   XdndLeave     it did not
 //
-// Accepted: files (text/uri-list, the paths decoded) and text (UTF-8). The
+// Accepted: files (text/uri-list, the paths decoded), text (UTF-8), a PNG and
+// any format by its name (the atom's: text/html, a program's own). The
 // program hears the drag as notes queued with the window's events (DND_*:
 // what is offered and the actions allowed; where the pointer is; what came
 // and the action done) and answers what it takes there and how — answer();
@@ -29,12 +30,21 @@
 // target asks for the data and says XdndFinished; letting go anywhere else,
 // or Escape, cancels. The program hears DRAG_DONE with the action done, 0
 // for none. A target that never finishes is given up after FINISH_MS.
+//
+// An image given for the drag (set_image) rides under the pointer: an
+// override-redirect window of its own, with alpha where the server has a
+// visual for it, cut by the Shape extension to what the image covers where
+// no compositor shows alpha, taking no input; the target under the pointer
+// is looked for under it.
 use "std/mem.cst" as mem;
 use "std/time.cst" as time;
 use "bind/x.cst" as x;
 use "bind/xlib.cst" as xlib;
 use "bind/xevent.cst" as xev;
 use "clipboard.cst" as clipboard;
+use "frame.cst" as frame;
+use "bind/xutil.cst" as xutil;
+use "bind/xshape.cst" as xshape;
 use "../transfer.cst" as transfer;
 
 let is i64 as XDND_VERSION with imut = 5;
@@ -43,6 +53,8 @@ let is i64 as FINISH_MS with imut = 10000;
 // What a drag offers, what a program takes, what arrived: transfer's bits.
 let is i32 as FILES with imut = 1;
 let is i32 as TEXT  with imut = 2;
+let is i32 as PNG   with imut = 4;
+let is i32 as NAMED with imut = 8;
 
 // The notes handle fills in, as events.cst's DND_* kinds and DRAG_DONE.
 let is i64 as _ENTER with imut = 17;
@@ -93,12 +105,16 @@ struct State {
     suggested  as i32;   // the action the last XdndPosition suggested
     accepted   as i32;   // the action the last XdndStatus said; 0 refused
     dropped    as i32;   // a drop happened and the data has arrived
-    want       as i32;   // FILES or TEXT: asked for at the drop
+    want       as i32;   // FILES, TEXT, PNG or NAMED: asked for at the drop
     x          as i64;   // where the pointer was, window coordinates
     y          as i64;
     count      as i64;   // files in the last drop
     paths      as transfer.Bytes;
     text       as transfer.Bytes;
+    data       as transfer.Bytes;   // a PNG's or a named format's, the last drop's
+    names      as transfer.Names;   // the formats beyond the three it offers, by name
+    taken_name as [128]u8;          // NAMED: the one the program takes
+    taken_n    as i64;
 
     // --- Source ---
     out_state   as i32;
@@ -116,9 +132,18 @@ struct State {
     out_mods    as u32;
     out_time    as i64;
     out_since   as i64;  // when the drop was sent, ms
-    out_types   as [8]i64;
+    out_types   as [16]i64;
     out_ntypes  as i32;
     xid         as i64;
+
+    // --- The image under the pointer ---
+    image       as *u8;  // a copy, 0xAARRGGBB a pixel; null for none
+    image_w     as i64;
+    image_h     as i64;
+    image_hx    as i64;  // the pointer's place in it
+    image_hy    as i64;
+    icon        as i64;  // its window while a drag runs, 0 for none
+    icon_map    as i64;  // that window's colormap, 0 for the screen's
 }
 
 // Advertises the window as a drop target. Without the XdndAware property no
@@ -127,6 +152,8 @@ fn init(st as *State, d as *u8, xid as i64) as void {
     mem.memzero(cast(*u8, st), sizeof(State));
     transfer.bytes_init(&st.paths);
     transfer.bytes_init(&st.text);
+    transfer.bytes_init(&st.data);
+    transfer.names_init(&st.names);
     st.root = xlib.XDefaultRootWindow(d);
     st.xid = xid;
     st.a_aware       = xlib.XInternAtom(d, "XdndAware", 0);
@@ -157,6 +184,8 @@ fn close(st as *State, d as *u8) as void {
     if (st.out_state != _OFF) { _source_end(st, d); }
     transfer.bytes_free(&st.paths);
     transfer.bytes_free(&st.text);
+    transfer.bytes_free(&st.data);
+    transfer.names_free(&st.names);
     st.ready = 0;
 }
 
@@ -188,11 +217,30 @@ fn text_length(st as *State) as i64 {
     return st.text.len;
 }
 
-// What the drag over the window offers, FILES and TEXT bits; 0 for none.
+// What the drag over the window offers, FILES, TEXT, PNG and NAMED bits; 0
+// for none.
 fn offered(st as *State) as i32 {
     if (st.source == 0) { return 0; }
     return st.offered;
 }
+
+// The names of the formats beyond the three it offers (NAMED in offered).
+fn offered_names(st as *State) as *transfer.Names { return &st.names; }
+
+// A PNG's or a named format's bytes, the last drop's (DND_DROP's drop PNG or
+// NAMED), data_length of them; null for none.
+fn data(st as *State) as *u8 {
+    if (st.dropped == 0 || st.data.len == 0) { return cast(*u8, 0); }
+    return st.data.data;
+}
+
+fn data_length(st as *State) as i64 {
+    if (st.dropped == 0) { return 0; }
+    return st.data.len;
+}
+
+// The name of the format the last drop's data is, when NAMED.
+fn data_name(st as *State) as *u8 { return &st.taken_name[0]; }
 
 // Clears the last drop, so a program can tell one from the next.
 fn clear(st as *State) as void {
@@ -200,6 +248,7 @@ fn clear(st as *State) as void {
     st.count = 0;
     transfer.bytes_clear(&st.paths);
     transfer.bytes_clear(&st.text);
+    transfer.bytes_clear(&st.data);
 }
 
 fn _action_bit(st as *State, atom as i64) as i32 {
@@ -219,7 +268,23 @@ fn _action_atom(st as *State, bit as i32) as i64 {
 // source's suggestion. Told the source at once. 1 when a drag is there.
 fn answer(st as *State, d as *u8, xid as i64, takes as i32, action as i32) as i32 {
     if (st.ready == 0 || st.source == 0) { return 0; }
-    st.answer = takes;
+    st.answer = takes & (FILES | TEXT | PNG);
+    st.action = action;
+    _status(st, d, xid);
+    return 1;
+}
+
+// The same for the format named name (n bytes) alone: taken when it is
+// offered. 1 when a drag is there.
+fn answer_named(st as *State, d as *u8, xid as i64, name as *u8, n as i64, action as i32) as i32 {
+    if (st.ready == 0 || st.source == 0 || n <= 0 || n > transfer.MAX_NAME) { return 0; }
+    st.answer = 0;
+    if (transfer.names_has(&st.names, name, n) == 1) {
+        st.answer = NAMED;
+        mem.memcpy(&st.taken_name[0], name, n);
+        st.taken_name[n] = 0;
+        st.taken_n = n;
+    }
     st.action = action;
     _status(st, d, xid);
     return 1;
@@ -297,10 +362,12 @@ fn _atoms(d as *u8, w as i64, prop as i64, out as *i64, max as i64) as i64 {
     return k;
 }
 
-// One type the source offers, folded into what it offers.
-fn _take_type(st as *State, t as i64) as void {
+// One type the source offers, folded into what it offers: any but the three
+// by its name, asked of the server.
+fn _take_type(st as *State, d as *u8, t as i64) as void {
     if (t == 0) { return; }
-    if (t == st.a_uri_list) { st.offered = st.offered | FILES; }
+    if (t == st.a_uri_list) { st.offered = st.offered | FILES; return; }
+    if (t == st.a_png) { st.offered = st.offered | PNG; return; }
     let is i32 as rank with mut = 9;
     if (t == st.a_utf8) { rank = 0; }
     if (t == st.a_text_utf8) { rank = 1; }
@@ -308,7 +375,16 @@ fn _take_type(st as *State, t as i64) as void {
     if (rank < 9) {
         st.offered = st.offered | TEXT;
         if (rank < st.text_rank) { st.text_rank = rank; st.text_type = t; }
+        return;
     }
+    let is *u8 as nm = xlib.XGetAtomName(d, t);
+    if (cast(i64, nm) == 0) { return; }
+    let is i64 as nn with mut = 0;
+    while (nm[nn] != 0) { nn = nn + 1; }
+    // TEXT and STRING are text's older names, not formats of their own.
+    if (transfer._named_is(nm, "STRING", 6) == 0 && transfer._named_is(nm, "TEXT", 4) == 0 &&
+        transfer.names_add(&st.names, nm, nn) == 1) { st.offered = st.offered | NAMED; }
+    xlib.XFree(nm);
 }
 
 // What the source offers. Up to three types ride in the XdndEnter message
@@ -317,16 +393,17 @@ fn _offers(st as *State, d as *u8, source as i64, c as *xev.XClientMessageEvent)
     st.offered = 0;
     st.text_rank = 9;
     st.text_type = 0;
+    transfer.names_clear(&st.names);
     if ((c.data[1] & 1) == 0) {
-        _take_type(st, c.data[2]);
-        _take_type(st, c.data[3]);
-        _take_type(st, c.data[4]);
+        _take_type(st, d, c.data[2]);
+        _take_type(st, d, c.data[3]);
+        _take_type(st, d, c.data[4]);
         return;
     }
     let is [64]i64 as t;
     let is i64 as n = _atoms(d, source, st.a_type_list, &t[0], 64);
     let is i64 as i with mut = 0;
-    while (i < n) { _take_type(st, t[i]); i = i + 1; }
+    while (i < n) { _take_type(st, d, t[i]); i = i + 1; }
 }
 
 // The actions the source allows: its XdndActionList, when it has one.
@@ -377,8 +454,9 @@ fn handle(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, e as 
         _offers(st, d, st.source, c);
         st.actions = _source_actions(st, d, st.source) | transfer.COPY;
         st.suggested = 0;
-        // Until the program says otherwise, everything it offers is taken.
-        st.answer = st.offered;
+        // Until the program says otherwise, everything it offers of the
+        // files and text is taken.
+        st.answer = st.offered & (FILES | TEXT);
         st.action = 0;
         clear(st);
         _note(note, _ENTER, st.x, st.y, cast(i64, st.offered), cast(i64, st.actions));
@@ -415,13 +493,23 @@ fn handle(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, e as 
             return 2;
         }
         // The data does not come with the message: asked for, it arrives
-        // later — landed() finishes the drop. Files when they are taken.
+        // later — landed() finishes the drop. Files when they are taken, then
+        // the named format taken, a PNG, text.
         st.want = TEXT;
         let is i64 as target with mut = st.text_type;
         if ((takes & FILES) != 0) { st.want = FILES; target = st.a_uri_list; }
+        else if ((takes & NAMED) != 0) { st.want = NAMED; }
+        else if ((takes & PNG) != 0) { st.want = PNG; target = st.a_png; }
         let is i64 as when with mut = x.CurrentTime;
         if (st.version >= 1) { when = c.data[2]; }
-        if (clipboard.request(sel, d, xid, clipboard.DROP, clipboard.XDND, st.want, target, when) == 0) {
+        let is i32 as asked with mut = 0;
+        if (st.want == NAMED) {
+            asked = clipboard.request_named(sel, d, xid, clipboard.DROP, clipboard.XDND, &st.taken_name[0], st.taken_n,
+                                            xlib.XInternAtom(d, &st.taken_name[0], 0), when);
+        } else {
+            asked = clipboard.request(sel, d, xid, clipboard.DROP, clipboard.XDND, st.want, target, when);
+        }
+        if (asked == 0) {
             _send(d, st.source, st.source, st.a_finished, xid, 0, 0, 0, 0);
             st.source = 0;
             _note(note, _LEAVE, st.x, st.y, 0, 0);
@@ -453,6 +541,8 @@ fn landed(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, note 
         if (st.count > 0) { st.dropped = 1; }
     } else if (got == transfer.TEXT) {
         if (transfer.bytes_set(&st.text, data, n) == 1) { st.dropped = 1; }
+    } else if (got == transfer.PNG || got == transfer.NAMED) {
+        if (transfer.bytes_set(&st.data, data, n) == 1) { st.dropped = 1; }
     }
     clipboard.forget(sel, clipboard.DROP);
     let is i32 as action = st.accepted;
@@ -494,6 +584,12 @@ fn begin(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, o as *
         st.out_types[st.out_ntypes] = st.a_text; st.out_ntypes = st.out_ntypes + 1;
     }
     if ((o.formats & transfer.PNG) != 0) { st.out_types[st.out_ntypes] = st.a_png; st.out_ntypes = st.out_ntypes + 1; }
+    let is i64 as nk with mut = 0;
+    while (nk < o.named_n && st.out_ntypes < 16) {
+        st.out_types[st.out_ntypes] = xlib.XInternAtom(d, transfer.named_name(o, nk), 0);
+        st.out_ntypes = st.out_ntypes + 1;
+        nk = nk + 1;
+    }
     xlib.XChangeProperty(d, xid, st.a_type_list, st.a_atom, 32, x.PropModeReplace, cast(*u8, &st.out_types[0]), st.out_ntypes);
     // The actions allowed, for a target that asks.
     let is [2]i64 as acts;
@@ -501,6 +597,19 @@ fn begin(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, o as *
     if ((actions & transfer.COPY) != 0) { acts[na] = st.a_copy; na = na + 1; }
     if ((actions & transfer.MOVE) != 0) { acts[na] = st.a_move; na = na + 1; }
     xlib.XChangeProperty(d, xid, st.a_action_list, st.a_atom, 32, x.PropModeReplace, cast(*u8, &acts[0]), na);
+    // The image under the pointer, where the pointer is now.
+    if (cast(i64, st.image) != 0) {
+        let is i64 as root_back with mut = 0;
+        let is i64 as child_back with mut = 0;
+        let is i32 as prx with mut = 0;
+        let is i32 as pry with mut = 0;
+        let is i32 as wxp with mut = 0;
+        let is i32 as wyp with mut = 0;
+        let is u32 as mk with mut = 0;
+        xlib.XQueryPointer(d, st.root, cast(*u8, &root_back), cast(*u8, &child_back), cast(*u8, &prx), cast(*u8, &pry),
+                           cast(*u8, &wxp), cast(*u8, &wyp), cast(*u8, &mk));
+        st.icon = _icon_open(st, d, cast(i64, prx), cast(i64, pry));
+    }
     xlib.XFlush(d);
     st.out_state = _DRAGGING;
     st.out_actions = actions;
@@ -517,6 +626,137 @@ fn begin(st as *State, sel as *clipboard.Selection, d as *u8, xid as i64, o as *
 
 fn source_active(st as *State) as i32 { return cast(i32, st.out_state != _OFF); }
 
+// The image the next drag carries under the pointer: argb, iw by ih,
+// 0xAARRGGBB a pixel, copied; the pointer at hx, hy of it. Null for none.
+fn set_image(st as *State, argb as *u8, iw as i64, ih as i64, hx as i64, hy as i64) as i32 {
+    if (cast(i64, st.image) != 0) { mem.core.munmap(st.image, st.image_w * st.image_h * 4); st.image = cast(*u8, 0); }
+    if (cast(i64, argb) == 0 || iw <= 0 || ih <= 0 || iw > 1024 || ih > 1024) { return cast(i32, cast(i64, argb) == 0); }
+    let is *u8 as copy = mem.core.mmap_anon(iw * ih * 4);
+    if (cast(i64, copy) == 0) { return 0; }
+    mem.memcpy(copy, argb, iw * ih * 4);
+    st.image = copy; st.image_w = iw; st.image_h = ih; st.image_hx = hx; st.image_hy = hy;
+    return 1;
+}
+
+let is xutil.XVisualInfo as _icon_vinfo;
+
+// The image's window, under the pointer at root x, y: alpha where a 32-bit
+// visual is, premultiplied as a compositor takes it; cut to the image where
+// no compositor runs; no input anywhere. 0 when it could not be made.
+fn _icon_open(st as *State, d as *u8, rx as i64, ry as i64) as i64 {
+    if (cast(i64, st.image) == 0) { return 0; }
+    let is i32 as scr = xlib.XDefaultScreen(d);
+    let is i64 as iw = st.image_w;
+    let is i64 as ih = st.image_h;
+    let is xlib.XSetWindowAttributes as at;
+    at.override_redirect = 1;
+    at.border_pixel = 0;
+    at.background_pixel = 0;
+    let is *u8 as visual with mut = xlib.XDefaultVisual(d, scr);
+    let is u32 as depth with mut = cast(u32, xlib.XDefaultDepth(d, scr));
+    let is i64 as mask with mut = x.CWOverrideRedirect | x.CWBorderPixel | x.CWBackPixel;
+    st.icon_map = 0;
+    if (xutil.XMatchVisualInfo(d, scr, 32, x.TrueColor, cast(*u8, &_icon_vinfo)) != 0) {
+        visual = _icon_vinfo.visual;
+        depth = cast(u32, 32);
+        st.icon_map = xlib.XCreateColormap(d, st.root, visual, x.AllocNone);
+        at.colormap = st.icon_map;
+        mask = mask | x.CWColormap;
+    }
+    let is i64 as win = xlib.XCreateWindow(d, st.root, cast(i32, rx - st.image_hx), cast(i32, ry - st.image_hy),
+                                           cast(u32, iw), cast(u32, ih), 0, cast(i32, depth), cast(u32, x.InputOutput),
+                                           visual, mask, cast(*u8, &at));
+    if (win == 0) { return 0; }
+    // The pointer passes through it.
+    frame.set_input_region(d, win, 0, 0, 0, 0);
+    // Where nothing shows alpha, only what the image covers: its rows' runs
+    // of pixels more than half opaque.
+    let is i32 as alpha = cast(i32, depth == cast(u32, 32) && frame.composited(d, scr) == 1);
+    if (alpha == 0) {
+        let is *xlib.XRectangle as rects = cast(*xlib.XRectangle, mem.core.mmap_anon(iw * ih * 8));
+        let is i32 as nr with mut = 0;
+        let is i64 as y with mut = 0;
+        while (y < ih) {
+            let is i64 as x0 with mut = 0 - 1;
+            let is i64 as xx with mut = 0;
+            while (xx <= iw) {
+                let is i32 as on with mut = 0;
+                if (xx < iw) { on = cast(i32, ((*cast(*u32, cast(i64, st.image) + (y * iw + xx) * 4) >> 24) & 255) > cast(u32, 127)); }
+                if (on == 1 && x0 < 0) { x0 = xx; }
+                if (on == 0 && x0 >= 0) {
+                    let is *xlib.XRectangle as r = cast(*xlib.XRectangle, cast(i64, rects) + cast(i64, nr) * 8);
+                    r.x = cast(i16, x0); r.y = cast(i16, y); r.width = cast(u16, xx - x0); r.height = cast(u16, 1);
+                    nr = nr + 1;
+                    x0 = 0 - 1;
+                }
+                xx = xx + 1;
+            }
+            y = y + 1;
+        }
+        xshape.XShapeCombineRectangles(d, win, xshape.ShapeBounding, 0, 0, cast(*u8, rects), nr, xshape.ShapeSet, 0);
+        mem.core.munmap(cast(*u8, rects), iw * ih * 8);
+    }
+    // The pixels: premultiplied with alpha, as they are without.
+    let is *u8 as px = mem.core.mmap_anon(iw * ih * 4);
+    let is i64 as k with mut = 0;
+    while (k < iw * ih) {
+        let is u32 as c = *cast(*u32, cast(i64, st.image) + k * 4);
+        let is u32 as a = (c >> 24) & 255;
+        if (alpha == 1) {
+            let is u32 as r = (((c >> 16) & 255) * a + 127) / 255;
+            let is u32 as g = (((c >> 8) & 255) * a + 127) / 255;
+            let is u32 as b = ((c & 255) * a + 127) / 255;
+            *cast(*u32, cast(i64, px) + k * 4) = (a << 24) | (r << 16) | (g << 8) | b;
+        } else {
+            *cast(*u32, cast(i64, px) + k * 4) = c | cast(u32, 4278190080);
+        }
+        k = k + 1;
+    }
+    let is *u8 as img = xlib.XCreateImage(d, visual, depth, x.ZPixmap, 0, px, cast(u32, iw), cast(u32, ih), 32, cast(i32, iw * 4));
+    xlib.XMapRaised(d, win);
+    if (cast(i64, img) != 0) {
+        let is *u8 as gc = xlib.XCreateGC(d, win, 0, cast(*u8, 0));
+        xlib.XPutImage(d, win, gc, img, 0, 0, 0, 0, cast(u32, iw), cast(u32, ih));
+        xlib.XFreeGC(d, gc);
+        // Ours, from mmap: not Xlib's to free.
+        cast(*xlib.XImage, img).data = cast(*u8, 0);
+        xlib.XDestroyImage(img);
+    }
+    mem.core.munmap(px, iw * ih * 4);
+    xlib.XFlush(d);
+    return win;
+}
+
+fn _icon_close(st as *State, d as *u8) as void {
+    if (st.icon != 0) { xlib.XDestroyWindow(d, st.icon); st.icon = 0; }
+    if (st.icon_map != 0) { xlib.XFreeColormap(d, st.icon_map); st.icon_map = 0; }
+}
+
+// The topmost mapped child of the root under root x, y but skip: the window
+// under the drag's image.
+fn _root_child_under(st as *State, d as *u8, rx as i64, ry as i64, skip as i64) as i64 {
+    let is i64 as root_ret with mut = 0;
+    let is i64 as parent_ret with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is i32 as n with mut = 0;
+    if (xlib.XQueryTree(d, st.root, cast(*u8, &root_ret), cast(*u8, &parent_ret), cast(*u8, &kids), cast(*u8, &n)) == 0) { return 0; }
+    let is i64 as found with mut = 0;
+    let is i32 as i with mut = n - 1;
+    while (i >= 0 && found == 0) {
+        let is i64 as c = kids[i];
+        if (c != skip) {
+            let is xlib.XWindowAttributes as wa;
+            if (xlib.XGetWindowAttributes(d, c, cast(*u8, &wa)) != 0 && wa.map_state == x.IsViewable &&
+                rx >= cast(i64, wa.x) && ry >= cast(i64, wa.y) && rx < cast(i64, wa.x + wa.width) && ry < cast(i64, wa.y + wa.height)) {
+                found = c;
+            }
+        }
+        i = i - 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
 fn _source_end(st as *State, d as *u8) as void {
     if (st.out_state == _DRAGGING) {
         xlib.XUngrabPointer(d, x.CurrentTime);
@@ -524,6 +764,7 @@ fn _source_end(st as *State, d as *u8) as void {
     }
     xlib.XDeleteProperty(d, st.xid, st.a_type_list);
     xlib.XDeleteProperty(d, st.xid, st.a_action_list);
+    _icon_close(st, d);
     xlib.XFlush(d);
     st.out_state = _OFF;
     st.out_target = 0;
@@ -542,6 +783,9 @@ fn _target_at(st as *State, d as *u8, rx as i64, ry as i64, version as *i64, to 
         let is i64 as child with mut = 0;
         if (xlib.XTranslateCoordinates(d, st.root, w, cast(i32, rx), cast(i32, ry), cast(*u8, &cx), cast(*u8, &cy),
                                        cast(*u8, &child)) == 0) { return 0; }
+        // The drag's own image is under the pointer, over everything: what
+        // is beneath it looked for.
+        if (w == st.root && st.icon != 0 && child == st.icon) { child = _root_child_under(st, d, rx, ry, st.icon); }
         if (child == 0) { return 0; }
         let is [1]i64 as v;
         let is i64 as proxy with mut = 0;
@@ -601,6 +845,7 @@ fn _leave(st as *State, d as *u8) as void {
 // The pointer at root x, y: the target under it entered, left, told.
 fn _moved(st as *State, d as *u8, rx as i64, ry as i64, mods as u32, t as i64) as void {
     st.out_x = rx; st.out_y = ry; st.out_mods = mods; st.out_time = t;
+    if (st.icon != 0) { xlib.XMoveWindow(d, st.icon, cast(i32, rx - st.image_hx), cast(i32, ry - st.image_hy)); }
     let is i64 as version with mut = 0;
     let is i64 as to with mut = 0;
     let is i64 as target = _target_at(st, d, rx, ry, &version, &to);

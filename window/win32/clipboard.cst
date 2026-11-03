@@ -3,7 +3,9 @@
 //
 // Text is CF_UNICODETEXT (UTF-16, NUL-terminated), made from and read back as
 // UTF-8; a PNG is the registered format "PNG", the file's bytes, as image
-// programs on Windows put it. Windows owns a block once SetClipboardData
+// programs on Windows put it; any other the format registered by its name —
+// text/html "HTML Format", its header of offsets made and read
+// (transfer.cf_html_*), as Windows programs have HTML. Windows owns a block once SetClipboardData
 // took it. There is no primary selection: asked for, refused. The clipboard
 // answers at once — request() reads it there and then.
 use "std/mem.cst" as mem;
@@ -18,16 +20,84 @@ struct State {
     offered as i32;      // the formats there, as transfer bits
     _pad    as i32;
     data    as transfer.Bytes;
+    names   as transfer.Names;   // the registered formats there beyond PNG, by name
 }
 
 fn init(s as *State) as void {
     s.ready = 0; s.got = 0; s.offered = 0;
     transfer.bytes_init(&s.data);
+    transfer.names_init(&s.names);
 }
 
 fn clear(s as *State) as void {
     transfer.bytes_free(&s.data);
+    transfer.names_free(&s.names);
     init(s);
+}
+
+// The registered format of name (n bytes of UTF-8; text/html Windows' own
+// "HTML Format"), registered as Windows registers formats: once a name, the
+// same number from then on. 0 when refused.
+fn named_format(name as *u8, n as i64) as u32 {
+    let is *u8 as use_name with mut = name;
+    let is i64 as un with mut = n;
+    if (transfer._named_is(transfer.MIME_HTML, name, n) == 1) { use_name = "HTML Format"; un = 11; }
+    if (un <= 0 || un > transfer.MAX_NAME) { return cast(u32, 0); }
+    let is [130]u16 as wide;
+    let is i32 as units = k.MultiByteToWideChar(cast(u32, t.CP_UTF8), 0, cast(*i8, use_name), cast(i32, un), &wide[0], 128);
+    if (units <= 0) { return cast(u32, 0); }
+    wide[units] = cast(u16, 0);
+    return u.RegisterClipboardFormatW(&wide[0]);
+}
+
+// A registered format's name as UTF-8 into out (room for 128 and a zero) —
+// "HTML Format" as text/html — its length; 0 for a format of the system's
+// own or none.
+fn format_name(cf as u32, out as *u8) as i64 {
+    if (cf < cast(u32, 49152)) { return 0; }   // 0xC000: the first registered
+    let is [130]u16 as wide;
+    let is i32 as units = u.GetClipboardFormatNameW(cf, &wide[0], 128);
+    if (units <= 0) { return 0; }
+    let is i32 as made = k.WideCharToMultiByte(cast(u32, t.CP_UTF8), 0, &wide[0], units, cast(*i8, out), 127, cast(*i8, 0), cast(*i32, 0));
+    if (made <= 0) { return 0; }
+    out[made] = cast(u8, 0);
+    if (transfer._named_is(out, "HTML Format", 11) == 1 && made == 11) {
+        mem.memcpy(out, transfer.MIME_HTML, 9);
+        out[9] = cast(u8, 0);
+        return 9;
+    }
+    return cast(i64, made);
+}
+
+// A named format's bytes as they go on the clipboard: HTML Format's header
+// before text/html, the rest as they are. A block, 0 when refused.
+fn named_block(o as *transfer.Offer, i as i64) as i64 {
+    let is *transfer.Bytes as b = transfer.named_bytes(o, i);
+    if (transfer._named_is(transfer.MIME_HTML, transfer.named_name(o, i), transfer.named_length(o, i)) == 1) {
+        let is transfer.Bytes as wrapped with mut;
+        transfer.bytes_init(&wrapped);
+        if (transfer.cf_html_wrap(b.data, b.len, &wrapped) == 0) { transfer.bytes_free(&wrapped); return 0; }
+        // HTML Format's text ends with a NUL, as Windows programs write it.
+        let is [1]u8 as z;
+        z[0] = 0;
+        transfer.append(&wrapped, &z[0], 1);
+        let is i64 as blk = block_of(wrapped.data, wrapped.len);
+        transfer.bytes_free(&wrapped);
+        return blk;
+    }
+    return block_of(b.data, b.len);
+}
+
+// A block of a named format read as its bytes: text/html out of HTML
+// Format's offsets, the rest whole (to its NUL for a block of text).
+fn read_named(block as i64, html as i32, out as *transfer.Bytes) as i32 {
+    let is i64 as n = cast(i64, k.GlobalSize(block));
+    let is *u8 as p = cast(*u8, k.GlobalLock(block));
+    if (cast(i64, p) == 0) { return 0; }
+    let is i32 as ok with mut = 0;
+    if (html == 1) { ok = transfer.cf_html_unwrap(p, n, out); } else { ok = transfer.bytes_set(out, p, n); }
+    k.GlobalUnlock(block);
+    return ok;
 }
 
 let is u32 as _png_format with mut = 0;
@@ -160,10 +230,21 @@ fn read_png(block as i64, out as *transfer.Bytes) as i32 {
 
 // --- The clipboard ---
 
+// The formats the clipboard offers, as transfer bits, asked without opening
+// it: text, a PNG, a DIB; NAMED when a registered format beyond PNG is there.
+fn offered_now() as i32 {
+    let is i32 as bits with mut = 0;
+    if (u.IsClipboardFormatAvailable(cast(u32, t.CF_UNICODETEXT)) != 0) { bits = bits | transfer.TEXT; }
+    if (u.IsClipboardFormatAvailable(png_format()) != 0) { bits = bits | transfer.PNG; }
+    if (u.IsClipboardFormatAvailable(cast(u32, 17)) != 0 || u.IsClipboardFormatAvailable(cast(u32, 8)) != 0) { bits = bits | transfer.DIB; }
+    if (u.IsClipboardFormatAvailable(cast(u32, t.CF_HDROP)) != 0) { bits = bits | transfer.FILES; }
+    return bits;
+}
+
 // What o offers on the clipboard, owned by hwnd: text and a PNG, both when
 // both are offered. 1 when the system took them.
 fn set(hwnd as i64, o as *transfer.Offer) as i32 {
-    if ((o.formats & (transfer.TEXT | transfer.PNG)) == 0) { return 0; }
+    if ((o.formats & (transfer.TEXT | transfer.PNG | transfer.NAMED | transfer.DIB)) == 0) { return 0; }
     let is i64 as text with mut = 0;
     let is i64 as png with mut = 0;
     if ((o.formats & transfer.TEXT) != 0) {
@@ -187,6 +268,26 @@ fn set(hwnd as i64, o as *transfer.Offer) as i32 {
     if (png != 0) {
         if (ok == 1 && u.SetClipboardData(png_format(), png) != 0) { png = 0; } else { ok = 0; }
     }
+    // The image as a DIB too, for the programs that read no PNG; Windows
+    // makes CF_DIBV5 and CF_BITMAP of it for those that ask.
+    if (ok == 1 && (o.formats & transfer.DIB) != 0) {
+        let is i64 as dib = block_of(o.dib.data, o.dib.len);
+        if (dib == 0 || u.SetClipboardData(cast(u32, 8), dib) == 0) {   // CF_DIB
+            if (dib != 0) { k.GlobalFree(dib); }
+            ok = 0;
+        }
+    }
+    // Every named format by its registered one.
+    let is i64 as ni with mut = 0;
+    while (ok == 1 && ni < o.named_n) {
+        let is u32 as cf = named_format(transfer.named_name(o, ni), transfer.named_length(o, ni));
+        let is i64 as blk = named_block(o, ni);
+        if (cf == cast(u32, 0) || blk == 0 || u.SetClipboardData(cf, blk) == 0) {
+            if (blk != 0) { k.GlobalFree(blk); }
+            ok = 0;
+        }
+        ni = ni + 1;
+    }
     u.CloseClipboard();
     if (text != 0) { k.GlobalFree(text); }
     if (png != 0) { k.GlobalFree(png); }
@@ -199,18 +300,58 @@ fn set(hwnd as i64, o as *transfer.Offer) as i32 {
 fn request(s as *State, hwnd as i64, format as i32) as i32 {
     s.ready = 0; s.got = 0; s.offered = 0;
     transfer.bytes_clear(&s.data);
+    transfer.names_clear(&s.names);
     if (u.OpenClipboard(hwnd) == 0) { return 0; }
     if (u.IsClipboardFormatAvailable(cast(u32, t.CF_UNICODETEXT)) != 0) { s.offered = s.offered | transfer.TEXT; }
     if (u.IsClipboardFormatAvailable(png_format()) != 0) { s.offered = s.offered | transfer.PNG; }
+    // CF_DIBV5 (17) or CF_DIB (8): an image of Windows' own.
+    if (u.IsClipboardFormatAvailable(cast(u32, 17)) != 0 || u.IsClipboardFormatAvailable(cast(u32, 8)) != 0) {
+        s.offered = s.offered | transfer.DIB;
+    }
+    // Every registered format there but PNG, by its name.
+    let is u32 as cf_at with mut = u.EnumClipboardFormats(cast(u32, 0));
+    while (cf_at != cast(u32, 0)) {
+        if (cf_at != png_format()) {
+            let is [130]u8 as nm;
+            let is i64 as nn = format_name(cf_at, &nm[0]);
+            if (nn > 0 && transfer.names_add(&s.names, &nm[0], nn) == 1) { s.offered = s.offered | transfer.NAMED; }
+        }
+        cf_at = u.EnumClipboardFormats(cf_at);
+    }
     if (format != 0 && (s.offered & format) != 0) {
         let is u32 as cf with mut = cast(u32, t.CF_UNICODETEXT);
         if (format == transfer.PNG) { cf = png_format(); }
+        if (format == transfer.DIB) {
+            // The V5 header first: it says alpha; Windows makes either of the other.
+            cf = cast(u32, 8);
+            if (u.IsClipboardFormatAvailable(cast(u32, 17)) != 0) { cf = cast(u32, 17); }
+        }
         let is i64 as block = u.GetClipboardData(cf);
         if (block != 0) {
             let is i32 as ok with mut = 0;
-            if (format == transfer.TEXT) { ok = read_wide(block, &s.data); } else { ok = read_png(block, &s.data); }
+            if (format == transfer.TEXT) { ok = read_wide(block, &s.data); }
+            else if (format == transfer.DIB) { ok = read_named(block, 0, &s.data); }
+            else { ok = read_png(block, &s.data); }
             if (ok == 1) { s.got = format; } else { transfer.bytes_clear(&s.data); }
         }
+    }
+    u.CloseClipboard();
+    s.ready = 1;
+    return 1;
+}
+
+// The clipboard read as the format named name (n bytes), now: got
+// transfer.NAMED and its bytes when it is there. 1 when it could be opened.
+fn request_named(s as *State, hwnd as i64, name as *u8, n as i64) as i32 {
+    s.ready = 0; s.got = 0;
+    transfer.bytes_clear(&s.data);
+    let is u32 as cf = named_format(name, n);
+    if (cf == cast(u32, 0)) { s.ready = 1; return 1; }
+    if (u.OpenClipboard(hwnd) == 0) { return 0; }
+    if (u.IsClipboardFormatAvailable(cf) != 0) {
+        let is i64 as block = u.GetClipboardData(cf);
+        let is i32 as html = transfer._named_is(transfer.MIME_HTML, name, n);
+        if (block != 0 && read_named(block, html, &s.data) == 1) { s.got = transfer.NAMED; } else { transfer.bytes_clear(&s.data); }
     }
     u.CloseClipboard();
     s.ready = 1;

@@ -4,7 +4,14 @@
 // Three formats, as bits: FILES (paths — text/uri-list on Linux, CF_HDROP on
 // Windows), TEXT (UTF-8 — UTF8_STRING and text/plain;charset=utf-8 on Linux,
 // CF_UNICODETEXT on Windows) and PNG (image/png's bytes; Windows' registered
-// "PNG"). Two actions: COPY and MOVE.
+// "PNG"). Any other by its MIME type's name — text/html, a program's own
+// application/x-… — NAMED, one bit for all of them, each with its name and
+// bytes in the offer (an X atom of the name, the name itself on Wayland, a
+// clipboard format registered by the name on Windows; text/html there the
+// "HTML Format" Windows programs read, cf_html). And DIB, Windows' own image
+// beside a PNG — CF_DIB's bytes, a BMP without its file header — which the
+// toolkit makes from a PNG and back (image/dib.cst): nothing to Linux. Two
+// actions: COPY and MOVE.
 //
 // An Offer is what this program puts on the clipboard or drags: a copy of the
 // data of each format offered, kept by the window until another offer takes
@@ -16,6 +23,13 @@ use "std/mem.cst" as mem;
 let is i32 as FILES with imut = 1;
 let is i32 as TEXT  with imut = 2;
 let is i32 as PNG   with imut = 4;
+let is i32 as NAMED with imut = 8;
+let is i32 as DIB   with imut = 16;
+
+// The most named formats an offer holds, and the longest name (bytes, its
+// zero not counted).
+let is i64 as MAX_NAMED with imut = 8;
+let is i64 as MAX_NAME  with imut = 127;
 
 let is i32 as COPY with imut = 1;
 let is i32 as MOVE with imut = 2;
@@ -76,6 +90,13 @@ fn bytes_set(b as *Bytes, p as *u8, n as i64) as i32 {
 
 // --- What is offered ---
 
+// A format by its MIME type's name: the name, zero-terminated, and its bytes.
+struct Named {
+    name as [128]u8;
+    n    as i64;
+    data as Bytes;
+}
+
 struct Offer {
     formats as i32;     // the formats it has, bits
     text    as Bytes;   // TEXT: UTF-8
@@ -83,17 +104,112 @@ struct Offer {
     uris    as Bytes;   // FILES: text/uri-list, built from the paths
     paths   as Bytes;   // FILES: the paths, back to back, each zero-terminated
     count   as i64;     // FILES: how many
+    named   as [8]Named;   // NAMED: each by its name
+    named_n as i64;
+    dib     as Bytes;   // DIB: a BITMAPINFOHEADER (or V5), then the rows
 }
 
 fn offer_init(o as *Offer) as void {
     o.formats = 0;
     bytes_init(&o.text); bytes_init(&o.png); bytes_init(&o.uris); bytes_init(&o.paths);
     o.count = 0;
+    let is i64 as k with mut = 0;
+    while (k < MAX_NAMED) {
+        o.named[k].name[0] = 0;
+        o.named[k].n = 0;
+        bytes_init(&o.named[k].data);
+        k = k + 1;
+    }
+    o.named_n = 0;
+    bytes_init(&o.dib);
 }
 
 fn offer_free(o as *Offer) as void {
     bytes_free(&o.text); bytes_free(&o.png); bytes_free(&o.uris); bytes_free(&o.paths);
+    bytes_free(&o.dib);
+    let is i64 as k with mut = 0;
+    while (k < MAX_NAMED) {
+        bytes_free(&o.named[k].data);
+        o.named[k].name[0] = 0;
+        o.named[k].n = 0;
+        k = k + 1;
+    }
+    o.named_n = 0;
     o.formats = 0; o.count = 0;
+}
+
+// Whether name, n bytes, is the one zero-terminated at z.
+fn _named_is(z as *u8, name as *u8, n as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < n && z[i] != 0 && z[i] == name[i]) { i = i + 1; }
+    return cast(i32, i == n && z[i] == 0);
+}
+
+// The named format name (n bytes) as the offer has it: its index, -1 for none.
+fn offer_find(o as *Offer, name as *u8, n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < o.named_n) {
+        if (_named_is(&o.named[k].name[0], name, n) == 1) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// The format named name (n bytes, a MIME type: text/html, application/x-…),
+// len bytes at p, offered too — in place of what was offered by that name:
+// 1, or 0 for a name too long or empty, no room for one more, or bytes not
+// kept. The three of transfer's own (text, PNG, files) are offered by theirs.
+fn offer_named(o as *Offer, name as *u8, n as i64, p as *u8, len as i64) as i32 {
+    if (n <= 0 || n > MAX_NAME) { return 0; }
+    let is i64 as k with mut = offer_find(o, name, n);
+    if (k < 0) {
+        if (o.named_n >= MAX_NAMED) { return 0; }
+        k = o.named_n;
+    }
+    if (bytes_set(&o.named[k].data, p, len) == 0) { return 0; }
+    mem.memcpy(&o.named[k].name[0], name, n);
+    o.named[k].name[n] = 0;
+    o.named[k].n = n;
+    if (k == o.named_n) { o.named_n = o.named_n + 1; }
+    o.formats = o.formats | NAMED;
+    return 1;
+}
+
+// The i-th named format's name, zero-terminated; null past the last.
+fn named_name(o as *Offer, i as i64) as *u8 {
+    if (i < 0 || i >= o.named_n) { return cast(*u8, 0); }
+    return &o.named[i].name[0];
+}
+
+fn named_length(o as *Offer, i as i64) as i64 {
+    if (i < 0 || i >= o.named_n) { return 0; }
+    return o.named[i].n;
+}
+
+// Its bytes; null past the last.
+fn named_bytes(o as *Offer, i as i64) as *Bytes {
+    if (i < 0 || i >= o.named_n) { return cast(*Bytes, 0); }
+    return &o.named[i].data;
+}
+
+// dst made a copy of src, every format of it: 1, or 0 (dst then empty) when
+// one could not be kept. dst's own let go first.
+fn offer_copy(dst as *Offer, src as *Offer) as i32 {
+    offer_free(dst);
+    offer_init(dst);
+    if ((src.formats & TEXT) != 0 && offer_text(dst, src.text.data, src.text.len) == 0) { offer_free(dst); return 0; }
+    if ((src.formats & PNG) != 0 && offer_png(dst, src.png.data, src.png.len) == 0) { offer_free(dst); return 0; }
+    if ((src.formats & FILES) != 0 && offer_files(dst, src.paths.data, src.count) == 0) { offer_free(dst); return 0; }
+    if ((src.formats & DIB) != 0 && offer_dib(dst, src.dib.data, src.dib.len) == 0) { offer_free(dst); return 0; }
+    let is i64 as k with mut = 0;
+    while (k < src.named_n) {
+        if (offer_named(dst, &src.named[k].name[0], src.named[k].n, src.named[k].data.data, src.named[k].data.len) == 0) {
+            offer_free(dst);
+            return 0;
+        }
+        k = k + 1;
+    }
+    return 1;
 }
 
 // Text, n bytes of UTF-8 at s, offered too: 1, or 0 when it could not be kept.
@@ -107,6 +223,14 @@ fn offer_text(o as *Offer, s as *u8, n as i64) as i32 {
 fn offer_png(o as *Offer, p as *u8, n as i64) as i32 {
     if (n < 8 || bytes_set(&o.png, p, n) == 0) { return 0; }
     o.formats = o.formats | PNG;
+    return 1;
+}
+
+// The same image as a DIB, n bytes at p — header and rows — offered too:
+// Windows' programs that read no PNG read it.
+fn offer_dib(o as *Offer, p as *u8, n as i64) as i32 {
+    if (n < 40 || bytes_set(&o.dib, p, n) == 0) { return 0; }
+    o.formats = o.formats | DIB;
     return 1;
 }
 
@@ -169,9 +293,11 @@ fn _absolute(p as *u8, len as i64) as i32 {
     return 0;
 }
 
-// The bytes of format f as they go out: text, the PNG, the uri-list.
+// The bytes of format f as they go out: text, the PNG, the uri-list. A named
+// one's by named_bytes.
 fn offer_bytes(o as *Offer, f as i32) as *Bytes {
     if (f == PNG) { return &o.png; }
+    if (f == DIB) { return &o.dib; }
     if (f == FILES) { return &o.uris; }
     return &o.text;
 }
@@ -271,6 +397,128 @@ fn path_at(b as *Bytes, count as i64, i as i64) as *u8 {
 let is *u8 as MIME_URIS with imut = "text/uri-list";
 let is *u8 as MIME_PNG  with imut = "image/png";
 let is *u8 as MIME_UTF8 with imut = "text/plain;charset=utf-8";
+let is *u8 as MIME_HTML with imut = "text/html";
+
+// --- A list of names: what another program offers ---
+//
+// The names of the formats offered, back to back, each zero-terminated, as
+// a selection's or a drag's types are learnt: the three of transfer's own
+// by their bits, and every other by its name here.
+struct Names {
+    list as Bytes;
+    n    as i64;
+}
+
+fn names_init(l as *Names) as void { bytes_init(&l.list); l.n = 0; }
+fn names_free(l as *Names) as void { bytes_free(&l.list); l.n = 0; }
+fn names_clear(l as *Names) as void { bytes_clear(&l.list); l.n = 0; }
+
+// name, n bytes, added — unless it is there already, empty, too long or
+// there are 32: 1 when added.
+fn names_add(l as *Names, name as *u8, n as i64) as i32 {
+    if (n <= 0 || n > MAX_NAME || l.n >= 32 || names_has(l, name, n) == 1) { return 0; }
+    if (append(&l.list, name, n) == 0) { return 0; }
+    let is [1]u8 as z;
+    z[0] = 0;
+    if (append(&l.list, &z[0], 1) == 0) { return 0; }
+    l.n = l.n + 1;
+    return 1;
+}
+
+fn names_has(l as *Names, name as *u8, n as i64) as i32 {
+    let is i64 as k with mut = 0;
+    while (k < l.n) {
+        if (_named_is(path_at(&l.list, l.n, k), name, n) == 1) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// The i-th name, zero-terminated; null past the last.
+fn names_at(l as *Names, i as i64) as *u8 { return path_at(&l.list, l.n, i); }
+
+// --- HTML on Windows: "HTML Format" ---
+//
+// Windows programs put HTML on the clipboard as "HTML Format": a header of
+// byte offsets into what follows — Version, StartHTML, EndHTML,
+// StartFragment, EndFragment, each a ten-digit decimal — then the document,
+// the part copied between <!--StartFragment--> and <!--EndFragment-->.
+
+fn _put_num(out as *u8, at as i64, v as i64) as void {
+    let is i64 as k with mut = 9;
+    let is i64 as x with mut = v;
+    while (k >= 0) {
+        out[at + k] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        k = k - 1;
+    }
+}
+
+// html, n bytes of UTF-8 — a document or a fragment of one — as HTML Format
+// into out: the fragment the whole of it, inside <html><body> when it has
+// none of its own. 1, or 0 when it could not be kept.
+fn cf_html_wrap(html as *u8, n as i64, out as *Bytes) as i32 {
+    let is *u8 as head = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n";
+    let is *u8 as open = "<html><body>\r\n<!--StartFragment-->";
+    let is *u8 as shut = "<!--EndFragment-->\r\n</body></html>";
+    let is i64 as hn with mut = 0;
+    while (head[hn] != 0) { hn = hn + 1; }
+    let is i64 as on with mut = 0;
+    while (open[on] != 0) { on = on + 1; }
+    let is i64 as sn with mut = 0;
+    while (shut[sn] != 0) { sn = sn + 1; }
+    bytes_clear(out);
+    if (append(out, head, hn) == 0 || append(out, open, on) == 0 || append(out, html, n) == 0 || append(out, shut, sn) == 0) {
+        return 0;
+    }
+    // The offsets: the document from after the header to the end, the
+    // fragment between the two markers.
+    _put_num(out.data, 23, hn);
+    _put_num(out.data, 43, out.len);
+    _put_num(out.data, 69, hn + on);
+    _put_num(out.data, 93, hn + on + n);
+    return 1;
+}
+
+// The number after key ("StartFragment:") in HTML Format's header, src n
+// bytes; -1 when it is not there.
+fn _header_num(src as *u8, n as i64, key as *u8) as i64 {
+    let is i64 as kn with mut = 0;
+    while (key[kn] != 0) { kn = kn + 1; }
+    let is i64 as i with mut = 0;
+    while (i + kn <= n) {
+        if (src[i] == key[0] && mem.memcmp(cast(*u8, cast(i64, src) + i), key, kn) == 0) {
+            let is i64 as j with mut = i + kn;
+            let is i64 as v with mut = 0;
+            let is i32 as any with mut = 0;
+            while (j < n && src[j] >= 48 && src[j] <= 57) {
+                v = v * 10 + cast(i64, src[j]) - 48;
+                any = 1;
+                j = j + 1;
+            }
+            if (any == 0) { return 0 - 1; }
+            return v;
+        }
+        // The header is over at the first '<'.
+        if (src[i] == 60) { return 0 - 1; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// What HTML Format src (n bytes) holds, into out: the fragment copied when
+// its offsets say where — or the document — as UTF-8. 1, or 0 for a header
+// that says neither.
+fn cf_html_unwrap(src as *u8, n as i64, out as *Bytes) as i32 {
+    let is i64 as a with mut = _header_num(src, n, "StartFragment:");
+    let is i64 as b with mut = _header_num(src, n, "EndFragment:");
+    if (a < 0 || b < a || b > n) {
+        a = _header_num(src, n, "StartHTML:");
+        b = _header_num(src, n, "EndHTML:");
+    }
+    if (a < 0 || b < a || b > n) { bytes_clear(out); return 0; }
+    return bytes_set(out, cast(*u8, cast(i64, src) + a), b - a);
+}
 
 fn _is(a as *u8, n as i64, b as *u8) as i32 {
     let is i64 as i with mut = 0;
