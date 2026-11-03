@@ -1,0 +1,104 @@
+// image/dib.cst — an image as Windows' clipboard has one besides a PNG: a
+// device-independent bitmap (CF_DIB, CF_DIBV5), a BMP file without its
+// fourteen-byte file header — a BITMAPINFOHEADER or BITMAPV5HEADER, then the
+// rows bottom-up.
+//
+// Both ways through caustic-image: a PNG decoded and written as a 32-bit BMP,
+// its file header left off (dib_from_png); a DIB given a file header again and
+// decoded, then written as a PNG (png_from_dib). caustic-image reads BI_RGB;
+// a 32-bit BI_BITFIELDS DIB with the usual masks — what CF_DIBV5 mostly is —
+// is the same bytes, said BI_RGB for it.
+use "std/mem.cst" as mem;
+use "caustic-image/decode.cst" as cdecode;
+use "caustic-image/encode.cst" as cencode;
+use "caustic-image/core/image.cst" as cimage;
+use "caustic-image/core/pixfmt.cst" as pixfmt;
+use "caustic-image/core/sniff.cst" as sniff;
+use "caustic-image/ops/ops.cst" as ops;
+use "caustic-compact/core/bytes.cst" as cb;
+
+// Not an image, or not one this reads.
+let is i64 as ERR_FORMAT with imut = 0 - 1002;
+
+fn _u32(p as *u8, at as i64) as i64 {
+    return cast(i64, p[at]) | (cast(i64, p[at + 1]) << 8) | (cast(i64, p[at + 2]) << 16) | (cast(i64, p[at + 3]) << 24);
+}
+
+fn _put32(p as *u8, at as i64, v as i64) as void {
+    p[at] = cast(u8, v & 255);
+    p[at + 1] = cast(u8, (v >> 8) & 255);
+    p[at + 2] = cast(u8, (v >> 16) & 255);
+    p[at + 3] = cast(u8, (v >> 24) & 255);
+}
+
+// A PNG, n bytes at png, as a DIB into out (emptied first): a 40-byte
+// BITMAPINFOHEADER, 32 bits a pixel, alpha kept. Its length, or a negative
+// error.
+fn dib_from_png(png as *u8, n as i64, out as *cb.Bytes) as i64 {
+    let is cimage.Image as img;
+    let is i64 as rc = cdecode.decode(png, n, &img);
+    if (rc < 0) { return rc; }
+    let is cimage.Image as rgba;
+    let is *cimage.Image as from with mut = &img;
+    if (img.fmt != pixfmt.FMT_RGBA8) {
+        ops.op_convert(&img, pixfmt.FMT_RGBA8, &rgba);
+        from = &rgba;
+    }
+    let is cb.Bytes as bmp with mut = cb.bytes_new(0);
+    let is i64 as m = cencode.encode(from, sniff.SNIFF_BMP, &bmp);
+    if (img.fmt != pixfmt.FMT_RGBA8) { cimage.image_free(&rgba); }
+    cimage.image_free(&img);
+    if (m < 14) { cb.bytes_free(&bmp); if (m < 0) { return m; } return ERR_FORMAT; }
+    out.len = 0;
+    if (cb.bytes_append(out, cast(*u8, cast(i64, bmp.ptr) + 14), m - 14) < 0) { cb.bytes_free(&bmp); return ERR_FORMAT; }
+    cb.bytes_free(&bmp);
+    return out.len;
+}
+
+// A DIB, n bytes at dib — CF_DIB or CF_DIBV5's — as a PNG into out (emptied
+// first): its length, or a negative error.
+fn png_from_dib(dib as *u8, n as i64, out as *cb.Bytes) as i64 {
+    if (n < 40) { return ERR_FORMAT; }
+    let is i64 as head = _u32(dib, 0);
+    if (head < 40 || head > n) { return ERR_FORMAT; }
+    let is i64 as bits = cast(i64, dib[14]) | (cast(i64, dib[15]) << 8);
+    let is i64 as compression = _u32(dib, 16);
+    let is i64 as used with mut = _u32(dib, 32);
+    // What follows the header before the rows: a palette for 8 bits and fewer,
+    // three masks after a 40-byte header said BI_BITFIELDS (later headers
+    // hold theirs inside).
+    let is i64 as extra with mut = 0;
+    if (bits <= 8) {
+        if (used == 0) { used = 1 << bits; }
+        extra = used * 4;
+    }
+    let is i32 as fields = cast(i32, compression == 3);
+    if (fields == 1 && head == 40) { extra = 12; }
+    if (fields == 1) {
+        // The usual masks only — red, green, blue, alpha as BGRA bytes — are
+        // the bytes BI_RGB has.
+        let is i64 as at with mut = 40;
+        if (head > 40) { at = 40; }
+        if (bits != 32 || _u32(dib, at) != 16711680 || _u32(dib, at + 4) != 65280 || _u32(dib, at + 8) != 255) {
+            return ERR_FORMAT;
+        }
+    }
+    let is i64 as total = 14 + n;
+    let is *u8 as file = mem.core.mmap_anon(total);
+    if (cast(i64, file) == 0) { return ERR_FORMAT; }
+    file[0] = cast(u8, 66);
+    file[1] = cast(u8, 77);
+    _put32(file, 2, total);
+    _put32(file, 6, 0);
+    _put32(file, 10, 14 + head + extra);
+    mem.memcpy(cast(*u8, cast(i64, file) + 14), dib, n);
+    if (fields == 1) { _put32(file, 14 + 16, 0); }
+    let is cimage.Image as img;
+    let is i64 as rc = cdecode.decode(file, total, &img);
+    mem.core.munmap(file, total);
+    if (rc < 0) { return rc; }
+    out.len = 0;
+    let is i64 as m = cencode.encode(&img, sniff.SNIFF_PNG, out);
+    cimage.image_free(&img);
+    return m;
+}
