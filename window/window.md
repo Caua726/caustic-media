@@ -626,7 +626,15 @@ where said:
   so does the capture taken elsewhere or the application deactivated on
   Windows, and the compositor's `popup_done`. `grabbing` says whether the grab
   could be had: not on a Wayland compositor with no seat. The program closes a
-  taken-down popup, innermost first. Tested by `popup_x11_test` (XTest, a second
+  taken-down popup, innermost first. A popup is seen through where it is
+  asked to be (`Config.transparent`: an ARGB visual on X11, every Wayland
+  surface, a layered window on Windows), for the rounded corners, shadow and
+  arrow drawn round it; `set_input_region` gives it a smaller input region,
+  and a press on its own pixels outside it is outside the popup — what lies
+  beneath gets it, or a grab takes the popup down — the same on all three. A
+  tooltip takes no input at all: its presses go through it to whatever is
+  beneath, another program's too (an empty input shape, an empty
+  `wl_region`, `WS_EX_TRANSPARENT`). Tested by `popup_x11_test` (XTest, a second
   client checking type, owner and grab), `popup_wayland_test` (kiosk Weston,
   headless and seated with XTest) and `popup_win32_test` (SendInput, isolated
   Wine, 96 and 144 dpi).
