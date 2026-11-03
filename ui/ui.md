@@ -354,11 +354,19 @@ are moved towards black or white until they read.
 ## Windows, popups and dialogs
 
 Each top-level window is a `window/` window with its own tree. Menus, the list
-of a combo box and tooltips are **popups**: separate windows positioned against
-their parent — override-redirect on X11, `xdg_popup` on Wayland — because a popup
-has to be able to extend past its parent's edge. `window/` already keeps several
-windows on one connection (`window/x11/multi_test.cst`), which is what this
-needs.
+of a combo box, popovers and tooltips are **popups**: separate windows
+positioned against their parent — override-redirect on X11, `xdg_popup` on
+Wayland, a `WS_POPUP` tool window on Windows — because a popup has to be able
+to extend past its parent's edge. As GTK 4 does it, a popup stays a widget of
+its window's tree, on a layer, with the tree's handles, router and signals:
+only its pixels and its input go through the platform's popup (a
+**surface**, `surface.cst`), placed by the platform from the same positioner
+the tree speaks everywhere (`xdg_positioner`'s model), its damage a region of
+its own and its input reaching the window's router in the window's
+coordinates. Where there is no host, or the platform refuses one, it is drawn
+inside the window on its layer instead, placed by that positioner within the
+window. `window/` keeps several windows on one connection
+(`window/x11/multi_test.cst`), which is what this needs.
 
 Dialogs are windows with a modal flag and a result. The file dialog is our own
 first; the XDG desktop portal on Linux (`window/linux/filechooser.cst`) and the
@@ -591,7 +599,7 @@ theme change restyles them all:
 
 | from | what | state |
 |---|---|---|
-| `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 implemented; native Wayland tested with Weston, desktop limits documented; Win32 under isolated Wine: a program starts, draws, takes input and closes (`program_win32_test`), popups, DnD and desktop services not yet |
+| `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 implemented; native Wayland tested with Weston, desktop limits documented; Win32 under isolated Wine: a program starts, draws, takes input and closes (`program_win32_test`), popups (`popup_win32_test`); DnD and desktop services not yet |
 | `input/` | events; text input and IME composition | design note |
 | `render/` | `draw2d`, `shapes2d`, scissor, layers | done |
 | `text/` | shaping, layout, caret, hit-testing, colour glyphs | done; complex scripts later |
@@ -630,9 +638,10 @@ By platform: X11 is the reference — everything above runs and is tested
 under Xvfb. Wayland: the host on a seated Weston with text-input-v3; external
 clipboard, drag and drop and an installed input method unverified. Windows,
 under isolated Wine: a program starts, draws, takes the system's input and
-closes; its file dialog, known folders, one instance and links are native;
-menus in native popups, OLE drag and drop, UI Automation and notifications
-not yet — and Wine is not proof of real Windows.
+closes; its file dialog, known folders, one instance and links are native,
+and its menus, lists, popovers and tooltips are popups of the system's; OLE
+drag and drop, UI Automation and notifications not yet — and Wine is not
+proof of real Windows.
 
 ## For scale
 
@@ -678,11 +687,12 @@ widget set applications actually use, done properly, not parity.
 9. **The application level**: the loop that puts the application's windows
    on the screen, the desktop's settings followed, icons, one instance,
    notifications, the tray, links. *Done on X11 and Linux's desktops. The
-   Wayland host has a Weston surface/timer smoke and text-input-v3 routing;
-   the three normal example applications are not all visually verified.
+   Wayland host has a Weston surface/timer smoke and text-input-v3 routing,
+   its popups `xdg_popup`s, and the three examples are checked on a nested
+   Weston.
    The Windows toolkit integration is blocked; see `window/win32/win32.md`.*
-10. **Examples**: a settings form, a text editor, a file browser. *Done on
-   X11.*
+10. **Examples**: a settings form, a text editor, a file browser. *Done,
+   each `--check`ed on X11, on a nested Weston and under Wine.*
 11. **A frame of the program's own** moved, resized, maximized and told
    where the window really is through the loop. *Done on X11; on Wayland —
    `xdg-decoration` asked first, the frame drawn where the compositor leaves

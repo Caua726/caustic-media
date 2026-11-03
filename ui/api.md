@@ -148,6 +148,7 @@ the application: its windows, each with its own tree, and what they share.
 - `set_cache(a as *App, h as i64, cc as *paint.Cache) as void` — The textures the window paints cached and translucent widgets through (paint.Cache), on the device its target is on; the program opens it and closes it after the window.
 - `cache(a as *App, h as i64) as *paint.Cache`
 - `paint(a as *App, h as i64, c as *draw2d.Canvas, theme as *style.Theme, time as i64,` — Paints what the last frame collected on c — begun by the caller on the window's target — with the window's own router for hover, press and focus, its cache and its active state; in theme, or the application's when...
+- `paint_surface(a as *App, h as i64, s as i64, c as *draw2d.Canvas, theme as *style.Theme, time as i64,` — The same for surface s of window h — a widget of it shown in a window of its own (tree.surface_open) — on c, begun at the surface's size.
 - `theme(a as *App) as *style.Theme` — The theme every window paints in.
 - `set_theme(a as *App, th as *style.Theme) as void` — A new theme for every window, laid out and repainted in it; th is copied.
 - `set_prefs(a as *App, p as *style.Prefs) as void` — The theme the system's preferences call for — dark, high contrast, the accent, the interface font, text scale, reduced motion — in every window.
@@ -175,7 +176,7 @@ a row or a column of widgets.
 
 what has to be repainted, found from the tree.
 
-- `collect(t as *tree.Tree) as i64` — Brings the tree's damage region up to date — run it after layout — and returns how many rectangles it holds.
+- `collect(t as *tree.Tree) as i64` — Brings the tree's damage regions up to date — the window's, and each surface's (tree.surface_damage_count) — run it after layout, and returns how many rectangles the window's holds.
 - `bounds(t as *tree.Tree) as math.rect.Rect` — The smallest rectangle around the whole region; empty when there is none.
 
 ## `ui/desktop.cst`
@@ -299,6 +300,11 @@ a window of the application's painted and shown: only what changed, as the damag
 what the platform says of a window, told the application and its router: the pointer, keys, text, focus, size, state, drags and requests to close.
 
 
+## `ui/host_popups.cst`
+
+the surfaces of a window's tree on the screen: a platform popup (window/device.cst's Config.popup) for each widget the tree shows in a window of its own (tree.surface_open) — a menu, a list dropping down, a tooltip.
+
+
 ## `ui/host_settings.cst`
 
 the desktop's settings, followed: the platform's, the portal's, the program's over them, handed to the application.
@@ -356,6 +362,7 @@ measure, place, and the pass that runs them.
 - `measure_hidden(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — The same, for a widget that is hidden but still has to be accounted for — a stack sizes itself to its largest page, shown or not.
 - `overlay_measure(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — Every visible child gets the whole area and aligns within it on its own; later children sit above earlier ones.
 - `overlay_arrange(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void`
+- `place_exact(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void` — w given exactly r — in its parent's coordinates, its edges on physical pixels — whatever its margins, alignment and limits say: a surface where the platform put it.
 - `place(t as *tree.Tree, w as i64, area as *math.rect.Rect) as void`
 - `run(t as *tree.Tree, w as f64, h as f64) as void` — Lays out the whole tree for a window of w by h logical pixels.
 - `min_size(t as *tree.Tree, out as *geom.Size) as void` — The smallest window the content fits in: the root's minimum.
@@ -428,6 +435,7 @@ drawing the tree, region by region, through render/'s 2D family.
 - `cache_used(cc as *Cache, t as *tree.Tree) as i64` — How many entries hold a texture for a widget still alive.
 - `options(theme as *style.Theme) as Options`
 - `frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of the tree's damage region on c, which the caller has begun.
+- `frame_surface(t as *tree.Tree, sf as i64, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of surface s's damage region — a widget shown in a window of its own (tree.surface_open) — on c, which the caller has begun at the surface's size: what is at the surface's corner in the wind...
 
 ## `ui/painter.cst`
 
@@ -441,13 +449,15 @@ what a widget's paint entry is handed.
 something shown over the window until it is dismissed.
 
 - `create(t as *tree.Tree) as i64` — A new popup, closed, as the last child of the tree's root.
+- `set_kind(t as *tree.Tree, p as i64, kind as i32) as void` — What its window is to the platform: surface.MENU, as a popup starts, or surface.LIST for a list dropping down from a control.
 - `content(t as *tree.Tree, p as i64) as i64` — What it holds: its first child.
 - `is_open(t as *tree.Tree, p as i64) as i32`
 - `set_arrow(t as *tree.Tree, p as i64, on as i32) as void` — An arrow pointing at what it is opened against (1), or none (0, at first).
 - `arrow_side(t as *tree.Tree, p as i64) as i32` — Which side its arrow is on, positioner.NONE for none.
 - `arrow_rect(t as *tree.Tree, p as i64) as math.rect.Rect` — Its arrow's box, in the window: empty for none.
 - `placed(t as *tree.Tree, p as i64) as math.rect.Rect` — Where it was put, in the window.
-- `open_at(t as *tree.Tree, r as *router.Router, p as i64, rect as math.rect.Rect, anchor as i32, gravity as i32,` — Opened against rect — the window's coordinates — from its anchor point, growing as gravity says, kept inside the window; the focus as focus says (FOCUS_SELF, FOCUS_FIRST or KEEP_FOCUS).
+- `open_at(t as *tree.Tree, r as *router.Router, p as i64, rect as math.rect.Rect, anchor as i32, gravity as i32,` — Opened against rect — the window's coordinates — from its anchor point, growing as gravity says, kept inside the room there is; the focus as focus says (FOCUS_SELF, FOCUS_FIRST or KEEP_FOCUS).
+- `open_from(t as *tree.Tree, r as *router.Router, p as i64, from as i64, rect as math.rect.Rect, anchor as i32,` — The same, rect what of widget from it is opened against — and placed again when from moves.
 - `close(t as *tree.Tree, p as i64) as void` — Closed: the window's input and the focus given back as they were; CLOSED.
 
 ## `ui/program.cst`
@@ -476,6 +486,7 @@ where each event goes.
 - `refresh_hover(t as *tree.Tree, r as *Router, time as i64) as void` — For when widgets moved under a pointer that did not: after a layout pass, a scroll, a widget shown or hidden.
 - `pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as void`
 - `pointer_shape(t as *tree.Tree, r as *Router) as i32` — The pointer's shape where it is, for the window to show: asked of the widget holding a press, wherever the pointer went, or else of the deepest one under it, then up the tree until one has a shape of its own.
+- `dismiss(t as *tree.Tree, r as *Router, time as i64) as i32` — The window system took a popup down — a press outside the program's windows, another program taking the pointer, the compositor's popup_done — with no press here to say so: the modal scope hears PRESS_OUTSIDE, as ...
 - `pointer_leave(t as *tree.Tree, r as *Router, time as i64) as void` — The pointer left the window.
 - `pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,` — button is 1 left, 2 middle, 3 right; pressed is 1 down, 0 up.
 - `pointer_cancel(t as *tree.Tree, r as *Router, button as i32, time as i64) as void` — The press of button is over and clicks nothing: the platform took it — a move or resize it follows from there — or let everything go, and no release will come.
@@ -550,7 +561,7 @@ the focus: the modal scope, the chain Tab walks, and what is brought into view a
 
 the widget under a point: hit-testing, delivery to it and up, hover.
 
-- `hit(t as *tree.Tree, x as f64, y as f64) as i64`
+- `hit(t as *tree.Tree, x as f64, y as f64) as i64` — The widget under window point x, y; 0 for none.
 - `hover(r as *Router) as i64`
 
 ## `ui/router_keys.cst`
@@ -688,6 +699,20 @@ the theme: what every widget's look is made of.
 - `override_radius(o as *Overrides, r as f64) as void`
 - `override_text_scale(o as *Overrides, k as f64) as void`
 - `apply(th as *Theme, o as *Overrides) as void` — th with o laid on it: the roles set, then what depends on them derived again — the accent's dependants when the accent changed, the variants always.
+
+## `ui/surface.cst`
+
+a widget on a layer put against a rectangle of the window: a menu, a list dropping down, a popover, a tooltip.
+
+- `open(t as *tree.Tree, w as i64, kind as i32, grab as i32, from as i64, rect as math.rect.Rect,` — w — a child of the root on a layer — shown against rect, window coordinates, of the widget from (0 for the window itself, rect then in its coordinates as they are): from its anchor point, growing as gravity says, ...
+- `open_offset(t as *tree.Tree, w as i64, kind as i32, grab as i32, from as i64, rect as math.rect.Rect,` — The same, moved off_x, off_y from where it would go — the way the positioner moves it, mirrored when it is flipped: a shadow round it reaching past what it is opened against.
+- `close(t as *tree.Tree, w as i64) as void` — Put away: its window, when it has one, and what it was anchored to forgotten.
+- `is_native(t as *tree.Tree, w as i64) as i32` — Whether it is in a window of its own.
+- `rect(t as *tree.Tree, w as i64) as math.rect.Rect` — Where it is, window coordinates: where the platform put it, where it was put inside the window, or where layout has it.
+- `anchor_rect(t as *tree.Tree, w as i64) as math.rect.Rect` — What it was last placed against, window coordinates.
+- `follow(t as *tree.Tree) as i64` — Every widget placed in the tree and shown, placed again where what it is anchored to has moved or its own size has changed — run after layout, and layout run again when it says so.
+- `clear(t as *tree.Tree) as i32` — Whether, in a window of its own, it can draw round itself what shows what is behind it — a shadow, rounded corners — as the host says before it opens.
+- `set_input(t as *tree.Tree, w as i64, r as math.rect.Rect) as void` — Where it takes the pointer, window coordinates — its frame, not the shadow round it — told its window when it has one.
 
 ## `ui/system.cst`
 
@@ -866,7 +891,7 @@ widgets as nodes in a window's tree, and the handles to them.
 - `set_enabled(t as *Tree, w as i64, on as i32) as void`
 - `is_enabled(t as *Tree, w as i64) as i32`
 - `set_focusable(t as *Tree, w as i64, on as i32) as void` — Whether w can take keyboard focus at all.
-- `set_flag(t as *Tree, w as i64, bit as i64, on as i32) as void` — The flags a program sets itself — F_FOCUS_WITHIN_LOOK and F_CACHE — and F_CACHE_DIRTY, which damage.cst and paint.cst keep.
+- `set_flag(t as *Tree, w as i64, bit as i64, on as i32) as void` — The flags a program sets itself — F_FOCUS_WITHIN_LOOK, F_CACHE and F_NO_INPUT — and F_CACHE_DIRTY, which damage.cst and paint.cst keep.
 - `is_textured(t as *Tree, w as i64) as i32`
 - `stale_textures(t as *Tree, w as i64) as void` — w's texture, if it has one, and every one around it, are to be painted again — damage.cst's, when something inside changed.
 - `has_flag(t as *Tree, w as i64, bit as i64) as i32`
@@ -906,9 +931,48 @@ widgets as nodes in a window's tree, and the handles to them.
 - `shift_asked(t as *Tree, dx as *f64, dy as *f64, keep as *math.rect.Rect) as i64` — The widget whose ask damage.collect is to weigh, with how far and what may move; 0 when none asked, or more than one did.
 - `set_shifted(t as *Tree, ok as i32, at as math.rect.Rect) as void` — damage.collect's answer: the window's rectangle at to be moved, or none.
 - `shift(t as *Tree, r as *math.rect.Rect, dx as *f64, dy as *f64) as i32` — After collect: 1 when the pixels of *r — window coordinates, logical pixels — are to be moved dx, dy before the damage is painted over them.
+- `set_shift_surface(t as *Tree, s as i64) as void` — Which window's pixels shift moves: the surface the scroll area is in, -1 for the window itself.
+- `shift_surface(t as *Tree) as i64` — Which window's pixels the shift asked moves, as set_shift_surface said.
 - `has_layered(t as *Tree) as i32` — Whether any widget is on a layer above 0, shown or not.
 - `layer(t as *Tree, w as i64) as i64`
 - `layered_count(t as *Tree) as i64` — How many widgets are on a layer above 0; with none, painting and hit-testing skip looking for them.
+- `set_surfaces(t as *Tree, cb as SurfaceFn, user as *u8) as void` — The host's function the tree asks to open, move and close its surfaces' windows (cb(user, what, s)); a null one keeps every widget in the window.
+- `has_surfaces(t as *Tree) as i32` — Whether a host lends the tree its windows.
+- `set_surfaces_clear(t as *Tree, on as i32) as void` — Whether the host's windows for surfaces show what is behind where they are not painted — a compositor runs — so a widget can draw a shadow and rounded corners round itself: known before it opens one, as the host s...
+- `surfaces_clear(t as *Tree) as i32` — What set_surfaces_clear said, where a host lends windows at all.
+- `surface_open(t as *Tree, w as i64, kind as i32, grab as i32, from as i64, place as *positioner.Positioner) as i64` — w shown in a window of its own — see tree_surface.cst's open — laid out and painted there from now on: its surface, or -1 when it stays in the window.
+- `surface_close(t as *Tree, w as i64) as void` — Its window put away; shown again, it is inside the window.
+- `surface_index(t as *Tree, w as i64) as i64` — The surface w is the widget of, -1 for none.
+- `surface_of(t as *Tree, w as i64) as i64` — The surface w is drawn in, -1 for the window.
+- `surface_widget(t as *Tree, s as i64) as i64` — Surface s's widget; 0 for a free surface.
+- `surface_kind(t as *Tree, s as i64) as i32` — What its window is to the platform: SURFACE_MENU, _LIST or _TOOLTIP.
+- `surface_grab(t as *Tree, s as i64) as i32` — Whether its window takes the pointer and keyboard for itself while open.
+- `surface_set_grab(t as *Tree, s as i64, on as i32) as void` — The host says its window holds no grab after all: the platform refused it.
+- `surface_owner(t as *Tree, s as i64) as i64` — The surface it opened against, -1 for the window.
+- `surface_place(t as *Tree, s as i64) as positioner.Positioner` — Against what of the window — its anchor rectangle in window coordinates, logical pixels — and how, its size the widget's own.
+- `surface_rect(t as *Tree, s as i64) as math.rect.Rect` — Where the platform put it, window coordinates: outside the window, larger than it, as the platform allows.
+- `surface_set_rect(t as *Tree, s as i64, r as math.rect.Rect) as void` — The host says where it went; laid out and painted there.
+- `surface_native(t as *Tree, s as i64) as i64` — The host's own handle for its window, as set_native gave it; 0 before.
+- `surface_set_input(t as *Tree, s as i64, r as math.rect.Rect) as void` — Where surface s's widget takes the pointer — its frame, not its shadow — in window coordinates: its window's input region.
+- `surface_input(t as *Tree, s as i64, r as *math.rect.Rect) as i32` — See surface_set_input.
+- `surface_set_native(t as *Tree, s as i64, n as i64) as void` — The host's own handle for its window, kept for it: its popup's slot.
+- `surface_see_through(t as *Tree, s as i64) as i32` — Whether what it leaves unpainted shows what is behind it — rounded corners, a shadow — as the host says its window allows.
+- `surface_set_see_through(t as *Tree, s as i64, on as i32) as void` — What the host says of its window: whether it shows what is behind it.
+- `placed_widget(t as *Tree, s as i64) as i64` — Every widget placed against a rectangle, shown by the host or inside the window — what ui/surface.cst places again as what it is anchored to moves: entries 0 ..
+- `placed_native(t as *Tree, s as i64) as i32` — Whether entry s is shown by the host, not inside the window.
+- `placed_place(t as *Tree, s as i64) as positioner.Positioner` — How entry s was placed: its positioner, its anchor rectangle where it was.
+- `placed_anchor(t as *Tree, s as i64) as math.rect.Rect` — Its anchor rectangle where it is now — what it is anchored to may have moved — in window coordinates.
+- `placed_from(t as *Tree, s as i64) as i64` — The widget entry s is anchored to; 0 for the window itself.
+- `placed_kind(t as *Tree, s as i64) as i32` — What entry s is: SURFACE_MENU, _LIST or _TOOLTIP.
+- `placed_grab(t as *Tree, s as i64) as i32` — Whether entry s takes the pointer and keyboard for itself while open.
+- `placed_rect(t as *Tree, s as i64) as math.rect.Rect` — Where entry s is, window coordinates, as last placed.
+- `placed_set_rect(t as *Tree, s as i64, r as math.rect.Rect) as void` — Where entry s was placed inside the window.
+- `placed_entry(t as *Tree, w as i64) as i64` — The entry w has, shown by the host or not; -1 for none.
+- `surface_damage_count(t as *Tree, s as i64) as i64` — Surface s's own damage region, as the window's is: window coordinates.
+- `surface_damage_at(t as *Tree, s as i64, i as i64) as math.rect.Rect` — Its i-th rectangle.
+- `surface_damage_clip(t as *Tree, s as i64, r as math.rect.Rect) as void` — Its region cut to r: what lies outside its window is not drawn.
+- `damage_add_to(t as *Tree, s as i64, r as *math.rect.Rect) as void` — r to repaint in surface s — the window for -1.
+- `damage_add_for(t as *Tree, w as i64, r as *math.rect.Rect) as void` — r to repaint wherever w is drawn.
 - `text_service(t as *Tree) as *u8`
 - `set_animator(t as *Tree, a as *u8) as void` — The window's animator (anim.cst), for widgets that move on their own — a switch's knob sliding, a progress bar's pulse.
 - `animator(t as *Tree) as *u8`
@@ -954,8 +1018,12 @@ widgets as nodes in a window's tree, and the handles to them.
 
 what a frame repaints and where things are drawn: the damage region, what moved, the layers above the rest, each widget's translation and opacity.
 
-- `damage_add(t as *Tree, r as *math.rect.Rect) as void`
+- `damage_add(t as *Tree, r as *math.rect.Rect) as void` — The window's region.
 - `damage_clip(t as *Tree, r as math.rect.Rect) as void`
+- `damage_add_to(t as *Tree, s as i64, r as *math.rect.Rect) as void` — Surface s's region; the window's for -1, or for a surface not open.
+- `surface_damage_clip(t as *Tree, s as i64, r as math.rect.Rect) as void` — Surface s's region cut to r.
+- `surface_damage_count(t as *Tree, s as i64) as i64` — How many rectangles surface s's region holds.
+- `surface_damage_at(t as *Tree, s as i64, i as i64) as math.rect.Rect` — Its i-th rectangle, window coordinates.
 - `damage_count(t as *Tree) as i64`
 - `damage_at(t as *Tree, i as i64) as math.rect.Rect`
 - `paint_wanted(t as *Tree) as i32`
@@ -968,6 +1036,8 @@ what a frame repaints and where things are drawn: the damage region, what moved,
 - `shift_request(t as *Tree, w as i64, dx as f64, dy as f64, keep as *math.rect.Rect) as void`
 - `shift_asked(t as *Tree, dx as *f64, dy as *f64, keep as *math.rect.Rect) as i64`
 - `set_shifted(t as *Tree, ok as i32, at as math.rect.Rect) as void`
+- `set_shift_surface(t as *Tree, s as i64) as void` — Which window's pixels the shift asked moves: a surface, -1 the window.
+- `shift_surface(t as *Tree) as i64` — What set_shift_surface said.
 - `shift(t as *Tree, r as *math.rect.Rect, dx as *f64, dy as *f64) as i32`
 - `has_layered(t as *Tree) as i32`
 - `layer(t as *Tree, w as i64) as i64`
@@ -1023,6 +1093,42 @@ what the tree is lent and keeps for its widgets: the theme, the application's se
 what the tree's parts share: its types — the tree, its nodes, the kinds of widget and what they are asked — its limits and constants, and the node table's own accessors.
 
 - `is_valid(t as *Tree, w as i64) as i32`
+
+## `ui/tree_surface.cst`
+
+the widgets shown in platform windows of their own: the table of surfaces, what the host is asked, and which surface a widget is drawn in.
+
+- `set_surfaces(t as *Tree, cb as SurfaceFn, user as *u8) as void` — The host's function, asked to open, move and close windows: see tree.cst.
+- `has_surfaces(t as *Tree) as i32` — Whether a host lends the tree its windows.
+- `entry(t as *Tree, w as i64) as i64` — The entry w has, shown by the host or not; -1 for none.
+- `index(t as *Tree, w as i64) as i64` — The surface w is the widget of — shown by the host — -1 for none.
+- `surface_of(t as *Tree, w as i64) as i64` — The surface w is drawn in — its own, or its nearest ancestor's: a submenu in a window of its own is drawn there, not in its menu's — or -1 for the window.
+- `surface_of_slot(t as *Tree, i as i64) as i64` — The same for a node's slot: what tree.cst has in hand when it damages.
+- `open(t as *Tree, w as i64, kind as i32, grab as i32, from as i64, place as *positioner.Positioner) as i64` — w — a widget on a layer — shown in a window of its own, of kind and grabbing as said, against place's anchor rectangle (window coordinates, logical pixels) of the widget from (the window for 0), place's size the w...
+- `close(t as *Tree, w as i64) as i32` — w's entry freed, its window put away when it had one: 2 when it had, 1 for an entry inside the window, 0 for none.
+- `widget(t as *Tree, s as i64) as i64` — Surface s's widget, shown by the host; 0 for none.
+- `kind(t as *Tree, s as i64) as i32` — What its window is to the platform: tst.SURFACE_MENU, _LIST or _TOOLTIP.
+- `grab(t as *Tree, s as i64) as i32` — Whether its window takes the pointer and keyboard while open.
+- `owner(t as *Tree, s as i64) as i64` — The surface it opened against, -1 for the window.
+- `place(t as *Tree, s as i64) as positioner.Positioner` — Its positioner as it was last placed: the anchor rectangle in window coordinates.
+- `rect(t as *Tree, s as i64) as math.rect.Rect` — Where the platform put it, window coordinates.
+- `set_rect(t as *Tree, s as i64, r as math.rect.Rect) as i32` — Where the platform put it, in window coordinates: 1 when that is new.
+- `native(t as *Tree, s as i64) as i64` — The host's handle for its window; 0 before it has one.
+- `set_native(t as *Tree, s as i64, n as i64) as void` — The host's handle for its window, kept for it.
+- `see_through(t as *Tree, s as i64) as i32` — Whether its window shows what is behind where it is not painted.
+- `set_see_through(t as *Tree, s as i64, on as i32) as void` — What the host says of its window's transparency.
+- `placed_widget(t as *Tree, s as i64) as i64` — Entry s's widget, shown by the host or inside the window; 0 for a free one.
+- `placed_native(t as *Tree, s as i64) as i32` — Whether entry s is shown by the host.
+- `placed_place(t as *Tree, s as i64) as positioner.Positioner` — The positioner as it was last placed, its anchor rectangle in window coordinates.
+- `placed_anchor(t as *Tree, s as i64) as math.rect.Rect` — The anchor rectangle where it is now, in window coordinates: what it is anchored to moved with it.
+- `placed_from(t as *Tree, s as i64) as i64` — The widget entry s is anchored to; 0 for the window.
+- `placed_kind(t as *Tree, s as i64) as i32` — What entry s is: tst.SURFACE_MENU, _LIST or _TOOLTIP.
+- `placed_grab(t as *Tree, s as i64) as i32` — Whether entry s takes the pointer and keyboard while open.
+- `placed_rect(t as *Tree, s as i64) as math.rect.Rect` — Where an entry inside the window was put, window coordinates; a surface's is the host's (rect).
+- `placed_set_rect(t as *Tree, s as i64, r as math.rect.Rect) as void` — Where entry s was placed inside the window.
+- `set_input(t as *Tree, s as i64, r as math.rect.Rect) as i32` — Where the widget of surface s takes the pointer, window coordinates — its frame, not the shadow round it: what the host gives its window as its input region.
+- `input(t as *Tree, s as i64, r as *math.rect.Rect) as i32` — 1 and *r when the widget said where it takes the pointer; 0 for all of it.
+- `set_grab(t as *Tree, s as i64, on as i32) as void` — Whether it holds a grab, as its window turned out: the host opened it without one where the platform refused it.
 
 ## `ui/widget.cst`
 
@@ -1439,6 +1545,7 @@ a popup menu: a column of items over the window.
 - `current(t as *tree.Tree, m as i64) as i64` — The item chosen in m: the one with the focus, or the one whose submenu is open; 0 for none.
 - `scroll(t as *tree.Tree, m as i64) as f64` — How far its items are moved up, when it is cut to the window.
 - `popup_at(t as *tree.Tree, r as *router.Router, m as i64, rect as math.rect.Rect, anchor as i32, gravity as i32,` — Menu m popped up against rect — the window's coordinates — growing as gravity says from its anchor point, flipped, slid and cut to stay inside the window; its first item chosen when select_first is 1, as when the ...
+- `popup_from(t as *tree.Tree, r as *router.Router, m as i64, from as i64, rect as math.rect.Rect, anchor as i32,` — The same, rect what of widget from it is popped up against — a menu bar's title, a menu button — and placed again when from moves.
 - `popup_at_pointer(t as *tree.Tree, r as *router.Router, m as i64) as i32` — At the pointer: its corner there, to the right and below — to the left right to left — flipped and slid as popup_at.
 - `close(t as *tree.Tree, m as i64) as void` — The whole menu m is in closed; scope and focus given back; CLOSED.
 

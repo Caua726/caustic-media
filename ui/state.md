@@ -67,6 +67,36 @@ bounds the adjustments allowed, in the spec's order — flipped when the other
 side fits, slid back inside, cut to fit unless that leaves nothing. A popup
 just touching an edge fits.
 
+**Surfaces** (`tree_surface.cst`, `surface.cst`, tested by
+`tree_surface_test`, `surface_test`, `surface_damage_test`,
+`surface_paint_test` and `surface_router_test`): a widget on a layer put
+against a rectangle — a menu, a list dropping down, a popover, a tooltip —
+shown in a platform window of its own where the host lends the tree its
+windows (`tree.set_surfaces`), at most `tree.MAX_SURFACES` at once, and inside
+the window on its layer where there is no host or it could not open one, as
+before. Either way it stays a widget of the tree, its handles, router and
+signals its own. Layout puts it where the platform put it
+(`tree.surface_rect`, relative to what it was opened against: the window, or
+the menu a submenu belongs to); what it is anchored to — a widget, and a
+rectangle in that widget's coordinates — is remembered, and `surface.follow`
+places it again when that moves or its own size changes (a list under an
+entry that grows, a popover over a button a resize moved). Its damage is a
+region of its own, in window coordinates and clipped to it, and none of it
+the window's even where it lies over the window; a scroll area inside it
+moves its pixels (`tree.shift_surface`), and one in the window under it the
+window's, which a popup drawn inside the window would have refused.
+`paint.frame_surface` paints it on its own canvas from its origin, pixel for
+pixel as it is painted inside the window, at any scale; the window is painted
+without it; what it leaves unpainted is nothing where its window is seen
+through (`tree.surface_see_through`) and the window's colour where not. The
+router takes its input in window coordinates — a point past the window's
+edges is the popup's when it lies in one — moving between it and the window
+leaves the one and enters the other, the window system taking it down is a
+press outside at no point (`router.dismiss`), and a widget that takes no
+input (`tree.F_NO_INPUT`, a tooltip) lets the pointer through to what lies
+beneath, as its window's input region does on the screen
+(`tree.surface_set_input`).
+
 **Scroll areas** (`scroll.cst`, tested by `scroll_test`): content measured
 without a limit along an axis that scrolls and given the view's size along one
 that does not; offsets clamped and on physical pixels, moving the content
@@ -459,12 +489,16 @@ window beside its tree and router, each widget's tip the program's text, told
 the time by the program's loop and saying when it next wants to be (as the
 animator does). The pointer resting on a widget with a tip — or inside one,
 the nearest ancestor's — for the router's `tooltip_ms` (500 by default)
-shows a bubble on a layer above everything, just below the pointer and kept
-inside the window, in the theme's tooltip colours, its text in the caption
-style wrapped to twenty-five of the body's ems; a tooltip to assistive
-technology, named by its text. Leaving the widget, a press or a key (the
-router counts them) hides it, and it does not show again until the pointer
-leaves and comes back.
+shows a bubble just below the pointer: in a platform tooltip of its own where
+the host lends the tree its windows, reaching past the window's edges and kept
+on the screen, taking no grab; elsewhere on a layer above everything, kept
+inside the window. In the theme's tooltip colours — square where its window
+shows nothing behind it — its text in the caption style wrapped to
+twenty-five of the body's ems; it takes no input, the pointer going through
+it to what is beneath (`tree.F_NO_INPUT`, and an empty input region on the
+screen); a tooltip to assistive technology, named by its text. Leaving the
+widget, a press or a key (the router counts them) hides it, and it does not
+show again until the pointer leaves and comes back.
 
 **Spin boxes** (`widgets/spin.cst`, tested by `spin_test`): a number in an
 entry held to its range and step, with as many decimals as the step has
@@ -564,12 +598,15 @@ editable or read-only.
 program builds once and pops up against a rectangle or at the pointer —
 items with mnemonics and the accelerators they show (Ctrl, Alt, Shift and
 Super before the key, a letter as its capital, named keys by name),
-separators, check items, radio items in groups, submenus. Inside the window
-until window/'s native popups can carry it out, on a layer above everything,
-a child of the root; placed by the positioner — flipped from an edge, slid
-inside, cut to the window's height and then scrolled by the wheel and by the
-keys moving through it; a submenu beside its item, the other side right to
-left, its first item level with it. While it is open the window's input is
+separators, check items, radio items in groups, submenus. A child of the
+root, on a layer above everything; where the host lends the tree its windows
+it is shown in a platform popup of its own (`surface.cst`), reaching past the
+window's edges, cut to the screen — flat, square where that window shows
+nothing behind it — and elsewhere inside the window, cut to it; either way
+placed by the positioner — flipped from an edge, slid inside, cut to the room
+there is and then scrolled by the wheel and by the keys moving through it; a
+submenu beside its item, the other side right to left, its first item level
+with it, in a popup of its own belonging to its menu's. While it is open the window's input is
 its own: the router's scope, every key claimed ahead of the window's
 shortcuts, a press outside closing it. The arrows move through what can be
 chosen, wrapping, Home and End to the ends, the arrow towards the line's end
@@ -760,8 +797,12 @@ arrow. Told as a table of table rows under column headers.
 
 **Popups** (`popup.cst`, tested by `popup_test`): what is made with one as
 parent, framed in the popover colour on a layer above the window, opened
-against a rectangle and placed by the positioner — flipped, slid, cut to the
-window's height. Open, it is the router's modal scope: Tab goes round what it
+against a rectangle — or against a widget (`open_from`), followed as it moves
+— and placed by the positioner: flipped, slid, cut to the room there is. In a
+platform popup of its own where the host lends the tree its windows, reaching
+past the window's edges; there a shadow lies round its frame and its corners
+are rounded where its window is seen through, the shadow taking no input, and
+it is flat and square where it is not. Open, it is the router's modal scope: Tab goes round what it
 holds, a press outside or Escape closes it, and the focus goes to the first
 of what it holds, to the popup, or stays where it is (`KEEP_FOCUS`, what has
 it let through the scope), coming back when it closes. CLOSED says it
@@ -871,14 +912,44 @@ the caret rectangle when the compositor provides the protocol. Candidate
 placement with an installed IME remains unverified; X11 candidate placement
 at the caret is not implemented.
 
+Its trees' surfaces are platform popups (`host_popups.cst`, tested by
+`host_popup_x11_test` under Xvfb, `host_popup_wayland_test` on a Weston with
+its desktop shell nested in Xvfb, and `host_popup_win32_test` on Wine at 96
+and 144 dpi, each with the platform's own input playing the user; the
+platform's popups themselves by `window/`'s `popup_*_test`, Wayland's at
+scales 1 and 2): an override-redirect window with the pointer
+and keyboard grabbed on X11 — the press's implicit XI2 grab let go of first
+—, an `xdg_popup` grabbing under the seat's latest press or key on Wayland, a
+`WS_POPUP` tool window never activated, owned and capturing the mouse, on
+Windows. A menu taller than its window reaches past its edge and an item
+there is chosen by a click; a press on the desktop or another program takes
+it down, the press spent; a submenu is a popup of its menu's; the pointer
+reaching another title of a menu bar opens that one; a combo box's list drops
+past the window's bottom and a row there is chosen; a tooltip reaches past
+the window's edge and a press on it goes to what is beneath; a popover points
+at its button, its shadow and corners seen through where they can be. Their
+input reaches the window's router in its coordinates; the window stays the
+active one while a popup has the keyboard; a button held when its popup
+closed is let go of even where its release comes nowhere; the window moved,
+minimized or closed moves or closes them. Weston refuses a grab under a key's
+serial, so a popup opened by a key is opened there again without one, closed
+when the window stops being active. A combo box typed into keeps the keys and
+the input method with its entry while its list is shown, in a popup taking
+no grab (`ime_x11_test` with Fcitx5, `ime_wayland_test` on KWin, whose
+text-input-v3 Weston 15 does not have, with and without Fcitx5).
+
 **A program started** (`program.cst`, tested by `program_x11_test` under
 Xvfb on a bare private bus, and with none; its fonts by `system_fonts_test`
 over the test fonts): a window of text in the fonts found, run until it is
 closed, everything let go after.
 
 **The examples** (`examples/settings_form.cst`, `text_editor.cst`,
-`file_browser.cst`, each checked by its own `--check` under Xvfb and its
-links by `check_needed.sh`): the three programs above. What they asked of
+`file_browser.cst`, each checked by its own `--check` under Xvfb, on a Weston
+nested in Xvfb and on Wine, and its links by `check_needed.sh`): the three
+programs above, driven by the system's own input (`examples/user_input.cst`:
+XSendEvent on X, the X server's XTest through `xdotool` for the nested
+Weston, SendInput on Windows), each opening a field's menu in a window made
+small — no smaller than its floor — past the window's bottom. What they asked of
 the toolkit is in it now: a text view's and an entry's edit actions for a
 program's own Edit menu (`can`, `act`), a window closed from inside its own
 event closing after it, `host.present`, a file link's path

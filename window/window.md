@@ -708,6 +708,12 @@ where said:
   ceiling kept together so neither request erases the other, read back from
   the server; a fixed window keeps its size as both. Tested by `x11/wm_test`
   and `device_x11_test`.
+- A size asked for (`set_size`, physical pixels): of the window manager on
+  X11 and of the system on Windows, the size arriving as a `RESIZE`; on
+  Wayland a floating window's size is its own to choose, so it is made so at
+  once within its floor and ceiling — its `RESIZE` with the next events, the
+  next frame drawn at it — and refused (0) while the compositor sizes it:
+  maximized, full screen, tiled. Tested by `wayland/backend_test`.
 
 **Where fonts are** (`fonts.cst`), for [`../text/fonts`](../text/fonts/fonts.md):
 the system's and the user's font directories, and where the font index is

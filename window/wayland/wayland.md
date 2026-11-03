@@ -200,7 +200,10 @@ late events for released keyboards or data sources close their descriptors.
 Connection state is single-threaded: open, pump and close from the owning
 application loop. A normal buffer grows to the toolkit's published minimum
 when the compositor leaves sizing to the client; maximize/fullscreen sizing
-remains compositor-controlled.
+remains compositor-controlled. A floating window is sized by the client when
+asked (`set_size`): made so at once within its floor and ceiling, a `RESIZE`
+queued, the next buffer at that size; refused while maximized, full screen
+or tiled.
 
 Optional globals degrade independently. Clipboard and DnD require
 `wl_data_device_manager`; primary selection requires
@@ -247,7 +250,8 @@ clipboard/DnD and text-input-v3 through internal wire tests and against
 other programs on KWin, opens and presents windows on Weston at scale 1 and
 2, and runs the toolkit application loop. Native regressions cover
 parent/child and independent-window lifetimes, abandoned acquisitions,
-presentation permits, maximize/fullscreen frames and normal-size restoration.
+presentation permits, maximize/fullscreen frames and normal-size restoration,
+and a floating window sized by the client, never below its floor.
 The toolkit regression checks that dialogs fit their native buffer and stay
 below their client-side header. The headless Weston has no keyboard/pointer
 seat; installed IME interaction is the separate KWin and Fcitx5 gate.
@@ -318,7 +322,8 @@ an XTest pointer from one to the other, parent and child both take the new
 scale and are shown at it.
 
 A separate Weston/X11 software-rendering smoke uses a real compositor seat,
-with XTest keyboard and pointer input. The editor accepts typing and Ctrl+A,
+with XTest keyboard and pointer input; the three examples' own `--check` run
+there too (`test-wayland`), their input the X server's through `xdotool`. The editor accepts typing and Ctrl+A,
 opens Preferences with Ctrl+, and resumes input after its dialog is closed.
 The settings form accepts text and Tab; header maximize/restore preserves
 its original buffer size. The browser accepts an edited directory path and
