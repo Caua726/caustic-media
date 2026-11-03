@@ -12,10 +12,15 @@
 // a connection of their own (XSendEvent) — only libX11, which every example
 // links already. On Windows they are SendInput's, a keyboard's and a mouse's
 // as Windows takes them from the devices, the pointer placed over the window
-// in the screen's coordinates. Modifiers are named as the toolkit names them
-// (input/keys.cst) and sent as each system's.
+// in the screen's coordinates. On Wayland — a Weston nested in an X server,
+// as the checks run it — they are the X server's own (XTest, through
+// xdotool, so that no example links libXtst), which Weston takes as its
+// seat's from the X window it shows its output in: the program's window found
+// there first (locate), by where the pointer is heard. Modifiers are named as
+// the toolkit names them (input/keys.cst) and sent as each system's.
 use "std/os.cst" as os;
 use "std/mem.cst" as mem;
+use "std/process.cst" as process;
 use "../window/device.cst" as device;
 use "../input/keys.cst" as keys;
 use "../window/x11/x11.cst" as x11;
@@ -32,9 +37,17 @@ let is u32 as WHEEL_DOWN with imut = 5;
 
 struct Sender {
     d    as *u8;   // X: a connection of its own, as another client's
-    xid  as i64;   // the program's window
+    xid  as i64;   // the program's window; Wayland: the window Weston shows its output in
     hwnd as i64;   // Windows: the program's window, 0 when there is none
+    wl   as i32;   // Wayland, through the X server Weston is nested in
+    _pad0 as i32;
+    ox   as i64;   // Wayland: where the program's window is on the X screen
+    oy   as i64;
 }
+
+// Whether the program heard the pointer: cb(user, &x, &y), 1 and where in
+// its window (physical pixels), 0 when it is not over it. See locate.
+type HeardFn = fn(*u8, *i64, *i64) as i32;
 
 // What sends to w, the program's window: nothing is sent when its system
 // could not be reached.
@@ -43,10 +56,32 @@ fn open(w as *device.Window) as Sender {
     s.d = cast(*u8, 0);
     s.xid = 0;
     s.hwnd = 0;
+    s.wl = 0;
+    s._pad0 = 0;
+    s.ox = 0;
+    s.oy = 0;
     if (os.current() == os.OS_WINDOWS) {
         s.hwnd = win32.hwnd(&w.win32_win);
         // SendInput goes where the keyboard is: to it.
         u.SetForegroundWindow(s.hwnd);
+        return s;
+    }
+    if (os.current() == os.OS_LINUX && w.backend == device.WAYLAND) {
+        s.d = xlib.XOpenDisplay(cast(*u8, 0));
+        if (cast(i64, s.d) == 0) { return s; }
+        s.xid = _weston(s.d);
+        s.wl = 1;
+        // Where Weston's window is on the X screen: the program's is found
+        // from there.
+        let is i32 as rx with mut = 0;
+        let is i32 as ry with mut = 0;
+        let is i64 as child with mut = 0;
+        if (s.xid != 0) {
+            xlib.XTranslateCoordinates(s.d, s.xid, xlib.XDefaultRootWindow(s.d), 0, 0, cast(*u8, &rx), cast(*u8, &ry),
+                                       cast(*u8, &child));
+        }
+        s.ox = cast(i64, rx);
+        s.oy = cast(i64, ry);
         return s;
     }
     if (os.current() == os.OS_LINUX) {
@@ -60,6 +95,178 @@ fn close(s as *Sender) as void {
     if (os.current() == os.OS_LINUX && cast(i64, s.d) != 0) { xlib.XCloseDisplay(s.d); }
     s.d = cast(*u8, 0);
     s.hwnd = 0;
+}
+
+// Whether the program's window is the one in front, where keys typed go: on
+// Windows, where SendInput types into whichever window that is; elsewhere
+// the keys are sent to the window itself, and it always is.
+fn in_front(s as *Sender) as i32 {
+    if (os.current() == os.OS_WINDOWS) { return cast(i32, s.hwnd != 0 && u.GetForegroundWindow() == s.hwnd); }
+    return 1;
+}
+
+// The window in front closed when it is another program's — one a file was
+// opened in — as the user closes it to go back to the program, which Windows
+// then brings to the front: a program cannot take the front from another
+// itself. On Windows; elsewhere nothing to do.
+fn close_front(s as *Sender) as void {
+    if (os.current() != os.OS_WINDOWS || s.hwnd == 0) { return; }
+    let is i64 as fg = u.GetForegroundWindow();
+    if (fg != 0 && fg != s.hwnd) { u.PostMessageW(fg, cast(u32, t.WM_CLOSE), cast(u64, 0), 0); }
+}
+
+// The X window a nested Weston shows its output in: the root's child named
+// so; 0 for none.
+fn _weston(d as *u8) as i64 {
+    let is i64 as root_ret with mut = 0;
+    let is i64 as parent_ret with mut = 0;
+    let is *i64 as kids with mut = cast(*i64, 0);
+    let is i32 as n with mut = 0;
+    xlib.XQueryTree(d, xlib.XDefaultRootWindow(d), cast(*u8, &root_ret), cast(*u8, &parent_ret), cast(*u8, &kids), cast(*u8, &n));
+    let is i64 as found with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < n && found == 0) {
+        let is *u8 as title with mut = cast(*u8, 0);
+        let is i64 as ty with mut = 0;
+        let is i32 as fmt with mut = 0;
+        let is i64 as k with mut = 0;
+        let is i64 as after with mut = 0;
+        xlib.XGetWindowProperty(d, kids[i], xlib.XInternAtom(d, "_NET_WM_NAME", 0), 0, 64, 0, 0, cast(*u8, &ty),
+                                cast(*u8, &fmt), cast(*u8, &k), cast(*u8, &after), cast(*u8, &title));
+        if (cast(i64, title) != 0) {
+            let is i64 as j with mut = 0;
+            while (j + 5 <= k && found == 0) {
+                if (title[j] == cast(u8, 101) && title[j + 1] == cast(u8, 115) && title[j + 2] == cast(u8, 116) &&
+                    title[j + 3] == cast(u8, 111) && title[j + 4] == cast(u8, 110)) { found = kids[i]; }
+                j = j + 1;
+            }
+            xlib.XFree(title);
+        }
+        i = i + 1;
+    }
+    if (cast(i64, kids) != 0) { xlib.XFree(cast(*u8, kids)); }
+    return found;
+}
+
+// On Wayland: the pointer moved over Weston's output until the program hears
+// it (heard), which says where its window is there. 1 when found, or
+// elsewhere, where there is nothing to find.
+fn locate(s as *Sender, heard as HeardFn, user as *u8) as i32 {
+    if (os.current() != os.OS_LINUX || s.wl == 0) { return 1; }
+    if (cast(i64, s.d) == 0 || s.xid == 0) { return 0; }
+    if (os.current() == os.OS_LINUX) { return _locate_x(s, heard, user); }
+    return 0;
+}
+
+fn _locate_x(s as *Sender, heard as HeardFn, user as *u8) as i32 {
+    let is xlib.XWindowAttributes as wa;
+    xlib.XGetWindowAttributes(s.d, s.xid, cast(*u8, &wa));
+    let is i64 as gy with mut = 30;
+    while (gy < cast(i64, wa.height)) {
+        let is i64 as gx with mut = 30;
+        while (gx < cast(i64, wa.width)) {
+            _xdo_move(s.ox + gx, s.oy + gy);
+            let is i64 as px with mut = 0;
+            let is i64 as py with mut = 0;
+            if (call(heard, user, &px, &py) == 1) {
+                s.ox = s.ox + gx - px;
+                s.oy = s.oy + gy - py;
+                return 1;
+            }
+            gx = gx + 60;
+        }
+        gy = gy + 60;
+    }
+    return 0;
+}
+
+// --- Wayland: the X server's own input, through xdotool ---
+
+fn _digits(v as i64, out as *u8) as void {
+    let is [24]u8 as r;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    let is i32 as neg = cast(i32, x < 0);
+    if (neg == 1) { x = 0 - x; }
+    if (x == 0) { r[0] = cast(u8, 48); n = 1; }
+    while (x > 0) {
+        r[n] = cast(u8, 48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    let is i64 as o with mut = 0;
+    if (neg == 1) { out[0] = cast(u8, 45); o = 1; }
+    while (n > 0) {
+        n = n - 1;
+        out[o] = r[n];
+        o = o + 1;
+    }
+    out[o] = cast(u8, 0);
+}
+
+// xdotool with up to four arguments, waited for.
+fn _xdo(a as *u8, b as *u8, c as *u8, d as *u8) as void {
+    let is [6]*u8 as argv;
+    argv[0] = "xdotool";
+    argv[1] = a;
+    argv[2] = b;
+    argv[3] = c;
+    argv[4] = d;
+    argv[5] = cast(*u8, 0);
+    let is i64 as pid = process.spawnp("xdotool", cast(*u8, &argv));
+    if (pid > 0) { process.wait_pid(pid); }
+}
+
+fn _xdo_move(x as i64, y as i64) as void {
+    let is [24]u8 as xs;
+    let is [24]u8 as ys;
+    _digits(x, cast(*u8, &xs));
+    _digits(y, cast(*u8, &ys));
+    _xdo("mousemove", cast(*u8, &xs), cast(*u8, &ys), cast(*u8, 0));
+}
+
+fn _put_s(out as *u8, o as i64, t as *u8) as i64 {
+    let is i64 as k with mut = 0;
+    while (t[k] != 0) {
+        out[o + k] = t[k];
+        k = k + 1;
+    }
+    return o + k;
+}
+
+// "ctrl+shift+" and the rest of mods, into out at o; where it ends.
+fn _mod_names(mods as i32, out as *u8, o as i64) as i64 {
+    let is i64 as k with mut = o;
+    if ((mods & keys.MOD_CONTROL) != 0) { k = _put_s(out, k, "ctrl+"); }
+    if ((mods & keys.MOD_SHIFT) != 0) { k = _put_s(out, k, "shift+"); }
+    if ((mods & keys.MOD_ALT) != 0) { k = _put_s(out, k, "alt+"); }
+    if ((mods & keys.MOD_SUPER) != 0) { k = _put_s(out, k, "super+"); }
+    return k;
+}
+
+// The key of keysym with mods held: "ctrl+0x73".
+fn _xdo_key(keysym as i64, mods as i32) as void {
+    let is [64]u8 as name;
+    let is *u8 as p = cast(*u8, &name);
+    let is i64 as k with mut = _mod_names(mods, p, 0);
+    k = _put_s(p, k, "0x");
+    let is *u8 as hex = "0123456789abcdef";
+    let is [16]u8 as hx;
+    let is i64 as n with mut = 0;
+    let is i64 as v with mut = keysym;
+    if (v == 0) { hx[0] = cast(u8, 48); n = 1; }
+    while (v > 0) {
+        hx[n] = hex[v & 15];
+        v = v >> 4;
+        n = n + 1;
+    }
+    while (n > 0) {
+        n = n - 1;
+        p[k] = hx[n];
+        k = k + 1;
+    }
+    p[k] = cast(u8, 0);
+    _xdo("key", p, cast(*u8, 0), cast(*u8, 0));
 }
 
 // --- Windows ---
@@ -197,6 +404,10 @@ fn key(s as *Sender, keysym as i64, mods as i32) as void {
         _mods(mods, 1);
         return;
     }
+    if (os.current() == os.OS_LINUX && s.wl == 1) {
+        _xdo_key(keysym, mods);
+        return;
+    }
     if (os.current() == os.OS_LINUX) { _key(s, keysym, _state(mods)); }
 }
 
@@ -245,6 +456,28 @@ fn type_text(s as *Sender, text as *u8) as void {
         return;
     }
     if (cast(i64, s.d) == 0) { return; }
+    if (s.wl == 1) {
+        // Typed a line at a time; a line feed is the Return key.
+        let is [256]u8 as line;
+        let is i64 as j with mut = 0;
+        let is i64 as n with mut = 0;
+        while (text[j] != 0) {
+            if (text[j] == cast(u8, 10) || n == 255) {
+                line[n] = cast(u8, 0);
+                if (n > 0) { _xdo("type", "--delay", "15", cast(*u8, &line)); }
+                n = 0;
+                if (text[j] == cast(u8, 10)) { _xdo_key(cast(i64, keys.RETURN), 0); }
+                else { line[n] = text[j]; n = 1; }
+            } else {
+                line[n] = text[j];
+                n = n + 1;
+            }
+            j = j + 1;
+        }
+        line[n] = cast(u8, 0);
+        if (n > 0) { _xdo("type", "--delay", "15", cast(*u8, &line)); }
+        return;
+    }
     let is i64 as i with mut = 0;
     while (text[i] != 0) {
         let is i64 as ks with mut = cast(i64, text[i]);
@@ -264,6 +497,10 @@ fn move(s as *Sender, px as i64, py as i64) as void {
         return;
     }
     if (cast(i64, s.d) == 0) { return; }
+    if (s.wl == 1) {
+        _xdo_move(s.ox + px, s.oy + py);
+        return;
+    }
     let is xev.XEvent as m;
     xev.clear(&m);
     let is *xev.XMotionEvent as e = xev.motion(&m);
@@ -299,6 +536,20 @@ fn button(s as *Sender, b as u32, px as i64, py as i64, mods as i32) as void {
         return;
     }
     if (cast(i64, s.d) == 0) { return; }
+    if (s.wl == 1) {
+        _xdo_move(s.ox + px, s.oy + py);
+        let is [64]u8 as held;
+        let is i64 as hk = _mod_names(mods, cast(*u8, &held), 0);
+        if (hk > 0) {
+            held[hk - 1] = cast(u8, 0);
+            _xdo("keydown", cast(*u8, &held), cast(*u8, 0), cast(*u8, 0));
+        }
+        let is [8]u8 as bs;
+        _digits(cast(i64, b), cast(*u8, &bs));
+        _xdo("click", cast(*u8, &bs), cast(*u8, 0), cast(*u8, 0));
+        if (hk > 0) { _xdo("keyup", cast(*u8, &held), cast(*u8, 0), cast(*u8, 0)); }
+        return;
+    }
     let is xev.XEvent as m;
     xev.clear(&m);
     let is *xev.XButtonEvent as e = xev.button(&m);

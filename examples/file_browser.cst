@@ -3,6 +3,9 @@
 //   caustic -q examples/file_browser.cst -o build/file_browser --path .caustic/deps
 //   ./build/file_browser [folder]
 //   sh window/x11/tools/run_headless.sh ./build/file_browser --check
+//   sh window/x11/tools/run_headless.sh env WESTON_BACKEND=x11 \
+//       sh window/wayland/tools/run_wayland.sh ./build/file_browser --check
+//   sh tools/run_wine_desktop.sh build/file_browser.exe --check
 //
 // Folders on one side as a tree, opened as they are asked for; the folder
 // chosen on the other as a table — name, size, when it changed; above them,
@@ -18,7 +21,8 @@
 //   - a message box when a folder cannot be read, the about dialog.
 //
 // --check drives it over a folder made in build/, the file it opens handed
-// to a stand-in xdg-open (ui/testdata/bin, first on the path).
+// to a stand-in xdg-open (ui/testdata/bin, first on the path) — on Windows
+// to the shell, the program it opens in closed again.
 use "std/io.cst" as io;
 use "std/env.cst" as env;
 use "std/mem.cst" as mem;
@@ -28,6 +32,8 @@ use "../sys/file.cst" as file;
 use "../window/folders.cst" as folders;
 use "../window/event.cst" as wevent;
 use "../input/keys.cst" as keys;
+use "../math/math.cst" as math;
+use "../window/device.cst" as device;
 use "../ui/ui.cst" as ui;
 use "user_input.cst" as xin;
 
@@ -539,10 +545,71 @@ fn opened_said() as i64 {
     return cast(i64, ends_with(cast(*u8, &b), n, "/browser_check/b%20c.txt"));
 }
 
+// The lowest edge of what is up in a popup of its own, window coordinates;
+// -1 for none up.
+fn _popup_bottom(t as *ui.tree.Tree) as f64 {
+    let is f64 as most with mut = 0.0 - 1.0;
+    let is i64 as s with mut = 0;
+    while (s < ui.tree.MAX_SURFACES) {
+        if (ui.tree.surface_widget(t, s) != 0) {
+            let is math.rect.Rect as r = ui.tree.surface_rect(t, s);
+            if (r.y + r.h > most) { most = r.y + r.h; }
+        }
+        s = s + 1;
+    }
+    return most;
+}
+
+// On Wayland: whether the window has the pointer, and where (physical
+// pixels), the loop run a little first — what locate asks.
+fn _heard(user as *u8, px as *i64, py as *i64) as i32 {
+    rounds(1);
+    let is *ui.router.Router as hr = ui.app.router(br.a, br.win);
+    if (hr.pointer_in == 0) { return 0; }
+    let is f64 as hsc = ui.app.scale(br.a, br.win);
+    *px = cast(i64, hr.pointer_x * hsc + 0.5);
+    *py = cast(i64, hr.pointer_y * hsc + 0.5);
+    return 1;
+}
+
+// A window made small — no smaller than its content lets it, as a window
+// manager keeps it — and the menu of a field low in it opened by the right
+// button: in a popup of its own, past the window's bottom; Escape closes it.
+fn small_window_menu(field as i64) as void {
+    let is *device.Window as nw = ui.host.native(br.hs, br.win);
+    let is i64 as was_w = device.width(nw);
+    let is i64 as was_h = device.height(nw);
+    let is f64 as sc = ui.app.scale(br.a, br.win);
+    let is ui.geom.Size as least;
+    ui.layout.min_size(br.t, &least);
+    let is i64 as sw with mut = cast(i64, 420.0 * sc);
+    let is i64 as sh with mut = cast(i64, 150.0 * sc);
+    if (sw < cast(i64, least.min_w * sc) + 1) { sw = cast(i64, least.min_w * sc) + 1; }
+    if (sh < cast(i64, least.min_h * sc) + 1) { sh = cast(i64, least.min_h * sc) + 1; }
+    device.set_size(nw, sw, sh);
+    rounds(6);
+    let is math.rect.Rect as fr = ui.layout.window_rect(br.t, field);
+    let is i64 as x = cast(i64, (fr.x + 8.0) * sc);
+    let is f64 as down with mut = fr.h / 2.0;
+    if (down > 12.0) { down = 12.0; }
+    let is i64 as y = cast(i64, (fr.y + down) * sc);
+    xin.move(&xs, x, y);
+    xin.button(&xs, cast(u32, 3), x, y, 0);
+    rounds(4);
+    expect("a small window: a field's menu in a popup of its own, past the window's bottom",
+           _popup_bottom(br.t) > ui.app.height(br.a, br.win));
+    xin.key(&xs, cast(i64, keys.ESCAPE), 0);
+    rounds(3);
+    expect("closed by Escape: no popup up", _popup_bottom(br.t) < 0.0);
+    device.set_size(nw, was_w, was_h);
+    rounds(6);
+}
+
 fn drive() as void {
     rounds(6);
     expect("on the screen", ui.host.shown(br.hs) == 1);
     xs = xin.open(ui.host.native(br.hs, br.win));
+    expect("its window found to send to", xin.locate(&xs, fn_ptr(_heard), cast(*u8, 0)) == 1);
     expect("the folder: its two, the hidden one not", ui.dirmodel.count(br.dir) == 2 && row_named("a") >= 0 &&
            row_named("b c.txt") >= 0 && row_named(".hidden") < 0);
     expect("said in the status bar, the title its name", status_is("2 items") == 1 &&
@@ -592,11 +659,22 @@ fn drive() as void {
     ui.listview.set_cursor(br.t, br.list, row_named("b c.txt"));
     key(keys.RETURN, 0);
     expect("a file activated: handed to the desktop as a link, escaped", br.opened == 1 && opened_said() == 1);
+    // On Windows the shell opened it in a program of its own, which comes up
+    // in front: the user closes it to go back to the browser before typing.
+    if (os.current() == os.OS_WINDOWS) {
+        let is i64 as until with mut = time.now_ms() + 5000;
+        while (xin.in_front(&xs) == 1 && time.now_ms() < until) { rounds(1); }
+        xin.close_front(&xs);
+        until = time.now_ms() + 5000;
+        while (xin.in_front(&xs) == 0 && time.now_ms() < until) { rounds(1); }
+        expect("the program it opened in closed: the browser in front again", xin.in_front(&xs) == 1);
+    }
     show_about();
     rounds(2);
     expect("its about dialog", ui.dialog.ref_valid(&br.about) == 1 && ui.dialog.is_shown(br.about.t, br.about.w) == 1);
     ui.dialog.respond(br.about.t, br.about.w, ui.dialog.CLOSE);
     rounds(1);
+    small_window_menu(br.path);
     key(keys.Q, keys.MOD_CONTROL);
     rounds(2);
     expect("Ctrl+Q: closed", ui.host.shown(br.hs) == 0);
