@@ -84,10 +84,11 @@ entry that grows, a popover over a button a resize moved). Its damage is a
 region of its own, in window coordinates and clipped to it, and none of it
 the window's even where it lies over the window; a scroll area inside it
 moves its pixels (`tree.shift_surface`), and one in the window under it the
-window's, which a popup drawn inside the window would have refused.
+window's, which a popup drawn inside the window would have refused; it holds
+`tree.MAX_DAMAGE` rectangles at most, as the window's does.
 `paint.frame_surface` paints it on its own canvas from its origin, pixel for
-pixel as it is painted inside the window, at any scale; the window is painted
-without it; what it leaves unpainted is nothing where its window is seen
+pixel as it is painted inside the window, at any scale — a cached widget
+and a faded one inside it too; the window is painted without it; what it leaves unpainted is nothing where its window is seen
 through (`tree.surface_see_through`) and the window's colour where not. The
 router takes its input in window coordinates — a point past the window's
 edges is the popup's when it lies in one — moving between it and the window
@@ -928,10 +929,15 @@ reaching another title of a menu bar opens that one; a combo box's list drops
 past the window's bottom and a row there is chosen; a tooltip reaches past
 the window's edge and a press on it goes to what is beneath; a popover points
 at its button, its shadow and corners seen through where they can be. Their
-input reaches the window's router in its coordinates; the window stays the
-active one while a popup has the keyboard; a button held when its popup
-closed is let go of even where its release comes nowhere; the window moved,
-minimized or closed moves or closes them. Weston refuses a grab under a key's
+input reaches the window's router in its coordinates, and the pointer's
+shape over one is what is under it there (`host.popup_pointer_shape`); the
+window stays the active one while a popup has the keyboard; a button held
+when its popup closed is let go of even where its release comes nowhere; a
+press on the desktop takes a submenu down before its menu; the title bar's
+right button opens the window's own menu in a popup; the window moved, it
+moves them; no longer active, what holds no grab — a tooltip — goes, the
+platform taking grabbing ones down itself; minimized, hidden or closed,
+nothing of it stays up. Weston refuses a grab under a key's
 serial, so a popup opened by a key is opened there again without one, closed
 when the window stops being active. A combo box typed into keeps the keys and
 the input method with its entry while its list is shown, in a popup taking
