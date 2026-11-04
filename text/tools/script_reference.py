@@ -30,6 +30,8 @@ LICENCES = os.path.join(HERE, "..", "testdata", "licenses", "scripts.txt")
 OFL_TEXT_FROM = "/usr/share/licenses/inter-font/LICENSE.txt"
 OUT = os.path.join(HERE, "..", "testdata", "scripts")
 NOTO = "/usr/share/fonts/noto"
+NOTO_CJK = "/usr/share/fonts/noto-cjk"
+KOREAN_FACE = 1    # of the collection: Noto Sans CJK KR
 SCRIPTS_TXT = os.path.expanduser("~/.cache/caustic-media/registry/Scripts.txt")
 
 BOT = 1
@@ -72,7 +74,7 @@ FONTS = [
     ("Telu", "ltr", "te", "NotoSansTelugu-Regular.ttf"), ("Knda", "ltr", "kn", "NotoSansKannada-Regular.ttf"),
     ("Mlym", "ltr", "ml", "NotoSansMalayalam-Regular.ttf"),
     ("Thai", "ltr", "th", "NotoSansThai-Regular.ttf"), ("Laoo", "ltr", "lo", "NotoSansLao-Regular.ttf"),
-    ("Hang", "ltr", "ko", "NotoSansKR-Regular.ttf"),
+    ("Hang", "ltr", "ko", "NotoSansCJK-Regular.ttc"),
     ("Khmr", "ltr", "km", "NotoSansKhmer-Regular.ttf"), ("Mymr", "ltr", "my", "NotoSansMyanmar-Regular.ttf"),
     ("Tibt", "ltr", "bo", "NotoSerifTibetan-Regular.ttf"), ("Sinh", "ltr", "si", "NotoSansSinhala-Regular.ttf"),
     ("Bali", "ltr", None, "NotoSansBalinese-Regular.ttf"), ("Java", "ltr", None, "NotoSansJavanese-Regular.ttf"),
@@ -125,9 +127,13 @@ def script_chars():
 
 
 def cut_down(path, chars, out):
-    font = TTFont(path)
+    font = source(path)
     have = font.getBestCmap()
     keep = sorted(u for u in chars if u in have)
+    # Of Hangul the jamo, and of its syllables a slice: what is left out of the
+    # font is what a shaper has to take apart, and the rest are like these.
+    if path.endswith(".ttc"):
+        keep = [u for u in keep if u < 0xAC00 or u >= 0xD7B0 or u < 0xAC00 + 28 * 21 * 2]
     for extra in (0x20, 0xA0, 0x200C, 0x200D, 0x25CC, 0x2010, 0x2011, 0x640, 0xFE00):
         if extra in have:
             keep.append(extra)
@@ -150,6 +156,13 @@ def cut_down(path, chars, out):
             rec.string = rec.toUnicode().replace("Noto", "CausticTest")
     font.save(out)
     return keep
+
+
+def source(path):
+    # The source's own date kept: made again, a font is the same bytes.
+    if path.endswith(".ttc"):
+        return TTFont(path, fontNumber=KOREAN_FACE, recalcTimestamp=False)
+    return TTFont(path, recalcTimestamp=False)
 
 
 def write_licences(copyrights):
@@ -204,14 +217,14 @@ def main():
     names = []
     copyrights = []
     for code, direction, lang, filename in FONTS:
-        path = os.path.join(NOTO, filename)
+        path = os.path.join(NOTO_CJK if filename.endswith(".ttc") else NOTO, filename)
+        # Each script's own: none left out for want of its font.
         if not os.path.exists(path):
-            print("no", filename)
-            continue
+            raise SystemExit("no " + filename)
         stem = os.path.splitext(filename)[0]
-        name = stem + ".ttf"
+        name = stem + (".otf" if filename.endswith(".ttc") else ".ttf")
         keep = cut_down(path, chars.get(code, []), os.path.join(OUT, name))
-        copyrights.append(TTFont(path)["name"].getDebugName(0) or "")
+        copyrights.append(source(path)["name"].getDebugName(0) or "")
         rng = random.Random(code)
         texts = words_of(code, lang) + made_up(rng, keep, 300)
         # A sentence, and a text starting with what needs a base.
