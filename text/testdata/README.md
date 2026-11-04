@@ -74,4 +74,7 @@ python3 text/tools/sfnt_reference.py
 fonts cut down to their scripts with `text/tools/script_reference.py`, renamed the same
 way (the files keep the names they came with), with what HarfBuzz makes of words and
 made-up strings in them (`.shape.ref`). Their licence, the one over them all with each
-font's copyright line, is `licenses/scripts.txt`.
+font's copyright line, is `licenses/scripts.txt`. Those not named Noto are made by the
+same tool, a box for each character and no tables of layout, for what a font with
+nothing does: Thai through its private use forms, Arabic through its presentation
+forms, Hangul composed or taken apart, every kind of mark placed.

@@ -211,6 +211,237 @@ def shape(blob, text, code, direction, lang, flags):
             for i, p in zip(buf.glyph_infos or [], buf.glyph_positions or [])]
 
 
+def write_reference(name, stem, code, direction, lang, texts):
+    blob = hb.Blob.from_file_path(os.path.join(OUT, name))
+    lines = ["# %s shaped by HarfBuzz %s; see text/tools/script_reference.py" % (name, hb.version_string())]
+    n = 0
+    for t in texts:
+        data = t.encode("utf-8")
+        glyphs = shape(blob, t, code, direction, lang, BOT)
+        lines += ["case " + code + " " + str(n), "face 0", "text " + " ".join("%02x" % b for b in data),
+                  "item 0 -1", "props %s %s %s" % (direction, code, lang or "-"), "flags start", "features 0",
+                  "variations 0", "glyphs %d" % len(glyphs)] + glyphs
+        n += 1
+    with open(os.path.join(OUT, stem + ".shape.ref"), "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return n
+
+
+# --- Fonts made here: what no Noto font is ---
+
+def made_font(path, chars):
+    # A box for each character, none with a table of layout: told apart by width,
+    # for the positions as well as the glyphs to say which was chosen.
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    fb = FontBuilder(1000, isTTF=True)
+    chars = sorted(set(chars))
+    names = [".notdef"] + ["u%04X" % c for c in chars]
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({c: "u%04X" % c for c in chars})
+    glyphs = {}
+    metrics = {}
+    for i, n in enumerate(names):
+        width = 300 + (i * 7) % 400
+        # Its side bearing and height its own too: a place worked out from them shows it.
+        left = 10 + (i * 11) % 60
+        top = 400 + (i * 13) % 300
+        bottom = (i * 17) % 90 - 40
+        pen = TTGlyphPen(None)
+        pen.moveTo((left, bottom))
+        pen.lineTo((left, top))
+        pen.lineTo((width - 20, top))
+        pen.lineTo((width - 20, bottom))
+        pen.closePath()
+        glyphs[n] = pen.glyph()
+        metrics[n] = (width, left)
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics(metrics)
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "Caustic Test Made", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.save(path)
+
+
+THAI_CONSONANTS = [0xE01, 0xE1B, 0xE1D, 0xE1F, 0xE0D, 0xE10, 0xE0E, 0xE0F, 0xE2E, 0xE2F, 0xE40, 0x61]
+THAI_MARKS = [0xE31, 0xE34, 0xE35, 0xE36, 0xE37, 0xE47, 0xE4D, 0xE4E, 0xE38, 0xE39, 0xE3A, 0xE48, 0xE49, 0xE4A, 0xE4B, 0xE4C]
+# The private use forms of Windows' fonts, and of Apple's.
+THAI_WINDOWS = list(range(0xF700, 0xF71B))
+THAI_APPLE = list(range(0xF884, 0xF89F))
+
+
+def thai_texts():
+    # Every consonant under every mark, and two and three of them, the second
+    # the kind of each, with SARA AM among them: every state and every move.
+    out = []
+    for c in THAI_CONSONANTS:
+        for m in THAI_MARKS:
+            out.append(chr(c) + chr(m))
+            out.append(chr(c) + chr(m) + "\u0e33")
+            for k in THAI_MARKS:
+                out.append(chr(c) + chr(m) + chr(k))
+    rng = random.Random("Thai made")
+    for _ in range(300):
+        out.append(chr(rng.choice(THAI_CONSONANTS)) + "".join(chr(rng.choice(THAI_MARKS)) for _ in range(rng.randint(3, 5))))
+    return out
+
+
+def forms_singles():
+    # The presentation forms that are one letter.
+    import unicodedata
+    out = []
+    for u in list(range(0xFB50, 0xFE00)) + list(range(0xFE70, 0xFEFF)):
+        d = unicodedata.decomposition(chr(u)).split()
+        if len(d) == 2 and d[0].startswith("<"):
+            out.append("%x" % u)
+    return out
+
+
+ARABIC_LETTERS = list(range(0x621, 0x64B)) + [0x67E, 0x686, 0x698, 0x6AF, 0x6A9, 0x6CC, 0x6C1, 0x6D2]
+ARABIC_MARKS = list(range(0x64B, 0x653)) + [0x670]
+ZW = [0x200C, 0x200D]
+
+
+def arabic_texts():
+    # Letters joined every way, the lams before the alefs, marks and the zero
+    # widths between them.
+    rng = random.Random("Arabic made")
+    out = []
+    lam, alefs = 0x644, [0x622, 0x623, 0x625, 0x627]
+    for a in alefs:
+        out += [chr(lam) + chr(a), chr(0x628) + chr(lam) + chr(a), chr(lam) + chr(0x651) + chr(a), chr(lam) + chr(0x200D) + chr(a)]
+    # Every pair and three that has a ligature, alone and between letters that join.
+    import unicodedata
+    seen = set()
+    for u in list(range(0xFB50, 0xFE00)) + list(range(0xFE70, 0xFEFF)):
+        d = unicodedata.decomposition(chr(u)).split()
+        if len(d) >= 3 and d[0].startswith("<"):
+            parts = [int(x, 16) for x in d[1:]]
+            if all(unicodedata.category(chr(p)) == "Lo" for p in parts) and tuple(parts) not in seen:
+                seen.add(tuple(parts))
+                word = "".join(chr(p) for p in parts)
+                out += [word, chr(0x628) + word, word + chr(0x628), chr(0x628) + word + chr(0x628)]
+    for parts in ((0x644, 0x644, 0x647), (0x644, 0x645, 0x62C)):
+        word = "".join(chr(p) for p in parts)
+        out += [word, chr(0x628) + word, word + chr(0x628), chr(0x628) + word + chr(0x628)]
+    for m in ARABIC_MARKS:
+        out.append(chr(0x628) + chr(m) + chr(0x651))
+        out.append(chr(0x628) + chr(0x651) + chr(m))
+        out.append(chr(0x628) + chr(0x640) + chr(m) + chr(0x651))
+    for _ in range(500):
+        t = []
+        for _ in range(rng.randint(1, 7)):
+            t.append(rng.choice(ARABIC_LETTERS))
+            if rng.random() < 0.2:
+                t.append(rng.choice(ARABIC_MARKS))
+            if rng.random() < 0.1:
+                t.append(rng.choice(ZW))
+        out.append("".join(chr(c) for c in t))
+    return out
+
+
+HANGUL_L = list(range(0x1100, 0x1113)) + [0x1113, 0x115E, 0xA960]
+HANGUL_V = list(range(0x1161, 0x1176)) + [0x1176, 0x11A2, 0xD7B0]
+HANGUL_T = list(range(0x11A8, 0x11C3)) + [0x11C3, 0x11FF, 0xD7CB]
+HANGUL_SYLLABLES = [0xAC00, 0xAC01, 0xAC1C, 0xAC1D, 0xAE68, 0xD788, 0xD7A3, 0xB098]
+HANGUL_OTHERS = [0x302E, 0x302F, 0x61, 0x25CC, 0x20]
+
+
+def hangul_texts():
+    # A syllable written every way, whole and in jamo, and jamo that make none,
+    # tone marks after each.
+    rng = random.Random("Hangul made")
+    out = []
+    for _ in range(600):
+        t = []
+        for _ in range(rng.randint(1, 3)):
+            kind = rng.randint(0, 4)
+            if kind == 0:
+                t += [rng.choice(HANGUL_L), rng.choice(HANGUL_V)]
+            elif kind == 1:
+                t += [rng.choice(HANGUL_L), rng.choice(HANGUL_V), rng.choice(HANGUL_T)]
+            elif kind == 2:
+                t += [rng.choice(HANGUL_SYLLABLES)]
+                if rng.random() < 0.5:
+                    t.append(rng.choice(HANGUL_T))
+            elif kind == 3:
+                t += [rng.choice(HANGUL_L + HANGUL_V + HANGUL_T)]
+            else:
+                t += [rng.choice(HANGUL_OTHERS)]
+        out.append("".join(chr(c) for c in t))
+    return out
+
+
+def marks_of_every_kind():
+    # Two of each category of mark and combining class there is.
+    import unicodedata
+    seen = {}
+    for u in range(0x300, 0x1E950):
+        c = chr(u)
+        cat = unicodedata.category(c)
+        if cat in ("Mn", "Mc", "Me"):
+            key = (cat, unicodedata.combining(c))
+            if len(seen.setdefault(key, [])) < 2:
+                seen[key].append(u)
+    return sorted(u for v in seen.values() for u in v)
+
+
+def mark_texts(marks, bases):
+    rng = random.Random("Marks made")
+    out = []
+    for b in bases:
+        for m in marks:
+            out.append(chr(b) + chr(m))
+    for _ in range(400):
+        out.append(chr(rng.choice(bases)) + "".join(chr(rng.choice(marks)) for _ in range(rng.randint(2, 4))))
+    for m in marks:
+        out.append(chr(m))
+        out.append(chr(m) + chr(rng.choice(marks)))
+    return out
+
+
+def made_fonts(names):
+    def made(stem, chars, code, direction, lang, texts):
+        name = stem + ".ttf"
+        made_font(os.path.join(OUT, name), chars)
+        n = write_reference(name, stem, code, direction, lang, texts)
+        names.append(name)
+        print(stem, n, "cases")
+    thai = list(range(0xE01, 0xE3B)) + list(range(0xE3F, 0xE5C)) + [0x20, 0x61]
+    made("thai-pua-windows", thai + THAI_WINDOWS, "Thai", "ltr", "th", thai_texts())
+    made("thai-pua-apple", thai + THAI_APPLE, "Thai", "ltr", "th", thai_texts())
+    made("thai-pua-none", thai, "Thai", "ltr", "th", thai_texts())
+    # Marks with nothing to place them: every kind, by the shapers that place them.
+    marks = marks_of_every_kind()
+    latin = [0x61, 0x6D, 0x69]
+    made("marks-latin", marks + latin + [0x20, 0x25CC], "Latn", "ltr", "en", mark_texts(marks, latin))
+    hebrew = [0x5D0, 0x5D1, 0x5D9]
+    made("marks-hebrew", marks + hebrew + [0x20, 0x25CC], "Hebr", "rtl", "he", mark_texts(marks, hebrew))
+    hangul = [0xAC00, 0xAC01, 0x61]
+    made("marks-hangul", marks + hangul + [0x20, 0x25CC], "Hang", "ltr", "ko", mark_texts(marks, hangul))
+    # Arabic with no features: drawn through what presentation forms it has.
+    arabic = list(range(0x621, 0x653)) + [0x670, 0x67E, 0x686, 0x698, 0x6A9, 0x6AF, 0x6C1, 0x6CC, 0x6D2, 0x640, 0x20, 0x25CC]
+    forms_b = list(range(0xFB50, 0xFBB2)) + list(range(0xFBD3, 0xFD3E))
+    forms_a = [c for c in range(0xFE70, 0xFEFD) if c not in (0xFE75,)] + [0xF201, 0xF211]
+    lam_alef = list(range(0xFEF5, 0xFEFD))
+    made("arabic-forms", arabic + forms_b + forms_a, "Arab", "rtl", "ar", arabic_texts())
+    made("arabic-forms-no-lam-alef", arabic + forms_b + [c for c in forms_a if c not in lam_alef], "Arab", "rtl", "ar", arabic_texts())
+    made("arabic-forms-none", arabic, "Arab", "rtl", "ar", arabic_texts())
+    # Ligatures with none of the single forms they are made from.
+    singles = {int(c, 16) for c in forms_singles()}
+    made("arabic-forms-ligatures-only", arabic + [c for c in forms_b + forms_a if c not in singles], "Arab", "rtl", "ar", arabic_texts())
+    # Hangul with no features: syllables and no jamo, jamo and no syllables,
+    # both, and no dotted circle for a tone mark alone.
+    jamo = HANGUL_L + HANGUL_V + HANGUL_T
+    syllables = list(range(0xAC00, 0xAC00 + 28 * 21 * 2)) + [0xAE68, 0xB098]
+    rest = [0x302E, 0x302F, 0x61, 0x20]
+    made("hangul-syllables", syllables + rest + [0x25CC], "Hang", "ltr", "ko", hangul_texts())
+    made("hangul-jamo", jamo + rest + [0x25CC], "Hang", "ltr", "ko", hangul_texts())
+    made("hangul-both", syllables + jamo + rest + [0x25CC], "Hang", "ltr", "ko", hangul_texts())
+    made("hangul-both-no-circle", syllables + jamo + rest, "Hang", "ltr", "ko", hangul_texts())
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     chars = script_chars()
@@ -230,20 +461,10 @@ def main():
         # A sentence, and a text starting with what needs a base.
         if len(texts) > 4:
             texts.append(" ".join(texts[:4]))
-        blob = hb.Blob.from_file_path(os.path.join(OUT, name))
-        lines = ["# %s shaped by HarfBuzz %s; see text/tools/script_reference.py" % (name, hb.version_string())]
-        n = 0
-        for t in texts:
-            data = t.encode("utf-8")
-            glyphs = shape(blob, t, code, direction, lang, BOT)
-            lines += ["case " + code + " " + str(n), "face 0", "text " + " ".join("%02x" % b for b in data),
-                      "item 0 -1", "props %s %s %s" % (direction, code, lang or "-"), "flags start", "features 0",
-                      "variations 0", "glyphs %d" % len(glyphs)] + glyphs
-            n += 1
-        with open(os.path.join(OUT, stem + ".shape.ref"), "w") as fh:
-            fh.write("\n".join(lines) + "\n")
+        n = write_reference(name, stem, code, direction, lang, texts)
         names.append(name)
         print(stem, len(keep), "characters", n, "cases")
+    made_fonts(names)
     with open(os.path.join(OUT, "index.txt"), "w") as fh:
         fh.write("\n".join(names) + "\n")
     write_licences(copyrights)

@@ -211,7 +211,8 @@ specification is Microsoft's, but where its page says:
 - **Arabic, Syriac** (`arabic.cst`): each letter's form from Joining_Type along the
   text and its context, Syriac's alaph forms included; `stch`, `ccmp`, `locl`, the
   forms one stage each, `rlig`, `rclt` and `calt`, `mset`. A font with none of the
-  forms but with the presentation forms (U+FB50..U+FEFF) is shaped through those.
+  forms but with the presentation forms (U+FB50..U+FEFF) is shaped through those,
+  with the ligatures HarfBuzz makes of them and no others (`tools/make_arabic_forms.py`).
   A Syriac Abbreviation Mark's pieces repeat along the word after it.
 - **Other scripts whose letters join** — N'Ko, Mongolian, Adlam, Mandaic and the
   rest — go to the Universal Shaping Engine, with the same forms.
@@ -291,7 +292,10 @@ choices, and these are ours:
   conventions do (`chars.order_class`, `arabic.reorder_marks`).
 - **Marks without GPOS** are placed by Unicode's combining classes around
   the base's ink, centred, a sixteenth of the em clear (fallback.cst);
-  HarfBuzz has its own guesses. The tests hold ours to what they promise.
+  HarfBuzz has its own guesses. Which of them are placed and what is left of their
+  advance is as HarfBuzz has it: each with the glyph before it that is not a mark,
+  whatever the clusters, a spacing mark only with a combining class, an enclosing
+  one not at all. The tests hold ours to what they promise.
 - **Unsafe to break** is ours: marked wherever a match, a ligature, a pair,
   an attachment or a fraction joins clusters, and checked by its promise.
   HarfBuzz's other flags — unsafe to concatenate, safe to insert tatweel —
