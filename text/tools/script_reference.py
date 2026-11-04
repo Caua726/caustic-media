@@ -165,6 +165,140 @@ def source(path):
     return TTFont(path, recalcTimestamp=False)
 
 
+# --- Texts by what the characters are ---
+
+def _ucd_values(name):
+    out = {}
+    for line in open(os.path.join(os.path.dirname(SCRIPTS_TXT), name), encoding="utf-8"):
+        line = line.split("#")[0].strip()
+        if line:
+            cps, value = [p.strip() for p in line.split(";")]
+            a, _, b = cps.partition("..")
+            for u in range(int(a, 16), int(b or a, 16) + 1):
+                out[u] = value
+    return out
+
+
+SYLLABIC = _ucd_values("IndicSyllabicCategory.txt")
+PLACED = _ucd_values("IndicPositionalCategory.txt")
+ZWJ_U, ZWNJ_U = 0x200D, 0x200C
+
+
+def _is_ra(u):
+    import unicodedata
+    name = unicodedata.name(chr(u), "")
+    return name.endswith(" LETTER RA") or name.endswith(" LETTER REPHA") or name.endswith(" LETTER VOCALIC R")
+
+
+def structured(code, keep, count):
+    # Syllables built of what the script's characters are, as a shaper parses
+    # them: consonants joined every way, the ra at either end, with joiners where
+    # they change things; vowel signs of each place, signs after them in any order;
+    # some with a piece missing.
+    rng = random.Random("structured " + code)
+
+    def by(*cats):
+        return [u for u in keep if SYLLABIC.get(u) in cats]
+    consonants = by("Consonant", "Consonant_Dead", "Consonant_With_Stacker")
+    ras = [u for u in consonants if _is_ra(u)]
+    joins = by("Virama", "Invisible_Stacker")
+    killers = by("Pure_Killer", "Reordering_Killer", "Consonant_Killer")
+    nuktas = by("Nukta")
+    bases = by("Vowel_Independent", "Consonant_Placeholder")
+    medials = by("Consonant_Medial", "Consonant_Subjoined", "Consonant_Final", "Consonant_Head_Letter",
+                 "Consonant_Preceding_Repha", "Consonant_Succeeding_Repha", "Consonant_Prefixed",
+                 "Consonant_Initial_Postfixed")
+    signs = by("Bindu", "Visarga", "Tone_Mark", "Cantillation_Mark", "Syllable_Modifier", "Gemination_Mark",
+               "Register_Shifter", "Modifying_Letter", "Tone_Letter")
+    vowels = {}
+    for u in by("Vowel_Dependent", "Vowel"):
+        vowels.setdefault(PLACED.get(u, "Other"), []).append(u)
+    if not consonants and not bases:
+        return []
+    letters = consonants or bases
+
+    def consonant():
+        if ras and rng.random() < 0.3:
+            return rng.choice(ras)
+        return rng.choice(letters)
+
+    def cluster():
+        out = [consonant()]
+        if nuktas and rng.random() < 0.15:
+            out.append(rng.choice(nuktas))
+        for _ in range(rng.randint(0, 3)):
+            if not joins:
+                break
+            j = rng.choice(joins)
+            how = rng.random()
+            if how < 0.1:
+                out += [ZWJ_U, j]
+            elif how < 0.15:
+                out += [ZWNJ_U, j]
+            else:
+                out.append(j)
+            if 0.2 < how < 0.35:
+                out.append(ZWJ_U)
+            elif 0.35 < how < 0.45:
+                out.append(ZWNJ_U)
+            out.append(consonant())
+            if nuktas and rng.random() < 0.1:
+                out.append(rng.choice(nuktas))
+        return out
+
+    def syllable():
+        kind = rng.random()
+        if kind < 0.12 and bases:
+            out = [rng.choice(bases)]
+        elif kind < 0.17:
+            out = []        # what goes on a base with none: the circle
+        else:
+            out = cluster()
+        for _ in range(rng.randint(0, 2)):
+            if medials and rng.random() < 0.5:
+                out.append(rng.choice(medials))
+        places = list(vowels)
+        rng.shuffle(places)
+        for place in places[:rng.randint(0, 2)]:
+            out.append(rng.choice(vowels[place]))
+        if joins and rng.random() < 0.12:
+            out.append(rng.choice(joins))
+        if killers and rng.random() < 0.1:
+            out.append(rng.choice(killers))
+        for _ in range(rng.randint(0, 2)):
+            if signs and rng.random() < 0.5:
+                out.append(rng.choice(signs))
+        return out
+
+    texts = []
+    for _ in range(count):
+        t = []
+        for _ in range(rng.randint(1, 2)):
+            t += syllable()
+        if t:
+            texts.append("".join(chr(c) for c in t))
+    return texts
+
+
+# The tags of the old specifications, a font's new ones renamed to them.
+OLD_TAGS = {"Deva": ("dev2", "deva"), "Beng": ("bng2", "beng"), "Guru": ("gur2", "guru"), "Gujr": ("gjr2", "gujr"),
+            "Orya": ("ory2", "orya"), "Taml": ("tml2", "taml"), "Telu": ("tel2", "telu"), "Knda": ("knd2", "knda"),
+            "Mlym": ("mlm2", "mlym"), "Mymr": ("mym2", "mymr")}
+
+
+def retagged(src, out, new, old):
+    font = TTFont(src, recalcTimestamp=False)
+    for name in ("GSUB", "GPOS"):
+        if name in font:
+            records = font[name].table.ScriptList.ScriptRecord
+            records[:] = [r for r in records if r.ScriptTag != old]
+            for r in records:
+                if r.ScriptTag == new:
+                    r.ScriptTag = old
+            records.sort(key=lambda r: r.ScriptTag)
+    font.save(out)
+
+
 def write_licences(copyrights):
     # One licence over them all: each font's own copyright line, then its text.
     text = open(OFL_TEXT_FROM, encoding="utf-8").read()
@@ -458,12 +592,24 @@ def main():
         copyrights.append(source(path)["name"].getDebugName(0) or "")
         rng = random.Random(code)
         texts = words_of(code, lang) + made_up(rng, keep, 300)
+        reordered = code in OLD_TAGS or code == "Khmr"
+        built = structured(code, keep, 800 if reordered else 300)
         # A sentence, and a text starting with what needs a base.
         if len(texts) > 4:
             texts.append(" ".join(texts[:4]))
-        n = write_reference(name, stem, code, direction, lang, texts)
+        n = write_reference(name, stem, code, direction, lang, texts + built)
         names.append(name)
         print(stem, len(keep), "characters", n, "cases")
+        if code in OLD_TAGS:
+            older = stem + "-old"
+            retagged(os.path.join(OUT, name), os.path.join(OUT, older + ".ttf"), *OLD_TAGS[code])
+            write_reference(older + ".ttf", older, code, direction, lang, built[:400])
+            names.append(older + ".ttf")
+            # And with nothing at all: its characters, a box each.
+            plain = stem + "-plain"
+            made_font(os.path.join(OUT, plain + ".ttf"), keep)
+            write_reference(plain + ".ttf", plain, code, direction, lang, built[:300])
+            names.append(plain + ".ttf")
     made_fonts(names)
     with open(os.path.join(OUT, "index.txt"), "w") as fh:
         fh.write("\n".join(names) + "\n")
