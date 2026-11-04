@@ -372,7 +372,9 @@ Dialogs are windows with a modal flag and a result, belonging to the window
 they are for or, for the whole application, to none; modal, what they belong
 to waits — every other window, for the application's own — and a press on a
 waiting window brings the dialog forward with the bell, as GTK and Qt do on
-Linux and Windows does itself for the windows it disabled. The file dialog is our own
+Linux. Windows beeps itself at a press on a window it disabled; the host brings the
+dialog forward, which Windows does not for the application's own, owned by none.
+The file dialog is our own
 first; the XDG desktop portal on Linux (`window/linux/filechooser.cst`) and the
 system dialog on Windows give users their own.
 
@@ -642,12 +644,12 @@ theme change restyles them all:
 | from | what | state |
 |---|---|---|
 | `window/` | windows, popups, several windows, clipboard, drag-and-drop, cursors, per-monitor scale | X11 implemented; native Wayland tested with Weston, desktop limits documented; Win32 under isolated Wine: a program starts, draws, takes input and closes (`program_win32_test`), popups (`popup_win32_test`); DnD and desktop services not yet |
-| `input/` | events; text input and IME composition | design note |
+| `input/` | events; text input and IME composition | built |
 | `render/` | `draw2d`, `shapes2d`, scissor, layers | done |
-| `text/` | shaping, layout, caret, hit-testing, colour glyphs | done; complex scripts later |
+| `text/` | shaping, layout, caret, hit-testing, colour glyphs | done, the scripts that join and reorder too |
 
-`input/` is still a design note: the router takes keys and text from
-`window/`'s events as they are.
+The router takes keys and text from `window/`'s cooked events, whose key ids and
+states are `input/`'s.
 
 The toolkit takes `window/` through its portable modules only — `device`,
 `display`, `cursor`, `folders`, `open`, `instance`, `input_extras` and the
@@ -681,8 +683,9 @@ under Xvfb. Wayland: the host on a seated Weston with text-input-v3; external
 clipboard, drag and drop and an installed input method unverified. Windows,
 under isolated Wine: a program starts, draws, takes the system's input and
 closes; its file dialog, known folders, one instance and links are native,
-and its menus, lists, popovers and tooltips are popups of the system's; OLE
-drag and drop, UI Automation and notifications not yet — and Wine is not
+and its menus, lists, popovers and tooltips are popups of the system's; drags
+past the program's windows and the clipboard's formats go through OLE and the
+system's clipboard; UI Automation and notifications not yet — and Wine is not
 proof of real Windows.
 
 ## For scale
@@ -724,15 +727,15 @@ widget set applications actually use, done properly, not parity.
    backend.*
 8. **Words in the user's language**. *Done: `strings.cst` in English and
    Brazilian Portuguese, the locale from the environment, right-to-left
-   languages mirrored. Windows locale is read by the native backend; its
-   toolkit integration remains blocked by the compiler.*
+   languages mirrored; on Windows the locale is the native backend's.*
 9. **The application level**: the loop that puts the application's windows
    on the screen, the desktop's settings followed, icons, one instance,
    notifications, the tray, links. *Done on X11 and Linux's desktops. The
    Wayland host has a Weston surface/timer smoke and text-input-v3 routing,
    its popups `xdg_popup`s, and the three examples are checked on a nested
    Weston.
-   The Windows toolkit integration is blocked; see `window/win32/win32.md`.*
+   On Windows the toolkit and its examples run under Wine; see
+   `window/win32/win32.md`.*
 10. **Examples**: a settings form, a text editor, a file browser. *Done,
    each `--check`ed on X11, on a nested Weston and under Wine.*
 11. **A frame of the program's own** moved, resized, maximized and told

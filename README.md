@@ -37,7 +37,7 @@ window and drive the GPU itself.
 | `render/` | the framework: meshes, sprites, materials, cameras, a frame | the 2D family built and tested — what the toolkit draws with; 3D pieces over the software device |
 | `3d/` | models, meshes, skeletons, animation | design note only |
 | `image/` | pixels on the CPU: load, save, transform, generate, atlas | built, tested; decoding through caustic-image |
-| `text/` | fonts, glyph atlases, shaping, layout | built, tested: faces, outlines, variable fonts, shaping, bidi layout, system fonts |
+| `text/` | fonts, glyph atlases, shaping, layout | built, tested: faces, outlines, variable fonts, shaping held to HarfBuzz with the scripts that join and reorder (Arabic, Indic, Hangul, Thai, Khmer, Myanmar, the Universal Shaping Engine), bidi layout, system fonts |
 | `audio/` | device, mixer, music, positional | device, sample conversion and a direct ALSA backend; the other backends a design note each |
 | `ui/` | a toolkit for applications, drawn by us; immediate mode beside it in `ui/immediate/` | **built**, tested: three example programs on X11, Wayland and Windows; immediate-mode prototype, tested |
 | `dbus/` | the D-Bus wire protocol, connections, objects | **built**, tested against busctl |
@@ -262,9 +262,8 @@ rather than by looking.
 
 The toolkit first, on all three platforms; then the GPU; the rest waits.
 
-1. **Windows parity** — the toolkit's menus in native popups, OLE drag and
-   drop, UI Automation, notifications, and a run on real Windows rather than
-   Wine.
+1. **Windows parity** — UI Automation, notifications, and a run on real Windows
+   rather than Wine.
 2. **Wayland acceptance** — the three examples checked whole, and the
    clipboard, drag and drop and input method against other programs.
 3. **After the toolkit** — the Vulkan device, so the 2D family draws on the

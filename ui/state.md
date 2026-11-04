@@ -580,6 +580,20 @@ outside the selection moving the caret there first, or below the caret from
 the keyboard with its first item chosen; made the first time, gone with the
 entry.
 
+**Styled text views** (`widgets/textview.cst`, same test): `set_styles` gives the
+program's looks — colour, a role's colour by the theme, background, weight, italic,
+underline (a wavy one for an error, drawn by the layout's decoration), strike;
+`set_highlighter` a function asked about a paragraph with what the one before it
+ended in, which returns spans and what this one ends in. Only what is seen and what
+is before it is asked; a change asks again from there until a paragraph ends in
+what it did. `add_range` puts a style on a stretch of text that goes with it as it is
+edited (`textbuf`'s marks), undone and redone too; over one another what each says
+wins. A background goes behind the text as a selection does; a selection shows
+through all of it. A theme's colours changing asks all of it again. AT-SPI's
+`GetAttributes` and `GetAttributeRun` say all of this (`tree.TEXT_ATTRS`); the
+limits are 32 styles, 30 looks over each other in one paragraph, 1024 spans in one
+paragraph, past which it stays plain.
+
 **Text views** (`widgets/textview.cst`, tested by `textview_test`): text of
 many lines, its paragraphs broken at line feeds, meant to be a scroll area's
 content, which it asks to keep the caret in view. Typing, Enter, Tab (unless
@@ -919,8 +933,8 @@ an OLE peer, run again from what it carries back over the program's windows, a
 list's rows going out as content (`host_drag_test`); a modal dialog in a window of its own above its owner, the owner told
 nothing meanwhile — a press, a key or the wheel on it bringing the dialog
 forward (`_NET_ACTIVE_WINDOW`, xdg-activation under the press's own serial)
-and ringing the bell, once for a burst, and Windows doing both itself for the
-owner it disabled (`host_modal_win32_test`, the bell heard on Wine's X
+and ringing the bell, once for a burst, the bell on Windows its own at a press
+on a window it disabled (`host_modal_win32_test`, heard on Wine's X
 server); the menus, lists, popovers and tooltip open over a window closed as
 a modal comes over it (`host_x11_test`, `host_popup_wayland_test`); a dialog
 of the whole application's, transient for the root with every window of the

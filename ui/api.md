@@ -840,6 +840,7 @@ the toolkit's text: one service per application that lays text out and draws it,
 - `lay_plain(s as *Service, r as *Run, text as *u8, nbytes as i64, st as *Style, params as *model.Params) as i32` — One style over the whole of the text: the common case.
 - `upload(s as *Service) as i32` — Every changed part of every page sent to its texture: 1, or 0 when the device refused one.
 - `draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color) as i32` — Run r drawn on c with its top left at (x, y), logical pixels, in fg where a style gives no colour of its own.
+- `draw_in(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color) as i32` — The same with every colour its styles give put aside: all of it in fg, as selected text is.
 
 ## `ui/textbuf.cst`
 
@@ -861,6 +862,12 @@ the text an entry or a text view edits.
 - `para_of(b as *Buf, at as i64) as i64` — The paragraph offset at is in; a line feed is its paragraph's.
 - `char_of(b as *Buf, at as i64) as i64` — The characters before offset at: its paragraph's, then those from its start.
 - `byte_of(b as *Buf, k as i64) as i64` — Where character k starts: found in its paragraph; the end past the last.
+- `mark_add(b as *Buf, start as i64, end as i64, tag as i64) as i64` — A range from start to end, clamped to the text: its id, never 0; 0 for memory refused.
+- `mark_count(b as *Buf) as i64`
+- `mark_at(b as *Buf, i as i64) as *Mark` — The i-th range, in the order they were added; those added later come later.
+- `mark_find(b as *Buf, id as i64) as *Mark` — The range of that id; null when it is gone.
+- `mark_remove(b as *Buf, id as i64) as i32`
+- `mark_clear(b as *Buf) as void`
 - `insert(b as *Buf, at as i64, s as *u8, n as i64) as i32` — The program's edits: not remembered, and forgetting what was.
 - `delete(b as *Buf, at as i64, n as i64) as i32`
 - `replace(b as *Buf, at as i64, n as i64, s as *u8, m as i64) as i32` — n bytes at at made s, m bytes.
@@ -1795,7 +1802,18 @@ what the entry and the text view share.
 
 text of many lines.
 
+- `text_style() as TextStyle`
 - `create(t as *tree.Tree, parent as i64) as i64` — A new, empty text view as the last child of parent — a scroll area, as a rule.
+- `set_styles(t as *tree.Tree, w as i64, styles as *TextStyle, n as i64) as i32` — The program's styles, n of them at styles, copied: what its highlighter's spans and its ranges name, by their place here.
+- `set_highlighter(t as *tree.Tree, w as i64, cb as HighlightFn, user as *u8) as i32` — What colours the text as it is written, from now on (see HighlightFn); null for nothing.
+- `rehighlight(t as *tree.Tree, w as i64) as void` — The highlighter's mind changed: all of it asked again.
+- `highlighter_calls(t as *tree.Tree, w as i64) as i64` — How many paragraphs the highlighter has been asked about.
+- `add_range(t as *tree.Tree, w as i64, start as i64, end as i64, st as i64) as i64` — Bytes start to end in style — a search's match, an error — on top of what colours it, going with the text as it is edited (textbuf's marks): its id, for taking it away; 0 when it cannot be had.
+- `remove_range(t as *tree.Tree, w as i64, id as i64) as i32`
+- `clear_ranges(t as *tree.Tree, w as i64) as void`
+- `range_count(t as *tree.Tree, w as i64) as i64`
+- `range_start(t as *tree.Tree, w as i64, id as i64) as i64` — Where it is now, the text having been edited; -1 for none.
+- `range_end(t as *tree.Tree, w as i64, id as i64) as i64`
 - `text(t as *tree.Tree, w as i64) as *u8`
 - `length(t as *tree.Tree, w as i64) as i64`
 - `paragraphs(t as *tree.Tree, w as i64) as i64`
