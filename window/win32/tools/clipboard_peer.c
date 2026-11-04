@@ -146,7 +146,9 @@ int main(int argc, char **argv) {
             size_t all = head + (sizeof pre - 1) + n + (sizeof post - 1);
             char *b = malloc(all + 1);
             int start = head + (int)(sizeof pre - 1);
-            snprintf(b, head + 1, fmt, head, (int)all, start, start + (int)n);
+            char top[128];
+            snprintf(top, sizeof top, fmt, head, (int)all, start, start + (int)n);
+            memcpy(b, top, (size_t)head);
             memcpy(b + head, pre, sizeof pre - 1);
             memcpy(b + start, frag, n);
             memcpy(b + start + n, post, sizeof post);

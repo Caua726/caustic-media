@@ -302,7 +302,7 @@ static Data *data_of(int band) {
         static const char own[] = "own from ole";
         add(d, type_cf(0), global_of(own, sizeof own - 1));
         static const char html[] =
-            "Version:0.9\r\nStartHTML:0000000097\r\nEndHTML:0000000170\r\nStartFragment:0000000129\r\nEndFragment:0000000138\r\n"
+            "Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000179\r\nStartFragment:0000000137\r\nEndFragment:0000000147\r\n"
             "<html><body><!--StartFragment--><i>ole</i><!--EndFragment--></body></html>";
         add(d, type_cf(1), global_of(html, sizeof html));
         FILE *f = fopen("image/testdata/rgba.png", "rb");
