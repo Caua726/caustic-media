@@ -57,6 +57,14 @@ struct Group {
     caret_re  as i64;
 }
 
+// A range of the text that goes with it as it is edited: see mark_add.
+struct Mark {
+    id    as i64;
+    start as i64;
+    end   as i64;
+    tag   as i64;   // the owner's
+}
+
 struct Buf {
     block    as *u8;
     cap      as i64;
@@ -87,6 +95,10 @@ struct Buf {
     ch_lo    as i64;   // what changed: from here, nothing before it moved
     ch_hi    as i64;   // to here, as the text is now
     ch_len0  as i64;   // its length before
+    marks    as *Mark;
+    nmarks   as i64;
+    mark_cap as i64;
+    next_mark as i64;
 }
 
 fn _grow(p as *u8, used as i64, cap as i64, want as i64, out_cap as *i64) as *u8 {
@@ -130,6 +142,7 @@ fn close(b as *Buf) as void {
     if (b.rec_cap > 0) { mem.core.munmap(cast(*u8, b.recs), b.rec_cap * sizeof(Rec)); }
     if (b.group_cap > 0) { mem.core.munmap(cast(*u8, b.groups), b.group_cap * sizeof(Group)); }
     if (b.store_cap > 0) { mem.core.munmap(b.store, b.store_cap); }
+    if (b.mark_cap > 0) { mem.core.munmap(cast(*u8, b.marks), b.mark_cap * sizeof(Mark)); }
     mem.memset(cast(*u8, b), 0, sizeof(Buf));
 }
 
@@ -352,6 +365,108 @@ fn byte_of(b as *Buf, k as i64) as i64 {
     return b.len;
 }
 
+// --- Ranges that go with the text ---
+//
+// A search's matches, an error's words: a range of the text an owner keeps, by
+// a tag of its own, that stays on the same text as it is edited — by anyone,
+// undone and redone too. Text put in at its start stays out of it, in at its end
+// too, and inside it grows it. All of it deleted leaves it empty where it was,
+// until its owner takes it away.
+
+// A range from start to end, clamped to the text: its id, never 0; 0 for memory
+// refused.
+fn mark_add(b as *Buf, start as i64, end as i64, tag as i64) as i64 {
+    if (b.nmarks == b.mark_cap) {
+        let is i64 as c with mut = b.mark_cap * 2;
+        if (c < 16) { c = 16; }
+        let is *Mark as m = cast(*Mark, mem.core.mmap_anon(c * sizeof(Mark)));
+        if (cast(i64, m) == 0) { return 0; }
+        if (b.mark_cap > 0) {
+            mem.memcpy(cast(*u8, m), cast(*u8, b.marks), b.nmarks * sizeof(Mark));
+            mem.core.munmap(cast(*u8, b.marks), b.mark_cap * sizeof(Mark));
+        }
+        b.marks = m;
+        b.mark_cap = c;
+    }
+    let is i64 as a with mut = start;
+    let is i64 as e with mut = end;
+    if (a < 0) { a = 0; }
+    if (a > b.len) { a = b.len; }
+    if (e < a) { e = a; }
+    if (e > b.len) { e = b.len; }
+    b.next_mark = b.next_mark + 1;
+    let is *Mark as k = &b.marks[b.nmarks];
+    k.id = b.next_mark;
+    k.start = a;
+    k.end = e;
+    k.tag = tag;
+    b.nmarks = b.nmarks + 1;
+    return k.id;
+}
+
+fn mark_count(b as *Buf) as i64 { return b.nmarks; }
+
+// The i-th range, in the order they were added; those added later come later.
+fn mark_at(b as *Buf, i as i64) as *Mark { return &b.marks[i]; }
+
+// The range of that id; null when it is gone.
+fn mark_find(b as *Buf, id as i64) as *Mark {
+    let is i64 as i with mut = 0;
+    while (i < b.nmarks) {
+        if (b.marks[i].id == id) { return &b.marks[i]; }
+        i = i + 1;
+    }
+    return cast(*Mark, 0);
+}
+
+fn mark_remove(b as *Buf, id as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < b.nmarks) {
+        if (b.marks[i].id == id) {
+            let is i64 as j with mut = i;
+            while (j + 1 < b.nmarks) {
+                b.marks[j] = b.marks[j + 1];
+                j = j + 1;
+            }
+            b.nmarks = b.nmarks - 1;
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn mark_clear(b as *Buf) as void { b.nmarks = 0; }
+
+fn _marks_inserted(b as *Buf, at as i64, k as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.nmarks) {
+        let is *Mark as m = &b.marks[i];
+        // Empty and there: stays before what comes.
+        if (m.start != m.end || m.start != at) {
+            if (m.start >= at) { m.start = m.start + k; }
+            if (m.end > at) { m.end = m.end + k; }
+        }
+        i = i + 1;
+    }
+}
+
+fn _mark_past(x as i64, at as i64, n as i64) as i64 {
+    if (x <= at) { return x; }
+    if (x >= at + n) { return x - n; }
+    return at;
+}
+
+fn _marks_deleted(b as *Buf, at as i64, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < b.nmarks) {
+        let is *Mark as m = &b.marks[i];
+        m.start = _mark_past(m.start, at, n);
+        m.end = _mark_past(m.end, at, n);
+        i = i + 1;
+    }
+}
+
 // --- Plain edits ---
 
 // s, n bytes, in at at — line ends made LF — the index kept: 1, or 0 for a
@@ -381,7 +496,10 @@ fn _insert(b as *Buf, at as i64, s as *u8, n as i64) as i32 {
     b.gap_len = b.gap_len - k;
     b.len = b.len + k;
     b.added = k;
-    if (k > 0) { _note(b, at, 0, k); }
+    if (k > 0) {
+        _note(b, at, 0, k);
+        _marks_inserted(b, at, k);
+    }
     let is i64 as chs with mut = 0;
     i = 0;
     while (i < k) {
@@ -421,7 +539,10 @@ fn _delete(b as *Buf, at as i64, n as i64) as i32 {
     b.gap_len = b.gap_len + n;
     b.len = b.len - n;
     b.nchars = b.nchars - chs;
-    if (n > 0) { _note(b, at, n, 0); }
+    if (n > 0) {
+        _note(b, at, n, 0);
+        _marks_deleted(b, at, n);
+    }
     // Paragraphs starting inside the range go; those after it move back.
     let is i64 as i with mut = 1;
     let is i64 as o with mut = 1;

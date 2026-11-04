@@ -61,6 +61,86 @@ let is i32 as WRAP_WORD with imut = 1;
 let is i64 as MAX_LAID    with imut = 48;      // paragraphs kept laid out
 let is i64 as MAX_PREEDIT with imut = 256;
 let is i64 as EXACT_BYTES with imut = 16384;   // a text this long or shorter is laid out whole
+let is i64 as MAX_STYLES  with imut = 32;      // the program's
+let is i64 as MAX_LOOKS   with imut = 30;      // ways its text looks in one paragraph, those over each other counted
+let is i64 as MAX_SPANS   with imut = 1024;    // spans of one paragraph looked at, its ranges' among them
+
+// --- How a stretch of it looks ---
+
+let is i32 as UNDERLINE with imut = 1;
+let is i32 as WAVY      with imut = 2;         // an error's
+
+// A colour by what it is for, the theme's whichever it is, in place of one.
+let is i32 as ROLE_NONE    with imut = 0;
+let is i32 as ROLE_FG      with imut = 1;
+let is i32 as ROLE_DIM     with imut = 2;
+let is i32 as ROLE_ACCENT  with imut = 3;
+let is i32 as ROLE_LINK    with imut = 4;
+let is i32 as ROLE_ERROR   with imut = 5;
+let is i32 as ROLE_WARNING with imut = 6;
+let is i32 as ROLE_SUCCESS with imut = 7;
+let is i32 as ROLE_SELECTION with imut = 8;
+
+// What a style changes of the text: anything left as text_style makes it is
+// as it would be. Over another, what it says wins and the rest stays.
+struct TextStyle {
+    fg        as math.color.Color;   // alpha 0: the text's
+    bg        as math.color.Color;   // alpha 0: none; painted behind it, as a selection is
+    fg_role   as i32;                // ROLE_*, in place of fg
+    bg_role   as i32;
+    weight    as i64;                // 0: the text's
+    italic    as i32;
+    underline as i32;                // UNDERLINE or WAVY
+    strike    as i32;
+    _pad      as i32;
+}
+
+fn text_style() as TextStyle {
+    let is TextStyle as s;
+    s.fg = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+    s.bg = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+    s.fg_role = ROLE_NONE;
+    s.bg_role = ROLE_NONE;
+    s.weight = 0;
+    s.italic = 0;
+    s.underline = 0;
+    s.strike = 0;
+    s._pad = 0;
+    return s;
+}
+
+// A stretch of a paragraph, bytes in it, in one of set_styles' styles.
+type Span = model.Span;
+
+// What colours a paragraph as it is written: cb(user, text, n, state, spans, cap,
+// end) — n bytes of the paragraph, its line feed not among them, and state,
+// what the one before it ended in (0 for the first) — writes up to cap spans,
+// says how many, and leaves in *end what this one ends in: a comment still open.
+type HighlightFn = fn(*u8, *u8, i64, i64, *model.Span, i64, *i64) as i64;
+
+// A background of a paragraph, as laid out.
+struct Bg {
+    a     as i64;
+    b     as i64;
+    color as math.color.Color;
+}
+
+// A stretch of a paragraph that looks one way: looks[look].
+struct Seg {
+    a    as i64;
+    b    as i64;
+    look as i64;
+}
+
+// What styling takes, mapped the first time it is asked for.
+struct Styling {
+    styles as [32]TextStyle;
+    spans  as [1024]model.Span;
+    cuts   as [2052]i64;
+    segs   as [2052]Seg;
+    looks  as [30]TextStyle;
+    laying as [2052]model.Span;
+}
 
 // One paragraph laid out at the view's width.
 struct Para {
@@ -69,10 +149,13 @@ struct Para {
     width   as f64;     // laid out at; below 0 not wrapped
     pre_at  as i64;     // where a composition is in it, its own offsets; -1 for none
     lay     as tlayout.Layout;
-    lstyles as [16]model.Style;
+    lstyles as [32]model.Style;
     run     as txt.Run;
     opened  as i32;
     _pad0   as i32;
+    bgs     as *Bg;     // the backgrounds of it, its own offsets
+    nbg     as i64;
+    bg_cap  as i64;
 }
 
 struct Doc {
@@ -124,6 +207,18 @@ struct Doc {
     source      as i32;     // its selection is being dragged, from tmp
     within      as i32;     // and was dropped in it: done there already
     _pad1       as i32;
+    sty         as *Styling;   // null while nothing is styled
+    nstyles     as i64;
+    hl_fn       as HighlightFn;
+    hl_user     as *u8;
+    hl_end      as *i64;    // what each paragraph ended in, as the highlighter said
+    hl_valid    as i64;     // the paragraphs before this one are as hl_end says
+    hl_stale    as i64;     // those before this one are asked whatever the one before them ended in
+    hl_known    as i64;     // those from this one on it has not been asked about
+    hl_calls    as i64;     // paragraphs asked of it so far
+    key_fg      as math.color.Color;   // the theme's colours they were laid out in
+    key_bg      as math.color.Color;
+    nlooks      as i64;
 }
 
 struct Data {
@@ -213,12 +308,15 @@ fn _destroy(t as *tree.Tree, w as i64, data as *u8) as void {
         while (i < MAX_LAID) {
             if (d.laid[i].opened == 1) { tlayout.close(&d.laid[i].lay); }
             txt.run_close(&d.laid[i].run);
+            if (d.laid[i].bg_cap > 0) { mem.core.munmap(cast(*u8, d.laid[i].bgs), d.laid[i].bg_cap * sizeof(Bg)); }
             i = i + 1;
         }
         mem.core.munmap(cast(*u8, d.laid), MAX_LAID * sizeof(Para));
     }
     textbuf.close(&d.buf);
+    if (cast(i64, d.sty) != 0) { mem.core.munmap(cast(*u8, d.sty), sizeof(Styling)); }
     if (d.cap > 0) {
+        mem.core.munmap(cast(*u8, d.hl_end), d.cap * 8);
         mem.core.munmap(cast(*u8, d.hs), d.cap * 8);
         mem.core.munmap(cast(*u8, d.ws), d.cap * 8);
         mem.core.munmap(cast(*u8, d.fen), (d.cap + 1) * 8);
@@ -237,17 +335,21 @@ fn _grow(d as *Doc, want as i64) as i32 {
     let is *f64 as hs = cast(*f64, mem.core.mmap_anon(c * 8));
     let is *f64 as ws = cast(*f64, mem.core.mmap_anon(c * 8));
     let is *f64 as fen = cast(*f64, mem.core.mmap_anon((c + 1) * 8));
-    if (cast(i64, hs) <= 0 || cast(i64, ws) <= 0 || cast(i64, fen) <= 0) { return 0; }
+    let is *i64 as hl = cast(*i64, mem.core.mmap_anon(c * 8));
+    if (cast(i64, hs) <= 0 || cast(i64, ws) <= 0 || cast(i64, fen) <= 0 || cast(i64, hl) <= 0) { return 0; }
     if (d.cap > 0) {
         mem.memcpy(cast(*u8, hs), cast(*u8, d.hs), d.n * 8);
         mem.memcpy(cast(*u8, ws), cast(*u8, d.ws), d.n * 8);
+        mem.memcpy(cast(*u8, hl), cast(*u8, d.hl_end), d.n * 8);
         mem.core.munmap(cast(*u8, d.hs), d.cap * 8);
         mem.core.munmap(cast(*u8, d.ws), d.cap * 8);
         mem.core.munmap(cast(*u8, d.fen), (d.cap + 1) * 8);
+        mem.core.munmap(cast(*u8, d.hl_end), d.cap * 8);
     }
     d.hs = hs;
     d.ws = ws;
     d.fen = fen;
+    d.hl_end = hl;
     d.cap = c;
     return 1;
 }
@@ -348,6 +450,9 @@ fn _sync_all(t as *tree.Tree, w as i64, d as *Doc) as void {
         d.laid[i].idx = 0 - 1;
         i = i + 1;
     }
+    d.hl_valid = 0;
+    d.hl_stale = 0;
+    d.hl_known = 0;
 }
 
 // n bytes from src to dst, the two maybe overlapping.
@@ -380,11 +485,27 @@ fn _resync(t as *tree.Tree, w as i64, d as *Doc) as void {
     let is i64 as old1 = p1 + d.n - n;
     if (_grow(d, n) == 0) { return; }
     let is i64 as by = n - d.n;
+    // What the last paragraph of the change ended in: what follows it was
+    // right if it still does.
+    let is i64 as ended with mut = 0;
+    if (old1 >= 0 && old1 < d.n) { ended = d.hl_end[old1]; }
     // The paragraphs after the change, moved.
     if (by != 0 && old1 + 1 < d.n) {
         let is i64 as count = d.n - old1 - 1;
         _move_bytes(cast(*u8, cast(i64, d.hs) + (p1 + 1) * 8), cast(*u8, cast(i64, d.hs) + (old1 + 1) * 8), count * 8);
         _move_bytes(cast(*u8, cast(i64, d.ws) + (p1 + 1) * 8), cast(*u8, cast(i64, d.ws) + (old1 + 1) * 8), count * 8);
+        _move_bytes(cast(*u8, cast(i64, d.hl_end) + (p1 + 1) * 8), cast(*u8, cast(i64, d.hl_end) + (old1 + 1) * 8), count * 8);
+    }
+    d.hl_end[p1] = ended;
+    // All asked so far already: nothing left of the last change.
+    if (d.hl_stale <= d.hl_valid) { d.hl_stale = 0; }
+    if (d.hl_valid > p0) { d.hl_valid = p0; }
+    if (d.hl_stale > old1) { d.hl_stale = d.hl_stale + by; }
+    if (d.hl_stale <= p1) { d.hl_stale = p1 + 1; }
+    if (d.hl_known > old1) {
+        d.hl_known = d.hl_known + by;
+    } else if (d.hl_known > p0) {
+        d.hl_known = p0;
     }
     d.n = n;
     let is i64 as i with mut = p0;
@@ -426,6 +547,347 @@ fn _styles(d as *Doc, th as *style.Theme, sts as *txt.Style) as void {
     sts[1].underline = 1;
 }
 
+// --- Styled ---
+
+fn _styling(d as *Doc) as *Styling {
+    if (cast(i64, d.sty) == 0) { d.sty = cast(*Styling, mem.core.mmap_anon(sizeof(Styling))); }
+    return d.sty;
+}
+
+fn _role(th as *style.Theme, role as i32, given as math.color.Color) as math.color.Color {
+    if (role == ROLE_FG) { return th.palette.fg; }
+    if (role == ROLE_DIM) { return th.palette.fg_dim; }
+    if (role == ROLE_ACCENT) { return th.palette.accent; }
+    if (role == ROLE_LINK) { return th.palette.link; }
+    if (role == ROLE_ERROR) { return th.palette.error; }
+    if (role == ROLE_WARNING) { return th.palette.warning; }
+    if (role == ROLE_SUCCESS) { return th.palette.success; }
+    if (role == ROLE_SELECTION) { return th.palette.selection_bg; }
+    return given;
+}
+
+// Whether anything colours the text at all.
+fn _styled_at_all(d as *Doc) as i32 {
+    return cast(i32, cast(i64, d.hl_fn) != 0 || (d.nstyles > 0 && textbuf.mark_count(&d.buf) > 0));
+}
+
+fn _para_text(d as *Doc, i as i64) as *u8 {
+    let is i64 as ps = _pstart(d, i);
+    return textbuf.span(&d.buf, ps, _pend(d, i) - ps);
+}
+
+// The highlighter asked about paragraphs up to upto, as far as it has not been:
+// each from what the one before ended in. One ending as it did, past what a
+// change touched, leaves all it was asked about after it as they are; one ending
+// otherwise means the next is not as it was laid out.
+fn _hl_walk(d as *Doc, upto as i64) as void {
+    if (cast(i64, d.hl_fn) == 0) { return; }
+    while (d.hl_valid <= upto && d.hl_valid < d.n) {
+        let is i64 as i = d.hl_valid;
+        let is i64 as from with mut = 0;
+        if (i > 0) { from = d.hl_end[i - 1]; }
+        let is i64 as ended with mut = from;
+        let is *Styling as sy = _styling(d);
+        d.hl_calls = d.hl_calls + 1;
+        call(d.hl_fn, d.hl_user, _para_text(d, i), _pend(d, i) - _pstart(d, i), from, cast(*model.Span, &sy.spans), MAX_SPANS, &ended);
+        let is i32 as same = cast(i32, ended == d.hl_end[i]);
+        d.hl_end[i] = ended;
+        d.hl_valid = i + 1;
+        if (i >= d.hl_known) {
+            d.hl_known = i + 1;
+        } else if (same == 0) {
+            if (i + 1 < d.n) { _forget(d, i + 1); }
+            if (d.hl_stale < i + 2) { d.hl_stale = i + 2; }
+        } else if (i + 1 >= d.hl_stale) {
+            d.hl_valid = d.hl_known;
+        }
+    }
+}
+
+// Paragraph i's spans into sty.spans, the highlighter's and over them its
+// ranges': how many. Bytes in the paragraph.
+fn _spans_of(d as *Doc, i as i64) as i64 {
+    let is *Styling as sy = _styling(d);
+    let is i64 as ps = _pstart(d, i);
+    let is i64 as pe = _pend(d, i);
+    let is i64 as n with mut = 0;
+    if (cast(i64, d.hl_fn) != 0) {
+        let is i64 as from with mut = 0;
+        if (i > 0) { from = d.hl_end[i - 1]; }
+        let is i64 as ended with mut = from;
+        d.hl_calls = d.hl_calls + 1;
+        n = call(d.hl_fn, d.hl_user, _para_text(d, i), pe - ps, from, cast(*model.Span, &sy.spans), MAX_SPANS - MAX_SPANS / 4, &ended);
+        if (n < 0) { n = 0; }
+        if (n > MAX_SPANS - MAX_SPANS / 4) { n = MAX_SPANS - MAX_SPANS / 4; }
+    }
+    let is i64 as k with mut = 0;
+    while (k < textbuf.mark_count(&d.buf) && n < MAX_SPANS) {
+        let is *textbuf.Mark as m = textbuf.mark_at(&d.buf, k);
+        let is i64 as a with mut = m.start;
+        let is i64 as b with mut = m.end;
+        if (a < ps) { a = ps; }
+        if (b > pe) { b = pe; }
+        if (a < b) {
+            sy.spans[n].start = a - ps;
+            sy.spans[n].end = b - ps;
+            sy.spans[n].style = m.tag;
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+// over laid on s: what it says wins.
+fn _over(s as *TextStyle, over as *TextStyle) as void {
+    if (over.fg.a > 0.0 || over.fg_role != ROLE_NONE) {
+        s.fg = over.fg;
+        s.fg_role = over.fg_role;
+    }
+    if (over.bg.a > 0.0 || over.bg_role != ROLE_NONE) {
+        s.bg = over.bg;
+        s.bg_role = over.bg_role;
+    }
+    if (over.weight != 0) { s.weight = over.weight; }
+    if (over.italic != 0) { s.italic = over.italic; }
+    if (over.underline != 0) { s.underline = over.underline; }
+    if (over.strike != 0) { s.strike = over.strike; }
+}
+
+// The look s among those of this paragraph, new when it is: the last there is
+// when there is no room.
+fn _look_of(d as *Doc, s as *TextStyle) as i64 {
+    let is *Styling as sy = d.sty;
+    let is i64 as k with mut = 0;
+    while (k < d.nlooks) {
+        if (mem.memcmp(cast(*u8, &sy.looks[k]), cast(*u8, s), sizeof(TextStyle)) == 0) { return k; }
+        k = k + 1;
+    }
+    if (d.nlooks >= MAX_LOOKS) { return MAX_LOOKS - 1; }
+    sy.looks[d.nlooks] = *s;
+    d.nlooks = d.nlooks + 1;
+    return d.nlooks - 1;
+}
+
+// Paragraph i, len bytes, cut where what it looks like changes — at at too,
+// 0 or more, a composition's place — into sty.segs, each with what is over it
+// laid together into a look of sty.looks: how many. Only what looks some way.
+fn _segments(d as *Doc, i as i64, len as i64, at as i64) as i64 {
+    let is *Styling as sy = _styling(d);
+    let is i64 as ns = _spans_of(d, i);
+    d.nlooks = 0;
+    let is i64 as nc with mut = 0;
+    sy.cuts[0] = 0;
+    sy.cuts[1] = len;
+    nc = 2;
+    if (at > 0 && at < len) {
+        sy.cuts[2] = at;
+        nc = 3;
+    }
+    let is i64 as k with mut = 0;
+    while (k < ns) {
+        let is i64 as a = sy.spans[k].start;
+        let is i64 as b = sy.spans[k].end;
+        if (a > 0 && a < len) {
+            sy.cuts[nc] = a;
+            nc = nc + 1;
+        }
+        if (b > 0 && b < len) {
+            sy.cuts[nc] = b;
+            nc = nc + 1;
+        }
+        k = k + 1;
+    }
+    // In order, as few there are.
+    let is i64 as x with mut = 1;
+    while (x < nc) {
+        let is i64 as v = sy.cuts[x];
+        let is i64 as y with mut = x;
+        while (y > 0 && sy.cuts[y - 1] > v) {
+            sy.cuts[y] = sy.cuts[y - 1];
+            y = y - 1;
+        }
+        sy.cuts[y] = v;
+        x = x + 1;
+    }
+    let is i64 as out with mut = 0;
+    k = 0;
+    while (k + 1 < nc) {
+        let is i64 as c0 = sy.cuts[k];
+        let is i64 as c1 = sy.cuts[k + 1];
+        if (c0 < c1) {
+            let is TextStyle as look with mut = text_style();
+            let is i32 as any with mut = 0;
+            let is i64 as j with mut = 0;
+            while (j < ns) {
+                let is i64 as st = sy.spans[j].style;
+                if (sy.spans[j].start <= c0 && sy.spans[j].end >= c1 && st >= 0 && st < d.nstyles) {
+                    _over(&look, &sy.styles[st]);
+                    any = 1;
+                }
+                j = j + 1;
+            }
+            if (any == 1) {
+                sy.segs[out].a = c0;
+                sy.segs[out].b = c1;
+                sy.segs[out].look = _look_of(d, &look);
+                out = out + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// A background of paragraph p kept; none past memory refused.
+fn _bg_push(p as *Para, a as i64, b as i64, color as math.color.Color) as void {
+    if (p.nbg == p.bg_cap) {
+        let is i64 as c with mut = p.bg_cap * 2;
+        if (c < 8) { c = 8; }
+        let is *Bg as g = cast(*Bg, mem.core.mmap_anon(c * sizeof(Bg)));
+        if (cast(i64, g) <= 0) { return; }
+        if (p.bg_cap > 0) {
+            mem.memcpy(cast(*u8, g), cast(*u8, p.bgs), p.nbg * sizeof(Bg));
+            mem.core.munmap(cast(*u8, p.bgs), p.bg_cap * sizeof(Bg));
+        }
+        p.bgs = g;
+        p.bg_cap = c;
+    }
+    p.bgs[p.nbg].a = a;
+    p.bgs[p.nbg].b = b;
+    p.bgs[p.nbg].color = color;
+    p.nbg = p.nbg + 1;
+}
+
+// All laid out again, by what it now looks like. The highlighter's own answers
+// stay, for the states; those of a highlighter that changed its mind go too.
+fn _relaid(d as *Doc, again as i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_LAID) {
+        d.laid[i].idx = 0 - 1;
+        i = i + 1;
+    }
+    if (again == 1) {
+        d.hl_valid = 0;
+        d.hl_stale = 0;
+        d.hl_known = 0;
+    }
+}
+
+fn _restyled(t as *tree.Tree, w as i64, d as *Doc, again as i32) as void {
+    _relaid(d, again);
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// The program's styles, n of them at styles, copied: what its highlighter's
+// spans and its ranges name, by their place here. 1, or 0 for more than there is
+// room for.
+fn set_styles(t as *tree.Tree, w as i64, styles as *TextStyle, n as i64) as i32 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0 || n < 0 || n > MAX_STYLES) { return 0; }
+    let is *Styling as sy = _styling(d);
+    if (cast(i64, sy) == 0) { return 0; }
+    if (n > 0) { mem.memcpy(cast(*u8, &sy.styles), cast(*u8, styles), n * sizeof(TextStyle)); }
+    d.nstyles = n;
+    _restyled(t, w, d, 0);
+    return 1;
+}
+
+// What colours the text as it is written, from now on (see HighlightFn); null
+// for nothing. Asked of a paragraph when it comes into view and of those before
+// it, as far as nobody has; a change asks again from there until a paragraph ends
+// in what it did, so an edit in a long text costs what it touches.
+fn set_highlighter(t as *tree.Tree, w as i64, cb as HighlightFn, user as *u8) as i32 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    d.hl_fn = cb;
+    d.hl_user = user;
+    _restyled(t, w, d, 1);
+    return 1;
+}
+
+// The highlighter's mind changed: all of it asked again.
+fn rehighlight(t as *tree.Tree, w as i64) as void {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return; }
+    _restyled(t, w, d, 1);
+}
+
+// How many paragraphs the highlighter has been asked about.
+fn highlighter_calls(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return d.hl_calls;
+}
+
+// The paragraphs a range covers, laid out again.
+fn _range_changed(t as *tree.Tree, w as i64, d as *Doc, start as i64, end as i64) as void {
+    _resync(t, w, d);
+    let is i64 as p0 = textbuf.para_of(&d.buf, start);
+    let is i64 as p1 = textbuf.para_of(&d.buf, end);
+    let is i64 as i with mut = p0;
+    while (i <= p1 && i < d.n) {
+        _forget(d, i);
+        i = i + 1;
+    }
+    widget.changed(t, w, widget.CHANGED_LAYOUT | widget.CHANGED_PAINT);
+}
+
+// Bytes start to end in style — a search's match, an error — on top of what
+// colours it, going with the text as it is edited (textbuf's marks): its id, for
+// taking it away; 0 when it cannot be had. Those added later over those before.
+fn add_range(t as *tree.Tree, w as i64, start as i64, end as i64, st as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    let is i64 as id = textbuf.mark_add(&d.buf, start, end, st);
+    if (id == 0) { return 0; }
+    let is *textbuf.Mark as m = textbuf.mark_find(&d.buf, id);
+    _range_changed(t, w, d, m.start, m.end);
+    return id;
+}
+
+fn remove_range(t as *tree.Tree, w as i64, id as i64) as i32 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    let is *textbuf.Mark as m = textbuf.mark_find(&d.buf, id);
+    if (cast(i64, m) == 0) { return 0; }
+    let is i64 as a = m.start;
+    let is i64 as b = m.end;
+    textbuf.mark_remove(&d.buf, id);
+    _range_changed(t, w, d, a, b);
+    return 1;
+}
+
+fn clear_ranges(t as *tree.Tree, w as i64) as void {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return; }
+    textbuf.mark_clear(&d.buf);
+    _restyled(t, w, d, 0);
+}
+
+fn range_count(t as *tree.Tree, w as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0; }
+    return textbuf.mark_count(&d.buf);
+}
+
+// Where it is now, the text having been edited; -1 for none.
+fn range_start(t as *tree.Tree, w as i64, id as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    let is *textbuf.Mark as m = textbuf.mark_find(&d.buf, id);
+    if (cast(i64, m) == 0) { return 0 - 1; }
+    return m.start;
+}
+
+fn range_end(t as *tree.Tree, w as i64, id as i64) as i64 {
+    let is *Doc as d = _doc(t, w);
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    let is *textbuf.Mark as m = textbuf.mark_find(&d.buf, id);
+    if (cast(i64, m) == 0) { return 0 - 1; }
+    return m.end;
+}
+
 // The theme's text as it was laid out in: if not, all laid out again.
 fn _fresh(t as *tree.Tree, w as i64, d as *Doc) as void {
     let is style.Theme as th;
@@ -435,8 +897,18 @@ fn _fresh(t as *tree.Tree, w as i64, d as *Doc) as void {
     let is txt.Style as st = sts[0];
     if (d.styled == 1 && st.size == d.key_size && st.weight == d.key_weight &&
         cast(i64, st.family) == cast(i64, d.key_family)) {
+        // Only its colours: what is styled by them laid out again, and asked
+        // of the highlighter again, which may choose by the theme.
+        if (_styled_at_all(d) == 1 && (th.palette.fg.r != d.key_fg.r || th.palette.fg.g != d.key_fg.g || th.palette.fg.b != d.key_fg.b ||
+                                       th.palette.view_bg.r != d.key_bg.r || th.palette.view_bg.g != d.key_bg.g || th.palette.view_bg.b != d.key_bg.b)) {
+            d.key_fg = th.palette.fg;
+            d.key_bg = th.palette.view_bg;
+            _relaid(d, 1);
+        }
         return;
     }
+    d.key_fg = th.palette.fg;
+    d.key_bg = th.palette.view_bg;
     let is *txt.Service as svc = _service(t);
     if (cast(i64, svc) == 0) { return; }
     let is model.Params as pp = model.params();
@@ -473,6 +945,9 @@ fn _tmp_room(d as *Doc, want as i64) as i32 {
 // known from then on. Null when it cannot be.
 fn _para(t as *tree.Tree, w as i64, d as *Doc, i as i64) as *Para {
     d.stamp = d.stamp + 1;
+    // A paragraph before it ending otherwise than it did: this one's not as
+    // it was laid out.
+    _hl_walk(d, i);
     let is i64 as k with mut = 0;
     let is i64 as free with mut = 0;
     while (k < MAX_LAID) {
@@ -510,23 +985,63 @@ fn _para(t as *tree.Tree, w as i64, d as *Doc, i as i64) as *Para {
     }
     let is style.Theme as th;
     widget.theme(t, w, &th);
-    let is [2]txt.Style as sts;
+    let is [32]txt.Style as sts;
     _styles(d, &th, cast(*txt.Style, &sts));
     let is model.Params as pp = model.params();
     pp.width = d.width;
-    let is model.Span as sp;
-    sp.start = p.pre_at;
-    sp.end = p.pre_at + d.npre;
-    sp.style = 1;
+    let is model.Span as one;
+    let is *model.Span as sp with mut = &one;
     let is i64 as nsp with mut = 0;
-    if (p.pre_at >= 0) { nsp = 1; }
-    if (txt.lay(svc, &p.run, s, n, cast(*txt.Style, &sts), 2, &sp, nsp, &pp) == 0) { return cast(*Para, 0); }
+    let is i64 as nst with mut = 2;
+    p.nbg = 0;
+    // A composition's offsets: past it, what comes after its place.
+    if (_styled_at_all(d) == 1) {
+        let is i64 as nseg = _segments(d, i, len, p.pre_at);
+        let is *Styling as sy = d.sty;
+        let is i64 as j with mut = 0;
+        while (j < d.nlooks) {
+            let is *TextStyle as lk = &sy.looks[j];
+            let is txt.Style as ts with mut = sts[0];
+            if (lk.weight != 0) { ts.weight = lk.weight; }
+            ts.italic = lk.italic;
+            ts.underline = lk.underline;
+            ts.strike = lk.strike;
+            ts.color = _role(&th, lk.fg_role, lk.fg);
+            sts[2 + j] = ts;
+            j = j + 1;
+        }
+        nst = 2 + d.nlooks;
+        sp = cast(*model.Span, &sy.laying);
+        j = 0;
+        while (j < nseg) {
+            let is i64 as a with mut = sy.segs[j].a;
+            let is i64 as b with mut = sy.segs[j].b;
+            if (p.pre_at >= 0 && a >= p.pre_at) { a = a + d.npre; }
+            if (p.pre_at >= 0 && b > p.pre_at) { b = b + d.npre; }
+            let is *TextStyle as lk = &sy.looks[sy.segs[j].look];
+            sy.laying[nsp].start = a;
+            sy.laying[nsp].end = b;
+            sy.laying[nsp].style = 2 + sy.segs[j].look;
+            nsp = nsp + 1;
+            let is math.color.Color as bg = _role(&th, lk.bg_role, lk.bg);
+            if (bg.a > 0.0) { _bg_push(p, a, b, bg); }
+            j = j + 1;
+        }
+    }
+    // The composition last: over what is styled.
+    if (p.pre_at >= 0) {
+        sp[nsp].start = p.pre_at;
+        sp[nsp].end = p.pre_at + d.npre;
+        sp[nsp].style = 1;
+        nsp = nsp + 1;
+    }
+    if (txt.lay(svc, &p.run, s, n, cast(*txt.Style, &sts), nst, sp, nsp, &pp) == 0) { return cast(*Para, 0); }
     if (p.opened == 0) {
         tlayout.open(&p.lay);
         p.opened = 1;
     }
     if (txt.lay_layout(svc, &p.lay, cast(*model.Style, &p.lstyles), txt.text_of(&p.run), txt.text_length(&p.run),
-                       cast(*txt.Style, &sts), 2, &sp, nsp, &pp) == 0) {
+                       cast(*txt.Style, &sts), nst, sp, nsp, &pp) == 0) {
         return cast(*Para, 0);
     }
     p.idx = i;
@@ -873,6 +1388,8 @@ fn set_text(t as *tree.Tree, w as i64, s as *u8, n as i64) as i32 {
     let is i64 as k = textedit.accept(s, n, 0 - 1, cast(textedit.FilterFn, 0), cast(*u8, 0), 1, d.tmp);
     if (textbuf.replace(&d.buf, 0, textbuf.length(&d.buf), d.tmp, k) == 0) { return 0; }
     textbuf.forget(&d.buf);
+    // A new text: no range was put on it.
+    textbuf.mark_clear(&d.buf);
     d.anchor = 0;
     d.caret = 0;
     d.upstream = 0;
@@ -1674,6 +2191,19 @@ fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void
                 nr = cursor.selection(&pa.lay, pa.pre_at + d.pre_seg_a, pa.pre_at + d.pre_seg_b, cast(*cursor.Rect, &rs), 32);
                 if (nr > 32) { nr = 32; }
             }
+            // What its spans have behind them, under a selection as text is.
+            let is i64 as g with mut = 0;
+            while (g < pa.nbg) {
+                let is [32]cursor.Rect as bgr;
+                let is i64 as nb with mut = cursor.selection(&pa.lay, pa.bgs[g].a, pa.bgs[g].b, cast(*cursor.Rect, &bgr), 32);
+                if (nb > 32) { nb = 32; }
+                let is i64 as e with mut = 0;
+                while (e < nb) {
+                    shapes.fill_rect(p.canvas, x + bgr[e].x, top + bgr[e].y, bgr[e].w, bgr[e].h, pa.bgs[g].color);
+                    e = e + 1;
+                }
+                g = g + 1;
+            }
             let is i64 as k with mut = 0;
             while (k < nr) {
                 shapes.fill_rect(p.canvas, x + rs[k].x, top + rs[k].y, rs[k].w, rs[k].h, th.palette.selection_bg);
@@ -1683,7 +2213,7 @@ fn _paint(t as *tree.Tree, w as i64, data as *u8, p as *painter.Painter) as void
             k = 0;
             while (k < nr) {
                 draw2d.push_clip(p.canvas, x + rs[k].x, top + rs[k].y, rs[k].w, rs[k].h);
-                txt.draw(svc, p.canvas, &pa.run, x, top, th.palette.selection_fg);
+                txt.draw_in(svc, p.canvas, &pa.run, x, top, th.palette.selection_fg);
                 draw2d.pop_clip(p.canvas);
                 k = k + 1;
             }
@@ -1756,6 +2286,53 @@ fn _text(t as *tree.Tree, w as i64, data as *u8, q as *tree.TextQuery) as i64 {
     }
     if (op == tree.TEXT_BYTE_OF) {
         q.a = textbuf.byte_of(&d.buf, q.at);
+        return 1;
+    }
+    if (op == tree.TEXT_ATTRS) {
+        q.attrs.weight = 0;
+        q.attrs.italic = 0;
+        q.attrs.underline = 0;
+        q.attrs.strike = 0;
+        q.attrs.fg = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+        q.attrs.bg = math.color.rgba(0.0, 0.0, 0.0, 0.0);
+        q.a = 0;
+        q.b = n;
+        if (_styled_at_all(d) == 0) { return 1; }
+        _resync(t, w, d);
+        let is i64 as at = _clamp(d, q.at);
+        let is i64 as pi = textbuf.para_of(&d.buf, at);
+        let is i64 as ps = textbuf.para_start(&d.buf, pi);
+        let is i64 as pe = textbuf.para_end(&d.buf, pi);
+        _hl_walk(d, pi);
+        let is i64 as nseg = _segments(d, pi, pe - ps, 0 - 1);
+        let is i64 as on = at - ps;
+        // Between two that look some way, it looks as the rest.
+        let is i64 as lo with mut = 0;
+        let is i64 as hi with mut = pe - ps;
+        let is i64 as k with mut = 0;
+        while (k < nseg) {
+            let is *Seg as sg = &d.sty.segs[k];
+            if (on >= sg.a && on < sg.b) {
+                lo = sg.a;
+                hi = sg.b;
+                let is style.Theme as th;
+                widget.theme(t, w, &th);
+                let is *TextStyle as lk = &d.sty.looks[sg.look];
+                q.attrs.weight = lk.weight;
+                q.attrs.italic = lk.italic;
+                q.attrs.underline = lk.underline;
+                q.attrs.strike = lk.strike;
+                q.attrs.fg = _role(&th, lk.fg_role, lk.fg);
+                q.attrs.bg = _role(&th, lk.bg_role, lk.bg);
+                k = nseg;
+            } else {
+                if (sg.b <= on && sg.b > lo) { lo = sg.b; }
+                if (sg.a > on && sg.a < hi) { hi = sg.a; }
+                k = k + 1;
+            }
+        }
+        q.a = ps + lo;
+        q.b = ps + hi;
         return 1;
     }
     if (op == tree.TEXT_PARAGRAPH) {
