@@ -227,6 +227,9 @@ specification is Microsoft's, but where its page says:
   Shaping Engine.
 - **Khmer** (`khmer.cst`), **Myanmar** (`myanmar.cst`, `mym2`; `mymr` is shaped by
   the common rules).
+- These three go by the syllabic categories only in the blocks of their own and what
+  they share (`indic.syllabic_category`): any other character is nothing to them,
+  whatever Unicode says of it.
 - **The Universal Shaping Engine** (`use.cst`) for all the scripts its specification
   lists, categories from Unicode's properties and Microsoft's additions
   (`tools/make_use_table.py`).
@@ -307,6 +310,10 @@ choices, and these are ours:
   defines, an axis range.
 - **Language tags** come from the registry and ISO 639-3, without
   HarfBuzz's private BCP 47 extensions or its overrides.
+- Another script's character, in a run forced to Devanagari, Khmer or Myanmar. The
+  itemizer gives each script its run, so no text gets there by it, and nothing holds
+  ours to it. The superscript digits are the one such case a run can hold by itself:
+  after a consonant in an Indic run, HarfBuzz makes them one cluster with it.
 
 Where a choice made no difference to anyone, HarfBuzz's was taken, so that
 text set here looks as it does elsewhere: an ill-formed byte is one U+FFFD;

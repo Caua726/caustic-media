@@ -363,12 +363,15 @@ def write_reference(name, stem, code, direction, lang, texts):
 
 # --- Fonts made here: what no Noto font is ---
 
-def made_font(path, chars):
-    # A box for each character, none with a table of layout: told apart by width,
-    # for the positions as well as the glyphs to say which was chosen.
+def made_font(path, chars, features=None):
+    # A box for each character, none with a table of layout unless given one:
+    # told apart by width, for the positions as well as the glyphs to say which
+    # was chosen.
     from fontTools.fontBuilder import FontBuilder
     from fontTools.pens.ttGlyphPen import TTGlyphPen
     fb = FontBuilder(1000, isTTF=True)
+    # Made again, the same bytes: no date of its making.
+    fb.updateHead(created=0, modified=0)
     chars = sorted(set(chars))
     names = [".notdef"] + ["u%04X" % c for c in chars]
     fb.setupGlyphOrder(names)
@@ -395,6 +398,9 @@ def made_font(path, chars):
     fb.setupNameTable({"familyName": "Caustic Test Made", "styleName": "Regular"})
     fb.setupOS2()
     fb.setupPost()
+    if features:
+        from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+        addOpenTypeFeaturesFromString(fb.font, features)
     fb.save(path)
 
 
@@ -418,6 +424,14 @@ def thai_texts():
     rng = random.Random("Thai made")
     for _ in range(300):
         out.append(chr(rng.choice(THAI_CONSONANTS)) + "".join(chr(rng.choice(THAI_MARKS)) for _ in range(rng.randint(3, 5))))
+    # SARA AM after two marks and three, moved in front of them all, and with
+    # nothing before it.
+    for m in THAI_MARKS:
+        for k in THAI_MARKS:
+            out.append("\u0e01" + chr(m) + chr(k) + "\u0e33")
+    for _ in range(40):
+        out.append("\u0e1b" + "".join(chr(rng.choice(THAI_MARKS)) for _ in range(3)) + "\u0e33\u0e01")
+    out += ["\u0e33", "\u0e33\u0e33", "\u0e48\u0e33", "\u0e48\u0e49\u0e33", "\u0e33\u0e01"]
     return out
 
 
@@ -535,10 +549,46 @@ def mark_texts(marks, bases):
     return out
 
 
+# Each of Khmer's features by a glyph of its own, cfar among them: Noto's has none.
+KHMER_FEATURES = """
+languagesystem DFLT dflt;
+languagesystem khmr dflt;
+feature pref { sub u17D2 u179A by u17DB; } pref;
+feature blwf { sub u17D2 u1780 by u17E0; sub u17D2 u1781 by u17E1; } blwf;
+feature abvf { sub u17C6 by u17E2; } abvf;
+feature pstf { sub u17C7 by u17E3; } pstf;
+feature cfar { sub u17C1 by u17E4; sub u17B8 by u17E5; sub u17B6 by u17E6; sub u1780 by u17E7; } cfar;
+"""
+
+KHMER_CHARS = list(range(0x1780, 0x17DE)) + list(range(0x17E0, 0x17EA)) + [0x200C, 0x200D, 0x20, 0x25CC]
+
+
+def khmer_texts():
+    # What cfar is held to: after COENG RO and only after it, on each kind of what
+    # can follow. And what is composed in a Khmer run: a mark never, whatever is
+    # asked of it, and anything else as anywhere.
+    bases = [0x1780, 0x1781, 0x179A, 0x17A2]
+    after = [0x17C1, 0x17B8, 0x17B6, 0x17C6, 0x17C7, 0x17BE, 0x17C4]
+    out = []
+    for b in bases:
+        for v in after:
+            out.append(chr(b) + "\u17d2\u179a" + chr(v))
+            out.append(chr(b) + chr(v))
+            out.append(chr(b) + "\u17d2\u1780" + chr(v))
+            out.append(chr(b) + "\u17d2\u179a\u17d2\u1780" + chr(v))
+            out.append(chr(b) + "\u17d2\u1780\u17d2\u179a" + chr(v))
+            out.append(chr(b) + "\u17d2\u179a\u200d" + chr(v))
+            out.append(chr(b) + "\u17d2\u179a" + chr(v) + " " + chr(b) + chr(v))
+    # Marks first and letters first, with U+0001 for what a wrong answer would make.
+    out += ["e\u0301", "\u00e9", "\u17b6\u17c6", "\u17c1\u17b8", "\u1780\u17b6\u17c6",
+            "\u1780\u17c1\u17b8", "\u1780e\u0301", "e\u0301\u1780"]
+    return out + structured("Khmr", KHMER_CHARS, 300)
+
+
 def made_fonts(names):
-    def made(stem, chars, code, direction, lang, texts):
+    def made(stem, chars, code, direction, lang, texts, features=None):
         name = stem + ".ttf"
-        made_font(os.path.join(OUT, name), chars)
+        made_font(os.path.join(OUT, name), chars, features)
         n = write_reference(name, stem, code, direction, lang, texts)
         names.append(name)
         print(stem, n, "cases")
@@ -574,6 +624,9 @@ def made_fonts(names):
     made("hangul-jamo", jamo + rest + [0x25CC], "Hang", "ltr", "ko", hangul_texts())
     made("hangul-both", syllables + jamo + rest + [0x25CC], "Hang", "ltr", "ko", hangul_texts())
     made("hangul-both-no-circle", syllables + jamo + rest, "Hang", "ltr", "ko", hangul_texts())
+    # Khmer with all its features, and the characters composing in its runs.
+    composing = [0x1, 0x65, 0xE9, 0x301]
+    made("khmer-features", KHMER_CHARS + composing, "Khmr", "ltr", "km", khmer_texts(), KHMER_FEATURES)
 
 
 def main():
