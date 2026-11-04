@@ -29,6 +29,18 @@ shape/
   pos.cst       GPOS: the nine positioning types, and attachments resolved
   kern.cst      the legacy kern table
   fallback.cst  what the font does not do: spaces it lacks, marks it does not place
+  work.cst      what a script's shaper is given to work with
+  syllable.cst  grammars of syllables, the dotted circle, sequences not to write
+  would.cst     whether a feature would substitute a few glyphs, not doing it
+  arabic.cst    letters that join; marks reordered (UAX #53); presentation forms; stretching
+  hangul.cst    syllables and jamo
+  thai.cst      SARA AM; a font of the private use area
+  indic.cst     syllables, base, reph and matras, features in stages
+  khmer.cst     syllables, COENG RO and left vowels
+  myanmar.cst   syllables, kinzi and medial ra
+  use.cst       the Universal Shaping Engine
+  use_table.cst each character's category under it, and vowels not to write, generated
+  arabic_forms.cst the presentation forms, generated (tools/make_arabic_forms.py)
 ```
 
 ---
@@ -44,13 +56,8 @@ scripts that need it. Arabic without it is a row of disconnected letters, which
 is not ugly but unreadable. Devanagari without it puts vowel signs in the wrong
 place, changing what the word says.
 
-Both are here for every script without rules of its own — Latin, Greek,
-Cyrillic, Han, kana, Thaana and the rest — in both directions. The scripts
-whose shaping reorders or joins (Arabic joining, Indic reordering, Hangul
-composition, Thai, Khmer, Myanmar, the Universal Shaping Engine's) are the [B]
-part of the plan; a run of them is shaped meanwhile by the same rules, which
-is right for their fonts' ligatures and marks and wrong where the script needs
-more.
+Both are here for every script, in both directions; those whose shaping
+reorders or joins have shapers of their own (below).
 
 ---
 
@@ -92,8 +99,10 @@ still to read the future it looks ahead to.
 7. **Composition.** Within each grapheme, a character the font cannot draw is
    decomposed into what it can, marks are put in canonical order, and a base
    and mark the font has a single character for are composed into it — so
-   `e` + `◌́` and `é` come out alike, whichever the font has. A space the font
-   lacks is drawn with its space, and a non-breaking hyphen with its hyphen.
+   `e` + `◌́` and `é` come out alike, whichever the font has. A shaper that takes
+   everything apart composes only if a mark comes after the text's first
+   character: with none, what it took apart stays so. A space the font lacks is
+   drawn with its space, and a non-breaking hyphen with its hyphen.
 8. **Glyphs** from `cmap`; a variation sequence through format 14, its
    selector then taken out — one the face does not know stays, drawn as
    nothing.
@@ -153,7 +162,12 @@ like any default ignorable.
 
 A ligature remembers which of its components each following mark belongs to,
 so that `mark` attaches it to the right one, and is not formed across a mark
-that belongs to another ligature's component. Context rules apply their
+that belongs to another ligature's component. A mark's height is settled when
+it is attached, from where the glyph under it is then; along the line it follows
+wherever that glyph ends up. The base is looked for once per lookup: a later
+subtable has the glyph the first one chose. Past a glyph a multiple substitution
+split, a mark goes on the first piece, unless the subtable has an anchor on the
+later one. Context rules apply their
 lookups at positions of the sequence they matched; a nested lookup may add or
 remove glyphs, and the positions after it move with them. Nesting stops at 64
 levels, and work is bounded by the text's length, so that no font makes
@@ -183,6 +197,42 @@ font, because splitting a paragraph into such runs is `layout`'s job, using
 caustic-unicode's answers.
 
 ---
+
+## Scripts with shapers of their own
+
+A script's shaper adds to the steps above: the features it wants, in **stages**
+(`plan.pause`), each seeing what the one before made, with its own work between
+them; a look at the text first; a mask for each glyph once it is composed; how far
+normalization goes (`compose.Rules`); when marks lose their width. `_kind` in
+`shape.cst` chooses by script and by what the font has: a font made for no script
+in particular (`DFLT`, `latn`) is shaped by the common rules. Each script's
+specification is Microsoft's, but where its page says:
+
+- **Arabic, Syriac** (`arabic.cst`): each letter's form from Joining_Type along the
+  text and its context, Syriac's alaph forms included; `stch`, `ccmp`, `locl`, the
+  forms one stage each, `rlig`, `rclt` and `calt`, `mset`. A font with none of the
+  forms but with the presentation forms (U+FB50..U+FEFF) is shaped through those.
+  A Syriac Abbreviation Mark's pieces repeat along the word after it.
+- **Other scripts whose letters join** — N'Ko, Mongolian, Adlam, Mandaic and the
+  rest — go to the Universal Shaping Engine, with the same forms.
+- **Hangul** (`hangul.cst`): syllables composed or taken apart as the font can draw
+  them; `ljmo`, `vjmo`, `tjmo` for what stays jamo; tone marks in front.
+- **Thai, Lao** (`thai.cst`): SARA AM into its two; a Thai font with no GSUB for the
+  script through the private use area, as Theppitak Karoonboonyanan's document gives.
+- **Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada,
+  Malayalam** (`indic.cst`): syllables by grammar (`syllable.cst`), each put in order
+  for the basic features, then the matra, the reph and a pre-base consonant moved to
+  where they end up; both tags, `deva` and `dev2`. `dev3` goes to the Universal
+  Shaping Engine.
+- **Khmer** (`khmer.cst`), **Myanmar** (`myanmar.cst`, `mym2`; `mymr` is shaped by
+  the common rules).
+- **The Universal Shaping Engine** (`use.cst`) for all the scripts its specification
+  lists, categories from Unicode's properties and Microsoft's additions
+  (`tools/make_use_table.py`).
+
+What cannot be drawn as written gets a dotted circle: a syllable with no base, and
+the vowel sequences Unicode and Microsoft say not to write (`vowel_constraints`).
+All of this happens with no `GSUB` in the font as well: only its lookups are missing.
 
 ## Tests
 
@@ -236,16 +286,19 @@ with advances of their own in a font without GPOS.
 Most of what a shaper does is fixed by the specifications; the rest is
 choices, and these are ours:
 
-- **Marks keep Unicode's canonical order.** HarfBuzz reorders some marks by
-  classes of its own (Arabic shadda first, some Tibetan and Tai Tham marks
-  last); that belongs to the shapers of those scripts, which are [B].
+- **Marks** are sorted by Unicode's classes where those give the order writing
+  wants, and otherwise as the SBL Hebrew manual, UAX #53 and the scripts'
+  conventions do (`chars.order_class`, `arabic.reorder_marks`).
 - **Marks without GPOS** are placed by Unicode's combining classes around
   the base's ink, centred, a sixteenth of the em clear (fallback.cst);
   HarfBuzz has its own guesses. The tests hold ours to what they promise.
 - **Unsafe to break** is ours: marked wherever a match, a ligature, a pair,
   an attachment or a fraction joins clusters, and checked by its promise.
   HarfBuzz's other flags — unsafe to concatenate, safe to insert tatweel —
-  are not made.
+  are not made. It is marked in three places HarfBuzz leaves unmarked, where the
+  parts do come out differently: syllables whose forms depend on each other
+  (`isol`, `init`, `medi`, `fina`), a character composed only because of a mark
+  elsewhere in the text, and text with the broken syllable below.
 - **Feature variations** are met by the one condition the specification
   defines, an axis range.
 - **Language tags** come from the registry and ISO 639-3, without
@@ -255,7 +308,9 @@ Where a choice made no difference to anyone, HarfBuzz's was taken, so that
 text set here looks as it does elsewhere: an ill-formed byte is one U+FFFD;
 a variation selector that found its glyph is taken out; a legacy kerning
 value is split between the pair; `rand` draws its numbers as HarfBuzz
-does.
+does. A broken syllable fifteen syllables on from another broken one goes
+without its dotted circle, syllables being numbered in four bits: only ill-formed
+text can show it, and a circle more would be the only difference from everyone else.
 
 ## Current state
 
@@ -264,7 +319,8 @@ steps above, `GSUB` and `GPOS` with every lookup type, format and flag, the
 legacy `kern` table, the fallback for marks and spaces. Every case of the
 tests gives HarfBuzz's glyphs, clusters, advances and offsets (but for the
 marks the fallback places), and every cut the shaper says is safe gives the
-whole. The scripts with shapers of their own are [B].
+whole; so does a font of each script with a shaper of its own, over its words
+and strings made up of its characters (`tools/script_reference.py`).
 
 A plan is made for each text; HarfBuzz caches them by face, script,
 language, direction and features — a cache is for when layout needs one.

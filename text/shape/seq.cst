@@ -7,7 +7,8 @@
 // over when it is not the item a rule asks for — save, in GSUB, a hidden one
 // (chars.is_hidden), which substitutions must see, and a ZWNJ within the
 // input, which is there to stop a ligature; and a ZWJ within the input of a
-// feature that handles joiners itself (plan.F_MANUAL_JOINERS).
+// feature that handles joiners itself (plan.F_MANUAL_ZWJ), a ZWNJ around it of
+// one that does (plan.F_MANUAL_ZWNJ).
 //
 // A rule's items are matched by glyph, by class or by coverage, one after
 // another from the current glyph: the input, which the rule acts on, must
@@ -60,6 +61,9 @@ struct Ctx {
     _pad0    as i32;
     store    as var.Store;
     depth    as i64;
+    syl      as i64;      // the syllable a per-syllable feature's match is in; 0 for any
+    base_found as i64;    // the base marks of this lookup go on, otl.NONE for none
+    base_until as i64;    // where it was looked for from
     pos      as *i64;     // where the current rule's input is
     stack    as [4160]i64;    // MAX_SEQ positions for each level
 }
@@ -82,6 +86,9 @@ fn open(c as *Ctx, f as *table.Face, r as *outline.Reader, run as *glyphs.Run, l
     c._pad0 = 0;
     c.store = otl.store(f);
     c.depth = 0;
+    c.syl = 0;
+    c.base_found = otl.NONE;
+    c.base_until = 0;
     c.pos = cast(*i64, &c.stack);
 }
 
@@ -130,11 +137,13 @@ fn ignored(c as *Ctx, g as *glyphs.Glyph) as i32 {
 // looked for.
 fn passable(c as *Ctx, g as *glyphs.Glyph, where as i64) as i32 {
     let is i64 as u = cast(i64, g.uflags);
-    if ((u & glyphs.U_IGNORABLE) == 0) { return 0; }
+    if (glyphs.is_ignorable(g) == 0) { return 0; }
     if (c.t == plan.GSUB && (u & glyphs.U_HIDDEN) != 0) { return 0; }
     if (where == INPUT) {
         if (c.t == plan.GSUB && (u & glyphs.U_ZWNJ) != 0) { return 0; }
-        if ((c.flags & plan.F_MANUAL_JOINERS) != 0 && (u & glyphs.U_ZWJ) != 0) { return 0; }
+        if ((c.flags & plan.F_MANUAL_ZWJ) != 0 && (u & glyphs.U_ZWJ) != 0) { return 0; }
+    } else if (c.t == plan.GSUB && (c.flags & plan.F_MANUAL_ZWNJ) != 0 && (u & glyphs.U_ZWNJ) != 0) {
+        return 0;
     }
     return 1;
 }
@@ -163,6 +172,7 @@ fn find_next(c as *Ctx, from as i64, where as i64, by as i64, base as i64, value
             let is i32 as wanted with mut = 1;
             if (where == INPUT && (cast(i64, g.mask) & c.mask) == 0) { wanted = 0; }
             if (by == BY_ANY && pass == 1) { wanted = 0; }
+            if (c.syl != 0 && cast(i64, g.syl) != c.syl) { wanted = 0; }
             if (wanted == 1 && is_item(c, g, by, base, value) == 1) { return k; }
             if (pass == 0) { return otl.NONE; }
         }
@@ -181,6 +191,7 @@ fn find_prev(c as *Ctx, from as i64, where as i64, by as i64, base as i64, value
             let is i32 as wanted with mut = 1;
             if (where == INPUT && (cast(i64, g.mask) & c.mask) == 0) { wanted = 0; }
             if (by == BY_ANY && pass == 1) { wanted = 0; }
+            if (c.syl != 0 && cast(i64, g.syl) != c.syl) { wanted = 0; }
             if (wanted == 1 && is_item(c, g, by, base, value) == 1) { return k; }
             if (pass == 0) { return otl.NONE; }
         }
@@ -219,6 +230,13 @@ fn _passes_ligature(c as *Ctx, g as *glyphs.Glyph) as i32 {
     return 0;
 }
 
+// The syllable a match is held to when asked: a per-syllable feature's in
+// GSUB, the current glyph's.
+fn _held(c as *Ctx, asked as i32) as i64 {
+    if (asked == 0 || c.t != plan.GSUB || (c.flags & plan.F_PER_SYLLABLE) == 0) { return 0; }
+    return cast(i64, cur(c).syl);
+}
+
 // The input, count items from the current glyph — the first is it, the rest
 // matched against the values at vals — into c.pos: 1, with *end just past
 // the last; or 0. A ligature is not formed from marks of another ligature's
@@ -228,6 +246,7 @@ fn match_input(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, end
     let is i64 as h = here(c);
     let is *glyphs.Glyph as first = at(c, h);
     c.pos[0] = h;
+    c.syl = _held(c, 1);
     let is i64 as n with mut = own_count(first);
     let is i32 as on_component = cast(i32, first.lig != cast(u8, 0) && first.comp != cast(u8, 0));
     let is i64 as freed with mut = 0 - 1;   // whether the lookup passes over first's ligature: unknown yet
@@ -259,6 +278,9 @@ fn match_input(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, end
 fn match_backtrack(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, start as *i64) as i32 {
     let is i64 as k with mut = here(c);
     let is i64 as i with mut = 0;
+    // Held to it only as long as nothing has been written or read past: where
+    // the run's two parts still line up.
+    c.syl = _held(c, cast(i32, c.run.passing == 0 || c.run.n == c.run.i));
     while (i < count) {
         k = find_prev(c, k, CONTEXT, by, base, u16(c, vals + i * 2));
         if (k == otl.NONE) { return 0; }
@@ -273,6 +295,7 @@ fn match_backtrack(c as *Ctx, count as i64, by as i64, base as i64, vals as i64,
 fn match_lookahead(c as *Ctx, count as i64, by as i64, base as i64, vals as i64, from as i64, end as *i64) as i32 {
     let is i64 as k with mut = from;
     let is i64 as i with mut = 0;
+    c.syl = _held(c, cast(i32, from == here(c)));
     while (i < count) {
         k = find_next(c, k, CONTEXT, by, base, u16(c, vals + i * 2));
         if (k == otl.NONE) { return 0; }

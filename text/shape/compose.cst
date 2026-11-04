@@ -13,6 +13,12 @@
 //
 // A space the font has no glyph for is drawn with its space, at the width
 // chars.space_kind says; a non-breaking hyphen with its hyphen.
+//
+// A script's shaper has its say through Rules: some want everything taken apart
+// as far as the font can and then put together again, whatever the font has
+// (PARTS) — a split vowel, an Indic letter with its nukta — some nothing put
+// together at all (KEEP); some have parts of their own for a character,
+// compositions to leave alone, and an order of their own for marks.
 use "../sfnt/table.cst" as table;
 use "../sfnt/cmap.cst" as cmap;
 use "caustic-unicode/src/ucd/tables/decomp.cst" as dec;
@@ -30,6 +36,21 @@ let is i64 as HANGUL_L with imut = 4352;
 let is i64 as HANGUL_V with imut = 4449;
 let is i64 as HANGUL_T with imut = 4519;
 let is i64 as HANGUL_COUNT with imut = 11172;
+
+let is i64 as FONT with imut = 0;    // a character the font has stays, unless it has marks to go with
+let is i64 as PARTS with imut = 1;   // all taken apart as far as the font can, then composed
+let is i64 as KEEP with imut = 2;    // a character the font has stays, and nothing is composed
+
+type DecomposeFn = fn(i64, *i64) as i64;
+type ComposeFn = fn(i64, i64) as i64;
+type ReorderFn = fn(*glyphs.Run, i64, i64) as void;
+
+struct Rules {
+    mode      as i64;
+    decompose as DecomposeFn;   // u into parts: how many; null for Unicode's
+    compose   as ComposeFn;     // a and b as one; 0 for none; null for Unicode's
+    reorder   as ReorderFn;     // what to do after a run of marks is sorted, a .. b of what is written
+}
 
 fn nominal(f as *table.Face, u as i64) as i64 { return cmap.glyph(f, u); }
 
@@ -61,24 +82,35 @@ fn decompose_once(u as i64, parts as *i64) as i64 {
     return n;
 }
 
-// u as characters the font has, into out from n: the new count, or -1 when
-// it cannot be.
-fn _expand(f as *table.Face, u as i64, out as *i64, n as i64, depth as i64) as i64 {
-    if (nominal(f, u) != 0) {
-        if (n >= 64) { return 0 - 1; }
-        out[n] = u;
-        return n + 1;
-    }
-    if (depth > 8) { return 0 - 1; }
+// u's parts as rules has it: its shaper's say first.
+fn _parts(rules as *Rules, u as i64, parts as *i64) as i64 {
+    if (cast(i64, rules.decompose) != 0) { return call(rules.decompose, u, parts); }
+    return decompose_once(u, parts);
+}
+
+// Decomposed as the font can draw it, into out from n: the new count, or -1 when
+// it cannot be. The second part has to be a glyph of the font; the first, if
+// shortest, stops there when the font has it, or else goes as far down as the
+// font has the pieces.
+fn _expand(f as *table.Face, u as i64, out as *i64, n as i64, depth as i64, shortest as i32, rules as *Rules) as i64 {
+    if (depth > 8 || n >= 62) { return 0 - 1; }
     let is [2]i64 as parts;
-    let is i64 as k = decompose_once(u, cast(*i64, &parts));
+    let is i64 as k = _parts(rules, u, cast(*i64, &parts));
     if (k == 0) { return 0 - 1; }
-    let is i64 as m with mut = n;
-    let is i64 as i with mut = 0;
-    while (i < k) {
-        m = _expand(f, parts[i], out, m, depth + 1);
-        if (m < 0) { return 0 - 1; }
-        i = i + 1;
+    if (k == 2 && nominal(f, parts[1]) == 0) { return 0 - 1; }
+    let is i32 as has_first = cast(i32, nominal(f, parts[0]) != 0);
+    let is i64 as m with mut = 0 - 1;
+    if (shortest == 0 || has_first == 0) {
+        m = _expand(f, parts[0], out, n, depth + 1, shortest, rules);
+    }
+    if (m < 0) {
+        if (has_first == 0) { return 0 - 1; }
+        out[n] = parts[0];
+        m = n + 1;
+    }
+    if (k == 2) {
+        out[m] = parts[1];
+        m = m + 1;
     }
     return m;
 }
@@ -87,23 +119,24 @@ fn _expand(f as *table.Face, u as i64, out as *i64, n as i64, depth as i64) as i
 fn _as(f as *table.Face, g as *glyphs.Glyph, u as i64) as void {
     g.id = cast(u32, u);
     g.cat = cast(u8, chars.category(u));
-    g.ccc = cast(u8, chars.combining_class(u));
+    g.ccc = cast(u8, chars.shaping_class(u));
     g.alt = cast(u32, nominal(f, u));
 }
 
-// The current record written as the font can draw it.
-fn _decompose(f as *table.Face, r as *glyphs.Run) as void {
+// The current record written as the font can draw it: keeping what the font has
+// when shortest, as far decomposed as it can be when not.
+fn _decompose(f as *table.Face, r as *glyphs.Run, shortest as i32, rules as *Rules) as void {
     let is glyphs.Glyph as g = *glyphs.cur(r);
     let is i64 as u = cast(i64, g.id);
     let is i64 as have = nominal(f, u);
-    if (have != 0) {
+    if (shortest == 1 && have != 0) {
         g.alt = cast(u32, have);
         glyphs.put(r, &g);
         glyphs.drop(r);
         return;
     }
     let is [64]i64 as pieces;
-    let is i64 as n = _expand(f, u, cast(*i64, &pieces), 0, 0);
+    let is i64 as n = _expand(f, u, cast(*i64, &pieces), 0, 0, shortest, rules);
     if (n > 0) {
         let is i64 as i with mut = 0;
         while (i < n) {
@@ -112,6 +145,12 @@ fn _decompose(f as *table.Face, r as *glyphs.Run) as void {
             glyphs.put(r, &piece);
             i = i + 1;
         }
+        glyphs.drop(r);
+        return;
+    }
+    if (have != 0) {
+        g.alt = cast(u32, have);
+        glyphs.put(r, &g);
         glyphs.drop(r);
         return;
     }
@@ -130,8 +169,8 @@ fn _decompose(f as *table.Face, r as *glyphs.Run) as void {
 }
 
 // Records a .. b of what was written, marks in canonical order: each run of
-// them sorted by class, stably.
-fn _order(r as *glyphs.Run, a as i64, b as i64) as void {
+// them sorted by class (chars.order_class), stably, then as its shaper says.
+fn _order(r as *glyphs.Run, a as i64, b as i64, rules as *Rules) as void {
     let is i64 as i with mut = a;
     while (i < b) {
         if (r.dst[i].ccc == cast(u8, 0)) {
@@ -144,13 +183,15 @@ fn _order(r as *glyphs.Run, a as i64, b as i64) as void {
                 while (k < end) {
                     let is glyphs.Glyph as x = r.dst[k];
                     let is i64 as j with mut = k;
-                    while (j > i && r.dst[j - 1].ccc > x.ccc) {
+                    let is i64 as xc = chars.order_class(cast(i64, x.ccc));
+                    while (j > i && chars.order_class(cast(i64, r.dst[j - 1].ccc)) > xc) {
                         r.dst[j] = r.dst[j - 1];
                         j = j - 1;
                     }
                     r.dst[j] = x;
                     k = k + 1;
                 }
+                if (cast(i64, rules.reorder) != 0) { call(rules.reorder, r, i, end); }
             }
             i = end;
         }
@@ -159,7 +200,7 @@ fn _order(r as *glyphs.Run, a as i64, b as i64) as void {
 
 // Records a .. of what was written composed where the font can; the new
 // end of them.
-fn _compose(f as *table.Face, r as *glyphs.Run, a as i64, b as i64) as i64 {
+fn _compose(f as *table.Face, r as *glyphs.Run, a as i64, b as i64, rules as *Rules) as i64 {
     if (b - a < 2) { return b; }
     let is i64 as w with mut = a + 1;       // where the next kept record goes
     let is i64 as starter with mut = 0 - 1;
@@ -168,10 +209,15 @@ fn _compose(f as *table.Face, r as *glyphs.Run, a as i64, b as i64) as i64 {
     let is i64 as i with mut = a + 1;
     while (i < b) {
         let is glyphs.Glyph as m = r.dst[i];
-        let is i64 as ccc = cast(i64, m.ccc);
+        let is i64 as ccc = chars.order_class(cast(i64, m.ccc));
         let is i32 as done with mut = 0;
         if (starter >= 0 && chars.is_mark(cast(i64, m.cat)) == 1 && (last_ccc < 0 || (last_ccc < ccc && last_ccc != 0))) {
-            let is i64 as both = cast(i64, norm.compose_pair(cast(i32, r.dst[starter].id), cast(i32, m.id)));
+            let is i64 as both with mut = 0;
+            if (cast(i64, rules.compose) != 0) {
+                both = call(rules.compose, cast(i64, r.dst[starter].id), cast(i64, m.id));
+            } else {
+                both = cast(i64, norm.compose_pair(cast(i32, r.dst[starter].id), cast(i32, m.id)));
+            }
             if (both > 0) {
                 let is i64 as g = nominal(f, both);
                 if (g != 0) {
@@ -195,18 +241,64 @@ fn _compose(f as *table.Face, r as *glyphs.Run, a as i64, b as i64) as i64 {
     return w;
 }
 
-// The run, a grapheme at a time, as the font can draw it.
-fn compose(f as *table.Face, r as *glyphs.Run) as void {
+// Whether the grapheme a .. of what is still to read, sharing cluster, has marks
+// to go with its base, and so is more than one character to decompose together;
+// a variation selector chooses from what the character is, and keeps it.
+fn _is_many(r as *glyphs.Run, cluster as u32) as i32 {
+    let is i64 as k with mut = r.i;
+    let is i32 as marks with mut = 0;
+    while (k < r.len && r.src[k].cluster == cluster) {
+        if (chars.is_variation_selector(cast(i64, r.src[k].id)) == 1) { return 0; }
+        if (chars.is_mark(cast(i64, r.src[k].cat)) == 1) { marks = 1; }
+        k = k + 1;
+    }
+    return marks;
+}
+
+// Whether a mark comes after the first record of the run: with none, what was
+// taken apart stays so, whatever its parts could make.
+fn _has_marks(r as *glyphs.Run) as i32 {
+    let is i64 as k with mut = 1;
+    while (k < r.len) {
+        if (chars.is_mark(cast(i64, r.src[k].cat)) == 1) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Whether the grapheme at what is still to read has marks of its own.
+fn _has_own_marks(r as *glyphs.Run, cluster as u32) as i32 {
+    let is i64 as k with mut = r.i;
+    while (k < r.len && r.src[k].cluster == cluster) {
+        if (chars.is_mark(cast(i64, r.src[k].cat)) == 1) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// The run, a grapheme at a time, as the font can draw it and rules says.
+fn compose(f as *table.Face, r as *glyphs.Run, rules as *Rules) as void {
+    let is i32 as marks = _has_marks(r);
+    let is i32 as by_others with mut = 0;   // something was composed for marks not its own
     glyphs.begin(r);
     while (glyphs.more(r) == 1) {
         let is i64 as a = r.n;
         let is u32 as cluster = glyphs.cur(r).cluster;
-        while (glyphs.more(r) == 1 && glyphs.cur(r).cluster == cluster) { _decompose(f, r); }
-        if (r.ok == 1 && r.n - a > 1) {
-            _order(r, a, r.n);
-            r.n = _compose(f, r, a, r.n);
+        let is i32 as shortest with mut = 1;
+        let is i32 as own with mut = _has_own_marks(r, cluster);
+        if (rules.mode != KEEP && (rules.mode == PARTS || _is_many(r, cluster) == 1)) { shortest = 0; }
+        while (glyphs.more(r) == 1 && glyphs.cur(r).cluster == cluster) { _decompose(f, r, shortest, rules); }
+        if (r.ok == 1 && r.n - a > 1 && marks == 1) {
+            _order(r, a, r.n, rules);
+            if (rules.mode != KEEP) {
+                let is i64 as before = r.n;
+                r.n = _compose(f, r, a, r.n, rules);
+                if (r.n != before && own == 0) { by_others = 1; }
+            }
         }
         glyphs.step(r, 1);
     }
     glyphs.end(r);
+    // Cut anywhere, the part with it might have no mark to compose it.
+    if (by_others == 1) { glyphs.mark_unsafe(r, 0, r.len); }
 }

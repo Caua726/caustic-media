@@ -1,0 +1,376 @@
+// text/shape/syllable.cst — finding syllables: what the scripts whose letters
+// reorder share.
+//
+// Each such script's specification gives a grammar of its categories of
+// character. Here a grammar is written down as just that: a category is its
+// letter (glyphs.Glyph's scat), with ( ) | ? * meaning what they do. A syllable
+// is the longest stretch any of a script's grammars matches from where the last
+// ended, the earlier grammar winning a tie; a character none of them takes is
+// one by itself. Each is numbered, with its kind, in every record's syl.
+//
+// Matching keeps every place in the grammar it could be at, character by
+// character, so what a grammar's shape is cannot make it slow.
+use "../sfnt/cmap.cst" as cmap;
+use "glyphs.cst" as glyphs;
+use "chars.cst" as chars;
+use "work.cst" as work;
+use "use_table.cst" as table;
+
+let is i64 as MAX_OPS with imut = 512;
+let is i64 as SF_PASSED_OVER with imut = 1;   // sflags: not looked at by a grammar, in the syllable around it
+let is i64 as OP_CAT with imut = 0;
+let is i64 as OP_SPLIT with imut = 1;
+let is i64 as OP_JUMP with imut = 2;
+let is i64 as OP_MATCH with imut = 3;
+
+struct Grammar {
+    n     as i64;
+    ready as i32;
+    bad   as i32;
+    kind  as [512]u8;
+    a     as [512]i16;   // relative: where to go on; a category's letter
+    b     as [512]i16;
+}
+
+fn _emit(g as *Grammar, kind as i64, a as i64, b as i64) as i64 {
+    if (g.n >= MAX_OPS) {
+        g.bad = 1;
+        return g.n - 1;
+    }
+    g.kind[g.n] = cast(u8, kind);
+    g.a[g.n] = cast(i16, a);
+    g.b[g.n] = cast(i16, b);
+    g.n = g.n + 1;
+    return g.n - 1;
+}
+
+// Room for one instruction at at, what is from there on moved up.
+fn _insert(g as *Grammar, at as i64) as void {
+    if (g.n >= MAX_OPS) {
+        g.bad = 1;
+        return;
+    }
+    let is i64 as k with mut = g.n;
+    while (k > at) {
+        g.kind[k] = g.kind[k - 1];
+        g.a[k] = g.a[k - 1];
+        g.b[k] = g.b[k - 1];
+        k = k - 1;
+    }
+    g.n = g.n + 1;
+}
+
+fn _set(g as *Grammar, at as i64, kind as i64, a as i64, b as i64) as void {
+    g.kind[at] = cast(u8, kind);
+    g.a[at] = cast(i16, a);
+    g.b[at] = cast(i16, b);
+}
+
+// One of: a sequence, alternatives after it; from s at *at.
+fn _alternatives(g as *Grammar, s as *u8, at as *i64) as void {
+    let is i64 as start = g.n;
+    _sequence(g, s, at);
+    while (s[*at] == cast(u8, 124)) {
+        *at = *at + 1;
+        // start: split to here, or past the jump that ends what came before.
+        _insert(g, start);
+        let is i64 as jump = _emit(g, OP_JUMP, 0, 0);
+        _set(g, start, OP_SPLIT, 1, jump + 1 - start);
+        _sequence(g, s, at);
+        _set(g, jump, OP_JUMP, g.n - jump, 0);
+    }
+}
+
+fn _sequence(g as *Grammar, s as *u8, at as *i64) as void {
+    while (s[*at] != cast(u8, 0) && s[*at] != cast(u8, 124) && s[*at] != cast(u8, 41)) {
+        let is i64 as start = g.n;
+        if (s[*at] == cast(u8, 40)) {
+            *at = *at + 1;
+            _alternatives(g, s, at);
+            if (s[*at] == cast(u8, 41)) { *at = *at + 1; } else { g.bad = 1; }
+        } else {
+            _emit(g, OP_CAT, cast(i64, s[*at]), 0);
+            *at = *at + 1;
+        }
+        if (s[*at] == cast(u8, 63)) {          // ?
+            *at = *at + 1;
+            _insert(g, start);
+            _set(g, start, OP_SPLIT, 1, g.n - start);
+        } else if (s[*at] == cast(u8, 42)) {   // *
+            *at = *at + 1;
+            _insert(g, start);
+            let is i64 as back = _emit(g, OP_JUMP, 0, 0);
+            _set(g, back, OP_JUMP, start - back, 0);
+            _set(g, start, OP_SPLIT, 1, g.n - start);
+        }
+    }
+}
+
+// The grammar written in s made ready: once.
+fn compile(g as *Grammar, s as *u8) as void {
+    if (g.ready == 1) { return; }
+    g.n = 0;
+    let is i64 as at with mut = 0;
+    _alternatives(g, s, &at);
+    if (s[at] != cast(u8, 0)) { g.bad = 1; }
+    _emit(g, OP_MATCH, 0, 0);
+    g.ready = 1;
+}
+
+// pc among those to go on from at this character, and where it leads.
+fn _add(g as *Grammar, list as *i16, n as *i64, seen as *i64, stamp as i64, pc as i64) as void {
+    if (seen[pc] == stamp) { return; }
+    seen[pc] = stamp;
+    let is i64 as k = cast(i64, g.kind[pc]);
+    if (k == OP_JUMP) {
+        _add(g, list, n, seen, stamp, pc + cast(i64, g.a[pc]));
+    } else if (k == OP_SPLIT) {
+        _add(g, list, n, seen, stamp, pc + cast(i64, g.a[pc]));
+        _add(g, list, n, seen, stamp, pc + cast(i64, g.b[pc]));
+    } else {
+        list[*n] = cast(i16, pc);
+        *n = *n + 1;
+    }
+}
+
+// How far past at the grammar matches in the run; at itself for not at all.
+fn match_at(g as *Grammar, run as *glyphs.Run, at as i64) as i64 {
+    if (g.bad == 1) { return at; }
+    let is [512]i16 as one;
+    let is [512]i16 as two;
+    let is [512]i64 as seen;
+    let is i64 as k with mut = 0;
+    while (k < g.n) {
+        seen[k] = 0 - 1;
+        k = k + 1;
+    }
+    let is *i16 as now with mut = cast(*i16, &one);
+    let is *i16 as next with mut = cast(*i16, &two);
+    let is i64 as n_now with mut = 0;
+    let is i64 as stamp with mut = at;
+    _add(g, now, &n_now, cast(*i64, &seen), stamp, 0);
+    let is i64 as best with mut = at;
+    let is i64 as i with mut = at;
+    while (n_now > 0) {
+        // What the grammar does not look at: as if it were not there.
+        while (i < run.len && (cast(i64, run.src[i].sflags) & SF_PASSED_OVER) != 0) { i = i + 1; }
+        let is i64 as n_next with mut = 0;
+        stamp = i + 1;
+        let is i64 as t with mut = 0;
+        while (t < n_now) {
+            let is i64 as pc = cast(i64, now[t]);
+            let is i64 as kind = cast(i64, g.kind[pc]);
+            if (kind == OP_MATCH) {
+                best = i;
+            } else if (i < run.len && cast(i64, run.src[i].scat) == cast(i64, g.a[pc])) {
+                _add(g, next, &n_next, cast(*i64, &seen), stamp, pc + 1);
+            }
+            t = t + 1;
+        }
+        let is *i16 as swap = now;
+        now = next;
+        next = swap;
+        n_now = n_next;
+        i = i + 1;
+    }
+    return best;
+}
+
+// The run cut into syllables: gs, n grammars, in the order of their kinds from
+// 0; other is the kind of a character none of them takes. Whether any were of the
+// kind broken, which -1 says none are.
+fn find(run as *glyphs.Run, gs as **Grammar, n as i64, other as i64, broken as i64) as i32 {
+    let is i32 as any with mut = 0;
+    let is i64 as serial with mut = 1;
+    let is i64 as i with mut = 0;
+    // What is not looked at and has nothing before it is in no syllable.
+    while (i < run.len && (cast(i64, run.src[i].sflags) & SF_PASSED_OVER) != 0) {
+        run.src[i].syl = cast(u8, other);
+        i = i + 1;
+    }
+    while (i < run.len) {
+        let is i64 as best with mut = i;
+        let is i64 as kind with mut = other;
+        let is i64 as k with mut = 0;
+        while (k < n) {
+            let is i64 as e = match_at(gs[k], run, i);
+            if (e > best) {
+                best = e;
+                kind = k;
+            }
+            k = k + 1;
+        }
+        if (best == i) { best = i + 1; }
+        while (best < run.len && (cast(i64, run.src[best].sflags) & SF_PASSED_OVER) != 0) { best = best + 1; }
+        if (kind == broken) { any = 1; }
+        let is i64 as j with mut = i;
+        while (j < best) {
+            run.src[j].syl = cast(u8, (serial << 4) | kind);
+            j = j + 1;
+        }
+        // A syllable can end inside a grapheme: what is left of that goes with it.
+        let is i64 as to with mut = best;
+        while (to < run.len && run.src[to].cluster == run.src[best - 1].cluster) { to = to + 1; }
+        glyphs.mark_unsafe(run, i, to);
+        serial = serial + 1;
+        if (serial == 16) { serial = 1; }
+        i = best;
+    }
+    return any;
+}
+
+// The end of the syllable from at.
+fn end_of(run as *glyphs.Run, at as i64) as i64 {
+    let is u8 as syl = run.src[at].syl;
+    let is i64 as e with mut = at + 1;
+    while (e < run.len && run.src[e].syl == syl) { e = e + 1; }
+    return e;
+}
+
+// A dotted circle put into each syllable of the kind broken, for what it lacks
+// to sit on, after anything of category repha (0 for none) it starts with.
+fn insert_circles(w as *work.Work, broken as i64, cat as i64, pos as i64, repha as i64) as void {
+    if (w.no_circle == 1) { return; }
+    let is i64 as gid = cmap.glyph(w.f, chars.DOTTED_CIRCLE);
+    if (gid == 0) { return; }
+    let is *glyphs.Run as run = w.run;
+    let is glyphs.Glyph as circle;
+    let is i64 as z with mut = 0;
+    while (z < sizeof(glyphs.Glyph)) {
+        *cast(*u8, cast(i64, &circle) + z) = cast(u8, 0);
+        z = z + 1;
+    }
+    circle.id = cast(u32, gid);
+    circle.alt = cast(u32, chars.DOTTED_CIRCLE);
+    circle.scat = cast(u8, cat);
+    circle.spos = cast(u8, pos);
+    let is i64 as last with mut = 0 - 1;
+    let is i64 as before with mut = 0 - 1;
+    let is i32 as passed with mut = 0;
+    glyphs.begin(run);
+    while (glyphs.more(run) == 1) {
+        let is *glyphs.Glyph as g = glyphs.cur(run);
+        let is i64 as syl = cast(i64, g.syl);
+        // Numbered in four bits, a broken syllable fifteen on from the last has
+        // its number and goes without, as in HarfBuzz; what follows would not.
+        if ((syl & 15) == broken && syl == last && syl != before) { passed = 1; }
+        before = syl;
+        if ((syl & 15) == broken && syl != last) {
+            last = syl;
+            let is glyphs.Glyph as c = circle;
+            c.cluster = g.cluster;
+            c.mask = g.mask;
+            c.syl = g.syl;
+            c.unsafe = g.unsafe;
+            if (repha != 0) {
+                while (glyphs.more(run) == 1 && cast(i64, glyphs.cur(run).syl) == last &&
+                       cast(i64, glyphs.cur(run).scat) == repha) {
+                    glyphs.keep(run);
+                }
+            }
+            glyphs.put(run, &c);
+        } else {
+            glyphs.keep(run);
+        }
+    }
+    glyphs.end(run);
+    if (passed == 1) { glyphs.mark_unsafe(run, 0, run.len); }
+}
+
+// The same, whatever moves past another made one cluster with it.
+fn sort_merging(run as *glyphs.Run, a as i64, b as i64) as void {
+    let is i64 as i with mut = a + 1;
+    while (i < b) {
+        let is i64 as j with mut = i;
+        while (j > a && run.src[j - 1].spos > run.src[i].spos) { j = j - 1; }
+        if (j < i) {
+            glyphs.join(run, j, i + 1);
+            let is glyphs.Glyph as x = run.src[i];
+            let is i64 as k with mut = i;
+            while (k > j) {
+                run.src[k] = run.src[k - 1];
+                k = k - 1;
+            }
+            run.src[j] = x;
+        }
+        i = i + 1;
+    }
+}
+
+// --- Vowels written in ways not to be written ---
+
+fn _hex6(s as *u8, at as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < 6) {
+        let is i64 as c = cast(i64, s[at + k]);
+        let is i64 as d with mut = c - 48;
+        if (c >= 65) { d = c - 55; }
+        v = v * 16 + d;
+        k = k + 1;
+    }
+    return v;
+}
+
+// How many characters of the sequences not to write start at the current one:
+// the one matched; 0 for none.
+fn _bad_sequence(run as *glyphs.Run) as i64 {
+    let is i64 as u = cast(i64, glyphs.cur(run).id);
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = table.SEQUENCES_COUNT - 1;
+    // The first with u.
+    while (lo < hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        if (_hex6(table.SEQUENCES, mid * 18) < u) { lo = mid + 1; } else { hi = mid; }
+    }
+    let is i64 as k with mut = lo;
+    while (k < table.SEQUENCES_COUNT && _hex6(table.SEQUENCES, k * 18) == u) {
+        let is i64 as b = _hex6(table.SEQUENCES, k * 18 + 6);
+        let is i64 as c = _hex6(table.SEQUENCES, k * 18 + 12);
+        if (run.i + 1 < run.len && cast(i64, run.src[run.i + 1].id) == b) {
+            if (c == 0) { return 2; }
+            if (run.i + 2 < run.len && cast(i64, run.src[run.i + 2].id) == c) { return 3; }
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// A dotted circle before the last character of each sequence not to write, for
+// the mistake to be seen; a font is free to draw it as it likes.
+fn vowel_constraints(w as *work.Work) as void {
+    if (w.no_circle == 1) { return; }
+    let is *glyphs.Run as run = w.run;
+    glyphs.begin(run);
+    while (glyphs.more(run) == 1) {
+        let is i64 as n = _bad_sequence(run);
+        if (n == 0) {
+            glyphs.keep(run);
+        } else {
+            glyphs.keep_n(run, n - 1);
+            let is glyphs.Glyph as c = *glyphs.cur(run);
+            c.id = cast(u32, chars.DOTTED_CIRCLE);
+            c.uflags = cast(u8, cast(i64, c.uflags) & (255 - glyphs.U_CONTINUES));
+            glyphs.put(run, &c);
+            glyphs.keep(run);
+        }
+        glyphs.step(run, 1);
+    }
+    glyphs.end(run);
+}
+
+// Records a .. b put in the order of their positions (spos), those of the same
+// position as they were.
+fn sort_range(run as *glyphs.Run, a as i64, b as i64) as void {
+    let is i64 as i with mut = a + 1;
+    while (i < b) {
+        let is glyphs.Glyph as x = run.src[i];
+        let is i64 as j with mut = i;
+        while (j > a && run.src[j - 1].spos > x.spos) {
+            run.src[j] = run.src[j - 1];
+            j = j - 1;
+        }
+        run.src[j] = x;
+        i = i + 1;
+    }
+}

@@ -1,0 +1,219 @@
+// text/shape/thai.cst — Thai and Lao.
+//
+// SARA AM (U+0E33, and Lao's AM, U+0EB3) is written as one character and drawn
+// as two: NIKHAHIT, which belongs over the consonant, under any tone mark, and
+// SARA AA after it. So it is taken apart and the nikhahit moved before the marks
+// above that come before it.
+//
+// A font with no GSUB for Thai may still draw it right the way fonts did before
+// OpenType: through glyphs in the private use area.
+use "../sfnt/cmap.cst" as cmap;
+use "../sfnt/table.cst" as tbl;
+use "glyphs.cst" as glyphs;
+use "chars.cst" as chars;
+use "work.cst" as work;
+use "scripts.cst" as scripts;
+
+fn _is_sara_am(u as i64) as i32 { return cast(i32, (u & 4294967167) == 3635); }  // 0E33, 0EB3
+fn _nikhahit_of(u as i64) as i64 { return u + 26; }
+fn _sara_aa_of(u as i64) as i64 { return u - 1; }
+
+// A mark above, Thai's or Lao's: what a nikhahit moves in front of.
+fn _is_above_base_mark(u as i64) as i32 {
+    let is i64 as v = u & 4294967167;     // Lao's as Thai's
+    return cast(i32, (v >= 3636 && v <= 3639) || (v >= 3655 && v <= 3662) || v == 3633 || v == 3643);
+}
+
+fn _with(g as *glyphs.Glyph, u as i64) as glyphs.Glyph {
+    let is glyphs.Glyph as out = *g;
+    out.id = cast(u32, u);
+    out.cat = cast(u8, chars.category(u));
+    out.ccc = cast(u8, chars.shaping_class(u));
+    return out;
+}
+
+// Each SARA AM taken apart, its nikhahit before the tone marks before it, all
+// that one cluster.
+fn preprocess(w as *work.Work) as void {
+    let is *glyphs.Run as run = w.run;
+    glyphs.begin(run);
+    while (glyphs.more(run) == 1) {
+        let is glyphs.Glyph as g = *glyphs.cur(run);
+        let is i64 as u = cast(i64, g.id);
+        glyphs.step(run, 1);
+        if (_is_sara_am(u) == 0) {
+            glyphs.keep(run);
+        } else {
+            glyphs.drop(run);
+            let is glyphs.Glyph as nik = _with(&g, _nikhahit_of(u));
+            let is glyphs.Glyph as aa = _with(&g, _sara_aa_of(u));
+            // The nikhahit is one of the kind that moves with marks.
+            let is i64 as end = run.n;
+            let is i64 as start with mut = end;
+            while (start > 0 && _is_above_base_mark(cast(i64, run.dst[start - 1].id)) == 1) { start = start - 1; }
+            glyphs.put(run, &nik);
+            glyphs.put(run, &aa);
+            if (start < end) {
+                // Moved in front of them, and all of it one cluster.
+                glyphs.join(run, start, end + 2);
+                let is glyphs.Glyph as moved = run.dst[end];
+                let is i64 as k with mut = end;
+                while (k > start) {
+                    run.dst[k] = run.dst[k - 1];
+                    k = k - 1;
+                }
+                run.dst[start] = moved;
+            } else if (start > 0) {
+                // A mark's: with what it sits on.
+                glyphs.join(run, start - 1, end + 2);
+            }
+        }
+    }
+    glyphs.end(run);
+    // A font with nothing of its own for the script.
+    if (w.script == scripts.of("Thai") && w.plan.chosen0 != scripts.of("thai")) { _shape_pua(w); }
+}
+
+// --- A font of the private use area ---
+
+// As Theppitak Karoonboonyanan's "Thai OpenType shaping" describes: glyphs that
+// fonts had before OpenType, for marks moved down onto a short consonant or left
+// away from a tall one, and for consonants whose foot is in the way of a vowel
+// below. Each mark's move depends on the consonant and the marks so far: the
+// states above and below it.
+
+// Consonants.
+let is i64 as NC with imut = 0;    // nothing above or below
+let is i64 as AC with imut = 1;    // an ascender
+let is i64 as RC with imut = 2;    // a descender that can be taken away
+let is i64 as DC with imut = 3;    // one that cannot
+let is i64 as NOT_CONSONANT with imut = 4;
+
+fn _consonant(u as i64) as i64 {
+    if (u == 3611 || u == 3613 || u == 3615) { return AC; }    // 0E1B 0E1D 0E1F
+    if (u == 3597 || u == 3600) { return RC; }                 // 0E0D 0E10
+    if (u == 3598 || u == 3599) { return DC; }                 // 0E0E 0E0F
+    if (u >= 3585 && u <= 3630) { return NC; }                 // 0E01..0E2E
+    return NOT_CONSONANT;
+}
+
+// Marks.
+let is i64 as AV with imut = 0;    // a vowel above
+let is i64 as BV with imut = 1;    // a vowel below
+let is i64 as TONE with imut = 2;  // a tone mark
+let is i64 as NOT_MARK with imut = 3;
+
+fn _mark(u as i64) as i64 {
+    if (u == 3633 || (u >= 3636 && u <= 3639) || u == 3655 || u == 3661 || u == 3662) { return AV; }
+    if (u >= 3640 && u <= 3642) { return BV; }
+    if (u >= 3656 && u <= 3660) { return TONE; }
+    return NOT_MARK;
+}
+
+// Moves.
+let is i64 as NOP with imut = 0;
+let is i64 as SD with imut = 1;    // shifted down
+let is i64 as SL with imut = 2;    // shifted left
+let is i64 as SDL with imut = 3;   // both
+let is i64 as RD with imut = 4;    // its descender removed
+
+// For each state of what is above a consonant so far — 0 low, 1 an ascender, 2 an
+// ascender and a mark moved left of it, 3 full — and of what is below it — 0
+// nothing, 1 a descender that can go, 2 one that cannot — and each kind of mark:
+// its move, and the next state. Digits, three to a state.
+let is *u8 as ABOVE_MOVES with imut = "001203002000";
+let is *u8 as ABOVE_NEXT  with imut = "303212323333";
+let is *u8 as BELOW_MOVES with imut = "000040010";
+let is *u8 as BELOW_NEXT  with imut = "020121222";
+
+fn _above_move(state as i64, mark as i64) as i64 { return cast(i64, ABOVE_MOVES[state * 3 + mark]) - 48; }
+fn _above_next(state as i64, mark as i64) as i64 { return cast(i64, ABOVE_NEXT[state * 3 + mark]) - 48; }
+fn _below_move(state as i64, mark as i64) as i64 { return cast(i64, BELOW_MOVES[state * 3 + mark]) - 48; }
+fn _below_next(state as i64, mark as i64) as i64 { return cast(i64, BELOW_NEXT[state * 3 + mark]) - 48; }
+
+fn _hex4(s as *u8, at as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        let is i64 as c = cast(i64, s[at + k]);
+        let is i64 as d with mut = c - 48;
+        if (c >= 65) { d = c - 55; }
+        v = v * 16 + d;
+        k = k + 1;
+    }
+    return v;
+}
+
+// A character and what it becomes, moved: on Windows' fonts, then Apple's.
+fn _table_shape(table as *u8, count as i64, u as i64, f as *tbl.Face) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < count) {
+        let is i64 as at = k * 12;
+        if (_hex4(table, at) == u) {
+            let is i64 as win = _hex4(table, at + 4);
+            if (cmap.glyph(f, win) != 0) { return win; }
+            let is i64 as mac = _hex4(table, at + 8);
+            if (cmap.glyph(f, mac) != 0) { return mac; }
+            return u;
+        }
+        k = k + 1;
+    }
+    return u;
+}
+
+let is *u8 as MOVED_DOWN with imut = "0E48F70AF88B0E49F70BF88E0E4AF70CF8910E4BF70DF8940E4CF70EF8970E38F718F89B0E39F719F89C0E3AF71AF89D";
+let is *u8 as MOVED_DOWN_LEFT with imut = "0E48F705F88C0E49F706F88F0E4AF707F8920E4BF708F8950E4CF709F898";
+let is *u8 as MOVED_LEFT with imut = "0E48F713F88A0E49F714F88D0E4AF715F8900E4BF716F8930E4CF717F8960E31F710F8840E34F701F8850E35F702F8860E36F703F8870E37F704F8880E47F712F8890E4DF711F899";
+let is *u8 as CUT with imut = "0E0DF70FF89A0E10F700F89E";
+
+fn _moved(f as *tbl.Face, u as i64, how as i64) as i64 {
+    if (how == SD) { return _table_shape(MOVED_DOWN, 8, u, f); }
+    if (how == SDL) { return _table_shape(MOVED_DOWN_LEFT, 5, u, f); }
+    if (how == SL) { return _table_shape(MOVED_LEFT, 12, u, f); }
+    if (how == RD) { return _table_shape(CUT, 2, u, f); }
+    return u;
+}
+
+fn _above_start(c as i64) as i64 {
+    if (c == AC) { return 1; }
+    if (c == NOT_CONSONANT) { return 3; }
+    return 0;
+}
+
+fn _below_start(c as i64) as i64 {
+    if (c == RC) { return 1; }
+    if (c == DC || c == NOT_CONSONANT) { return 2; }
+    return 0;
+}
+
+// The run's marks and consonants their private use characters.
+fn _shape_pua(w as *work.Work) as void {
+    let is *glyphs.Run as run = w.run;
+    let is i64 as above with mut = 3;
+    let is i64 as below with mut = 2;
+    let is i64 as base with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < run.len) {
+        let is i64 as u = cast(i64, run.src[i].id);
+        let is i64 as mt = _mark(u);
+        if (mt == NOT_MARK) {
+            let is i64 as c = _consonant(u);
+            above = _above_start(c);
+            below = _below_start(c);
+            base = i;
+        } else {
+            let is i64 as how with mut = _above_move(above, mt);
+            let is i64 as how_below = _below_move(below, mt);
+            if (how == NOP) { how = how_below; }
+            above = _above_next(above, mt);
+            below = _below_next(below, mt);
+            glyphs.mark_unsafe(run, base, i);
+            if (how == RD) {
+                run.src[base].id = cast(u32, _moved(w.f, cast(i64, run.src[base].id), how));
+            } else {
+                run.src[i].id = cast(u32, _moved(w.f, u, how));
+            }
+        }
+        i = i + 1;
+    }
+}

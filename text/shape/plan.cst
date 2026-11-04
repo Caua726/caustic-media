@@ -15,6 +15,11 @@
 // in the order of the LookupList — the order the OpenType specification
 // says lookups are applied in — with the bits of all the features that
 // asked for it.
+//
+// GSUB's stages are what a script's rules are built of: what one feature
+// makes the next must see, so it goes in a stage after it, and between two
+// stages a pause lets the script's shaper look at the glyphs — find syllables,
+// reorder them — before the lookups go on.
 use "std/mem.cst" as mem;
 use "../sfnt/table.cst" as table;
 use "../sfnt/var.cst" as var;
@@ -24,13 +29,21 @@ use "langs.cst" as langs;
 
 // What a wanted feature is to the shaper.
 let is i64 as F_KEEP with imut = 1;            // kept even when the font lacks it
-let is i64 as F_MANUAL_JOINERS with imut = 2;  // ZWJ is not passed over within its matches
+let is i64 as F_MANUAL_ZWJ with imut = 2;      // ZWJ is not passed over within its matches
 let is i64 as F_RANDOM with imut = 4;          // its largest value picks an alternate at random
+let is i64 as F_MANUAL_ZWNJ with imut = 8;     // nor ZWNJ around them, in GSUB
+let is i64 as F_MANUAL_JOINERS with imut = 10; // neither
+let is i64 as F_PER_SYLLABLE with imut = 16;   // its matches stay in the syllable they start in
 
 let is i64 as GSUB with imut = 0;
 let is i64 as GPOS with imut = 1;
 let is i64 as STAGE_FIRST with imut = 0;       // GSUB's first stage: rvrn alone
 let is i64 as STAGE_MAIN with imut = 1;
+let is i64 as MAX_STAGES with imut = 32;
+
+// A pause between stages: called with the user shape.cst gave, glyphs as they
+// now are, no pass under way.
+type Pause = fn(*u8) as void;
 
 let is i64 as EVERYWHERE with imut = 1;        // bit 0
 let is i64 as MAX_BITS with imut = 8;
@@ -80,10 +93,16 @@ struct Plan {
     steps    as *Step;
     nsteps   as i64;
     cap_steps as i64;
-    // Where each stage's steps end: GSUB's two, then GPOS's.
-    first_end as i64;
+    // Where each of GSUB's stages' steps end, and what is done after them; then
+    // GPOS's.
+    ends     as [32]i64;
+    pauses   as [32]Pause;
+    current  as i64;   // the stage features are being wanted in
+    nstages  as i64;
     gsub_end as i64;
     gpos_end as i64;
+    chosen0  as i64;   // the script tag selected in GSUB, in GPOS; 0 for none
+    chosen1  as i64;
     gsub     as otl.Layout;
     gpos     as otl.Layout;
     langsys0 as i64;   // the language systems selected; 0 for none
@@ -127,19 +146,30 @@ fn _block(block as **u8, bytes as *i64, need as i64) as i32 {
 // The language system of layout l that script and lang select: the script's
 // first tag the table has, or DFLT, dflt or latn; then the language's first
 // tag the script has, or dflt, or the script's default.
-fn _select(f as *table.Face, l as *otl.Layout, script as i64, lang as *u8) as i64 {
+fn _select(f as *table.Face, l as *otl.Layout, script as i64, lang as *u8, chosen as *i64) as i64 {
+    *chosen = 0;
     if (l.ok == 0) { return 0; }
-    let is [2]i64 as stags;
+    let is [3]i64 as stags;
     let is i64 as ns = scripts.tags(script, cast(*i64, &stags));
     let is i64 as s with mut = 0;
     let is i64 as i with mut = 0;
     while (i < ns && s == 0) {
         s = otl.script(f, l, stags[i]);
+        if (s != 0) { *chosen = stags[i]; }
         i = i + 1;
     }
-    if (s == 0) { s = otl.script(f, l, scripts.DFLT); }
-    if (s == 0) { s = otl.script(f, l, scripts.DFLT_LOWER); }
-    if (s == 0) { s = otl.script(f, l, scripts.LATN); }
+    if (s == 0) {
+        s = otl.script(f, l, scripts.DFLT);
+        if (s != 0) { *chosen = scripts.DFLT; }
+    }
+    if (s == 0) {
+        s = otl.script(f, l, scripts.DFLT_LOWER);
+        if (s != 0) { *chosen = scripts.DFLT_LOWER; }
+    }
+    if (s == 0) {
+        s = otl.script(f, l, scripts.LATN);
+        if (s != 0) { *chosen = scripts.LATN; }
+    }
     if (s == 0) { return 0; }
     let is [8]i64 as ltags;
     let is i64 as nl = langs.tags(lang, cast(*i64, &ltags), langs.MAX_TAGS);
@@ -164,11 +194,38 @@ fn begin(p as *Plan, f as *table.Face, script as i64, lang as *u8, most as i64) 
     p.nwants = 0;
     p.nfeats = 0;
     p.nsteps = 0;
+    p.current = 0;
+    p.nstages = 0;
+    mem.memzero(cast(*u8, &p.pauses), sizeof(Pause) * MAX_STAGES);
     p.gsub = otl.open(f, f.gsub);
     p.gpos = otl.open(f, f.gpos);
-    p.langsys0 = _select(f, &p.gsub, script, lang);
-    p.langsys1 = _select(f, &p.gpos, script, lang);
+    p.langsys0 = _select(f, &p.gsub, script, lang, &p.chosen0);
+    p.langsys1 = _select(f, &p.gpos, script, lang, &p.chosen1);
     return 1;
+}
+
+// The stage features are being wanted in ended: cb, unless null, is called after
+// its lookups, and what is wanted from now on comes after that.
+fn pause(p as *Plan, cb as Pause) as void {
+    if (p.current >= MAX_STAGES - 1) { return; }
+    p.pauses[p.current] = cb;
+    p.current = p.current + 1;
+}
+
+// A feature on everywhere, in the stage being wanted in.
+fn on(p as *Plan, tag as i64, flags as i64) as void { want(p, tag, 1, 0, ALL, p.current, flags); }
+
+// A feature with bits of its own, on no glyph yet: its shaper sets them.
+fn add(p as *Plan, tag as i64, flags as i64) as void { want(p, tag, 1, 0, 0, p.current, flags); }
+
+// A feature off, whoever wanted it.
+fn off(p as *Plan, tag as i64) as void { want(p, tag, 0, 0, ALL, p.current, 0); }
+
+// Whether the plan found the feature in the font, in GSUB or GPOS; those kept
+// without being there have neither.
+fn found(p as *Plan, tag as i64) as i32 {
+    let is *Feature as ft = feature(p, tag);
+    return cast(i32, cast(i64, ft) != 0 && (ft.index0 != otl.NONE || ft.index1 != otl.NONE));
 }
 
 // Feature tag wanted with value over clusters start .. end (0 and ALL for
@@ -396,9 +453,13 @@ fn compile(f as *table.Face, p as *Plan, c as *var.Coords) as i32 {
     p.steps = cast(*Step, p.sblock);
     p.cap_steps = most + 1;
     p.nsteps = 0;
-    _stage(f, p, GSUB, STAGE_FIRST, req0, p.req_stage);
-    p.first_end = p.nsteps;
-    _stage(f, p, GSUB, STAGE_MAIN, req0, p.req_stage);
+    let is i64 as st with mut = 0;
+    while (st <= p.current) {
+        _stage(f, p, GSUB, st, req0, p.req_stage);
+        p.ends[st] = p.nsteps;
+        st = st + 1;
+    }
+    p.nstages = p.current + 1;
     p.gsub_end = p.nsteps;
     _stage(f, p, GPOS, STAGE_FIRST, req1, STAGE_FIRST);
     p.gpos_end = p.nsteps;

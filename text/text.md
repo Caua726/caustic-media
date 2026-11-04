@@ -178,9 +178,8 @@ answer while the layout is being built than afterwards.
 2. **`raster` and `atlas`** — glyphs on screen at one size. Done.
 3. **Shaping**, both stages: every `GSUB` and `GPOS` lookup, the legacy `kern`
    table, the fallbacks — done, held to what HarfBuzz gives
-   ([`shape/shape.md`](shape/shape.md)). The scripts with shapers of their
-   own (Arabic joining, Indic reordering, Hangul, Thai, Khmer, Myanmar, USE)
-   are [B].
+   ([`shape/shape.md`](shape/shape.md)), the scripts with shapers of their
+   own too: Arabic joining, Indic reordering, Hangul, Thai, Khmer, Myanmar, USE.
 4. **Layout**, with caustic-unicode for breaking and bidi — done
    ([`layout/layout.md`](layout/layout.md)).
 5. **Caret and hit-testing**, which `ui/` blocks on — done, in
@@ -201,8 +200,8 @@ even-odd, the filler public (`ui/icons.cst` draws with it); a glyph cache over
 the atlas, coverage and colour pages apart; the system's fonts indexed and
 matched as CSS does, fallback chains by coverage, emoji and CJK preferred by
 language; shaping held to HarfBuzz (every `GSUB` and `GPOS` lookup, `kern`,
-marks); layout with breaking and bidi (caustic-unicode), alignment,
+marks, and the scripts that join and reorder, Arabic and Indic to the Universal
+Shaping Engine's); layout with breaking and bidi (caustic-unicode), alignment,
 ellipsis, line limits, spans; caret and hit-testing across bidi runs;
-colour glyphs, `CBDT`/`CBLC` and `COLR` v0 with `CPAL`. Not yet [B]: the
-scripts with shapers of their own, `sbix` and `COLR` v1, WOFF and WOFF2,
-hinting, SDF.
+colour glyphs, `CBDT`/`CBLC` and `COLR` v0 with `CPAL`. Not yet [B]: `sbix` and
+`COLR` v1, WOFF and WOFF2, hinting, SDF.

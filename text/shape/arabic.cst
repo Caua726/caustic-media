@@ -1,0 +1,620 @@
+// text/shape/arabic.cst — scripts whose letters join: which form each letter
+// takes, Unicode's Joining_Type telling (ArabicShaping.txt, chapter 9 of the
+// standard); the order of the marks (UAX #53); the features in the stages the
+// OpenType script specifications for Arabic and Syriac give.
+//
+// Joining goes along the text, a letter at a time, with what the letter before
+// it is willing to do: a letter that joins on its left, followed by one that
+// joins on its right, is initial, or medial when it also joined before it; the
+// one after it is final. What is transparent — marks — is passed over. Syriac's
+// alaph has forms of its own at the end of a word (fin2, or fin3 after dalath or
+// rish), and in the middle after a right-joining letter (med2).
+//
+// A font with none of the features but the presentation forms is shaped through
+// those. And the Syriac Abbreviation Mark, which the font's stch breaks into
+// fixed and repeating pieces, is stretched along the word after it.
+use "std/mem.cst" as mem;
+use "caustic-unicode/src/ucd/tables/joining.cst" as joining;
+use "../sfnt/cmap.cst" as cmap;
+use "../outline/outline.cst" as outline;
+use "glyphs.cst" as glyphs;
+use "chars.cst" as chars;
+use "plan.cst" as plan;
+use "work.cst" as work;
+use "scripts.cst" as scripts;
+use "arabic_forms.cst" as forms;
+
+// What a letter does: the form it takes.
+let is i64 as ISOL with imut = 0;
+let is i64 as FINA with imut = 1;
+let is i64 as FIN2 with imut = 2;
+let is i64 as FIN3 with imut = 3;
+let is i64 as MEDI with imut = 4;
+let is i64 as MED2 with imut = 5;
+let is i64 as INIT with imut = 6;
+let is i64 as NONE with imut = 7;
+let is i64 as STCH_FIXED with imut = 8;
+let is i64 as STCH_REPEATING with imut = 9;
+
+let is i64 as V_FALLBACK with imut = 0;    // work.values: shaped through the presentation forms
+let is i64 as V_HAS_STCH with imut = 1;    // the font has stch
+let is i64 as V_STRETCH with imut = 2;     // and something in the run came of it
+
+// caustic-unicode's Joining_Type.
+let is i64 as JT_U with imut = 0;
+let is i64 as JT_C with imut = 1;
+let is i64 as JT_D with imut = 2;
+let is i64 as JT_L with imut = 3;
+let is i64 as JT_R with imut = 4;
+let is i64 as JT_T with imut = 5;
+
+// A letter as the walk sees it.
+let is i64 as AS_U with imut = 0;
+let is i64 as AS_L with imut = 1;
+let is i64 as AS_R with imut = 2;
+let is i64 as AS_D with imut = 3;
+let is i64 as AS_ALAPH with imut = 4;
+let is i64 as AS_DALATH_RISH with imut = 5;
+let is i64 as AS_T with imut = 6;
+
+// For each state a walk is in — what the letters so far let the next one do —
+// and each kind of letter: what the letter before becomes, what this one is, and
+// the next state. Three digits each, NONE for nothing; six kinds, seven states:
+//   0 nothing before it that could join
+//   1 a right-joining letter, or an isolated alaph, before it
+//   2 a letter that would join on, isolated so far
+//   3 a letter that would join on, final so far
+//   4 a final alaph
+//   5 an alaph in one of its end forms
+//   6 dalath or rish
+let is *u8 as STATES with imut = "770702701702701706770702701702725706770702611613614616770702411413414416770702501502525506770702001002025006770702701702735706";
+
+fn _entry(state as i64, kind as i64, which as i64) as i64 {
+    return cast(i64, STATES[(state * 6 + kind) * 3 + which]) - 48;
+}
+
+// How letter u takes part in the walk.
+fn kind_of(u as i64) as i64 {
+    if (u == 1808) { return AS_ALAPH; }
+    if (u == 1813 || u == 1814 || u == 1834 || u == 1839) { return AS_DALATH_RISH; }
+    let is i64 as t = cast(i64, joining.joining_get(cast(i32, u)));
+    if (t == JT_T) { return AS_T; }
+    if (t == JT_R) { return AS_R; }
+    if (t == JT_L) { return AS_L; }
+    if (t == JT_D || t == JT_C) { return AS_D; }
+    return AS_U;
+}
+
+let is i64 as CONTEXT_MOST with imut = 8;     // characters looked through for the letter around the run
+
+fn _decode(b as *u8, at as i64, end as i64, out as *i64) as i64 {
+    let is i64 as c0 = cast(i64, b[at]);
+    let is i64 as n with mut = 1;
+    let is i64 as v with mut = c0;
+    if (c0 >= 240) { n = 4; v = c0 & 7; }
+    else if (c0 >= 224) { n = 3; v = c0 & 15; }
+    else if (c0 >= 192) { n = 2; v = c0 & 31; }
+    let is i64 as k with mut = 1;
+    while (k < n && at + k < end) {
+        v = (v << 6) | (cast(i64, b[at + k]) & 63);
+        k = k + 1;
+    }
+    *out = v;
+    return at + n;
+}
+
+// What comes before the run that joins with it: its kind; AS_U for nothing.
+fn _before(w as *work.Work) as i64 {
+    let is i64 as at with mut = w.start;
+    let is i64 as seen with mut = 0;
+    while (at > 0 && seen < CONTEXT_MOST) {
+        at = at - 1;
+        while (at > 0 && (cast(i64, w.bytes[at]) & 192) == 128) { at = at - 1; }
+        let is i64 as u with mut = 0;
+        _decode(w.bytes, at, w.n, &u);
+        let is i64 as k = kind_of(u);
+        if (k != AS_T) { return k; }
+        seen = seen + 1;
+    }
+    return AS_U;
+}
+
+fn _after(w as *work.Work) as i64 {
+    let is i64 as at with mut = w.end;
+    let is i64 as seen with mut = 0;
+    while (at < w.n && seen < CONTEXT_MOST) {
+        let is i64 as u with mut = 0;
+        at = _decode(w.bytes, at, w.n, &u);
+        let is i64 as k = kind_of(u);
+        if (k != AS_T) { return k; }
+        seen = seen + 1;
+    }
+    return AS_U;
+}
+
+// Each character's form into its spos.
+fn joining_forms(w as *work.Work) as void {
+    let is *glyphs.Run as run = w.run;
+    let is i64 as state with mut = 0;
+    let is i64 as before = _before(w);
+    state = _entry(0, before, 2);
+    let is i64 as prev with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < run.len) {
+        let is i64 as k = kind_of(cast(i64, run.src[i].id));
+        if (k == AS_T) {
+            run.src[i].spos = cast(u8, NONE);
+        } else {
+            let is i64 as was = _entry(state, k, 0);
+            if (was != NONE && prev >= 0) {
+                run.src[prev].spos = cast(u8, was);
+                glyphs.mark_unsafe(run, prev, i + 1);
+            } else if (prev < 0) {
+                if (k == AS_R || k == AS_D || k == AS_ALAPH || k == AS_DALATH_RISH) {
+                    run.src[i].unsafe = cast(u8, 1);
+                }
+            } else if (k >= AS_R || (state >= 2 && state <= 5)) {
+                glyphs.mark_unsafe(run, prev, i + 1);
+            }
+            run.src[i].spos = cast(u8, _entry(state, k, 1));
+            prev = i;
+            state = _entry(state, k, 2);
+        }
+        i = i + 1;
+    }
+    let is i64 as after = _after(w);
+    if (after != AS_U && prev >= 0) {
+        let is i64 as was = _entry(state, after, 0);
+        if (was != NONE) { run.src[prev].spos = cast(u8, was); }
+        run.src[prev].unsafe = cast(u8, 1);
+    }
+    // A Mongolian variation selector goes as the letter it selects.
+    if (w.script == scripts.of("Mong")) {
+        i = 1;
+        while (i < run.len) {
+            let is i64 as u = cast(i64, run.src[i].id);
+            if ((u >= 6155 && u <= 6157) || u == 6159) { run.src[i].spos = run.src[i - 1].spos; }
+            i = i + 1;
+        }
+    }
+}
+
+// Each glyph's feature for its form switched on.
+fn form_masks(w as *work.Work) as void {
+    let is *glyphs.Run as run = w.run;
+    let is i64 as i with mut = 0;
+    while (i < run.len) {
+        let is i64 as a = cast(i64, run.src[i].spos);
+        if (a < NONE) { run.src[i].mask = cast(u64, cast(i64, run.src[i].mask) | w.masks[a]); }
+        i = i + 1;
+    }
+}
+
+fn _tag_of(i as i64) as i64 {
+    if (i == ISOL) { return work.tag("isol"); }
+    if (i == FINA) { return work.tag("fina"); }
+    if (i == FIN2) { return work.tag("fin2"); }
+    if (i == FIN3) { return work.tag("fin3"); }
+    if (i == MEDI) { return work.tag("medi"); }
+    if (i == MED2) { return work.tag("med2"); }
+    return work.tag("init");
+}
+
+fn _is_syriac_form(i as i64) as i32 { return cast(i32, i == FIN2 || i == FIN3 || i == MED2); }
+
+// The forms' features wanted, one stage each: what one makes is there for the
+// next. Also for a joining script under the Universal Shaping Engine.
+fn collect_forms(w as *work.Work) as void {
+    let is i64 as i with mut = 0;
+    while (i < NONE) {
+        let is i64 as flags with mut = plan.F_KEEP;
+        if (_is_syriac_form(i) == 1) { flags = 0; }
+        plan.add(w.plan, _tag_of(i), flags);
+        plan.pause(w.plan, cast(plan.Pause, 0));
+        i = i + 1;
+    }
+}
+
+fn prepared_forms(w as *work.Work) as void {
+    let is i64 as i with mut = 0;
+    while (i < NONE) {
+        w.masks[i] = plan.one_of(w.plan, _tag_of(i));
+        i = i + 1;
+    }
+}
+
+fn collect(w as *work.Work) as void {
+    let is *plan.Plan as p = w.plan;
+    plan.on(p, work.tag("stch"), 0);
+    plan.pause(p, fn_ptr(_record_stch));
+    plan.on(p, work.tag("ccmp"), 0);
+    plan.on(p, work.tag("locl"), 0);
+    plan.pause(p, cast(plan.Pause, 0));
+    collect_forms(w);
+    plan.on(p, work.tag("rlig"), plan.F_MANUAL_ZWJ | plan.F_KEEP);
+    if (w.script == scripts.of("Arab")) { plan.pause(p, fn_ptr(_presentation_forms)); }
+    plan.on(p, work.tag("rclt"), plan.F_MANUAL_ZWJ);
+    plan.on(p, work.tag("calt"), plan.F_MANUAL_ZWJ);
+    plan.pause(p, cast(plan.Pause, 0));
+    plan.on(p, work.tag("mset"), 0);
+}
+
+fn prepared(w as *work.Work) as void {
+    prepared_forms(w);
+    let is i64 as fb with mut = cast(i64, w.script == scripts.of("Arab"));
+    let is i64 as i with mut = 0;
+    while (i < NONE) {
+        if (_is_syriac_form(i) == 0 && plan.found(w.plan, _tag_of(i)) == 1) { fb = 0; }
+        i = i + 1;
+    }
+    w.values[V_FALLBACK] = fb;
+    w.values[V_HAS_STCH] = cast(i64, plan.one_of(w.plan, work.tag("stch")) != 0);
+    w.values[V_STRETCH] = 0;
+}
+
+fn setup(w as *work.Work) as void {
+    joining_forms(w);
+    form_masks(w);
+}
+
+// --- Marks: UAX #53 ---
+
+// Whether u is a Modifier Combining Mark.
+fn _is_mcm(u as i64) as i32 {
+    return cast(i32, u == 1620 || u == 1621 || u == 1624 || u == 1756 || u == 1763 || u == 1767 || u == 1768 ||
+                     u == 2250 || u == 2251 || u == 2253 || u == 2254 || u == 2259 || u == 2291);
+}
+
+// Marks a .. b of what is written, sorted: those of class 220, then of 230, that
+// modify the letter come right after it, before the marks with a lower class.
+fn reorder_marks(r as *glyphs.Run, a as i64, b as i64) as void {
+    let is i64 as start with mut = a;
+    let is i64 as i with mut = a;
+    let is i64 as cc with mut = 220;
+    while (cc <= 230) {
+        while (i < b && chars.order_class(cast(i64, r.dst[i].ccc)) < cc) { i = i + 1; }
+        if (i >= b) { return; }
+        if (chars.order_class(cast(i64, r.dst[i].ccc)) == cc) {
+            let is i64 as j with mut = i;
+            while (j < b && chars.order_class(cast(i64, r.dst[j].ccc)) == cc && _is_mcm(cast(i64, r.dst[j].id)) == 1) { j = j + 1; }
+            if (j > i) {
+                // Up in front: a rotation of start .. j. What moved is given the
+                // class it now has, so nothing puts it back.
+                let is [32]glyphs.Glyph as moved;
+                let is i64 as n = j - i;
+                if (n <= 32) {
+                    let is i64 as k with mut = 0;
+                    while (k < n) {
+                        moved[k] = r.dst[i + k];
+                        // Classes Arabic's marks do not use, and sorted before theirs.
+                        if (cc == 220) { moved[k].ccc = cast(u8, 22); } else { moved[k].ccc = cast(u8, 26); }
+                        k = k + 1;
+                    }
+                    k = i - 1;
+                    while (k >= start) {
+                        r.dst[k + n] = r.dst[k];
+                        k = k - 1;
+                    }
+                    k = 0;
+                    while (k < n) {
+                        r.dst[start + k] = moved[k];
+                        k = k + 1;
+                    }
+                    start = start + n;
+                }
+                i = j;
+            }
+        }
+        cc = cc + 10;
+    }
+}
+
+// --- A font of presentation forms ---
+
+fn _hex4(s as *u8, at as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < 4) {
+        let is i64 as c = cast(i64, s[at + k]);
+        let is i64 as d with mut = c - 48;
+        if (c >= 65) { d = c - 55; }
+        v = v * 16 + d;
+        k = k + 1;
+    }
+    return v;
+}
+
+// The character of letter u's form: 0 for none. which: 0 isolated, 1 final, 2
+// initial, 3 medial.
+fn form_of(u as i64, which as i64) as i64 {
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = forms.FORMS_COUNT - 1;
+    while (lo <= hi) {
+        let is i64 as mid = (lo + hi) / 2;
+        let is i64 as v = _hex4(forms.FORMS, mid * 20);
+        if (u < v) {
+            hi = mid - 1;
+        } else if (u > v) {
+            lo = mid + 1;
+        } else {
+            return _hex4(forms.FORMS, mid * 20 + 4 + which * 4);
+        }
+    }
+    return 0;
+}
+
+fn _which(action as i64) as i64 {
+    if (action == ISOL) { return 0; }
+    if (action == FINA) { return 1; }
+    if (action == INIT) { return 2; }
+    if (action == MEDI) { return 3; }
+    return 0 - 1;
+}
+
+// Each letter still the font's own for it made its form's glyph.
+fn _singles(w as *work.Work) as void {
+    let is *glyphs.Run as run = w.run;
+    let is i64 as i with mut = 0;
+    while (i < run.len) {
+        let is *glyphs.Glyph as g = &run.src[i];
+        let is i64 as which = _which(cast(i64, g.spos));
+        let is i64 as u = cast(i64, g.alt);
+        if (which >= 0 && cast(i64, g.id) == cmap.glyph(w.f, u)) {
+            let is i64 as s = form_of(u, which);
+            if (s != 0) {
+                let is i64 as gid = cmap.glyph(w.f, s);
+                if (gid != 0) {
+                    g.id = cast(u32, gid);
+                    g.made = cast(u8, cast(i64, g.made) | glyphs.SUBSTITUTED);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// The ligature of a lam's glyph and the alef's after it, as the font has it: 0
+// for none. An isolated one from a lam starting a word, a final one from a lam
+// in the middle of one.
+fn _lam_alef_glyph(w as *work.Work, lam as *glyphs.Glyph, alef as *glyphs.Glyph) as i64 {
+    if (cast(i64, lam.alt) != 1604) { return 0; }
+    let is i64 as action = cast(i64, lam.spos);
+    let is i64 as column with mut = 0 - 1;
+    if (action == INIT) { column = 0; }
+    if (action == MEDI) { column = 1; }
+    if (column < 0 || cast(i64, alef.spos) != FINA) { return 0; }
+    let is i64 as a = cast(i64, alef.alt);
+    let is i64 as k with mut = 0;
+    while (k < forms.LAM_ALEF_COUNT) {
+        if (_hex4(forms.LAM_ALEF, k * 12) == a) {
+            let is i64 as s = _hex4(forms.LAM_ALEF, k * 12 + 4 + column * 4);
+            return cmap.glyph(w.f, s);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn _shadda_glyph(w as *work.Work, first as i64, second as i64) as i64 {
+    let is i64 as m with mut = 0;
+    if (first == 1617) { m = second; }
+    if (second == 1617) { m = first; }
+    if (m == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    while (k < forms.SHADDA_COUNT) {
+        if (_hex4(forms.SHADDA, k * 8) == m) { return cmap.glyph(w.f, _hex4(forms.SHADDA, k * 8 + 4)); }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Lam and alef joined, marks between them passed over and going after the
+// ligature; a mark and shadda made one.
+fn _ligatures(w as *work.Work) as void {
+    let is *glyphs.Run as run = w.run;
+    glyphs.begin(run);
+    while (glyphs.more(run) == 1) {
+        let is *glyphs.Glyph as g = glyphs.cur(run);
+        let is i64 as k with mut = run.i + 1;
+        let is i64 as lig with mut = 0;
+        if (chars.is_mark(cast(i64, g.cat)) == 1) {
+            if (k < run.len) { lig = _shadda_glyph(w, cast(i64, g.alt), cast(i64, run.src[k].alt)); }
+        } else {
+            while (k < run.len && chars.is_mark(cast(i64, run.src[k].cat)) == 1) { k = k + 1; }
+            if (k < run.len) { lig = _lam_alef_glyph(w, g, &run.src[k]); }
+        }
+        if (lig != 0) {
+            let is glyphs.Glyph as out = *g;
+            out.id = cast(u32, lig);
+            out.made = cast(u8, cast(i64, out.made) | glyphs.LIGATED | glyphs.SUBSTITUTED);
+            let is i64 as start = run.n;
+            glyphs.put(run, &out);
+            glyphs.drop(run);
+            while (run.i < k) { glyphs.keep(run); }
+            let is u32 as joined = run.src[k].cluster;
+            glyphs.drop(run);
+            if (joined < out.cluster) { out.cluster = joined; }
+            let is i64 as j with mut = start;
+            while (j < run.n) {
+                run.dst[j].cluster = out.cluster;
+                j = j + 1;
+            }
+        } else {
+            glyphs.keep(run);
+        }
+    }
+    glyphs.end(run);
+}
+
+fn _presentation_forms(user as *u8) as void {
+    let is *work.Work as w = cast(*work.Work, user);
+    if (w.values[V_FALLBACK] == 0) { return; }
+    _singles(w);
+    _ligatures(w);
+}
+
+// --- Stretching ---
+
+// What the font's stch made: its odd pieces repeat.
+fn _record_stch(user as *u8) as void {
+    let is *work.Work as w = cast(*work.Work, user);
+    if (w.values[V_HAS_STCH] == 0) { return; }
+    let is *glyphs.Run as run = w.run;
+    let is i64 as i with mut = 0;
+    while (i < run.len) {
+        if ((cast(i64, run.src[i].made) & glyphs.MULTIPLIED) != 0) {
+            let is i64 as a with mut = STCH_FIXED;
+            if ((cast(i64, run.src[i].comp) & 1) == 1) { a = STCH_REPEATING; }
+            run.src[i].spos = cast(u8, a);
+            w.values[V_STRETCH] = 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn _is_stretch(g as *glyphs.Glyph) as i32 {
+    let is i64 as a = cast(i64, g.spos);
+    return cast(i32, a == STCH_FIXED || a == STCH_REPEATING);
+}
+
+// Whether the word a stretch runs along goes on through a glyph of this category.
+fn _in_word(gc as i64) as i32 {
+    return cast(i32, gc == 0 || gc == 29 || gc == 4 || gc == 5 || gc == 6 || gc == 7 || gc == 8 ||
+                     gc == 9 || gc == 10 || gc == 11 || gc == 19 || gc == 20 || gc == 21 || gc == 22);
+}
+
+// What a stretch comes to, along what follows it: how many more of each
+// repeating piece, into *copies; how much they overlap, into *overlap; and how
+// far the whole is off centre over the word, into *start.
+fn _measure(total as i64, fixed as i64, repeating as i64, nrepeating as i64, copies as *i64, overlap as *i64, start as *i64) as void {
+    let is i64 as left with mut = total - fixed;
+    let is i64 as n with mut = 0;
+    let is i64 as lap with mut = 0;
+    if (left > repeating && repeating > 0) { n = left / repeating - 1; }
+    // One more and squeezed a little, when it would otherwise fall short.
+    if (left - repeating * (n + 1) > 0 && nrepeating > 0) {
+        n = n + 1;
+        let is i64 as excess = (n + 1) * repeating - left;
+        if (excess > 0) {
+            lap = excess / (n * nrepeating);
+            left = 0;
+        }
+    }
+    *copies = n;
+    *overlap = lap;
+    *start = left / 2;
+}
+
+// Each stretch's pieces repeated to fill the word it runs along. The run is in
+// the text's order here, right to left: pieces lie one after another towards the
+// word, all drawn over the place the stretch has, which takes no width.
+fn stretch(w as *work.Work) as void {
+    if (w.values[V_STRETCH] == 0) { return; }
+    let is *glyphs.Run as run = w.run;
+    // Measured first: how much more room.
+    let is i64 as more with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < run.len) {
+        if (_is_stretch(&run.src[i]) == 0) {
+            i = i + 1;
+        } else {
+            let is i64 as fixed with mut = 0;
+            let is i64 as repeating with mut = 0;
+            let is i64 as nrep with mut = 0;
+            let is i64 as a = i;
+            while (i < run.len && _is_stretch(&run.src[i]) == 1) {
+                let is i64 as width = outline.advance_rounded(w.r, cast(i64, run.src[i].id));
+                if (cast(i64, run.src[i].spos) == STCH_FIXED) {
+                    fixed = fixed + width;
+                } else {
+                    repeating = repeating + width;
+                    nrep = nrep + 1;
+                }
+                i = i + 1;
+            }
+            let is i64 as total with mut = 0;
+            let is i64 as c with mut = i;
+            while (c < run.len && _is_stretch(&run.src[c]) == 0 &&
+                   (glyphs.is_ignorable(&run.src[c]) == 1 || _in_word(cast(i64, run.src[c].cat)) == 1)) {
+                total = total + cast(i64, run.place[c].xa);
+                c = c + 1;
+            }
+            let is i64 as copies with mut = 0;
+            let is i64 as lap with mut = 0;
+            let is i64 as x with mut = 0;
+            _measure(total, fixed, repeating, nrep, &copies, &lap, &x);
+            more = more + copies * nrep;
+            // Stored while the room is got: in what will be read back.
+            glyphs.mark_unsafe(run, a, c);
+        }
+    }
+    let is i64 as was = run.len;
+    let is i64 as now = was + more;
+    run.n = 0;
+    if (glyphs.room(run, now) == 0) { return; }
+    // Moved up to the end of the room, then written in place from the start.
+    let is i64 as from = now - was;
+    if (from > 0) {
+        mem.core.memmove(cast(*u8, &run.src[from]), cast(*u8, &run.src[0]), was * sizeof(glyphs.Glyph));
+        mem.core.memmove(cast(*u8, &run.place[from]), cast(*u8, &run.place[0]), was * sizeof(glyphs.Place));
+    }
+    let is i64 as out with mut = 0;
+    i = from;
+    while (i < now) {
+        if (_is_stretch(&run.src[i]) == 0) {
+            run.src[out] = run.src[i];
+            run.place[out] = run.place[i];
+            out = out + 1;
+            i = i + 1;
+        } else {
+            let is i64 as fixed with mut = 0;
+            let is i64 as repeating with mut = 0;
+            let is i64 as nrep with mut = 0;
+            let is i64 as a = i;
+            while (i < now && _is_stretch(&run.src[i]) == 1) {
+                let is i64 as width = outline.advance_rounded(w.r, cast(i64, run.src[i].id));
+                if (cast(i64, run.src[i].spos) == STCH_FIXED) {
+                    fixed = fixed + width;
+                } else {
+                    repeating = repeating + width;
+                    nrep = nrep + 1;
+                }
+                i = i + 1;
+            }
+            let is i64 as total with mut = 0;
+            let is i64 as c with mut = i;
+            while (c < now && _is_stretch(&run.src[c]) == 0 &&
+                   (glyphs.is_ignorable(&run.src[c]) == 1 || _in_word(cast(i64, run.src[c].cat)) == 1)) {
+                total = total + cast(i64, run.place[c].xa);
+                c = c + 1;
+            }
+            let is i64 as copies with mut = 0;
+            let is i64 as lap with mut = 0;
+            let is i64 as x with mut = 0;
+            _measure(total, fixed, repeating, nrep, &copies, &lap, &x);
+            let is i64 as k with mut = a;
+            // In the text's order, from where the mark is: this writes over what
+            // has been read, never ahead of it, room having been made for all.
+            while (k < i) {
+                let is glyphs.Glyph as piece = run.src[k];
+                let is glyphs.Place as at = run.place[k];
+                let is i64 as width = outline.advance_rounded(w.r, cast(i64, piece.id));
+                let is i64 as repeat with mut = 1;
+                if (cast(i64, piece.spos) == STCH_REPEATING) { repeat = repeat + copies; }
+                let is i64 as n with mut = 0;
+                while (n < repeat) {
+                    x = x - width;
+                    if (n > 0) { x = x + lap; }
+                    run.src[out] = piece;
+                    run.place[out] = at;
+                    run.place[out].xa = cast(i32, 0);
+                    run.place[out].xo = cast(i32, x);
+                    out = out + 1;
+                    n = n + 1;
+                }
+                k = k + 1;
+            }
+        }
+    }
+    run.len = out;
+}

@@ -69,3 +69,9 @@ python3 text/tools/sfnt_reference.py
 ~/.cache/caustic-media/venv/bin/python text/tools/shape_reference.py
 ~/.cache/caustic-media/venv/bin/python text/tools/color_reference.py
 ```
+
+`scripts/` holds one font for each writing system that has a shaper of its own: Noto
+fonts cut down to their scripts with `text/tools/script_reference.py`, renamed the same
+way (the files keep the names they came with), with what HarfBuzz makes of words and
+made-up strings in them (`.shape.ref`). Their licence, the one over them all with each
+font's copyright line, is `licenses/scripts.txt`.
