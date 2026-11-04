@@ -756,8 +756,8 @@ where said:
   every window of the program in one group (WM_HINTS window_group, led by a
   never-mapped window of the connection's own), which EWMH reads as modal over
   the group. `set_blocked` tells Windows that a window waits on a modal of the
-  program's — disabled, the system beeping at a press on it and bringing the
-  modal forward — and is 0 elsewhere, where the program keeps the input from it.
+  program's — disabled, the system beeping at a press on it, which it says
+  (`PRESS_KEPT`) — and is 0 elsewhere, where the program keeps the input from it.
 - The smallest and largest a window may be made (`set_min_size`, `min_size`,
   `set_max_size`): asked again whenever they change — what a layout cannot
   fit into changes after the window is open — as `WM_NORMAL_HINTS`, floor and
