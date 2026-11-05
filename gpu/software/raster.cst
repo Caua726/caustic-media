@@ -492,6 +492,94 @@ fn _blend_premul(src as i64, dst as i64) as i64 {
     return (a << 24) | (b << 16) | (g << 8) | r;
 }
 
+// --- Rows of one colour ---
+//
+// What most of a frame's blending is: one source over a run of pixels. Written
+// as plain loops over a pointer, the source's products worked out ahead and no
+// call or test but the clamp each pixel has anyway, so that -O2 takes them a
+// register at a time; the same arithmetic as _blend_over and _blend_premul, on
+// sources neither opaque nor (for over) clear, which is what reaches them.
+
+fn _row_fill(p as *i32, n as i64, v as i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        p[i] = v;
+        i = i + 1;
+    }
+}
+
+// Two channels at a time, each in sixteen bits of the pixel's thirty-two: red
+// and blue, then green and alpha. Every product a blend divides is at most
+// 255 * 255, and with what dividing adds at most 65280, so neither reaches into
+// the other; and alpha over alpha never passes 255, so the clamp goes.
+fn _row_over(p as *u32, n as i64, src as i64) as void {
+    let is u32 as sa = cast(u32, (src >> 24) & 255);
+    let is u32 as ia = 255 - sa;
+    let is u32 as rb = (cast(u32, src & 255) * sa) | ((cast(u32, (src >> 16) & 255) * sa) << 16);
+    let is u32 as ga = cast(u32, (src >> 8) & 255) * sa;
+    let is u32 as top = sa << 24;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is u32 as d = p[i];
+        let is u32 as x = (d & 16711935) * ia + rb;
+        let is u32 as y = ((d >> 8) & 16711935) * ia + ga;
+        let is u32 as low = ((x + 65537 + ((x >> 8) & 16711935)) >> 8) & 16711935;
+        let is u32 as high = (y + 65537 + ((y >> 8) & 16711935)) & 4278255360;
+        p[i] = (low | high) + top;
+        i = i + 1;
+    }
+}
+
+// The same for a source already carrying its alpha, added as it is. A colour
+// past its alpha could pass 255 and has to be clamped, a channel at a time.
+fn _row_premul(p as *u32, n as i64, src as i64) as void {
+    let is u32 as sa = cast(u32, (src >> 24) & 255);
+    let is u32 as ia = 255 - sa;
+    let is u32 as sr = cast(u32, src & 255);
+    let is u32 as sg = cast(u32, (src >> 8) & 255);
+    let is u32 as sb = cast(u32, (src >> 16) & 255);
+    let is i64 as i with mut = 0;
+    if (sr <= sa && sg <= sa && sb <= sa) {
+        let is u32 as whole = cast(u32, src & 4294967295);
+        while (i < n) {
+            let is u32 as d = p[i];
+            let is u32 as x = (d & 16711935) * ia;
+            let is u32 as y = ((d >> 8) & 16711935) * ia;
+            let is u32 as low = ((x + 65537 + ((x >> 8) & 16711935)) >> 8) & 16711935;
+            let is u32 as high = (y + 65537 + ((y >> 8) & 16711935)) & 4278255360;
+            p[i] = (low | high) + whole;
+            i = i + 1;
+        }
+        return;
+    }
+    while (i < n) {
+        let is u32 as d = p[i];
+        let is u32 as xr = (d & 255) * ia;
+        let is u32 as xg = ((d >> 8) & 255) * ia;
+        let is u32 as xb = ((d >> 16) & 255) * ia;
+        let is u32 as xa = (d >> 24) * ia;
+        let is u32 as r with mut = sr + ((xr + 1 + (xr >> 8)) >> 8);
+        let is u32 as g with mut = sg + ((xg + 1 + (xg >> 8)) >> 8);
+        let is u32 as b with mut = sb + ((xb + 1 + (xb >> 8)) >> 8);
+        let is u32 as a with mut = sa + ((xa + 1 + (xa >> 8)) >> 8);
+        if (r > 255) { r = 255; }
+        if (g > 255) { g = 255; }
+        if (b > 255) { b = 255; }
+        if (a > 255) { a = 255; }
+        p[i] = (a << 24) | (b << 16) | (g << 8) | r;
+        i = i + 1;
+    }
+}
+
+// A row of one colour that shows through, blended.
+fn _row_blend(p as *u32, n as i64, mode as i32, src as i64) as void {
+    if (mode == BLEND_ALPHA) {
+        _row_over(p, n, src);
+    } else {
+        _row_premul(p, n, src);
+    }
+}
+
 fn _blend(mode as i32, src as i64, dst as i64) as i64 {
     if (mode == BLEND_ALPHA) { return _blend_over(src, dst); }
     if (mode == BLEND_PREMULTIPLIED) { return _blend_premul(src, dst); }
@@ -667,20 +755,10 @@ fn _fill_unlit(t as *tgt.Target, pa as Projected, pb as Projected, pc as Project
         if (_row_span(pa, pb, pc, area, own_a, own_b, own_c, py, x0, x1, &first, &last) == 1) {
             let is i64 as row = cast(i64, t.color) + py * stride;
             if (flat == 1 && (blend == BLEND_NONE || flat_alpha == 255)) {
-                let is i32 as v = cast(i32, flat_packed);
-                px = first;
-                while (px <= last) {
-                    *cast(*i32, row + px * 4) = v;
-                    px = px + 1;
-                }
+                _row_fill(cast(*i32, row + first * 4), last - first + 1, cast(i32, flat_packed));
             } else if (flat == 1) {
                 if (_blend_noop(blend, flat_packed) == 0) {
-                    px = first;
-                    while (px <= last) {
-                        let is *i32 as dst = cast(*i32, row + px * 4);
-                        *dst = cast(i32, _blend(blend, flat_packed, cast(i64, *dst) & 4294967295));
-                        px = px + 1;
-                    }
+                    _row_blend(cast(*u32, row + first * 4), last - first + 1, blend, flat_packed);
                 }
             } else {
                 let is f64 as sy = cast(f64, py) + 0.5;
@@ -874,24 +952,9 @@ fn rect_shaded(t as *tgt.Target, a as Shaded, b as Shaded, c as Shaded, d as Sha
                 packed = (_byte(col.a) << 24) | (_byte(col.b) << 16) | (_byte(col.g) << 8) | _byte(col.r);
             }
             if (st.blend == BLEND_NONE || ((packed >> 24) & 255) == 255) {
-                // Two pixels a store, once the row is at an even pixel.
-                let is i32 as pv = cast(i32, packed);
-                if ((px & 1) == 1 && px < px1) {
-                    *cast(*i32, row + px * 4) = pv;
-                    px = px + 1;
-                }
-                let is i64 as pair = (packed << 32) | packed;
-                while (px + 1 < px1) {
-                    *cast(*i64, row + px * 4) = pair;
-                    px = px + 2;
-                }
-                if (px < px1) { *cast(*i32, row + px * 4) = pv; }
+                _row_fill(cast(*i32, row + px * 4), px1 - px, cast(i32, packed));
             } else if (_blend_noop(st.blend, packed) == 0) {
-                while (px < px1) {
-                    let is *i32 as dst = cast(*i32, row + px * 4);
-                    *dst = cast(i32, _blend(st.blend, packed, cast(i64, *dst) & 4294967295));
-                    px = px + 1;
-                }
+                _row_blend(cast(*u32, row + px * 4), px1 - px, st.blend, packed);
             }
         } else if (cast(i64, cov) != 0 && flat == 1) {
             // Coverage sampled nearest, one texel to a pixel (_one_to_one):
@@ -916,7 +979,19 @@ fn rect_shaded(t as *tgt.Target, a as Shaded, b as Shaded, c as Shaded, d as Sha
                     if (sa == 255) {
                         *dst = cast(i32, packed);
                     } else if (sa != 0) {
-                        *dst = cast(i32, _blend_over(packed, cast(i64, *dst) & 4294967295));
+                        // _blend_over, with its tests already made.
+                        let is i64 as d = cast(i64, *dst) & 4294967295;
+                        let is i64 as ia = 255 - sa;
+                        let is i64 as xr = (packed & 255) * sa + (d & 255) * ia;
+                        let is i64 as xg = ((packed >> 8) & 255) * sa + ((d >> 8) & 255) * ia;
+                        let is i64 as xb = ((packed >> 16) & 255) * sa + ((d >> 16) & 255) * ia;
+                        let is i64 as xa = ((d >> 24) & 255) * ia;
+                        let is i64 as r = (xr + 1 + (xr >> 8)) >> 8;
+                        let is i64 as g = (xg + 1 + (xg >> 8)) >> 8;
+                        let is i64 as b = (xb + 1 + (xb >> 8)) >> 8;
+                        let is i64 as a with mut = sa + ((xa + 1 + (xa >> 8)) >> 8);
+                        if (a > 255) { a = 255; }
+                        *dst = cast(i32, (a << 24) | (b << 16) | (g << 8) | r);
                     }
                 } else {
                     *dst = cast(i32, _blend(mode, packed, cast(i64, *dst) & 4294967295));
