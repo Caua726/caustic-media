@@ -177,8 +177,8 @@ caustic-mk run test          # everything that needs no screen
 caustic-mk run test-x11      # what does, under Xvfb: windows, the toolkit's loop, the examples
 caustic-mk run test-wayland  # protocol catalog against wayland-scanner, clients on a private Weston
 caustic-mk run test-win32    # Windows libraries and the native backend under a private Wine
-caustic -q examples/cube.cst -o build/cube && ./build/cube
-caustic -q examples/text_editor.cst -o build/text_editor --path .caustic/deps && ./build/text_editor
+caustic -q -O2 examples/cube.cst -o build/cube && ./build/cube
+caustic -q -O2 examples/text_editor.cst -o build/text_editor --path .caustic/deps && ./build/text_editor
 ```
 
 `test` is headless, the device included, so it runs with no `DISPLAY`;
