@@ -29,6 +29,9 @@
 // stages, and SPIR-V. A custom shader reports UNSUPPORTED instead of drawing
 // nothing.
 use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "std/os.cst" as os;
+use "std/thread.cst" as thread;
 use "std/math.cst" as fm;
 use "../../math/math.cst" as math;
 use "../device.cst" as dev;
@@ -504,8 +507,18 @@ struct Exec {
     cov         as raster.Coverage8;   // the coverage fragment worked out, for cov_color
     cov_color   as math.color.Color;
     cov_ok      as i32;
-    _pad0       as i32;
+    draws       as i32;   // 0: bindings followed, nothing drawn
     table       as [256]i32;
+    // Drawing one band of the target: only rows band0 up to band1 are written,
+    // and what lies wholly outside them is passed over before its vertices are
+    // run, when a vertex's row can be told from its y: pixel y = ya * y + yb.
+    band_on     as i32;
+    ym_state    as i32;   // 0 not worked out, 1 yes, 2 it cannot be told
+    band0       as i64;
+    band1       as i64;
+    ya          as f64;
+    yb          as f64;
+    y_off       as i64;   // where a vertex's y is
 }
 
 // Quads of render/draw2d.cst's filled as rectangles (raster.rect_shaded), as
@@ -572,6 +585,134 @@ fn _index_at(ex as *Exec, i as i64) as i64 {
     return cast(i64, *cast(*i32, cast(i64, ex.idata) + i * 4)) & 4294967295;
 }
 
+// --- Bands ---
+//
+// A pass with enough to draw is drawn by several threads, each on its own rows
+// of the target: no two write the same pixel, and in each the draws keep their
+// order, so blending and depth come out as they do on one thread. Whether a
+// pixel is covered and what colour it gets are worked out from its own row and
+// column, never carried from the row before, so where a band starts changes
+// nothing. The threads last as long as the pass: nothing sleeps between frames
+// and nothing is left to shut down, for the small price of starting them, which
+// is why a pass with little to draw stays on the caller's thread.
+
+let is i64 as MAX_THREADS with imut = 32;
+let is i64 as _threads with mut = 1;
+let is i64 as _band_min with mut = 131072;   // pixels a pass's draws must reach
+let is i64 as _bands_drawn with mut = 0;
+
+// How many threads a pass may be drawn on, in this process; 1, the default, is
+// the caller's alone.
+fn set_threads(n as i64) as void {
+    _threads = n;
+    if (_threads < 1) { _threads = 1; }
+    if (_threads > MAX_THREADS) { _threads = MAX_THREADS; }
+}
+fn threads() as i64 { return _threads; }
+
+// How many pixels a pass's draws must reach to be worth threads: for tests.
+fn set_band_min(n as i64) as void { _band_min = n; }
+// How many passes have been drawn in bands: for tests.
+fn bands_drawn() as i64 { return _bands_drawn; }
+
+fn _parse_count(s as *u8) as i64 {
+    if (cast(i64, s) == 0) { return 0; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (s[i] >= 48 && s[i] <= 57 && i < 6) {
+        v = v * 10 + (cast(i64, s[i]) - 48);
+        i = i + 1;
+    }
+    if (i == 0 || s[i] != 0) { return 0; }
+    return v;
+}
+
+fn _cpus() as i64 {
+    if (os.current() == os.OS_LINUX) {
+        let is [128]u8 as mask;
+        let is i64 as got = os.linux.sched_getaffinity(0, 128, cast(*u8, &mask));
+        let is i64 as n with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < got) {
+            let is i64 as b with mut = cast(i64, mask[i]) & 255;
+            while (b != 0) {
+                n = n + (b & 1);
+                b = b >> 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+    if (os.current() == os.OS_WINDOWS) { return _parse_count(env.getenv("NUMBER_OF_PROCESSORS")); }
+    return 1;
+}
+
+// What a program drawing on this machine should ask for: up to four, past which
+// little is gained for what it takes from everything else. The environment's
+// CAUSTIC_RENDER_THREADS says otherwise, 1 for none.
+fn auto_threads() as i64 {
+    let is i64 as asked = _parse_count(env.getenv("CAUSTIC_RENDER_THREADS"));
+    if (asked > 0) { return asked; }
+    let is i64 as n = _cpus();
+    if (n < 1) { return 1; }
+    if (n > 4) { return 4; }
+    return n;
+}
+
+fn _band_clip(ex as *Exec) as void {
+    if (ex.band_on == 0) { return; }
+    if (ex.st.sy0 < ex.band0) { ex.st.sy0 = ex.band0; }
+    if (ex.st.sy1 > ex.band1) { ex.st.sy1 = ex.band1; }
+}
+
+// Whether a vertex's row follows from its y alone, and how: a position of three
+// f64 through a matrix that takes y to y and keeps w at 1, as draw2d's does.
+fn _y_map(ex as *Exec) as void {
+    ex.ym_state = 2;
+    if (cast(i64, ex.vert_stage) != cast(i64, fn_ptr(vs_builtin))) { return; }
+    let is i64 as off with mut = 0 - 1;
+    let is i32 as i with mut = 0;
+    while (i < ex.layout.count) {
+        if (ex.layout.attrs[i].location == pipe.LOC_POSITION && ex.layout.attrs[i].format == pipe.F64X3) {
+            off = cast(i64, ex.layout.attrs[i].offset);
+        }
+        i = i + 1;
+    }
+    if (off < 0) { return; }
+    let is f64 as m5 with mut = 1.0;
+    let is f64 as m13 with mut = 0.0;
+    if (cast(i64, ex.env.uniforms) != 0) {
+        let is *shd.BuiltinUniforms as un = cast(*shd.BuiltinUniforms, ex.env.uniforms);
+        if (un.mvp.m[1] != 0.0 || un.mvp.m[9] != 0.0 || un.mvp.m[3] != 0.0 || un.mvp.m[7] != 0.0 ||
+            un.mvp.m[11] != 0.0 || un.mvp.m[15] != 1.0) { return; }
+        m5 = un.mvp.m[5];
+        m13 = un.mvp.m[13];
+    }
+    let is f64 as vh = cast(f64, ex.st.vh);
+    ex.ya = 0.0 - 0.5 * m5 * vh;
+    ex.yb = cast(f64, ex.st.vy) + (0.5 - 0.5 * m13) * vh;
+    ex.y_off = off + 8;
+    ex.ym_state = 1;
+}
+
+// Whether the vertices at these indices lie wholly outside this band: never
+// says so of what touches it, a row's margin to spare.
+fn _outside(ex as *Exec, ia as i64, ib as i64, ic as i64) as i32 {
+    if (ex.ym_state == 0) { _y_map(ex); }
+    if (ex.ym_state != 1) { return 0; }
+    let is i64 as base = cast(i64, ex.vdata) + ex.y_off;
+    let is i64 as stride = cast(i64, ex.layout.stride);
+    let is f64 as a = *cast(*f64, base + ia * stride);
+    let is f64 as b = *cast(*f64, base + ib * stride);
+    let is f64 as c = *cast(*f64, base + ic * stride);
+    let is f64 as lo = fm.min_f64(a, fm.min_f64(b, c)) * ex.ya + ex.yb;
+    let is f64 as hi = fm.max_f64(a, fm.max_f64(b, c)) * ex.ya + ex.yb;
+    let is f64 as top = fm.min_f64(lo, hi);
+    let is f64 as bottom = fm.max_f64(lo, hi);
+    if (bottom + 1.0 < cast(f64, ex.band0) || top - 1.0 > cast(f64, ex.band1)) { return 1; }
+    return 0;
+}
+
 // One triangle, from three vertex indices: decode, run the vertex stage,
 // rasterize. This is the whole draw path, and everything above it exists to
 // decide which three indices to hand it.
@@ -584,6 +725,7 @@ fn _emit_triangle(ex as *Exec, ia as i64, ib as i64, ic as i64) as void {
     if ((ic + 1) * stride > ex.vbytes) { return; }
     if ((ia + 1) * stride > ex.vbytes) { return; }
     if ((ib + 1) * stride > ex.vbytes) { return; }
+    if (ex.band_on == 1 && _outside(ex, ia, ib, ic) == 1) { return; }
 
     let is VertexIn as va;
     let is VertexIn as vb;
@@ -608,6 +750,8 @@ fn _emit_triangle(ex as *Exec, ia as i64, ib as i64, ic as i64) as void {
 fn _six(ex as *Exec, first as i64) as i32 {
     let is i64 as stride = cast(i64, ex.layout.stride);
     if ((first + 6) * stride > ex.vbytes) { return 0; }
+    if (ex.band_on == 1 && _outside(ex, first, first + 1, first + 2) == 1 &&
+        _outside(ex, first + 3, first + 4, first + 5) == 1) { return 1; }
     let is i64 as base = cast(i64, ex.vdata);
     let is [6]raster.Shaded as sh;
     let is i64 as k with mut = 0;
@@ -626,7 +770,7 @@ fn _six(ex as *Exec, first as i64) as i32 {
         th = cast(*tex.Info, ex.env.tex0).height;
     }
     if (raster.rect_shaded(&ex.target, sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], &ex.st, tw, th, cov) == 1) {
-        _rects_filled = _rects_filled + 1;
+        if (ex.band_on == 0) { _rects_filled = _rects_filled + 1; }
         return 1;
     }
     raster.triangle_shaded(&ex.target, sh[0], sh[1], sh[2], &ex.st);
@@ -692,29 +836,10 @@ fn _move_region(inf as *tex.Info, pixels as *u8, x as i64, y as i64, w as i64, h
     }
 }
 
-fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
-    let is *cmd.Info as ci = cast(*cmd.Info, payload);
-
-    let is Exec as ex;
-    ex.in_pass = 0;
-    ex.has_pipe = 0;
-    ex.vdata = cast(*u8, 0);
-    ex.vbytes = 0;
-    ex.idata = cast(*u8, 0);
-    ex.ibytes = 0;
-    ex.index_bytes = 4;
-    ex.uniforms = cast(*u8, 0);
-    ex.env.uniforms = cast(*u8, 0);
-    ex.env.tex0 = cast(*u8, 0);
-    ex.env.samp0 = cast(*u8, 0);
-    ex.vert_stage = cast(*u8, 0);
-    ex.st.frag = cast(*u8, 0);
-    ex.st.env = cast(*u8, &ex.env);
-    ex.st.unlit = 0;
-    ex.cov_ok = 0;
-
-    let is i64 as n with mut = 0;
-    while (n < ci.count) {
+// The records from from up to to, on ex.
+fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i64) as void {
+    let is i64 as n with mut = from;
+    while (n < to) {
         let is *cmd.Record as r = cmd.record_at(ci, n);
 
         if (r.op == cmd.OP_BEGIN_PASS) {
@@ -754,6 +879,7 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
             ex.st.vw = r.i2; ex.st.vh = r.i3;
             if (ex.st.vw <= 0) { ex.st.vw = ex.target.width; }
             if (ex.st.vh <= 0) { ex.st.vh = ex.target.height; }
+            ex.ym_state = 0;
 
         } else if (r.op == cmd.OP_SET_SCISSOR) {
             if (r.i2 < 0) {
@@ -763,6 +889,7 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
                 ex.st.sx0 = r.i0; ex.st.sy0 = r.i1;
                 ex.st.sx1 = r.i0 + r.i2; ex.st.sy1 = r.i1 + r.i3;
             }
+            _band_clip(ex);
 
         } else if (r.op == cmd.OP_BIND_PIPELINE) {
             let is *u8 as pp = dev.payload(dv, dev.KIND_PIPELINE, r.i0);
@@ -779,6 +906,7 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
             ex.st.unlit = 0;
             if (cast(i64, pst.frag) == cast(i64, fn_ptr(fs_unlit))) { ex.st.unlit = 1; }
             ex.has_pipe = 1;
+            ex.ym_state = 0;
 
         } else if (r.op == cmd.OP_BIND_VERTEX) {
             let is *u8 as bp = dev.payload(dv, dev.KIND_BUFFER, r.i0);
@@ -805,15 +933,16 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
 
         } else if (r.op == cmd.OP_SET_UNIFORMS) {
             ex.env.uniforms = cast(*u8, cast(i64, ci.uniforms) + r.i0);
+            ex.ym_state = 0;
 
         } else if (r.op == cmd.OP_DRAW) {
-            if (ex.in_pass == 1 && ex.has_pipe == 1 && cast(i64, ex.vdata) != 0) {
+            if (ex.draws == 1 && ex.in_pass == 1 && ex.has_pipe == 1 && cast(i64, ex.vdata) != 0) {
                 let is i64 as i with mut = 0;
                 while (i + 2 < r.i1) {
-                    if (_rects == 1 && i + 5 < r.i1 && _six(&ex, r.i0 + i) == 1) {
+                    if (_rects == 1 && i + 5 < r.i1 && _six(ex, r.i0 + i) == 1) {
                         i = i + 6;
                     } else {
-                        _emit_triangle(&ex, r.i0 + i, r.i0 + i + 1, r.i0 + i + 2);
+                        _emit_triangle(ex, r.i0 + i, r.i0 + i + 1, r.i0 + i + 2);
                         i = i + 3;
                     }
                 }
@@ -827,20 +956,177 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
             }
 
         } else if (r.op == cmd.OP_DRAW_INDEXED) {
-            if (ex.in_pass == 1 && ex.has_pipe == 1
+            if (ex.draws == 1 && ex.in_pass == 1 && ex.has_pipe == 1
                 && cast(i64, ex.vdata) != 0 && cast(i64, ex.idata) != 0) {
                 let is i64 as i with mut = 0;
                 while (i + 2 < r.i1) {
-                    _emit_triangle(&ex,
-                        _index_at(&ex, r.i0 + i),
-                        _index_at(&ex, r.i0 + i + 1),
-                        _index_at(&ex, r.i0 + i + 2));
+                    _emit_triangle(ex,
+                        _index_at(ex, r.i0 + i),
+                        _index_at(ex, r.i0 + i + 1),
+                        _index_at(ex, r.i0 + i + 2));
                     i = i + 3;
                 }
             }
         }
 
         n = n + 1;
+    }
+}
+
+// What a pass from record from draws on, up to its END_PASS at *end: the rows its
+// draws can reach and how many pixels their scissors hold, 0 when it holds
+// anything but drawing, for one thread to go through in order.
+fn _maxi(a as i64, b as i64) as i64 { if (a > b) { return a; } return b; }
+fn _mini(a as i64, b as i64) as i64 { if (a < b) { return a; } return b; }
+
+fn _pass_work(ci as *cmd.Info, ex as *Exec, from as i64, end as *i64, y0 as *i64, y1 as *i64) as i64 {
+    let is i64 as w = ex.target.width;
+    let is i64 as h = ex.target.height;
+    let is i64 as sx0 with mut = 0;
+    let is i64 as sy0 with mut = 0;
+    let is i64 as sx1 with mut = w;
+    let is i64 as sy1 with mut = h;
+    let is i64 as work with mut = 0;
+    let is i64 as top with mut = h;
+    let is i64 as bottom with mut = 0;
+    let is i64 as n with mut = from;
+    while (n < ci.count) {
+        let is *cmd.Record as r = cmd.record_at(ci, n);
+        if (r.op == cmd.OP_END_PASS) {
+            *end = n;
+            *y0 = top;
+            *y1 = bottom;
+            return work;
+        }
+        if (r.op == cmd.OP_SET_SCISSOR) {
+            if (r.i2 < 0) {
+                sx0 = 0; sy0 = 0; sx1 = w; sy1 = h;
+            } else {
+                sx0 = _maxi(r.i0, 0);
+                sy0 = _maxi(r.i1, 0);
+                sx1 = _mini(r.i0 + r.i2, w);
+                sy1 = _mini(r.i1 + r.i3, h);
+            }
+        } else if (r.op == cmd.OP_DRAW || r.op == cmd.OP_DRAW_INDEXED) {
+            if (sx1 > sx0 && sy1 > sy0) {
+                work = work + (sx1 - sx0) * (sy1 - sy0);
+                top = _mini(top, sy0);
+                bottom = _maxi(bottom, sy1);
+            }
+        } else if (r.op != cmd.OP_SET_VIEWPORT && r.op != cmd.OP_BIND_PIPELINE && r.op != cmd.OP_BIND_VERTEX &&
+                   r.op != cmd.OP_BIND_INDEX && r.op != cmd.OP_BIND_TEXTURE && r.op != cmd.OP_SET_UNIFORMS) {
+            return 0;
+        }
+        n = n + 1;
+    }
+    return 0;
+}
+
+struct BandJob {
+    ci    as *cmd.Info;
+    dv    as *dev.Device;
+    base  as *Exec;
+    from  as i64;
+    to    as i64;
+    y0    as i64;
+    y1    as i64;
+    bands as i64;
+    next  as i64;   // the next band nobody has taken
+}
+
+fn _band_worker(arg as i64) as i64 {
+    let is *BandJob as job = cast(*BandJob, arg);
+    let is i64 as i with mut = atomic_add(&job.next, 1);
+    while (i < job.bands) {
+        let is Exec as ex = *job.base;
+        ex.st.env = cast(*u8, &ex.env);
+        ex.cov_ok = 0;
+        ex.ym_state = 0;
+        ex.band_on = 1;
+        ex.band0 = job.y0 + (job.y1 - job.y0) * i / job.bands;
+        ex.band1 = job.y0 + (job.y1 - job.y0) * (i + 1) / job.bands;
+        _band_clip(&ex);
+        _replay(job.ci, job.dv, &ex, job.from, job.to);
+        i = atomic_add(&job.next, 1);
+    }
+    return 0;
+}
+
+// Records from up to to drawn on _threads threads, the caller's one of them.
+// Twice as many bands as threads, so that one with little in it leaves its
+// thread free for the next. A thread that cannot be started leaves its share to
+// the others.
+fn _draw_bands(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i64, y0 as i64, y1 as i64) as void {
+    _bands_drawn = _bands_drawn + 1;
+    let is BandJob as job;
+    job.ci = ci;
+    job.dv = dv;
+    job.base = ex;
+    job.from = from;
+    job.to = to;
+    job.y0 = y0;
+    job.y1 = y1;
+    job.bands = _mini(_threads * 2, y1 - y0);
+    job.next = 0;
+    let is [32]thread.Thread as ths;
+    let is [32]i32 as started;
+    let is i64 as i with mut = 1;
+    while (i < _threads) {
+        started[i] = cast(i32, thread.spawn(&ths[i], fn_ptr(_band_worker), cast(i64, &job)) == 0);
+        i = i + 1;
+    }
+    _band_worker(cast(i64, &job));
+    i = 1;
+    while (i < _threads) {
+        if (started[i] == 1) { thread.join(&ths[i]); }
+        i = i + 1;
+    }
+}
+
+fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
+    let is *cmd.Info as ci = cast(*cmd.Info, payload);
+
+    let is Exec as ex;
+    ex.in_pass = 0;
+    ex.has_pipe = 0;
+    ex.vdata = cast(*u8, 0);
+    ex.vbytes = 0;
+    ex.idata = cast(*u8, 0);
+    ex.ibytes = 0;
+    ex.index_bytes = 4;
+    ex.uniforms = cast(*u8, 0);
+    ex.env.uniforms = cast(*u8, 0);
+    ex.env.tex0 = cast(*u8, 0);
+    ex.env.samp0 = cast(*u8, 0);
+    ex.vert_stage = cast(*u8, 0);
+    ex.st.frag = cast(*u8, 0);
+    ex.st.env = cast(*u8, &ex.env);
+    ex.st.unlit = 0;
+    ex.cov_ok = 0;
+    ex.draws = 1;
+    ex.band_on = 0;
+    ex.ym_state = 0;
+    ex.band0 = 0;
+    ex.band1 = 0;
+
+    let is i64 as n with mut = 0;
+    while (n < ci.count) {
+        let is *cmd.Record as r = cmd.record_at(ci, n);
+        _replay(ci, dv, &ex, n, n + 1);
+        n = n + 1;
+        if (r.op == cmd.OP_BEGIN_PASS && ex.in_pass == 1 && _threads > 1) {
+            let is i64 as end with mut = 0;
+            let is i64 as y0 with mut = 0;
+            let is i64 as y1 with mut = 0;
+            if (_pass_work(ci, &ex, n, &end, &y0, &y1) >= _band_min && y1 - y0 >= 2) {
+                _draw_bands(ci, dv, &ex, n, end, y0, y1);
+                // What the pass bound stays bound after it.
+                ex.draws = 0;
+                _replay(ci, dv, &ex, n, end + 1);
+                ex.draws = 1;
+                n = end + 1;
+            }
+        }
     }
     return 1;
 }

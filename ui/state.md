@@ -255,9 +255,11 @@ has anything to collect at all.
 Scrolled, a scroll area does not have its content painted again: it asks to
 move the pixels that stay in view (`tree.shift_request`), and `collect` takes
 the ask when the window moves pixels (`tree.set_moves`, as the host's does)
-and nothing but what the area holds is drawn over them — a kind whose `paint_over` leaves part of it alone says which (`over_clear`: a window's frame draws only its hairline, and what lies past that moves) — no shown widget on a
-layer above, no ancestor drawn through a texture or over its children,
-nothing drawn after the area reaching them. Then what moved with the content
+and nothing but what the area holds is drawn over them — no shown widget on a
+layer above, no ancestor drawn through a texture, none drawn over its children
+but where it says it leaves them alone (`over_clear`: a window's frame draws
+only its hairline, and what lies past that and its corners moves), nothing
+drawn after the area reaching them, a widget that draws nothing not counting. Then what moved with the content
 is not damaged; the area damages what comes into view, its bars, and, where
 a focus ring round it or round what holds it is shown or changes, a band at
 its edges as deep as the ring reaches. The window moves the pixels

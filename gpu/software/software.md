@@ -142,9 +142,25 @@ A software rasterizer is bound by fragments. The parallelism that matters is
 primitives that touch its own region. No locking, since no two threads write the
 same pixel, and the depth buffer stays correct because a tile is owned outright.
 
-Caustic has threads, atomics and a thread-safe allocator, so this is available
-rather than aspirational. It stays behind the same opt-in as the rest of the
-library's threading: single-threaded by default.
+Here a tile is a **band** of rows (`bands_test.cst`). A pass goes through its
+records once per band, each on its own copy of the bindings, its scissor cut to
+the band; coverage and colour are worked out from a pixel's own row and column,
+never carried from the row before, so where a band starts changes nothing, and
+in each band the draws keep their order, so blending and depth come out as on
+one thread. There are twice as many bands as threads, taken as they come free,
+over only the rows the pass's scissors reach. A quad or triangle wholly outside
+a band is passed over before its vertices are run, read from its y when the
+matrix takes y to y as draw2d's does; turned geometry runs its vertex stage in
+every band, which still works and gains only on the fill.
+
+The threads last as long as the pass. Nothing sleeps between frames, nothing has
+to be shut down — a Caustic program returning from `main` ends only its own
+thread on Linux, and would wait for any left sleeping — and starting them costs
+little beside a pass worth drawing this way: one whose draws' scissors hold fewer
+than 131072 pixels stays on the caller's thread, as does one that moves pixels
+inside it. It is opt-in: `gpu.set_threads(device, n)`, one by default. The
+toolkit's host asks for `gpu.auto_threads()`: as many as there are processors up
+to four, or what `CAUSTIC_RENDER_THREADS` says, 1 for none.
 
 Before that, the cheap wins. The rasterizer finds each row's covered
 interval and fills it, rather than testing the whole bounding box. And most
@@ -153,7 +169,11 @@ glyph and image render/draw2d.cst draws is a quad of two — so those are
 recognised and filled row by row (`raster.rect_shaded`): no edge tests, no
 barycentric weights, a glyph's texels read one after another and the colour
 each coverage makes looked up in a table built once per colour, blends
-divided by 255 without a division, opaque fills two pixels a store. Measured
+divided by 255 without a division. A row of one colour is a plain loop over a
+pointer (`_row_fill`, `_row_over`, `_row_premul`), the source's products worked
+out ahead, two channels at a time in sixteen bits each, which `-O2` takes a
+vector register at a time; `raster_test` holds it to one pixel blended alone over
+every alpha. Measured
 on the text editor scrolling a full window of text, 1366x740: the raster
 went from 32 ms a frame to 7, the whole frame (layout, paint, raster, the
 copy to X) from 45 ms to about 12. A full repaint of 1920x1080 is still
@@ -176,7 +196,8 @@ frame at 1366x740.
 3. **Compute**, which is a loop over a workgroup grid here, and the obvious
    place for the thread pool.
 4. **SPIR-V interpreter**, for custom shaders and for compute's shader half.
-5. **Tiled multithreading**, once there is something worth parallelising.
+5. ~~**Tiled multithreading**, once there is something worth parallelising.~~
+   Done, in bands; see above.
 
 Before any of those: presenting only what changed, which on X11 is still a
 copy of the whole frame and its conversion to the server's order.
@@ -192,8 +213,8 @@ draw2d's rectangles filled as rectangles — the same pixels as their two
 triangles, compared over a frame of everything draw2d draws
 (`rect_test.cst`); a texture not one texel to a pixel is left to the
 triangles, since sampled at a texel's edge the two ways round could pick
-different texels. Compute, SPIR-V and threads are still to come (the order
-of work above).
+different texels. Compute and SPIR-V are still to come (the order of work
+above).
 
 `raster_test.cst` also runs a native fragment with twenty simultaneously
 live floating-point values and verifies every pixel of its two-triangle

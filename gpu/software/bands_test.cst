@@ -1,0 +1,245 @@
+// gpu/software/bands_test.cst — a pass drawn by several threads, the same
+// pixels as on one.
+//
+// Each thread draws its own rows, in the order the draws were recorded. So a
+// frame of everything the device draws — rectangles solid, blended and
+// premultiplied, gradients, rounded corners, glyphs from a coverage atlas,
+// images, clips, replaced regions; triangles turned so a vertex's row cannot be
+// told from its y, through depth; a second pass that binds nothing and draws
+// with what the first bound; pixels moved between passes and inside one — comes
+// out the same on any number of threads, every time.
+use "std/io.cst" as io;
+use "../../math/math.cst" as math;
+use "../gpu.cst" as gpu;
+use "backend.cst" as backend;
+use "../../render/draw2d.cst" as draw2d;
+use "../../render/shapes2d.cst" as shapes;
+
+let is i32 as fails with mut = 0;
+
+fn check(name as *u8, ok as i32) as void {
+    if (ok == 0) {
+        io.printf("FAIL: %s\n", name);
+        fails = fails + 1;
+    }
+}
+
+let is i64 as W with imut = 320;
+let is i64 as H with imut = 200;
+let is [64000]i32 as one with mut;
+let is [64000]i32 as many with mut;
+
+let is gpu.device.Device as dv with mut;
+let is i64 as target with mut = 0;
+let is i64 as depth with mut = 0;
+let is i64 as cmd with mut = 0;
+let is i64 as atlas with mut = 0;
+let is i64 as picture with mut = 0;
+let is i64 as pl3 with mut = 0;
+let is i64 as vb3 with mut = 0;
+
+// As pipeline.layout_pos_color declares it.
+struct Vtx {
+    x as f64; y as f64; z as f64;
+    r as f64; g as f64; b as f64; a as f64;
+}
+
+fn scene(c as *draw2d.Canvas) as void {
+    draw2d.begin(c, cast(f64, W), cast(f64, H), 1.0);
+    let is math.color.Color as red = math.color.rgba(0.9, 0.1, 0.1, 1.0);
+    let is math.color.Color as see = math.color.rgba(0.2, 0.8, 0.4, 0.55);
+    let is math.color.Color as ink = math.color.rgba(0.95, 0.9, 0.2, 0.9);
+    shapes.fill_rect(c, 0.0, 0.0, 320.0, 60.0, math.color.rgba(0.3, 0.3, 0.35, 1.0));
+    shapes.fill_rect(c, 10.5, 12.25, 300.0, 170.5, see);
+    shapes.fill_rounded_gradient(c, 40.0, 20.0, 120.0, 150.0, 0.0, 0.0, 0.0, 0.0, red, see);
+    shapes.fill_rounded(c, 180.0, 30.0, 100.0, 140.0, 12.0, 12.0, 12.0, 12.0, see);
+    // Glyphs on the rows the bands meet at, at their size and scaled.
+    let is i64 as k with mut = 0;
+    while (k < 300) {
+        let is f64 as gx = cast(f64, (k * 37) % 300);
+        let is f64 as gy = cast(f64, (k * 23) % 190);
+        if (k % 3 == 0) {
+            draw2d.glyph(c, atlas, gx, gy, 8.0, 10.0, 0.0, 0.0, 0.25, 0.3125, ink);
+        } else if (k % 3 == 1) {
+            draw2d.glyph(c, atlas, gx + 0.5, gy + 0.25, 8.0, 10.0, 0.25, 0.0, 0.5, 0.3125, red);
+        } else {
+            draw2d.glyph(c, atlas, gx, gy, 16.0, 20.0, 0.5, 0.0, 0.75, 0.3125, see);
+        }
+        k = k + 1;
+    }
+    draw2d.image(c, picture, 0, 20.0, 90.0, 64.0, 64.0, 0.0, 0.0, 1.0, 1.0, math.color.rgba(1.0, 1.0, 1.0, 1.0));
+    draw2d.image(c, picture, 1, 100.5, 80.25, 80.0, 90.0, 0.0, 0.0, 1.0, 1.0, see);
+    draw2d.image_premultiplied(c, picture, 0, 200.0, 100.0, 64.0, 64.0, 0.25, 0.25, 0.75, 0.75,
+                               math.color.rgba(0.5, 0.5, 0.5, 0.5));
+    draw2d.push_clip(c, 60.5, 60.5, 200.0, 70.0);
+    shapes.fill_rect(c, 0.0, 0.0, 320.0, 200.0, see);
+    draw2d.glyph(c, atlas, 70.0, 70.0, 64.0, 50.0, 0.75, 0.5, 1.0, 0.8125, ink);
+    draw2d.pop_clip(c);
+    draw2d.replace_rect(c, 150.0, 150.0, 40.0, 30.0, math.color.rgba(0.0, 0.0, 1.0, 0.5));
+}
+
+// Turned about z, so y depends on x too, and through depth.
+fn turned(angle_cos as f64, angle_sin as f64, z as f64) as gpu.shader.BuiltinUniforms {
+    let is math.mat.Mat4 as m with mut = math.mat.m4_identity();
+    m.m[0] = angle_cos * 0.8;
+    m.m[1] = angle_sin * 0.8;
+    m.m[4] = 0.0 - angle_sin * 0.8;
+    m.m[5] = angle_cos * 0.8;
+    m.m[14] = z;
+    return gpu.shader.uniforms(m, math.color.rgba(1.0, 1.0, 1.0, 1.0));
+}
+
+// One frame, through every kind of pass, read into out.
+fn render(c as *draw2d.Canvas, out as *i32) as void {
+    scene(c);
+    gpu.command.begin(&dv, cmd);
+    let is gpu.command.Pass as ps = gpu.command.pass(target, 0, math.color.rgba(0.1, 0.2, 0.3, 1.0));
+    gpu.command.begin_pass(&dv, cmd, &ps);
+    draw2d.flush(c, cmd);
+    gpu.command.end_pass(&dv, cmd);
+    // Moved between passes, across the rows the bands meet at.
+    gpu.command.move_region(&dv, cmd, target, 10, 10, 200, 120, 15, 40);
+    // Bound in one pass and used in the next, which binds nothing.
+    let is gpu.command.Pass as p3 with mut = gpu.command.pass_load(target, depth);
+    p3.clear_depth = 1;
+    gpu.command.begin_pass(&dv, cmd, &p3);
+    gpu.command.bind_pipeline(&dv, cmd, pl3);
+    gpu.command.bind_vertex_buffer(&dv, cmd, vb3);
+    let is gpu.shader.BuiltinUniforms as u0 = turned(0.8, 0.6, 0.2);
+    gpu.command.set_uniforms(&dv, cmd, cast(*u8, &u0), sizeof(gpu.shader.BuiltinUniforms));
+    gpu.command.draw(&dv, cmd, 0, 6);
+    gpu.command.end_pass(&dv, cmd);
+    let is gpu.command.Pass as p4 = gpu.command.pass_load(target, depth);
+    gpu.command.begin_pass(&dv, cmd, &p4);
+    let is gpu.shader.BuiltinUniforms as u1 = turned(0.6, 0.0 - 0.8, 0.0 - 0.1);
+    gpu.command.set_uniforms(&dv, cmd, cast(*u8, &u1), sizeof(gpu.shader.BuiltinUniforms));
+    gpu.command.draw(&dv, cmd, 3, 6);
+    // And pixels moved inside a pass: that one goes through in order.
+    gpu.command.move_region(&dv, cmd, target, 40, 40, 80, 80, 0 - 10, 30);
+    gpu.command.draw(&dv, cmd, 0, 3);
+    gpu.command.end_pass(&dv, cmd);
+    gpu.command.end(&dv, cmd);
+    gpu.command.submit(&dv, cmd);
+    gpu.texture.read(&dv, target, cast(*u8, out), W * H * 4);
+}
+
+fn differ() as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < W * H) {
+        if (one[i] != many[i]) {
+            if (n == 0) { io.printf("  first at %d,%d: %x against %x\n", i % W, i / W, many[i], one[i]); }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() as i32 {
+    dv = gpu.open_headless(W, H, gpu.SOFTWARE);
+    let is gpu.texture.Desc as td = gpu.texture.desc(W, H, gpu.texture.RGBA8, gpu.texture.RENDER_TARGET);
+    target = gpu.texture.create(&dv, &td);
+    let is gpu.texture.Desc as dd = gpu.texture.desc(W, H, gpu.texture.DEPTH, gpu.texture.RENDER_TARGET);
+    depth = gpu.texture.create(&dv, &dd);
+    cmd = gpu.command.create(&dv);
+    let is [1024]u8 as cov;
+    let is i64 as k with mut = 0;
+    while (k < 1024) {
+        cov[k] = cast(u8, (k * 37 + (k / 32) * 11) % 256);
+        k = k + 1;
+    }
+    let is gpu.texture.Desc as ad = gpu.texture.desc(32, 32, gpu.texture.R8, 0);
+    atlas = gpu.texture.create(&dv, &ad);
+    gpu.texture.upload(&dv, atlas, cast(*u8, &cov), 1024);
+    let is [256]i32 as img;
+    k = 0;
+    while (k < 256) {
+        img[k] = cast(i32, (((k * 13) % 256) << 24) | (((k * 7) % 256) << 16) | (((k * 3) % 256) << 8) | (k % 256));
+        k = k + 1;
+    }
+    let is gpu.texture.Desc as idesc = gpu.texture.desc(16, 16, gpu.texture.RGBA8, 0);
+    picture = gpu.texture.create(&dv, &idesc);
+    gpu.texture.upload(&dv, picture, cast(*u8, &img), 1024);
+
+    let is [9]Vtx as tri;
+    k = 0;
+    while (k < 9) {
+        let is f64 as fk = cast(f64, k);
+        tri[k].x = 0.9 - 0.2 * fk;
+        tri[k].y = 0.8 * (cast(f64, (k * 5) % 7) / 3.0 - 1.0);
+        tri[k].z = 0.1 * (fk - 4.0);
+        tri[k].r = cast(f64, k % 3) / 2.0;
+        tri[k].g = cast(f64, (k + 1) % 3) / 2.0;
+        tri[k].b = cast(f64, (k + 2) % 3) / 2.0;
+        tri[k].a = 1.0;
+        k = k + 1;
+    }
+    vb3 = gpu.buffer.create(&dv, sizeof(Vtx) * 9, gpu.buffer.VERTEX);
+    gpu.buffer.upload(&dv, vb3, 0, cast(*u8, &tri), sizeof(Vtx) * 9);
+    let is i64 as sh = gpu.shader.builtin(&dv, gpu.shader.UNLIT_COLOR);
+    let is gpu.pipeline.Desc as pd with mut = gpu.pipeline.desc_opaque(sh, gpu.pipeline.layout_pos_color());
+    pd.depth_test = gpu.pipeline.DEPTH_LESS;
+    pd.depth_write = 1;
+    pd.cull = gpu.pipeline.CULL_NONE;
+    pl3 = gpu.pipeline.create(&dv, &pd);
+
+    let is draw2d.Limits as l = draw2d.limits_default();
+    let is draw2d.Canvas as c = draw2d.open(&dv, &l);
+    check("open", draw2d.is_open(&c) == 1 && atlas != 0 && picture != 0 && pl3 != 0 && depth != 0);
+
+    // One thread is the default, and draws nothing in bands.
+    check("one thread by default", backend.threads() == 1);
+    let is i64 as b0 = backend.bands_drawn();
+    render(&c, cast(*i32, &one));
+    check("on one thread: no bands", backend.bands_drawn() == b0);
+    let is i64 as lit with mut = 0;
+    k = 0;
+    while (k < W * H) {
+        if (one[k] != one[0]) { lit = lit + 1; }
+        k = k + 1;
+    }
+    check("and something drawn", lit > 1000);
+
+    // Every pass worth it, however little it holds.
+    backend.set_band_min(0);
+    let is [5]i64 as counts;
+    counts[0] = 2; counts[1] = 3; counts[2] = 4; counts[3] = 7; counts[4] = 32;
+    let is i64 as ci with mut = 0;
+    while (ci < 5) {
+        backend.set_threads(counts[ci]);
+        let is i64 as before = backend.bands_drawn();
+        let is i64 as round with mut = 0;
+        let is i64 as wrong with mut = 0;
+        while (round < 25) {
+            render(&c, cast(*i32, &many));
+            wrong = wrong + differ();
+            round = round + 1;
+        }
+        io.printf("  %d threads: %d pixels differ\n", counts[ci], wrong);
+        check("in bands: the same pixels, every time", wrong == 0);
+        // Three of the four passes: the one that moves pixels goes in order.
+        check("and drawn in bands", backend.bands_drawn() - before == 25 * 3);
+        ci = ci + 1;
+    }
+
+    // A pass with little to draw stays on the caller's thread.
+    backend.set_band_min(1073741824);
+    let is i64 as b1 = backend.bands_drawn();
+    render(&c, cast(*i32, &many));
+    check("not worth it: no bands, the same", backend.bands_drawn() == b1 && differ() == 0);
+
+    backend.set_threads(0);
+    check("no fewer than one", backend.threads() == 1);
+    backend.set_threads(1000);
+    check("no more than there is room for", backend.threads() == backend.MAX_THREADS);
+    backend.set_threads(1);
+    check("what to ask for: at least one", backend.auto_threads() >= 1);
+
+    if (fails == 0) {
+        io.printf("software bands: all checks passed\n");
+        return 0;
+    }
+    io.printf("software bands: %d failures\n", fails);
+    return 1;
+}
