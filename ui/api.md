@@ -159,7 +159,8 @@ the application: its windows, each with its own tree, and what they share.
 - `paint_surface(a as *App, h as i64, s as i64, c as *draw2d.Canvas, theme as *style.Theme, time as i64,` — The same for surface s of window h — a widget of it shown in a window of its own (tree.surface_open) — on c, begun at the surface's size.
 - `theme(a as *App) as *style.Theme` — The theme every window paints in.
 - `set_theme(a as *App, th as *style.Theme) as void` — A new theme for every window, laid out and repainted in it; th is copied.
-- `set_prefs(a as *App, p as *style.Prefs) as void` — The theme the system's preferences call for — dark, high contrast, the accent, the interface font, text scale, reduced motion — in every window.
+- `fix_theme(a as *App, th as *style.Theme) as void` — th in every window from now on, whatever the system's preferences say or come to say: for a program with a look of its own, which set_theme alone would lose when the host reads the desktop's settings, as it does when ...
+- `set_prefs(a as *App, p as *style.Prefs) as void` — The theme the system's preferences call for — dark, high contrast, the accent, the interface font, text scale, reduced motion — in every window, unless fix_theme said otherwise.
 - `set_system(a as *App, s as *wsettings.Settings) as void` — What the desktop says — window.read_settings, the portal — in every window: the theme its preferences call for, and its timings in every router.
 - `settings(a as *App) as *router.Settings`
 - `set_locale(a as *App, tag as *u8, n as i64) as void` — The user's language, a BCP 47 tag of n bytes: the toolkit's words in it — English where strings.cst has none of it — and every window laid out in its direction, right to left for Arabic, Hebrew and the others.

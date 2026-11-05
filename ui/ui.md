@@ -347,7 +347,8 @@ radii, the same on every platform — ships light, dark and high contrast, chose
 from the platform's preferences and switchable at run time. It imitates no
 platform's look. Every theme holds its text to WCAG contrast — 4.5 to 1, 7 in high
 contrast — whatever accent the user picked: text, the ring and the selection
-are moved towards black or white until they read.
+are moved towards black or white until they read. A program with a look of its own
+fixes its theme (`app.fix_theme`), and the platform's preferences stop reaching it.
 
 ---
 
