@@ -69,7 +69,7 @@ renderer:
 |---|---|---|
 | Ordering | depth buffer, submission order free | **layer index**, submission order matters |
 | Batching | by material | **by texture atlas** |
-| Clipping | frustum | **scissor rectangle**, nested |
+| Clipping | frustum | **scissor rectangle**, nested; an outline where a scissor cannot do it |
 | Depth | per-fragment test | usually none |
 
 So: one engine, one resource model, one frame — and two families of draw that

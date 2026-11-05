@@ -21,7 +21,12 @@
 //
 // Sized at open, like everything that holds per-frame data here: vertices and
 // batches have capacities, and running out is reported by overflowed() and by
-// flush returning 0 — never by writing past the end.
+// flush returning 0 — never by writing past the end. allow_growth lets a frame
+// run past what open was told, up to a limit.
+//
+// set_transform moves everything drawn after it. A transform that only moves
+// and scales keeps scissor clips; one that turns things, and a clip with rounded
+// corners, clips each triangle against the outline.
 use "std/mem.cst" as mem;
 use "std/math.cst" as fm;
 use "../math/math.cst" as math;
@@ -40,6 +45,9 @@ let is i32 as KIND_REPLACE with imut = 4;   // vertex colour written as it is, n
 let is i64 as KINDS with imut = 5;
 
 let is i64 as MAX_CLIP_DEPTH with imut = 32;
+
+let is i64 as MAX_POLYS with imut = 6;
+let is i64 as POLY_POINTS with imut = 64;
 
 struct Limits {
     vertices as i64;
@@ -67,6 +75,23 @@ struct Clip {
     y0 as i64;
     x1 as i64;
     y1 as i64;
+}
+
+// A clip no scissor can do: the inside of a convex outline, kept where
+// everything has already been transformed and going the same way round.
+struct Poly {
+    n as i64;
+    x as [64]f64;
+    y as [64]f64;
+}
+
+// A corner on its way to the vertex buffer.
+struct _V {
+    x as f64;
+    y as f64;
+    col as math.color.Color;
+    u as f64;
+    v as f64;
 }
 
 struct Batch {
@@ -103,6 +128,12 @@ struct Canvas {
     layer       as i64;
     clips       as [32]Clip;
     clip_n      as i64;
+    clip_poly   as [32]i64;  // how many polys there were before each clip
+    polys       as [6]Poly;
+    poly_n      as i64;
+    m           as [6]f64;   // a b c d e f: x' = ax + cy + e, y' = bx + dy + f
+    moved       as i32;      // m is not the identity
+    vmost       as i64;      // as far as the vertices may grow; vcap unless told
     overflowed  as i32;
     ok          as i32;
 }
@@ -134,6 +165,10 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
     c.origin_y = 0.0;
     c.layer = 0;
     c.clip_n = 0;
+    c.poly_n = 0;
+    c.moved = 0;
+    _identity(&c);
+    c.vmost = c.vcap;
     if (c.vcap < 3 || c.bcap < 1) { return c; }
 
     let is i64 as vbytes = c.vcap * sizeof(Vertex);
@@ -205,7 +240,63 @@ fn begin(c as *Canvas, width as f64, height as f64, scale as f64) as void {
     c.origin_y = 0.0;
     c.layer = 0;
     c.clip_n = 0;
+    c.poly_n = 0;
+    c.moved = 0;
+    _identity(c);
     c.overflowed = 0;
+}
+
+fn _identity(c as *Canvas) as void {
+    c.m[0] = 1.0; c.m[1] = 0.0;
+    c.m[2] = 0.0; c.m[3] = 1.0;
+    c.m[4] = 0.0; c.m[5] = 0.0;
+}
+
+// What is drawn from here on goes through this matrix — x' = ax + cy + e,
+// y' = bx + dy + f, logical to logical — until told otherwise; begin resets it.
+// Clips already pushed stay where they were put; clips pushed now move with it.
+fn set_transform(c as *Canvas, a as f64, b as f64, cc as f64, d as f64, e as f64, f as f64) as void {
+    c.m[0] = a; c.m[1] = b;
+    c.m[2] = cc; c.m[3] = d;
+    c.m[4] = e; c.m[5] = f;
+    c.moved = cast(i32, a != 1.0 || b != 0.0 || cc != 0.0 || d != 1.0 || e != 0.0 || f != 0.0);
+}
+
+fn transformed(c as *Canvas) as i32 { return c.moved; }
+
+// Whether the matrix does no more than move things, and how far: what lands on
+// whole pixels before it may still land on them after.
+fn is_translation(c as *Canvas) as i32 {
+    return cast(i32, c.m[0] == 1.0 && c.m[1] == 0.0 && c.m[2] == 0.0 && c.m[3] == 1.0);
+}
+fn offset_x(c as *Canvas) as f64 { return c.m[4]; }
+fn offset_y(c as *Canvas) as f64 { return c.m[5]; }
+
+// A frame may outgrow what open was told, as far as this many vertices, instead
+// of being cut short. Open with the size most frames need.
+fn allow_growth(c as *Canvas, vertices as i64) as void {
+    if (vertices > c.vcap) { c.vmost = vertices; }
+}
+
+fn _grow(c as *Canvas) as i32 {
+    if (c.vcap >= c.vmost) { return 0; }
+    let is i64 as nv = _mini(c.vcap * 2, c.vmost);
+    let is i64 as nb = c.bcap * 2;
+    let is i64 as vbytes = nv * sizeof(Vertex);
+    let is i64 as bytes = vbytes + nb * sizeof(Batch);
+    let is *u8 as block = mem.core.mmap_anon(bytes);
+    if (cast(i64, block) == 0 || cast(i64, block) == 0 - 1) { return 0; }
+    let is *u8 as batches = cast(*u8, cast(i64, block) + vbytes);
+    if (c.vcount > 0) { mem.core.memcpy(block, c.verts, c.vcount * sizeof(Vertex)); }
+    if (c.bcount > 0) { mem.core.memcpy(batches, c.batches, c.bcount * sizeof(Batch)); }
+    mem.core.munmap(c.block, c.block_bytes);
+    c.block = block;
+    c.block_bytes = bytes;
+    c.verts = block;
+    c.batches = batches;
+    c.vcap = nv;
+    c.bcap = nb;
+    return 1;
 }
 
 // One physical pixel in logical units: the width of an anti-aliasing fringe.
@@ -254,13 +345,121 @@ fn _mini(a as i64, b as i64) as i64 { if (a < b) { return a; } return b; }
 // physical pixel the rectangle touches.
 fn push_clip(c as *Canvas, x as f64, y as f64, w as f64, h as f64) as void {
     if (c.clip_n >= MAX_CLIP_DEPTH) { c.overflowed = 1; return; }
+    if (c.moved == 0) {
+        _push_scissor(c, x, y, x + w, y + h);
+        return;
+    }
+    let is [4]f64 as xs with mut;
+    let is [4]f64 as ys with mut;
+    xs[0] = x;     ys[0] = y;
+    xs[1] = x + w; ys[1] = y;
+    xs[2] = x + w; ys[2] = y + h;
+    xs[3] = x;     ys[3] = y + h;
+    _push_outline(c, cast(*f64, &xs), cast(*f64, &ys), 4, cast(i32, c.m[1] != 0.0 || c.m[2] != 0.0));
+}
+
+// The same for a rectangle with rounded corners — top left, top right, bottom
+// right, bottom left — and whatever the transform has done to it. Its edge is
+// not anti-aliased.
+fn push_clip_rounded(c as *Canvas, x as f64, y as f64, w as f64, h as f64,
+                     r1 as f64, r2 as f64, r3 as f64, r4 as f64) as void {
+    if (c.clip_n >= MAX_CLIP_DEPTH) { c.overflowed = 1; return; }
+    if (r1 <= 0.0 && r2 <= 0.0 && r3 <= 0.0 && r4 <= 0.0) {
+        push_clip(c, x, y, w, h);
+        return;
+    }
+    let is [64]f64 as xs with mut;
+    let is [64]f64 as ys with mut;
+    let is i64 as n with mut = 0;
+    n = _clip_corner(cast(*f64, &xs), cast(*f64, &ys), n, x + r1, y + r1, r1, fm.PI);
+    n = _clip_corner(cast(*f64, &xs), cast(*f64, &ys), n, x + w - r2, y + r2, r2, fm.PI * 1.5);
+    n = _clip_corner(cast(*f64, &xs), cast(*f64, &ys), n, x + w - r3, y + h - r3, r3, 0.0);
+    n = _clip_corner(cast(*f64, &xs), cast(*f64, &ys), n, x + r4, y + h - r4, r4, fm.PI * 0.5);
+    _push_outline(c, cast(*f64, &xs), cast(*f64, &ys), n, 1);
+}
+
+// A quarter circle from the angle `from`, as points, going the way the box does.
+fn _clip_corner(xs as *f64, ys as *f64, n0 as i64, cx as f64, cy as f64, r as f64, from as f64) as i64 {
+    let is i64 as n with mut = n0;
+    if (r <= 0.0) {
+        xs[n] = cx;
+        ys[n] = cy;
+        return n + 1;
+    }
+    let is i64 as k with mut = 0;
+    while (k <= 15) {
+        let is f64 as a = from + cast(f64, k) / 15.0 * fm.PI * 0.5;
+        xs[n] = cx + r * fm.cos(a);
+        ys[n] = cy + r * fm.sin(a);
+        n = n + 1;
+        k = k + 1;
+    }
+    return n;
+}
+
+// The scissor around n points, once transformed, and the outline itself when
+// a scissor alone would not do.
+fn _push_outline(c as *Canvas, xs as *f64, ys as *f64, n as i64, exact as i32) as void {
+    let is i64 as before = c.poly_n;
+    let is f64 as x0 with mut = 0.0;
+    let is f64 as y0 with mut = 0.0;
+    let is f64 as x1 with mut = 0.0;
+    let is f64 as y1 with mut = 0.0;
+    let is *Poly as out with mut = cast(*Poly, 0);
+    if (exact == 1 && c.poly_n < MAX_POLYS && n >= 3 && n <= POLY_POINTS) {
+        out = &c.polys[c.poly_n];
+        out.n = n;
+    }
+    let is f64 as area with mut = 0.0;
+    let is f64 as prev_x with mut = 0.0;
+    let is f64 as prev_y with mut = 0.0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is f64 as px = c.m[0] * xs[i] + c.m[2] * ys[i] + c.m[4];
+        let is f64 as py = c.m[1] * xs[i] + c.m[3] * ys[i] + c.m[5];
+        if (i == 0 || px < x0) { x0 = px; }
+        if (i == 0 || px > x1) { x1 = px; }
+        if (i == 0 || py < y0) { y0 = py; }
+        if (i == 0 || py > y1) { y1 = py; }
+        if (i > 0) { area = area + prev_x * py - px * prev_y; }
+        prev_x = px;
+        prev_y = py;
+        if (out != null) {
+            out.x[i] = px;
+            out.y[i] = py;
+        }
+        i = i + 1;
+    }
+    if (out != null) {
+        // Whichever way a mirror has turned it, the inside is on the same hand.
+        if (area < 0.0) {
+            let is i64 as lo with mut = 0;
+            let is i64 as hi with mut = n - 1;
+            while (lo < hi) {
+                let is f64 as tx = out.x[lo];
+                let is f64 as ty = out.y[lo];
+                out.x[lo] = out.x[hi];
+                out.y[lo] = out.y[hi];
+                out.x[hi] = tx;
+                out.y[hi] = ty;
+                lo = lo + 1;
+                hi = hi - 1;
+            }
+        }
+        c.poly_n = c.poly_n + 1;
+    }
+    _push_scissor(c, x0, y0, x1, y1);
+    c.clip_poly[c.clip_n - 1] = before;
+}
+
+fn _push_scissor(c as *Canvas, x0 as f64, y0 as f64, x1 as f64, y1 as f64) as void {
     let is Clip as k;
-    let is f64 as lx = x - c.origin_x;
-    let is f64 as ly = y - c.origin_y;
+    let is f64 as lx = x0 - c.origin_x;
+    let is f64 as ly = y0 - c.origin_y;
     k.x0 = cast(i64, fm.floor(lx * c.scale));
     k.y0 = cast(i64, fm.floor(ly * c.scale));
-    k.x1 = cast(i64, fm.ceil((lx + w) * c.scale));
-    k.y1 = cast(i64, fm.ceil((ly + h) * c.scale));
+    k.x1 = cast(i64, fm.ceil((x1 - c.origin_x) * c.scale));
+    k.y1 = cast(i64, fm.ceil((y1 - c.origin_y) * c.scale));
     if (c.clip_n > 0) {
         let is Clip as o = c.clips[c.clip_n - 1];
         k.x0 = _maxi(k.x0, o.x0);
@@ -271,11 +470,15 @@ fn push_clip(c as *Canvas, x as f64, y as f64, w as f64, h as f64) as void {
     if (k.x1 < k.x0) { k.x1 = k.x0; }
     if (k.y1 < k.y0) { k.y1 = k.y0; }
     c.clips[c.clip_n] = k;
+    c.clip_poly[c.clip_n] = c.poly_n;
     c.clip_n = c.clip_n + 1;
 }
 
 fn pop_clip(c as *Canvas) as void {
-    if (c.clip_n > 0) { c.clip_n = c.clip_n - 1; }
+    if (c.clip_n > 0) {
+        c.clip_n = c.clip_n - 1;
+        c.poly_n = c.clip_poly[c.clip_n];
+    }
 }
 
 // The clip now, in physical pixels — x0, y0 inclusive, x1, y1 exclusive:
@@ -284,7 +487,8 @@ fn pop_clip(c as *Canvas) as void {
 // drawn at, an origin added back: with one, the clip kept is on the target and
 // what is drawn is still in the window, and comparing the two left out everything.
 fn clip_bounds(c as *Canvas, x0 as *i64, y0 as *i64, x1 as *i64, y1 as *i64) as i32 {
-    if (c.clip_n == 0) { return 0; }
+    // Under a transform the clip and what is drawn are not in the same terms.
+    if (c.clip_n == 0 || c.moved == 1) { return 0; }
     let is Clip as k = c.clips[c.clip_n - 1];
     let is i64 as ox = cast(i64, c.origin_x * c.scale);
     let is i64 as oy = cast(i64, c.origin_y * c.scale);
@@ -305,10 +509,29 @@ fn _maxf(a as f64, b as f64) as f64 { if (a > b) { return a; } return b; }
 fn _outside(c as *Canvas, x0 as f64, y0 as f64, x1 as f64, y1 as f64) as i32 {
     if (c.clip_n == 0) { return 0; }
     let is Clip as k = c.clips[c.clip_n - 1];
-    let is f64 as px0 = (_minf(x0, x1) - c.origin_x) * c.scale;
-    let is f64 as px1 = (_maxf(x0, x1) - c.origin_x) * c.scale;
-    let is f64 as py0 = (_minf(y0, y1) - c.origin_y) * c.scale;
-    let is f64 as py1 = (_maxf(y0, y1) - c.origin_y) * c.scale;
+    let is f64 as lo_x with mut = _minf(x0, x1);
+    let is f64 as hi_x with mut = _maxf(x0, x1);
+    let is f64 as lo_y with mut = _minf(y0, y1);
+    let is f64 as hi_y with mut = _maxf(y0, y1);
+    if (c.moved == 1) {
+        // The box around the four corners, wherever the matrix took them.
+        let is f64 as ax = c.m[0] * lo_x;
+        let is f64 as bx = c.m[0] * hi_x;
+        let is f64 as cx = c.m[2] * lo_y;
+        let is f64 as dx = c.m[2] * hi_y;
+        let is f64 as ay = c.m[1] * lo_x;
+        let is f64 as by = c.m[1] * hi_x;
+        let is f64 as cy = c.m[3] * lo_y;
+        let is f64 as dy = c.m[3] * hi_y;
+        lo_x = _minf(ax, bx) + _minf(cx, dx) + c.m[4];
+        hi_x = _maxf(ax, bx) + _maxf(cx, dx) + c.m[4];
+        lo_y = _minf(ay, by) + _minf(cy, dy) + c.m[5];
+        hi_y = _maxf(ay, by) + _maxf(cy, dy) + c.m[5];
+    }
+    let is f64 as px0 = (lo_x - c.origin_x) * c.scale;
+    let is f64 as px1 = (hi_x - c.origin_x) * c.scale;
+    let is f64 as py0 = (lo_y - c.origin_y) * c.scale;
+    let is f64 as py1 = (hi_y - c.origin_y) * c.scale;
     return cast(i32, px1 <= cast(f64, k.x0) || px0 >= cast(f64, k.x1) || py1 <= cast(f64, k.y0) || py0 >= cast(f64, k.y1));
 }
 
@@ -322,7 +545,7 @@ fn _same_clip(a as Clip, b as Clip) as i32 {
 // Room for three vertices in a batch with this state, or 0.
 fn _reserve(c as *Canvas, kind as i32, tex as i64, samp as i64) as i32 {
     if (c.ok == 0) { return 0; }
-    if (c.vcount + 3 > c.vcap) { c.overflowed = 1; return 0; }
+    if (c.vcount + 3 > c.vcap && _grow(c) == 0) { c.overflowed = 1; return 0; }
     let is Clip as clip = _current_clip(c);
     if (c.bcount > 0) {
         let is *Batch as last = _batch_at(c, c.bcount - 1);
@@ -333,7 +556,7 @@ fn _reserve(c as *Canvas, kind as i32, tex as i64, samp as i64) as i32 {
             return 1;
         }
     }
-    if (c.bcount >= c.bcap) { c.overflowed = 1; return 0; }
+    if (c.bcount >= c.bcap && _grow(c) == 0) { c.overflowed = 1; return 0; }
     let is *Batch as b = _batch_at(c, c.bcount);
     b.kind = kind;
     b._pad0 = 0;
@@ -361,12 +584,128 @@ fn _put(c as *Canvas, x as f64, y as f64, col as math.color.Color, u as f64, v a
     c.vcount = c.vcount + 1;
 }
 
+fn _at(c as *Canvas, out as *_V, x as f64, y as f64, col as math.color.Color, u as f64, v as f64) as void {
+    out.x = c.m[0] * x + c.m[2] * y + c.m[4];
+    out.y = c.m[1] * x + c.m[3] * y + c.m[5];
+    out.col = col;
+    out.u = u;
+    out.v = v;
+}
+
+fn _mix(a as *_V, b as *_V, t as f64, out as *_V) as void {
+    out.x = a.x + (b.x - a.x) * t;
+    out.y = a.y + (b.y - a.y) * t;
+    out.col.r = a.col.r + (b.col.r - a.col.r) * t;
+    out.col.g = a.col.g + (b.col.g - a.col.g) * t;
+    out.col.b = a.col.b + (b.col.b - a.col.b) * t;
+    out.col.a = a.col.a + (b.col.a - a.col.a) * t;
+    out.u = a.u + (b.u - a.u) * t;
+    out.v = a.v + (b.v - a.v) * t;
+}
+
+// Which side of the edge from (ax, ay) to (bx, by) a point is on: inside is not
+// negative, an outline going the way _push_outline leaves them.
+fn _side(ax as f64, ay as f64, bx as f64, by as f64, x as f64, y as f64) as f64 {
+    return (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+}
+
+// Three corners already transformed, through the outlines that clip them.
+fn _emit(c as *Canvas, kind as i32, tex as i64, samp as i64, a as *_V, b as *_V, d as *_V) as void {
+    let is [160]_V as one with mut;
+    let is [160]_V as two with mut;
+    let is *_V as from with mut = cast(*_V, &one);
+    let is *_V as to with mut = cast(*_V, &two);
+    from[0] = *a;
+    from[1] = *b;
+    from[2] = *d;
+    let is i64 as n with mut = 3;
+    let is i64 as k with mut = 0;
+    while (k < c.poly_n && n >= 3) {
+        let is *Poly as pl = &c.polys[k];
+        let is i64 as e with mut = 0;
+        while (e < pl.n && n >= 3) {
+            let is i64 as e2 = (e + 1) % pl.n;
+            let is f64 as ax = pl.x[e];
+            let is f64 as ay = pl.y[e];
+            let is f64 as bx = pl.x[e2];
+            let is f64 as by = pl.y[e2];
+            // Most things lie wholly inside most edges, and nothing need be done for them.
+            let is i64 as out_n with mut = 0;
+            let is i64 as i with mut = 0;
+            while (i < n) {
+                if (_side(ax, ay, bx, by, from[i].x, from[i].y) < 0.0) { out_n = out_n + 1; }
+                i = i + 1;
+            }
+            if (out_n == n) { return; }
+            if (out_n > 0) {
+                let is i64 as m with mut = 0;
+                i = 0;
+                while (i < n && m + 2 < 160) {
+                    let is *_V as p = &from[i];
+                    let is *_V as q = &from[(i + 1) % n];
+                    let is f64 as sp = _side(ax, ay, bx, by, p.x, p.y);
+                    let is f64 as sq = _side(ax, ay, bx, by, q.x, q.y);
+                    if (sp >= 0.0) {
+                        to[m] = *p;
+                        m = m + 1;
+                    }
+                    if ((sp >= 0.0) != (sq >= 0.0)) {
+                        _mix(p, q, sp / (sp - sq), &to[m]);
+                        m = m + 1;
+                    }
+                    i = i + 1;
+                }
+                let is *_V as swap = from;
+                from = to;
+                to = swap;
+                n = m;
+            }
+            e = e + 1;
+        }
+        k = k + 1;
+    }
+    let is i64 as i with mut = 1;
+    while (i + 1 < n) {
+        if (_reserve(c, kind, tex, samp) == 0) { return; }
+        _put_at(c, &from[0]);
+        _put_at(c, &from[i]);
+        _put_at(c, &from[i + 1]);
+        i = i + 1;
+    }
+}
+
+fn _put_at(c as *Canvas, p as *_V) as void {
+    let is *Vertex as o = _vertex_at(c, c.vcount);
+    o.x = (p.x - c.origin_x) * c.scale;
+    o.y = (p.y - c.origin_y) * c.scale;
+    o.z = 0.0;
+    o.r = p.col.r;
+    o.g = p.col.g;
+    o.b = p.col.b;
+    o.a = p.col.a;
+    o.u = p.u;
+    o.v = p.v;
+    c.vcount = c.vcount + 1;
+}
+
+fn _plain(c as *Canvas) as i32 { return cast(i32, c.moved == 0 && c.poly_n == 0); }
+
 // A triangle in plain colours, one per corner, interpolated between.
 fn triangle(c as *Canvas, x0 as f64, y0 as f64, c0 as math.color.Color,
             x1 as f64, y1 as f64, c1 as math.color.Color,
             x2 as f64, y2 as f64, c2 as math.color.Color) as void {
     if (_outside(c, _minf(x0, _minf(x1, x2)), _minf(y0, _minf(y1, y2)), _maxf(x0, _maxf(x1, x2)),
                  _maxf(y0, _maxf(y1, y2))) == 1) { return; }
+    if (_plain(c) == 0) {
+        let is _V as a with mut;
+        let is _V as b with mut;
+        let is _V as d with mut;
+        _at(c, &a, x0, y0, c0, 0.0, 0.0);
+        _at(c, &b, x1, y1, c1, 0.0, 0.0);
+        _at(c, &d, x2, y2, c2, 0.0, 0.0);
+        _emit(c, KIND_COLOR, 0, 0, &a, &b, &d);
+        return;
+    }
     if (_reserve(c, KIND_COLOR, 0, 0) == 0) { return; }
     _put(c, x0, y0, c0, 0.0, 0.0);
     _put(c, x1, y1, c1, 0.0, 0.0);
@@ -383,6 +722,19 @@ fn _quad(c as *Canvas, kind as i32, tex as i64, samp as i64,
          x as f64, y as f64, w as f64, h as f64,
          u0 as f64, v0 as f64, u1 as f64, v1 as f64, col as math.color.Color) as void {
     if (_outside(c, x, y, x + w, y + h) == 1) { return; }
+    if (_plain(c) == 0) {
+        let is _V as a with mut;
+        let is _V as b with mut;
+        let is _V as d with mut;
+        let is _V as f with mut;
+        _at(c, &a, x, y, col, u0, v0);
+        _at(c, &b, x, y + h, col, u0, v1);
+        _at(c, &d, x + w, y + h, col, u1, v1);
+        _at(c, &f, x + w, y, col, u1, v0);
+        _emit(c, kind, tex, samp, &a, &b, &d);
+        _emit(c, kind, tex, samp, &a, &d, &f);
+        return;
+    }
     if (_reserve(c, kind, tex, samp) == 0) { return; }
     _put(c, x, y, col, u0, v0);
     _put(c, x, y + h, col, u0, v1);
@@ -414,10 +766,13 @@ fn image_premultiplied(c as *Canvas, tex as i64, smooth as i32, x as f64, y as f
 }
 
 // A glyph from a coverage atlas (an R8 texture), in colour. Sampled nearest:
-// glyphs are rasterized at the size they are drawn, one texel to one pixel.
+// glyphs are rasterized at the size they are drawn, one texel to one pixel —
+// until a transform has turned or scaled them, when they are not any more.
 fn glyph(c as *Canvas, atlas as i64, x as f64, y as f64, w as f64, h as f64,
          u0 as f64, v0 as f64, u1 as f64, v1 as f64, col as math.color.Color) as void {
-    _quad(c, KIND_GLYPH, atlas, c.nearest, x, y, w, h, u0, v0, u1, v1, col);
+    let is i64 as samp with mut = c.nearest;
+    if (is_translation(c) == 0) { samp = c.linear; }
+    _quad(c, KIND_GLYPH, atlas, samp, x, y, w, h, u0, v0, u1, v1, col);
 }
 
 // --- Recording ---
@@ -431,6 +786,13 @@ fn flush(c as *Canvas, cmd as i64) as i32 {
     if (c.overflowed == 1) { result = 0; }
     if (c.vcount == 0) { return result; }
 
+    // A frame that grew past the buffer gets one that holds it.
+    if (c.vcount * sizeof(Vertex) > buffer.size(c.d, c.vbuf)) {
+        let is i64 as bigger = buffer.create(c.d, c.vcap * sizeof(Vertex), buffer.VERTEX);
+        if (bigger == 0) { return 0; }
+        buffer.destroy(c.d, c.vbuf);
+        c.vbuf = bigger;
+    }
     buffer.upload(c.d, c.vbuf, 0, c.verts, c.vcount * sizeof(Vertex));
     // Physical pixels to clip space, y down.
     let is math.mat.Mat4 as proj = math.mat.m4_ortho(0.0, c.width, c.height, 0.0, 0.0 - 1.0, 1.0);
