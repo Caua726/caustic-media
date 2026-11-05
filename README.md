@@ -2,7 +2,7 @@
 
 **Windowing, input, graphics and audio for [Caustic](https://github.com/Caua726/Caustic) — roughly what SDL is for C, plus a renderer and a UI layer.**
 
-![version](https://img.shields.io/badge/version-0.0.1-blue)
+![version](https://img.shields.io/badge/version-0.0.2-blue)
 ![status](https://img.shields.io/badge/status-8%20of%2010%20layers%20built-yellow)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
