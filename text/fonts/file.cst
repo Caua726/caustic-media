@@ -7,12 +7,16 @@
 // for each: CreateFileW and a read-only view of a file mapping; the handle's
 // file information, whose volume serial and file index are its identity (a
 // link or junction opened is its target); FindFirstFileW for the names.
+// CausticOS with statx, dir_list and a read: it maps no file, so a mapping
+// there is fresh memory with the file read into it; a file's identity is its
+// first cluster, the one thing FAT has that every name of it shares.
 use "std/os.cst" as os;
 use "std/mem.cst" as mem;
 use "std/os/linux.cst" as linux;
 use "../../window/win32/bind/types.cst" as t;
 use "../../window/win32/bind/kernel32.cst" as k;
 use "pool.cst" as pool;
+use "../../sys/file.cst" as sysfile;
 
 // What separates a directory from a name in a path.
 fn sep() as u8 with imut {
@@ -62,6 +66,7 @@ fn map(path as *u8) as Mapped {
     m.size = 0;
     if (os.current() == os.OS_WINDOWS) { _map_windows(path, &m); }
     if (os.current() == os.OS_LINUX) { _map_linux(path, &m); }
+    if (os.current() == os.OS_CAUSTIC) { _map_caustic(path, &m); }
     return m;
 }
 
@@ -69,6 +74,7 @@ fn unmap(m as *Mapped) as void {
     if (cast(i64, m.data) == 0) { return; }
     if (os.current() == os.OS_WINDOWS) { k.UnmapViewOfFile(m.data); }
     if (os.current() == os.OS_LINUX) { linux.munmap(m.data, m.size); }
+    if (os.current() == os.OS_CAUSTIC) { os.caustic.munmap(cast(i64, m.data), m.size); }
     m.data = cast(*u8, 0);
     m.size = 0;
 }
@@ -89,6 +95,32 @@ fn _map_linux(path as *u8, m as *Mapped) as void {
     if (v < 0 && v > 0 - 4096) { return; }
     m.data = data;
     m.size = size;
+}
+
+fn _map_caustic(path as *u8, m as *Mapped) as void {
+    let is Info as info;
+    if (_stat_caustic(path, &info) == 0 || info.kind != FILE || info.size <= 0) { return; }
+    let is i64 as fd = os.caustic.open_read(path);
+    if (fd < 0) { return; }
+    let is i64 as rw = os.caustic.PROT_READ | os.caustic.PROT_WRITE;
+    let is i64 as at = os.caustic.mmap(0, info.size, rw);
+    if (at < 0) {
+        os.caustic.close(fd);
+        return;
+    }
+    let is i64 as got with mut = 0;
+    while (got < info.size) {
+        let is i64 as n = os.caustic.read(fd, cast(*u8, at + got), info.size - got);
+        if (n <= 0) { break; }
+        got = got + n;
+    }
+    os.caustic.close(fd);
+    if (got != info.size) {
+        os.caustic.munmap(at, info.size);
+        return;
+    }
+    m.data = cast(*u8, at);
+    m.size = info.size;
 }
 
 fn _map_windows(path as *u8, m as *Mapped) as void {
@@ -121,7 +153,21 @@ fn stat(path as *u8, out as *Info) as i32 {
     mem.memzero(cast(*u8, out), sizeof(Info));
     if (os.current() == os.OS_WINDOWS) { return _stat_windows(path, out); }
     if (os.current() == os.OS_LINUX) { return _stat_linux(path, out); }
+    if (os.current() == os.OS_CAUSTIC) { return _stat_caustic(path, out); }
     return 0;
+}
+
+fn _stat_caustic(path as *u8, out as *Info) as i32 {
+    let is [256]u8 as whole;
+    if (sysfile.whole(path, cast(*u8, &whole)) < 0) { return 0; }
+    let is [5]i64 as st;   // size, first cluster, attr, is_dir, mtime (seconds)
+    if (os.caustic.statx(cast(*u8, &whole), cast(*u8, &st)) != 0) { return 0; }
+    if (st[3] != 0) { out.kind = DIR; } else { out.kind = FILE; }
+    out.size = st[0];
+    out.mtime = st[4] * 1000000000;
+    out.dev = 0;
+    out.ino = st[1];
+    return 1;
 }
 
 fn _mode(st as *u8) as i64 {
@@ -172,6 +218,7 @@ fn _stat_windows(path as *u8, out as *Info) as i32 {
 fn list(path as *u8, names as *pool.Pool, offs as *pool.Pool) as i32 {
     if (os.current() == os.OS_WINDOWS) { return _list_windows(path, names, offs); }
     if (os.current() == os.OS_LINUX) { return _list_linux(path, names, offs); }
+    if (os.current() == os.OS_CAUSTIC) { return _list_caustic(path, names, offs); }
     return 0;
 }
 
@@ -203,6 +250,30 @@ fn _list_linux(path as *u8, names as *pool.Pool, offs as *pool.Pool) as i32 {
         got = linux.getdents64(fd, cast(*u8, &buf), 8192);
     }
     linux.close(fd);
+    return ok;
+}
+
+fn _list_caustic(path as *u8, names as *pool.Pool, offs as *pool.Pool) as i32 {
+    let is [256]u8 as whole;
+    let is i64 as wn = sysfile.whole(path, cast(*u8, &whole));
+    if (wn < 0) { return 0; }
+    let is i64 as fd = os.caustic.open_read(cast(*u8, &whole));   // dir_list reads an open directory
+    if (fd < 0) { return 0; }
+    // dir_list's records: rec_len first, the name NUL-ended at DIR_LIST_HDR.
+    let is [8192]u8 as buf;
+    let is i32 as ok with mut = 1;
+    let is i64 as got with mut = os.caustic.dir_list(fd, cast(*u8, &buf), 8192);
+    while (got > 0 && ok == 1) {
+        let is i64 as pos with mut = 0;
+        while (pos < got && ok == 1) {
+            let is *i64 as e = cast(*i64, cast(i64, &buf) + pos);
+            if (e[0] <= 0) { break; }
+            ok = _add(cast(*u8, cast(i64, e) + os.caustic.DIR_LIST_HDR), names, offs);
+            pos = pos + e[0];
+        }
+        got = os.caustic.dir_list(fd, cast(*u8, &buf), 8192);
+    }
+    os.caustic.close(fd);
     return ok;
 }
 

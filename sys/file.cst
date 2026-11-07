@@ -16,7 +16,10 @@
 // Linux answers with raw syscalls (open, getdents64, stat with links
 // followed, rename, mkdir, unlink, rmdir, getcwd); Windows with CreateFileW,
 // FindFirstFileW, GetFileAttributesExW, MoveFileExW, CreateDirectoryW,
-// DeleteFileW, RemoveDirectoryW and GetCurrentDirectoryW.
+// DeleteFileW, RemoveDirectoryW and GetCurrentDirectoryW. CausticOS with
+// its own calls (statx, dir_list, rename, mkdir, unlink, rmdir), which take a
+// whole path: a relative one is made whole under the folder the program was
+// started in (its KEY_DIR), where its open() looks too.
 use "std/os.cst" as os;
 use "std/mem.cst" as mem;
 use "std/os/linux.cst" as linux;
@@ -99,6 +102,38 @@ fn _from_attributes(attrs as i64, hi as u32, lo as u32, ft as *t.FILETIME, out a
     out.mtime = _seconds(ft);
 }
 
+// --- CausticOS: whole paths ---
+
+// The longest path CausticOS takes, with its NUL.
+let is i64 as _CAUSTIC_PATH with imut = 256;
+
+// CausticOS: path made whole into out, _CAUSTIC_PATH bytes — what its
+// stat, mkdir, rename, unlink and dir_open take: its length, or -1 when it
+// does not fit or names nothing (under a folder that was removed).
+fn whole(path as *u8, out as *u8) as i64 {
+    let is i64 as n = _len(path);
+    if (n == 0) { return 0 - 1; }
+    if (path[0] == cast(u8, 47)) {
+        if (n >= _CAUSTIC_PATH) { return 0 - 1; }
+        mem.memcpy(out, path, n + 1);
+        return n;
+    }
+    let is i64 as dk = os.caustic.key(os.caustic.KEY_DIR);
+    if (dk < 0) {
+        if (n + 1 >= _CAUSTIC_PATH) { return 0 - 1; }
+        out[0] = cast(u8, 47);
+        mem.memcpy(cast(*u8, cast(i64, out) + 1), path, n + 1);
+        return n + 1;
+    }
+    let is i64 as got = os.caustic.dir_resolve(dk, path, n, out, _CAUSTIC_PATH);
+    if (got <= 0 || got >= _CAUSTIC_PATH) { return 0 - 1; }
+    out[got] = cast(u8, 0);
+    return got;
+}
+
+// FAT's hidden attribute.
+let is i64 as _ATTR_HIDDEN with imut = 2;
+
 // --- What a path is ---
 
 fn _mode(st as *u8) as i64 {
@@ -130,6 +165,17 @@ fn stat(path as *u8, out as *Info) as i32 {
         let is [144]u8 as st;
         if (linux.stat(path, cast(*u8, &st)) != 0) { return 0; }
         _from_stat(cast(*u8, &st), out);
+        return 1;
+    }
+    if (os.current() == os.OS_CAUSTIC) {
+        let is [256]u8 as whole;
+        if (whole(path, cast(*u8, &whole)) < 0) { return 0; }
+        let is [5]i64 as st;   // size, first cluster, attr, is_dir, mtime
+        if (os.caustic.statx(cast(*u8, &whole), cast(*u8, &st)) != 0) { return 0; }
+        if (st[3] != 0) { out.kind = DIR; } else { out.kind = FILE; }
+        out.hidden = cast(i32, (st[2] & _ATTR_HIDDEN) != 0);
+        out.size = st[0];
+        out.mtime = st[4];
         return 1;
     }
     return 0;
@@ -168,6 +214,18 @@ fn read(path as *u8, buf as *u8, cap as i64) as i64 {
             got = got + n;
         }
         linux.close(fd);
+        return got;
+    }
+    if (os.current() == os.OS_CAUSTIC) {
+        let is i64 as fd = os.caustic.open_read(path);
+        if (fd < 0) { return 0 - 1; }
+        let is i64 as got with mut = 0;
+        while (got < cap) {
+            let is i64 as n = os.caustic.read(fd, cast(*u8, cast(i64, buf) + got), cap - got);
+            if (n <= 0) { break; }
+            got = got + n;
+        }
+        os.caustic.close(fd);
         return got;
     }
     return 0 - 1;
@@ -232,6 +290,20 @@ fn _write_linux(path as *u8, buf as *u8, n as i64, private as i32) as i32 {
     return cast(i32, done == n);
 }
 
+// CausticOS keeps no owner or mode on a file: private changes nothing.
+fn _write_caustic(path as *u8, buf as *u8, n as i64) as i32 {
+    let is i64 as fd = os.caustic.open_write(path);
+    if (fd < 0) { return 0; }
+    let is i64 as done with mut = 0;
+    while (done < n) {
+        let is i64 as w = os.caustic.write(fd, cast(*u8, cast(i64, buf) + done), n - done);
+        if (w <= 0) { break; }
+        done = done + w;
+    }
+    os.caustic.close(fd);
+    return cast(i32, done == n);
+}
+
 // The n bytes at buf as the whole of the file at path: written beside it
 // first, then renamed over it, so a reader meets the old file or the new,
 // never part of one. private: readable by its owner only (Linux's 0600;
@@ -243,6 +315,7 @@ fn write_atomic(path as *u8, buf as *u8, n as i64, private as i32) as i32 {
     let is i32 as wrote with mut = 0;
     if (os.current() == os.OS_WINDOWS) { wrote = _write_windows(cast(*u8, &tmp), buf, n); }
     if (os.current() == os.OS_LINUX) { wrote = _write_linux(cast(*u8, &tmp), buf, n, private); }
+    if (os.current() == os.OS_CAUSTIC) { wrote = _write_caustic(cast(*u8, &tmp), buf, n); }
     if (wrote == 0 || rename(cast(*u8, &tmp), path) == 0) {
         remove(cast(*u8, &tmp));
         return 0;
@@ -266,6 +339,11 @@ fn make_dir(path as *u8, private as i32) as i32 {
         if (private == 1) { mode = 448; }    // 0700
         made = cast(i32, linux.mkdir(path, mode) == 0);
     }
+    if (os.current() == os.OS_CAUSTIC) {
+        let is [256]u8 as whole;
+        if (whole(path, cast(*u8, &whole)) < 0) { return 0; }
+        made = cast(i32, os.caustic.mkdir(cast(*u8, &whole)) == 0);
+    }
     if (made == 1) { return 1; }
     let is Info as info;
     return cast(i32, stat(path, &info) == 1 && info.kind == DIR);
@@ -280,6 +358,20 @@ fn rename(from as *u8, to as *u8) as i32 {
         return cast(i32, k.MoveFileExW(&a[0], &b[0], cast(u32, t.MOVEFILE_REPLACE_EXISTING)) != 0);
     }
     if (os.current() == os.OS_LINUX) { return cast(i32, linux.rename(from, to) == 0); }
+    if (os.current() == os.OS_CAUSTIC) {
+        let is [256]u8 as a;
+        let is [256]u8 as b;
+        if (whole(from, cast(*u8, &a)) < 0 || whole(to, cast(*u8, &b)) < 0) { return 0; }
+        let is i32 as r = os.caustic.rename(cast(*u8, &a), cast(*u8, &b));
+        if (r == 0) { return 1; }
+        // A file already at `to` is replaced: taken away first, which leaves
+        // a moment with neither, where Linux and Windows have no such moment.
+        if (cast(i64, r) != os.caustic.E_EXIST) { return 0; }
+        let is Info as there;
+        if (stat(cast(*u8, &b), &there) == 0 || there.kind != FILE) { return 0; }
+        if (os.caustic.unlink(cast(*u8, &b)) != 0) { return 0; }
+        return cast(i32, os.caustic.rename(cast(*u8, &a), cast(*u8, &b)) == 0);
+    }
     return 0;
 }
 
@@ -295,6 +387,14 @@ fn remove(path as *u8) as i32 {
         let is i64 as r = linux.unlink(path);
         if (r == 0) { return 1; }
         if (r == 0 - 21) { return cast(i32, linux.rmdir(path) == 0); }   // EISDIR
+        return 0;
+    }
+    if (os.current() == os.OS_CAUSTIC) {
+        let is [256]u8 as whole;
+        if (whole(path, cast(*u8, &whole)) < 0) { return 0; }
+        let is i32 as r = os.caustic.unlink(cast(*u8, &whole));
+        if (r == 0) { return 1; }
+        if (cast(i64, r) == os.caustic.E_ISDIR) { return cast(i32, os.caustic.rmdir(cast(*u8, &whole)) == 0); }
         return 0;
     }
     return 0;
@@ -321,6 +421,20 @@ fn cwd(out as *u8, cap as i64) as i64 {
         if (n <= 1) { return 0; }
         return n - 1;
     }
+    if (os.current() == os.OS_CAUSTIC) {
+        // The folder it was started in, where that is now; "/" with none.
+        let is i64 as dk = os.caustic.key(os.caustic.KEY_DIR);
+        if (dk < 0) {
+            if (cap < 2) { return 0; }
+            out[0] = cast(u8, 47);
+            out[1] = cast(u8, 0);
+            return 1;
+        }
+        let is i64 as n = os.caustic.dir_resolve(dk, cast(*u8, ""), 0, out, cap);
+        if (n <= 0 || n >= cap) { return 0; }
+        out[n] = cast(u8, 0);
+        return n;
+    }
     return 0;
 }
 
@@ -329,9 +443,9 @@ fn cwd(out as *u8, cap as i64) as i64 {
 struct Lister {
     open   as i32;
     first  as i32;           // Windows: the entry FindFirstFileW gave, not yet said
-    fd     as i64;           // Linux's directory
+    fd     as i64;           // Linux's directory, CausticOS's
     handle as i64;           // Windows' search
-    pos    as i64;           // Linux: where in buf, and how much getdents64 gave
+    pos    as i64;           // Linux, CausticOS: where in buf, and how much getdents64 or dir_list gave
     got    as i64;
     plen   as i64;           // the folder's path and a '/', for stat on Linux
     path   as [4096]u8;
@@ -373,6 +487,15 @@ fn open_dir(l as *Lister, path as *u8) as i32 {
     }
     if (os.current() == os.OS_LINUX) {
         l.fd = linux.open(cast(*u8, &l.path), 65536 | linux.O_CLOEXEC, 0);   // O_DIRECTORY
+        if (l.fd < 0) { return 0; }
+        l.open = 1;
+        return 1;
+    }
+    if (os.current() == os.OS_CAUSTIC) {
+        let is [256]u8 as whole;
+        let is i64 as wn = whole(cast(*u8, &l.path), cast(*u8, &whole));
+        if (wn < 0) { return 0; }
+        l.fd = os.caustic.open_read(cast(*u8, &whole));   // dir_list reads an open directory
         if (l.fd < 0) { return 0; }
         l.open = 1;
         return 1;
@@ -432,6 +555,31 @@ fn next(l as *Lister, out as *u8, cap as i64, info as *Info) as i64 {
             }
         }
     }
+    if (os.current() == os.OS_CAUSTIC) {
+        // dir_list's records: rec_len, size, mtime, attr, is_dir, name_len,
+        // id, then the name at DIR_LIST_HDR — what it is comes with it.
+        while (1 == 1) {
+            if (l.pos >= l.got) {
+                l.got = os.caustic.dir_list(l.fd, cast(*u8, &l.buf), 8192);
+                l.pos = 0;
+                if (l.got <= 0) { return 0 - 1; }
+            }
+            let is *i64 as e = cast(*i64, cast(i64, &l.buf) + l.pos);
+            if (e[0] <= 0) { l.pos = l.got; continue; }
+            l.pos = l.pos + e[0];
+            let is *u8 as name = cast(*u8, cast(i64, e) + os.caustic.DIR_LIST_HDR);
+            let is i64 as n = e[5];
+            if (_dots(name) == 0 && n < cap) {
+                mem.memcpy(out, name, n);
+                out[n] = cast(u8, 0);
+                if (e[4] != 0) { info.kind = DIR; } else { info.kind = FILE; }
+                info.hidden = cast(i32, (e[3] & _ATTR_HIDDEN) != 0);
+                info.size = e[1];
+                info.mtime = e[2];
+                return n;
+            }
+        }
+    }
     return 0 - 1;
 }
 
@@ -439,5 +587,6 @@ fn close_dir(l as *Lister) as void {
     if (l.open == 0) { return; }
     if (os.current() == os.OS_WINDOWS) { k.FindClose(l.handle); }
     if (os.current() == os.OS_LINUX) { linux.close(l.fd); }
+    if (os.current() == os.OS_CAUSTIC) { os.caustic.close(l.fd); }
     l.open = 0;
 }
