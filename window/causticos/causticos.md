@@ -60,7 +60,9 @@ window manager composes opaque content. No scale: one pixel is one pixel.
 ## Fonts
 
 The toolkit's text comes from `/fonts` (`window/fonts.cst`), which the
-desktop profile fills with Noto Sans and Noto Sans Mono. No index is kept: the
+causticos `media` profile fills with Noto Sans and Noto Sans Mono — the
+desktop and its fonts (`caustic-mk run iso -- --profile media`); the plain
+desktop has none. No index is kept: the
 root lives in memory and is made again at every boot.
 
 ## Testing
