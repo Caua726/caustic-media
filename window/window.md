@@ -92,16 +92,17 @@ native handles it is built from.
 
 ---
 
-## The four backends
+## The backends
 
 | Backend | Platform | Transport |
 |---------|----------|-----------|
 | `x11` | Linux, BSD — and **Wayland sessions through XWayland** | libX11 today, X11 wire protocol later |
 | `wayland` | Linux, native | direct socket protocol; xkbcommon for keyboard translation |
-| `kms` | Linux with no compositor: console, embedded, CausticOS | DRM ioctls — no library at all |
+| `kms` | Linux with no compositor: console, embedded | DRM ioctls — no library at all |
 | `win32` | Windows | user32 + gdi32 |
+| `causticos` | CausticOS | its window manager's protocol 4, a channel and a shared segment — see [causticos/causticos.md](causticos/causticos.md) |
 
-**XWayland is not a fifth backend.** From a client's side it *is* X11: same
+**XWayland is not another backend.** From a client's side it *is* X11: same
 protocol, same library, same code path. A Wayland session running XWayland is
 served by `x11` with nothing extra.
 

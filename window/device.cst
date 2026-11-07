@@ -5,6 +5,7 @@
 //   WAYLAND  Linux, the compositor's socket spoken directly
 //   KMS      Linux console / DRM direct (designed)
 //   WIN32    Windows user32 / gdi32
+//   CAUSTICOS CausticOS, a client of its window manager
 //
 // The interface is pull:
 //
@@ -28,6 +29,7 @@ use "x11/x11.cst" as x11;
 use "wayland/backend.cst" as wayland;
 use "wayland/state.cst" as wayland_state;
 use "win32/backend.cst" as win32;
+use "causticos/backend.cst" as cos;
 use "std/os.cst" as os;
 use "std/env.cst" as env;
 use "std/mem.cst" as mem;
@@ -47,6 +49,7 @@ let is i32 as X11     with imut = 0;
 let is i32 as WAYLAND with imut = 1;
 let is i32 as KMS     with imut = 2;
 let is i32 as WIN32   with imut = 3;
+let is i32 as CAUSTICOS with imut = 4;
 
 fn backend_name(id as i32) as *u8 {
     if (id == AUTO)    { return "auto"; }
@@ -54,12 +57,14 @@ fn backend_name(id as i32) as *u8 {
     if (id == WAYLAND) { return "wayland"; }
     if (id == KMS)     { return "kms"; }
     if (id == WIN32)   { return "win32"; }
+    if (id == CAUSTICOS) { return "causticos"; }
     return "unknown";
 }
 
 fn available(id as i32) as i32 {
     if (os.current() == os.OS_LINUX && (id == X11 || id == WAYLAND)) { return 1; }
     if (os.current() == os.OS_WINDOWS && id == WIN32) { return 1; }
+    if (os.current() == os.OS_CAUSTIC && id == CAUSTICOS) { return 1; }
     return 0;
 }
 
@@ -172,6 +177,7 @@ struct Window {
     x11_win     as x11.window.Window;
     wayland_win as *wayland_state.Window;
     win32_win   as win32.Window;
+    cos_win     as cos.Window;
     // A popup's kind, 0 for a window; where it was put, relative to its
     // owner's client; and its owner, kept where the program keeps it.
     popup       as i32;
@@ -264,10 +270,70 @@ fn _open_win32(w as *Window, c as *Config) as void {
     else { w.err = NO_WINDOW; }
 }
 
+// CausticOS: the window manager makes it, and places a popup itself against
+// the rectangle of its owner it is anchored to — positioner.cst's anchor,
+// gravity and adjustments are the protocol's numbers.
+fn _open_caustic(w as *Window, c as *Config) as void {
+    let is cos.Config as cc with mut = cos.config(c.title, c.width, c.height);
+    cc.resizable = c.resizable;
+    cc.decorated = c.decorated;
+    if (cast(i64, c.owner) != 0 && c.owner.backend == CAUSTICOS && c.owner.ok == 1) {
+        cc.owner = c.owner.cos_win.n;
+    }
+    if (c.dialog == 1) {
+        cc.role = cast(i32, cos.p.ROLE_DIALOG);
+        if (c.modal == 1) { cc.flags = cast(i32, cos.p.WF_MODAL); }
+    }
+    if (c.popup != 0) {
+        if (cast(i64, cc.owner) == 0) { w.ok = 0; w.err = BAD_ARGUMENT; return; }
+        _caustic_place(&cc, c.popup, c.grab, &c.place, c.width, c.height);
+    }
+    w.cos_win = cos.open_config(&cc);
+    w.ok = cast(i32, cast(i64, w.cos_win.n) != 0);
+    let is i32 as e = cos.open_error();
+    if (w.ok == 1) {
+        w.err = OK;
+        if (c.popup != 0) {
+            let is i64 as px with mut = 0;
+            let is i64 as py with mut = 0;
+            cos.popup_position(&w.cos_win, &px, &py);
+            w.popup_x = px; w.popup_y = py;
+            w.popup_w = cos.width(&w.cos_win); w.popup_h = cos.height(&w.cos_win);
+        }
+    }
+    else if (e == cos.NO_DISPLAY) { w.err = NO_DISPLAY; }
+    else if (e == cos.NO_MEMORY) { w.err = NO_MEMORY; }
+    else if (e == cos.NO_SURFACE) { w.err = NO_SURFACE; }
+    else if (e == cos.BAD_ARGUMENT) { w.err = BAD_ARGUMENT; }
+    else { w.err = NO_WINDOW; }
+}
+
+fn _caustic_place(cc as *cos.Config, popup as i32, grab as i32, place as *positioner.Positioner, width as i64, height as i64) as void {
+    cc.role = cast(i32, cos.p.ROLE_MENU);
+    if (popup == POPUP_LIST) { cc.role = cast(i32, cos.p.ROLE_LIST); }
+    if (popup == POPUP_TOOLTIP) { cc.role = cast(i32, cos.p.ROLE_TOOLTIP); }
+    cc.flags = 0;
+    if (grab == 1) { cc.flags = cast(i32, cos.p.WF_GRAB); }
+    cc.anchor = place.anchor;
+    cc.gravity = place.gravity;
+    cc.adjust = place.adjust;
+    cc.ax = cast(i64, place.anchor_rect.x);
+    cc.ay = cast(i64, place.anchor_rect.y);
+    cc.aw = cast(i64, place.anchor_rect.w);
+    cc.ah = cast(i64, place.anchor_rect.h);
+    if (cc.aw < 1) { cc.aw = 1; }
+    if (cc.ah < 1) { cc.ah = 1; }
+    cc.off_x = cast(i64, place.off_x);
+    cc.off_y = cast(i64, place.off_y);
+    cc.width = width;
+    cc.height = height;
+}
+
 // The backend a window asked for with AUTO gets: Win32 on Windows; on Linux,
 // Wayland when WAYLAND_DISPLAY names a compositor, else X11.
 fn auto_backend() as i32 {
     if (os.current() == os.OS_WINDOWS) { return WIN32; }
+    if (os.current() == os.OS_CAUSTIC) { return CAUSTICOS; }
     let is *u8 as display = env.getenv("WAYLAND_DISPLAY");
     if (cast(i64, display) != 0 && display[0] != 0) { return WAYLAND; }
     return X11;
@@ -374,6 +440,11 @@ fn open_config(c as *Config) as Window {
         return w;
     }
 
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) {
+        _open_caustic(&w, c);
+        return w;
+    }
+
     w.ok = 0;
     w.err = NO_BACKEND;
     return w;
@@ -400,6 +471,7 @@ fn close(w as *Window) as void {
         }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.close(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.close(&w.cos_win); }
     w.ok = 0;
 }
 
@@ -432,6 +504,7 @@ fn is_open(w as *Window) as i32 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.is_open(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.is_open(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.is_open(&w.cos_win); }
     return 0;
 }
 
@@ -455,6 +528,7 @@ fn next_frame(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.next_frame(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.next_frame(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.next_frame(&w.cos_win); }
     return 0;
 }
 
@@ -469,6 +543,7 @@ fn pump(w as *Window) as void {
         if (w.backend == WAYLAND && w.ok == 1) { wayland.pump(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.pump(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.pump(&w.cos_win); }
 }
 
 // Whether an event is there to be read, so sleeping now would miss it.
@@ -479,6 +554,7 @@ fn pending(w as *Window) as i32 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.pending(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.pending(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.pending(&w.cos_win); }
     return 0;
 }
 
@@ -491,6 +567,7 @@ fn connection_fd(w as *Window) as i64 {
         if (w.backend == X11) { return cast(i64, x11.connection_fd(&w.x11_win)); }
         if (w.backend == WAYLAND) { return wayland.native_fd(w.wayland_win); }
     }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.connection_fd(&w.cos_win); }
     return 0 - 1;
 }
 
@@ -508,6 +585,7 @@ fn acquire(w as *Window) as tgt.Target {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.acquire(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.acquire(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.acquire(&w.cos_win); }
     return _no_target();
 }
 
@@ -517,6 +595,7 @@ fn submit(w as *Window) as void {
         if (w.backend == WAYLAND && w.ok == 1) { wayland.submit(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.submit(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.submit(&w.cos_win); }
 }
 
 // How old the buffer acquire handed out is: 1 when it holds the frame
@@ -530,6 +609,7 @@ fn buffer_age(w as *Window) as i32 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.buffer_age(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.buffer_age(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.buffer_age(&w.cos_win); }
     return 0;
 }
 
@@ -544,6 +624,7 @@ fn submit_region(w as *Window, l as *damage.List) as void {
         if (w.backend == WAYLAND && w.ok == 1) { wayland.submit_region(w.wayland_win, l); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.submit_region(&w.win32_win, l); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.submit_region(&w.cos_win, l); }
 }
 
 // --- Geometry and State ---
@@ -554,6 +635,7 @@ fn width(w as *Window) as i64 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.width(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.width(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.width(&w.cos_win); }
     return 0;
 }
 
@@ -563,6 +645,7 @@ fn height(w as *Window) as i64 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.height(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.height(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.height(&w.cos_win); }
     return 0;
 }
 
@@ -572,6 +655,7 @@ fn resized(w as *Window) as i32 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.resized(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.resized(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.resized(&w.cos_win); }
     return 0;
 }
 
@@ -581,6 +665,7 @@ fn should_close(w as *Window) as i32 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.should_close(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.should_close(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.should_close(&w.cos_win); }
     return 1;
 }
 
@@ -593,6 +678,7 @@ fn keep_open(w as *Window) as void {
         if (w.backend == WAYLAND) { wayland.keep_open(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.keep_open(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.keep_open(&w.cos_win); }
 }
 
 fn request_close(w as *Window) as void {
@@ -601,6 +687,7 @@ fn request_close(w as *Window) as void {
         if (w.backend == WAYLAND && w.ok == 1) { wayland.request_close(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.request_close(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.request_close(&w.cos_win); }
 }
 
 fn transport_name(w as *Window) as *u8 {
@@ -609,6 +696,7 @@ fn transport_name(w as *Window) as *u8 {
         if (w.backend == WAYLAND) { return "wayland"; }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.transport_name(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return "causticos"; }
     return backend_name(w.backend);
 }
 
@@ -638,6 +726,7 @@ fn poll_event(w as *Window, out as *event.Event) as i32 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.poll_event(w.wayland_win, out); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.poll_event(&w.win32_win, out); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.poll_event(&w.cos_win, out); }
     return 0;
 }
 
@@ -650,6 +739,7 @@ fn poll_input(w as *Window, out as *ie.Event) as i32 {
         if (w.backend == WAYLAND && w.ok == 1) { return wayland.poll_input(w.wayland_win, out); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.poll_input(&w.win32_win, out); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.poll_input(&w.cos_win, out); }
     return 0;
 }
 
@@ -675,6 +765,7 @@ fn set_title(w as *Window, s as *u8, n as i64) as void {
         if (w.backend == WAYLAND) { wayland.set_title(w.wayland_win, s, n); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.set_title(&w.win32_win, s, n); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.set_title(&w.cos_win, s, n); }
 }
 
 fn show(w as *Window) as void {
@@ -752,6 +843,7 @@ fn set_decorated(w as *Window, on as i32) as i32 {
         if (w.backend == WAYLAND) { return wayland.set_decorated(w.wayland_win, on); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_decorated(&w.win32_win, on); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.set_decorated(&w.cos_win, on); }
     return 0;
 }
 
@@ -762,6 +854,7 @@ fn decorated(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.decorated(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.decorated(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.decorated(&w.cos_win); }
     return 0;
 }
 
@@ -810,6 +903,7 @@ fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64
         if (w.backend == WAYLAND) { return wayland.begin_move_resize(w.wayland_win, x, y, how, button); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.begin_move_resize(&w.win32_win, x, y, how, button); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.begin_move_resize(&w.cos_win, x, y, how, button); }
     return 0;
 }
 
@@ -830,6 +924,7 @@ fn minimize(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.minimize(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.minimize(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.minimize(&w.cos_win); }
     return 0;
 }
 
@@ -841,6 +936,7 @@ fn popup_position(w as *Window, x as *i64, y as *i64) as i32 {
         if (cast(i64, w.popup_owner) == 0 || w.popup_owner.ok == 0) { return 0; }
         return wayland.popup_position(w.wayland_win, w.popup_owner.wayland_win, x, y);
     }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.popup_position(&w.cos_win, x, y); }
     *x = w.popup_x;
     *y = w.popup_y;
     return 1;
@@ -857,6 +953,7 @@ fn popup_rect(w as *Window, x as *i64, y as *i64, pw as *i64, ph as *i64) as i32
         if (cast(i64, w.popup_owner) == 0 || w.popup_owner.ok == 0) { return 0; }
         return wayland.popup_size(w.wayland_win, w.popup_owner.wayland_win, pw, ph);
     }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.popup_size(&w.cos_win, pw, ph); }
     *pw = w.popup_w;
     *ph = w.popup_h;
     return 1;
@@ -870,6 +967,7 @@ fn grabbing(w as *Window) as i32 {
     if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.grabbing(&w.x11_win); }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.grabbing(w.wayland_win); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.grabbing(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.grabbing(&w.cos_win); }
     return 0;
 }
 
@@ -881,6 +979,7 @@ fn popup_done(w as *Window) as i32 {
     if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.popup_done(&w.x11_win); }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.popup_done(w.wayland_win); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.popup_done(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.popup_done(&w.cos_win); }
     return 0;
 }
 
@@ -894,6 +993,11 @@ fn reposition(w as *Window, place as *positioner.Positioner) as i32 {
         if (w.popup_owner.ok == 0 || _wayland_place(w.popup_owner.wayland_win, place, cast(i64, place.w), cast(i64, place.h), &wo) == 0) { return 0; }
         let is i32 as s = wayland.scale(w.popup_owner.wayland_win);
         return wayland.reposition(w.wayland_win, &wo, _logical(cast(i64, place.w), s), _logical(cast(i64, place.h), s));
+    }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) {
+        let is cos.Config as cc with mut = cos.config("", cast(i64, place.w), cast(i64, place.h));
+        _caustic_place(&cc, w.popup, cos.grabbing(&w.cos_win), place, cast(i64, place.w), cast(i64, place.h));
+        return cos.reposition(&w.cos_win, &cc);
     }
     let is math.rect.Rect as at;
     let is i64 as ox with mut = 0;
@@ -966,6 +1070,7 @@ fn set_size(w as *Window, width as i64, height as i64) as i32 {
     if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.set_size(&w.x11_win, width, height); }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.set_size(w.wayland_win, width, height); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_size(&w.win32_win, width, height); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.set_size(&w.cos_win, width, height); }
     return 0;
 }
 
@@ -980,6 +1085,7 @@ fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
         if (w.backend == WAYLAND) { return wayland.set_min_size(w.wayland_win, width, height); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_min_size(&w.win32_win, width, height); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.set_min_size(&w.cos_win, width, height); }
     return 0;
 }
 
@@ -991,6 +1097,7 @@ fn min_size(w as *Window, width as *i64, height as *i64) as i32 {
         if (w.backend == WAYLAND) { return wayland.min_size(w.wayland_win, width, height); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.min_size(&w.win32_win, width, height); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.min_size(&w.cos_win, width, height); }
     return 0;
 }
 
@@ -1003,6 +1110,7 @@ fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
         if (w.backend == WAYLAND) { return wayland.set_max_size(w.wayland_win, width, height); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_max_size(&w.win32_win, width, height); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.set_max_size(&w.cos_win, width, height); }
     return 0;
 }
 
@@ -1014,6 +1122,7 @@ fn set_maximized(w as *Window, on as i32) as i32 {
         if (w.backend == WAYLAND) { return wayland.set_maximized(w.wayland_win, on); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_maximized(&w.win32_win, on); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.set_maximized(&w.cos_win, on); }
     return 0;
 }
 
@@ -1035,6 +1144,7 @@ fn state(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.state(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.state(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.state(&w.cos_win); }
     return 0;
 }
 
@@ -1173,6 +1283,7 @@ fn cursor_set(w as *Window, shape as i32) as i32 {
     if (w.ok == 0) { return 0; }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.set_cursor(w.wayland_win, shape); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.set_cursor(&w.win32_win, shape); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.set_cursor(&w.cos_win, shape); }
     return 0;
 }
 
@@ -1193,6 +1304,7 @@ fn text_input_enable(w as *Window, on as i32) as i32 {
     if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.text_input_enable(&w.x11_win, on); }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.text_input_enable(w.wayland_win, on); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.text_input_enable(&w.win32_win, on); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.text_input_enable(&w.cos_win, on); }
     return 0;
 }
 
@@ -1201,6 +1313,7 @@ fn text_input_active(w as *Window) as i32 {
     if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.text_input_active(&w.x11_win); }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.text_input_active(w.wayland_win); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.text_input_active(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.text_input_active(&w.cos_win); }
     return 0;
 }
 
@@ -1209,6 +1322,7 @@ fn text_input_rect(w as *Window, x as i64, y as i64, width as i64, height as i64
     if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.text_input_rect(&w.x11_win, x, y, width, height); }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.text_input_rect(w.wayland_win, x, y, width, height); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.text_input_rect(&w.win32_win, x, y, width, height); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.text_input_rect(&w.cos_win, x, y, width, height); }
     return 0;
 }
 
@@ -1230,6 +1344,7 @@ fn text_input_context(w as *Window, text as *u8, n as i64, caret as i64, anchor 
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) {
         return win32.text_input_context(&w.win32_win, text, n, caret, anchor, purpose, hints);
     }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.text_input_context(&w.cos_win, purpose); }
     return 0;
 }
 
@@ -1244,6 +1359,7 @@ fn text_input_reset(w as *Window) as i32 {
     }
     if (os.current() == os.OS_LINUX && w.backend == WAYLAND) { return wayland.text_input_reset(w.wayland_win); }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.text_input_reset(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.text_input_reset(&w.cos_win); }
     return 0;
 }
 
@@ -1268,6 +1384,7 @@ fn clipboard_set(w as *Window, which as i32, o as *transfer.Offer) as i32 {
         if (w.backend == WAYLAND) { return wayland.clipboard_set(w.wayland_win, which, o); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_set(&w.win32_win, which, o); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { if (which != CLIPBOARD) { return 0; } return cos.clipboard_set(&w.cos_win, o); }
     return 0;
 }
 
@@ -1278,6 +1395,7 @@ fn clipboard_request(w as *Window, which as i32, format as i32) as i32 {
         if (w.backend == WAYLAND) { return wayland.clipboard_request(w.wayland_win, which, format); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_request(&w.win32_win, which, format); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { if (which != CLIPBOARD) { return 0; } return cos.clipboard_request(&w.cos_win, format); }
     return 0;
 }
 
@@ -1289,6 +1407,7 @@ fn clipboard_ready(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.clipboard_ready(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_ready(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.clipboard_ready(&w.cos_win); }
     return 0;
 }
 
@@ -1300,6 +1419,7 @@ fn clipboard_pending(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.clipboard_pending(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_pending(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.clipboard_pending(&w.cos_win); }
     return 0;
 }
 
@@ -1311,6 +1431,7 @@ fn clipboard_format(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.clipboard_format(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_format(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.clipboard_format(&w.cos_win); }
     return 0;
 }
 
@@ -1323,6 +1444,7 @@ fn clipboard_data(w as *Window) as *u8 {
         if (w.backend == WAYLAND) { return wayland.clipboard_data(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_data(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.clipboard_data(&w.cos_win); }
     return cast(*u8, 0);
 }
 
@@ -1333,6 +1455,7 @@ fn clipboard_length(w as *Window) as i64 {
         if (w.backend == WAYLAND) { return wayland.clipboard_length(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_length(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.clipboard_length(&w.cos_win); }
     return 0;
 }
 
@@ -1344,6 +1467,7 @@ fn clipboard_offered(w as *Window) as i32 {
         if (w.backend == WAYLAND) { return wayland.clipboard_offered(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.clipboard_offered(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.clipboard_offered(&w.cos_win); }
     return 0;
 }
 
@@ -1394,6 +1518,7 @@ fn drop_answer(w as *Window, takes as i32, action as i32) as i32 {
         if (w.backend == WAYLAND) { return wayland.drop_answer(w.wayland_win, takes, action); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.drop_answer(&w.win32_win, takes, action); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.drop_answer(&w.cos_win, takes, action); }
     return 0;
 }
 
@@ -1404,6 +1529,7 @@ fn dropped_files(w as *Window) as i64 {
         if (w.backend == WAYLAND) { return wayland.dropped_files(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_files(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.dropped_files(&w.cos_win); }
     return 0;
 }
 
@@ -1415,6 +1541,7 @@ fn dropped_file(w as *Window, i as i64) as *u8 {
         if (w.backend == WAYLAND) { return wayland.dropped_file(w.wayland_win, i); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_file(&w.win32_win, i); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.dropped_file(&w.cos_win, i); }
     return cast(*u8, 0);
 }
 
@@ -1426,6 +1553,7 @@ fn dropped_text(w as *Window) as *u8 {
         if (w.backend == WAYLAND) { return wayland.dropped_text(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_text(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.dropped_text(&w.cos_win); }
     return cast(*u8, 0);
 }
 
@@ -1436,6 +1564,7 @@ fn dropped_text_length(w as *Window) as i64 {
         if (w.backend == WAYLAND) { return wayland.dropped_text_length(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { return win32.dropped_text_length(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { return cos.dropped_text_length(&w.cos_win); }
     return 0;
 }
 
@@ -1504,6 +1633,7 @@ fn clear_drop(w as *Window) as void {
         if (w.backend == WAYLAND) { wayland.clear_drop(w.wayland_win); }
     }
     if (os.current() == os.OS_WINDOWS && w.backend == WIN32) { win32.clear_drop(&w.win32_win); }
+    if (os.current() == os.OS_CAUSTIC && w.backend == CAUSTICOS) { cos.clear_drop(&w.cos_win); }
 }
 
 // The image the next drag of the window carries under the pointer: argb, iw
@@ -1553,7 +1683,7 @@ fn read_settings(w as *Window, out as *settings.Settings) as i32 {
     }
     locale.read(out);
     settings.read_environment(out);
-    if (w.backend == X11) { return x11.read_settings(&w.x11_win, out); }
+    if (os.current() == os.OS_LINUX && w.backend == X11) { return x11.read_settings(&w.x11_win, out); }
     return 0;
 }
 

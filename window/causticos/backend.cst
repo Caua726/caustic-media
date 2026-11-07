@@ -1,0 +1,1309 @@
+// window/causticos/backend.cst — a window on CausticOS: a client of its
+// window manager (proto.cst), drawn by the program in its own memory.
+//
+// The program draws into memory of its own, width by height and nothing in
+// between rows, which is what a target is (gpu/software/target.cst). The
+// window manager reads a segment whose rows are as long as the screen is
+// wide — a resize changes how much of it is used, not where rows start — so
+// submit copies the frame into it. The segment holds two buffers: one the
+// screen shows, one written; a frame is shown with PRESENT and the next is
+// written once FRAME says the other buffer is free again. A submit that
+// comes before then waits for it, and is the one shown.
+//
+// Everything a window is told is read off its channel by pump: lifecycle
+// into the window's own queue (window/event.cst), what a person did into its
+// input queue (input/event.cst) — keys and their text, the pointer, the
+// wheel, an input method's composition.
+//
+// The first window is the channel the program was started with; others —
+// windows of their own, dialogs, popups — are asked for on their owner's, and
+// opening one waits for the answer there.
+use "std/os.cst" as os;
+use "std/mem.cst" as mem;
+use "../../gpu/software/target.cst" as tgt;
+use "../event.cst" as event;
+use "../../input/event.cst" as ie;
+use "../../input/keys.cst" as keys;
+use "../transfer.cst" as transfer;
+use "../damage.cst" as damage;
+use "proto.cst" as p;
+
+let is i32 as OK           with imut = 0;
+let is i32 as NO_DISPLAY   with imut = 2;
+let is i32 as NO_WINDOW    with imut = 4;
+let is i32 as NO_MEMORY    with imut = 6;
+let is i32 as NO_SURFACE   with imut = 7;
+let is i32 as BAD_ARGUMENT with imut = 8;
+
+let is i64 as MAX_EVENTS with imut = 64;
+
+// How long opening a window waits for the window manager's answers.
+let is i64 as ANSWER_NS with imut = 3000000000;
+
+struct Config {
+    title     as *u8;
+    width     as i64;
+    height    as i64;
+    resizable as i32;
+    decorated as i32;    // 0: the program draws its own frame, the window manager none
+    role      as i32;    // proto ROLE_*; TOPLEVEL with no owner: the program's first window or another
+    flags     as i32;    // WF_MODAL, WF_GRAB
+    anchor    as i32;    // a popup's placement: positioner.cst's numbers, the protocol's own
+    gravity   as i32;
+    adjust    as i32;
+    owner     as *Native;
+    ax        as i64;    // the anchor rectangle, in the owner's content
+    ay        as i64;
+    aw        as i64;
+    ah        as i64;
+    off_x     as i64;
+    off_y     as i64;
+}
+
+fn config(title as *u8, width as i64, height as i64) as Config {
+    let is Config as c;
+    mem.memzero(cast(*u8, &c), sizeof(Config));
+    c.title = title;
+    c.width = width;
+    c.height = height;
+    c.resizable = 1;
+    c.decorated = 1;
+    c.role = cast(i32, p.ROLE_TOPLEVEL);
+    return c;
+}
+
+struct Native {
+    alive    as i32;
+    err      as i32;
+    chan     as i64;
+    rd       as p.Reader;
+    role     as i64;
+    tag      as i64;
+    owner    as *Native;
+    // The screen and the window, and what the segment has room for.
+    screen_w as i64;
+    screen_h as i64;
+    w        as i64;
+    h        as i64;
+    room_w   as i64;
+    room_h   as i64;
+    stride   as i64;
+    seg      as i64;
+    seg_va   as i64;
+    seg_pages as i64;
+    buf_bytes as i64;
+    nbuf     as i64;
+    back     as i64;     // the buffer written next
+    waiting  as i32;     // a frame on its way to the screen: the other buffer not free
+    wanted   as i32;     // a submit waiting for it
+    presented as i32;
+    resized  as i32;
+    framed   as i32;     // the window manager draws its frame
+    state    as i32;     // event.STATE_* bits, as the window manager last said
+    asked    as i32;     // the window manager asked it to close
+    focused  as i32;
+    // The frame the program draws.
+    pixels   as *u8;
+    pix_bytes as i64;
+    // The damage of this frame and of the one before: the buffer written was
+    // last written two frames ago.
+    dmg_x0 as i64; dmg_y0 as i64; dmg_x1 as i64; dmg_y1 as i64;
+    old_x0 as i64; old_y0 as i64; old_x1 as i64; old_y1 as i64;
+    // What it was told.
+    events   as [64]event.Event;
+    ev_head  as i64;
+    ev_len   as i64;
+    input    as *ie.Queue;
+    // The pointer and the keyboard as last told.
+    buttons  as i64;
+    mods     as i64;
+    px       as i64;
+    py       as i64;
+    inside   as i32;
+    held_key as i32;     // the last key down not yet up: a second down is a repeat
+    // Size hints.
+    min_w as i64; min_h as i64; max_w as i64; max_h as i64;
+    // A popup: where it went and how big, and whether it was dismissed.
+    popup_x  as i64;
+    popup_y  as i64;
+    popup_w  as i64;
+    popup_h  as i64;
+    dismissed as i32;
+    grab     as i32;
+    // The clipboard asked for, and what came.
+    clip_pending as i32;
+    clip_ready   as i32;
+    clip_format  as i32;
+    _pad0        as i32;
+    clip         as transfer.Bytes;
+    // Text input.
+    ti_on      as i32;
+    ti_purpose as i32;
+    ti_x as i64; ti_y as i64; ti_w as i64; ti_h as i64;
+    // A drag over it, and what was dropped.
+    drag_formats as i64;
+    drag_actions as i64;
+    drop_format  as i32;
+    drop_action  as i32;
+    drop         as transfer.Bytes;
+    drop_paths   as transfer.Bytes;
+    drop_count   as i64;
+}
+
+// The program's windows: the first is the one the program was started with.
+let is i64 as MAX_WINDOWS with imut = 32;
+let is [32]i64 as _windows with mut;
+let is i64 as _next_tag with mut = 1;
+
+fn _first() as *Native {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_windows[i] != 0) { return cast(*Native, _windows[i]); }
+        i = i + 1;
+    }
+    return cast(*Native, 0);
+}
+
+fn _keep(n as *Native) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_windows[i] == 0) { _windows[i] = cast(i64, n); return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _forget(n as *Native) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_WINDOWS) {
+        if (_windows[i] == cast(i64, n)) { _windows[i] = 0; }
+        i = i + 1;
+    }
+}
+
+// --- What it was told ---
+
+fn _emit(n as *Native, kind as i32, raw as i64, x as i64, y as i64, w as i64, h as i64) as void {
+    if (n.ev_len == MAX_EVENTS) { return; }
+    let is i64 as at = (n.ev_head + n.ev_len) % MAX_EVENTS;
+    let is *event.Event as e = &n.events[at];
+    event.clear(e);
+    e.kind = kind;
+    e.raw_kind = cast(i32, raw);
+    e.x = x; e.y = y; e.width = w; e.height = h;
+    n.ev_len = n.ev_len + 1;
+}
+
+fn _modifiers(m as i64) as i32 {
+    let is i32 as out with mut = 0;
+    if ((m & p.MOD_SHIFT) != 0) { out = out | keys.MOD_SHIFT; }
+    if ((m & p.MOD_CTRL) != 0)  { out = out | keys.MOD_CONTROL; }
+    if ((m & p.MOD_ALT) != 0)   { out = out | keys.MOD_ALT; }
+    if ((m & p.MOD_SUPER) != 0) { out = out | keys.MOD_SUPER; }
+    return out;
+}
+
+fn _input(n as *Native, kind as i32) as ie.Event {
+    let is ie.Event as e;
+    ie.clear(&e);
+    e.kind = kind;
+    e.modifiers = _modifiers(n.mods);
+    e.x = n.px;
+    e.y = n.py;
+    e.time_ms = os.caustic.time_ns() / 1000000;
+    return e;
+}
+
+// A named keysym as keys.cst's.
+fn _named(sym as i64) as i32 {
+    if (sym == p.KEY_ENTER) { return keys.RETURN; }
+    if (sym == p.KEY_BACKSPACE) { return keys.BACKSPACE; }
+    if (sym == p.KEY_TAB) { return keys.TAB; }
+    if (sym == p.KEY_ESC) { return keys.ESCAPE; }
+    if (sym == p.KEY_UP) { return keys.UP; }
+    if (sym == p.KEY_DOWN) { return keys.DOWN; }
+    if (sym == p.KEY_LEFT) { return keys.LEFT; }
+    if (sym == p.KEY_RIGHT) { return keys.RIGHT; }
+    if (sym == p.KEY_PGUP) { return keys.PAGE_UP; }
+    if (sym == p.KEY_PGDN) { return keys.PAGE_DOWN; }
+    if (sym == p.KEY_HOME) { return keys.HOME; }
+    if (sym == p.KEY_END) { return keys.END; }
+    if (sym == p.KEY_DEL) { return keys.DELETE; }
+    if (sym == p.KEY_INSERT) { return keys.INSERT; }
+    if (sym >= p.KEY_F1 && sym < p.KEY_F1 + 12) { return keys.F1 + cast(i32, sym - p.KEY_F1); }
+    return keys.UNKNOWN;
+}
+
+// The key at a place of the keyboard (set 1 scancodes; ext the E0 prefix):
+// what a key that typed nothing is — a modifier — and what a shortcut is
+// matched against whatever the layout made of it.
+let is *u8 as _ROW1 with imut = "1234567890-=";
+let is *u8 as _ROW2 with imut = "qwertyuiop[]";
+let is *u8 as _ROW3 with imut = "asdfghjkl;'`";
+let is *u8 as _ROW4 with imut = "\\zxcvbnm,./";
+
+fn _place(sc as i64, ext as i64) as i32 {
+    if (ext == 1) {
+        if (sc == 0x1D) { return keys.CONTROL_R; }
+        if (sc == 0x38) { return keys.ALT_R; }
+        if (sc == 0x5B) { return keys.SUPER_L; }
+        if (sc == 0x5C) { return keys.SUPER_R; }
+        if (sc == 0x5D) { return keys.MENU; }
+        return keys.UNKNOWN;
+    }
+    if (sc == 0x2A) { return keys.SHIFT_L; }
+    if (sc == 0x36) { return keys.SHIFT_R; }
+    if (sc == 0x1D) { return keys.CONTROL_L; }
+    if (sc == 0x38) { return keys.ALT_L; }
+    if (sc == 0x3A) { return keys.CAPS_LOCK; }
+    if (sc == 0x45) { return keys.NUM_LOCK; }
+    if (sc == 0x39) { return keys.SPACE; }
+    if (sc >= 0x02 && sc <= 0x0D) { return cast(i32, _ROW1[sc - 0x02]); }
+    if (sc >= 0x10 && sc <= 0x1B) { return cast(i32, _ROW2[sc - 0x10]); }
+    if (sc >= 0x1E && sc <= 0x29) { return cast(i32, _ROW3[sc - 0x1E]); }
+    if (sc >= 0x2B && sc <= 0x35) { return cast(i32, _ROW4[sc - 0x2B]); }
+    return keys.UNKNOWN;
+}
+
+fn _utf8(cp as i64, out as *u8) as i64 {
+    if (cp < 0x80) { out[0] = cast(u8, cp); return 1; }
+    if (cp < 0x800) {
+        out[0] = cast(u8, 0xC0 | (cp >> 6));
+        out[1] = cast(u8, 0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = cast(u8, 0xE0 | (cp >> 12));
+        out[1] = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+        out[2] = cast(u8, 0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = cast(u8, 0xF0 | (cp >> 18));
+    out[1] = cast(u8, 0x80 | ((cp >> 12) & 0x3F));
+    out[2] = cast(u8, 0x80 | ((cp >> 6) & 0x3F));
+    out[3] = cast(u8, 0x80 | (cp & 0x3F));
+    return 4;
+}
+
+fn _key(n as *Native, m as *i64) as void {
+    let is i64 as sym = m[1];
+    let is i64 as b = m[2];
+    let is i64 as sc = m[3] & 0xFF;
+    let is i64 as pressed = (b >> 8) & 1;
+    let is i64 as ext = (b >> 9) & 1;
+    n.mods = b & 0xFF;
+    let is i32 as place = _place(sc, ext);
+    let is i32 as key with mut = keys.UNKNOWN;
+    if (sym >= p.KEY_BASE) { key = _named(sym); }
+    else if (sym >= 65 && sym <= 90) { key = cast(i32, sym + 32); }       // a capital: its key is the letter's
+    else if (sym > 32 && sym < 127) { key = cast(i32, sym); }
+    else if (sym == 32) { key = keys.SPACE; }
+    else if (sym >= 1 && sym <= 26) { key = cast(i32, 96 + sym); }       // a control character: the letter held with Ctrl
+    else if (sym >= 160) { key = cast(i32, sym); }
+    else { key = place; }
+    let is ie.Event as e with mut = _input(n, ie.KEY_UP);
+    if (pressed == 1) { e.kind = ie.KEY_DOWN; }
+    e.key = key;
+    e.shortcut = key;
+    if (place >= 97 && place <= 122) { e.shortcut = place; }   // a letter where US has it
+    e.physical = cast(i32, sc | (ext << 8));
+    if (pressed == 1 && n.held_key == key && key != keys.UNKNOWN) { e.repeat = 1; }
+    if (pressed == 1) { n.held_key = key; } else if (n.held_key == key) { n.held_key = 0; }
+    ie.push(n.input, &e, cast(*u8, 0), 0);
+    // What it typed, unless held with Ctrl, Alt or Super, which make it a shortcut.
+    if (pressed == 1 && sym >= 32 && sym != 127 && sym < p.KEY_BASE && (n.mods & (p.MOD_CTRL | p.MOD_ALT | p.MOD_SUPER)) == 0) {
+        let is [4]u8 as u;
+        let is i64 as k = _utf8(sym, cast(*u8, &u[0]));
+        let is ie.Event as t with mut = _input(n, ie.TEXT);
+        t.from_key = 1;
+        ie.push(n.input, &t, cast(*u8, &u[0]), k);
+    }
+}
+
+fn _button_of(bit as i64) as i32 {
+    if (bit == p.BTN_LEFT) { return 1; }
+    if (bit == p.BTN_MIDDLE) { return 2; }
+    if (bit == p.BTN_RIGHT) { return 3; }
+    if (bit == p.BTN_BACK) { return 8; }
+    return 9;
+}
+
+// The pointer at x, y with buttons held: ENTER or LEAVE where it crossed the
+// content's edge, MOTION where it moved, a BUTTON_DOWN or _UP for each button
+// that changed.
+fn _pointer(n as *Native, a as i64, x as i64, y as i64) as void {
+    let is i64 as buttons = a & 0xFF;
+    n.mods = (a >> 8) & 0xFF;
+    let is i32 as in = cast(i32, x >= 0 && y >= 0 && x < n.w && y < n.h);
+    let is i32 as moved = cast(i32, x != n.px || y != n.py);
+    n.px = x;
+    n.py = y;
+    if (in == 1 && n.inside == 0) {
+        n.inside = 1;
+        let is ie.Event as e = _input(n, ie.ENTER);
+        ie.push(n.input, &e, cast(*u8, 0), 0);
+    } else if (moved == 1) {
+        let is ie.Event as e = _input(n, ie.MOTION);
+        ie.push(n.input, &e, cast(*u8, 0), 0);
+    }
+    let is i64 as bit with mut = 1;
+    while (bit <= p.BTN_FORWARD) {
+        if ((buttons & bit) != (n.buttons & bit)) {
+            let is ie.Event as e with mut = _input(n, ie.BUTTON_UP);
+            if ((buttons & bit) != 0) { e.kind = ie.BUTTON_DOWN; }
+            e.button = _button_of(bit);
+            ie.push(n.input, &e, cast(*u8, 0), 0);
+        }
+        bit = bit * 2;
+    }
+    n.buttons = buttons;
+    // Outside with nothing held: it left. Held, the press keeps it.
+    if (in == 0 && n.inside == 1 && buttons == 0) {
+        n.inside = 0;
+        let is ie.Event as e = _input(n, ie.LEAVE);
+        ie.push(n.input, &e, cast(*u8, 0), 0);
+    }
+}
+
+fn _wheel(n as *Native, notches as i64, x as i64, y as i64) as void {
+    n.px = x;
+    n.py = y;
+    let is ie.Event as e with mut = _input(n, ie.SCROLL);
+    e.dy = cast(f64, 0 - notches);
+    e.steps_y = cast(i32, 0 - notches);
+    e.value120_y = cast(i32, (0 - notches) * 120);
+    e.source = ie.SCROLL_WHEEL;
+    ie.push(n.input, &e, cast(*u8, 0), 0);
+}
+
+// A segment sent before a message: its first n bytes into b.
+fn _take_segment(n as *Native, len as i64, b as *transfer.Bytes) as i32 {
+    transfer.bytes_clear(b);
+    if (len <= 0) { return 1; }
+    let is i64 as fd = os.caustic.fd_recv(n.chan);
+    if (fd < 0) { return 0; }
+    let is i32 as ok with mut = 0;
+    if (transfer.reserve(b, len + 1) == 1) {
+        if (os.caustic.seg_read(fd, 0, b.data, len) >= 0) {
+            b.len = len;
+            b.data[len] = cast(u8, 0);
+            ok = 1;
+        }
+    }
+    os.caustic.close(fd);
+    return ok;
+}
+
+// What was dropped as paths: one a line, each kept NUL-ended.
+fn _drop_paths(n as *Native) as void {
+    transfer.bytes_clear(&n.drop_paths);
+    n.drop_count = 0;
+    let is i64 as i with mut = 0;
+    while (i < n.drop.len) {
+        let is i64 as j with mut = i;
+        while (j < n.drop.len && n.drop.data[j] != cast(u8, 10)) { j = j + 1; }
+        let is i64 as end with mut = j;
+        if (end > i && n.drop.data[end - 1] == cast(u8, 13)) { end = end - 1; }
+        if (end > i) {
+            let is [1]u8 as z;
+            z[0] = cast(u8, 0);
+            transfer.append(&n.drop_paths, cast(*u8, cast(i64, n.drop.data) + i), end - i);
+            transfer.append(&n.drop_paths, cast(*u8, &z[0]), 1);
+            n.drop_count = n.drop_count + 1;
+        }
+        i = j + 1;
+    }
+}
+
+fn _drop_bits(formats as i64) as i32 {
+    let is i32 as out with mut = 0;
+    if ((formats & p.DND_FILES) != 0) { out = out | event.DROP_FILES; }
+    if ((formats & p.DND_TEXT) != 0) { out = out | event.DROP_TEXT; }
+    return out;
+}
+
+fn _handle(n as *Native, m as *i64) as void {
+    let is i64 as kind = m[0];
+    if (kind == p.KEY) { _key(n, m); return; }
+    if (kind == p.MOUSE_BTN || kind == p.MOUSE_MOVE) { _pointer(n, m[1], m[2], m[3]); return; }
+    if (kind == p.MOUSE_WHEEL) { _wheel(n, m[1], m[2], m[3]); return; }
+    if (kind == p.FRAME) {
+        n.waiting = 0;
+        if (n.wanted == 1) { _present(n); }
+        return;
+    }
+    if (kind == p.RESIZE) {
+        let is i64 as w with mut = m[1];
+        let is i64 as h with mut = m[2];
+        if (w > n.room_w) { w = n.room_w; }
+        if (h > n.room_h) { h = n.room_h; }
+        if (w < 1) { w = 1; }
+        if (h < 1) { h = 1; }
+        if (w != n.w || h != n.h) {
+            n.w = w;
+            n.h = h;
+            n.resized = 1;
+            _emit(n, event.RESIZE, kind, 0, 0, w, h);
+        }
+        return;
+    }
+    if (kind == p.FOCUS) {
+        n.focused = cast(i32, m[1] != 0);
+        if (n.focused == 1) { _emit(n, event.FOCUS_IN, kind, 0, 0, 0, 0); }
+        else {
+            _emit(n, event.FOCUS_OUT, kind, 0, 0, 0, 0);
+            n.held_key = 0;
+            ie.cancel(n.input, ie.CANCEL_FOCUS);
+        }
+        return;
+    }
+    if (kind == p.CLOSE_REQ) {
+        if (n.asked == 0) {
+            n.asked = 1;
+            _emit(n, event.CLOSE, kind, 0, 0, 0, 0);
+        }
+        return;
+    }
+    if (kind == p.STATE) {
+        let is i32 as now = cast(i32, m[1] & 0xFF);
+        if (now != n.state) {
+            n.state = now;
+            _emit(n, event.STATE, kind, 0, 0, 0, 0);
+            n.events[(n.ev_head + n.ev_len - 1) % MAX_EVENTS].state = now;
+        }
+        return;
+    }
+    if (kind == p.POPUP_DONE) {
+        n.dismissed = 1;
+        _emit(n, event.POPUP_DONE, kind, 0, 0, 0, 0);
+        return;
+    }
+    if (kind == p.POPUP_PLACED) {
+        n.popup_x = p.xy_x(m[1]);
+        n.popup_y = p.xy_y(m[1]);
+        if (m[2] != 0) {
+            n.popup_w = p.wh_w(m[2]);
+            n.popup_h = p.wh_h(m[2]);
+        }
+        return;
+    }
+    if (kind == p.CLIP_DATA) {
+        n.clip_pending = 0;
+        n.clip_ready = 1;
+        n.clip_format = 0;
+        if (_take_segment(n, m[1], &n.clip) == 1 && n.clip.len > 0) { n.clip_format = transfer.TEXT; }
+        return;
+    }
+    if (kind == p.IME_PREEDIT) {
+        let is i64 as len with mut = 0;
+        let is *u8 as s = p.text_take(&n.rd, m[1], &len);
+        let is ie.Event as e with mut = _input(n, ie.PREEDIT);
+        e.cursor = m[2];
+        if (m[2] < 0) { e.cursor = 0 - 1; }
+        ie.push(n.input, &e, s, len);
+        return;
+    }
+    if (kind == p.IME_COMMIT) {
+        let is i64 as len with mut = 0;
+        let is *u8 as s = p.text_take(&n.rd, m[1], &len);
+        let is ie.Event as e = _input(n, ie.TEXT);
+        ie.push(n.input, &e, s, len);
+        return;
+    }
+    if (kind == p.DRAG_ENTER) {
+        n.drag_formats = m[1] & 0xFFFF;
+        n.drag_actions = (m[1] >> 16) & 0xFF;
+        _emit(n, event.DND_ENTER, kind, m[2], m[3], 0, 0);
+        let is *event.Event as e = &n.events[(n.ev_head + n.ev_len - 1) % MAX_EVENTS];
+        e.drop = _drop_bits(n.drag_formats);
+        e.action = cast(i32, n.drag_actions);
+        return;
+    }
+    if (kind == p.DRAG_MOTION) {
+        _emit(n, event.DND_MOVE, kind, m[2], m[3], 0, 0);
+        n.events[(n.ev_head + n.ev_len - 1) % MAX_EVENTS].action = cast(i32, n.drag_actions);
+        return;
+    }
+    if (kind == p.DRAG_LEAVE) { _emit(n, event.DND_LEAVE, kind, 0, 0, 0, 0); return; }
+    if (kind == p.DROP) {
+        n.drop_format = 0;
+        n.drop_action = cast(i32, m[3]);
+        if (_take_segment(n, m[2], &n.drop) == 1) {
+            if (m[1] == p.DND_FILES) {
+                _drop_paths(n);
+                n.drop_format = event.DROP_FILES;
+            } else if (m[1] == p.DND_TEXT) {
+                n.drop_format = event.DROP_TEXT;
+            }
+        }
+        _emit(n, event.DND_DROP, kind, n.px, n.py, 0, 0);
+        let is *event.Event as e = &n.events[(n.ev_head + n.ev_len - 1) % MAX_EVENTS];
+        e.drop = n.drop_format;
+        e.action = n.drop_action;
+        return;
+    }
+    if (kind == p.WINDOW) {
+        // An answer for a window being opened is read where it waits; one
+        // that comes after it gave up names a channel nobody wants.
+        if (m[2] == 0) {
+            let is i64 as fd = os.caustic.fd_recv(n.chan);
+            if (fd >= 0) {
+                p.send(fd, p.CLOSE, 0, 0, 0);
+                os.caustic.close(fd);
+            }
+        }
+        return;
+    }
+}
+
+// Everything on the channel now, read and told.
+fn pump(w as *Window) as void {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return; }
+    let is [4]i64 as m;
+    while (1 == 1) {
+        let is i32 as r = p.next(n.chan, &n.rd, &m[0]);
+        if (r == 0) { return; }
+        if (r < 0) {
+            // The window manager is gone: the window is closed.
+            if (n.asked == 0) {
+                n.asked = 1;
+                _emit(n, event.CLOSE, 0, 0, 0, 0, 0);
+            }
+            n.alive = 0;
+            return;
+        }
+        _handle(n, &m[0]);
+    }
+}
+
+// --- The surface ---
+
+fn _segment(n as *Native, room_w as i64, room_h as i64, nbuf as i64) as i32 {
+    n.room_w = room_w;
+    n.room_h = room_h;
+    n.stride = room_w * 4;
+    let is i64 as one = (n.stride * room_h + 4095) / 4096;
+    n.buf_bytes = one * 4096;
+    n.nbuf = nbuf;
+    n.seg_pages = one * nbuf;
+    n.seg = os.caustic.seg_create(n.seg_pages, 0);
+    if (n.seg < 0) { return 0; }
+    n.seg_va = os.caustic.mmap_fd(os.caustic.PROT_READ | os.caustic.PROT_WRITE, n.seg);
+    if (n.seg_va < 0) {
+        os.caustic.close(n.seg);
+        n.seg = 0 - 1;
+        return 0;
+    }
+    if (os.caustic.fd_send(n.chan, n.seg) != 0) { return 0; }
+    let is i64 as c with mut = p.VERSION;
+    if (nbuf == 2) { c = c | p.TWO_BUFFERS; }
+    return cast(i32, p.send(n.chan, p.HELLO, n.seg_pages, n.stride, c) == 0);
+}
+
+fn _pixels(n as *Native) as i32 {
+    let is i64 as want = n.w * n.h * 4;
+    if (want <= n.pix_bytes && cast(i64, n.pixels) != 0) { return 1; }
+    if (cast(i64, n.pixels) != 0) { mem.core.munmap(n.pixels, n.pix_bytes); }
+    // Room for the largest it can be at once: no new memory at each resize.
+    let is i64 as room = n.room_w * n.room_h * 4;
+    n.pixels = mem.core.mmap_anon(room);
+    if (cast(i64, n.pixels) <= 0) {
+        n.pixels = cast(*u8, 0);
+        n.pix_bytes = 0;
+        return 0;
+    }
+    n.pix_bytes = room;
+    return 1;
+}
+
+fn _damage_all(n as *Native) as void {
+    n.dmg_x0 = 0; n.dmg_y0 = 0; n.dmg_x1 = n.w; n.dmg_y1 = n.h;
+}
+
+fn _damage_add(n as *Native, x as i64, y as i64, w as i64, h as i64) as void {
+    if (w <= 0 || h <= 0) { return; }
+    if (n.dmg_x1 <= n.dmg_x0 || n.dmg_y1 <= n.dmg_y0) {
+        n.dmg_x0 = x; n.dmg_y0 = y; n.dmg_x1 = x + w; n.dmg_y1 = y + h;
+        return;
+    }
+    if (x < n.dmg_x0) { n.dmg_x0 = x; }
+    if (y < n.dmg_y0) { n.dmg_y0 = y; }
+    if (x + w > n.dmg_x1) { n.dmg_x1 = x + w; }
+    if (y + h > n.dmg_y1) { n.dmg_y1 = y + h; }
+}
+
+fn _clip(v as i64, hi as i64) as i64 {
+    if (v < 0) { return 0; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+// The frame into the buffer not shown, and that buffer shown — or, while the
+// other is still on its way to the screen, kept until FRAME frees it.
+fn _present(n as *Native) as void {
+    if (n.alive == 0 || n.seg_va == 0 || cast(i64, n.pixels) == 0) { return; }
+    if (n.waiting == 1) {
+        n.wanted = 1;
+        return;
+    }
+    n.wanted = 0;
+    // What has to be copied: this frame's damage, and the last frame's,
+    // which the buffer written now has not seen.
+    let is i64 as x0 with mut = n.dmg_x0;
+    let is i64 as y0 with mut = n.dmg_y0;
+    let is i64 as x1 with mut = n.dmg_x1;
+    let is i64 as y1 with mut = n.dmg_y1;
+    if (n.nbuf == 2 && n.old_x1 > n.old_x0 && n.old_y1 > n.old_y0) {
+        if (x1 <= x0 || y1 <= y0) { x0 = n.old_x0; y0 = n.old_y0; x1 = n.old_x1; y1 = n.old_y1; }
+        else {
+            if (n.old_x0 < x0) { x0 = n.old_x0; }
+            if (n.old_y0 < y0) { y0 = n.old_y0; }
+            if (n.old_x1 > x1) { x1 = n.old_x1; }
+            if (n.old_y1 > y1) { y1 = n.old_y1; }
+        }
+    }
+    // Never shown yet: all of it.
+    if (n.presented < 2) { x0 = 0; y0 = 0; x1 = n.w; y1 = n.h; }
+    x0 = _clip(x0, n.w); x1 = _clip(x1, n.w);
+    y0 = _clip(y0, n.h); y1 = _clip(y1, n.h);
+    let is i64 as buf with mut = 0;
+    if (n.nbuf == 2) { buf = n.back; }
+    let is i64 as base = n.seg_va + buf * n.buf_bytes;
+    if (x1 > x0) {
+        let is i64 as y with mut = y0;
+        while (y < y1) {
+            mem.memcpy(cast(*u8, base + y * n.stride + x0 * 4),
+                       cast(*u8, cast(i64, n.pixels) + (y * n.w + x0) * 4), (x1 - x0) * 4);
+            y = y + 1;
+        }
+    }
+    // The window manager is told this frame's own damage.
+    let is i64 as cx0 = _clip(n.dmg_x0, n.w);
+    let is i64 as cy0 = _clip(n.dmg_y0, n.h);
+    let is i64 as cx1 = _clip(n.dmg_x1, n.w);
+    let is i64 as cy1 = _clip(n.dmg_y1, n.h);
+    if (n.presented < 1 || cx1 <= cx0 || cy1 <= cy0) { p.send(n.chan, p.COMMIT, 0, 0, p.wh(n.w, n.h)); }
+    else { p.send(n.chan, p.COMMIT, cx0, cy0, p.wh(cx1 - cx0, cy1 - cy0)); }
+    if (n.nbuf == 2) {
+        p.send(n.chan, p.PRESENT, n.back, 1, 0);
+        n.waiting = 1;
+        n.back = 1 - n.back;
+    } else {
+        p.send(n.chan, p.PRESENT, 0 - 1, 0, 0);
+    }
+    n.old_x0 = n.dmg_x0; n.old_y0 = n.dmg_y0; n.old_x1 = n.dmg_x1; n.old_y1 = n.dmg_y1;
+    n.dmg_x0 = 0; n.dmg_y0 = 0; n.dmg_x1 = 0; n.dmg_y1 = 0;
+    if (n.presented < 2) { n.presented = n.presented + 1; }
+}
+
+// --- Opening ---
+
+// The window, as device.cst keeps it: a pointer to what lives here.
+struct Window {
+    n as *Native;
+}
+
+// The next message on n's channel within the time, handled unless it is of
+// kind want — then it is in m: 1; 0 when the time ran out or it closed.
+fn _await(n as *Native, want as i64, m as *i64) as i32 {
+    let is i64 as until = os.caustic.time_ns() + ANSWER_NS;
+    while (1 == 1) {
+        let is i64 as left = until - os.caustic.time_ns();
+        if (left <= 0) { return 0; }
+        if (p.readable(n.chan, left) == 0) { continue; }
+        let is i32 as r = p.next(n.chan, &n.rd, m);
+        if (r < 0) { return 0; }
+        if (r == 1) {
+            if (m[0] == want) { return 1; }
+            _handle(n, m);
+        }
+    }
+    return 0;
+}
+
+// The WINDOW answering the request tagged tag, on the owner's channel: the
+// new window's channel, or -1.
+fn _await_window(owner as *Native, tag as i64) as i64 {
+    let is [4]i64 as m;
+    while (_await(owner, p.WINDOW, &m[0]) == 1) {
+        if (m[1] != tag) {
+            _handle(owner, &m[0]);
+            continue;
+        }
+        if (m[2] != 0) { return 0 - 1; }
+        return os.caustic.fd_recv(owner.chan);
+    }
+    return 0 - 1;
+}
+
+fn _native() as *Native {
+    let is *Native as n = cast(*Native, mem.core.mmap_anon(sizeof(Native)));
+    if (cast(i64, n) <= 0) { return cast(*Native, 0); }
+    mem.memzero(cast(*u8, n), sizeof(Native));
+    n.chan = 0 - 1;
+    n.seg = 0 - 1;
+    p.reader_init(&n.rd);
+    transfer.bytes_init(&n.clip);
+    transfer.bytes_init(&n.drop);
+    transfer.bytes_init(&n.drop_paths);
+    n.input = ie.create();
+    return n;
+}
+
+fn _free(n as *Native) as void {
+    if (n.seg_va != 0) { os.caustic.munmap(n.seg_va, n.seg_pages * 4096); }
+    if (n.seg >= 0) { os.caustic.close(n.seg); }
+    if (cast(i64, n.pixels) != 0) { mem.core.munmap(n.pixels, n.pix_bytes); }
+    if (cast(i64, n.input) != 0) { ie.destroy(n.input); }
+    transfer.bytes_free(&n.clip);
+    transfer.bytes_free(&n.drop);
+    transfer.bytes_free(&n.drop_paths);
+    mem.core.munmap(cast(*u8, n), sizeof(Native));
+}
+
+fn _fail(w as *Window, n as *Native, err as i32) as void {
+    if (cast(i64, n) != 0) {
+        if (n.chan >= 0 && n.chan != os.caustic.key(os.caustic.KEY_WM)) { os.caustic.close(n.chan); }
+        _free(n);
+    }
+    w.n = cast(*Native, 0);
+    _open_err = err;
+}
+
+// Why the last open failed, OK when it did not.
+let is i32 as _open_err with mut = 0;
+fn open_error() as i32 { return _open_err; }
+
+fn _len(s as *u8) as i64 {
+    if (cast(i64, s) == 0) { return 0; }
+    let is i64 as k with mut = 0;
+    while (s[k] != cast(u8, 0)) { k = k + 1; }
+    return k;
+}
+
+fn open_config(c as *Config) as Window {
+    let is Window as w;
+    w.n = cast(*Native, 0);
+    _open_err = OK;
+    let is *Native as n = _native();
+    if (cast(i64, n) == 0 || cast(i64, n.input) == 0) { _fail(&w, n, NO_MEMORY); return w; }
+    n.role = cast(i64, c.role);
+    let is *Native as first = _first();
+    let is *Native as owner with mut = c.owner;
+    if (cast(i64, first) == 0 && cast(i64, owner) == 0 && n.role == p.ROLE_TOPLEVEL) {
+        // The program's first window: the channel it was started with.
+        n.chan = os.caustic.key(os.caustic.KEY_WM);
+        if (n.chan < 0) { _fail(&w, n, NO_DISPLAY); return w; }
+    } else {
+        if (cast(i64, owner) == 0) { owner = first; }
+        if (cast(i64, owner) == 0 || owner.alive == 0) { _fail(&w, n, BAD_ARGUMENT); return w; }
+        n.owner = owner;
+        n.tag = _next_tag;
+        _next_tag = (_next_tag + 1) & 0xFFFF;
+        if (_next_tag == 0) { _next_tag = 1; }
+        let is i64 as a = p.window_a(n.tag, n.role, cast(i64, c.flags), cast(i64, c.anchor),
+                                     cast(i64, c.gravity), cast(i64, c.adjust));
+        if (p.send(owner.chan, p.WINDOW_NEW, a, p.rect16(c.ax, c.ay, c.aw, c.ah),
+                   p.rect16(c.width, c.height, c.off_x, c.off_y)) != 0) {
+            _fail(&w, n, NO_WINDOW);
+            return w;
+        }
+        n.chan = _await_window(owner, n.tag);
+        if (n.chan < 0) { _fail(&w, n, NO_WINDOW); return w; }
+        n.grab = cast(i32, (c.flags & cast(i32, p.WF_GRAB)) != 0);
+    }
+    // WELCOME: the screen and the size it was given.
+    let is [4]i64 as m;
+    if (_await(n, p.WELCOME, &m[0]) == 0) { _fail(&w, n, NO_WINDOW); return w; }
+    n.screen_w = m[1];
+    n.screen_h = m[2];
+    n.w = p.wh_w(m[3]);
+    n.h = p.wh_h(m[3]);
+    if (n.w < 1) { n.w = 1; }
+    if (n.h < 1) { n.h = 1; }
+    // A window that may be resized gets room for the whole screen; a popup
+    // only its own size.
+    let is i64 as rw with mut = n.screen_w;
+    let is i64 as rh with mut = n.screen_h;
+    let is i64 as nbuf with mut = 2;
+    if (n.role == p.ROLE_MENU || n.role == p.ROLE_LIST || n.role == p.ROLE_TOOLTIP) {
+        rw = n.w; rh = n.h;
+        if (c.width > rw) { rw = c.width; }
+        if (c.height > rh) { rh = c.height; }
+        nbuf = 1;
+    }
+    if (rw < n.w) { rw = n.w; }
+    if (rh < n.h) { rh = n.h; }
+    if (_segment(n, rw, rh, nbuf) == 0 || _pixels(n) == 0) { _fail(&w, n, NO_SURFACE); return w; }
+    n.popup_w = n.w;
+    n.popup_h = n.h;
+    n.alive = 1;
+    n.focused = 0;
+    _damage_all(n);
+    if (_keep(n) == 0) { _fail(&w, n, NO_MEMORY); return w; }
+    w.n = n;
+    // Motion with no button held is wanted: hover, ENTER and LEAVE.
+    p.send(n.chan, p.POINTER_TRACK, 1, 0, 0);
+    n.framed = 1;
+    if (n.role == p.ROLE_TOPLEVEL || n.role == p.ROLE_DIALOG) {
+        if (c.decorated == 0) { set_decorated(&w, 0); }
+        set_title(&w, c.title, _len(c.title));
+        if (c.resizable == 0) {
+            n.min_w = c.width; n.min_h = c.height; n.max_w = c.width; n.max_h = c.height;
+        }
+        p.send(n.chan, p.SIZE_HINTS, p.wh(n.min_w, n.min_h), p.wh(n.max_w, n.max_h), p.wh(c.width, c.height));
+        // The window manager welcomed it at a size of its choosing; the size
+        // asked comes back as a RESIZE. Waited for here, so that the program
+        // starts at the size it asked for and not at the one it was given
+        // first — which it would otherwise ask to keep.
+        if (n.w != c.width || n.h != c.height) {
+            let is [4]i64 as rm;
+            let is i64 as until = os.caustic.time_ns() + 500000000;
+            while (os.caustic.time_ns() < until) {
+                if (p.readable(n.chan, until - os.caustic.time_ns()) == 0) { break; }
+                let is i32 as got = p.next(n.chan, &n.rd, &rm[0]);
+                if (got < 0) { break; }
+                if (got == 1) {
+                    _handle(n, &rm[0]);
+                    if (rm[0] == p.RESIZE) { break; }
+                }
+            }
+        }
+    }
+    // A popup is told where it went just after it is welcomed.
+    if (cast(i64, n.owner) != 0 && (n.role == p.ROLE_MENU || n.role == p.ROLE_LIST || n.role == p.ROLE_TOOLTIP)) {
+        n.popup_x = c.ax;
+        n.popup_y = c.ay + c.ah;
+        p.readable(n.chan, 200000000);
+        pump(&w);
+    }
+    return w;
+}
+
+fn close(w as *Window) as void {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0) { return; }
+    if (n.chan >= 0) {
+        p.send(n.chan, p.CLOSE, 0, 0, 0);
+        // The first window's channel is the program's key: kept, a later
+        // window asks on it no more, but the next first window may.
+        if (n.chan != os.caustic.key(os.caustic.KEY_WM)) { os.caustic.close(n.chan); }
+    }
+    _forget(n);
+    _free(n);
+    w.n = cast(*Native, 0);
+}
+
+// --- The frame ---
+
+fn is_open(w as *Window) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    return w.n.alive;
+}
+
+fn next_frame(w as *Window) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    n.resized = 0;
+    pump(w);
+    return n.alive;
+}
+
+fn pending(w as *Window) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0) { return 0; }
+    return cast(i32, n.ev_len > 0 || ie.pending(n.input) == 1 || n.rd.fill > 0);
+}
+
+fn connection_fd(w as *Window) as i64 {
+    if (cast(i64, w.n) == 0 || w.n.alive == 0) { return 0 - 1; }
+    return w.n.chan;
+}
+
+fn acquire(w as *Window) as tgt.Target {
+    let is tgt.Target as t;
+    t.color = cast(*u8, 0); t.depth = cast(*u8, 0); t.width = 0; t.height = 0;
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0 || _pixels(n) == 0) { return t; }
+    t.color = n.pixels;
+    t.width = n.w;
+    t.height = n.h;
+    return t;
+}
+
+fn submit(w as *Window) as void {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0) { return; }
+    _damage_all(n);
+    _present(n);
+}
+
+fn submit_region(w as *Window, l as *damage.List) as void {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0) { return; }
+    if (l.whole == 1) { _damage_all(n); }
+    else {
+        let is i32 as i with mut = 0;
+        while (i < l.n) {
+            _damage_add(n, cast(i64, l.rects[i].x), cast(i64, l.rects[i].y), cast(i64, l.rects[i].w), cast(i64, l.rects[i].h));
+            i = i + 1;
+        }
+    }
+    _present(n);
+}
+
+// What the frame drawn into holds: the last one submitted, whole (1), once
+// there was one; 0 before.
+fn buffer_age(w as *Window) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.presented == 0) { return 0; }
+    return 1;
+}
+
+fn poll_event(w as *Window, out as *event.Event) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.ev_len == 0) { return 0; }
+    *out = n.events[n.ev_head];
+    n.ev_head = (n.ev_head + 1) % MAX_EVENTS;
+    n.ev_len = n.ev_len - 1;
+    return 1;
+}
+
+fn poll_input(w as *Window, out as *ie.Event) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0) { return 0; }
+    return ie.next(n.input, out);
+}
+
+fn width(w as *Window) as i64 { if (cast(i64, w.n) == 0) { return 0; } return w.n.w; }
+fn height(w as *Window) as i64 { if (cast(i64, w.n) == 0) { return 0; } return w.n.h; }
+fn resized(w as *Window) as i32 { if (cast(i64, w.n) == 0) { return 0; } return w.n.resized; }
+fn should_close(w as *Window) as i32 { if (cast(i64, w.n) == 0) { return 0; } return w.n.asked; }
+fn keep_open(w as *Window) as void { if (cast(i64, w.n) != 0) { w.n.asked = 0; } }
+fn focused(w as *Window) as i32 { if (cast(i64, w.n) == 0) { return 0; } return w.n.focused; }
+fn screen_size(w as *Window, sw as *i64, sh as *i64) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    *sw = w.n.screen_w;
+    *sh = w.n.screen_h;
+    return 1;
+}
+
+fn request_close(w as *Window) as void {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.asked == 1) { return; }
+    n.asked = 1;
+    _emit(n, event.CLOSE, 0, 0, 0, 0, 0);
+}
+
+// --- What the window manager is told ---
+
+fn set_title(w as *Window, s as *u8, len as i64) as void {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return; }
+    if (len <= 16) {
+        // Up to 16 bytes ride in the message itself.
+        let is [2]i64 as packed;
+        packed[0] = 0; packed[1] = 0;
+        let is *u8 as into = cast(*u8, &packed[0]);
+        let is i64 as k with mut = 0;
+        while (k < len) { into[k] = s[k]; k = k + 1; }
+        p.send(n.chan, p.SET_TITLE, len, packed[0], packed[1]);
+        return;
+    }
+    p.send_text(n.chan, p.SET_TITLE, s, len, 0, 0);
+}
+
+fn _hints(n as *Native, ask_w as i64, ask_h as i64) as void {
+    p.send(n.chan, p.SIZE_HINTS, p.wh(n.min_w, n.min_h), p.wh(n.max_w, n.max_h), p.wh(ask_w, ask_h));
+}
+
+fn set_size(w as *Window, width as i64, height as i64) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0 || width <= 0 || height <= 0) { return 0; }
+    _hints(n, width, height);
+    return 1;
+}
+
+fn set_min_size(w as *Window, width as i64, height as i64) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    n.min_w = width; n.min_h = height;
+    _hints(n, 0, 0);
+    return 1;
+}
+
+fn min_size(w as *Window, width as *i64, height as *i64) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    *width = w.n.min_w;
+    *height = w.n.min_h;
+    return 1;
+}
+
+fn set_max_size(w as *Window, width as i64, height as i64) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    n.max_w = width; n.max_h = height;
+    _hints(n, 0, 0);
+    return 1;
+}
+
+// The pointer's shape over the content: window/cursor.cst's numbers are the
+// protocol's. 1 when told.
+fn set_cursor(w as *Window, shape as i32) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    let is i64 as s with mut = cast(i64, shape);
+    if (s < 0 || s > 35) { s = 0; }
+    return cast(i32, p.send(n.chan, p.SET_CURSOR, s, 0, 0) == 0);
+}
+
+// --- The frame, and what the window is ---
+
+// The window manager's frame (1) or the program's own (0). 1 when told.
+fn set_decorated(w as *Window, on as i32) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    if (n.role != p.ROLE_TOPLEVEL && n.role != p.ROLE_DIALOG) { return 0; }
+    let is i64 as a with mut = 0;
+    if (on != 0) { a = 1; }
+    if (p.send(n.chan, p.SET_FRAME, a, 0, 0) != 0) { return 0; }
+    n.framed = cast(i32, a);
+    return 1;
+}
+
+fn decorated(w as *Window) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    return w.n.framed;
+}
+
+// The press held now dragged by the window manager: a move (how 8) or a
+// resize from an edge or a corner (0 top-left, 1 top, 2 top-right, 3 right,
+// 4 bottom-right, 5 bottom, 6 bottom-left, 7 left), as EWMH numbers them.
+// The release is the window manager's: the button is said to be up, taken.
+fn begin_move_resize(w as *Window, x as i64, y as i64, how as i64, button as i64) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0 || n.buttons == 0) { return 0; }
+    let is i64 as edges with mut = 0;
+    if (how == 0) { edges = p.EDGE_N | p.EDGE_W; }
+    else if (how == 1) { edges = p.EDGE_N; }
+    else if (how == 2) { edges = p.EDGE_N | p.EDGE_E; }
+    else if (how == 3) { edges = p.EDGE_E; }
+    else if (how == 4) { edges = p.EDGE_S | p.EDGE_E; }
+    else if (how == 5) { edges = p.EDGE_S; }
+    else if (how == 6) { edges = p.EDGE_S | p.EDGE_W; }
+    else if (how == 7) { edges = p.EDGE_W; }
+    else if (how != 8) { return 0; }
+    if (p.send(n.chan, p.MOVE_RESIZE, edges, 0, 0) != 0) { return 0; }
+    let is i64 as bit with mut = p.BTN_LEFT;
+    if (button == 2) { bit = p.BTN_MIDDLE; }
+    if (button == 3) { bit = p.BTN_RIGHT; }
+    if ((n.buttons & bit) != 0) {
+        n.buttons = n.buttons & (0 - 1 - bit);
+        let is ie.Event as up with mut = _input(n, ie.BUTTON_UP);
+        up.detail = ie.BUTTON_TAKEN;
+        up.button = cast(i32, button);
+        ie.push(n.input, &up, cast(*u8, 0), 0);
+    }
+    return 1;
+}
+
+fn minimize(w as *Window) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    return cast(i32, p.send(n.chan, p.SET_STATE, p.SET_MINIMIZE, 0, 0) == 0);
+}
+
+fn set_maximized(w as *Window, on as i32) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    let is i64 as what with mut = p.SET_RESTORE;
+    if (on != 0) { what = p.SET_MAXIMIZE; }
+    return cast(i32, p.send(n.chan, p.SET_STATE, what, 0, 0) == 0);
+}
+
+fn state(w as *Window) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    return w.n.state;
+}
+
+// --- Popups ---
+
+fn popup_position(w as *Window, x as *i64, y as *i64) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    *x = w.n.popup_x;
+    *y = w.n.popup_y;
+    return 1;
+}
+
+fn popup_size(w as *Window, pw as *i64, ph as *i64) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    *pw = w.n.w;
+    *ph = w.n.h;
+    return 1;
+}
+
+fn grabbing(w as *Window) as i32 {
+    if (cast(i64, w.n) == 0 || w.n.alive == 0) { return 0; }
+    return cast(i32, w.n.grab == 1 && w.n.dismissed == 0);
+}
+
+fn popup_done(w as *Window) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    return w.n.dismissed;
+}
+
+// Placed again against the anchor rectangle; the size within the room it was
+// made with. 1 when asked.
+fn reposition(w as *Window, c as *Config) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    if (c.width > n.room_w || c.height > n.room_h) { return 0; }
+    let is i64 as a = p.window_a(n.tag, n.role, cast(i64, c.flags), cast(i64, c.anchor),
+                                 cast(i64, c.gravity), cast(i64, c.adjust));
+    if (p.send(n.chan, p.POPUP_PLACE, a, p.rect16(c.ax, c.ay, c.aw, c.ah),
+               p.rect16(c.width, c.height, c.off_x, c.off_y)) != 0) { return 0; }
+    p.readable(n.chan, 200000000);
+    pump(w);
+    return 1;
+}
+
+// --- Text input ---
+
+fn _purpose(purpose as i32) as i64 {
+    // input/text.cst's PURPOSE_* as the protocol's TI_PURPOSE_*.
+    if (purpose == 2) { return 1; }    // DIGITS
+    if (purpose == 3) { return 2; }    // NUMBER
+    if (purpose == 4) { return 3; }    // PHONE
+    if (purpose == 5) { return 4; }    // URL
+    if (purpose == 6) { return 5; }    // EMAIL
+    if (purpose == 7) { return 6; }    // NAME
+    if (purpose == 8) { return 7; }    // PASSWORD
+    if (purpose == 9) { return 8; }    // PIN
+    if (purpose == 13) { return 9; }   // TERMINAL
+    return 0;
+}
+
+fn _text_input(n as *Native) as i32 {
+    if (n.ti_on == 0) { return cast(i32, p.send(n.chan, p.TEXT_INPUT, 0, 0, 0) == 0); }
+    let is i64 as a = 1 | (_purpose(n.ti_purpose) << 8);
+    return cast(i32, p.send(n.chan, p.TEXT_INPUT, a, p.wh(n.ti_x, n.ti_y), p.wh(n.ti_w, n.ti_h)) == 0);
+}
+
+fn text_input_enable(w as *Window, on as i32) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    n.ti_on = cast(i32, on != 0);
+    return _text_input(n);
+}
+
+fn text_input_active(w as *Window) as i32 {
+    if (cast(i64, w.n) == 0) { return 0; }
+    return w.n.ti_on;
+}
+
+fn text_input_rect(w as *Window, x as i64, y as i64, width as i64, height as i64) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    n.ti_x = x; n.ti_y = y; n.ti_w = width; n.ti_h = height;
+    if (n.ti_on == 0) { return 1; }
+    return _text_input(n);
+}
+
+fn text_input_context(w as *Window, purpose as i32) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0 || n.ti_on == 0) { return 0; }
+    if (purpose == n.ti_purpose) { return 1; }
+    n.ti_purpose = purpose;
+    return _text_input(n);
+}
+
+// The composition dropped: told again, the input method starts over.
+fn text_input_reset(w as *Window) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0 || n.ti_on == 0) { return 0; }
+    p.send(n.chan, p.TEXT_INPUT, 0, 0, 0);
+    return _text_input(n);
+}
+
+// --- The clipboard: text, the window manager's ---
+
+fn clipboard_set(w as *Window, o as *transfer.Offer) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    if ((o.formats & transfer.TEXT) == 0) { return 0; }
+    if (transfer.offer_is_lazy(o, transfer.TEXT, 0) == 1 && transfer.offer_fill(o, transfer.TEXT, 0) == 0) { return 0; }
+    let is i64 as len = o.text.len;
+    if (len <= 0) { return cast(i32, p.send(n.chan, p.CLIP_SET, 0, 0, 0) == 0); }
+    let is i64 as fd = os.caustic.seg_create((len + 4095) / 4096, 0);
+    if (fd < 0) { return 0; }
+    if (os.caustic.seg_write(fd, 0, o.text.data, len) < 0) {
+        os.caustic.close(fd);
+        return 0;
+    }
+    let is i64 as sent = os.caustic.fd_send(n.chan, fd);
+    os.caustic.close(fd);
+    if (sent != 0) { return 0; }
+    return cast(i32, p.send(n.chan, p.CLIP_SET, len, 0, 0) == 0);
+}
+
+fn clipboard_request(w as *Window, format as i32) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    if (format != 0 && format != transfer.TEXT) { return 0; }
+    n.clip_ready = 0;
+    n.clip_pending = 1;
+    return cast(i32, p.send(n.chan, p.CLIP_GET, 0, 0, 0) == 0);
+}
+
+fn clipboard_ready(w as *Window) as i32 { if (cast(i64, w.n) == 0) { return 0; } return w.n.clip_ready; }
+fn clipboard_pending(w as *Window) as i32 { if (cast(i64, w.n) == 0) { return 0; } return w.n.clip_pending; }
+fn clipboard_format(w as *Window) as i32 { if (cast(i64, w.n) == 0) { return 0; } return w.n.clip_format; }
+fn clipboard_offered(w as *Window) as i32 { if (cast(i64, w.n) == 0) { return 0; } return w.n.clip_format; }
+fn clipboard_data(w as *Window) as *u8 {
+    if (cast(i64, w.n) == 0 || w.n.clip.len == 0) { return ""; }
+    return w.n.clip.data;
+}
+fn clipboard_length(w as *Window) as i64 { if (cast(i64, w.n) == 0) { return 0; } return w.n.clip.len; }
+
+// --- Drops ---
+
+fn drop_answer(w as *Window, takes as i32, action as i32) as i32 {
+    let is *Native as n = w.n;
+    if (cast(i64, n) == 0 || n.alive == 0) { return 0; }
+    let is i64 as format with mut = 0;
+    if ((takes & event.DROP_FILES) != 0 && (n.drag_formats & p.DND_FILES) != 0) { format = p.DND_FILES; }
+    else if ((takes & event.DROP_TEXT) != 0 && (n.drag_formats & p.DND_TEXT) != 0) { format = p.DND_TEXT; }
+    let is i64 as act with mut = cast(i64, action);
+    if (format == 0) { act = 0; }
+    return cast(i32, p.send(n.chan, p.DRAG_ANSWER, format, act, 0) == 0);
+}
+
+fn dropped_files(w as *Window) as i64 {
+    if (cast(i64, w.n) == 0 || w.n.drop_format != event.DROP_FILES) { return 0; }
+    return w.n.drop_count;
+}
+
+fn dropped_file(w as *Window, i as i64) as *u8 {
+    if (cast(i64, w.n) == 0 || i < 0 || i >= w.n.drop_count) { return ""; }
+    return transfer.path_at(&w.n.drop_paths, w.n.drop_count, i);
+}
+
+fn dropped_text(w as *Window) as *u8 {
+    if (cast(i64, w.n) == 0 || w.n.drop_format != event.DROP_TEXT || w.n.drop.len == 0) { return ""; }
+    return w.n.drop.data;
+}
+
+fn dropped_text_length(w as *Window) as i64 {
+    if (cast(i64, w.n) == 0 || w.n.drop_format != event.DROP_TEXT) { return 0; }
+    return w.n.drop.len;
+}
+
+fn clear_drop(w as *Window) as void {
+    if (cast(i64, w.n) == 0) { return; }
+    transfer.bytes_clear(&w.n.drop);
+    transfer.bytes_clear(&w.n.drop_paths);
+    w.n.drop_count = 0;
+    w.n.drop_format = 0;
+}
+

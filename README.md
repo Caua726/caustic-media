@@ -46,7 +46,7 @@ The shape the whole thing is aiming at:
 
 ```
 math/     vectors, matrices, quaternions, geometry, colour, curves   — pure
-window/   window, display, platform:  x11 | wayland | kms | win32
+window/   window, display, platform:  x11 | wayland | kms | win32 | causticos
 input/    keyboard, mouse, touch, pen, gamepad, haptics, sensors
             cooked from the display server, or raw from evdev
 gpu/      the device, in the shape of wgpu:  vk | gl | d3d | software

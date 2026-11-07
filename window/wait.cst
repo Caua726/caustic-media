@@ -17,7 +17,9 @@
 // message queue stands for the connection (a window names it, null leaves
 // messages out), an auto-reset event for wake, and the watched are waitable
 // HANDLEs - "readable" means signalled. A watched auto-reset object is taken
-// by being reported, as WaitForSingleObject takes it.
+// by being reported, as WaitForSingleObject takes it. CausticOS sleeps in
+// its poll: the window's channel to the window manager, the reading end of a
+// channel pair for wake (the other end written), the watched descriptors.
 use "std/os.cst" as os;
 use "std/os/linux.cst" as linux;
 use "../sys/linux.cst" as sys;
@@ -44,7 +46,8 @@ let is i64 as _POLLHUP with imut = 16;
 struct Wait {
     ok    as i32;
     _pad0 as i32;
-    wake  as i64;                // the eventfd (Windows: the event) another thread sets
+    wake  as i64;                // the eventfd (Windows: the event; CausticOS: a channel's writing end) another thread sets
+    wake_rd as i64;              // CausticOS: the channel's reading end, which wait polls
     n     as i64;
     fds   as [16]i64;
     ready as [16]i32;
@@ -59,6 +62,13 @@ fn open() as Wait {
         w.ok = cast(i32, w.wake != 0);
         return w;
     }
+    if (os.current() == os.OS_CAUSTIC) {
+        let is [2]i64 as pair;
+        w.ok = cast(i32, os.caustic.channel_create(&pair[0]) == 0);
+        w.wake = pair[0];
+        w.wake_rd = pair[1];
+        return w;
+    }
     w.wake = sys.eventfd(0, sys.EFD_NONBLOCK | sys.EFD_CLOEXEC);
     w.ok = cast(i32, w.wake >= 0);
     return w;
@@ -69,6 +79,10 @@ fn is_open(w as *Wait) as i32 { return w.ok; }
 fn close(w as *Wait) as void {
     if (w.ok == 0) { return; }
     if (os.current() == os.OS_WINDOWS) { k.CloseHandle(w.wake); }
+    else if (os.current() == os.OS_CAUSTIC) {
+        os.caustic.close(w.wake);
+        os.caustic.close(w.wake_rd);
+    }
     else { sys.close(w.wake); }
     w.ok = 0;
     w.n = 0;
@@ -119,6 +133,13 @@ fn readable(w as *Wait, fd as i64) as i32 {
 fn wake(w as *Wait) as void {
     if (w.ok == 0) { return; }
     if (os.current() == os.OS_WINDOWS) { k.SetEvent(w.wake); return; }
+    if (os.current() == os.OS_CAUSTIC) {
+        // One byte; a full channel has a wake in it already.
+        let is [1]u8 as b;
+        b[0] = cast(u8, 1);
+        os.caustic.write(w.wake, cast(*u8, &b[0]), 1);
+        return;
+    }
     sys.event_add(w.wake, 1);
 }
 
@@ -186,6 +207,53 @@ fn _wait_windows(w as *Wait, win as *device.Window, timeout_ms as i64, got_befor
     return got;
 }
 
+// CausticOS: one poll of {fd, want, got} triples — the connection, the wake
+// channel, the watched — with the time in nanoseconds.
+fn _wait_caustic(w as *Wait, conn as i64, win as *device.Window, tm as i64, due as i64, got_before as i32) as i32 {
+    let is i32 as got with mut = got_before;
+    let is [54]i64 as e;
+    e[0] = conn; e[1] = os.caustic.POLL_READABLE; e[2] = 0;
+    e[3] = w.wake_rd; e[4] = os.caustic.POLL_READABLE; e[5] = 0;
+    let is i64 as i with mut = 0;
+    while (i < w.n) {
+        e[6 + i * 3] = w.fds[i];
+        e[7 + i * 3] = os.caustic.POLL_READABLE;
+        e[8 + i * 3] = 0;
+        i = i + 1;
+    }
+    // No connection: its entry polls nothing.
+    let is i64 as first with mut = 0;
+    if (conn < 0) { first = 1; }
+    let is i64 as ns with mut = 0 - 1;
+    if (tm >= 0) { ns = tm * 1000000; }
+    let is i64 as r = os.caustic.poll(&e[first * 3], 2 + w.n - first, ns);
+    if (r <= 0) {
+        if (due >= 0 && device.input_due(win) == 0) { got = got | WINDOW; }
+        return got;
+    }
+    if (conn >= 0 && e[2] != 0) { got = got | WINDOW; }
+    if (e[5] != 0) {
+        // Every wake so far taken: what the channel holds, read off.
+        let is [64]u8 as drain;
+        let is [3]i64 as q;
+        q[0] = w.wake_rd; q[1] = os.caustic.POLL_READABLE; q[2] = 0;
+        while (os.caustic.poll(&q[0], 1, 0) > 0 && (q[2] & os.caustic.POLL_READABLE) != 0) {
+            if (os.caustic.read(w.wake_rd, cast(*u8, &drain[0]), 64) <= 0) { break; }
+            q[2] = 0;
+        }
+        got = got | WOKEN;
+    }
+    i = 0;
+    while (i < w.n) {
+        if (e[8 + i * 3] != 0) {
+            w.ready[i] = 1;
+            got = got | DESCRIPTOR;
+        }
+        i = i + 1;
+    }
+    return got;
+}
+
 // Sleeps until an event waits for a window of the program — win, any of
 // them; null for none — a watched descriptor is readable, wake was called,
 // or timeout_ms pass (negative: no time). What woke it, as bits; TIMEOUT
@@ -202,7 +270,7 @@ fn wait(w as *Wait, win as *device.Window, timeout_ms as i64) as i32 {
     let is i64 as conn with mut = 0 - 1;
     let is i64 as due with mut = 0 - 1;
     if (cast(i64, win) != 0) {
-        if (os.current() == os.OS_LINUX) { conn = device.connection_fd(win); }
+        if (os.current() == os.OS_LINUX || os.current() == os.OS_CAUSTIC) { conn = device.connection_fd(win); }
         // Read off the connection already: there, and no sleeping on it.
         if (device.pending(win) == 1) {
             got = WINDOW;
@@ -214,6 +282,7 @@ fn wait(w as *Wait, win as *device.Window, timeout_ms as i64) as i32 {
         if (due >= 0 && (tm < 0 || due < tm)) { tm = due; }
     }
     if (os.current() == os.OS_WINDOWS) { return _wait_windows(w, win, tm, got); }
+    if (os.current() == os.OS_CAUSTIC) { return _wait_caustic(w, conn, win, tm, due, got); }
     // The connection, the wake-up, then what is watched.
     let is [18]i64 as raw;
     let is *u8 as p = cast(*u8, &raw);
