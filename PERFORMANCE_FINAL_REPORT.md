@@ -112,6 +112,12 @@ and the 4-pixel group. Each was caught.
 
 ## Commits (c893bd7..HEAD)
 
+These are the hashes on branch `agent/media-perf`. On `main`,
+caustic-push-daily re-dates commits as it sends them to GitHub, which gives
+each one, and every one after it, a new hash (same tree, message and
+author); the subjects below identify them. The merge was `5fea8a2` when
+the final gates ran on it; the first daily send made it `485dcb5`.
+
 ```
 5fea8a2 Merge agent/media-perf: the performance audit's fixes, progressive image loading
 6baa23a image/load: a Stream decodes an image as its bytes arrive
