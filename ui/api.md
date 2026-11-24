@@ -842,7 +842,9 @@ the toolkit's text: one service per application that lays text out and draws it,
 - `lay_layout(s as *Service, l as *layout.Layout, lstyles as *model.Style, text as *u8, nbytes as i64,` — The run's text set in styles, each span of it in its style and the rest in style 0, in the box params describes: 1, or 0 when it could not be — a style with no font, more than MAX_STYLES of them, memory refused, or ...
 - `layouts(s as *Service) as i64` — How many times s has laid text out since it opened — every lay_text, lay_plain and lay_layout: what a change costs, counted.
 - `lay_text(s as *Service, r as *Run, styles as *Style, nstyles as i64, spans as *model.Span, nspans as i64,`
+- `lay_text_in(s as *Service, r as *Run, l as *layout.Layout, lstyles as *model.Style, styles as *Style,` — As lay_text, laid out in the caller's Layout l — with its styles' fonts in lstyles, as lay_layout — which then answers the cursor's questions about the run: one layout for both, where a widget that keeps a Layout ...
 - `lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, nstyles as i64,` — The text — nbytes of UTF-8, copied into the run — laid out as lay_text does.
+- `lay_in(s as *Service, r as *Run, text as *u8, nbytes as i64, l as *layout.Layout, lstyles as *model.Style,` — The text copied into the run and laid out as lay_text_in does.
 - `lay_plain(s as *Service, r as *Run, text as *u8, nbytes as i64, st as *Style, params as *model.Params) as i32` — One style over the whole of the text: the common case.
 - `sizes(s as *Service, st as *Style, out as *Sizes) as i32` — The sizes of text in style st that no text changes — an ellipsis's width, a line's height, a digit's width — laid out the first time its font and size are asked, and kept while the service is: a font is one face l...
 - `upload(s as *Service) as i32` — Every changed part of every page sent to its texture: 1, or 0 when the device refused one.
