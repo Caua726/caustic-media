@@ -12,7 +12,16 @@
 // a transparent entry, RGBA — as RGBA8; 16-bit channels by their high byte,
 // as caustic-image converts them. A failure is an Image with no pixels, and
 // last_error() says why: caustic-image's negative code, or ERR_FILE.
+//
+// A Job decodes in the background (start, done, take, cancel) where a thread
+// can be started, and at once where none can. Every decode here — a Job's
+// and bytes()'s and file()'s — takes one lock: caustic-image's JPEG and WebP
+// decoders keep their state in module variables, so two at a time would
+// tread on each other. Decoding is whole or nothing: caustic-image decodes a
+// complete file, so there is no image in part while it runs.
 use "std/mem.cst" as mem;
+use "std/thread.cst" as thread;
+use "std/sync.cst" as sync;
 use "std/os/linux.cst" as linux;
 use "caustic-image/decode.cst" as cdecode;
 use "caustic-image/core/image.cst" as cimage;
@@ -22,6 +31,13 @@ use "buffer.cst" as buffer;
 
 // The file could not be opened or read.
 let is i64 as ERR_FILE with imut = 0 - 1000;
+// A Job could not keep its own copy of the bytes.
+let is i64 as ERR_MEMORY with imut = 0 - 1001;
+// A Job cancelled before it decoded.
+let is i64 as ERR_CANCELLED with imut = 0 - 1002;
+
+// Held by whatever decodes: see above.
+let is sync.Mutex as _decoding with mut;
 
 let is i64 as _last with mut = 0;
 
@@ -42,7 +58,7 @@ fn _none(code as i64) as buffer.Image {
 
 // The decoded image in the nearest format here, copied into an Image of its
 // own. Its size was checked as it was decoded, so it converts.
-fn _adopt(src as *cimage.Image) as buffer.Image {
+fn _converted(src as *cimage.Image) as buffer.Image {
     let is i64 as ch = pixfmt.fmt_channels(src.fmt);
     let is i64 as want with mut = pixfmt.FMT_RGBA8;
     let is i32 as format with mut = buffer.RGBA8;
@@ -62,18 +78,139 @@ fn _adopt(src as *cimage.Image) as buffer.Image {
         y = y + 1;
     }
     if (src.fmt != want) { cimage.image_free(&conv); }
-    _last = 0;
     return im;
+}
+
+// len bytes at data decoded into *out, under the lock: 0, or the code of
+// why not (out then has no pixels). last_error() is left as it was.
+fn _decode(data as *u8, len as i64, out as *buffer.Image) as i64 {
+    sync.mutex_lock(&_decoding);
+    let is cimage.Image as decoded;
+    let is i64 as rc with mut = cdecode.decode(data, len, &decoded);
+    if (rc >= 0) {
+        *out = _converted(&decoded);
+        cimage.image_free(&decoded);
+        rc = 0;
+    } else {
+        out.pixels = cast(*u8, 0);
+        out.width = 0;
+        out.height = 0;
+        out.stride = 0;
+        out.format = buffer.RGBA8;
+        out.borrowed = 0;
+    }
+    sync.mutex_unlock(&_decoding);
+    return rc;
 }
 
 // An image from len bytes at data.
 fn bytes(data as *u8, len as i64) as buffer.Image {
-    let is cimage.Image as decoded;
-    let is i64 as rc = cdecode.decode(data, len, &decoded);
+    let is buffer.Image as im;
+    let is i64 as rc = _decode(data, len, &im);
     if (rc < 0) { return _none(rc); }
-    let is buffer.Image as im = _adopt(&decoded);
-    cimage.image_free(&decoded);
+    _last = 0;
     return im;
+}
+
+// --- In the background ---
+//
+// A Job is the caller's, and stays where it is from start until take or
+// cancel: its thread writes into it. It keeps a copy of the bytes, so they
+// may be freed or changed as soon as start returns. A program waits for its
+// Jobs (take or cancel) before main returns: main ends with exit, not
+// exit_group, and a decode still running would outlive it.
+
+struct Job {
+    copy     as *u8;           // its own copy of the bytes, freed once decoded
+    len      as i64;
+    room     as i64;           // what copy maps: len, or a page for none
+    result   as buffer.Image;
+    err      as i64;           // 0, or why not, when done
+    th       as thread.Thread;
+    state    as u32;           // 0 not started, 1 decoding, 2 done
+    stop     as u32;           // asked to cancel
+    threaded as i32;           // its thread is to be joined
+    _pad     as i32;
+}
+
+fn _job_run(arg as i64) as i64 {
+    let is *Job as j = cast(*Job, arg);
+    if (atomic_load(&j.stop) == cast(u32, 0)) {
+        j.err = _decode(j.copy, j.len, &j.result);
+    } else {
+        j.err = ERR_CANCELLED;
+        j.result.pixels = cast(*u8, 0);
+    }
+    mem.core.munmap(j.copy, j.room);
+    j.copy = cast(*u8, 0);
+    atomic_store(&j.state, cast(u32, 2));
+    return 0;
+}
+
+// The len bytes at data decoded in the background — on this thread, before
+// it returns, where none can be started. 1; 0 when the bytes could not be
+// copied, the Job then done with ERR_MEMORY.
+fn start(j as *Job, data as *u8, len as i64) as i32 {
+    j.result.pixels = cast(*u8, 0);
+    j.result.width = 0;
+    j.result.height = 0;
+    j.err = 0;
+    j.threaded = 0;
+    atomic_store(&j.stop, cast(u32, 0));
+    let is i64 as room with mut = len;
+    if (room < 1) { room = 1; }
+    j.copy = mem.core.mmap_anon(room);
+    if (cast(i64, j.copy) == 0 || cast(i64, j.copy) == 0 - 1) {
+        j.copy = cast(*u8, 0);
+        j.err = ERR_MEMORY;
+        atomic_store(&j.state, cast(u32, 2));
+        return 0;
+    }
+    if (len > 0) { mem.core.memcpy(j.copy, data, len); }
+    j.room = room;
+    j.len = len;
+    if (len < 0) { j.len = 0; }
+    atomic_store(&j.state, cast(u32, 1));
+    if (thread.spawn(&j.th, fn_ptr(_job_run), cast(i64, j)) == 0) {
+        j.threaded = 1;
+    } else {
+        _job_run(cast(i64, j));
+    }
+    return 1;
+}
+
+// Whether it is decoded, or refused: take then does not wait.
+fn done(j as *Job) as i32 { return cast(i32, atomic_load(&j.state) == cast(u32, 2)); }
+
+fn _join(j as *Job) as void {
+    if (j.threaded == 1) {
+        thread.join(&j.th);
+        j.threaded = 0;
+    }
+}
+
+// The decoded image, waiting for it if need be; no pixels when it could not
+// be decoded, and error() says why. The image is the caller's; the Job may
+// be started again.
+fn take(j as *Job) as buffer.Image {
+    _join(j);
+    let is buffer.Image as im = j.result;
+    j.result.pixels = cast(*u8, 0);
+    atomic_store(&j.state, cast(u32, 0));
+    return im;
+}
+
+// Why the Job's image has no pixels, 0 when it has them.
+fn error(j as *Job) as i64 { return j.err; }
+
+// Not wanted any more: nothing decoded if it has not begun; what it decodes,
+// if it has, thrown away when it ends — this waits for that.
+fn cancel(j as *Job) as void {
+    atomic_store(&j.stop, cast(u32, 1));
+    _join(j);
+    if (cast(i64, j.result.pixels) != 0) { buffer.destroy(&j.result); }
+    j.result.pixels = cast(*u8, 0);
+    atomic_store(&j.state, cast(u32, 0));
 }
 
 // An image from the file at path. What can be read of it is decoded: an

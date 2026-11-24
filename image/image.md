@@ -82,6 +82,35 @@ not decide to allocate on a program's behalf without being asked.
 
 ---
 
+## Decoding in the background
+
+`load.bytes` and `load.file` decode on the caller's thread and return when
+the image is whole; they stay as they are. A program that must not wait —
+a file manager's thumbnails, a browser's images — uses a `load.Job`:
+
+```
+let is load.Job as j;              // stays put until take or cancel
+load.start(&j, data, len);         // copies the bytes; returns at once
+...                                // each frame: draw a placeholder
+if (load.done(&j) == 1) {
+    let is image.buffer.Image as im = load.take(&j);   // no pixels: load.error(&j)
+}
+// or, no longer wanted: load.cancel(&j);
+```
+
+Where no thread can be started (the target has none, or spawning fails),
+`start` decodes before it returns and the Job is done at once: the same
+code runs, only without the overlap. Every decode — a Job's, `bytes`'s,
+`file`'s — takes one lock, because caustic-image's JPEG and WebP decoders
+keep their state in module variables; Jobs overlap the program, not each
+other. Decoding is whole or nothing — caustic-image decodes complete files
+— so there is no partial image to show while it runs, and `cancel` after
+the decode began waits for it to end and drops the result. A program takes
+or cancels its Jobs before `main` returns (its runtime ends with `exit`,
+not `exit_group`).
+
+---
+
 ## Formats
 
 The framework's own format enum — RGBA8, RGB8, R8, RGBA16F, RGBA32F and the

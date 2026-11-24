@@ -8,6 +8,13 @@
 use "std/io.cst" as io;
 use "image.cst" as img;
 use "load.cst" as load;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "caustic-image/encode.cst" as cencode;
+use "caustic-image/core/image.cst" as cimage;
+use "caustic-image/core/pixfmt.cst" as pixfmt;
+use "caustic-image/core/sniff.cst" as sniff;
+use "caustic-compact/core/bytes.cst" as cb;
 
 let is i32 as fails with mut = 0;
 
@@ -37,6 +44,131 @@ fn sized(im as *img.buffer.Image, format as i32) as i32 {
     if (cast(i64, im.pixels) != 0 && im.width == 3 && im.height == 2 && im.format == format
         && im.stride == 3 * img.bytes_per_pixel(format) && im.borrowed == 0) { return 1; }
     return 0;
+}
+
+// The file's bytes, in memory of their own (*len set), or 0.
+fn slurp(path as *u8, len as *i64) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is *u8 as data = mem.core.mmap_anon(65536);
+    let is i64 as n = linux.read(fd, data, 65536);
+    linux.close(fd);
+    *len = n;
+    return data;
+}
+
+fn same(a as *img.buffer.Image, b as *img.buffer.Image) as i32 {
+    if (a.width != b.width || a.height != b.height || a.format != b.format || a.stride != b.stride) { return 0; }
+    if (cast(i64, a.pixels) == 0 || cast(i64, b.pixels) == 0) { return 0; }
+    return cast(i32, mem.core.memcmp(a.pixels, b.pixels, a.stride * a.height) == 0);
+}
+
+// In the background: what bytes() gives, several at a time; the bytes the
+// caller's again as soon as start returns; refused and cancelled ones.
+fn jobs() as void {
+    let is [4]*u8 as names;
+    names[0] = "image/testdata/gray.png";
+    names[1] = "image/testdata/rgb.png";
+    names[2] = "image/testdata/rgba16.png";
+    names[3] = "image/testdata/palette.png";
+    let is [4]load.Job as js;
+    let is [4]img.buffer.Image as want;
+    let is i32 as k with mut = 0;
+    while (k < 4) {
+        let is i64 as n with mut = 0;
+        let is *u8 as data = slurp(names[k], &n);
+        want[k] = load.bytes(data, n);
+        check("started", load.start(&js[k], data, n) == 1);
+        // Its bytes overwritten at once: the Job decodes its own copy.
+        mem.core.memset(data, 0, n);
+        mem.core.munmap(data, 65536);
+        k = k + 1;
+    }
+    k = 0;
+    while (k < 4) {
+        let is img.buffer.Image as got with mut = load.take(&js[k]);
+        check("in the background: as bytes() decodes it", same(&got, &want[k]) == 1 && load.error(&js[k]) == 0);
+        check("taken: not done till started again", load.done(&js[k]) == 0);
+        img.buffer.destroy(&got);
+        img.buffer.destroy(&want[k]);
+        k = k + 1;
+    }
+    let is load.Job as bad with mut;
+    load.start(&bad, cast(*u8, "not an image at all"), 19);
+    let is img.buffer.Image as none with mut = load.take(&bad);
+    check("refused: no pixels, and why", cast(i64, none.pixels) == 0 && load.error(&bad) < 0);
+    load.start(&bad, cast(*u8, "GIF89a"), 0);
+    none = load.take(&bad);
+    check("no bytes: refused", cast(i64, none.pixels) == 0 && load.error(&bad) < 0);
+    let is i64 as n2 with mut = 0;
+    let is *u8 as d2 = slurp("image/testdata/rgba.png", &n2);
+    load.start(&bad, d2, n2);
+    load.cancel(&bad);
+    check("cancelled: nothing left, may start again", load.done(&bad) == 0 && cast(i64, bad.result.pixels) == 0);
+    load.start(&bad, d2, n2);
+    while (load.done(&bad) == 0) { }
+    let is img.buffer.Image as late = load.take(&bad);
+    check("done, then taken without waiting", sized(&late, img.RGBA8) == 1);
+    img.buffer.destroy(&late);
+    mem.core.munmap(d2, 65536);
+}
+
+// A 192 x 192 picture, seeded, as a JPEG into out.
+fn jpeg(seed as i64, out as *cb.Bytes) as void {
+    let is img.buffer.Image as im = img.buffer.create(192, 192, img.RGB8);
+    let is i64 as y with mut = 0;
+    while (y < 192) {
+        let is i64 as x with mut = 0;
+        while (x < 192) {
+            let is *u8 as px = cast(*u8, cast(i64, im.pixels) + y * im.stride + x * 3);
+            px[0] = cast(u8, (x * seed + y) & 255);
+            px[1] = cast(u8, (y * seed * 3 + x * x) & 255);
+            px[2] = cast(u8, ((x ^ y) * seed) & 255);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is cimage.Image as view;
+    view.pixels = im.pixels;
+    view.width = im.width;
+    view.height = im.height;
+    view.stride = im.stride;
+    view.fmt = pixfmt.FMT_RGB8;
+    view.owned = 0;
+    out.len = 0;
+    cencode.encode(&view, sniff.SNIFF_JPEG, out);
+    img.buffer.destroy(&im);
+}
+
+// JPEGs, whose decoder keeps its tables in module variables, eight at once:
+// each as it decodes alone — the lock keeps them one at a time.
+fn jpegs() as void {
+    let is [2]cb.Bytes as files;
+    let is [2]img.buffer.Image as want;
+    let is i32 as k with mut = 0;
+    while (k < 2) {
+        files[k] = cb.bytes_new(0);
+        jpeg(cast(i64, k * 5 + 3), &files[k]);
+        want[k] = load.bytes(files[k].ptr, files[k].len);
+        check("a JPEG made and read", want[k].width == 192 && load.last_error() == 0);
+        k = k + 1;
+    }
+    check("two pictures apart", same(&want[0], &want[1]) == 0);
+    let is [8]load.Job as js;
+    k = 0;
+    while (k < 8) { load.start(&js[k], files[k & 1].ptr, files[k & 1].len); k = k + 1; }
+    let is i32 as alike with mut = 0;
+    k = 0;
+    while (k < 8) {
+        let is img.buffer.Image as got with mut = load.take(&js[k]);
+        alike = alike + same(&got, &want[k & 1]);
+        img.buffer.destroy(&got);
+        k = k + 1;
+    }
+    if (alike != 8) { io.printf("  %d of 8 alike\n", alike); }
+    check("eight JPEGs at once: each as decoded alone", alike == 8);
+    k = 0;
+    while (k < 2) { img.buffer.destroy(&want[k]); cb.bytes_free(&files[k]); k = k + 1; }
 }
 
 fn main() as i32 {
@@ -79,6 +211,8 @@ fn main() as i32 {
     g = load.bytes(cast(*u8, "GIF89a"), 0);
     check("no bytes", cast(i64, g.pixels) == 0 && load.last_error() < 0);
     // And from memory, after a failure: the error cleared.
+    jobs();
+    jpegs();
     let is img.buffer.Image as again = load.file("image/testdata/rgb.png");
     check("after a failure, read", sized(&again, img.RGB8) == 1 && load.last_error() == 0);
     img.destroy(&again);
