@@ -1243,6 +1243,7 @@ the table of functions every kind of widget fills in.
 - `changed(t as *tree.Tree, w as i64, what as i32) as void`
 - `kind(name as *u8, data_bytes as i64) as tree.Kind` — A kind with no behaviour yet; the caller sets the entries it needs.
 - `theme(t as *tree.Tree, w as i64, out as *style.Theme) as void` — The theme that applies to w: its tree's, with every override from the root down to w laid on in that order, the nearest last.
+- `theme_at(t as *tree.Tree, w as i64, room as *style.Theme) as *style.Theme` — The same theme, to read and not to change: the tree's own where nothing from the root down to w overrides it — no copy, kilobytes, for each widget measured — else resolved into room, which is returned.
 
 ## `ui/winstate.cst`
 
