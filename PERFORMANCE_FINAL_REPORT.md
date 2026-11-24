@@ -10,7 +10,7 @@ each, is in `PERFORMANCE_STATUS.md`; this report sums it up.
 | State | Count | Items |
 |---|---|---|
 | FIXED | 42 | A1.1–A1.3, A2.1, A3.1–A3.4, A4.1–A4.3, A5.1, A5.2, A6.1, B1, B2.1, B2.2, B3, B4, B5.1, B5.2, B5.4, C1.1, C1.2, C1.3, C2, C3.1, C3.2, C3.3, C3.5, C4, C5, C6, D1.1, D1.2, D2.1, D2.2, D3, E1.1, E1.2, E2.2, E2.3 |
-| PARTIAL | 1 | C3.4 (compact vertices blocked by the pixel-exact rule) |
+| PARTIAL | 1 | C3.4 (64-byte vertices done; f32/u8 vertices blocked by the pixel-exact rule) |
 | UNRESOLVED | 0 | — |
 | NOT_APPLICABLE | 2 | A2.2, B5.3 (measured: the cost does not exist) |
 | BLOCKED | 0 | (C3.4's remainder is blocked; it is counted as PARTIAL) |
@@ -21,7 +21,7 @@ Architecture, tracked apart:
 |---|---|---|
 | F4 | FIXED (`a208bed`) | |
 | F1 | BLOCKED | the pixel-exact rule |
-| F2 | UNRESOLVED | evaluated; the bound is too small for the state it needs |
+| F2 | PARTIAL (`28eb3f9`) | glyph-cache hints done; keeping the quads themselves is not |
 | F3 | NOT_APPLICABLE in software | with C1.3, copying is cheaper than repainting what the buffer's age lacks |
 | F3 (GPU swapchain) | BLOCKED | there is no GPU backend |
 
@@ -48,6 +48,8 @@ Cross-project, tracked apart:
 | C1 premultiply | 1080p, translucent / opaque | 7.24 → 4.31–4.45 ms / 1.05 → 0.93 ms |
 | C1.3 | 1080p present into a premultiplied buffer, opaque (BGRA8 window texture) | 0.94 → 0.46 ms |
 | F4 | full repaint of a maximized window | one 1080p fill fewer (0.13 ms) |
+| F2 (hints) | a cached run drawn again, a glyph | 65–77 → 56–57 ns |
+| C3.4 (no z) | r_bench frame, same hash | 29.470 → 29.359 M instructions; vertex buffer 4.7 → 4.2 MB |
 | C2 | Wayland conversion, 1080p | 1.86–1.96 → 0.94 ms |
 | C3.1–3 | per frame | 12.2–13.0 → 9.6–10.0 M cycles |
 | C3.4/C3.5 | per frame | 35.0 → 30.1 → 29.33 M instructions |
@@ -91,6 +93,8 @@ and the 4-pixel group. Each was caught.
 ## Commits (c893bd7..HEAD)
 
 ```
+dbd0c6e draw2d: 64-byte vertices, no z
+28eb3f9 text/atlas, ui/text: a run's glyph found where it was last time
 a208bed ui: a square opaque frame over the window's background is not filled again
 7e9f7e3 gpu: a BGRA8 render target; the host draws in its window buffer's order
 bbd5bb6 ui/host_popup_win32_test: the tooltip's colour read in its padding
@@ -142,6 +146,10 @@ one), so they are not listed above.
   from `texture.create`, and the caller falls back to `RGBA8`, as the host
   does. `raster.set_bgra` is the software device's per-pass order: the
   backend sets it at `BEGIN_PASS` and resets it at `END_PASS`.
+- `pipeline.layout_pos2_color_uv()` is a 64-byte vertex layout
+  (x, y, colour, uv), which draw2d now uses. `atlas.get_hinted` is
+  `atlas.get` given where the glyph was found last time (`*hint`, -1 when
+  not known); `ui.text` keeps that in `Glyph.hint`.
 - `painter.S_ON_WINDOW_BG` tells the window's first widget that it is
   painted straight over the background just laid down. A widget that fills
   that same opaque colour without rounding can skip the fill.
@@ -180,9 +188,10 @@ one), so they are not listed above.
 
 ## What is left, and why
 
-- **C3.4, rest BLOCKED by the pixel-exact rule:** compact f32/u8 vertices
-  move positions and colours by rounding. Prerequisite: the owner accepts
-  non-exact vertex quantisation.
+- **C3.4, rest BLOCKED by the pixel-exact rule:**
+  - Done exactly: 64-byte vertices with no z, since z is always 0.
+  - Not done: f32/u8 positions and colours, which round. Prerequisite: the
+    owner accepts that.
 - **F1, BLOCKED by the pixel-exact rule (biggest remaining gain):**
   - 60 rounded controls make 38,520 vertices and take 4.53 ms, against
     0.36 ms as two quads each.
@@ -191,13 +200,15 @@ one), so they are not listed above.
   - Prerequisites: the owner accepts that, and decides an atlas budget.
   - The exact work left on that path is in the rasteriser: `_row_span`
     31%, `_fill_unlit` 15%, `_triangle` 11%.
-- **F2, UNRESOLVED (evaluated, not done):**
-  - A kept run must still touch each glyph's atlas slot, so it is not
-    evicted, and must still emit its vertices.
-  - Only the lookups (`_look`, 2.6% of a text-heavy frame) and part of
-    `_draw` (4.8%) would go.
-  - In exchange, each run would keep per-run slot and era state that can
-    go stale.
+- **F2, PARTIAL:**
+  - Done: each glyph remembers its glyph-cache entry, so drawing a run
+    again checks that one entry with no hashing (65–77 → 56–57 ns a glyph,
+    same pixels).
+  - Not done: keeping the quads themselves to replay as a vertex copy.
+  - Why: the quads would need per-run vertex and batch state kept valid
+    against clips, colour glyphs, decorations and atlas eviction. That is
+    a rewrite of text drawing for vertex emission, which is 32% of text
+    CPU. The goal asks to avoid speculative rewrites.
 - **F3:**
   - **Software, NOT_APPLICABLE:** after C1.3 presenting is a copy
     (0.15–0.2 ms) or a premultiply alone (0.46 ms) per full opaque 1080p
@@ -260,7 +271,7 @@ Its residual risks:
 
 ## Gates
 
-All five gate scripts pass at `a208bed`, the last code commit. They ran one
+All five gate scripts pass at `dbd0c6e`, the last code commit. They ran one
 at a time, inside the 2.5 GiB memory and 100% CPU caps, with
 `WAYLAND_DISPLAY` unset:
 

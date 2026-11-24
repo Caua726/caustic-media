@@ -44,7 +44,7 @@ exist). Low gain is not NOT_APPLICABLE.
 | C3.1 | ortho/screen-space vertex fast path | FIXED | `e91bea1`; mvp read in place, w = 1 when last row is 0 0 0 1, no divide by w = 1; exact |
 | C3.2 | `_six` shades 6 vertices of a quad | FIXED | `e91bea1`; repeated vertices (bytes equal) reuse the shaded corner; rect_test mutation (forced reuse) fails |
 | C3.3 | tint multiply when tint is white | FIXED | `e91bea1`; with C3.1/C3.2: 12.2–13.0 → 9.6–10.0 M cycles, 38.6 → 35.0 M instructions a frame, same hash |
-| C3.4 | 72-byte f64 vertices | PARTIAL | `53de283`; nine-f64 decode in place (35.0 → 30.1 M instructions a frame); compact f32/u8 vertices BLOCKED by the pixel-exact rule: they move positions and colours by rounding (prerequisite: the owner accepting non-exact vertex quantisation) |
+| C3.4 | 72-byte f64 vertices | PARTIAL | `53de283`: nine-f64 decode in place (35.0 → 30.1 M instructions a frame); `dbd0c6e`: 64-byte vertices, no z (draw2d's z is always 0): same hash, 29.470 → 29.359 M instructions, vertex buffer 4.7 → 4.2 MB; f32/u8 positions and colours BLOCKED by the pixel-exact rule (they round; prerequisite: the owner accepting that) |
 | C3.5 | vertices stored twice / copied per flush (= E2.1) | FIXED | `c3c1ebf`; caps.maps_in_place; draw2d writes into the vertex buffer; 30.08 → 29.33 M instructions, ~1.9 MB copy a frame fewer |
 | C4 | `rect_shaded`/`_same_shaded` by-value structs | FIXED | `7d9ed09`; confirmed rep movsb 6×80 B in the callee; now pointers; same hash, time within noise |
 | C5 | band threads spawned per pass | FIXED | `4e8fba0`; keep_threads (Linux, opt-in, host.run); 4 threads best 1.26–1.34 → 1.14–1.18 ms a frame; bands_test both modes |
@@ -64,7 +64,7 @@ exist). Low gain is not NOT_APPLICABLE.
 | ID | Option | State |
 |---|---|---|
 | F1 | shape coverage cache | BLOCKED — evaluated: 60 rounded controls (fill + border, 120×32, r 6, scale 1.5) 38,520 vertices, 4.53 ms vs 0.36 ms as two quads each (f1 bench); largest remaining gain; a mask composites once where the tessellation blends overlapping fringe triangles in turn, so not pixel-exact: prerequisite the owner accepting that, and an atlas budget. Exact work on the same path is in the rasteriser (_row_span 31%, _fill_unlit 15%, _triangle 11% of it) |
-| F2 | retained per-run text geometry | UNRESOLVED — evaluated, not done: a kept run must still touch each glyph's atlas slot (eviction) and emit its vertices; only the lookups (_look 2.6%) and part of _draw (4.8%) of a text-heavy frame would go, for per-run slot/era state that can go stale |
+| F2 | retained per-run text geometry | PARTIAL — `28eb3f9`: each glyph remembers its glyph-cache entry (Glyph.hint), checked and taken with no hash or probe: a run drawn again 65–77 → 56–57 ns a glyph, same pixels; keeping the quads themselves (vertex copy) not done: it needs per-run vertex/batch state kept valid against clips, colour glyphs, decorations and atlas eviction — a rewrite of text drawing for the 32% of text CPU that vertex emission is |
 | F3 | direct-to-buffer / swapchain presentation (C1 option 3) | NOT_APPLICABLE (software) / BLOCKED (GPU) — with C1.3 presenting is a copy (0.15–0.2 ms) or premultiply (0.46 ms) a full opaque 1080p frame; painting into the buffer instead means repainting what its age lacks (the last frames' damage), costlier than copying it, and breaks scroll pixel moves within a kept texture; swapchain presentation needs a GPU backend, none exists |
 | F4 | skip background clear under an opaque root | FIXED — `a208bed`: the window's first widget is told it is painted over the background just laid (painter.S_ON_WINDOW_BG); a square opaque decoration leaves its fill out: one full-window fill less per full repaint (0.13 ms at 1080p), same pixels (decoration_test, mutant caught) |
 
@@ -80,7 +80,7 @@ exist). Low gain is not NOT_APPLICABLE.
 - Baseline `caustic-mk run test` on `c893bd7`: failed at
   `sh ui/tools/api.sh | diff ui/api.md -` (api.md 7 entries stale on main);
   with api.md regenerated (`193ba9b`): rc=0.
-- Final, at `a208bed`: test, test-x11, test-wayland, test-win32 and
+- Final, at `dbd0c6e`: test, test-x11, test-wayland, test-win32 and
   test-win32-native all rc=0.
 
 ## New issues found
