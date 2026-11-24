@@ -134,6 +134,8 @@ struct Canvas {
     m           as [6]f64;   // a b c d e f: x' = ax + cy + e, y' = bx + dy + f
     moved       as i32;      // m is not the identity
     vmost       as i64;      // as far as the vertices may grow; vcap unless told
+    direct      as i32;      // verts is the vertex buffer's own memory (caps.maps_in_place): no upload
+    _pad_direct as i32;
     overflowed  as i32;
     ok          as i32;
 }
@@ -169,6 +171,7 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
     c.moved = 0;
     _identity(&c);
     c.vmost = c.vcap;
+    c.direct = 0;
     if (c.vcap < 3 || c.bcap < 1) { return c; }
 
     let is i64 as vbytes = c.vcap * sizeof(Vertex);
@@ -179,6 +182,16 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
     c.batches = cast(*u8, cast(i64, c.block) + vbytes);
 
     c.vbuf = buffer.create(d, vbytes, buffer.VERTEX);
+    // Where the device draws from its buffers' own memory, the vertices are
+    // written there: flush then has nothing to copy. The block's room for
+    // them stays mapped and untouched.
+    if (c.vbuf != 0 && d.caps.maps_in_place == 1) {
+        let is *u8 as mapped = buffer.map(d, c.vbuf);
+        if (cast(i64, mapped) != 0) {
+            c.verts = mapped;
+            c.direct = 1;
+        }
+    }
     c.shaders[0] = shader.builtin(d, shader.UNLIT_COLOR);
     c.shaders[1] = shader.builtin(d, shader.TEXTURED);
     c.shaders[2] = shader.builtin(d, shader.COVERAGE);
@@ -287,12 +300,28 @@ fn _grow(c as *Canvas) as i32 {
     let is *u8 as block = mem.core.mmap_anon(bytes);
     if (cast(i64, block) == 0 || cast(i64, block) == 0 - 1) { return 0; }
     let is *u8 as batches = cast(*u8, cast(i64, block) + vbytes);
-    if (c.vcount > 0) { mem.core.memcpy(block, c.verts, c.vcount * sizeof(Vertex)); }
+    let is *u8 as verts with mut = block;
+    let is i64 as vbuf with mut = 0;
+    if (c.direct == 1) {
+        // A bigger vertex buffer, written in place like the last.
+        vbuf = buffer.create(c.d, vbytes, buffer.VERTEX);
+        if (vbuf != 0) { verts = buffer.map(c.d, vbuf); }
+        if (vbuf == 0 || cast(i64, verts) == 0) {
+            if (vbuf != 0) { buffer.destroy(c.d, vbuf); }
+            mem.core.munmap(block, bytes);
+            return 0;
+        }
+    }
+    if (c.vcount > 0) { mem.core.memcpy(verts, c.verts, c.vcount * sizeof(Vertex)); }
     if (c.bcount > 0) { mem.core.memcpy(batches, c.batches, c.bcount * sizeof(Batch)); }
     mem.core.munmap(c.block, c.block_bytes);
+    if (c.direct == 1) {
+        buffer.destroy(c.d, c.vbuf);
+        c.vbuf = vbuf;
+    }
     c.block = block;
     c.block_bytes = bytes;
-    c.verts = block;
+    c.verts = verts;
     c.batches = batches;
     c.vcap = nv;
     c.bcap = nb;
@@ -787,13 +816,15 @@ fn flush(c as *Canvas, cmd as i64) as i32 {
     if (c.vcount == 0) { return result; }
 
     // A frame that grew past the buffer gets one that holds it.
-    if (c.vcount * sizeof(Vertex) > buffer.size(c.d, c.vbuf)) {
-        let is i64 as bigger = buffer.create(c.d, c.vcap * sizeof(Vertex), buffer.VERTEX);
-        if (bigger == 0) { return 0; }
-        buffer.destroy(c.d, c.vbuf);
-        c.vbuf = bigger;
+    if (c.direct == 0) {
+        if (c.vcount * sizeof(Vertex) > buffer.size(c.d, c.vbuf)) {
+            let is i64 as bigger = buffer.create(c.d, c.vcap * sizeof(Vertex), buffer.VERTEX);
+            if (bigger == 0) { return 0; }
+            buffer.destroy(c.d, c.vbuf);
+            c.vbuf = bigger;
+        }
+        buffer.upload(c.d, c.vbuf, 0, c.verts, c.vcount * sizeof(Vertex));
     }
-    buffer.upload(c.d, c.vbuf, 0, c.verts, c.vcount * sizeof(Vertex));
     // Physical pixels to clip space, y down.
     let is math.mat.Mat4 as proj = math.mat.m4_ortho(0.0, c.width, c.height, 0.0, 0.0 - 1.0, 1.0);
     let is shader.BuiltinUniforms as un = shader.uniforms_mvp(proj);
