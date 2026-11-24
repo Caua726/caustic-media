@@ -497,6 +497,7 @@ drawing the tree, region by region, through render/'s 2D family.
 - `cache_close(cc as *Cache) as void`
 - `cache_used(cc as *Cache, t as *tree.Tree) as i64` — How many entries hold a texture for a widget still alive.
 - `options(theme as *style.Theme) as Options`
+- `set_bg_hint(on as i32) as void` — Whether painter.S_ON_WINDOW_BG is given: 1, as it is; 0 to paint as if it never were — what a test compares the frames with it against.
 - `subtree(t as *tree.Tree, w as i64, x as f64, y as f64, rw as f64, rh as f64, c as *draw2d.Canvas, o as *Options) as void` — w and what it holds painted on c, which the caller has begun at rw by rh: the rectangle at x, y of w, in its own coordinates, at c's corner — what a drag shows of the widget it began from.
 - `frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of the tree's damage region on c, which the caller has begun.
 - `frame_surface(t as *tree.Tree, sf as i64, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of surface s's damage region — a widget shown in a window of its own (tree.surface_open) — on c, which the caller has begun at the surface's size: what is at the surface's corner in the wind...
