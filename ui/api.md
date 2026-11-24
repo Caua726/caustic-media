@@ -245,10 +245,13 @@ a folder's entries as a flat model.
 - `set_hidden(d as *Dir, on as i32) as void` — Names starting with a dot shown (1) or not (0, at first); read again.
 - `set_folders_only(d as *Dir, on as i32) as void` — Folders only (1), as when a folder is to be chosen, or files too (0, at first); read again.
 - `set_icons(d as *Dir, folder as i64, file as i64) as void` — A folder's name shown with icon folder, a file's with file — integers, as a list or table takes them (listview.show_icon); 0 for none.
+- `set_icon_fn(d as *Dir, f as i64, user as *u8) as void` — Each entry's ICON from f, fn(user *u8, d *Dir, index i64, out *model.Value) as i32 — an icon of the toolkit's (model.integer) or a texture of the program's (model.handle), 1 when it set one — instead of set_icons'...
+- `set_clock(d as *Dir, now as i64, offset as i64) as void` — Dates said as a person near now reads them — "Today 18:40", "Yesterday 09:30", "5 Nov 14:02", "5 Nov 2025" — at offset seconds east of UTC, against now, seconds since 1970; now 0 for "YYYY-MM-DD HH:MM" in UTC again.
 - `set_language(d as *Dir, lang as i32) as void` — Sizes said in language lang (strings.cst) from now on.
 - `set_filter(d as *Dir, s as *u8, n as i64) as void` — The files shown from now on, s, n bytes: patterns split at ';' or spaces; empty for all.
 - `size_text(v as i64, lang as i32, out as *u8) as i64` — A size as a person reads it in language lang, into out (32 bytes); how many bytes: bytes under 1000, then one decimal of kB, MB or GB.
 - `date_text(secs as i64, out as *u8) as i64` — Seconds since 1970 as "YYYY-MM-DD HH:MM", in UTC, into out (16 bytes): the days turned into a date as the proleptic Gregorian calendar has them.
+- `date_relative_text(secs as i64, now as i64, offset as i64, out as *u8) as i64` — secs as a person near now reads it, both at offset seconds east of UTC, into out (24 bytes): today and yesterday by name with the time, this year's with the day, month and time, older ones with the year.
 
 ## `ui/dnd.cst`
 
@@ -543,6 +546,7 @@ where each event goes.
 - `inputs(r as *Router) as i64` — How many presses and key presses have come so far: what changes when the user does something, for a tooltip to go away on.
 - `hovered(t as *tree.Tree, r as *Router, w as i64) as i32` — Whether w is under the pointer — itself or through a descendant.
 - `capture(r as *Router) as i64` — The widget holding the pointer, 0 for none.
+- `set_key_first(r as *Router, f as *u8, user as *u8) as void` — A program that has to see keys before the focused widget does: a browser, whose page answers keys first even with a text field focused.
 - `refresh_hover(t as *tree.Tree, r as *Router, time as i64) as void` — For when widgets moved under a pointer that did not: after a layout pass, a scroll, a widget shown or hidden.
 - `pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as void`
 - `pointer_shape(t as *tree.Tree, r as *Router) as i32` — The pointer's shape where it is, for the window to show: asked of the widget holding a press, wherever the pointer went, or else of the deepest one under it, then up the tree until one has a shape of its own.
@@ -836,6 +840,7 @@ the toolkit's text: one service per application that lays text out and draws it,
 - `next_frame(s as *Service) as void` — A frame begins: what the glyph caches hold for it is kept until the next.
 - `font_for(s as *Service, family as *u8, weight as i64, italic as i32) as *font.Font` — The font for a family, weight and style: resolved once and remembered.
 - `lay_layout(s as *Service, l as *layout.Layout, lstyles as *model.Style, text as *u8, nbytes as i64,` — The run's text set in styles, each span of it in its style and the rest in style 0, in the box params describes: 1, or 0 when it could not be — a style with no font, more than MAX_STYLES of them, memory refused, or ...
+- `layouts(s as *Service) as i64` — How many times s has laid text out since it opened — every lay_text, lay_plain and lay_layout: what a change costs, counted.
 - `lay_text(s as *Service, r as *Run, styles as *Style, nstyles as i64, spans as *model.Span, nspans as i64,`
 - `lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, nstyles as i64,` — The text — nbytes of UTF-8, copied into the run — laid out as lay_text does.
 - `lay_plain(s as *Service, r as *Run, text as *u8, nbytes as i64, st as *Style, params as *model.Params) as i32` — One style over the whole of the text: the common case.
@@ -1372,6 +1377,7 @@ one of a list's rows chosen, from a list that drops down.
 a window's frame, drawn by the toolkit.
 
 - `create(t as *tree.Tree, parent as i64) as i64` — A new frame filling parent — the tree's root, usually — a title bar across its top and a column under it for what the window holds.
+- `set_header_over(t as *tree.Tree, w as i64, on as i32) as void` — The title bar laid over what the window holds — which then fills the window to its top, under the bar — on 1; above it, as made, on 0.
 - `header_of(t as *tree.Tree, w as i64) as i64`
 - `content_of(t as *tree.Tree, w as i64) as i64`
 - `grip(t as *tree.Tree, w as i64, which as i32) as i64` — Edge or corner which's handle; 0 for none.
@@ -1611,6 +1617,7 @@ rows read from a model, only those seen made.
 - `set_single_click(t as *tree.Tree, w as i64, on as i32) as void` — A plain click activating its row, as in a list to pick one thing from, or (0, at first) only a double click.
 - `go_to(t as *tree.Tree, w as i64, index as i64) as void` — The keyboard to row index as an arrow key would move it there: alone chosen, the anchor there, brought into view.
 - `show_text(t as *tree.Tree, l as i64, m as *model.Model, id as i64, column as i64) as void` — Label l showing row id's text in column of m — a number in its digits — or nothing.
+- `icon_side(th as *style.Theme) as f64` — The side of an icon in a row, as the theme has it; ICON_SIZE when it says nothing.
 - `show_icon(t as *tree.Tree, im as i64, m as *model.Model, id as i64, column as i64) as void` — Image im showing row id's ICON in column of m — one of the toolkit's own icons (an integer) or a texture of the program's (a handle), ICON_SIZE square — or hidden when the row has none.
 - `row_icon(t as *tree.Tree, rw as i64) as i64` — The icon of row widget rw, one of the list's own making; 0 for none.
 - `digits(v as i64, out as *u8) as i64` — The decimal digits of v into out, 24 bytes; how many.
@@ -1850,6 +1857,7 @@ a window's title bar, drawn by the toolkit.
 - `set_maximized(t as *tree.Tree, w as i64, on as i32) as void` — The window is maximized, or not: its button restores, or maximizes.
 - `is_maximized(t as *tree.Tree, w as i64) as i32`
 - `set_rounding(t as *tree.Tree, w as i64, r as f64) as void` — Its top corners rounded by r, as the window's are when the toolkit draws its frame (decoration.cst); 0 for square.
+- `set_scrim(t as *tree.Tree, w as i64, on as i32) as void` — A shade over what is under it — dark at the top, clear at its foot — in place of the bar's colour (on 1), for a bar laid over a picture (decoration.set_header_over); its colour again (on 0).
 - `button(t as *tree.Tree, w as i64, which as i32) as i64` — The window's button which (MINIMIZE, MAXIMIZE, CLOSE), 0 when it has none.
 - `buttons(t as *tree.Tree, w as i64) as i32` — Which of the window's buttons it shows: BTN_* bits, always minimize, then maximize, then close.
 - `set_buttons(t as *tree.Tree, w as i64, flags as i32) as void` — The window's buttons it shows: flags, BTN_* bits.
