@@ -143,7 +143,9 @@ fn _texel(inf as *tex.Info, pixels as *u8, tx as i64, ty as i64) as math.color.C
         let is i64 as v = cast(i64, *cast(*u8, cast(i64, pixels) + i)) & 255;
         return math.color.gray(cast(f64, v) / 255.0);
     }
-    let is i64 as p = cast(i64, *cast(*i32, cast(i64, pixels) + i * 4)) & 4294967295;
+    let is i64 as p with mut = cast(i64, *cast(*i32, cast(i64, pixels) + i * 4)) & 4294967295;
+    // A BGRA8 texture's texel turned back first.
+    if (inf.format == tex.BGRA8) { p = (p & 4278255360) | ((p & 255) << 16) | ((p >> 16) & 255); }
     return math.color.unpack_rgba8(p);
 }
 
@@ -465,8 +467,11 @@ fn sw_texture_read_region(self as *u8, payload as *u8, dst as *u8, args as *u8) 
     let is i64 as row with mut = 0;
     while (row < ra.h) {
         let is i64 as src = cast(i64, st.pixels) + ((ra.y + row) * inf.width + ra.x) * bpp;
-        if (ra.convert == 0) {
+        if (ra.convert == 0 || (ra.convert == bgra.BGRA && inf.format == tex.BGRA8)) {
+            // As it is, or already in the order asked for.
             mem.core.memcpy(cast(*u8, cast(i64, dst) + row * ra.stride), cast(*u8, src), ra.w * bpp);
+        } else if (inf.format == tex.BGRA8) {
+            bgra.premultiply(cast(i64, dst) + row * ra.stride, src, ra.w);
         } else {
             bgra.convert(cast(i64, dst) + row * ra.stride, src, ra.w, cast(i32, ra.convert == bgra.BGRA_PREMULTIPLIED));
         }
@@ -577,6 +582,8 @@ struct Exec {
     cov_color   as math.color.Color;
     cov_ok      as i32;
     draws       as i32;   // 0: bindings followed, nothing drawn
+    cov_bgra    as i32;   // the order table was made in (raster.set_bgra)
+    _pad_cb     as i32;
     table       as [256]i32;
     // Drawing one band of the target: only rows band0 up to band1 are written,
     // and what lies wholly outside them is passed over before its vertices are
@@ -620,16 +627,18 @@ fn _coverage_for(ex as *Exec, col as math.color.Color) as *raster.Coverage8 {
         if (si.filter != tex.NEAREST || si.wrap != tex.CLAMP) { return cast(*raster.Coverage8, 0); }
     }
     let is math.color.Color as kc = ex.cov_color;
-    if (ex.cov_ok == 0 || kc.r != col.r || kc.g != col.g || kc.b != col.b || kc.a != col.a) {
+    if (ex.cov_ok == 0 || ex.cov_bgra != raster.bgra_order() ||
+        kc.r != col.r || kc.g != col.g || kc.b != col.b || kc.a != col.a) {
         // As fs_coverage makes it: the texel's value scales the alpha.
         let is i64 as k with mut = 0;
         while (k < 256) {
             let is math.color.Color as c with mut = col;
             c.a = col.a * (cast(f64, k) / 255.0);
-            ex.table[k] = cast(i32, math.color.pack_rgba8(c));
+            ex.table[k] = cast(i32, raster.ordered(math.color.pack_rgba8(c)));
             k = k + 1;
         }
         ex.cov_color = col;
+        ex.cov_bgra = raster.bgra_order();
         ex.cov_ok = 1;
     }
     ex.cov.pixels = ts.pixels;
@@ -653,6 +662,8 @@ fn _image_for(ex as *Exec) as *raster.Image32 {
     ex.img.pixels = ts.pixels;
     ex.img.width = inf.width;
     ex.img.height = inf.height;
+    // Turned as it is copied where its order is not the target's.
+    ex.img.swap = cast(i64, cast(i32, inf.format == tex.BGRA8) != raster.bgra_order());
     return &ex.img;
 }
 
@@ -969,6 +980,8 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
             }
 
             ex.target = tgt.target(cst.pixels, dpix, cinf.width, cinf.height);
+            // Its order, for every colour the pass makes (and its bands).
+            raster.set_bgra(cast(i32, cinf.format == tex.BGRA8));
             // A pass starts covering its whole target; SET_VIEWPORT narrows it.
             ex.st.vx = 0; ex.st.vy = 0;
             ex.st.vw = cinf.width; ex.st.vh = cinf.height;
@@ -977,7 +990,11 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
             ex.st.sx1 = cinf.width; ex.st.sy1 = cinf.height;
 
             if ((r.i2 & cmd.CLEAR_COLOR) != 0) {
-                tgt.clear_color(&ex.target, math.color.rgba(r.f0, r.f1, r.f2, r.f3));
+                if (cinf.format == tex.BGRA8) {
+                    tgt.clear_color(&ex.target, math.color.rgba(r.f2, r.f1, r.f0, r.f3));
+                } else {
+                    tgt.clear_color(&ex.target, math.color.rgba(r.f0, r.f1, r.f2, r.f3));
+                }
             }
             if ((r.i2 & cmd.CLEAR_DEPTH) != 0) {
                 _clear_depth_to(&ex.target, r.f4);
@@ -986,6 +1003,7 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
 
         } else if (r.op == cmd.OP_END_PASS) {
             ex.in_pass = 0;
+            raster.set_bgra(0);
 
         } else if (r.op == cmd.OP_SET_VIEWPORT) {
             ex.st.vx = r.i0; ex.st.vy = r.i1;
