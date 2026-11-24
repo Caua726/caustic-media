@@ -29,6 +29,7 @@
 // stages, and SPIR-V. A custom shader reports UNSUPPORTED instead of drawing
 // nothing.
 use "std/mem.cst" as mem;
+use "../bgra.cst" as bgra;
 use "std/env.cst" as env;
 use "std/os.cst" as os;
 use "std/thread.cst" as thread;
@@ -100,6 +101,8 @@ struct Env {
     uniforms as *u8;
     tex0     as *u8;   // texture payload, or null
     samp0    as *u8;   // sampler payload, or null
+    flat     as i32;   // the uniforms' mvp ends in a row 0 0 0 1: every w is 1 (_uniforms_set)
+    white    as i32;   // their tint is white: a colour times it is itself
 }
 
 // A vertex as decoded from the buffer, per the pipeline's declared layout.
@@ -140,7 +143,9 @@ fn _texel(inf as *tex.Info, pixels as *u8, tx as i64, ty as i64) as math.color.C
         let is i64 as v = cast(i64, *cast(*u8, cast(i64, pixels) + i)) & 255;
         return math.color.gray(cast(f64, v) / 255.0);
     }
-    let is i64 as p = cast(i64, *cast(*i32, cast(i64, pixels) + i * 4)) & 4294967295;
+    let is i64 as p with mut = cast(i64, *cast(*i32, cast(i64, pixels) + i * 4)) & 4294967295;
+    // A BGRA8 texture's texel turned back first.
+    if (inf.format == tex.BGRA8) { p = (p & 4278255360) | ((p & 255) << 16) | ((p >> 16) & 255); }
     return math.color.unpack_rgba8(p);
 }
 
@@ -210,11 +215,41 @@ fn vs_builtin(env as *u8, vin as *VertexIn, out as *raster.Shaded) as i64 {
         return 1;
     }
     let is *shd.BuiltinUniforms as un = cast(*shd.BuiltinUniforms, e.uniforms);
-    out.clip = math.mat.m4_mul_v4(un.mvp, math.vec.v4_point(vin.pos));
-    out.vary.color = math.color.col_mul(vin.color, un.tint);
+    if (e.flat == 1) {
+        // m4_mul_v4 term for term, the matrix read where it is rather than
+        // copied: a point's w is 1, so each row's last term is its
+        // translation, and a last row of 0 0 0 1 gives w = 1 exactly.
+        let is *f64 as m = cast(*f64, &un.mvp);
+        let is f64 as x = vin.pos.x;
+        let is f64 as y = vin.pos.y;
+        let is f64 as z = vin.pos.z;
+        out.clip.x = m[0] * x + m[4] * y + m[8] * z + m[12];
+        out.clip.y = m[1] * x + m[5] * y + m[9] * z + m[13];
+        out.clip.z = m[2] * x + m[6] * y + m[10] * z + m[14];
+        out.clip.w = 1.0;
+    } else {
+        out.clip = math.mat.m4_mul_v4(un.mvp, math.vec.v4_point(vin.pos));
+    }
+    // A colour times white is itself.
+    if (e.white == 1) {
+        out.vary.color = vin.color;
+    } else {
+        out.vary.color = math.color.col_mul(vin.color, un.tint);
+    }
     out.vary.u = vin.u;
     out.vary.v = vin.v;
     return 1;
+}
+
+// What vs_builtin may skip for the uniforms just set.
+fn _uniforms_set(e as *Env) as void {
+    e.flat = 0;
+    e.white = 0;
+    if (cast(i64, e.uniforms) == 0) { return; }
+    let is *shd.BuiltinUniforms as un = cast(*shd.BuiltinUniforms, e.uniforms);
+    let is *f64 as m = cast(*f64, &un.mvp);
+    if (m[3] == 0.0 && m[7] == 0.0 && m[11] == 0.0 && m[15] == 1.0) { e.flat = 1; }
+    if (un.tint.r == 1.0 && un.tint.g == 1.0 && un.tint.b == 1.0 && un.tint.a == 1.0) { e.white = 1; }
 }
 
 fn fs_unlit(env as *u8, vary as *raster.Varyings) as i64 {
@@ -285,6 +320,76 @@ fn _read_component(base as i64, off as i64, fmt as i32, out as *f64) as i64 {
         return 4;
     }
     return 0;
+}
+
+// Whether lay is layout_pos_color_uv's — draw2d's — exactly.
+fn _is_pcu(lay as *pipe.Layout) as i32 {
+    if (lay.stride != 72 || lay.count != 3) { return 0; }
+    if (lay.attrs[0].location != pipe.LOC_POSITION || lay.attrs[0].format != pipe.F64X3 || lay.attrs[0].offset != 0) { return 0; }
+    if (lay.attrs[1].location != pipe.LOC_COLOR || lay.attrs[1].format != pipe.F64X4 || lay.attrs[1].offset != 24) { return 0; }
+    if (lay.attrs[2].location != pipe.LOC_UV || lay.attrs[2].format != pipe.F64X2 || lay.attrs[2].offset != 56) { return 0; }
+    return 1;
+}
+
+// layout_pos2_color_uv_f32's, exactly: 3; layout_pos2_color_uv's: 2;
+// layout_pos_color_uv's: 1; 0 for others.
+fn _layout_kind(lay as *pipe.Layout) as i32 {
+    if (_is_pcu(lay) == 1) { return 1; }
+    if (lay.stride == 32 && lay.count == 3 &&
+        lay.attrs[0].location == pipe.LOC_POSITION && lay.attrs[0].format == pipe.F32X2 && lay.attrs[0].offset == 0 &&
+        lay.attrs[1].location == pipe.LOC_COLOR && lay.attrs[1].format == pipe.F32X4 && lay.attrs[1].offset == 8 &&
+        lay.attrs[2].location == pipe.LOC_UV && lay.attrs[2].format == pipe.F32X2 && lay.attrs[2].offset == 24) { return 3; }
+    if (lay.stride != 64 || lay.count != 3) { return 0; }
+    if (lay.attrs[0].location != pipe.LOC_POSITION || lay.attrs[0].format != pipe.F64X2 || lay.attrs[0].offset != 0) { return 0; }
+    if (lay.attrs[1].location != pipe.LOC_COLOR || lay.attrs[1].format != pipe.F64X4 || lay.attrs[1].offset != 16) { return 0; }
+    if (lay.attrs[2].location != pipe.LOC_UV || lay.attrs[2].format != pipe.F64X2 || lay.attrs[2].offset != 48) { return 0; }
+    return 2;
+}
+
+// A vertex of layout_pos2_color_uv_f32: eight f32s, z 0.
+fn _decode_p2cu32(vptr as i64, out as *VertexIn) as void {
+    let is *f32 as f = cast(*f32, vptr);
+    out.pos = math.vec.v3(cast(f64, f[0]), cast(f64, f[1]), 0.0);
+    out.color = math.color.rgba(cast(f64, f[2]), cast(f64, f[3]), cast(f64, f[4]), cast(f64, f[5]));
+    out.u = cast(f64, f[6]);
+    out.v = cast(f64, f[7]);
+}
+
+// A vertex of layout_pos2_color_uv: eight f64s, z 0, as _decode_vertex
+// reads a two-component position.
+fn _decode_p2cu(vptr as i64, out as *VertexIn) as void {
+    let is *f64 as f = cast(*f64, vptr);
+    out.pos = math.vec.v3(f[0], f[1], 0.0);
+    out.color = math.color.rgba(f[2], f[3], f[4], f[5]);
+    out.u = f[6];
+    out.v = f[7];
+}
+
+// A vertex of layout_pos_color_uv: nine f64s in order, what _decode_vertex
+// reads from that layout one attribute and one component at a time.
+fn _decode_pcu(vptr as i64, out as *VertexIn) as void {
+    let is *f64 as f = cast(*f64, vptr);
+    out.pos = math.vec.v3(f[0], f[1], f[2]);
+    out.color = math.color.rgba(f[3], f[4], f[5], f[6]);
+    out.u = f[7];
+    out.v = f[8];
+}
+
+// One vertex, by the fast way when the layout is draw2d's.
+fn _decode(ex as *Exec, vptr as i64, out as *VertexIn) as void {
+    if (ex.pcu == 3) {
+        _decode_p2cu32(vptr, out);
+        return;
+    }
+    if (ex.pcu == 2) {
+        _decode_p2cu(vptr, out);
+        return;
+    }
+    if (ex.pcu == 1) {
+        _decode_pcu(vptr, out);
+        return;
+    }
+    _decode_vertex(vptr, &ex.layout, out);
 }
 
 // Decodes one vertex. Attributes the layout does not declare keep their
@@ -404,7 +509,14 @@ fn sw_texture_read_region(self as *u8, payload as *u8, dst as *u8, args as *u8) 
     let is i64 as row with mut = 0;
     while (row < ra.h) {
         let is i64 as src = cast(i64, st.pixels) + ((ra.y + row) * inf.width + ra.x) * bpp;
-        mem.core.memcpy(cast(*u8, cast(i64, dst) + row * ra.stride), cast(*u8, src), ra.w * bpp);
+        if (ra.convert == 0 || (ra.convert == bgra.BGRA && inf.format == tex.BGRA8)) {
+            // As it is, or already in the order asked for.
+            mem.core.memcpy(cast(*u8, cast(i64, dst) + row * ra.stride), cast(*u8, src), ra.w * bpp);
+        } else if (inf.format == tex.BGRA8) {
+            bgra.premultiply(cast(i64, dst) + row * ra.stride, src, ra.w);
+        } else {
+            bgra.convert(cast(i64, dst) + row * ra.stride, src, ra.w, cast(i32, ra.convert == bgra.BGRA_PREMULTIPLIED));
+        }
         row = row + 1;
     }
     return 1;
@@ -495,6 +607,8 @@ struct Exec {
     st          as raster.ShadeState;
     env         as Env;
     layout      as pipe.Layout;
+    pcu         as i32;   // 1: pipe.layout_pos_color_uv's, decoded by _decode_pcu; 2: layout_pos2_color_uv's, by _decode_p2cu
+    _pad_pcu    as i32;
     vert_stage  as *u8;
     vdata       as *u8;
     vbytes      as i64;
@@ -510,6 +624,8 @@ struct Exec {
     cov_color   as math.color.Color;
     cov_ok      as i32;
     draws       as i32;   // 0: bindings followed, nothing drawn
+    cov_bgra    as i32;   // the order table was made in (raster.set_bgra)
+    _pad_cb     as i32;
     table       as [256]i32;
     // Drawing one band of the target: only rows band0 up to band1 are written,
     // and what lies wholly outside them is passed over before its vertices are
@@ -553,16 +669,18 @@ fn _coverage_for(ex as *Exec, col as math.color.Color) as *raster.Coverage8 {
         if (si.filter != tex.NEAREST || si.wrap != tex.CLAMP) { return cast(*raster.Coverage8, 0); }
     }
     let is math.color.Color as kc = ex.cov_color;
-    if (ex.cov_ok == 0 || kc.r != col.r || kc.g != col.g || kc.b != col.b || kc.a != col.a) {
+    if (ex.cov_ok == 0 || ex.cov_bgra != raster.bgra_order() ||
+        kc.r != col.r || kc.g != col.g || kc.b != col.b || kc.a != col.a) {
         // As fs_coverage makes it: the texel's value scales the alpha.
         let is i64 as k with mut = 0;
         while (k < 256) {
             let is math.color.Color as c with mut = col;
             c.a = col.a * (cast(f64, k) / 255.0);
-            ex.table[k] = cast(i32, math.color.pack_rgba8(c));
+            ex.table[k] = cast(i32, raster.ordered(math.color.pack_rgba8(c)));
             k = k + 1;
         }
         ex.cov_color = col;
+        ex.cov_bgra = raster.bgra_order();
         ex.cov_ok = 1;
     }
     ex.cov.pixels = ts.pixels;
@@ -586,6 +704,8 @@ fn _image_for(ex as *Exec) as *raster.Image32 {
     ex.img.pixels = ts.pixels;
     ex.img.width = inf.width;
     ex.img.height = inf.height;
+    // Turned as it is copied where its order is not the target's.
+    ex.img.swap = cast(i64, cast(i32, inf.format == tex.BGRA8) != raster.bgra_order());
     return &ex.img;
 }
 
@@ -752,9 +872,9 @@ fn _emit_triangle(ex as *Exec, ia as i64, ib as i64, ic as i64) as void {
     let is VertexIn as va;
     let is VertexIn as vb;
     let is VertexIn as vc;
-    _decode_vertex(base + ia * stride, &ex.layout, &va);
-    _decode_vertex(base + ib * stride, &ex.layout, &vb);
-    _decode_vertex(base + ic * stride, &ex.layout, &vc);
+    _decode(ex, base + ia * stride, &va);
+    _decode(ex, base + ib * stride, &vb);
+    _decode(ex, base + ic * stride, &vc);
 
     let is raster.Shaded as sa;
     let is raster.Shaded as sb;
@@ -764,6 +884,20 @@ fn _emit_triangle(ex as *Exec, ia as i64, ib as i64, ic as i64) as void {
     call(ex.vert_stage, cast(*u8, &ex.env), &vc, &sc);
 
     raster.triangle_image(&ex.target, &sa, &sb, &sc, &ex.st, ex.img_p);
+}
+
+// Whether n bytes at a and b are the same: eight at a time, then one.
+fn _same_bytes(a as i64, b as i64, n as i64) as i32 {
+    let is i64 as i with mut = 0;
+    while (i + 8 <= n) {
+        if (*cast(*i64, a + i) != *cast(*i64, b + i)) { return 0; }
+        i = i + 8;
+    }
+    while (i < n) {
+        if (*cast(*u8, a + i) != *cast(*u8, b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
 }
 
 // Six vertices from first, two triangles: one rectangle, as draw2d draws
@@ -778,9 +912,19 @@ fn _six(ex as *Exec, first as i64) as i32 {
     let is [6]raster.Shaded as sh;
     let is i64 as k with mut = 0;
     while (k < 6) {
-        let is VertexIn as vi;
-        _decode_vertex(base + (first + k) * stride, &ex.layout, &vi);
-        call(ex.vert_stage, cast(*u8, &ex.env), &vi, &sh[k]);
+        // draw2d's quads repeat their first and third corners as the fourth
+        // and fifth: the same bytes, the same stage, the same shaded vertex.
+        let is i64 as again with mut = 0 - 1;
+        if (k == 3) { again = 0; }
+        if (k == 4) { again = 2; }
+        if (again >= 0 && _same_bytes(base + (first + k) * stride, base + (first + again) * stride, stride) == 1) {
+            sh[k].clip = sh[again].clip;
+            sh[k].vary = sh[again].vary;
+        } else {
+            let is VertexIn as vi;
+            _decode(ex, base + (first + k) * stride, &vi);
+            call(ex.vert_stage, cast(*u8, &ex.env), &vi, &sh[k]);
+        }
         k = k + 1;
     }
     let is *raster.Coverage8 as cov = _coverage_for(ex, sh[0].vary.color);
@@ -791,7 +935,7 @@ fn _six(ex as *Exec, first as i64) as i32 {
         tw = cast(*tex.Info, ex.env.tex0).width;
         th = cast(*tex.Info, ex.env.tex0).height;
     }
-    if (raster.rect_shaded(&ex.target, sh[0], sh[1], sh[2], sh[3], sh[4], sh[5], &ex.st, tw, th, cov, ex.img_p) == 1) {
+    if (raster.rect_shaded(&ex.target, &sh[0], &sh[1], &sh[2], &sh[3], &sh[4], &sh[5], &ex.st, tw, th, cov, ex.img_p) == 1) {
         if (ex.band_on == 0) { _rects_filled = _rects_filled + 1; }
         return 1;
     }
@@ -878,6 +1022,8 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
             }
 
             ex.target = tgt.target(cst.pixels, dpix, cinf.width, cinf.height);
+            // Its order, for every colour the pass makes (and its bands).
+            raster.set_bgra(cast(i32, cinf.format == tex.BGRA8));
             // A pass starts covering its whole target; SET_VIEWPORT narrows it.
             ex.st.vx = 0; ex.st.vy = 0;
             ex.st.vw = cinf.width; ex.st.vh = cinf.height;
@@ -886,7 +1032,11 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
             ex.st.sx1 = cinf.width; ex.st.sy1 = cinf.height;
 
             if ((r.i2 & cmd.CLEAR_COLOR) != 0) {
-                tgt.clear_color(&ex.target, math.color.rgba(r.f0, r.f1, r.f2, r.f3));
+                if (cinf.format == tex.BGRA8) {
+                    tgt.clear_color(&ex.target, math.color.rgba(r.f2, r.f1, r.f0, r.f3));
+                } else {
+                    tgt.clear_color(&ex.target, math.color.rgba(r.f0, r.f1, r.f2, r.f3));
+                }
             }
             if ((r.i2 & cmd.CLEAR_DEPTH) != 0) {
                 _clear_depth_to(&ex.target, r.f4);
@@ -895,6 +1045,7 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
 
         } else if (r.op == cmd.OP_END_PASS) {
             ex.in_pass = 0;
+            raster.set_bgra(0);
 
         } else if (r.op == cmd.OP_SET_VIEWPORT) {
             ex.st.vx = r.i0; ex.st.vy = r.i1;
@@ -919,6 +1070,7 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
             let is *pipe.Info as pinf = cast(*pipe.Info, pp);
             let is *PipeState as pst = cast(*PipeState, pipe.backend_state(pp));
             ex.layout = pinf.desc.vertex_layout;
+            ex.pcu = _layout_kind(&ex.layout);
             ex.st.cull = pinf.desc.cull;
             ex.st.depth_test = pinf.desc.depth_test;
             ex.st.depth_write = pinf.desc.depth_write;
@@ -955,6 +1107,7 @@ fn _replay(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to as i
 
         } else if (r.op == cmd.OP_SET_UNIFORMS) {
             ex.env.uniforms = cast(*u8, cast(i64, ci.uniforms) + r.i0);
+            _uniforms_set(&ex.env);
             ex.ym_state = 0;
 
         } else if (r.op == cmd.OP_DRAW) {
@@ -1076,6 +1229,139 @@ fn _band_worker(arg as i64) as i64 {
     return 0;
 }
 
+// --- The band workers, kept between passes (Linux, keep_threads) ---
+//
+// Starting threads for every pass costs a stack mapped and freed and a clone
+// and a join for each, 170-270 us a pass for three. Between keep_threads(1)
+// and keep_threads(0) the workers are kept on Linux: each waits on its own
+// word until a pass is handed to it. keep_threads(0) ends and joins them
+// before it returns, and it must come before main returns: main ends with
+// exit, not exit_group, so threads still asleep would outlive it and the
+// process's status would be the last one's, not main's. As a net, a worker
+// with nothing for POOL_IDLE_MS ends itself. Outside, and on Windows and
+// CausticOS (no futex: a waiter there yields in a loop), threads are started
+// for each pass as before.
+//
+// A worker's word: GONE (0, not running), IDLE (1, waiting), GIVEN (2, a pass
+// handed to it), QUIT (3, told to end). Only the caller moves IDLE to GIVEN
+// or QUIT, only the worker GIVEN to IDLE or IDLE to GONE — each by
+// compare-and-swap, so a worker leaving as a pass is handed to it either
+// takes the pass or is seen gone and started again.
+let is i64 as POOL_IDLE_MS with imut = 100;
+let is u32 as _GONE with imut = 0;
+let is u32 as _IDLE with imut = 1;
+let is u32 as _GIVEN with imut = 2;
+let is u32 as _QUIT with imut = 3;
+let is i32 as _keep with mut = 0;
+let is [32]u32 as _pool_state with mut;
+let is [32]thread.Thread as _pool_ths with mut;
+let is [32]i32 as _pool_started with mut;   // a thread to join before its slot is used again
+let is i64 as _pool_job with mut = 0;        // *BandJob of the pass handed out
+let is u32 as _pool_left with mut = 0;       // workers given the pass and not done with it
+let is i64 as _pool_starts with mut = 0;     // threads started, for tests
+
+fn _pool_worker(arg as i64) as i64 {
+    let is i64 as k = arg;
+    let is *u32 as word = &_pool_state[k];
+    let is [2]i64 as ts;
+    ts[0] = POOL_IDLE_MS / 1000;
+    ts[1] = (POOL_IDLE_MS % 1000) * 1000000;
+    while (1) {
+        let is u32 as s = atomic_load(word);
+        if (s == _QUIT) { return 0; }
+        if (s == _GIVEN) {
+            _band_worker(_pool_job);
+            atomic_store(word, _IDLE);
+            if (atomic_add(&_pool_left, cast(u32, 0 - 1)) == cast(u32, 1)) {
+                _pool_wake(&_pool_left);
+            }
+        } else {
+            let is i64 as r = _pool_wait(word, cast(i64, _IDLE), cast(*u8, &ts));
+            // Timed out with nothing handed over: gone, unless a pass came
+            // just now, which the next turn takes.
+            if (r == 0 - 110 && atomic_cas(word, _IDLE, _GONE) == _IDLE) { return 0; }
+        }
+    }
+    return 0;
+}
+
+// The futex calls, each inside the test for Linux — the only system the
+// pool runs on — so a build for another has no Linux system call in it.
+fn _pool_wake(word as *u32) as void {
+    if (os.current() == os.OS_LINUX) {
+        os.linux.futex(cast(*u8, word), os.linux.FUTEX_WAKE_PRIVATE, 1, cast(*u8, 0), cast(*u8, 0), 0);
+    }
+}
+
+fn _pool_wait(word as *u32, v as i64, timeout as *u8) as i64 {
+    if (os.current() == os.OS_LINUX) {
+        return os.linux.futex(cast(*u8, word), os.linux.FUTEX_WAIT_PRIVATE, v, timeout, cast(*u8, 0), 0);
+    }
+    return 0;
+}
+
+// job drawn by the caller and n - 1 kept workers; 0 when one could not be
+// started, which leaves its share to the others as before.
+fn _pool_run(job as *BandJob, n as i64) as void {
+    _pool_job = cast(i64, job);
+    atomic_store(&_pool_left, cast(u32, 0));
+    let is i64 as k with mut = 0;
+    while (k < n - 1) {
+        if (atomic_cas(&_pool_state[k], _IDLE, _GIVEN) == _IDLE) {
+            atomic_add(&_pool_left, cast(u32, 1));
+            _pool_wake(&_pool_state[k]);
+        } else {
+            // Gone (or never started): its stack back, then a new one, given the pass.
+            if (_pool_started[k] == 1) {
+                thread.join(&_pool_ths[k]);
+                _pool_started[k] = 0;
+            }
+            atomic_store(&_pool_state[k], _GIVEN);
+            atomic_add(&_pool_left, cast(u32, 1));
+            if (thread.spawn(&_pool_ths[k], fn_ptr(_pool_worker), k) == 0) {
+                _pool_started[k] = 1;
+                _pool_starts = _pool_starts + 1;
+            } else {
+                atomic_store(&_pool_state[k], _GONE);
+                atomic_add(&_pool_left, cast(u32, 0 - 1));
+            }
+        }
+        k = k + 1;
+    }
+    _band_worker(cast(i64, job));
+    let is u32 as v with mut = atomic_load(&_pool_left);
+    while (v != cast(u32, 0)) {
+        _pool_wait(&_pool_left, cast(i64, v), cast(*u8, 0));
+        v = atomic_load(&_pool_left);
+    }
+}
+
+// Band workers kept between passes (1) or started for each (0, the
+// default); 0 ends and joins any kept, before it returns. Only Linux keeps
+// them. A program that turns it on turns it off before main returns.
+fn keep_threads(on as i32) as void {
+    if (on == 1 && os.current() == os.OS_LINUX) {
+        _keep = 1;
+        return;
+    }
+    _keep = 0;
+    let is i64 as k with mut = 0;
+    while (k < MAX_THREADS) {
+        if (atomic_cas(&_pool_state[k], _IDLE, _QUIT) == _IDLE) {
+            _pool_wake(&_pool_state[k]);
+        }
+        if (_pool_started[k] == 1) {
+            thread.join(&_pool_ths[k]);
+            _pool_started[k] = 0;
+        }
+        atomic_store(&_pool_state[k], _GONE);
+        k = k + 1;
+    }
+}
+
+// How many band threads have been started since the process began: for tests.
+fn pool_starts() as i64 { return _pool_starts; }
+
 // Records from up to to drawn on _threads threads, the caller's one of them.
 // Twice as many bands as threads, so that one with little in it leaves its
 // thread free for the next. A thread that cannot be started leaves its share to
@@ -1094,6 +1380,13 @@ fn _draw_bands(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to 
     job.next = 0;
     let is [32]thread.Thread as ths;
     let is [32]i32 as started;
+    // The bands race on the rasterizer's test counter: none counted.
+    raster.count_fills(0);
+    if (_keep == 1) {
+        _pool_run(&job, _threads);
+        raster.count_fills(1);
+        return;
+    }
     let is i64 as i with mut = 1;
     while (i < _threads) {
         started[i] = cast(i32, thread.spawn(&ths[i], fn_ptr(_band_worker), cast(i64, &job)) == 0);
@@ -1105,6 +1398,7 @@ fn _draw_bands(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to 
         if (started[i] == 1) { thread.join(&ths[i]); }
         i = i + 1;
     }
+    raster.count_fills(1);
 }
 
 fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
@@ -1113,6 +1407,7 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
     let is Exec as ex;
     ex.in_pass = 0;
     ex.has_pipe = 0;
+    ex.pcu = 0;
     ex.vdata = cast(*u8, 0);
     ex.vbytes = 0;
     ex.idata = cast(*u8, 0);
@@ -1122,6 +1417,8 @@ fn sw_commands_submit(self as *u8, payload as *u8, dv as *dev.Device) as i64 {
     ex.env.uniforms = cast(*u8, 0);
     ex.env.tex0 = cast(*u8, 0);
     ex.env.samp0 = cast(*u8, 0);
+    ex.env.flat = 0;
+    ex.env.white = 0;
     ex.vert_stage = cast(*u8, 0);
     ex.st.frag = cast(*u8, 0);
     ex.st.env = cast(*u8, &ex.env);
@@ -1354,6 +1651,8 @@ fn _fill_caps(d as *dev.Device) as void {
     d.caps.has_compute = 0;
     d.caps.has_geometry = 0;
     d.caps.has_custom_shaders = 0;
+    // sw_buffer_map hands out the allocation itself; a submit draws before it returns.
+    d.caps.maps_in_place = 1;
 }
 
 // Always succeeds unless memory does. That is what lets gpu.AUTO fall through

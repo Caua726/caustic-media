@@ -8,6 +8,15 @@
 use "std/io.cst" as io;
 use "image.cst" as img;
 use "load.cst" as load;
+use "std/mem.cst" as mem;
+use "std/os/linux.cst" as linux;
+use "caustic-image/encode.cst" as cencode;
+use "caustic-image/core/image.cst" as cimage;
+use "caustic-image/core/pixfmt.cst" as pixfmt;
+use "caustic-image/core/sniff.cst" as sniff;
+use "caustic-compact/core/bytes.cst" as cb;
+use "caustic-compact/core/checksum.cst" as checksum;
+use "std/thread.cst" as thread;
 
 let is i32 as fails with mut = 0;
 
@@ -37,6 +46,441 @@ fn sized(im as *img.buffer.Image, format as i32) as i32 {
     if (cast(i64, im.pixels) != 0 && im.width == 3 && im.height == 2 && im.format == format
         && im.stride == 3 * img.bytes_per_pixel(format) && im.borrowed == 0) { return 1; }
     return 0;
+}
+
+// The file's bytes, in memory of their own (*len set), or 0.
+fn slurp(path as *u8, len as *i64) as *u8 {
+    let is i64 as fd = linux.open(path, 0, 0);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is *u8 as data = mem.core.mmap_anon(65536);
+    let is i64 as n = linux.read(fd, data, 65536);
+    linux.close(fd);
+    *len = n;
+    return data;
+}
+
+fn same(a as *img.buffer.Image, b as *img.buffer.Image) as i32 {
+    if (a.width != b.width || a.height != b.height || a.format != b.format || a.stride != b.stride) { return 0; }
+    if (cast(i64, a.pixels) == 0 || cast(i64, b.pixels) == 0) { return 0; }
+    return cast(i32, mem.core.memcmp(a.pixels, b.pixels, a.stride * a.height) == 0);
+}
+
+// In the background: what bytes() gives, several at a time; the bytes the
+// caller's again as soon as start returns; refused and cancelled ones.
+fn jobs() as void {
+    let is [4]*u8 as names;
+    names[0] = "image/testdata/gray.png";
+    names[1] = "image/testdata/rgb.png";
+    names[2] = "image/testdata/rgba16.png";
+    names[3] = "image/testdata/palette.png";
+    let is [4]load.Job as js;
+    let is [4]img.buffer.Image as want;
+    let is i32 as k with mut = 0;
+    while (k < 4) {
+        let is i64 as n with mut = 0;
+        let is *u8 as data = slurp(names[k], &n);
+        want[k] = load.bytes(data, n);
+        check("started", load.start(&js[k], data, n) == 1);
+        // Its bytes overwritten at once: the Job decodes its own copy.
+        mem.core.memset(data, 0, n);
+        mem.core.munmap(data, 65536);
+        k = k + 1;
+    }
+    k = 0;
+    while (k < 4) {
+        let is img.buffer.Image as got with mut = load.take(&js[k]);
+        check("in the background: as bytes() decodes it", same(&got, &want[k]) == 1 && load.error(&js[k]) == 0);
+        check("taken: not done till started again", load.done(&js[k]) == 0);
+        img.buffer.destroy(&got);
+        img.buffer.destroy(&want[k]);
+        k = k + 1;
+    }
+    let is load.Job as bad with mut;
+    load.start(&bad, cast(*u8, "not an image at all"), 19);
+    let is img.buffer.Image as none with mut = load.take(&bad);
+    check("refused: no pixels, and why", cast(i64, none.pixels) == 0 && load.error(&bad) < 0);
+    load.start(&bad, cast(*u8, "GIF89a"), 0);
+    none = load.take(&bad);
+    check("no bytes: refused", cast(i64, none.pixels) == 0 && load.error(&bad) < 0);
+    let is i64 as n2 with mut = 0;
+    let is *u8 as d2 = slurp("image/testdata/rgba.png", &n2);
+    load.start(&bad, d2, n2);
+    load.cancel(&bad);
+    check("cancelled: nothing left, may start again", load.done(&bad) == 0 && cast(i64, bad.result.pixels) == 0);
+    load.start(&bad, d2, n2);
+    while (load.done(&bad) == 0) { }
+    let is img.buffer.Image as late = load.take(&bad);
+    check("done, then taken without waiting", sized(&late, img.RGBA8) == 1);
+    img.buffer.destroy(&late);
+    mem.core.munmap(d2, 65536);
+}
+
+// A 192 x 192 picture, seeded, as a JPEG into out.
+fn jpeg(seed as i64, out as *cb.Bytes) as void {
+    let is img.buffer.Image as im = img.buffer.create(192, 192, img.RGB8);
+    let is i64 as y with mut = 0;
+    while (y < 192) {
+        let is i64 as x with mut = 0;
+        while (x < 192) {
+            let is *u8 as px = cast(*u8, cast(i64, im.pixels) + y * im.stride + x * 3);
+            px[0] = cast(u8, (x * seed + y) & 255);
+            px[1] = cast(u8, (y * seed * 3 + x * x) & 255);
+            px[2] = cast(u8, ((x ^ y) * seed) & 255);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is cimage.Image as view;
+    view.pixels = im.pixels;
+    view.width = im.width;
+    view.height = im.height;
+    view.stride = im.stride;
+    view.fmt = pixfmt.FMT_RGB8;
+    view.owned = 0;
+    out.len = 0;
+    cencode.encode(&view, sniff.SNIFF_JPEG, out);
+    img.buffer.destroy(&im);
+}
+
+// JPEGs, whose decoder keeps its tables in module variables, eight at once:
+// each as it decodes alone — the lock keeps them one at a time.
+fn jpegs() as void {
+    let is [2]cb.Bytes as files;
+    let is [2]img.buffer.Image as want;
+    let is i32 as k with mut = 0;
+    while (k < 2) {
+        files[k] = cb.bytes_new(0);
+        jpeg(cast(i64, k * 5 + 3), &files[k]);
+        want[k] = load.bytes(files[k].ptr, files[k].len);
+        check("a JPEG made and read", want[k].width == 192 && load.last_error() == 0);
+        k = k + 1;
+    }
+    check("two pictures apart", same(&want[0], &want[1]) == 0);
+    let is [8]load.Job as js;
+    k = 0;
+    while (k < 8) { load.start(&js[k], files[k & 1].ptr, files[k & 1].len); k = k + 1; }
+    let is i32 as alike with mut = 0;
+    k = 0;
+    while (k < 8) {
+        let is img.buffer.Image as got with mut = load.take(&js[k]);
+        alike = alike + same(&got, &want[k & 1]);
+        img.buffer.destroy(&got);
+        k = k + 1;
+    }
+    if (alike != 8) { io.printf("  %d of 8 alike\n", alike); }
+    check("eight JPEGs at once: each as decoded alone", alike == 8);
+    // Cut short — at a half, at its header — and cut to random bytes: no
+    // pixels, a reason, nothing read past what was given.
+    let is load.Job as cut with mut;
+    load.start(&cut, files[0].ptr, files[0].len / 2);
+    let is img.buffer.Image as half with mut = load.take(&cut);
+    check("a JPEG cut in half: no pixels and why, or the part it holds", (cast(i64, half.pixels) == 0 && load.error(&cut) < 0) ||
+          (half.width == 192 && load.error(&cut) == 0));
+    img.buffer.destroy(&half);
+    load.start(&cut, files[1].ptr, 20);
+    half = load.take(&cut);
+    check("a JPEG cut at its header: no pixels and why", cast(i64, half.pixels) == 0 && load.error(&cut) < 0);
+    let is [600]u8 as noise;
+    let is i64 as ni with mut = 0;
+    while (ni < 600) { noise[ni] = cast(u8, (ni * 131 + 7) & 255); ni = ni + 1; }
+    noise[0] = cast(u8, 0xFF); noise[1] = cast(u8, 0xD8); noise[2] = cast(u8, 0xFF);
+    load.start(&cut, cast(*u8, &noise), 600);
+    half = load.take(&cut);
+    check("a JPEG's first bytes, then noise: refused", cast(i64, half.pixels) == 0 && load.error(&cut) < 0);
+    // Cancelled while others decode: it waits its turn or its decode, and
+    // leaves nothing; the rest are as decoded alone.
+    let is [4]load.Job as more;
+    k = 0;
+    while (k < 4) { load.start(&more[k], files[k & 1].ptr, files[k & 1].len); k = k + 1; }
+    load.cancel(&more[1]);
+    load.cancel(&more[2]);
+    let is img.buffer.Image as m0 with mut = load.take(&more[0]);
+    let is img.buffer.Image as m3 with mut = load.take(&more[3]);
+    check("two of four cancelled: the others as decoded alone", same(&m0, &want[0]) == 1 && same(&m3, &want[1]) == 1 &&
+          cast(i64, more[1].result.pixels) == 0 && cast(i64, more[2].result.pixels) == 0);
+    img.buffer.destroy(&m0);
+    img.buffer.destroy(&m3);
+    k = 0;
+    while (k < 2) { img.buffer.destroy(&want[k]); cb.bytes_free(&files[k]); k = k + 1; }
+}
+
+
+// --- Streams: decoding as the bytes arrive ---
+
+let is i64 as _sd with mut = 77;
+fn _rb() as i64 {
+    _sd = _sd * 6364136223846793005 + 1442695040888963407;
+    return (_sd >> 33) & 255;
+}
+
+// A w x h picture of fmt (RGB8 or RGBA8), noise in every other band of rows
+// so its stream is long, encoded as `kind` (sniff id) into out.
+fn picture(w as i64, h as i64, format as i32, kind as i64, out as *cb.Bytes) as void {
+    let is img.buffer.Image as im = img.buffer.create(w, h, format);
+    let is i64 as bpp = img.bytes_per_pixel(format);
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        let is i64 as x with mut = 0;
+        while (x < w * bpp) {
+            let is i64 as v with mut = (x * 3 + y * 5) & 255;
+            if ((y / 8) % 2 == 0) { v = _rb(); }
+            *cast(*u8, cast(i64, im.pixels) + y * im.stride + x) = cast(u8, v);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let is cimage.Image as view;
+    view.pixels = im.pixels;
+    view.width = w;
+    view.height = h;
+    view.stride = im.stride;
+    view.fmt = pixfmt.FMT_RGB8;
+    if (format == img.RGBA8) { view.fmt = pixfmt.FMT_RGBA8; }
+    view.owned = 0;
+    *out = cb.bytes_new(4096);
+    cencode.encode(&view, kind, out);
+    img.buffer.destroy(&im);
+}
+
+fn rows_alike(a as *img.buffer.Image, b as *img.buffer.Image, n as i64) as i32 {
+    if (n == 0) { return 1; }
+    if (cast(i64, a) == 0 || a.stride != b.stride || a.format != b.format) { return 0; }
+    return cast(i32, mem.core.memcmp(a.pixels, b.pixels, n * a.stride) == 0);
+}
+
+// Waits (a while) for the Stream to show at least `rows` rows or be done.
+fn wait_rows(s as *load.Stream, rows as i64) as void {
+    let is i64 as spin with mut = 0;
+    while (load.stream_rows(s) < rows && load.stream_done(s) == 0 && spin < 200000000) { spin = spin + 1; }
+}
+
+// data fed in pieces of `piece`: its size from the header, rows that are the
+// final ones as they come, then what bytes() gives. Every check on the way.
+fn streamed(name as *u8, data as *u8, n as i64, piece as i64, want_rows as i32) as void {
+    let is img.buffer.Image as want = load.bytes(data, n);
+    let is load.Stream as s with mut;
+    check("a Stream opens", load.stream_open(&s) == 1);
+    let is i64 as at with mut = 0;
+    let is i64 as seen with mut = 0;
+    let is i32 as right with mut = 1;
+    let is i32 as sized_early with mut = 0;
+    // All but the last byte, then the size — the decoder's thread reads it
+    // when it gets to it — then the last byte.
+    while (at < n - 1) {
+        let is i64 as k with mut = piece;
+        if (at + k > n - 1) { k = n - 1 - at; }
+        // Through a scratch copy wiped as soon as feed returns: the
+        // Stream keeps its own.
+        let is *u8 as scratch = mem.core.mmap_anon(k + 1);
+        mem.core.memcpy(scratch, cast(*u8, cast(i64, data) + at), k);
+        load.stream_feed(&s, scratch, k);
+        mem.core.memset(scratch, 0, k);
+        mem.core.munmap(scratch, k + 1);
+        at = at + k;
+        let is i64 as w with mut = 0;
+        let is i64 as h with mut = 0;
+        if (load.stream_size(&s, &w, &h) == 1) {
+            if (w != want.width || h != want.height) { right = 0; }
+        }
+        let is i64 as r = load.stream_rows(&s);
+        if (r > 0) {
+            if (rows_alike(load.stream_shown(&s), &want, r) == 0) { right = 0; }
+            if (r > seen) { seen = r; }
+        }
+    }
+    let is i64 as sw with mut = 0;
+    let is i64 as sh with mut = 0;
+    let is i64 as spin with mut = 0;
+    while (load.stream_size(&s, &sw, &sh) == 0 && load.stream_done(&s) == 0 && spin < 400000000) { spin = spin + 1; }
+    if (load.stream_size(&s, &sw, &sh) == 1 && sw == want.width && sh == want.height) { sized_early = 1; }
+    if (want_rows == 1) {
+        // Before the end: rows, and they are the final ones.
+        wait_rows(&s, 1);
+        let is i64 as r2 = load.stream_rows(&s);
+        if (r2 > 0 && rows_alike(load.stream_shown(&s), &want, r2) == 0) { right = 0; }
+        if (r2 > seen) { seen = r2; }
+        check("rows shown before the end", seen > 0 && load.stream_done(&s) == 0);
+    }
+    load.stream_feed(&s, cast(*u8, cast(i64, data) + n - 1), 1);
+    load.stream_end(&s);
+    let is img.buffer.Image as got with mut = load.stream_take(&s);
+    if (right == 0 || sized_early == 0) { io.printf("  %s\n", name); }
+    check("streamed: size and rows as the final image's", right == 1);
+    check("streamed: the size known before the last byte", sized_early == 1);
+    check("streamed: the image bytes() gives", same(&got, &want) == 1 && load.stream_error(&s) == 0 && load.stream_done(&s) == 1);
+    if (want_rows == 1) {
+        check("streamed: every row shown, as final", load.stream_rows(&s) == want.height &&
+              rows_alike(load.stream_shown(&s), &want, want.height) == 1);
+    }
+    // Whatever rows were shown, in the end too, are the final image's
+    // (rgba16.png's arrive with its last byte, converted from 16 bits).
+    check("streamed: the rows shown, the image's", rows_alike(load.stream_shown(&s), &want, load.stream_rows(&s)) == 1);
+    if (n < 4096) { check("a small PNG: every row shown at its end", load.stream_rows(&s) == want.height || load.stream_rows(&s) == 0); }
+    load.stream_close(&s);
+    load.stream_close(&s);
+    check("closed: nothing kept", cast(i64, load.stream_shown(&s)) == 0 && load.stream_rows(&s) == 0);
+    img.buffer.destroy(&got);
+    img.buffer.destroy(&want);
+}
+
+fn _feeder(arg as i64) as i64 {
+    let is *cb.Bytes as f = cast(*cb.Bytes, arg);
+    let is load.Stream as s with mut;
+    load.stream_open(&s);
+    let is i64 as at with mut = 0;
+    while (at < f.len) {
+        let is i64 as k with mut = 3001;
+        if (at + k > f.len) { k = f.len - at; }
+        load.stream_feed(&s, cast(*u8, cast(i64, f.ptr) + at), k);
+        at = at + k;
+    }
+    load.stream_end(&s);
+    let is img.buffer.Image as got = load.stream_take(&s);
+    load.stream_close(&s);
+    let is img.buffer.Image as want = load.bytes(f.ptr, f.len);
+    let is i64 as ok = cast(i64, same(&got, &want));
+    img.buffer.destroy(&got);
+    img.buffer.destroy(&want);
+    return ok;
+}
+
+fn streams() as void {
+    let is cb.Bytes as big;
+    picture(320, 240, img.RGB8, sniff.SNIFF_PNG, &big);
+    streamed("png rgb 320x240, 4 KB pieces", big.ptr, big.len, 4096, 1);
+    streamed("png rgb, 1 byte at a time for the header then 64 KB", big.ptr, big.len, 65536, 0);
+    let is cb.Bytes as alpha;
+    picture(200, 150, img.RGBA8, sniff.SNIFF_PNG, &alpha);
+    streamed("png rgba 200x150, 1500-byte pieces", alpha.ptr, alpha.len, 1500, 1);
+    let is cb.Bytes as jp;
+    picture(160, 120, img.RGB8, sniff.SNIFF_JPEG, &jp);
+    streamed("jpeg 160x120", jp.ptr, jp.len, 999, 0);
+    let is cb.Bytes as bm;
+    picture(64, 48, img.RGBA8, sniff.SNIFF_BMP, &bm);
+    streamed("bmp 64x48", bm.ptr, bm.len, 777, 0);
+    // Where no thread can be started: the same, done in feed and end.
+    load.stream_inline(1);
+    streamed("inline: png rgb, 4 KB pieces", big.ptr, big.len, 4096, 1);
+    streamed("inline: jpeg", jp.ptr, jp.len, 999, 0);
+    let is load.Stream as il with mut;
+    load.stream_open(&il);
+    load.stream_feed(&il, big.ptr, big.len / 2);
+    check("inline: rows as fed", load.stream_rows(&il) > 0 && il.threaded == 0);
+    load.stream_close(&il);
+    load.stream_inline(0);
+    // The 16-bit and palette PNGs of image/testdata, a few bytes at a time.
+    let is i64 as tn with mut = 0;
+    let is *u8 as td with mut = slurp("image/testdata/rgba16.png", &tn);
+    streamed("rgba16.png", td, tn, 5, 0);
+    mem.core.munmap(td, 65536);
+    td = slurp("image/testdata/palette.png", &tn);
+    streamed("palette.png", td, tn, 3, 0);
+    mem.core.munmap(td, 65536);
+
+    // Cut short: refused at the end, why, and the rows that came kept.
+    let is img.buffer.Image as want = load.bytes(big.ptr, big.len);
+    let is load.Stream as s with mut;
+    load.stream_open(&s);
+    load.stream_feed(&s, big.ptr, big.len * 7 / 10);
+    wait_rows(&s, 1);
+    load.stream_end(&s);
+    let is img.buffer.Image as none with mut = load.stream_take(&s);
+    let is i64 as kept = load.stream_rows(&s);
+    check("cut short: no image, and why", cast(i64, none.pixels) == 0 && load.stream_error(&s) < 0 && load.stream_done(&s) == 1);
+    check("cut short: the rows that came, right", kept > 0 && kept < want.height &&
+          rows_alike(load.stream_shown(&s), &want, kept) == 1);
+    check("cut short: no more bytes taken", load.stream_feed(&s, big.ptr, 10) == 0);
+    load.stream_close(&s);
+
+    // A chunk's CRC wrong: refused as it comes, without waiting for the end.
+    let is cb.Bytes as bad = cb.bytes_new(big.len);
+    cb.bytes_append(&bad, big.ptr, big.len);
+    bad.ptr[big.len / 2] = cast(u8, cast(i64, bad.ptr[big.len / 2]) ^ 85);
+    load.stream_open(&s);
+    load.stream_feed(&s, bad.ptr, bad.len);
+    let is i64 as spin with mut = 0;
+    while (load.stream_done(&s) == 0 && spin < 400000000) { spin = spin + 1; }
+    check("a wrong CRC: refused before the end", load.stream_done(&s) == 1 && load.stream_error(&s) < 0);
+    check("a wrong CRC: the rows before it right", rows_alike(load.stream_shown(&s), &want, load.stream_rows(&s)) == 1);
+    load.stream_end(&s);
+    none = load.stream_take(&s);
+    check("a wrong CRC: no image", cast(i64, none.pixels) == 0);
+    load.stream_close(&s);
+    cb.bytes_free(&bad);
+
+    // A size no image may have: refused at the header, nothing allocated.
+    let is [33]u8 as hd;
+    let is *u8 as sig = "\x89PNG\r\n\x1a\n";
+    let is i64 as i with mut = 0;
+    while (i < 8) { hd[i] = sig[i]; i = i + 1; }
+    hd[8] = 0; hd[9] = 0; hd[10] = 0; hd[11] = 13; hd[12] = 73; hd[13] = 72; hd[14] = 68; hd[15] = 82;
+    hd[16] = 1; hd[17] = 0; hd[18] = 0; hd[19] = 1;      // 16777217 wide
+    hd[20] = 0; hd[21] = 0; hd[22] = 0; hd[23] = 16;
+    hd[24] = 8; hd[25] = 6; hd[26] = 0; hd[27] = 0; hd[28] = 0;
+    let is i64 as crc = checksum.crc32(cast(*u8, cast(i64, &hd) + 12), 17);
+    hd[29] = cast(u8, (crc >> 24) & 255); hd[30] = cast(u8, (crc >> 16) & 255);
+    hd[31] = cast(u8, (crc >> 8) & 255);  hd[32] = cast(u8, crc & 255);
+    load.stream_open(&s);
+    load.stream_feed(&s, cast(*u8, &hd), 33);
+    spin = 0;
+    while (load.stream_done(&s) == 0 && spin < 400000000) { spin = spin + 1; }
+    let is i64 as sw with mut = 0;
+    let is i64 as sh with mut = 0;
+    check("an absurd size: refused at once, no size, no rows", load.stream_done(&s) == 1 && load.stream_error(&s) < 0 &&
+          load.stream_size(&s, &sw, &sh) == 0 && cast(i64, load.stream_shown(&s)) == 0);
+    load.stream_close(&s);
+
+    // Not an image: refused at the end.
+    load.stream_open(&s);
+    load.stream_feed(&s, cast(*u8, "not an image, not at all, really"), 32);
+    load.stream_end(&s);
+    none = load.stream_take(&s);
+    check("not an image: refused", cast(i64, none.pixels) == 0 && load.stream_error(&s) < 0);
+    load.stream_close(&s);
+    // Nothing fed.
+    load.stream_open(&s);
+    load.stream_end(&s);
+    none = load.stream_take(&s);
+    check("nothing fed: refused", cast(i64, none.pixels) == 0 && load.stream_error(&s) < 0);
+    load.stream_close(&s);
+
+    // Cancelled: while waiting for bytes, with rows shown, right after the
+    // end, before any byte; each leaves nothing.
+    load.stream_open(&s);
+    load.stream_close(&s);
+    check("closed before a byte", cast(i64, load.stream_shown(&s)) == 0);
+    load.stream_open(&s);
+    load.stream_feed(&s, big.ptr, big.len / 2);
+    wait_rows(&s, 1);
+    load.stream_close(&s);
+    check("closed with rows shown: nothing kept", load.stream_rows(&s) == 0 && cast(i64, load.stream_shown(&s)) == 0);
+    check("closed: no more bytes taken", load.stream_feed(&s, big.ptr, 10) == 0);
+    load.stream_open(&s);
+    load.stream_feed(&s, jp.ptr, jp.len);
+    load.stream_end(&s);
+    load.stream_close(&s);
+    check("closed during its last decode: waited for, nothing kept", cast(i64, s.result.pixels) == 0);
+
+    // Four at once on four threads, PNG and JPEG: each as decoded alone.
+    let is [4]thread.Thread as ts;
+    let is [4]*cb.Bytes as fs;
+    fs[0] = &big; fs[1] = &jp; fs[2] = &alpha; fs[3] = &jp;
+    let is i32 as k with mut = 0;
+    let is i32 as spawned with mut = 0;
+    while (k < 4) {
+        if (thread.spawn(&ts[k], fn_ptr(_feeder), cast(i64, fs[k])) == 0) { spawned = spawned + 1; }
+        k = k + 1;
+    }
+    let is i64 as alike with mut = 0;
+    k = 0;
+    while (k < spawned) { alike = alike + thread.join(&ts[k]); k = k + 1; }
+    check("four Streams on four threads: each as decoded alone", spawned == 4 && alike == 4);
+
+    img.buffer.destroy(&want);
+    cb.bytes_free(&big);
+    cb.bytes_free(&alpha);
+    cb.bytes_free(&jp);
+    cb.bytes_free(&bm);
 }
 
 fn main() as i32 {
@@ -79,6 +523,9 @@ fn main() as i32 {
     g = load.bytes(cast(*u8, "GIF89a"), 0);
     check("no bytes", cast(i64, g.pixels) == 0 && load.last_error() < 0);
     // And from memory, after a failure: the error cleared.
+    jobs();
+    jpegs();
+    streams();
     let is img.buffer.Image as again = load.file("image/testdata/rgb.png");
     check("after a failure, read", sized(&again, img.RGB8) == 1 && load.last_error() == 0);
     img.destroy(&again);

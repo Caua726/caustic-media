@@ -245,10 +245,13 @@ a folder's entries as a flat model.
 - `set_hidden(d as *Dir, on as i32) as void` — Names starting with a dot shown (1) or not (0, at first); read again.
 - `set_folders_only(d as *Dir, on as i32) as void` — Folders only (1), as when a folder is to be chosen, or files too (0, at first); read again.
 - `set_icons(d as *Dir, folder as i64, file as i64) as void` — A folder's name shown with icon folder, a file's with file — integers, as a list or table takes them (listview.show_icon); 0 for none.
+- `set_icon_fn(d as *Dir, f as i64, user as *u8) as void` — Each entry's ICON from f, fn(user *u8, d *Dir, index i64, out *model.Value) as i32 — an icon of the toolkit's (model.integer) or a texture of the program's (model.handle), 1 when it set one — instead of set_icons'...
+- `set_clock(d as *Dir, now as i64, offset as i64) as void` — Dates said as a person near now reads them — "Today 18:40", "Yesterday 09:30", "5 Nov 14:02", "5 Nov 2025" — at offset seconds east of UTC, against now, seconds since 1970; now 0 for "YYYY-MM-DD HH:MM" in UTC again.
 - `set_language(d as *Dir, lang as i32) as void` — Sizes said in language lang (strings.cst) from now on.
 - `set_filter(d as *Dir, s as *u8, n as i64) as void` — The files shown from now on, s, n bytes: patterns split at ';' or spaces; empty for all.
 - `size_text(v as i64, lang as i32, out as *u8) as i64` — A size as a person reads it in language lang, into out (32 bytes); how many bytes: bytes under 1000, then one decimal of kB, MB or GB.
 - `date_text(secs as i64, out as *u8) as i64` — Seconds since 1970 as "YYYY-MM-DD HH:MM", in UTC, into out (16 bytes): the days turned into a date as the proleptic Gregorian calendar has them.
+- `date_relative_text(secs as i64, now as i64, offset as i64, out as *u8) as i64` — secs as a person near now reads it, both at offset seconds east of UTC, into out (24 bytes): today and yesterday by name with the time, this year's with the day, month and time, older ones with the year.
 
 ## `ui/dnd.cst`
 
@@ -419,6 +422,7 @@ measure, place, and the pass that runs them.
 
 - `measure(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — What w would like; nothing when it is hidden itself.
 - `measure_hidden(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — The same, for a widget that is hidden but still has to be accounted for — a stack sizes itself to its largest page, shown or not.
+- `measured() as i64` — How many measures were worked out rather than taken from what an item kept, in this process: for tests.
 - `overlay_measure(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — Every visible child gets the whole area and aligns within it on its own; later children sit above earlier ones.
 - `overlay_arrange(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void`
 - `place_exact(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void` — w given exactly r — in its parent's coordinates, its edges on physical pixels — whatever its margins, alignment and limits say: a surface where the platform put it.
@@ -493,6 +497,7 @@ drawing the tree, region by region, through render/'s 2D family.
 - `cache_close(cc as *Cache) as void`
 - `cache_used(cc as *Cache, t as *tree.Tree) as i64` — How many entries hold a texture for a widget still alive.
 - `options(theme as *style.Theme) as Options`
+- `set_bg_hint(on as i32) as void` — Whether painter.S_ON_WINDOW_BG is given: 1, as it is; 0 to paint as if it never were — what a test compares the frames with it against.
 - `subtree(t as *tree.Tree, w as i64, x as f64, y as f64, rw as f64, rh as f64, c as *draw2d.Canvas, o as *Options) as void` — w and what it holds painted on c, which the caller has begun at rw by rh: the rectangle at x, y of w, in its own coordinates, at c's corner — what a drag shows of the widget it began from.
 - `frame(t as *tree.Tree, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of the tree's damage region on c, which the caller has begun.
 - `frame_surface(t as *tree.Tree, sf as i64, c as *draw2d.Canvas, o as *Options, st as *Stats) as i64` — Paints every rectangle of surface s's damage region — a widget shown in a window of its own (tree.surface_open) — on c, which the caller has begun at the surface's size: what is at the surface's corner in the wind...
@@ -543,9 +548,11 @@ where each event goes.
 - `inputs(r as *Router) as i64` — How many presses and key presses have come so far: what changes when the user does something, for a tooltip to go away on.
 - `hovered(t as *tree.Tree, r as *Router, w as i64) as i32` — Whether w is under the pointer — itself or through a descendant.
 - `capture(r as *Router) as i64` — The widget holding the pointer, 0 for none.
+- `set_key_first(r as *Router, f as *u8, user as *u8) as void` — A program that has to see keys before the focused widget does: a browser, whose page answers keys first even with a text field focused.
 - `refresh_hover(t as *tree.Tree, r as *Router, time as i64) as void` — For when widgets moved under a pointer that did not: after a layout pass, a scroll, a widget shown or hidden.
 - `pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as void`
 - `pointer_shape(t as *tree.Tree, r as *Router) as i32` — The pointer's shape where it is, for the window to show: asked of the widget holding a press, wherever the pointer went, or else of the deepest one under it, then up the tree until one has a shape of its own.
+- `shapes_found(r as *Router) as i64` — How many times pointer_shape worked the shape out rather than remembering it: for tests.
 - `dismiss(t as *tree.Tree, r as *Router, time as i64) as i32` — The window system took a popup down — a press outside the program's windows, another program taking the pointer, the compositor's popup_done — with no press here to say so: the modal scope hears PRESS_OUTSIDE, as ...
 - `pointer_leave(t as *tree.Tree, r as *Router, time as i64) as void` — The pointer left the window.
 - `pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,` — button is 1 left, 2 middle, 3 right; pressed is 1 down, 0 up.
@@ -833,12 +840,19 @@ the toolkit's text: one service per application that lays text out and draws it,
 - `close(s as *Service) as void`
 - `set_family(s as *Service, family as *u8) as void` — The interface font a style of no family is set in, from here on.
 - `fill_path(s as *Service, c as *draw2d.Canvas, p as *path.Path, t as *raster.flatten.Transform, rule as i32,` — Path p — its points mapped by t into logical units — filled in col on c under rule, through the service's coverage pages as its glyphs are: an icon (icons.cst).
+- `draw_mark(s as *Service, c as *draw2d.Canvas, key as i64, t as *raster.flatten.Transform, rule as i32,` — Mark key drawn with logical transform t and rule as it was kept: 1 when it was, and is drawn; 0 when it is not kept — the caller then has its path made and calls fill_mark.
+- `fill_mark(s as *Service, c as *draw2d.Canvas, key as i64, p as *path.Path, t as *raster.flatten.Transform,` — Path p, mark key, filled with logical transform t and rule as fill_path fills it, and kept: rasterized moved by the fraction of a pixel alone, so that wherever it is drawn again by whole pixels it is the same coverage.
+- `mark_fills(s as *Service) as i64` — How many marks s has rasterized: each mark once while it is kept.
 - `next_frame(s as *Service) as void` — A frame begins: what the glyph caches hold for it is kept until the next.
 - `font_for(s as *Service, family as *u8, weight as i64, italic as i32) as *font.Font` — The font for a family, weight and style: resolved once and remembered.
 - `lay_layout(s as *Service, l as *layout.Layout, lstyles as *model.Style, text as *u8, nbytes as i64,` — The run's text set in styles, each span of it in its style and the rest in style 0, in the box params describes: 1, or 0 when it could not be — a style with no font, more than MAX_STYLES of them, memory refused, or ...
+- `layouts(s as *Service) as i64` — How many times s has laid text out since it opened — every lay_text, lay_plain and lay_layout: what a change costs, counted.
 - `lay_text(s as *Service, r as *Run, styles as *Style, nstyles as i64, spans as *model.Span, nspans as i64,`
+- `lay_text_in(s as *Service, r as *Run, l as *layout.Layout, lstyles as *model.Style, styles as *Style,` — As lay_text, laid out in the caller's Layout l — with its styles' fonts in lstyles, as lay_layout — which then answers the cursor's questions about the run: one layout for both, where a widget that keeps a Layout ...
 - `lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, nstyles as i64,` — The text — nbytes of UTF-8, copied into the run — laid out as lay_text does.
+- `lay_in(s as *Service, r as *Run, text as *u8, nbytes as i64, l as *layout.Layout, lstyles as *model.Style,` — The text copied into the run and laid out as lay_text_in does.
 - `lay_plain(s as *Service, r as *Run, text as *u8, nbytes as i64, st as *Style, params as *model.Params) as i32` — One style over the whole of the text: the common case.
+- `sizes(s as *Service, st as *Style, out as *Sizes) as i32` — The sizes of text in style st that no text changes — an ellipsis's width, a line's height, a digit's width — laid out the first time its font and size are asked, and kept while the service is: a font is one face l...
 - `upload(s as *Service) as i32` — Every changed part of every page sent to its texture: 1, or 0 when the device refused one.
 - `draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color) as i32` — Run r drawn on c with its top left at (x, y), logical pixels, in fg where a style gives no colour of its own.
 - `draw_in(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color) as i32` — The same with every colour its styles give put aside: all of it in fg, as selected text is.
@@ -979,6 +993,8 @@ widgets as nodes in a window's tree, and the handles to them.
 - `invalidate_layout(t as *Tree, w as i64) as void`
 - `needs_layout(t as *Tree, w as i64) as i32`
 - `clear_layout(t as *Tree, w as i64) as void`
+- `stamp(t as *Tree) as i64` — A number that changes whenever anything may have moved, been shown or hidden or drawn differently — every invalidation, every layout pass that arranged anything — and not otherwise: what was worked out from the tr...
+- `bump(t as *Tree) as void` — Changes the stamp: for a pass that moved what was laid out (layout.run).
 - `invalidate_paint(t as *Tree, w as i64) as void`
 - `invalidate_paint_subtree(t as *Tree, w as i64) as void` — w and everything under it — for a change every descendant shows, such as being disabled.
 - `needs_paint(t as *Tree, w as i64) as i32`
@@ -1229,6 +1245,7 @@ the table of functions every kind of widget fills in.
 - `changed(t as *tree.Tree, w as i64, what as i32) as void`
 - `kind(name as *u8, data_bytes as i64) as tree.Kind` — A kind with no behaviour yet; the caller sets the entries it needs.
 - `theme(t as *tree.Tree, w as i64, out as *style.Theme) as void` — The theme that applies to w: its tree's, with every override from the root down to w laid on in that order, the nearest last.
+- `theme_at(t as *tree.Tree, w as i64, room as *style.Theme) as *style.Theme` — The same theme, to read and not to change: the tree's own where nothing from the root down to w overrides it — no copy, kilobytes, for each widget measured — else resolved into room, which is returned.
 
 ## `ui/winstate.cst`
 
@@ -1372,6 +1389,7 @@ one of a list's rows chosen, from a list that drops down.
 a window's frame, drawn by the toolkit.
 
 - `create(t as *tree.Tree, parent as i64) as i64` — A new frame filling parent — the tree's root, usually — a title bar across its top and a column under it for what the window holds.
+- `set_header_over(t as *tree.Tree, w as i64, on as i32) as void` — The title bar laid over what the window holds — which then fills the window to its top, under the bar — on 1; above it, as made, on 0.
 - `header_of(t as *tree.Tree, w as i64) as i64`
 - `content_of(t as *tree.Tree, w as i64) as i64`
 - `grip(t as *tree.Tree, w as i64, which as i32) as i64` — Edge or corner which's handle; 0 for none.
@@ -1611,6 +1629,7 @@ rows read from a model, only those seen made.
 - `set_single_click(t as *tree.Tree, w as i64, on as i32) as void` — A plain click activating its row, as in a list to pick one thing from, or (0, at first) only a double click.
 - `go_to(t as *tree.Tree, w as i64, index as i64) as void` — The keyboard to row index as an arrow key would move it there: alone chosen, the anchor there, brought into view.
 - `show_text(t as *tree.Tree, l as i64, m as *model.Model, id as i64, column as i64) as void` — Label l showing row id's text in column of m — a number in its digits — or nothing.
+- `icon_side(th as *style.Theme) as f64` — The side of an icon in a row, as the theme has it; ICON_SIZE when it says nothing.
 - `show_icon(t as *tree.Tree, im as i64, m as *model.Model, id as i64, column as i64) as void` — Image im showing row id's ICON in column of m — one of the toolkit's own icons (an integer) or a texture of the program's (a handle), ICON_SIZE square — or hidden when the row has none.
 - `row_icon(t as *tree.Tree, rw as i64) as i64` — The icon of row widget rw, one of the list's own making; 0 for none.
 - `digits(v as i64, out as *u8) as i64` — The decimal digits of v into out, 24 bytes; how many.
@@ -1850,6 +1869,7 @@ a window's title bar, drawn by the toolkit.
 - `set_maximized(t as *tree.Tree, w as i64, on as i32) as void` — The window is maximized, or not: its button restores, or maximizes.
 - `is_maximized(t as *tree.Tree, w as i64) as i32`
 - `set_rounding(t as *tree.Tree, w as i64, r as f64) as void` — Its top corners rounded by r, as the window's are when the toolkit draws its frame (decoration.cst); 0 for square.
+- `set_scrim(t as *tree.Tree, w as i64, on as i32) as void` — A shade over what is under it — dark at the top, clear at its foot — in place of the bar's colour (on 1), for a bar laid over a picture (decoration.set_header_over); its colour again (on 0).
 - `button(t as *tree.Tree, w as i64, which as i32) as i64` — The window's button which (MINIMIZE, MAXIMIZE, CLOSE), 0 when it has none.
 - `buttons(t as *tree.Tree, w as i64) as i32` — Which of the window's buttons it shows: BTN_* bits, always minimize, then maximize, then close.
 - `set_buttons(t as *tree.Tree, w as i64, flags as i32) as void` — The window's buttons it shows: flags, BTN_* bits.

@@ -71,11 +71,15 @@ struct Cache {
     raster  as *raster.Raster;
     path    as *outline.path.Path;
     entries as *Entry;
-    cap     as i64;
+    cap     as i64;     // a power of two: the table is gone round by a mask
+    mask    as i64;
     xsteps  as i64;
     ysteps  as i64;
+    xshift  as i64;     // log2 of the steps when they are a power of two; -1 when not
+    yshift  as i64;
     frame   as i64;
     drawn   as i64;   // glyphs not found, and so read and drawn
+    hinted  as i64;   // glyphs found where get_hinted was told they were
 }
 
 fn open(pages as *image.atlas.Atlas, r as *raster.Raster, p as *outline.path.Path, entries as i64,
@@ -84,18 +88,49 @@ fn open(pages as *image.atlas.Atlas, r as *raster.Raster, p as *outline.path.Pat
     c.pages = pages;
     c.raster = r;
     c.path = p;
-    c.cap = entries;
+    // Entries up to a power of two, so that a probe's place is a mask and
+    // not a division.
+    let is i64 as cap with mut = 0;
+    if (entries > 0) {
+        cap = 1;
+        while (cap < entries) { cap = cap * 2; }
+    }
+    c.cap = cap;
+    c.mask = cap - 1;
     // Fewer than one step is one: whole pixels.
     c.xsteps = xsteps;
     c.ysteps = ysteps;
     if (c.xsteps < 1) { c.xsteps = 1; }
     if (c.ysteps < 1) { c.ysteps = 1; }
+    c.xshift = _log2(c.xsteps);
+    c.yshift = _log2(c.ysteps);
     c.frame = 0;
     c.drawn = 0;
+    c.hinted = 0;
     // Of no entries, the mapping fails, and the cache is none.
-    c.entries = cast(*Entry, mem.core.mmap_anon(entries * sizeof(Entry)));
+    c.entries = cast(*Entry, mem.core.mmap_anon(cap * sizeof(Entry)));
     if (cast(i64, c.entries) == 0) { c.cap = 0; }
     return c;
+}
+
+// n's base-2 logarithm when n is a power of two; -1 when it is not.
+fn _log2(n as i64) as i64 {
+    let is i64 as k with mut = 0;
+    while (k < 62) {
+        if ((1 << k) == n) { return k; }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// As raster.subpixel, by a shift when the steps are a power of two: the
+// shift is arithmetic, so it floors as the division and its correction do.
+fn _sub(x as f64, steps as i64, shift as i64, whole as *i64) as i64 {
+    if (shift < 0) { return raster.subpixel(x, steps, whole); }
+    let is i64 as q = cast(i64, fm.floor(x * cast(f64, steps) + 0.5));
+    let is i64 as w = q >> shift;
+    *whole = w;
+    return q - (w << shift);
 }
 
 fn ok(c as *Cache) as i32 {
@@ -104,7 +139,7 @@ fn ok(c as *Cache) as i32 {
 }
 
 fn close(c as *Cache) as void {
-    if (cast(i64, c.entries) != 0) { mem.core.munmap(cast(*u8, c.entries), c.cap * sizeof(Entry)); }
+    if (cast(i64, c.entries) != 0 && c.cap > 0) { mem.core.munmap(cast(*u8, c.entries), c.cap * sizeof(Entry)); }
     c.entries = cast(*Entry, 0);
     c.cap = 0;
 }
@@ -153,8 +188,8 @@ struct Look {
 }
 
 fn _look(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f64, l as *Look) as void {
-    l.sx = raster.subpixel(x, c.xsteps, &l.wx);
-    l.sy = raster.subpixel(y, c.ysteps, &l.wy);
+    l.sx = _sub(x, c.xsteps, c.xshift, &l.wx);
+    l.sy = _sub(y, c.ysteps, c.yshift, &l.wy);
     l.step = l.sx + l.sy * 65536;
     l.bits = fm.f64_bits(size);
     l.found = 0 - 1;
@@ -162,12 +197,12 @@ fn _look(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f64
     if (c.cap == 0) { return; }
     // A table smaller than the probes is gone round more than once, which
     // finds nothing new.
-    let is i64 as home = _hash(font, l.bits, glyph, l.step) % c.cap;
+    let is i64 as home = _hash(font, l.bits, glyph, l.step) & c.mask;
     let is i64 as free with mut = 0 - 1;
     let is i64 as oldest with mut = 0 - 1;
     let is i64 as k with mut = 0;
     while (k < PROBES) {
-        let is i64 as i = (home + k) % c.cap;
+        let is i64 as i = (home + k) & c.mask;
         let is *Entry as e = _entry(c, i);
         let is i32 as alive with mut = 0;
         if (e.state == NEVER) { alive = 1; }
@@ -232,12 +267,51 @@ fn find(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f64,
     let is Look as l;
     _look(c, font, size, glyph, x, y, &l);
     if (l.found < 0) { return MISSING; }
+    return _hit(c, &l, out);
+}
+
+// The entry look found, used this frame and placed.
+fn _hit(c as *Cache, l as *Look, out as *Placed) as i32 {
     let is *Entry as e = _entry(c, l.found);
     e.last = c.frame;
     if (e.state == NEVER) { return NEVER; }
     if (e.slot.page >= 0) { image.atlas.touch(c.pages, &e.slot); }
     _place(c, e, l.wx, l.wy, out);
     return PLACED;
+}
+
+// Entry i as it is now, into *out: for a caller that will ask whether it is
+// still so (entry_same). 1, or 0 when there is no entry i.
+fn entry_copy(c as *Cache, i as i64, out as *Entry) as i32 {
+    if (c.cap == 0 || i < 0 || i > c.mask) { return 0; }
+    mem.memcpy(cast(*u8, out), cast(*u8, _entry(c, i)), sizeof(Entry));
+    return 1;
+}
+
+// Whether entry i is still *was — the same glyph, size and step, the same
+// box and place, still alive — all but when it was last used: what
+// get_hinted, told i, would take there. Nothing is changed.
+fn entry_same(c as *Cache, i as i64, was as *Entry) as i32 {
+    if (c.cap == 0 || i < 0 || i > c.mask) { return 0; }
+    let is *Entry as e = _entry(c, i);
+    if (e.font != was.font || e.size != was.size || e.glyph != was.glyph || e.step != was.step ||
+        e.state != was.state || e.left != was.left || e.top != was.top || e.w != was.w || e.h != was.h ||
+        e.slot.page != was.slot.page || e.slot.x != was.slot.x || e.slot.y != was.slot.y ||
+        e.slot.era != was.slot.era) { return 0; }
+    if (e.state == NEVER) { return 1; }
+    if (e.state != PLACED) { return 0; }
+    if (e.slot.page >= 0 && image.atlas.valid(c.pages, &e.slot) == 0) { return 0; }
+    return 1;
+}
+
+// Entry i found again where get_hinted was told it was, after entry_same:
+// used this frame, its page too, and counted as hinted.
+fn entry_found(c as *Cache, i as i64) as void {
+    let is *Entry as e = _entry(c, i);
+    c.hinted = c.hinted + 1;
+    e.last = c.frame;
+    if (e.state == NEVER) { return; }
+    if (e.slot.page >= 0) { image.atlas.touch(c.pages, &e.slot); }
 }
 
 // A place for a bitmap of the glyph at the pen, w by h at (left, top) from
@@ -274,10 +348,39 @@ fn refuse(c as *Cache, font as i64, size as f64, glyph as i64, x as f64, y as f6
 // it this frame, or NEVER when it cannot be drawn.
 fn get(c as *Cache, r as *outline.Reader, font as i64, size as f64, glyph as i64, x as f64, y as f64,
        out as *Placed) as i32 {
+    let is i64 as none with mut = 0 - 1;
+    return get_hinted(c, r, font, size, glyph, x, y, &none, out);
+}
+
+// get, told where the glyph was found the last time (*hint, -1 for not
+// known): when the entry there is still alive and still that glyph at that
+// size and step — what _look would find — it is taken without hashing or
+// probing. *hint is then where it is now, or -1.
+fn get_hinted(c as *Cache, r as *outline.Reader, font as i64, size as f64, glyph as i64, x as f64, y as f64,
+              hint as *i64, out as *Placed) as i32 {
     let is Look as l;
+    let is i64 as h = *hint;
+    if (h >= 0 && h <= c.mask && c.cap > 0) {
+        l.sx = _sub(x, c.xsteps, c.xshift, &l.wx);
+        l.sy = _sub(y, c.ysteps, c.yshift, &l.wy);
+        l.step = l.sx + l.sy * 65536;
+        l.bits = fm.f64_bits(size);
+        let is *Entry as he = _entry(c, h);
+        if (he.font == font && he.size == l.bits && he.glyph == glyph && he.step == l.step &&
+            (he.state == NEVER || (he.state == PLACED && (he.slot.page < 0 || image.atlas.valid(c.pages, &he.slot) == 1)))) {
+            c.hinted = c.hinted + 1;
+            l.found = h;
+            return _hit(c, &l, out);
+        }
+    }
+    *hint = 0 - 1;
     _look(c, font, size, glyph, x, y, &l);
-    if (l.found >= 0) { return find(c, font, size, glyph, x, y, out); }
+    if (l.found >= 0) {
+        *hint = l.found;
+        return _hit(c, &l, out);
+    }
     if (l.place < 0) { return NO_ROOM; }
+    *hint = l.place;
     let is *Entry as e = _claim(c, &l, font, glyph);
     c.drawn = c.drawn + 1;
     if (c.pages.format != image.R8) { return NEVER; }

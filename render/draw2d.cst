@@ -61,11 +61,11 @@ fn limits_default() as Limits {
     return l;
 }
 
-// layout_pos_color_uv: position, colour, uv — 72 bytes.
+// layout_pos2_color_uv_f32: position (z is 0), colour, uv — 32 bytes.
 struct Vertex {
-    x as f64; y as f64; z as f64;
-    r as f64; g as f64; b as f64; a as f64;
-    u as f64; v as f64;
+    x as f32; y as f32;
+    r as f32; g as f32; b as f32; a as f32;
+    u as f32; v as f32;
 }
 
 // A clip in physical pixels: x0, y0 inclusive, x1, y1 exclusive. x1 < 0 means
@@ -105,6 +105,19 @@ struct Batch {
     count   as i64;
 }
 
+// A coverage mask kept for shapes2d: a quarter of a rounded rectangle's
+// corner, r and bw physical pixels (bw < 0 for the filled corner), side by
+// side pixels, in its own R8 texture. tex 0: none.
+struct Mask {
+    r    as f64;
+    bw   as f64;
+    tex  as i64;
+    side as i64;
+    last as i64;   // the frame it was last drawn in
+}
+
+let is i64 as MASKS with imut = 32;
+
 struct Canvas {
     d           as *dev.Device;
     block       as *u8;
@@ -134,8 +147,12 @@ struct Canvas {
     m           as [6]f64;   // a b c d e f: x' = ax + cy + e, y' = bx + dy + f
     moved       as i32;      // m is not the identity
     vmost       as i64;      // as far as the vertices may grow; vcap unless told
+    direct      as i32;      // verts is the vertex buffer's own memory (caps.maps_in_place): no upload
+    _pad_direct as i32;
     overflowed  as i32;
     ok          as i32;
+    masks       as [32]Mask;
+    frames      as i64;      // begin()s so far: a mask drawn in this one is not given up
 }
 
 fn _vertex_at(c as *Canvas, i as i64) as *Vertex {
@@ -169,16 +186,38 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
     c.moved = 0;
     _identity(&c);
     c.vmost = c.vcap;
+    c.direct = 0;
+    c.frames = 0;
+    let is i64 as mi with mut = 0;
+    while (mi < MASKS) {
+        c.masks[mi].tex = 0;
+        mi = mi + 1;
+    }
     if (c.vcap < 3 || c.bcap < 1) { return c; }
 
     let is i64 as vbytes = c.vcap * sizeof(Vertex);
-    c.block_bytes = vbytes + c.bcap * sizeof(Batch);
-    c.block = mem.core.mmap_anon(c.block_bytes);
-    if (cast(i64, c.block) == 0) { return c; }
-    c.verts = c.block;
-    c.batches = cast(*u8, cast(i64, c.block) + vbytes);
-
     c.vbuf = buffer.create(d, vbytes, buffer.VERTEX);
+    // Where the device draws from its buffers' own memory, the vertices are
+    // written there: flush then has nothing to copy, and the block holds
+    // the batches alone.
+    let is *u8 as mapped with mut = cast(*u8, 0);
+    if (c.vbuf != 0 && d.caps.maps_in_place == 1) {
+        mapped = buffer.map(d, c.vbuf);
+        if (cast(i64, mapped) != 0) { c.direct = 1; }
+    }
+    let is i64 as vroom with mut = vbytes;
+    if (c.direct == 1) { vroom = 0; }
+    c.block_bytes = vroom + c.bcap * sizeof(Batch);
+    c.block = mem.core.mmap_anon(c.block_bytes);
+    if (cast(i64, c.block) == 0) {
+        if (c.vbuf != 0) { buffer.destroy(d, c.vbuf); }
+        c.vbuf = 0;
+        c.direct = 0;
+        return c;
+    }
+    c.verts = c.block;
+    if (c.direct == 1) { c.verts = mapped; }
+    c.batches = cast(*u8, cast(i64, c.block) + vroom);
     c.shaders[0] = shader.builtin(d, shader.UNLIT_COLOR);
     c.shaders[1] = shader.builtin(d, shader.TEXTURED);
     c.shaders[2] = shader.builtin(d, shader.COVERAGE);
@@ -186,7 +225,7 @@ fn open(d as *dev.Device, l as *Limits) as Canvas {
     c.shaders[4] = shader.builtin(d, shader.UNLIT_COLOR);
     let is i64 as k with mut = 0;
     while (k < KINDS) {
-        let is pipeline.Desc as pd with mut = pipeline.desc_blended(c.shaders[k], pipeline.layout_pos_color_uv());
+        let is pipeline.Desc as pd with mut = pipeline.desc_blended(c.shaders[k], pipeline.layout_pos2_color_uv_f32());
         if (k == KIND_IMAGE_PREMUL) { pd.blend = pipeline.BLEND_PREMULTIPLIED; }
         if (k == KIND_REPLACE) { pd.blend = pipeline.BLEND_NONE; }
         c.pipes[k] = pipeline.create(d, &pd);
@@ -212,6 +251,12 @@ fn close(c as *Canvas) as void {
         c.shaders[k] = 0;
         k = k + 1;
     }
+    let is i64 as mi with mut = 0;
+    while (mi < MASKS) {
+        if (c.masks[mi].tex != 0) { texture.destroy(c.d, c.masks[mi].tex); }
+        c.masks[mi].tex = 0;
+        mi = mi + 1;
+    }
     if (c.linear != 0) { texture.sampler_destroy(c.d, c.linear); }
     if (c.nearest != 0) { texture.sampler_destroy(c.d, c.nearest); }
     if (c.vbuf != 0) { buffer.destroy(c.d, c.vbuf); }
@@ -230,6 +275,7 @@ fn is_open(c as *Canvas) as i32 { return c.ok; }
 // Starts a frame for a target of width by height physical pixels, drawing at
 // scale physical pixels per logical one.
 fn begin(c as *Canvas, width as f64, height as f64, scale as f64) as void {
+    c.frames = c.frames + 1;
     c.vcount = 0;
     c.bcount = 0;
     c.width = width;
@@ -283,16 +329,35 @@ fn _grow(c as *Canvas) as i32 {
     let is i64 as nv = _mini(c.vcap * 2, c.vmost);
     let is i64 as nb = c.bcap * 2;
     let is i64 as vbytes = nv * sizeof(Vertex);
-    let is i64 as bytes = vbytes + nb * sizeof(Batch);
+    // Room for the vertices only where they are not in the vertex buffer.
+    let is i64 as vroom with mut = vbytes;
+    if (c.direct == 1) { vroom = 0; }
+    let is i64 as bytes = vroom + nb * sizeof(Batch);
     let is *u8 as block = mem.core.mmap_anon(bytes);
     if (cast(i64, block) == 0 || cast(i64, block) == 0 - 1) { return 0; }
-    let is *u8 as batches = cast(*u8, cast(i64, block) + vbytes);
-    if (c.vcount > 0) { mem.core.memcpy(block, c.verts, c.vcount * sizeof(Vertex)); }
+    let is *u8 as batches = cast(*u8, cast(i64, block) + vroom);
+    let is *u8 as verts with mut = block;
+    let is i64 as vbuf with mut = 0;
+    if (c.direct == 1) {
+        // A bigger vertex buffer, written in place like the last.
+        vbuf = buffer.create(c.d, vbytes, buffer.VERTEX);
+        if (vbuf != 0) { verts = buffer.map(c.d, vbuf); }
+        if (vbuf == 0 || cast(i64, verts) == 0) {
+            if (vbuf != 0) { buffer.destroy(c.d, vbuf); }
+            mem.core.munmap(block, bytes);
+            return 0;
+        }
+    }
+    if (c.vcount > 0) { mem.core.memcpy(verts, c.verts, c.vcount * sizeof(Vertex)); }
     if (c.bcount > 0) { mem.core.memcpy(batches, c.batches, c.bcount * sizeof(Batch)); }
     mem.core.munmap(c.block, c.block_bytes);
+    if (c.direct == 1) {
+        buffer.destroy(c.d, c.vbuf);
+        c.vbuf = vbuf;
+    }
     c.block = block;
     c.block_bytes = bytes;
-    c.verts = block;
+    c.verts = verts;
     c.batches = batches;
     c.vcap = nv;
     c.bcap = nb;
@@ -544,15 +609,21 @@ fn _same_clip(a as Clip, b as Clip) as i32 {
 
 // Room for three vertices in a batch with this state, or 0.
 fn _reserve(c as *Canvas, kind as i32, tex as i64, samp as i64) as i32 {
+    return _reserve_n(c, kind, tex, samp, 3);
+}
+
+// Room for n vertices (a multiple of 3) in one batch, as n / 3 calls of
+// _reserve would leave it when none of them has to grow the canvas.
+fn _reserve_n(c as *Canvas, kind as i32, tex as i64, samp as i64, n as i64) as i32 {
     if (c.ok == 0) { return 0; }
-    if (c.vcount + 3 > c.vcap && _grow(c) == 0) { c.overflowed = 1; return 0; }
+    if (c.vcount + n > c.vcap && _grow(c) == 0) { c.overflowed = 1; return 0; }
     let is Clip as clip = _current_clip(c);
     if (c.bcount > 0) {
         let is *Batch as last = _batch_at(c, c.bcount - 1);
         if (last.kind == kind && last.texture == tex && last.sampler == samp
             && last.layer == c.layer && _same_clip(last.clip, clip) == 1
             && last.first + last.count == c.vcount) {
-            last.count = last.count + 3;
+            last.count = last.count + n;
             return 1;
         }
     }
@@ -565,22 +636,21 @@ fn _reserve(c as *Canvas, kind as i32, tex as i64, samp as i64) as i32 {
     b.layer = c.layer;
     b.clip = clip;
     b.first = c.vcount;
-    b.count = 3;
+    b.count = n;
     c.bcount = c.bcount + 1;
     return 1;
 }
 
 fn _put(c as *Canvas, x as f64, y as f64, col as math.color.Color, u as f64, v as f64) as void {
     let is *Vertex as p = _vertex_at(c, c.vcount);
-    p.x = (x - c.origin_x) * c.scale;
-    p.y = (y - c.origin_y) * c.scale;
-    p.z = 0.0;
-    p.r = col.r;
-    p.g = col.g;
-    p.b = col.b;
-    p.a = col.a;
-    p.u = u;
-    p.v = v;
+    p.x = cast(f32, (x - c.origin_x) * c.scale);
+    p.y = cast(f32, (y - c.origin_y) * c.scale);
+    p.r = cast(f32, col.r);
+    p.g = cast(f32, col.g);
+    p.b = cast(f32, col.b);
+    p.a = cast(f32, col.a);
+    p.u = cast(f32, u);
+    p.v = cast(f32, v);
     c.vcount = c.vcount + 1;
 }
 
@@ -676,19 +746,20 @@ fn _emit(c as *Canvas, kind as i32, tex as i64, samp as i64, a as *_V, b as *_V,
 
 fn _put_at(c as *Canvas, p as *_V) as void {
     let is *Vertex as o = _vertex_at(c, c.vcount);
-    o.x = (p.x - c.origin_x) * c.scale;
-    o.y = (p.y - c.origin_y) * c.scale;
-    o.z = 0.0;
-    o.r = p.col.r;
-    o.g = p.col.g;
-    o.b = p.col.b;
-    o.a = p.col.a;
-    o.u = p.u;
-    o.v = p.v;
+    o.x = cast(f32, (p.x - c.origin_x) * c.scale);
+    o.y = cast(f32, (p.y - c.origin_y) * c.scale);
+    o.r = cast(f32, p.col.r);
+    o.g = cast(f32, p.col.g);
+    o.b = cast(f32, p.col.b);
+    o.a = cast(f32, p.col.a);
+    o.u = cast(f32, p.u);
+    o.v = cast(f32, p.v);
     c.vcount = c.vcount + 1;
 }
 
 fn _plain(c as *Canvas) as i32 { return cast(i32, c.moved == 0 && c.poly_n == 0); }
+// Nothing transforms what is drawn, nor cuts it to a polygon.
+fn plain(c as *Canvas) as i32 { return _plain(c); }
 
 // A triangle in plain colours, one per corner, interpolated between.
 fn triangle(c as *Canvas, x0 as f64, y0 as f64, c0 as math.color.Color,
@@ -735,6 +806,18 @@ fn _quad(c as *Canvas, kind as i32, tex as i64, samp as i64,
         _emit(c, kind, tex, samp, &a, &d, &f);
         return;
     }
+    if (c.vcount + 6 <= c.vcap) {
+        // Both triangles fit: the batch and vertices two _reserves would
+        // make, with one look at the last batch and the clip.
+        if (_reserve_n(c, kind, tex, samp, 6) == 0) { return; }
+        _put(c, x, y, col, u0, v0);
+        _put(c, x, y + h, col, u0, v1);
+        _put(c, x + w, y + h, col, u1, v1);
+        _put(c, x, y, col, u0, v0);
+        _put(c, x + w, y + h, col, u1, v1);
+        _put(c, x + w, y, col, u1, v0);
+        return;
+    }
     if (_reserve(c, kind, tex, samp) == 0) { return; }
     _put(c, x, y, col, u0, v0);
     _put(c, x, y + h, col, u0, v1);
@@ -743,6 +826,114 @@ fn _quad(c as *Canvas, kind as i32, tex as i64, samp as i64,
     _put(c, x, y, col, u0, v0);
     _put(c, x + w, y + h, col, u1, v1);
     _put(c, x + w, y, col, u1, v0);
+}
+
+// --- Coverage masks kept for shapes ---
+
+// The texture of the mask kept for r and bw, side into *side, marked drawn
+// in this frame; 0 when none is kept.
+fn mask_find(c as *Canvas, r as f64, bw as f64, side as *i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < MASKS) {
+        let is *Mask as m = &c.masks[i];
+        if (m.tex != 0 && m.r == r && m.bw == bw) {
+            m.last = c.frames;
+            *side = m.side;
+            return m.tex;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// tex kept as the mask for r and bw, drawn in this frame, in place of the one
+// drawn longest ago, whose texture is destroyed. 1, or 0 when every mask was
+// drawn in this frame — the caller keeps tex, and its shape is drawn
+// another way.
+fn mask_keep(c as *Canvas, r as f64, bw as f64, tex as i64, side as i64) as i32 {
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MASKS) {
+        let is *Mask as m = &c.masks[i];
+        if (m.tex == 0) {
+            at = i;
+            i = MASKS;
+        } else {
+            if (m.last < c.frames && (at < 0 || m.last < c.masks[at].last)) { at = i; }
+            i = i + 1;
+        }
+    }
+    if (at < 0) { return 0; }
+    let is *Mask as k = &c.masks[at];
+    if (k.tex != 0) { texture.destroy(c.d, k.tex); }
+    k.r = r;
+    k.bw = bw;
+    k.tex = tex;
+    k.side = side;
+    k.last = c.frames;
+    return 1;
+}
+
+// How many masks are kept: for tests.
+fn mask_count(c as *Canvas) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < MASKS) {
+        if (c.masks[i].tex != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// --- Quads kept by a caller, to draw again ---
+
+// What, besides the corners, colours and texture given, decides the vertices
+// glyph() makes: 1 with the origin and the innermost rectangular clip (none:
+// *clip_on 0) into the out parameters, when nothing transforms or cuts what
+// is drawn; 0 otherwise, when vertices are not worth keeping.
+fn quad_state(c as *Canvas, ox as *f64, oy as *f64, clip_on as *i64, clip as *Clip) as i32 {
+    if (_plain(c) == 0) { return 0; }
+    *ox = c.origin_x;
+    *oy = c.origin_y;
+    *clip_on = 0;
+    if (c.clip_n > 0) {
+        *clip_on = 1;
+        *clip = c.clips[c.clip_n - 1];
+    }
+    return 1;
+}
+
+// Vertex i of the frame, as written: for copying the last glyph()'s out.
+fn vertex(c as *Canvas, i as i64) as *Vertex { return _vertex_at(c, i); }
+
+// n glyph() quads again, their six vertices each copied from src as an
+// earlier glyph() wrote them under the same quad_state, scale and texture:
+// the same vertices and batches the n calls would make, and, short of room,
+// what each would keep and the overflow it would report.
+fn glyph_quads(c as *Canvas, atlas as i64, src as *Vertex, n as i64) as void {
+    if (n <= 0) { return; }
+    let is i64 as samp with mut = c.nearest;
+    if (is_translation(c) == 0) { samp = c.linear; }
+    let is i64 as vb = sizeof(Vertex);
+    if (c.vcount + 6 * n <= c.vcap) {
+        if (_reserve_n(c, KIND_GLYPH, atlas, samp, 6 * n) == 0) { return; }
+        mem.core.memcpy(cast(*u8, _vertex_at(c, c.vcount)), cast(*u8, src), 6 * n * vb);
+        c.vcount = c.vcount + 6 * n;
+        return;
+    }
+    let is i64 as q with mut = 0;
+    while (q < n) {
+        let is i64 as from = cast(i64, src) + q * 6 * vb;
+        if (_reserve(c, KIND_GLYPH, atlas, samp) == 1) {
+            mem.core.memcpy(cast(*u8, _vertex_at(c, c.vcount)), cast(*u8, from), 3 * vb);
+            c.vcount = c.vcount + 3;
+            if (_reserve(c, KIND_GLYPH, atlas, samp) == 1) {
+                mem.core.memcpy(cast(*u8, _vertex_at(c, c.vcount)), cast(*u8, from + 3 * vb), 3 * vb);
+                c.vcount = c.vcount + 3;
+            }
+        }
+        q = q + 1;
+    }
 }
 
 // A rectangle of texture, tinted. smooth 1 filters between texels, 0 takes
@@ -787,13 +978,15 @@ fn flush(c as *Canvas, cmd as i64) as i32 {
     if (c.vcount == 0) { return result; }
 
     // A frame that grew past the buffer gets one that holds it.
-    if (c.vcount * sizeof(Vertex) > buffer.size(c.d, c.vbuf)) {
-        let is i64 as bigger = buffer.create(c.d, c.vcap * sizeof(Vertex), buffer.VERTEX);
-        if (bigger == 0) { return 0; }
-        buffer.destroy(c.d, c.vbuf);
-        c.vbuf = bigger;
+    if (c.direct == 0) {
+        if (c.vcount * sizeof(Vertex) > buffer.size(c.d, c.vbuf)) {
+            let is i64 as bigger = buffer.create(c.d, c.vcap * sizeof(Vertex), buffer.VERTEX);
+            if (bigger == 0) { return 0; }
+            buffer.destroy(c.d, c.vbuf);
+            c.vbuf = bigger;
+        }
+        buffer.upload(c.d, c.vbuf, 0, c.verts, c.vcount * sizeof(Vertex));
     }
-    buffer.upload(c.d, c.vbuf, 0, c.verts, c.vcount * sizeof(Vertex));
     // Physical pixels to clip space, y down.
     let is math.mat.Mat4 as proj = math.mat.m4_ortho(0.0, c.width, c.height, 0.0, 0.0 - 1.0, 1.0);
     let is shader.BuiltinUniforms as un = shader.uniforms_mvp(proj);

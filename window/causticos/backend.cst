@@ -105,10 +105,11 @@ struct Native {
     // The frame the program draws.
     pixels   as *u8;
     pix_bytes as i64;
-    // The damage of this frame and of the one before: the buffer written was
-    // last written two frames ago.
-    dmg_x0 as i64; dmg_y0 as i64; dmg_x1 as i64; dmg_y1 as i64;
-    old_x0 as i64; old_y0 as i64; old_x1 as i64; old_y1 as i64;
+    // The damage of this frame and of the one before — the buffer written
+    // was last written two frames ago — as rectangles kept apart where they
+    // are apart (window/damage.cst), not one box round them all.
+    dmg as damage.List;
+    old as damage.List;
     // What it was told.
     events   as [64]event.Event;
     ev_head  as i64;
@@ -633,20 +634,26 @@ fn _pixels(n as *Native) as i32 {
     return 1;
 }
 
-fn _damage_all(n as *Native) as void {
-    n.dmg_x0 = 0; n.dmg_y0 = 0; n.dmg_x1 = n.w; n.dmg_y1 = n.h;
-}
+fn _damage_all(n as *Native) as void { damage.whole(&n.dmg); }
 
 fn _damage_add(n as *Native, x as i64, y as i64, w as i64, h as i64) as void {
     if (w <= 0 || h <= 0) { return; }
-    if (n.dmg_x1 <= n.dmg_x0 || n.dmg_y1 <= n.dmg_y0) {
-        n.dmg_x0 = x; n.dmg_y0 = y; n.dmg_x1 = x + w; n.dmg_y1 = y + h;
-        return;
-    }
-    if (x < n.dmg_x0) { n.dmg_x0 = x; }
-    if (y < n.dmg_y0) { n.dmg_y0 = y; }
-    if (x + w > n.dmg_x1) { n.dmg_x1 = x + w; }
-    if (y + h > n.dmg_y1) { n.dmg_y1 = y + h; }
+    damage.add(&n.dmg, x, y, w, h, n.w, n.h);
+}
+
+// What a frame copies into the buffer it writes — its own damage and the
+// frame before's, which that buffer has not seen (two buffers), all of it
+// until both have been shown once — into copy; what the window manager is
+// told changed — the frame's own, all of it the first time or when nothing
+// was said — into tell. Rectangles apart stay apart: two small changes far
+// from each other copy and tell those two, not the box round them.
+fn _frame_rects(dmg as *damage.List, old as *damage.List, nbuf as i64, presented as i64, w as i64, h as i64,
+                copy as *damage.List, tell as *damage.List) as void {
+    *copy = *dmg;
+    if (nbuf == 2) { damage.add_list(copy, old, w, h); }
+    if (presented < 2) { damage.whole(copy); }
+    *tell = *dmg;
+    if (presented < 1 || damage.empty(dmg) == 1) { damage.whole(tell); }
 }
 
 fn _clip(v as i64, hi as i64) as i64 {
@@ -676,6 +683,20 @@ fn _to_bgra(dst as i64, src as i64, n as i64) as void {
     }
 }
 
+// Rows y0 to y1 of columns x0 to x1, clipped to the window, from the frame
+// into the buffer at base, turned as they go.
+fn _copy_rect(n as *Native, base as i64, x0 as i64, y0 as i64, x1 as i64, y1 as i64) as void {
+    let is i64 as cx0 = _clip(x0, n.w);
+    let is i64 as cx1 = _clip(x1, n.w);
+    let is i64 as cy1 = _clip(y1, n.h);
+    if (cx1 <= cx0) { return; }
+    let is i64 as y with mut = _clip(y0, n.h);
+    while (y < cy1) {
+        _to_bgra(base + y * n.stride + cx0 * 4, cast(i64, n.pixels) + (y * n.w + cx0) * 4, cx1 - cx0);
+        y = y + 1;
+    }
+}
+
 // The frame into the buffer not shown, and that buffer shown — or, while the
 // other is still on its way to the screen, kept until FRAME frees it.
 fn _present(n as *Native) as void {
@@ -685,42 +706,34 @@ fn _present(n as *Native) as void {
         return;
     }
     n.wanted = 0;
-    // What has to be copied: this frame's damage, and the last frame's,
-    // which the buffer written now has not seen.
-    let is i64 as x0 with mut = n.dmg_x0;
-    let is i64 as y0 with mut = n.dmg_y0;
-    let is i64 as x1 with mut = n.dmg_x1;
-    let is i64 as y1 with mut = n.dmg_y1;
-    if (n.nbuf == 2 && n.old_x1 > n.old_x0 && n.old_y1 > n.old_y0) {
-        if (x1 <= x0 || y1 <= y0) { x0 = n.old_x0; y0 = n.old_y0; x1 = n.old_x1; y1 = n.old_y1; }
-        else {
-            if (n.old_x0 < x0) { x0 = n.old_x0; }
-            if (n.old_y0 < y0) { y0 = n.old_y0; }
-            if (n.old_x1 > x1) { x1 = n.old_x1; }
-            if (n.old_y1 > y1) { y1 = n.old_y1; }
-        }
-    }
-    // Never shown yet: all of it.
-    if (n.presented < 2) { x0 = 0; y0 = 0; x1 = n.w; y1 = n.h; }
-    x0 = _clip(x0, n.w); x1 = _clip(x1, n.w);
-    y0 = _clip(y0, n.h); y1 = _clip(y1, n.h);
+    let is damage.List as copy;
+    let is damage.List as tell;
+    _frame_rects(&n.dmg, &n.old, n.nbuf, n.presented, n.w, n.h, &copy, &tell);
     let is i64 as buf with mut = 0;
     if (n.nbuf == 2) { buf = n.back; }
     let is i64 as base = n.seg_va + buf * n.buf_bytes;
-    if (x1 > x0) {
-        let is i64 as y with mut = y0;
-        while (y < y1) {
-            _to_bgra(base + y * n.stride + x0 * 4, cast(i64, n.pixels) + (y * n.w + x0) * 4, x1 - x0);
-            y = y + 1;
+    if (copy.whole == 1) {
+        _copy_rect(n, base, 0, 0, n.w, n.h);
+    } else {
+        let is i32 as k with mut = 0;
+        while (k < copy.n) {
+            let is *damage.Rect as r = &copy.rects[k];
+            _copy_rect(n, base, cast(i64, r.x), cast(i64, r.y), cast(i64, r.x + r.w), cast(i64, r.y + r.h));
+            k = k + 1;
         }
     }
-    // The window manager is told this frame's own damage.
-    let is i64 as cx0 = _clip(n.dmg_x0, n.w);
-    let is i64 as cy0 = _clip(n.dmg_y0, n.h);
-    let is i64 as cx1 = _clip(n.dmg_x1, n.w);
-    let is i64 as cy1 = _clip(n.dmg_y1, n.h);
-    if (n.presented < 1 || cx1 <= cx0 || cy1 <= cy0) { p.send(n.chan, p.COMMIT, 0, 0, p.wh(n.w, n.h)); }
-    else { p.send(n.chan, p.COMMIT, cx0, cy0, p.wh(cx1 - cx0, cy1 - cy0)); }
+    // The window manager is told this frame's own damage: a COMMIT each
+    // rectangle, which it adds to what it composes.
+    if (tell.whole == 1) {
+        p.send(n.chan, p.COMMIT, 0, 0, p.wh(n.w, n.h));
+    } else {
+        let is i32 as j with mut = 0;
+        while (j < tell.n) {
+            let is *damage.Rect as tr = &tell.rects[j];
+            p.send(n.chan, p.COMMIT, cast(i64, tr.x), cast(i64, tr.y), p.wh(cast(i64, tr.w), cast(i64, tr.h)));
+            j = j + 1;
+        }
+    }
     if (n.nbuf == 2) {
         p.send(n.chan, p.PRESENT, n.back, 1, 0);
         n.waiting = 1;
@@ -728,8 +741,8 @@ fn _present(n as *Native) as void {
     } else {
         p.send(n.chan, p.PRESENT, 0 - 1, 0, 0);
     }
-    n.old_x0 = n.dmg_x0; n.old_y0 = n.dmg_y0; n.old_x1 = n.dmg_x1; n.old_y1 = n.dmg_y1;
-    n.dmg_x0 = 0; n.dmg_y0 = 0; n.dmg_x1 = 0; n.dmg_y1 = 0;
+    n.old = n.dmg;
+    damage.clear(&n.dmg);
     if (n.presented < 2) { n.presented = n.presented + 1; }
 }
 
