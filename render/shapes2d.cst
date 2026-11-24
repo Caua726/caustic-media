@@ -28,11 +28,16 @@ use "../text/outline/path.cst" as path;
 use "../text/raster/raster.cst" as raster;
 use "draw2d.cst" as draw2d;
 use "coverage.cst" as coverage;
+use "../gpu/texture.cst" as texture;
 
 // Points an outline may have: four corners of up to MAX_CORNER_SEGMENTS + 1
 // points each.
 let is i64 as MAX_CORNER_SEGMENTS with imut = 64;
 let is i64 as MAX_POINTS with imut = 260;
+
+fn _same_color(a as math.color.Color, b as math.color.Color) as i32 {
+    return cast(i32, a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a);
+}
 
 fn _with_alpha(c as math.color.Color, a as f64) as math.color.Color {
     return math.color.rgba(c.r, c.g, c.b, c.a * a);
@@ -278,6 +283,140 @@ fn _outline(xs as *f64, ys as *f64, x as f64, y as f64, w as f64, h as f64,
     return n;
 }
 
+// --- Rounded rectangles from kept corners ---
+//
+// A rounded rectangle whose edges fall on whole physical pixels, with one
+// radius for its four corners, is drawn as rectangles and four quads of one
+// corner's coverage — the same corner turned for each — kept by the canvas
+// (draw2d.mask_find). Its coverage is the fringe's: at a pixel's centre, half
+// a pixel inside the edge is full and half a pixel outside is none, the
+// distance to a corner measured from its circle's centre. A few triangles
+// over each pixel once, where the outline's fan and fringes are hundreds.
+
+let is i64 as MASK_SIDE with imut = 64;
+let is i32 as _kept_on with mut = 1;
+
+// Rounded rectangles drawn from kept corners (1, the default) or always as
+// outlines and fringes (0): for comparing the two.
+fn kept_corners(on as i32) as void { _kept_on = on; }
+// The four corners of a mask side by side, each turned: 2 * MASK_SIDE square.
+let is [16384]u8 as _mask_px with mut;
+
+fn _clamp01(v as f64) as f64 {
+    if (v < 0.0) { return 0.0; }
+    if (v > 1.0) { return 1.0; }
+    return v;
+}
+
+// How much of the pixel centred at (px, py), from the corner of the shape, a
+// corner of radius r is over: the fringe's coverage of the rounded edge.
+fn _corner_cover(px as f64, py as f64, cx as f64, r as f64) as f64 {
+    let is f64 as qx = fm.max_f64(cx - px, 0.0);
+    let is f64 as qy = fm.max_f64(cx - py, 0.0);
+    return _clamp01(0.5 - (fm.sqrt(qx * qx + qy * qy) - r));
+}
+
+// The texture of the corner of radius r physical pixels — filled when bw < 0,
+// otherwise its border bw wide — and its side, from the canvas's masks or
+// made now; 0 when it is larger than MASK_SIDE or cannot be made.
+fn _mask(c as *draw2d.Canvas, r as f64, bw as f64, side as *i64) as i64 {
+    let is i64 as t = cast(i64, fm.ceil(fm.max_f64(r, bw)));
+    if (t < 1 || t > MASK_SIDE) { return 0; }
+    let is i64 as tex with mut = draw2d.mask_find(c, r, bw, side);
+    if (tex != 0) { return tex; }
+    // _kept_corners keeps a border thinner than the corner's side, so the
+    // inner corner turns about the same centre, r - bw round.
+    let is f64 as ri = fm.max_f64(r - bw, 0.0);
+    let is i64 as t2 = t * 2;
+    let is i64 as j with mut = 0;
+    while (j < t) {
+        let is i64 as i with mut = 0;
+        while (i < t) {
+            let is f64 as fx = cast(f64, i) + 0.5;
+            let is f64 as fy = cast(f64, j) + 0.5;
+            let is f64 as v with mut = _corner_cover(fx, fy, r, r);
+            if (bw >= 0.0) { v = _clamp01(v - _corner_cover(fx, fy, r, ri)); }
+            let is u8 as b = cast(u8, cast(i64, v * 255.0 + 0.5));
+            // Top-left as computed; the others mirrored into their quarters.
+            _mask_px[j * t2 + i] = b;
+            _mask_px[j * t2 + (t2 - 1 - i)] = b;
+            _mask_px[(t2 - 1 - j) * t2 + i] = b;
+            _mask_px[(t2 - 1 - j) * t2 + (t2 - 1 - i)] = b;
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    let is texture.Desc as td = texture.desc(t2, t2, texture.R8, texture.SAMPLED);
+    tex = texture.create(c.d, &td);
+    if (tex == 0) { return 0; }
+    if (texture.upload_region(c.d, tex, 0, 0, t2, t2, cast(*u8, &_mask_px), t2) == 0 ||
+        draw2d.mask_keep(c, r, bw, tex, t) == 0) {
+        texture.destroy(c.d, tex);
+        return 0;
+    }
+    *side = t;
+    return tex;
+}
+
+// Whether a rounded rectangle at x, y, w by h with radius r is drawn from
+// kept corners: its side t (logical) into *t, the corner's physical radius
+// into *rp. bw is its border, physical, or -1 for a fill.
+fn _kept_corners(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64, r as f64,
+                 bwp as f64, t as *f64, rp as *f64) as i32 {
+    if (_kept_on == 0 || r <= 0.0 || draw2d.plain(c) == 0 || _aligned(c, x, y, w, h) == 0) { return 0; }
+    let is f64 as s = draw2d.scale(c);
+    let is f64 as side = fm.ceil(fm.max_f64(r * s, bwp));
+    if (bwp >= 0.0 && side < bwp + 1.0) { return 0; }
+    if (side > cast(f64, MASK_SIDE) || w * s < side * 2.0 || h * s < side * 2.0) { return 0; }
+    *t = side / s;
+    *rp = r * s;
+    return 1;
+}
+
+// The four corners, each from its quarter of the mask: one texel to a pixel,
+// the way the software device draws coverage fastest.
+fn _corners(c as *draw2d.Canvas, tex as i64, x as f64, y as f64, w as f64, h as f64, t as f64,
+            col as math.color.Color) as void {
+    draw2d.glyph(c, tex, x, y, t, t, 0.0, 0.0, 0.5, 0.5, col);
+    draw2d.glyph(c, tex, x + w - t, y, t, t, 0.5, 0.0, 1.0, 0.5, col);
+    draw2d.glyph(c, tex, x + w - t, y + h - t, t, t, 0.5, 0.5, 1.0, 1.0, col);
+    draw2d.glyph(c, tex, x, y + h - t, t, t, 0.0, 0.5, 0.5, 1.0, col);
+}
+
+// A border's straight side on whole pixels, bwp physical pixels deep from
+// the edge at x, y (logical), len long, going down (horiz 1) or across: its
+// whole pixels solid, then a pixel of the rest as faint as the fringe makes
+// it — the coverage at that pixel's centre.
+fn _side(c as *draw2d.Canvas, x as f64, y as f64, len as f64, bwp as f64, horiz as i32, inward as f64,
+         col as math.color.Color) as void {
+    let is f64 as s = draw2d.scale(c);
+    let is f64 as whole = fm.floor(bwp);
+    let is f64 as rest = bwp - whole;
+    let is f64 as wl = whole / s;
+    let is f64 as px = 1.0 / s;
+    if (horiz == 1) {
+        let is f64 as y0 with mut = y;
+        if (inward < 0.0) { y0 = y - wl; }
+        _rect_solid(c, x, y0, len, wl, col, col);
+        if (rest > 0.0) {
+            let is f64 as yr with mut = y + wl;
+            if (inward < 0.0) { yr = y - wl - px; }
+            let is math.color.Color as f = _with_alpha(col, col.a * rest);
+            _rect_solid(c, x, yr, len, px, f, f);
+        }
+    } else {
+        let is f64 as x0 with mut = x;
+        if (inward < 0.0) { x0 = x - wl; }
+        _rect_solid(c, x0, y, wl, len, col, col);
+        if (rest > 0.0) {
+            let is f64 as xr with mut = x + wl;
+            if (inward < 0.0) { xr = x - wl - px; }
+            let is math.color.Color as f = _with_alpha(col, col.a * rest);
+            _rect_solid(c, xr, y, px, len, f, f);
+        }
+    }
+}
+
 // --- Public shapes ---
 
 fn fill_rect(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64, col as math.color.Color) as void {
@@ -309,6 +448,20 @@ fn fill_rounded_gradient(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as
     if (a == 0.0 && b == 0.0 && d == 0.0 && e == 0.0 && _aligned(c, x, y, w, h) == 1) {
         _rect_solid(c, x, y, w, h, top, bottom);
         return;
+    }
+    let is f64 as t with mut = 0.0;
+    let is f64 as rp with mut = 0.0;
+    if (a == b && a == d && a == e && _same_color(top, bottom) == 1 &&
+        _kept_corners(c, x, y, w, h, a, 0.0 - 1.0, &t, &rp) == 1) {
+        let is i64 as side with mut = 0;
+        let is i64 as tex = _mask(c, rp, 0.0 - 1.0, &side);
+        if (tex != 0) {
+            _rect_solid(c, x + t, y, w - t * 2.0, h, top, top);
+            _rect_solid(c, x, y + t, t, h - t * 2.0, top, top);
+            _rect_solid(c, x + w - t, y + t, t, h - t * 2.0, top, top);
+            _corners(c, tex, x, y, w, h, t, top);
+            return;
+        }
     }
     let is [4]i64 as k;
     k[0] = _segments(c, a);
@@ -361,6 +514,21 @@ fn stroke_rounded(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64,
     if (bw < px) {
         fill = _with_alpha(col, bw / px);
         bw = px;
+    }
+    let is f64 as t with mut = 0.0;
+    let is f64 as rp with mut = 0.0;
+    let is f64 as bwp = bw * draw2d.scale(c);
+    if (a == b && a == d && a == e && _kept_corners(c, x, y, w, h, a, bwp, &t, &rp) == 1) {
+        let is i64 as side with mut = 0;
+        let is i64 as tex = _mask(c, rp, bwp, &side);
+        if (tex != 0) {
+            _corners(c, tex, x, y, w, h, t, fill);
+            _side(c, x + t, y, w - t * 2.0, bwp, 1, 1.0, fill);
+            _side(c, x + t, y + h, w - t * 2.0, bwp, 1, 0.0 - 1.0, fill);
+            _side(c, x, y + t, h - t * 2.0, bwp, 0, 1.0, fill);
+            _side(c, x + w, y + t, h - t * 2.0, bwp, 0, 0.0 - 1.0, fill);
+            return;
+        }
     }
 
     let is [4]i64 as k;
