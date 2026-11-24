@@ -166,7 +166,7 @@ struct Run {
     cut     as i32;   // max_lines left text out
     ok      as i32;   // laid out since the text was set
     ysorted as i32;   // its glyphs looked at in order, yslack apart (below): 0 before it is laid out
-    _pad_ys as i32;
+    kept_state as i32;   // 0 nothing kept; 1 the last draw's _Key, 2 and its quads, in the block _kslot names
     pxmax   as f64;   // the largest of its faces' sizes
     yslack  as f64;   // how far a glyph's baseline is at most above the lowest before it
 }
@@ -189,6 +189,7 @@ fn run() as Run {
     r.ysorted = 0;
     r.pxmax = 0.0;
     r.yslack = 0.0;
+    r.kept_state = 0;
     return r;
 }
 
@@ -207,6 +208,7 @@ fn _order(r as *Run) as void {
 }
 
 fn _forget(r as *Run) as void {
+    _kept_drop(r);
     r.ysorted = 0;
     r.nglyphs = 0;
     r.nfaces = 0;
@@ -221,6 +223,7 @@ fn _forget(r as *Run) as void {
 }
 
 fn run_close(r as *Run) as void {
+    _kept_drop(r);
     if (r.bytes > 0) { mem.core.munmap(r.block, r.bytes); }
     r.block = cast(*u8, 0);
     r.bytes = 0;
@@ -249,6 +252,7 @@ fn _room(r as *Run, need as i64, keep as i64) as i32 {
 // refused, the run as it was.
 fn set_text(r as *Run, text as *u8, n as i64) as i32 {
     if (n < 0) { return 0; }
+    _kept_drop(r);
     let is i64 as at = cast(i64, text) - cast(i64, r.block);
     if (r.bytes > 0 && at >= 0 && at < r.bytes) {
         // Part of its own: moved to the front, which is never past it.
@@ -283,6 +287,17 @@ fn _faces(r as *Run) as i64 { return _glyphs(r) + r.nglyphs * sizeof(Glyph); }
 fn _lines(r as *Run) as i64 { return _faces(r) + r.nfaces * sizeof(Face); }
 fn _decos(r as *Run) as i64 { return _lines(r) + r.nlines * sizeof(Line); }
 fn _colors(r as *Run) as i64 { return _decos(r) + r.ndecos * sizeof(Deco); }
+// After the colours, laid out with them: where the block of quads kept is,
+// while kept_state is not 0 (a Run's size is not grown: widgets hold runs in
+// data of a set size).
+fn _kslot(r as *Run) as *i64 { return cast(*i64, _colors(r) + r.nstyles * sizeof(math.color.Color)); }
+fn _kb(r as *Run) as *u8 { return cast(*u8, *_kslot(r)); }
+
+// The quads kept given back.
+fn _kept_drop(r as *Run) as void {
+    if (r.kept_state != 0) { mem.core.munmap(_kb(r), *cast(*i64, _kb(r))); }
+    r.kept_state = 0;
+}
 
 fn glyph_count(r as *Run) as i64 { return r.nglyphs; }
 fn glyph(r as *Run, i as i64) as *Glyph { return cast(*Glyph, _glyphs(r) + i * sizeof(Glyph)); }
@@ -415,6 +430,7 @@ struct Service {
     _pad0    as i32;
     lays     as i64;                   // text laid out since open: layouts()
     scanned  as i64;                   // glyphs a draw looked at, in or out of its clip: for tests
+    replayed as i64;                   // draws whose kept quads were copied in: for tests
     sizes    as [8]Sizes;              // sizes(), by font and size; the oldest replaced
     nsizes   as i64;
     snext    as i64;
@@ -781,7 +797,7 @@ fn lay_text_in(s as *Service, r as *Run, l as *layout.Layout, lstyles as *model.
     let is i64 as nl = layout.line_count(l);
     let is i64 as nd = layout.deco_count(l);
     let is i64 as need = _a8(r.nbytes) + ng * sizeof(Glyph) + nf * sizeof(Face) + nl * sizeof(Line) +
-                         nd * sizeof(Deco) + nstyles * sizeof(math.color.Color);
+                         nd * sizeof(Deco) + nstyles * sizeof(math.color.Color) + 8;
     if (_room(r, need, r.nbytes) == 0) { return 0; }
     r.nglyphs = ng;
     r.nfaces = nf;
@@ -1046,6 +1062,175 @@ fn _waves(c as *draw2d.Canvas, x as f64, y as f64, w as f64, h as f64, col as ma
     }
 }
 
+// --- Quads kept: a run drawn again as it was ---
+//
+// What a draw's glyph quads come from besides the run: the service, the pen,
+// the scale, the colours, and what of the canvas shapes a quad.
+struct _Key {
+    s       as i64;
+    x       as f64;
+    y       as f64;
+    k       as f64;
+    fr      as f64;
+    fgr     as f64;
+    fb      as f64;
+    fa      as f64;
+    all_fg  as i64;
+    ox      as f64;
+    oy      as f64;
+    clip_on as i64;
+    clip    as draw2d.Clip;
+}
+
+// At the front of a run's kept block; then cap _Recs, cap pages and cap
+// quads of six vertices.
+struct _Kept {
+    bytes   as i64;   // the block's size
+    cap     as i64;   // glyphs and quads it has room for
+    key     as _Key;
+    scanned as i64;   // what the draw added to s.scanned
+    nfaces  as i64;
+    nrecs   as i64;
+    nquads  as i64;
+    face    as [16]i64;   // the run's faces the draw opened
+    fid     as [16]i64;   // and the id each had
+}
+
+// A glyph cache entry the draw found, and where.
+struct _Rec {
+    idx as i64;
+    e   as atlas.Entry;
+}
+
+fn _khead(r as *Run) as *_Kept { return cast(*_Kept, _kb(r)); }
+fn _kbytes(cap as i64) as i64 {
+    return sizeof(_Kept) + cap * (sizeof(_Rec) + 8 + 6 * sizeof(draw2d.Vertex));
+}
+// In a kept block b: glyph i's entry, quad i's page and its vertices.
+fn _brec(b as *u8, i as i64) as *_Rec {
+    return cast(*_Rec, cast(i64, b) + sizeof(_Kept) + i * sizeof(_Rec));
+}
+fn _bpage(b as *u8, i as i64) as *i64 {
+    return cast(*i64, cast(i64, b) + sizeof(_Kept) + cast(*_Kept, b).cap * sizeof(_Rec) + i * 8);
+}
+fn _bverts(b as *u8, i as i64) as *draw2d.Vertex {
+    return cast(*draw2d.Vertex, cast(i64, b) + sizeof(_Kept) + cast(*_Kept, b).cap * (sizeof(_Rec) + 8) +
+                i * 6 * sizeof(draw2d.Vertex));
+}
+fn _krec(r as *Run, i as i64) as *_Rec { return _brec(_kb(r), i); }
+fn _kpage(r as *Run, i as i64) as *i64 { return _bpage(_kb(r), i); }
+fn _kverts(r as *Run, i as i64) as *draw2d.Vertex { return _bverts(_kb(r), i); }
+
+// Room kept for need glyphs and quads, what is there kept. 1, or 0 when
+// memory is refused, the block as it was.
+fn _kept_room(r as *Run, need as i64) as i32 {
+    let is i64 as had with mut = 0;
+    if (r.kept_state != 0) { had = cast(i64, _kb(r)); }
+    if (had != 0 && need <= _khead(r).cap) { return 1; }
+    let is i64 as cap with mut = 16;
+    if (had != 0 && _khead(r).cap * 2 > cap) { cap = _khead(r).cap * 2; }
+    if (cap < need) { cap = need; }
+    let is i64 as size = (_kbytes(cap) + 4095) / 4096 * 4096;
+    let is *u8 as nb = mem.core.mmap_anon(size);
+    if (cast(i64, nb) <= 0) { return 0; }
+    let is *_Kept as nh = cast(*_Kept, nb);
+    if (had != 0) {
+        let is *_Kept as h = _khead(r);
+        mem.memcpy(nb, _kb(r), sizeof(_Kept));
+        nh.cap = cap;
+        if (h.nrecs > 0) { mem.memcpy(cast(*u8, _brec(nb, 0)), cast(*u8, _krec(r, 0)), h.nrecs * sizeof(_Rec)); }
+        if (h.nquads > 0) {
+            mem.memcpy(cast(*u8, _bpage(nb, 0)), cast(*u8, _kpage(r, 0)), h.nquads * 8);
+            mem.memcpy(cast(*u8, _bverts(nb, 0)), cast(*u8, _kverts(r, 0)), h.nquads * 6 * sizeof(draw2d.Vertex));
+        }
+        mem.core.munmap(_kb(r), h.bytes);
+    }
+    nh.bytes = size;
+    nh.cap = cap;
+    *_kslot(r) = cast(i64, nb);
+    return 1;
+}
+
+// The key of a draw now into *out: 1, or 0 when its quads are not kept.
+fn _key_now(s as *Service, c as *draw2d.Canvas, x as f64, y as f64, fg as math.color.Color, all_fg as i32,
+            out as *_Key) as i32 {
+    mem.memset(cast(*u8, out), 0, sizeof(_Key));
+    if (draw2d.quad_state(c, &out.ox, &out.oy, &out.clip_on, &out.clip) == 0) { return 0; }
+    out.s = cast(i64, s);
+    out.x = x;
+    out.y = y;
+    out.k = draw2d.scale(c);
+    out.fr = fg.r;
+    out.fgr = fg.g;
+    out.fb = fg.b;
+    out.fa = fg.a;
+    out.all_fg = cast(i64, all_fg);
+    return 1;
+}
+
+// Bit for bit.
+fn _same_key(a as *_Key, b as *_Key) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < sizeof(_Key)) {
+        if (*cast(*i64, cast(i64, a) + i) != *cast(*i64, cast(i64, b) + i)) { return 0; }
+        i = i + 8;
+    }
+    return 1;
+}
+
+// The open face fc is, as _open finds it, changing nothing; none if not open.
+fn _find_open(s as *Service, fc as *Face) as *Open {
+    let is i64 as i with mut = 0;
+    while (i < s.nopens) {
+        let is *Open as o = &s.opens[i];
+        if (o.id != 0 && cast(i64, o.font) == cast(i64, fc.font) && o.index == fc.index && o.px == fc.px) { return o; }
+        i = i + 1;
+    }
+    return cast(*Open, 0);
+}
+
+// The kept quads drawn, when every face the draw opened is open still as it
+// was and every glyph cache entry it found is still there as it was — what
+// the glyph walk would find and draw, the same vertices — and the same done
+// to the caches as that walk: 1. Otherwise 0, nothing done.
+fn _replay(s as *Service, c as *draw2d.Canvas, r as *Run) as i32 {
+    let is *u8 as b = _kb(r);
+    let is *_Kept as h = cast(*_Kept, b);
+    let is i64 as i with mut = 0;
+    while (i < h.nfaces) {
+        let is *Open as o = _find_open(s, face(r, h.face[i]));
+        if (cast(i64, o) == 0 || o.id != h.fid[i]) { return 0; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < h.nrecs) {
+        let is *_Rec as rc = _brec(b, i);
+        if (atlas.entry_same(&s.cache, rc.idx, &rc.e) == 0) { return 0; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < h.nfaces) {
+        _find_open(s, face(r, h.face[i])).used = s.frame;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < h.nrecs) {
+        atlas.entry_found(&s.cache, _brec(b, i).idx);
+        i = i + 1;
+    }
+    s.scanned = s.scanned + h.scanned;
+    s.replayed = s.replayed + 1;
+    i = 0;
+    while (i < h.nquads) {
+        let is i64 as pg = *_bpage(b, i);
+        let is i64 as j with mut = i + 1;
+        while (j < h.nquads && *_bpage(b, j) == pg) { j = j + 1; }
+        draw2d.glyph_quads(c, coverage.texture_of(&s.cov, pg), _bverts(b, i), j - i);
+        i = j;
+    }
+    return 1;
+}
+
 fn _draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color, all_fg as i32) as i32 {
     if (s.drawing == 0 || r.ok == 0) { return 0; }
     let is i32 as ok with mut = 1;
@@ -1074,6 +1259,31 @@ fn _draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg a
     let is i64 as i with mut = 0;
     while (i < 16) { opened[i] = cast(*Open, 0); i = i + 1; }
     i = 0;
+    // Drawn as the last time — the same key — its quads are kept: the
+    // second time they are recorded, from then on copied in (_replay) while
+    // the faces and glyph cache entries they came from are still as they were.
+    let is _Key as key;
+    let is i32 as keep = _key_now(s, c, x, y, fg, all_fg, &key);
+    let is i32 as rec with mut = 0;
+    let is i32 as replayed with mut = 0;
+    let is i64 as scanned0 = s.scanned;
+    if (keep == 0) {
+        _kept_drop(r);
+    } else if (r.kept_state >= 1 && _same_key(&_khead(r).key, &key) == 1) {
+        if (r.kept_state == 2 && _replay(s, c, r) == 1) { replayed = 1; }
+        if (replayed == 0) {
+            rec = 1;
+            _khead(r).nfaces = 0;
+            _khead(r).nrecs = 0;
+            _khead(r).nquads = 0;
+            r.kept_state = 1;
+        }
+    } else if (_kept_room(r, 0) == 1) {
+        _khead(r).key = key;
+        r.kept_state = 1;
+    } else {
+        r.kept_state = 0;
+    }
     // Lines top to bottom and a clip: only the glyphs whose baselines are
     // within twice the largest face's size of it can reach it — the test
     // below, for every face — found by halving, and the walk ends past them.
@@ -1092,6 +1302,7 @@ fn _draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg a
         }
         i = lo;
     }
+    if (replayed == 1) { i = r.nglyphs; }
     while (i < r.nglyphs) {
         let is *Glyph as g = glyph(r, i);
         let is *Face as fc = face(r, g.face);
@@ -1111,6 +1322,16 @@ fn _draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg a
         if (cast(i64, o) == 0) {
             o = _open(s, fc);
             if (g.face >= 0 && g.face < 16) { opened[g.face] = o; }
+            if (rec == 1) {
+                let is *_Kept as kh with mut = _khead(r);
+                if (g.face < 0 || g.face >= 16 || cast(i64, o) == 0 || o.color != 0 || kh.nfaces >= 16) {
+                    rec = 0;
+                } else {
+                    kh.face[kh.nfaces] = g.face;
+                    kh.fid[kh.nfaces] = o.id;
+                    kh.nfaces = kh.nfaces + 1;
+                }
+            }
         }
         let is math.color.Color as col with mut = color_of(r, g.style);
         if (col.a <= 0.0 || all_fg == 1) { col = fg; }
@@ -1120,13 +1341,34 @@ fn _draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg a
             let is atlas.Placed as pl;
             if (o.color == 0 || color.kind(o.face, g.id) == color.NONE) {
                 let is i32 as got = atlas.get_hinted(&s.cache, &o.r, o.id, px, g.id, gx, gy, &g.hint, &pl);
-                if (got == atlas.NO_ROOM) { ok = 0; }
+                if (got == atlas.NO_ROOM) { ok = 0; rec = 0; }
+                let is *_Kept as kh with mut = _khead(r);
+                if (rec == 1) {
+                    if (_kept_room(r, kh.nrecs + 1) == 0) { rec = 0; }
+                    kh = _khead(r);
+                }
+                if (rec == 1) {
+                    let is *_Rec as rc = _krec(r, kh.nrecs);
+                    rc.idx = g.hint;
+                    if (atlas.entry_copy(&s.cache, g.hint, &rc.e) == 0) { rec = 0; }
+                    kh.nrecs = kh.nrecs + 1;
+                }
                 if (got == atlas.PLACED && pl.w > 0 && pl.h > 0) {
                     let is i64 as tex = coverage.texture_of(&s.cov, pl.page);
+                    let is i64 as v0 = draw2d.vertex_count(c);
                     draw2d.glyph(c, tex, _div(cast(f64, pl.x), k, ik), _div(cast(f64, pl.y), k, ik),
                                  _div(cast(f64, pl.w), k, ik), _div(cast(f64, pl.h), k, ik),
                                  _div(cast(f64, pl.sx), pw, ipw), _div(cast(f64, pl.sy), ph, iph),
                                  _div(cast(f64, pl.sx + pl.w), pw, ipw), _div(cast(f64, pl.sy + pl.h), ph, iph), col);
+                    let is i64 as dv = draw2d.vertex_count(c) - v0;
+                    if (rec == 1 && dv == 6) {
+                        *_kpage(r, kh.nquads) = pl.page;
+                        mem.memcpy(cast(*u8, _kverts(r, kh.nquads)), cast(*u8, draw2d.vertex(c, v0)),
+                                   6 * sizeof(draw2d.Vertex));
+                        kh.nquads = kh.nquads + 1;
+                    } else if (dv != 0) {
+                        rec = 0;
+                    }
                 }
             } else {
                 // A layer may be in the text's colour, so the colour is
@@ -1150,6 +1392,10 @@ fn _draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg a
             }
         }
         i = i + 1;
+    }
+    if (rec == 1 && ok == 1 && draw2d.overflowed(c) == 0) {
+        _khead(r).scanned = s.scanned - scanned0;
+        r.kept_state = 2;
     }
     i = 0;
     while (i < r.ndecos) {
