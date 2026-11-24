@@ -4,9 +4,13 @@
 // opened on it for a list of families (chain.open), or for the desktop's
 // interface and monospace fonts (ui, mono), which window/settings.cst reads.
 use "std/env.cst" as env;
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
 use "../../window/fonts.cst" as places;
 use "../../window/settings.cst" as settings;
 use "scan.cst" as scan;
+use "file.cst" as file;
+use "pool.cst" as pool;
 use "face.cst" as face;
 use "index.cst" as index;
 use "match.cst" as matching;
@@ -17,12 +21,108 @@ fn _set(p as *u8) as i32 {
     return 0;
 }
 
+// --- What the index was made from ---
+//
+// Beside the index, its directories and their times: a font added, removed
+// or moved over another changes its directory's time, so while none has
+// changed the index holds without looking at each file. A file written in
+// place, its directory untouched, goes unnoticed until one does change.
+//
+// CMFONTDR, how many roots, how many in all, then for each its time, the
+// length of its path with the zero, the path, and zeros up to eight bytes.
+// The roots come first: other directories asked for is another index.
+let is i64 as DIRS_MAGIC with imut = 5927381095851593027;
+let is i64 as DIRS_HEADER with imut = 24;
+
+fn _sidecar(cache as *u8, out as *u8) as i32 {
+    let is i64 as n with mut = 0;
+    while (*cast(*u8, cast(i64, cache) + n) != 0) { n = n + 1; }
+    if (n + 6 > 528) { return 0; }
+    mem.memcpy(out, cache, n);
+    mem.memcpy(cast(*u8, cast(i64, out) + n), ".dirs", 6);
+    return 1;
+}
+
+fn _time_of(path as *u8) as i64 {
+    let is file.Info as st;
+    if (file.stat(path, &st) == 0) { return 0; }
+    return st.mtime;
+}
+
+fn _add_dir(b as *pool.Pool, path as *u8, mtime as i64) as void {
+    let is i64 as n with mut = 0;
+    while (*cast(*u8, cast(i64, path) + n) != 0) { n = n + 1; }
+    pool.add_i64(b, mtime);
+    pool.add_i64(b, n + 1);
+    pool.add(b, path, n + 1);
+    let is i64 as pad = (8 - ((n + 1) & 7)) & 7;
+    let is i64 as zero = 0;
+    if (pad > 0) { pool.add(b, cast(*u8, &zero), pad); }
+}
+
+fn _dirs_save(d as *places.Dirs, s as *scan.Scan, path as *u8) as void {
+    let is pool.Pool as b with mut = pool.empty();
+    pool.add_i64(&b, DIRS_MAGIC);
+    pool.add_i64(&b, d.n);
+    pool.add_i64(&b, d.n + scan.dir_count(s));
+    let is i64 as i with mut = 0;
+    while (i < d.n) { _add_dir(&b, places.dir(d, i), _time_of(places.dir(d, i))); i = i + 1; }
+    i = 0;
+    while (i < scan.dir_count(s)) { _add_dir(&b, scan.dir_path(s, i), scan.dir_mtime(s, i)); i = i + 1; }
+    io.write_file_atomic(path, b.base, b.len);
+    pool.free(&b);
+}
+
+fn _same_str(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (*cast(*u8, cast(i64, a) + i) != 0 && *cast(*u8, cast(i64, a) + i) == *cast(*u8, cast(i64, b) + i)) { i = i + 1; }
+    return cast(i32, *cast(*u8, cast(i64, a) + i) == *cast(*u8, cast(i64, b) + i));
+}
+
+// Whether the file names these roots and every directory in it is as it was.
+fn _dirs_hold(d as *places.Dirs, path as *u8) as i32 {
+    let is file.Mapped as m with mut = file.map(path);
+    if (cast(i64, m.data) == 0) { return 0; }
+    let is i64 as base = cast(i64, m.data);
+    let is i32 as ok with mut = 1;
+    if (m.size < DIRS_HEADER || *cast(*i64, base) != DIRS_MAGIC || *cast(*i64, base + 8) != d.n) { ok = 0; }
+    if (ok == 1) {
+        let is i64 as total = *cast(*i64, base + 16);
+        let is i64 as at with mut = DIRS_HEADER;
+        let is i64 as i with mut = 0;
+        if (total < d.n) { ok = 0; }
+        while (ok == 1 && i < total) {
+            if (at + 16 > m.size) { ok = 0; break; }
+            let is i64 as mtime = *cast(*i64, base + at);
+            let is i64 as n = *cast(*i64, base + at + 8);
+            if (n < 1 || n > m.size - at - 16 || *cast(*u8, base + at + 16 + n - 1) != 0) { ok = 0; break; }
+            let is *u8 as name = cast(*u8, base + at + 16);
+            if (i < d.n && _same_str(name, places.dir(d, i)) == 0) { ok = 0; break; }
+            if (_time_of(name) != mtime) { ok = 0; break; }
+            at = at + 16 + ((n + 7) & (0 - 8));
+            i = i + 1;
+        }
+    }
+    file.unmap(&m);
+    return ok;
+}
+
 // The fonts under the directories of d into ix, the index kept at cache
 // read first and written again when it no longer holds — cache null or
 // empty for none. 1; the index is empty when there are no fonts at all.
 fn refresh(d as *places.Dirs, cache as *u8, ix as *index.Index) as i32 {
     let is index.Index as old with mut = index.empty();
-    if (_set(cache) == 1) { index.load(cache, &old); }
+    let is [528]u8 as side;
+    let is i32 as has_side with mut = 0;
+    if (_set(cache) == 1) {
+        has_side = _sidecar(cache, cast(*u8, &side));
+        if (index.load(cache, &old) == 1 && has_side == 1 && _dirs_hold(d, cast(*u8, &side)) == 1) {
+            *ix = old;
+            ix.kept = ix.nfiles;
+            ix.reads = 0;
+            return 1;
+        }
+    }
     let is scan.Scan as s with mut = scan.open();
     let is i64 as i with mut = 0;
     while (i < d.n) {
@@ -30,7 +130,9 @@ fn refresh(d as *places.Dirs, cache as *u8, ix as *index.Index) as i32 {
         i = i + 1;
     }
     *ix = index.update(&old, &s);
-    if (_set(cache) == 1 && index.changed(&old, ix) == 1) { index.save(ix, cache); }
+    let is i32 as kept with mut = _set(cache);
+    if (kept == 1 && index.changed(&old, ix) == 1) { kept = index.save(ix, cache); }
+    if (kept == 1 && has_side == 1) { _dirs_save(d, &s, cast(*u8, &side)); }
     scan.close(&s);
     index.close(&old);
     return 1;
