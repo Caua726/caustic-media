@@ -9,6 +9,7 @@
 // break before its cluster, and its advance and offset in font units.
 use "std/mem.cst" as mem;
 use "../sfnt/table.cst" as table;
+use "../sfnt/var.cst" as var;
 use "../sfnt/cmap.cst" as cmap;
 use "../outline/outline.cst" as outline;
 use "glyphs.cst" as glyphs;
@@ -68,17 +69,107 @@ struct Text {
     flags     as i64;
 }
 
+// The plan last compiled, kept for the next text that would compile the same
+// one: the same face, script, language, direction and variations, no
+// features of its own, and a shaper that adds none from what it reads.
+struct Memo {
+    ok     as i64;
+    data   as *u8;          // the face: where its bytes are, how many, which
+    size   as i64;
+    index  as i64;
+    dir    as i64;          // its table records
+    script as i64;
+    tdir   as i64;
+    nolang as i64;          // no language given
+    lang   as [16]u8;       // the tag, nul-ended
+    kind   as i64;
+    circle as i64;
+    coords as var.Coords;
+}
+
 struct Shaper {
     run  as glyphs.Run;
     plan as plan.Plan;
     ctx  as seq.Ctx;
     text_wants as i64;   // where the text's own features begin among the plan's wants
     w    as work.Work;
+    memo as Memo;
+    compiled as i64;     // plans compiled, for tests
 }
 
 fn open(s as *Shaper) as void {
     s.run = glyphs.open();
     s.plan = plan.open();
+    s.memo.ok = 0;
+    s.compiled = 0;
+}
+
+// How many plans were compiled: a text like the last shaped reuses its plan.
+fn plans_compiled(s as *Shaper) as i64 { return s.compiled; }
+
+// The language tag into out, nul-ended: 1, or 0 when it is too long to keep.
+fn _lang_into(lang as *u8, out as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < 16) {
+        out[i] = lang[i];
+        if (lang[i] == cast(u8, 0)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _same_lang(lang as *u8, kept as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (i < 16) {
+        if (lang[i] != kept[i]) { return 0; }
+        if (lang[i] == cast(u8, 0)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _same_coords(a as *var.Coords, b as *var.Coords) as i32 {
+    if (a.n != b.n) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a.n) {
+        if (a.v[i] != b.v[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _memo_hit(s as *Shaper, r as *outline.Reader, t as *Text) as i32 {
+    let is *Memo as m = &s.memo;
+    if (m.ok == 0 || t.nfeatures != 0) { return 0; }
+    let is *table.Face as f = r.face;
+    if (m.data != f.data || m.size != f.size || m.index != f.index || m.dir != f.dir) { return 0; }
+    if (m.script != t.script || m.tdir != t.dir) { return 0; }
+    if (cast(i64, t.lang) == 0) {
+        if (m.nolang == 0) { return 0; }
+    } else if (m.nolang == 1 || _same_lang(t.lang, cast(*u8, &m.lang)) == 0) { return 0; }
+    return _same_coords(&r.coords, &m.coords);
+}
+
+fn _memo_keep(s as *Shaper, r as *outline.Reader, t as *Text) as void {
+    let is *Memo as m = &s.memo;
+    m.ok = 0;
+    let is *work.Work as w = &s.w;
+    if (t.nfeatures != 0 || (w.kind != work.K_DEFAULT && w.kind != work.K_THAI)) { return; }
+    if (r.coords.n < 0 || r.coords.n > 64) { return; }
+    m.nolang = cast(i64, cast(i64, t.lang) == 0);
+    if (m.nolang == 0 && _lang_into(t.lang, cast(*u8, &m.lang)) == 0) { return; }
+    m.data = r.face.data;
+    m.size = r.face.size;
+    m.index = r.face.index;
+    m.dir = r.face.dir;
+    m.script = t.script;
+    m.tdir = t.dir;
+    m.kind = w.kind;
+    m.circle = cast(i64, w.circle);
+    m.coords.n = r.coords.n;
+    let is i64 as i with mut = 0;
+    while (i < r.coords.n) { m.coords.v[i] = r.coords.v[i]; i = i + 1; }
+    m.ok = 1;
 }
 
 fn close(s as *Shaper) as void {
@@ -353,22 +444,21 @@ fn _ways(w as *work.Work) as void {
 
 fn _plan(s as *Shaper, r as *outline.Reader, t as *Text, dir as i64) as i32 {
     let is *plan.Plan as p = &s.plan;
-    if (plan.begin(p, r.face, t.script, t.lang, DEFAULT_FEATURES + t.nfeatures) == 0) { return 0; }
     let is *work.Work as w = &s.w;
-    w.f = r.face;
-    w.r = r;
-    w.run = &s.run;
-    w.plan = p;
-    w.ctx = &s.ctx;
-    w.lang = t.lang;
-    w.script = t.script;
-    w.chosen = p.chosen0;
-    w.dir = dir;
-    w.bytes = t.bytes;
-    w.n = t.n;
-    w.start = t.start;
-    w.end = t.n;
-    if (t.length >= 0 && t.start + t.length < t.n) { w.end = t.start + t.length; }
+    if (_memo_hit(s, r, t) == 1) {
+        // The plan compiled for the last text is this one's.
+        _fill(s, r, t, dir);
+        w.kind = s.memo.kind;
+        w.circle = cast(i32, s.memo.circle);
+        w.no_circle = cast(i32, (t.flags & NO_DOTTED_CIRCLE) != 0);
+        _ways(w);
+        if (w.rules.mode == compose.FONT && plan.one_of(p, scripts.of("mark")) != 0) { w.rules.mode = compose.PARTS; }
+        _prepared(w);
+        return 1;
+    }
+    s.memo.ok = 0;
+    if (plan.begin(p, r.face, t.script, t.lang, DEFAULT_FEATURES + t.nfeatures) == 0) { return 0; }
+    _fill(s, r, t, dir);
     w.kind = _kind(p, t.script);
     w.circle = cast(i32, _nominal(r.face, chars.DOTTED_CIRCLE));
     w.no_circle = cast(i32, (t.flags & NO_DOTTED_CIRCLE) != 0);
@@ -412,11 +502,32 @@ fn _plan(s as *Shaper, r as *outline.Reader, t as *Text, dir as i64) as i32 {
     }
     _override(w);
     if (plan.compile(r.face, p, &r.coords) == 0) { return 0; }
+    s.compiled = s.compiled + 1;
     _ways(w);
     // A font that places marks: everything taken apart for it to work on.
     if (w.rules.mode == compose.FONT && plan.one_of(p, scripts.of("mark")) != 0) { w.rules.mode = compose.PARTS; }
     _prepared(w);
+    _memo_keep(s, r, t);
     return 1;
+}
+
+// What the work is on, whether its plan was compiled now or before.
+fn _fill(s as *Shaper, r as *outline.Reader, t as *Text, dir as i64) as void {
+    let is *work.Work as w = &s.w;
+    w.f = r.face;
+    w.r = r;
+    w.run = &s.run;
+    w.plan = &s.plan;
+    w.ctx = &s.ctx;
+    w.lang = t.lang;
+    w.script = t.script;
+    w.chosen = s.plan.chosen0;
+    w.dir = dir;
+    w.bytes = t.bytes;
+    w.n = t.n;
+    w.start = t.start;
+    w.end = t.n;
+    if (t.length >= 0 && t.start + t.length < t.n) { w.end = t.start + t.length; }
 }
 
 // Every glyph's mask: the plan's.
