@@ -35,7 +35,8 @@ struct Ent {
 
 struct Dir {
     out     as model.Model;   // what views read
-    n       as i64;
+    n       as i64;           // shown: ents[0, n), in order
+    all     as i64;           // read: ents[n, all) are what the filter leaves out
     cap     as i64;
     ents    as *Ent;
     blob    as *u8;
@@ -86,6 +87,7 @@ fn _free(d as *Dir) as void {
     d.ents = cast(*Ent, 0);
     d.blob = cast(*u8, 0);
     d.n = 0;
+    d.all = 0;
     d.cap = 0;
     d.bn = 0;
     d.bcap = 0;
@@ -196,7 +198,7 @@ fn _room(d as *Dir, ents as i64, bytes as i64) as i32 {
         let is *u8 as p = mem.core.mmap_anon(cap * sizeof(Ent));
         if (cast(i64, p) <= 0) { return 0; }
         if (cast(i64, d.ents) != 0) {
-            mem.memcpy(p, cast(*u8, d.ents), d.n * sizeof(Ent));
+            mem.memcpy(p, cast(*u8, d.ents), d.all * sizeof(Ent));
             mem.core.munmap(cast(*u8, d.ents), d.cap * sizeof(Ent));
         }
         d.ents = cast(*Ent, p);
@@ -275,6 +277,48 @@ fn _top(p as *u8, n as i64) as i64 {
     return r;
 }
 
+fn _wanted(d as *Dir, e as *Ent) as i32 {
+    if (e.dir == 1) { return 1; }
+    if (d.folders == 1) { return 0; }
+    return _passes(d, cast(*u8, cast(i64, d.blob) + e.at), e.len);
+}
+
+// What was read put in order, the entries wanted first: ents[0, n).
+fn _arrange(d as *Dir) as void {
+    d.n = 0;
+    if (d.all == 0) { return; }
+    let is i64 as i with mut = 0;
+    let is *u8 as m = mem.core.mmap_anon(d.all * sizeof(Ent));
+    if (cast(i64, m) > 0) {
+        let is *Ent as tmp = cast(*Ent, m);
+        _sort(d, tmp, 0, d.all);
+        let is i64 as out with mut = 0;
+        while (i < d.all) {
+            if (_wanted(d, &d.ents[i]) == 1) {
+                d.ents[d.n] = d.ents[i];
+                d.n = d.n + 1;
+            } else {
+                tmp[out] = d.ents[i];
+                out = out + 1;
+            }
+            i = i + 1;
+        }
+        mem.memcpy(cast(*u8, cast(i64, d.ents) + d.n * sizeof(Ent)), m, out * sizeof(Ent));
+        mem.core.munmap(m, d.all * sizeof(Ent));
+        return;
+    }
+    // no memory for it: as they came
+    while (i < d.all) {
+        if (_wanted(d, &d.ents[i]) == 1) {
+            let is Ent as e = d.ents[i];
+            d.ents[i] = d.ents[d.n];
+            d.ents[d.n] = e;
+            d.n = d.n + 1;
+        }
+        i = i + 1;
+    }
+}
+
 // The folder at p, n bytes, read into d: 1, or 0 when it cannot be opened,
 // d as it was.
 fn _read(d as *Dir, p as *u8, n as i64) as i32 {
@@ -293,28 +337,21 @@ fn _read(d as *Dir, p as *u8, n as i64) as i32 {
         let is i32 as hidden = cast(i32, (nl > 0 && nm[0] == cast(u8, 46)) || info.hidden == 1);
         if (hidden == 0 || d.hidden == 1) {
             let is i64 as dir = cast(i64, info.kind == file.DIR);
-            let is i32 as wanted = cast(i32, dir == 1 || (d.folders == 0 && _passes(d, cast(*u8, &nm), nl) == 1));
-            if (wanted == 1 && _room(d, d.n + 1, d.bn + nl) == 1) {
-                d.ents[d.n].at = d.bn;
-                d.ents[d.n].len = nl;
-                d.ents[d.n].size = info.size;
-                d.ents[d.n].mtime = info.mtime;
-                d.ents[d.n].dir = dir;
+            if (_room(d, d.all + 1, d.bn + nl) == 1) {
+                d.ents[d.all].at = d.bn;
+                d.ents[d.all].len = nl;
+                d.ents[d.all].size = info.size;
+                d.ents[d.all].mtime = info.mtime;
+                d.ents[d.all].dir = dir;
                 mem.memcpy(cast(*u8, cast(i64, d.blob) + d.bn), cast(*u8, &nm), nl);
                 d.bn = d.bn + nl;
-                d.n = d.n + 1;
+                d.all = d.all + 1;
             }
         }
         nl = file.next(&l, cast(*u8, &nm), 1024, &info);
     }
     file.close_dir(&l);
-    if (d.n > 1) {
-        let is *u8 as tmp = mem.core.mmap_anon(d.n * sizeof(Ent));
-        if (cast(i64, tmp) > 0) {
-            _sort(d, cast(*Ent, tmp), 0, d.n);
-            mem.core.munmap(tmp, d.n * sizeof(Ent));
-        }
-    }
+    _arrange(d);
     // The path kept, a slash at its end only for the top ("/", "C:/").
     let is i64 as k with mut = n;
     let is i64 as top = _top(p, n);
@@ -401,6 +438,17 @@ fn set_filter(d as *Dir, s as *u8, n as i64) as void {
     mem.memcpy(cast(*u8, &d.filter), s, k);
     d.flen = k;
     reload(d);
+}
+
+// The same out of what was read last, the folder not read again: a filter
+// typed a letter at a time.
+fn refilter(d as *Dir, s as *u8, n as i64) as void {
+    let is i64 as k with mut = n;
+    if (k > MAX_FILTER) { k = MAX_FILTER; }
+    mem.memcpy(cast(*u8, &d.filter), s, k);
+    d.flen = k;
+    _arrange(d);
+    model.reset(&d.out);
 }
 
 // --- What a cell says ---

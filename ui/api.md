@@ -249,6 +249,7 @@ a folder's entries as a flat model.
 - `set_clock(d as *Dir, now as i64, offset as i64) as void` — Dates said as a person near now reads them — "Today 18:40", "Yesterday 09:30", "5 Nov 14:02", "5 Nov 2025" — at offset seconds east of UTC, against now, seconds since 1970; now 0 for "YYYY-MM-DD HH:MM" in UTC again.
 - `set_language(d as *Dir, lang as i32) as void` — Sizes said in language lang (strings.cst) from now on.
 - `set_filter(d as *Dir, s as *u8, n as i64) as void` — The files shown from now on, s, n bytes: patterns split at ';' or spaces; empty for all.
+- `refilter(d as *Dir, s as *u8, n as i64) as void` — The same out of what was read last, the folder not read again: a filter typed a letter at a time.
 - `size_text(v as i64, lang as i32, out as *u8) as i64` — A size as a person reads it in language lang, into out (32 bytes); how many bytes: bytes under 1000, then one decimal of kB, MB or GB.
 - `date_text(secs as i64, out as *u8) as i64` — Seconds since 1970 as "YYYY-MM-DD HH:MM", in UTC, into out (16 bytes): the days turned into a date as the proleptic Gregorian calendar has them.
 - `date_relative_text(secs as i64, now as i64, offset as i64, out as *u8) as i64` — secs as a person near now reads it, both at offset seconds east of UTC, into out (24 bytes): today and yesterday by name with the time, this year's with the day, month and time, older ones with the year.
