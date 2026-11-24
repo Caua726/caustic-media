@@ -9,17 +9,28 @@ each, is in `PERFORMANCE_STATUS.md`; this report sums it up.
 
 | State | Count | Items |
 |---|---|---|
-| FIXED | 40 | A1.1–A1.3, A2.1, A3.1–A3.4, A4.1–A4.3, A5.1, A5.2, A6.1, B1, B2.1, B2.2, B3, B4, B5.1, B5.2, B5.4, C1.1, C2, C3.1, C3.2, C3.3, C3.5, C4, C5, C6, D1.1, D1.2, D2.1, D2.2, D3, E1.1, E1.2, E2.2, E2.3 |
-| PARTIAL | 2 | C1.2 (the rest blocked on F3), C3.4 (the rest blocked by the pixel-exact rule) |
-| UNRESOLVED | 1 | C1.3 (bounded at ≤ 0.7 ms a full frame; its cost is below) |
+| FIXED | 42 | A1.1–A1.3, A2.1, A3.1–A3.4, A4.1–A4.3, A5.1, A5.2, A6.1, B1, B2.1, B2.2, B3, B4, B5.1, B5.2, B5.4, C1.1, C1.2, C1.3, C2, C3.1, C3.2, C3.3, C3.5, C4, C5, C6, D1.1, D1.2, D2.1, D2.2, D3, E1.1, E1.2, E2.2, E2.3 |
+| PARTIAL | 1 | C3.4 (compact vertices blocked by the pixel-exact rule) |
+| UNRESOLVED | 0 | — |
 | NOT_APPLICABLE | 2 | A2.2, B5.3 (measured: the cost does not exist) |
-| BLOCKED | 0 | (two PARTIAL items have blocked remainders) |
+| BLOCKED | 0 | (C3.4's remainder is blocked; it is counted as PARTIAL) |
 
-Tracked apart:
-- Architecture: F1 is BLOCKED by the pixel-exact rule. F2, F3 and F4 are
-  evaluated with measured bounds and not implemented.
-- Cross-project: X1 is FIXED in this repository. X2 is PARTIAL; its
-  incremental decoding is blocked on caustic-image.
+Architecture, tracked apart:
+
+| Item | State | Why |
+|---|---|---|
+| F4 | FIXED (`a208bed`) | |
+| F1 | BLOCKED | the pixel-exact rule |
+| F2 | UNRESOLVED | evaluated; the bound is too small for the state it needs |
+| F3 | NOT_APPLICABLE in software | with C1.3, copying is cheaper than repainting what the buffer's age lacks |
+| F3 (GPU swapchain) | BLOCKED | there is no GPU backend |
+
+Cross-project, tracked apart:
+
+| Item | State |
+|---|---|
+| X1 | FIXED in this repository |
+| X2 | PARTIAL: incremental decoding is blocked on caustic-image |
 
 ## Measured A/B (best of repeated runs, same machine, before → after)
 
@@ -35,6 +46,8 @@ Tracked apart:
 | B4 | a4 bench, whole program | 1,241.8 → 1,216.3 M instructions |
 | C1.1 | 1080p present | 1.52–2.11 → 1.31–1.66 ms |
 | C1 premultiply | 1080p, translucent / opaque | 7.24 → 4.31–4.45 ms / 1.05 → 0.93 ms |
+| C1.3 | 1080p present into a premultiplied buffer, opaque (BGRA8 window texture) | 0.94 → 0.46 ms |
+| F4 | full repaint of a maximized window | one 1080p fill fewer (0.13 ms) |
 | C2 | Wayland conversion, 1080p | 1.86–1.96 → 0.94 ms |
 | C3.1–3 | per frame | 12.2–13.0 → 9.6–10.0 M cycles |
 | C3.4/C3.5 | per frame | 35.0 → 30.1 → 29.33 M instructions |
@@ -78,6 +91,8 @@ and the 4-pixel group. Each was caught.
 ## Commits (c893bd7..HEAD)
 
 ```
+a208bed ui: a square opaque frame over the window's background is not filled again
+7e9f7e3 gpu: a BGRA8 render target; the host draws in its window buffer's order
 bbd5bb6 ui/host_popup_win32_test: the tooltip's colour read in its padding
 90222aa tests: decodes cut short or cancelled; CausticOS damage clipped and capped
 02a5fd5 gpu/software: the band pool's futex calls inside the test for Linux
@@ -120,6 +135,17 @@ one), so they are not listed above.
 
 ## API guidance (new or changed public calls)
 
+- `gpu.texture.BGRA8` is a render target in a window buffer's order. The
+  host uses it whenever `device.native_pixels` names an order;
+  `read_region_as` from it is then a plain copy (`BGRA`) or a premultiply
+  alone (`BGRA_PREMULTIPLIED`). A device that cannot create one returns 0
+  from `texture.create`, and the caller falls back to `RGBA8`, as the host
+  does. `raster.set_bgra` is the software device's per-pass order: the
+  backend sets it at `BEGIN_PASS` and resets it at `END_PASS`.
+- `painter.S_ON_WINDOW_BG` tells the window's first widget that it is
+  painted straight over the background just laid down. A widget that fills
+  that same opaque colour without rounding can skip the fill.
+  `paint.set_bg_hint(0)` turns this off for tests.
 - `gpu.texture.read_region_as(d, h, x, y, w, ht, dst, stride, convert)` reads
   a region in the order a platform wants: `bgra.AS_IS`, `BGRA` or
   `BGRA_PREMULTIPLIED`. `read_region` is the `AS_IS` case.
@@ -154,18 +180,6 @@ one), so they are not listed above.
 
 ## What is left, and why
 
-- **C1.3 (BGRA target), UNRESOLVED:**
-  - It would gain at most 0.7 ms on a full opaque 1080p frame. A plain
-    read takes 0.23 ms and the fused read and convert 0.93 ms.
-  - It would mean about 23 colour pack sites and texel unpacking in the
-    rasteriser's inner loops and the reference renderer, with uploads
-    swapped on the way in and reads swapped on the way out. Blending
-    needs no change, because it treats red and blue alike.
-  - F3 would make the offscreen texture's order moot.
-- **C1.2, rest BLOCKED on F3:** buffer age requires copying the last
-  frame's damage into the older buffer when painting into an offscreen
-  texture. That copy is now a single fused, faster pass. Only painting
-  into the platform buffer removes it.
 - **C3.4, rest BLOCKED by the pixel-exact rule:** compact f32/u8 vertices
   move positions and colours by rounding. Prerequisite: the owner accepts
   non-exact vertex quantisation.
@@ -177,24 +191,31 @@ one), so they are not listed above.
   - Prerequisites: the owner accepts that, and decides an atlas budget.
   - The exact work left on that path is in the rasteriser: `_row_span`
     31%, `_fill_unlit` 15%, `_triangle` 11%.
-- **F2, evaluated:** about 12% of a text-heavy frame is text-side CPU, and
-  rasterising the quads (52%) is untouched. It needs per-run quad caches
-  invalidated by atlas era.
-- **F3, evaluated:** it removes the 0.93 ms opaque and 4.3–4.45 ms
-  translucent fused copy per full 1080p frame, and the 8 MB offscreen
-  texture. It needs buffer-age painting on each platform, and it is the
-  route to GPU backends.
-- **F4, evaluated:** at most 0.13 ms per full 1080p repaint. It needs an
-  opacity hint that keeps rounded corners and shadows cleared.
-- **X1:** built for `caustic-x86_64` and tested on Linux through
-  `_frame_rects`, including clipping and the 16-rectangle cap. It was not
-  run on CausticOS, which needs that repository's system image. It sends
-  up to 16 COMMIT messages a frame instead of one; each is 32 bytes,
-  written whole by `_write_all`.
-- **X2, incremental decoding BLOCKED:** caustic-image decodes whole files
-  only, and sibling repositories are not edited here. Background decoding
-  is done and tested, including cancellation and cut-short, noisy and
-  malformed input.
+- **F2, UNRESOLVED (evaluated, not done):**
+  - A kept run must still touch each glyph's atlas slot, so it is not
+    evicted, and must still emit its vertices.
+  - Only the lookups (`_look`, 2.6% of a text-heavy frame) and part of
+    `_draw` (4.8%) would go.
+  - In exchange, each run would keep per-run slot and era state that can
+    go stale.
+- **F3:**
+  - **Software, NOT_APPLICABLE:** after C1.3 presenting is a copy
+    (0.15–0.2 ms) or a premultiply alone (0.46 ms) per full opaque 1080p
+    frame. Painting into the window's buffer instead would mean repainting
+    everything its age lacks, which costs more than copying it, and it
+    would break scroll pixel moves within a kept texture.
+  - **GPU swapchain, BLOCKED:** it needs a GPU backend, and none exists.
+- **X1:**
+  - Built for `caustic-x86_64` and tested on Linux through `_frame_rects`,
+    including clipping and the 16-rectangle cap.
+  - Not run on CausticOS, which needs that repository's system image.
+  - It sends up to 16 COMMIT messages a frame instead of one. Each is
+    32 bytes, written whole by `_write_all`.
+- **X2, incremental decoding BLOCKED:**
+  - caustic-image decodes whole files only, and sibling repositories are
+    not edited here.
+  - Background decoding is done and tested, including cancellation and
+    cut-short, noisy and malformed input.
 
 ## New issues found (not part of the audit)
 
@@ -239,7 +260,7 @@ Its residual risks:
 
 ## Gates
 
-All five gate scripts pass at `bbd5bb6`, the last code commit. They ran one
+All five gate scripts pass at `a208bed`, the last code commit. They ran one
 at a time, inside the 2.5 GiB memory and 100% CPU caps, with
 `WAYLAND_DISPLAY` unset:
 
@@ -260,7 +281,7 @@ Getting there took three fixes:
   the padding (`ed3203b`, `bbd5bb6`).
 - **One timeout:** `test-win32-native` timed out once at
   `win32_dnd_named_test`. That test passes in 19.3 s both on `c893bd7` and
-  on this branch, and the full script passed on the rerun.
+  on this branch, and every later run of the script passed.
 
 Not run: the branch on CausticOS itself, which needs the CausticOS
 repository's system image.

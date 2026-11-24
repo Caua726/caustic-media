@@ -38,8 +38,8 @@ exist). Low gain is not NOT_APPLICABLE.
 | B5.3 | `upload` at the end of every run | NOT_APPLICABLE | shown not to cost: upload sends only dirty regions (clean pages upload nothing); skipping even the clean-page loop measured 242–274 vs 218–247 ns a 3-glyph run — no difference; reverted |
 | B5.4 | `_open` scan per glyph without last-face cache | FIXED | `d8586af`; each run face opened once a draw; with B3/B5: 131–145 → 81–82 ns a glyph |
 | C1.1 | present: copy then separate swizzle/premultiply | FIXED | `cb9f39a`; texture.read_region_as converts as it copies; device.native_pixels/submit_native; 1080p 1.52–2.11 → 1.31–1.66 ms, same bytes |
-| C1.2 | buffer-age damage recopied and reconverted | PARTIAL | the copy of the last frame's damage is what buffer age requires with an offscreen source (not redundant: overlaps merged); it is one fused pass (`cb9f39a`), translucent 7.24 → 4.31–4.45 ms/1080p (`9ffd9e9`), opaque 1.05 → 0.93 ms (`bf5f84b`); removing it: BLOCKED on F3 (painting into the platform buffer) |
-| C1.3 | offscreen texture in platform (BGRA) order | UNRESOLVED | not done: bound ≤ 0.7 ms a full opaque 1080p frame (plain read 0.23 vs fused 0.93 ms, c13 bench), for ~23 colour pack sites and texel unpacking in the rasteriser's inner loops and the reference renderer, uploads swapped, reads swapped back; F3 makes the offscreen order moot |
+| C1.2 | buffer-age damage recopied and reconverted | FIXED | the reconversion is gone: the window's texture is in the buffer's order (`7e9f7e3`), so the copy buffer age requires is a plain copy (depth-24 X11) or a premultiply alone, 0.94 → 0.46 ms a full opaque 1080p frame; the copy of the last frame's damage itself is required (not redundant: overlaps merged) |
+| C1.3 | offscreen texture in platform (BGRA) order | FIXED | `7e9f7e3`; texture.BGRA8 drawn into by trading red and blue as colours are made (pass order, coverage tables, pictures turned, texels turned back, clears); host uses it where native_pixels says an order; opaque present 0.94 → 0.46 ms/1080p; bands_test: whole scene BGRA8 = RGBA8 traded, one thread and bands, three mutants caught; RGBA frame same hash, +0.29% instructions |
 | C2 | Wayland `_to_argb` byte-wise | FIXED | `fca4705`; gpu/bgra (via window/pixels) two pixels a word, opaque pairs no arithmetic; 1080p 1.86–1.96 → 0.94 ms; pixels_test byte-exact vs old code |
 | C3.1 | ortho/screen-space vertex fast path | FIXED | `e91bea1`; mvp read in place, w = 1 when last row is 0 0 0 1, no divide by w = 1; exact |
 | C3.2 | `_six` shades 6 vertices of a quad | FIXED | `e91bea1`; repeated vertices (bytes equal) reuse the shaded corner; rect_test mutation (forced reuse) fails |
@@ -64,9 +64,9 @@ exist). Low gain is not NOT_APPLICABLE.
 | ID | Option | State |
 |---|---|---|
 | F1 | shape coverage cache | BLOCKED — evaluated: 60 rounded controls (fill + border, 120×32, r 6, scale 1.5) 38,520 vertices, 4.53 ms vs 0.36 ms as two quads each (f1 bench); largest remaining gain; a mask composites once where the tessellation blends overlapping fringe triangles in turn, so not pixel-exact: prerequisite the owner accepting that, and an atlas budget. Exact work on the same path is in the rasteriser (_row_span 31%, _fill_unlit 15%, _triangle 11% of it) |
-| F2 | retained per-run text geometry | UNRESOLVED — evaluated: text-side CPU (_draw, _look, _put, _reserve, _quad) ≈ 12% of the label-heavy r_bench frame; rasterising the quads (rect_shaded 52%) is untouched by it |
-| F3 | direct-to-buffer / swapchain presentation (C1 option 3) | UNRESOLVED — evaluated: would remove the fused copy (0.93 ms opaque, 4.31–4.45 ms translucent per full 1080p frame) and the 8 MB offscreen texture; needs buffer-age painting per platform |
-| F4 | skip background clear under an opaque root | UNRESOLVED — evaluated: bound 0.13 ms per full 1080p repaint (one opaque fill, f4 bench); needs an opacity hint that keeps rounded corners/shadows cleared |
+| F2 | retained per-run text geometry | UNRESOLVED — evaluated, not done: a kept run must still touch each glyph's atlas slot (eviction) and emit its vertices; only the lookups (_look 2.6%) and part of _draw (4.8%) of a text-heavy frame would go, for per-run slot/era state that can go stale |
+| F3 | direct-to-buffer / swapchain presentation (C1 option 3) | NOT_APPLICABLE (software) / BLOCKED (GPU) — with C1.3 presenting is a copy (0.15–0.2 ms) or premultiply (0.46 ms) a full opaque 1080p frame; painting into the buffer instead means repainting what its age lacks (the last frames' damage), costlier than copying it, and breaks scroll pixel moves within a kept texture; swapchain presentation needs a GPU backend, none exists |
+| F4 | skip background clear under an opaque root | FIXED — `a208bed`: the window's first widget is told it is painted over the background just laid (painter.S_ON_WINDOW_BG); a square opaque decoration leaves its fill out: one full-window fill less per full repaint (0.13 ms at 1080p), same pixels (decoration_test, mutant caught) |
 
 ## Cross-project (tracked apart)
 
@@ -80,7 +80,7 @@ exist). Low gain is not NOT_APPLICABLE.
 - Baseline `caustic-mk run test` on `c893bd7`: failed at
   `sh ui/tools/api.sh | diff ui/api.md -` (api.md 7 entries stale on main);
   with api.md regenerated (`193ba9b`): rc=0.
-- Final, at `bbd5bb6`: test, test-x11, test-wayland, test-win32 and
+- Final, at `a208bed`: test, test-x11, test-wayland, test-win32 and
   test-win32-native all rc=0.
 
 ## New issues found
