@@ -844,6 +844,7 @@ the toolkit's text: one service per application that lays text out and draws it,
 - `lay_text(s as *Service, r as *Run, styles as *Style, nstyles as i64, spans as *model.Span, nspans as i64,`
 - `lay(s as *Service, r as *Run, text as *u8, nbytes as i64, styles as *Style, nstyles as i64,` — The text — nbytes of UTF-8, copied into the run — laid out as lay_text does.
 - `lay_plain(s as *Service, r as *Run, text as *u8, nbytes as i64, st as *Style, params as *model.Params) as i32` — One style over the whole of the text: the common case.
+- `sizes(s as *Service, st as *Style, out as *Sizes) as i32` — The sizes of text in style st that no text changes — an ellipsis's width, a line's height, a digit's width — laid out the first time its font and size are asked, and kept while the service is: a font is one face l...
 - `upload(s as *Service) as i32` — Every changed part of every page sent to its texture: 1, or 0 when the device refused one.
 - `draw(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color) as i32` — Run r drawn on c with its top left at (x, y), logical pixels, in fg where a style gives no colour of its own.
 - `draw_in(s as *Service, c as *draw2d.Canvas, r as *Run, x as f64, y as f64, fg as math.color.Color) as i32` — The same with every colour its styles give put aside: all of it in fg, as selected text is.
