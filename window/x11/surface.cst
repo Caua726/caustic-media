@@ -102,6 +102,7 @@ struct Backing {
     ok         as i32;
     _pad2      as i32;
     presents   as i64;   // frames put since the buffers were made
+    seg_bytes  as i64;   // SHM: each segment's size, bytes and room to grow (_room)
     // MAX_BUFFERS Buffers, mapped rather than inline, and this is a
     // correctness requirement rather than a size one.
     //
@@ -133,7 +134,7 @@ fn _buf(b as *Backing, i as i64) as *Buffer {
 fn _zero(b as *Backing) as void {
     b.transport = SOCKET; b.count = 0; b.completion = 0;
     b.current = 0; b.width = 0; b.height = 0; b.stride = 0; b.bytes = 0;
-    b.visual = cast(*u8, 0); b.depth = 0; b.ok = 0; b.presents = 0;
+    b.visual = cast(*u8, 0); b.depth = 0; b.ok = 0; b.presents = 0; b.seg_bytes = 0;
     if (cast(i64, b.buf) == 0) { return; }
     let is i64 as i with mut = 0;
     while (i < MAX_BUFFERS) {
@@ -203,7 +204,8 @@ fn _display_is_local(d as *u8) as i32 {
 fn _shm_buffer(b as *Backing, d as *u8, i as i64) as i32 {
     let is *Buffer as bf = _buf(b, i);
 
-    let is i64 as id = xshm.shmget(b.bytes);
+    if (b.seg_bytes < b.bytes) { b.seg_bytes = b.bytes; }
+    let is i64 as id = xshm.shmget(b.seg_bytes);
     if (id < 0) { return 0; }
     bf.seg.shmid = cast(i32, id);
 
@@ -387,6 +389,10 @@ fn resize(b as *Backing, d as *u8, w as i64, h as i64) as i32 {
     if (w <= 0 || h <= 0) { return 0; }
     if (w == b.width && h == b.height) { return 1; }
     _resizes = _resizes + 1;
+    if (_reshape(b, d, w, h) == 1) { return 1; }
+    // Made again with room: a drag that grows a little at a time remakes
+    // them once in a quarter more, not every step.
+    b.seg_bytes = _room(w * h * 4);
 
     // Both buffers may still be being read. Waiting is not an option here —
     // the old ones describe a window that no longer exists — so the detach
@@ -414,6 +420,60 @@ fn resize(b as *Backing, d as *u8, w as i64, h as i64) as i32 {
     b.count = n;
     return 1;
 }
+
+// A segment for bytes, with a quarter more to grow into, in whole pages.
+fn _room(bytes as i64) as i64 {
+    let is i64 as r = bytes + bytes / 4;
+    return (r + 4095) / 4096 * 4096;
+}
+
+// SHM, the new size's pixels fitting the segments and filling at least a
+// quarter of them: the same segments, attached as they are, under XImages
+// of the new size — made on the client, nothing asked of the server, no
+// XSync. A buffer still being read stays pending, its completion still
+// coming; what both hold is of no size now, so their age starts over.
+// 0 leaves everything as it was, for resize to make them again.
+fn _reshape(b as *Backing, d as *u8, w as i64, h as i64) as i32 {
+    let is i64 as bytes = w * h * 4;
+    if (b.transport != SHM || b.ok == 0 || bytes > b.seg_bytes || bytes < b.seg_bytes / 4) { return 0; }
+    let is [2]*u8 as made;
+    let is i64 as i with mut = 0;
+    while (i < cast(i64, b.count)) {
+        let is *Buffer as bf = _buf(b, i);
+        made[i] = xshm.XShmCreateImage(d, b.visual, b.depth, x.ZPixmap, bf.pixels, cast(*u8, &bf.seg),
+                                       cast(u32, w), cast(u32, h));
+        if (cast(i64, made[i]) == 0) {
+            while (i > 0) {
+                i = i - 1;
+                let is *xlib.XImage as gone = cast(*xlib.XImage, made[i]);
+                gone.data = cast(*u8, 0);
+                xlib.XDestroyImage(made[i]);
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < cast(i64, b.count)) {
+        let is *Buffer as bf = _buf(b, i);
+        let is *xlib.XImage as img = cast(*xlib.XImage, bf.image);
+        img.data = cast(*u8, 0);
+        xlib.XDestroyImage(bf.image);
+        bf.image = made[i];
+        bf.at = 0;
+        i = i + 1;
+    }
+    b.width = w;
+    b.height = h;
+    b.stride = w * 4;
+    b.bytes = bytes;
+    _reshapes = _reshapes + 1;
+    return 1;
+}
+
+// How many resizes kept the segments (_reshape), in this process: for tests.
+let is i64 as _reshapes with mut = 0;
+fn reshapes(b as *Backing) as i64 { return _reshapes; }
 
 // How many times resize rebuilt buffers, in this process: for tests.
 let is i64 as _resizes with mut = 0;
