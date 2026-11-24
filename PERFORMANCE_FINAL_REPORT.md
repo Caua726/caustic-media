@@ -21,7 +21,7 @@ Architecture, tracked apart:
 |---|---|---|
 | F4 | FIXED (`a208bed`) | |
 | F1 | BLOCKED | the pixel-exact rule |
-| F2 | PARTIAL (`28eb3f9`) | glyph-cache hints done; keeping the quads themselves is not |
+| F2 | PARTIAL (`28eb3f9`, `53dbcc9`) | glyph-cache hints and one reserve per quad done; keeping the quads themselves is not |
 | F3 | NOT_APPLICABLE in software | with C1.3, copying is cheaper than repainting what the buffer's age lacks |
 | F3 (GPU swapchain) | BLOCKED | there is no GPU backend |
 
@@ -48,7 +48,7 @@ Cross-project, tracked apart:
 | C1 premultiply | 1080p, translucent / opaque | 7.24 → 4.31–4.45 ms / 1.05 → 0.93 ms |
 | C1.3 | 1080p present into a premultiplied buffer, opaque (BGRA8 window texture) | 0.94 → 0.46 ms |
 | F4 | full repaint of a maximized window | one 1080p fill fewer (0.13 ms) |
-| F2 (hints) | a cached run drawn again, a glyph | 65–77 → 56–57 ns |
+| F2 (hints, one reserve a quad) | a cached run drawn again, a glyph | 65–77 → 53 ns; r_bench 29.359 → 29.078 M instructions, same hash |
 | C3.4 (no z) | r_bench frame, same hash | 29.470 → 29.359 M instructions; vertex buffer 4.7 → 4.2 MB |
 | C2 | Wayland conversion, 1080p | 1.86–1.96 → 0.94 ms |
 | C3.1–3 | per frame | 12.2–13.0 → 9.6–10.0 M cycles |
@@ -93,6 +93,7 @@ and the 4-pixel group. Each was caught.
 ## Commits (c893bd7..HEAD)
 
 ```
+53dbcc9 draw2d: a quad reserves its six vertices at once
 dbd0c6e draw2d: 64-byte vertices, no z
 28eb3f9 text/atlas, ui/text: a run's glyph found where it was last time
 a208bed ui: a square opaque frame over the window's background is not filled again
@@ -201,14 +202,17 @@ one), so they are not listed above.
   - The exact work left on that path is in the rasteriser: `_row_span`
     31%, `_fill_unlit` 15%, `_triangle` 11%.
 - **F2, PARTIAL:**
-  - Done: each glyph remembers its glyph-cache entry, so drawing a run
-    again checks that one entry with no hashing (65–77 → 56–57 ns a glyph,
-    same pixels).
-  - Not done: keeping the quads themselves to replay as a vertex copy.
-  - Why: the quads would need per-run vertex and batch state kept valid
-    against clips, colour glyphs, decorations and atlas eviction. That is
-    a rewrite of text drawing for vertex emission, which is 32% of text
-    CPU. The goal asks to avoid speculative rewrites.
+  - Done: each glyph remembers its glyph-cache entry (`28eb3f9`), and a
+    quad reserves its six vertices at once (`53dbcc9`). A run drawn again
+    went from 65–77 to 53 ns a glyph, with the same pixels.
+  - Not done: keeping the quads themselves.
+  - Why: all of text drawing is now about 10% of the r_bench frame, and
+    building vertices about 5%. An exact replay would need the same pen,
+    scale, canvas transform, clip result, colours and atlas entries. It
+    would still need a loop over every glyph to keep the glyph cache's
+    eviction order. That is a rewrite for at most a few percent.
+  - Tried and dropped: inlining floor in the glyph cache's subpixel step,
+    and in the rasteriser's row span. Neither gained anything.
 - **F3:**
   - **Software, NOT_APPLICABLE:** after C1.3 presenting is a copy
     (0.15–0.2 ms) or a premultiply alone (0.46 ms) per full opaque 1080p
@@ -271,7 +275,7 @@ Its residual risks:
 
 ## Gates
 
-All five gate scripts pass at `dbd0c6e`, the last code commit. They ran one
+All five gate scripts pass at `53dbcc9`, the last code commit. They ran one
 at a time, inside the 2.5 GiB memory and 100% CPU caps, with
 `WAYLAND_DISPLAY` unset:
 

@@ -64,7 +64,7 @@ exist). Low gain is not NOT_APPLICABLE.
 | ID | Option | State |
 |---|---|---|
 | F1 | shape coverage cache | BLOCKED — evaluated: 60 rounded controls (fill + border, 120×32, r 6, scale 1.5) 38,520 vertices, 4.53 ms vs 0.36 ms as two quads each (f1 bench); largest remaining gain; a mask composites once where the tessellation blends overlapping fringe triangles in turn, so not pixel-exact: prerequisite the owner accepting that, and an atlas budget. Exact work on the same path is in the rasteriser (_row_span 31%, _fill_unlit 15%, _triangle 11% of it) |
-| F2 | retained per-run text geometry | PARTIAL — `28eb3f9`: each glyph remembers its glyph-cache entry (Glyph.hint), checked and taken with no hash or probe: a run drawn again 65–77 → 56–57 ns a glyph, same pixels; keeping the quads themselves (vertex copy) not done: it needs per-run vertex/batch state kept valid against clips, colour glyphs, decorations and atlas eviction — a rewrite of text drawing for the 32% of text CPU that vertex emission is |
+| F2 | retained per-run text geometry | PARTIAL — `28eb3f9`: each glyph remembers its glyph-cache entry (Glyph.hint), checked and taken with no hash or probe; `53dbcc9`: a quad reserves its six vertices at once (same vertices and batches). A run drawn again 65–77 → 53 ns a glyph, same pixels; r_bench 29.359 → 29.078 M instructions, same hash. Keeping the quads themselves not done: all of text drawing is now about 10% of the r_bench frame and vertex building about 5%; an exact replay needs the same pen, scale, canvas transform, clip result, colours and atlas entries, and still a per-glyph loop to keep the glyph cache's eviction order — a rewrite for at most a few percent, the speculative kind the goal rules out |
 | F3 | direct-to-buffer / swapchain presentation (C1 option 3) | NOT_APPLICABLE (software) / BLOCKED (GPU) — with C1.3 presenting is a copy (0.15–0.2 ms) or premultiply (0.46 ms) a full opaque 1080p frame; painting into the buffer instead means repainting what its age lacks (the last frames' damage), costlier than copying it, and breaks scroll pixel moves within a kept texture; swapchain presentation needs a GPU backend, none exists |
 | F4 | skip background clear under an opaque root | FIXED — `a208bed`: the window's first widget is told it is painted over the background just laid (painter.S_ON_WINDOW_BG); a square opaque decoration leaves its fill out: one full-window fill less per full repaint (0.13 ms at 1080p), same pixels (decoration_test, mutant caught) |
 
@@ -80,7 +80,7 @@ exist). Low gain is not NOT_APPLICABLE.
 - Baseline `caustic-mk run test` on `c893bd7`: failed at
   `sh ui/tools/api.sh | diff ui/api.md -` (api.md 7 entries stale on main);
   with api.md regenerated (`193ba9b`): rc=0.
-- Final, at `dbd0c6e`: test, test-x11, test-wayland, test-win32 and
+- Final, at `53dbcc9`: test, test-x11, test-wayland, test-win32 and
   test-win32-native all rc=0.
 
 ## New issues found
