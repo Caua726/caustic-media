@@ -238,6 +238,16 @@ one), so they are not listed above.
     everything its age lacks, which costs more than copying it, and it
     would break scroll pixel moves within a kept texture.
   - **GPU swapchain, BLOCKED:** it needs a GPU backend, and none exists.
+- **X1 on CausticOS itself, not run:**
+  - What it takes: a copy of the local `causticos` checkout with its
+    `caustic-media` dependency swapped for this branch, a userspace build
+    and an ISO, then a QEMU boot. The sibling is not edited.
+  - Two things stopped it on 2026-11-24:
+    - `/tmp` is a RAM disk, and the machine had about 1 GB of its 15 GB
+      available, too little for a copy of the checkout plus a build.
+    - CausticOS pins caustic-media `v0.0.8`, so the OS side has to take a
+      release containing `X1` first.
+  - Prerequisites: the memory free, and a tagged caustic-media release.
 - **X1:**
   - Built for `caustic-x86_64` and tested on Linux through `_frame_rects`,
     including clipping and the 16-rectangle cap.
