@@ -422,6 +422,7 @@ measure, place, and the pass that runs them.
 
 - `measure(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — What w would like; nothing when it is hidden itself.
 - `measure_hidden(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — The same, for a widget that is hidden but still has to be accounted for — a stack sizes itself to its largest page, shown or not.
+- `measured() as i64` — How many measures were worked out rather than taken from what an item kept, in this process: for tests.
 - `overlay_measure(t as *tree.Tree, w as i64, c as *geom.Constraint, out as *geom.Size) as void` — Every visible child gets the whole area and aligns within it on its own; later children sit above earlier ones.
 - `overlay_arrange(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void`
 - `place_exact(t as *tree.Tree, w as i64, r as *math.rect.Rect) as void` — w given exactly r — in its parent's coordinates, its edges on physical pixels — whatever its margins, alignment and limits say: a surface where the platform put it.
