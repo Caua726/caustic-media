@@ -1,9 +1,9 @@
 # PERFORMANCE_STATUS — caustic-media
 
-Branch `agent/media-perf`, worktree `../.agent-media-perf`, from `main`
-`c893bd7` (the tree the original audit read; `main` has no commit since).
+Done on branch `agent/media-perf` from `main` `c893bd7` (the tree the
+original audit read), merged into `main` at `5fea8a2` on 2026-11-24.
 Source of the items: "Performance audit — caustic-media", the final answer of
-the 2026-11-21 session (copy: `/tmp/cm-audit/audit.md` while this runs).
+the 2026-11-21 session.
 
 States: FIXED (code committed, test + A/B evidence), PARTIAL, UNRESOLVED,
 BLOCKED (with the prerequisite), NOT_APPLICABLE (measured or shown not to
@@ -73,7 +73,7 @@ exist). Low gain is not NOT_APPLICABLE.
 | ID | Item | State |
 |---|---|---|
 | X1 | CausticOS #15: toolkit damage collapsed into one bounding box | FIXED (`e1874ce`) and verified on CausticOS 2026-11-24: isolated clone at `/var/tmp/cm-x1` (causticos 19e1629, caustic-media dependency overridden with this branch at `00be77f`), userspace + ISO built under caps (122 targets, 23 MB); `scripts/test-clip-focus.sh` PASS; QEMU/QMP check (typing, maximise twice): 0 differing pixels between screenshots; COMMIT area for the same session 7,052,720 px / 93 COMMITs (old) → 4,878,192 px / 133 COMMITs (−31% copied) |
-| X2 | CausticOS G29 / browser F7: background/incremental image decoding API | caustic-media side FIXED (`6b86c39`, `90222aa`: load.Job background decode). caustic-image side FIXED on branch `agent/progressive-decode` (worktree `/var/tmp/cm-x2/caustic-image`, main `f6296f0` untouched): `78bdef3` (main's JPEG encoder did not compile), `d94c3bd` (PNG scanline helpers), `540edfa` zsteps (inflate that stops at the input's end; crafted 1 KB PNG hung png_decode forever on main), `689791e` progressive feed/finish/take/close. Integrating it into caustic-media BLOCKED: needs that branch merged and released (not done here by rule) |
+| X2 | CausticOS G29 / browser F7: background/incremental image decoding API | FIXED and integrated: `6b86c39`, `90222aa` load.Job; `6baa23a` load.Stream (size from the header, PNG rows as they come, the image load.bytes gives, cancel at any point; four on four threads; malformed inputs refused) over caustic-image `main` `f7d9733` (progressive.cst, v0.2.0) and caustic-compact `main` `33023cf` (inflate_stream; the cut-stream hang fixed in `a08d265`), both v0.2.0 (local tags). 512×512 PNG in 16 KB pieces: 37 + 7 ms → 8 + 0 ms vs 6 ms one-shot |
 
 ## Gates
 
@@ -82,9 +82,12 @@ exist). Low gain is not NOT_APPLICABLE.
   with api.md regenerated (`193ba9b`): rc=0.
 - At `0d7d9fd`: test, test-x11, test-wayland, test-win32 and
   test-win32-native all rc=0.
-- Final, at `00be77f` (F1, C3.4 f32 in): test, test-x11, test-wayland,
-  test-win32 and test-win32-native all rc=0, no FAIL line, run one at a
-  time under the caps with WAYLAND_DISPLAY unset.
+- At `00be77f` (F1, C3.4 f32 in): test, test-x11, test-wayland,
+  test-win32 and test-win32-native all rc=0.
+- Final, on `main` at `5fea8a2` (merged, with load.Stream and the v0.2.0
+  dependencies), in a clean worktree: all five rc=0, no FAIL line, one at a
+  time under the caps with WAYLAND_DISPLAY unset; caustic-image and
+  caustic-compact suites all green on their `main`.
 
 ## New issues found
 
@@ -118,12 +121,11 @@ exist). Low gain is not NOT_APPLICABLE.
 - `host_popup_wayland_test` "painted in the tooltip's colour" fails on
   `c893bd7` (before this work) and after; not a perf regression.
 
-- caustic-image `main`: `encode_ex` in formats/jpeg.cst declares `i` twice
+- caustic-image: `encode_ex` in formats/jpeg.cst declared `i` twice
   (f9ecbfa), so test_jpeg, test_jpeg_prog, test_jpeg_enc and test_dispatch
-  do not compile. Fixed on the branch (`78bdef3`), not on main.
-- caustic-compact `inflate`: a zlib stream cut inside a Huffman block makes
-  it read zero bits past the end and never return. png_decode (and TIFF
-  deflate, CSIF method 0) of a crafted 1 KB PNG hangs. caustic-image's
-  branch stops using it for untrusted input (`540edfa`); caustic-compact
-  itself not edited (not authorised).
+  did not compile. Fixed on caustic-image `main` (`78bdef3`).
+- caustic-compact `inflate`: a zlib stream cut inside a Huffman block made
+  it read zero bits past the end and never return; png_decode of a crafted
+  1 KB PNG hung (and load.bytes here). Fixed at the root on caustic-compact
+  `main` (`a08d265`), regression tests in both libraries.
 

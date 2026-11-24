@@ -1,7 +1,8 @@
 # PERFORMANCE_FINAL_REPORT — caustic-media
 
-Branch `agent/media-perf` (worktree `../.agent-media-perf`), from `main`
-`c893bd7`. Not merged, rebased or pushed; `main` untouched. Source: the
+Done on branch `agent/media-perf` from `main` `c893bd7`, merged into
+`main` at `5fea8a2` on 2026-11-24 (with caustic-image and caustic-compact
+`main` at v0.2.0, local tags). Nothing pushed. Source: the
 "Performance audit — caustic-media" of 2026-11-21. Per-item detail, one row
 each, is in `PERFORMANCE_STATUS.md`; this report sums it up.
 
@@ -30,7 +31,7 @@ Cross-project, tracked apart:
 | Item | State |
 |---|---|
 | X1 | FIXED, and verified on CausticOS in an isolated checkout |
-| X2 | caustic-media background decode FIXED; caustic-image progressive decoding FIXED on its own branch; integration here BLOCKED on that branch being merged and released |
+| X2 | FIXED: background (`load.Job`) and incremental (`load.Stream`) decoding, over caustic-image and caustic-compact v0.2.0 |
 
 ## Measured A/B (best of repeated runs, same machine, before → after)
 
@@ -65,7 +66,9 @@ Cross-project, tracked apart:
 | E2.3 | cached subtree renders on a new window texture | 1 → 0 |
 | X1 | CausticOS, two small corner changes in 800×600 | 467,040 → 840 px copied |
 | X1 on CausticOS | same QEMU session, COMMIT area | 7,052,720 px / 93 COMMITs → 4,878,192 px / 133 COMMITs (−31%) |
-| X2 (caustic-image) | 512×512 PNG, 396,523 B, fed 16 KB at a time | first rows after 32 KB (8%); feeds 37 ms + finish 6–7 ms vs one-shot 6–7 ms; png_decode with zsteps 6–7 ms vs 5–6 ms before |
+| X2 (caustic-image) | 512×512 PNG, 396,523 B, fed 16 KB at a time | feeds 37 ms + finish 7 ms → feeds 8 ms + finish 0 ms (one-shot decode 6 ms); first rows after 16 KB |
+| X2 (caustic-media) | 1024×768 PNG, 1,188,400 B, `load.Stream` in 16 KB pieces | slowest `stream_feed` 0.23–0.38 ms; whole 24–27 ms vs `load.bytes` 19–20 ms; same image |
+| caustic-compact | inflate, 40 × (window + big) | 23.8–24.2 → 23.3–23.7 ms after the cut-stream fix (unchanged) |
 
 Not kept, because nothing measured better:
 - B5.3: skipping clean uploads gave 242–274 ns a run after, against
@@ -110,6 +113,8 @@ and the 4-pixel group. Each was caught.
 ## Commits (c893bd7..HEAD)
 
 ```
+5fea8a2 Merge agent/media-perf: the performance audit's fixes, progressive image loading
+6baa23a image/load: a Stream decodes an image as its bytes arrive
 00be77f draw2d: 32-byte f32 vertices
 4b171a0 shapes2d: rounded rectangles from kept corner masks
 0d7d9fd ui/text: a run drawn again as it was copies its quads in
@@ -169,26 +174,22 @@ one), so they are not listed above.
 - **f32 vertices (`00be77f`):** `draw2d.Vertex` is eight f32s (32 bytes),
   `pipeline.layout_pos2_color_uv_f32()`. A custom pipeline fed draw2d's
   buffer must use that layout.
-- **caustic-image progressive decoding (branch `agent/progressive-decode`,
-  not merged):** `progressive.cst`:
-  - `let p = progressive(); feed(&p, bytes, n)` per arrival returns the
-    state: NEED, HEADER (`width`/`height` known), ROWS (`rows(&p)` top rows
-    of `image_of(&p)` final, non-interlaced PNG), DONE, or a negative errno.
-  - `finish(&p)` decodes the whole with `decode()`: the final image is the
-    one-shot one, bit for bit. `take(&p, &img)` hands it over after DONE.
-  - Lifetime: the Progressive owns its bytes and image until `take`;
-    `close(&p)` at any state frees everything and is the cancel; twice is
-    safe; after it every call returns I_BADPARAM.
-  - Threads: one Progressive is used by one thread at a time; separate ones
-    share nothing (zsteps fills constant tables once, every thread writing
-    the same values). JPEG/WebP still decode through module globals inside
-    `finish`, so caustic-media's decode lock must cover `finish`.
-  - Malformed input: dimensions refused at the header before allocation
-    (I_DIMS), chunk CRCs checked as they arrive (I_CORRUPT), output bounded
-    by the image size, cut-short streams end in an error with the rows that
-    came kept.
-  - In caustic-media, a `load.Job` would feed a Progressive from its thread
-    and publish `rows()` for a partial paint; that waits for the release.
+- **Images as their bytes arrive (`6baa23a`):** `image.load.Stream`:
+  - `stream_open`, then `stream_feed(&s, data, n)` per piece (copies,
+    returns at once), `stream_end`; `stream_size` once the header is read;
+    `stream_rows` rows of `stream_shown(&s)` final (non-interlaced PNG);
+    `stream_done`, `stream_take` (the image `load.bytes` gives),
+    `stream_error`; `stream_close` at any time, also the cancel.
+  - Ownership: the Stream stays put from open to close; `stream_shown` is
+    the Stream's until close; the taken image is the caller's.
+  - Threads: the decoding is on the Stream's own thread; a shown row is
+    written before `stream_rows` counts it and never changes after, so it
+    is read without a lock. Final JPEG/WebP decodes take the decode lock,
+    as `bytes()` does. Close every Stream before `main` returns.
+  - Where no thread can start, `stream_feed`/`stream_end` do the work.
+  - Underneath: caustic-image `progressive.cst` (`feed`, `finish`, `take`,
+    `close`, `kept`) and caustic-compact `inflate_stream.cst`
+    (`inflate_stream`, `inflate_stream_run`), both v0.2.0.
 
 - `gpu.texture.BGRA8` is a render target in a window buffer's order. The
   host uses it whenever `device.native_pixels` names an order;
@@ -252,6 +253,13 @@ one), so they are not listed above.
 
 ## What is left, and why
 
+- **The v0.2.0 tags are local.** caustic-media's Causticfile asks for
+  caustic-image and caustic-compact `v0.2.0`, which exist only in the local
+  repositories (nothing was pushed or released). Builds here use the
+  `.caustic/deps` checkouts already at those tags; a fresh clone elsewhere
+  cannot fetch them until both tags (and the three `main` branches) are
+  pushed.
+
 - **C3.4, FIXED:** 64-byte vertices with no z (`dbd0c6e`), then eight f32s
   (`00be77f`) once the owner accepted rounding. u8 colours were not done:
   the colour is four f32s inside the 32 bytes, and packing it to 4 bytes
@@ -283,27 +291,38 @@ one), so they are not listed above.
     a swapchain on the window's native handles). That is a backend project,
     not a performance fix, and nothing here claims it.
 - **X1, verified on CausticOS (2026-11-24):** no release was needed. An
-  isolated clone in `/var/tmp/cm-x1` (disk, not the `/tmp` RAM disk) of
+  isolated clone in `/var/tmp/cm-x1` (disk, not the `/tmp` RAM disk; removed
+  after the run) of
   causticos `19e1629`, with its caustic-media dependency overridden by this
   branch at `00be77f`, built (122 targets, 23 MB ISO, under the caps).
   `scripts/test-clip-focus.sh` passed. A QEMU/QMP session (typing with the
   pointer on the title bar, maximise twice) gave 0 differing pixels between
   the screenshots, and copied 31% less (above). The sibling checkout was
   not touched. Each frame sends up to 16 COMMITs of 32 bytes instead of one.
-- **X2:**
-  - caustic-media: `load.Job` background decoding, done and tested.
-  - caustic-image, branch `agent/progressive-decode` only (main `f6296f0`
-    untouched, nothing pushed): `78bdef3`, `d94c3bd`, `540edfa`, `689791e`.
-    Its suite is green with `test_progressive`, `test_zsteps` and the
-    hanging-PNG regression; mutants of the CRC check, dimension check,
-    unfiltering, partial-IDAT use, finish and zsteps' end-of-input, output
-    cap and block rewind were each caught.
-  - Cost: rows shown during arrival cost about 6× a one-shot decode in all
-    (each 16 KB step decodes the unfinished deflate block again); `finish`
-    then decodes once more. Only non-interlaced PNG shows rows early;
-    JPEG, GIF, BMP and QOI report their size early and decode at `finish`.
-  - BLOCKED here: using it in caustic-media needs that branch merged and
-    released, which this work does not do.
+- **X2, FIXED and integrated (2026-11-24):**
+  - caustic-compact `main` `33023cf` (local tag `v0.2.0`): `a08d265` fixes
+    the inflate that never returned on a cut stream (root cause: the 9-bit
+    table paths took codes from the zero bits past the input's end) and a
+    one-byte gzip taken as empty; `33023cf` adds `inflate_stream`, which
+    resumes at the symbol where the input ran out, Huffman tables kept, so
+    a stream fed in any pieces costs one inflate.
+  - caustic-image `main` `f7d9733` (local tag `v0.2.0`): the JPEG test
+    build fix, the PNG scanline helpers, `progressive.cst` over
+    `inflate_stream`; its private inflater (`zsteps`) is gone and PNG, TIFF
+    and CSIF use caustic-compact's fixed inflate again. `finish` keeps the
+    rows decoded as the PNG came when the file arrived whole and checks
+    out, so nothing is decoded twice.
+  - caustic-media `6baa23a`: `load.Stream` (above), dependencies at v0.2.0.
+  - Overhead: 512×512 PNG fed in 16 KB pieces, 37 ms of feeds + 7 ms
+    finish (about 7× a one-shot decode) → 8 ms + 0 ms against 6 ms; the
+    stream inflater is 1.7× `inflate` per byte, nothing repeated. In
+    caustic-media a 1024×768 PNG in 16 KB pieces: slowest `stream_feed`
+    0.23–0.38 ms on the caller's thread, whole 24–27 ms vs `load.bytes`
+    19–20 ms, the same image.
+  - Limits: rows appear for non-interlaced PNG only; JPEG, GIF, BMP and
+    QOI give their size early and their pixels at the end. A PNG whose
+    first IHDR has an impossible size is refused at once, even if a second
+    IHDR (malformed by the spec) would have been accepted by `decode()`.
 
 ## New issues found (not part of the audit)
 
@@ -330,13 +349,17 @@ one), so they are not listed above.
 - **mmap failure checks:** `draw2d.open` and `sw_buffer_create` test
   `mmap_anon` for 0 only, not for -1. This predates the branch and was
   found in review.
-- **caustic-image `main` does not build its JPEG tests:** `encode_ex` declares
-  `i` twice (f9ecbfa). Fixed on the branch only (`78bdef3`).
-- **caustic-compact `inflate` hangs on a cut stream:** cut inside a Huffman
-  block, it decodes zero bits past the end forever. A crafted 1 KB PNG with
-  valid CRCs hangs `png_decode` on caustic-image main — and so any
-  caustic-media program loading untrusted PNGs. caustic-image's branch
-  avoids it (`540edfa`); caustic-compact is not edited (not authorised).
+- **caustic-image's JPEG tests did not build:** `encode_ex` declared `i`
+  twice (f9ecbfa). Fixed on caustic-image `main` (`78bdef3`).
+- **caustic-compact `inflate` hung on a cut stream:** cut inside a Huffman
+  block, it decoded the zero bits past the end without stopping, so a
+  crafted 1 KB PNG with valid CRCs hung `png_decode` — and `load.bytes`
+  here. Fixed at the root in caustic-compact `a08d265` (with regression
+  tests: every fixture cut as raw, zlib and gzip, the PNG's stream, 400
+  garbage inputs); caustic-image keeps the PNG as `repro_png_cut`.
+- **caustic-compact `gzip_decompress`** took a lone first byte as an empty
+  stream; it is a member cut short now (`a08d265`). Empty input still
+  gives 0.
 - **Profile finding not in the audit:** `cmap` format-12 lookup is 9.45% of
   an entry keystroke.
 
@@ -355,18 +378,24 @@ Its residual risks:
 
 ## Gates
 
-All five gate scripts pass at `00be77f`, the last code commit (they also
-passed at `0d7d9fd` before F1 and the f32 vertices). They ran one
-at a time, inside the 2.5 GiB memory and 100% CPU caps, with
-`WAYLAND_DISPLAY` unset:
+Final, on the integrated `main` branches (caustic-media `5fea8a2` in a
+clean worktree, caustic-image `6d92042`, caustic-compact `33023cf`), one at a
+time inside the 2.5 GiB memory and 100% CPU caps, `WAYLAND_DISPLAY` unset:
 
 | Script | Result |
 |---|---|
-| `caustic-mk run test` | rc=0, no FAIL (includes the `ui/api.md` gate, `causticos_damage_test`, `load_test`) |
-| `caustic-mk run test-x11` | rc=0 |
-| `caustic-mk run test-wayland` | rc=0 |
-| `caustic-mk run test-win32` | rc=0 |
-| `caustic-mk run test-win32-native` | rc=0 |
+| caustic-media `caustic-mk run test` | rc=0, no FAIL (includes the `ui/api.md` gate, `causticos_damage_test`, `load_test` with the Stream checks) |
+| caustic-media `caustic-mk run test-x11` | rc=0 |
+| caustic-media `caustic-mk run test-wayland` | rc=0 |
+| caustic-media `caustic-mk run test-win32` | rc=0 |
+| caustic-media `caustic-mk run test-win32-native` | rc=0 |
+| caustic-image `caustic-mk run test` | all green (40 suites, with `test_progressive` and `repro_png_cut`) |
+| caustic-compact `caustic-mk run test` | all green (with `[truncated]` and `[inflate_stream]`) |
+
+After them caustic-image took one more commit, `f7d9733`, which removes two
+unused locals from `png_decode`; its suite and caustic-media's `load_test`
+and `save_test` passed again against it. The gates also passed at
+`00be77f` and `0d7d9fd` on the branch.
 
 Getting there took three fixes:
 - **Windows build (my regression):** the Win32 scripts first failed on a
