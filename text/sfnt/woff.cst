@@ -1,0 +1,699 @@
+// text/sfnt/woff.cst — WOFF and WOFF2, undone into the sfnt file they were made from.
+//
+// Both are the same tables in a compressed envelope, and a font off the web is one or the
+// other. WOFF deflates each table by itself. WOFF2 puts all of them through one Brotli
+// stream, and rearranges `glyf`, `loca` and sometimes `hmtx` first so that they compress
+// better, which is all the work here: those are written back out as the tables they were.
+//
+// Nothing about the file is trusted, it comes from whichever site asked for it. Every read
+// is checked, what it grows to is limited, and what does not add up is no font at all.
+//
+// Brotli and DEFLATE keep their tables at module level: a program decompressing on another
+// thread as well has to hold whatever lock it holds for those around unwrap.
+
+use "std/mem.cst" as mem;
+use "caustic-compact/core/bytes.cst" as bytes;
+use "caustic-compact/formats/brotli.cst" as brotli;
+use "caustic-compact/formats/zlib.cst" as zlib;
+
+let is i64 as MAX_SFNT with imut = 134217728;
+let is i64 as MAX_TABLES with imut = 1024;
+let is i64 as MAX_POINTS with imut = 65536;
+
+let is i64 as TAG_WOFF with imut = 0x774F4646;
+let is i64 as TAG_WOF2 with imut = 0x774F4632;
+let is i64 as TAG_TTCF with imut = 0x74746366;
+let is i64 as TAG_GLYF with imut = 0x676C7966;
+let is i64 as TAG_LOCA with imut = 0x6C6F6361;
+let is i64 as TAG_HMTX with imut = 0x686D7478;
+let is i64 as TAG_HHEA with imut = 0x68686561;
+let is i64 as TAG_MAXP with imut = 0x6D617870;
+
+struct _R {
+    p   as *u8;
+    n   as i64;
+    i   as i64;
+    bad as i64;
+}
+
+struct _Table {
+    tag   as i64;
+    from  as *u8;     // its bytes, in the stream or in owned
+    len   as i64;
+    orig  as i64;
+    kept  as i64;     // length in the stream, transformed or not
+    shape as i64;     // the transform: 0 for none
+    owned as bytes.Bytes;
+    owns  as i64;
+}
+
+fn _rd(p as *u8, n as i64) as _R {
+    let is _R as r with mut;
+    r.p = p;
+    r.n = n;
+    r.i = 0;
+    r.bad = cast(i64, n < 0);
+    return r;
+}
+
+fn _u8(r as *_R) as i64 {
+    if (r.i >= r.n) {
+        r.bad = 1;
+        return 0;
+    }
+    let is i64 as v = cast(i64, r.p[r.i]);
+    r.i = r.i + 1;
+    return v;
+}
+
+fn _u16(r as *_R) as i64 {
+    let is i64 as a = _u8(r);
+    return (a << 8) | _u8(r);
+}
+
+fn _i16(r as *_R) as i64 {
+    let is i64 as v = _u16(r);
+    if (v >= 32768) { return v - 65536; }
+    return v;
+}
+
+fn _u32(r as *_R) as i64 {
+    let is i64 as a = _u16(r);
+    return (a << 16) | _u16(r);
+}
+
+// Variable-length, as WOFF2 writes a table's size. No leading zeros, at most five bytes.
+fn _base128(r as *_R) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < 5) {
+        let is i64 as b = _u8(r);
+        if (k == 0 && b == 128) { r.bad = 1; }
+        if (v > 0x1FFFFFF) { r.bad = 1; }
+        v = (v << 7) | (b & 127);
+        if ((b & 128) == 0) { return v; }
+        k = k + 1;
+    }
+    r.bad = 1;
+    return 0;
+}
+
+fn _255(r as *_R) as i64 {
+    let is i64 as c = _u8(r);
+    if (c == 253) { return _u16(r); }
+    if (c == 255) { return _u8(r) + 253; }
+    if (c == 254) { return _u8(r) + 506; }
+    return c;
+}
+
+fn _put8(b as *bytes.Bytes, v as i64) as void { bytes.bytes_push(b, cast(u8, v & 255)); }
+
+fn _put16(b as *bytes.Bytes, v as i64) as void {
+    _put8(b, v >> 8);
+    _put8(b, v);
+}
+
+fn _put32(b as *bytes.Bytes, v as i64) as void {
+    _put16(b, v >> 16);
+    _put16(b, v);
+}
+
+fn _tag_of_index(k as i64) as i64 {
+    let is *u8 as s = "cmapheadhheahmtxmaxpnameOS/2postcvt fpgmglyflocaprepCFF VORGEBDTEBLCgasphdmxkernLTSHPCLTVDMXvheavmtxBASEGDEFGPOSGSUBEBSCJSTFMATHCBDTCBLCCOLRCPALSVG sbixacntavarbdatblocbslncvarfdscfeatfmtxfvargvarhstyjustlcarmortmorxopbdproptrakZapfSilfGlatGlocFeatSill";
+    let is *u8 as t = &s[k * 4];
+    return (cast(i64, t[0]) << 24) | (cast(i64, t[1]) << 16) | (cast(i64, t[2]) << 8) | cast(i64, t[3]);
+}
+
+fn _with_sign(flag as i64, mag as i64) as i64 {
+    if ((flag & 1) != 0) { return mag; }
+    return 0 - mag;
+}
+
+// The point a flag and its bytes say, as a step from the last one.
+fn _triplet(r as *_R, flag0 as i64, dx as *i64, dy as *i64) as void {
+    let is i64 as flag = flag0 & 127;
+    if (flag < 10) {
+        *dx = 0;
+        *dy = _with_sign(flag, ((flag & 14) << 7) + _u8(r));
+    } else if (flag < 20) {
+        *dx = _with_sign(flag, (((flag - 10) & 14) << 7) + _u8(r));
+        *dy = 0;
+    } else if (flag < 84) {
+        let is i64 as b0 = flag - 20;
+        let is i64 as b1 = _u8(r);
+        *dx = _with_sign(flag, 1 + (b0 & 0x30) + (b1 >> 4));
+        *dy = _with_sign(flag >> 1, 1 + ((b0 & 0x0C) << 2) + (b1 & 0x0F));
+    } else if (flag < 120) {
+        let is i64 as b0 = flag - 84;
+        let is i64 as b1 = _u8(r);
+        let is i64 as b2 = _u8(r);
+        *dx = _with_sign(flag, 1 + ((b0 / 12) << 8) + b1);
+        *dy = _with_sign(flag >> 1, 1 + (((b0 % 12) >> 2) << 8) + b2);
+    } else if (flag < 124) {
+        let is i64 as b1 = _u8(r);
+        let is i64 as b2 = _u8(r);
+        let is i64 as b3 = _u8(r);
+        *dx = _with_sign(flag, (b1 << 4) + (b2 >> 4));
+        *dy = _with_sign(flag >> 1, ((b2 & 0x0F) << 8) + b3);
+    } else {
+        let is i64 as b1 = _u8(r);
+        let is i64 as b2 = _u8(r);
+        let is i64 as b3 = _u8(r);
+        let is i64 as b4 = _u8(r);
+        *dx = _with_sign(flag, (b1 << 8) + b2);
+        *dy = _with_sign(flag >> 1, (b3 << 8) + b4);
+    }
+}
+
+fn _sub(whole as *_R, n as i64) as _R {
+    let is _R as r with mut = _rd(cast(*u8, 0), 0);
+    if (n < 0 || whole.i + n > whole.n) {
+        whole.bad = 1;
+        r.bad = 1;
+        return r;
+    }
+    r = _rd(&whole.p[whole.i], n);
+    whole.i = whole.i + n;
+    return r;
+}
+
+fn _copy_from(r as *_R, out as *bytes.Bytes, n as i64) as void {
+    if (n < 0 || r.i + n > r.n) {
+        r.bad = 1;
+        return;
+    }
+    bytes.bytes_append(out, &r.p[r.i], n);
+    r.i = r.i + n;
+}
+
+struct _Points {
+    dx    as *i32;
+    dy    as *i32;
+    flags as *u8;
+    ends  as *i64;
+}
+
+// One glyph of outlines back as `glyf` writes it. Its least x comes back through xmin.
+fn _simple(contours as i64, counts as *_R, flag_r as *_R, glyph_r as *_R, instr_r as *_R, box_r as *_R, boxed as i64, overlap as i64, pt as *_Points, out as *bytes.Bytes, xmin as *i64) as i64 {
+    let is i64 as total with mut = 0;
+    let is i64 as c with mut = 0;
+    while (c < contours) {
+        total = total + _255(counts);
+        if (counts.bad == 1 || total > MAX_POINTS - 1) { return 0; }
+        pt.ends[c] = total - 1;
+        c = c + 1;
+    }
+    let is i64 as x with mut = 0;
+    let is i64 as y with mut = 0;
+    let is i64 as lox with mut = 0;
+    let is i64 as hix with mut = 0;
+    let is i64 as loy with mut = 0;
+    let is i64 as hiy with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < total) {
+        let is i64 as f = _u8(flag_r);
+        let is i64 as dx with mut = 0;
+        let is i64 as dy with mut = 0;
+        _triplet(glyph_r, f, &dx, &dy);
+        if (flag_r.bad == 1 || glyph_r.bad == 1) { return 0; }
+        x = x + dx;
+        y = y + dy;
+        if (x < -32768 || x > 32767 || y < -32768 || y > 32767) { return 0; }
+        if (i == 0 || x < lox) { lox = x; }
+        if (i == 0 || x > hix) { hix = x; }
+        if (i == 0 || y < loy) { loy = y; }
+        if (i == 0 || y > hiy) { hiy = y; }
+        pt.dx[i] = cast(i32, dx);
+        pt.dy[i] = cast(i32, dy);
+        // On the curve is the top bit clear here and the low bit set there.
+        let is i64 as tt with mut = 0;
+        if ((f & 128) == 0) { tt = 1; }
+        if (dx == 0) { tt = tt | 0x10; }
+        else if (dx > -256 && dx < 256) {
+            tt = tt | 0x02;
+            if (dx > 0) { tt = tt | 0x10; }
+        }
+        if (dy == 0) { tt = tt | 0x20; }
+        else if (dy > -256 && dy < 256) {
+            tt = tt | 0x04;
+            if (dy > 0) { tt = tt | 0x20; }
+        }
+        if (i == 0 && overlap == 1) { tt = tt | 0x40; }
+        pt.flags[i] = cast(u8, tt);
+        i = i + 1;
+    }
+    let is i64 as ilen = _255(glyph_r);
+    _put16(out, contours & 65535);
+    if (boxed == 1) {
+        lox = _i16(box_r);
+        loy = _i16(box_r);
+        hix = _i16(box_r);
+        hiy = _i16(box_r);
+        if (box_r.bad == 1) { return 0; }
+    }
+    *xmin = lox;
+    _put16(out, lox & 65535);
+    _put16(out, loy & 65535);
+    _put16(out, hix & 65535);
+    _put16(out, hiy & 65535);
+    c = 0;
+    while (c < contours) {
+        _put16(out, pt.ends[c]);
+        c = c + 1;
+    }
+    _put16(out, ilen);
+    _copy_from(instr_r, out, ilen);
+    if (instr_r.bad == 1) { return 0; }
+    // Flags with their repeats folded, as a table this size is usually written.
+    i = 0;
+    while (i < total) {
+        let is i64 as f = cast(i64, pt.flags[i]);
+        let is i64 as run with mut = 0;
+        while (i + run + 1 < total && run < 255 && cast(i64, pt.flags[i + run + 1]) == f) { run = run + 1; }
+        if (run > 0) {
+            _put8(out, f | 0x08);
+            _put8(out, run);
+        } else {
+            _put8(out, f);
+        }
+        i = i + run + 1;
+    }
+    i = 0;
+    while (i < total) {
+        let is i64 as d = cast(i64, pt.dx[i]);
+        let is i64 as f = cast(i64, pt.flags[i]);
+        if ((f & 0x02) != 0) {
+            if (d < 0) { _put8(out, 0 - d); } else { _put8(out, d); }
+        } else if ((f & 0x10) == 0) {
+            _put16(out, d & 65535);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < total) {
+        let is i64 as d = cast(i64, pt.dy[i]);
+        let is i64 as f = cast(i64, pt.flags[i]);
+        if ((f & 0x04) != 0) {
+            if (d < 0) { _put8(out, 0 - d); } else { _put8(out, d); }
+        } else if ((f & 0x20) == 0) {
+            _put16(out, d & 65535);
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _composite(comp_r as *_R, glyph_r as *_R, instr_r as *_R, box_r as *_R, boxed as i64, out as *bytes.Bytes, xmin as *i64) as i64 {
+    if (boxed == 0) { return 0; }
+    _put16(out, 65535);
+    let is i64 as lox = _i16(box_r);
+    *xmin = lox;
+    _put16(out, lox & 65535);
+    _put16(out, _i16(box_r) & 65535);
+    _put16(out, _i16(box_r) & 65535);
+    _put16(out, _i16(box_r) & 65535);
+    if (box_r.bad == 1) { return 0; }
+    let is i64 as has_instr with mut = 0;
+    let is i64 as more with mut = 1;
+    while (more == 1) {
+        let is i64 as fl = _u16(comp_r);
+        let is i64 as gid = _u16(comp_r);
+        if (comp_r.bad == 1) { return 0; }
+        _put16(out, fl);
+        _put16(out, gid);
+        let is i64 as extra with mut = 2;
+        if ((fl & 0x0001) != 0) { extra = 4; }
+        if ((fl & 0x0008) != 0) { extra = extra + 2; }
+        else if ((fl & 0x0040) != 0) { extra = extra + 4; }
+        else if ((fl & 0x0080) != 0) { extra = extra + 8; }
+        _copy_from(comp_r, out, extra);
+        if (comp_r.bad == 1) { return 0; }
+        if ((fl & 0x0100) != 0) { has_instr = 1; }
+        more = cast(i64, (fl & 0x0020) != 0);
+    }
+    if (has_instr == 1) {
+        let is i64 as ilen = _255(glyph_r);
+        _put16(out, ilen);
+        _copy_from(instr_r, out, ilen);
+        if (glyph_r.bad == 1 || instr_r.bad == 1) { return 0; }
+    }
+    return 1;
+}
+
+// The transformed `glyf`, as `glyf` and `loca`. xmins has room made here, one a glyph.
+fn _glyf(src as *u8, n as i64, glyf as *bytes.Bytes, loca as *bytes.Bytes, xmins as **i64, out_glyphs as *i64) as i64 {
+    let is _R as h with mut = _rd(src, n);
+    _u16(&h);
+    let is i64 as options = _u16(&h);
+    let is i64 as glyphs = _u16(&h);
+    let is i64 as format = _u16(&h);
+    if (format > 1) { return 0; }
+    let is i64 as s_cont = _u32(&h);
+    let is i64 as s_pts = _u32(&h);
+    let is i64 as s_flag = _u32(&h);
+    let is i64 as s_glyph = _u32(&h);
+    let is i64 as s_comp = _u32(&h);
+    let is i64 as s_box = _u32(&h);
+    let is i64 as s_instr = _u32(&h);
+    let is _R as conts with mut = _sub(&h, s_cont);
+    let is _R as pts with mut = _sub(&h, s_pts);
+    let is _R as fl with mut = _sub(&h, s_flag);
+    let is _R as gl with mut = _sub(&h, s_glyph);
+    let is _R as comp with mut = _sub(&h, s_comp);
+    let is _R as bx with mut = _sub(&h, s_box);
+    let is _R as instr with mut = _sub(&h, s_instr);
+    let is i64 as map_bytes = ((glyphs + 31) / 32) * 4;
+    let is _R as boxmap with mut = _sub(&bx, map_bytes);
+    let is _R as lap with mut = _rd(cast(*u8, 0), 0);
+    if ((options & 1) != 0) { lap = _sub(&h, (glyphs + 7) / 8); }
+    if (h.bad == 1 || bx.bad == 1) { return 0; }
+
+    let is _Points as pt with mut;
+    pt.dx = cast(*i32, mem.core.mmap_anon(MAX_POINTS * 4));
+    pt.dy = cast(*i32, mem.core.mmap_anon(MAX_POINTS * 4));
+    pt.flags = mem.core.mmap_anon(MAX_POINTS);
+    pt.ends = cast(*i64, mem.core.mmap_anon(MAX_POINTS * 8));
+    let is *i64 as xm = cast(*i64, mem.core.mmap_anon((glyphs + 1) * 8));
+    *xmins = xm;
+    *out_glyphs = glyphs;
+    let is i64 as ok with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < glyphs && ok == 1) {
+        if (format == 0) { _put16(loca, glyf.len / 2); }
+        else { _put32(loca, glyf.len); }
+        let is i64 as c = _i16(&conts);
+        let is i64 as boxed = cast(i64, (cast(i64, boxmap.p[i / 8]) >> (7 - i % 8)) & 1);
+        let is i64 as lapped with mut = 0;
+        if (lap.n > 0) { lapped = (cast(i64, lap.p[i / 8]) >> (7 - i % 8)) & 1; }
+        if (conts.bad == 1) { ok = 0; }
+        else if (c == 0) {
+            if (boxed == 1) { ok = 0; }
+        } else if (c == 0 - 1) {
+            ok = _composite(&comp, &gl, &instr, &bx, boxed, glyf, &xm[i]);
+        } else if (c > 0) {
+            ok = _simple(c, &pts, &fl, &gl, &instr, &bx, boxed, lapped, &pt, glyf, &xm[i]);
+        } else {
+            ok = 0;
+        }
+        while ((glyf.len & 3) != 0) { _put8(glyf, 0); }
+        if (glyf.len > MAX_SFNT) { ok = 0; }
+        i = i + 1;
+    }
+    if (ok == 1) {
+        if (format == 0) {
+            if (glyf.len / 2 > 65535) { ok = 0; }
+            _put16(loca, glyf.len / 2);
+        } else {
+            _put32(loca, glyf.len);
+        }
+    }
+    mem.core.munmap(cast(*u8, pt.dx), MAX_POINTS * 4);
+    mem.core.munmap(cast(*u8, pt.dy), MAX_POINTS * 4);
+    mem.core.munmap(pt.flags, MAX_POINTS);
+    mem.core.munmap(cast(*u8, pt.ends), MAX_POINTS * 8);
+    return ok;
+}
+
+// The transformed `hmtx`: what could be worked out from the outlines was left out.
+fn _hmtx(src as *u8, n as i64, metrics as i64, glyphs as i64, xm as *i64, out as *bytes.Bytes) as i64 {
+    if (metrics < 1 || metrics > glyphs || xm == null) { return 0; }
+    let is _R as r with mut = _rd(src, n);
+    let is i64 as fl = _u8(&r);
+    if ((fl & 0xFC) != 0 || (fl & 3) == 0) { return 0; }
+    let is _R as adv with mut = _sub(&r, metrics * 2);
+    let is _R as lsb with mut = _rd(cast(*u8, 0), 0);
+    let is _R as rest with mut = _rd(cast(*u8, 0), 0);
+    if ((fl & 1) == 0) { lsb = _sub(&r, metrics * 2); }
+    if ((fl & 2) == 0) { rest = _sub(&r, (glyphs - metrics) * 2); }
+    if (r.bad == 1) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < metrics) {
+        _put16(out, _u16(&adv));
+        if ((fl & 1) == 0) { _put16(out, _u16(&lsb)); }
+        else { _put16(out, xm[i] & 65535); }
+        i = i + 1;
+    }
+    while (i < glyphs) {
+        if ((fl & 2) == 0) { _put16(out, _u16(&rest)); }
+        else { _put16(out, xm[i] & 65535); }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _checksum(p as *u8, n as i64) as i64 {
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as v with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < 4) {
+            v = v << 8;
+            if (i + k < n) { v = v | cast(i64, p[i + k]); }
+            k = k + 1;
+        }
+        sum = (sum + v) & 4294967295;
+        i = i + 4;
+    }
+    return sum;
+}
+
+fn _w16(p as *u8, v as i64) as void {
+    p[0] = cast(u8, (v >> 8) & 255);
+    p[1] = cast(u8, v & 255);
+}
+
+fn _w32(p as *u8, v as i64) as void {
+    _w16(p, (v >> 16) & 65535);
+    _w16(&p[2], v & 65535);
+}
+
+// The tables as one sfnt file, in the order a directory wants. Null if it would be too big.
+fn _assemble(t as *_Table, n as i64, flavor as i64, out_size as *i64) as *u8 {
+    let is i64 as total with mut = 12 + 16 * n;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        total = total + ((t[i].len + 3) & (0 - 4));
+        i = i + 1;
+    }
+    if (total > MAX_SFNT) { return cast(*u8, 0); }
+    let is *u8 as out = mem.core.mmap_anon(total);
+    if (cast(i64, out) == 0 || cast(i64, out) == 0 - 1) { return cast(*u8, 0); }
+    // By tag, in place: a directory is searched, and they are few.
+    i = 1;
+    while (i < n) {
+        let is _Table as x = t[i];
+        let is i64 as k with mut = i;
+        while (k > 0 && t[k - 1].tag > x.tag) {
+            t[k] = t[k - 1];
+            k = k - 1;
+        }
+        t[k] = x;
+        i = i + 1;
+    }
+    _w32(out, flavor);
+    _w16(&out[4], n);
+    let is i64 as range with mut = 16;
+    let is i64 as sel with mut = 0;
+    while (range * 2 <= n * 16) {
+        range = range * 2;
+        sel = sel + 1;
+    }
+    _w16(&out[6], range);
+    _w16(&out[8], sel);
+    _w16(&out[10], n * 16 - range);
+    let is i64 as at with mut = 12 + 16 * n;
+    i = 0;
+    while (i < n) {
+        let is *u8 as d = &out[12 + i * 16];
+        _w32(d, t[i].tag);
+        _w32(&d[4], _checksum(t[i].from, t[i].len));
+        _w32(&d[8], at);
+        _w32(&d[12], t[i].len);
+        if (t[i].len > 0) { mem.core.memcpy(&out[at], t[i].from, t[i].len); }
+        at = at + ((t[i].len + 3) & (0 - 4));
+        i = i + 1;
+    }
+    *out_size = total;
+    return out;
+}
+
+fn _free_tables(t as *_Table, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (t[i].owns == 1) { bytes.bytes_free(&t[i].owned); }
+        i = i + 1;
+    }
+    mem.core.munmap(cast(*u8, t), MAX_TABLES * sizeof(_Table));
+}
+
+fn _woff1(data as *u8, size as i64, out_size as *i64) as *u8 {
+    let is _R as r with mut = _rd(data, size);
+    _u32(&r);
+    let is i64 as flavor = _u32(&r);
+    if (flavor == TAG_TTCF) { return cast(*u8, 0); }
+    _u32(&r);
+    let is i64 as n = _u16(&r);
+    if (n == 0 || n > MAX_TABLES || r.bad == 1) { return cast(*u8, 0); }
+    r.i = 44;
+    let is *_Table as t = cast(*_Table, mem.core.mmap_anon(MAX_TABLES * sizeof(_Table)));
+    let is i64 as ok with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < n && ok == 1) {
+        let is i64 as tag = _u32(&r);
+        let is i64 as off = _u32(&r);
+        let is i64 as comp = _u32(&r);
+        let is i64 as orig = _u32(&r);
+        _u32(&r);
+        if (r.bad == 1 || off + comp > size || orig > MAX_SFNT || comp > orig) { ok = 0; break; }
+        t[i].tag = tag;
+        t[i].orig = orig;
+        if (comp == orig) {
+            t[i].from = &data[off];
+            t[i].len = orig;
+        } else {
+            t[i].owned = bytes.bytes_new(orig + 16);
+            t[i].owns = 1;
+            if (zlib.zlib_decompress(&data[off], comp, &t[i].owned) < 0 || t[i].owned.len != orig) { ok = 0; }
+            t[i].from = t[i].owned.ptr;
+            t[i].len = t[i].owned.len;
+        }
+        i = i + 1;
+    }
+    let is *u8 as out with mut = cast(*u8, 0);
+    if (ok == 1) { out = _assemble(t, n, flavor, out_size); }
+    _free_tables(t, n);
+    return out;
+}
+
+fn _find(t as *_Table, n as i64, tag as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (t[i].tag == tag) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _woff2(data as *u8, size as i64, out_size as *i64) as *u8 {
+    let is _R as r with mut = _rd(data, size);
+    _u32(&r);
+    let is i64 as flavor = _u32(&r);
+    if (flavor == TAG_TTCF) { return cast(*u8, 0); }
+    _u32(&r);
+    let is i64 as n = _u16(&r);
+    _u16(&r);
+    _u32(&r);
+    let is i64 as packed = _u32(&r);
+    r.i = 48;
+    if (n == 0 || n > MAX_TABLES || r.bad == 1) { return cast(*u8, 0); }
+    let is *_Table as t = cast(*_Table, mem.core.mmap_anon(MAX_TABLES * sizeof(_Table)));
+    let is i64 as stream with mut = 0;
+    let is i64 as ok with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < n && ok == 1) {
+        let is i64 as fl = _u8(&r);
+        let is i64 as tag with mut = 0;
+        if ((fl & 63) == 63) { tag = _u32(&r); }
+        else { tag = _tag_of_index(fl & 63); }
+        let is i64 as shape = fl >> 6;
+        let is i64 as orig = _base128(&r);
+        let is i64 as kept with mut = orig;
+        // For these two, 0 is the transform and 3 is none. For anything else, 0 is none.
+        let is i64 as is_gl = cast(i64, tag == TAG_GLYF || tag == TAG_LOCA);
+        let is i64 as changed with mut = cast(i64, shape != 0);
+        if (is_gl == 1) { changed = cast(i64, shape == 0); }
+        if (is_gl == 1 && shape != 0 && shape != 3) { ok = 0; }
+        if (is_gl == 0 && shape != 0 && (tag != TAG_HMTX || shape != 1)) { ok = 0; }
+        if (changed == 1) { kept = _base128(&r); }
+        if (r.bad == 1 || orig > MAX_SFNT || kept > MAX_SFNT) { ok = 0; }
+        t[i].tag = tag;
+        t[i].orig = orig;
+        t[i].kept = kept;
+        t[i].shape = changed;
+        stream = stream + kept;
+        if (stream > MAX_SFNT) { ok = 0; }
+        i = i + 1;
+    }
+    let is *u8 as out with mut = cast(*u8, 0);
+    if (ok == 0 || r.i + packed > size) {
+        _free_tables(t, n);
+        return out;
+    }
+    let is bytes.Bytes as plain with mut = bytes.bytes_new(stream + 16);
+    if (brotli.brotli_decompress(&data[r.i], packed, &plain) < 0 || plain.len != stream) { ok = 0; }
+    let is i64 as at with mut = 0;
+    i = 0;
+    while (i < n && ok == 1) {
+        t[i].from = &plain.ptr[at];
+        t[i].len = t[i].kept;
+        at = at + t[i].kept;
+        i = i + 1;
+    }
+    let is *i64 as xm with mut = cast(*i64, 0);
+    let is i64 as glyphs with mut = 0;
+    if (ok == 1) {
+        let is i64 as g = _find(t, n, TAG_GLYF);
+        let is i64 as l = _find(t, n, TAG_LOCA);
+        if (cast(i64, g >= 0) != cast(i64, l >= 0)) { ok = 0; }
+        else if (g >= 0 && t[g].shape != t[l].shape) { ok = 0; }
+        else if (g >= 0 && t[g].shape == 1) {
+            if (t[l].kept != 0) { ok = 0; }
+            else {
+                t[g].owned = bytes.bytes_new(t[g].orig + 64);
+                t[g].owns = 1;
+                t[l].owned = bytes.bytes_new(t[l].orig + 8);
+                t[l].owns = 1;
+                ok = _glyf(t[g].from, t[g].kept, &t[g].owned, &t[l].owned, &xm, &glyphs);
+                t[g].from = t[g].owned.ptr;
+                t[g].len = t[g].owned.len;
+                t[l].from = t[l].owned.ptr;
+                t[l].len = t[l].owned.len;
+            }
+        }
+    }
+    if (ok == 1) {
+        let is i64 as h = _find(t, n, TAG_HMTX);
+        if (h >= 0 && t[h].shape == 1) {
+            let is i64 as hh = _find(t, n, TAG_HHEA);
+            let is i64 as mx = _find(t, n, TAG_MAXP);
+            if (hh < 0 || t[hh].len < 36 || mx < 0 || t[mx].len < 6 || xm == null) { ok = 0; }
+            else {
+                let is _R as q with mut = _rd(&t[hh].from[34], 2);
+                let is i64 as metrics = _u16(&q);
+                t[h].owned = bytes.bytes_new(t[h].orig + 8);
+                t[h].owns = 1;
+                ok = _hmtx(t[h].from, t[h].kept, metrics, glyphs, xm, &t[h].owned);
+                t[h].from = t[h].owned.ptr;
+                t[h].len = t[h].owned.len;
+            }
+        }
+    }
+    if (ok == 1) { out = _assemble(t, n, flavor, out_size); }
+    if (xm != null) { mem.core.munmap(cast(*u8, xm), (glyphs + 1) * 8); }
+    bytes.bytes_free(&plain);
+    _free_tables(t, n);
+    return out;
+}
+
+fn is_wrapped(data as *u8, size as i64) as i64 {
+    if (size < 4) { return 0; }
+    let is _R as r with mut = _rd(data, size);
+    let is i64 as tag = _u32(&r);
+    return cast(i64, tag == TAG_WOFF || tag == TAG_WOF2);
+}
+
+// The sfnt inside data, in memory of its own for free, or null if there is none. A single
+// font only: a collection in WOFF2 is something the web does not serve.
+fn unwrap(data as *u8, size as i64, out_size as *i64) as *u8 {
+    if (size < 44) { return cast(*u8, 0); }
+    let is _R as r with mut = _rd(data, size);
+    let is i64 as tag = _u32(&r);
+    if (tag == TAG_WOFF) { return _woff1(data, size, out_size); }
+    if (tag == TAG_WOF2 && size >= 48) { return _woff2(data, size, out_size); }
+    return cast(*u8, 0);
+}
+
+fn free(p as *u8, size as i64) as void {
+    if (cast(i64, p) != 0) { mem.core.munmap(p, size); }
+}
