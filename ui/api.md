@@ -550,6 +550,7 @@ where each event goes.
 - `refresh_hover(t as *tree.Tree, r as *Router, time as i64) as void` — For when widgets moved under a pointer that did not: after a layout pass, a scroll, a widget shown or hidden.
 - `pointer_move(t as *tree.Tree, r as *Router, x as f64, y as f64, time as i64) as void`
 - `pointer_shape(t as *tree.Tree, r as *Router) as i32` — The pointer's shape where it is, for the window to show: asked of the widget holding a press, wherever the pointer went, or else of the deepest one under it, then up the tree until one has a shape of its own.
+- `shapes_found(r as *Router) as i64` — How many times pointer_shape worked the shape out rather than remembering it: for tests.
 - `dismiss(t as *tree.Tree, r as *Router, time as i64) as i32` — The window system took a popup down — a press outside the program's windows, another program taking the pointer, the compositor's popup_done — with no press here to say so: the modal scope hears PRESS_OUTSIDE, as ...
 - `pointer_leave(t as *tree.Tree, r as *Router, time as i64) as void` — The pointer left the window.
 - `pointer_button(t as *tree.Tree, r as *Router, button as i32, pressed as i32,` — button is 1 left, 2 middle, 3 right; pressed is 1 down, 0 up.
@@ -990,6 +991,8 @@ widgets as nodes in a window's tree, and the handles to them.
 - `invalidate_layout(t as *Tree, w as i64) as void`
 - `needs_layout(t as *Tree, w as i64) as i32`
 - `clear_layout(t as *Tree, w as i64) as void`
+- `stamp(t as *Tree) as i64` — A number that changes whenever anything may have moved, been shown or hidden or drawn differently — every invalidation, every layout pass that arranged anything — and not otherwise: what was worked out from the tr...
+- `bump(t as *Tree) as void` — Changes the stamp: for a pass that moved what was laid out (layout.run).
 - `invalidate_paint(t as *Tree, w as i64) as void`
 - `invalidate_paint_subtree(t as *Tree, w as i64) as void` — w and everything under it — for a change every descendant shows, such as being disabled.
 - `needs_paint(t as *Tree, w as i64) as i32`
