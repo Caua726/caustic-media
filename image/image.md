@@ -103,11 +103,48 @@ Where no thread can be started (the target has none, or spawning fails),
 code runs, only without the overlap. Every decode — a Job's, `bytes`'s,
 `file`'s — takes one lock, because caustic-image's JPEG and WebP decoders
 keep their state in module variables; Jobs overlap the program, not each
-other. Decoding is whole or nothing — caustic-image decodes complete files
-— so there is no partial image to show while it runs, and `cancel` after
-the decode began waits for it to end and drops the result. A program takes
-or cancels its Jobs before `main` returns (its runtime ends with `exit`,
-not `exit_group`).
+other. A Job decodes a complete file, so there is no partial image to show
+while it runs, and `cancel` after the decode began waits for it to end and
+drops the result. A program takes or cancels its Jobs before `main` returns
+(its runtime ends with `exit`, not `exit_group`).
+
+## Decoding as the bytes arrive
+
+A program that gets an image in pieces — a download, a pipe — uses a
+`load.Stream`, which decodes on a thread of its own as the pieces come
+(caustic-image's `progressive.cst`):
+
+```
+let is load.Stream as s;           // stays put from open to close
+load.stream_open(&s);
+load.stream_feed(&s, data, n);     // per piece: copies, returns at once
+load.stream_end(&s);               // no more pieces
+...                                // each frame:
+if (load.stream_size(&s, &w, &h) == 1) { /* lay out w x h */ }
+let is i64 as n = load.stream_rows(&s);   // rows of stream_shown(&s) final
+if (load.stream_done(&s) == 1) {
+    let is image.buffer.Image as im = load.stream_take(&s);  // no pixels: stream_error
+}
+load.stream_close(&s);             // any time; also the cancel
+```
+
+- The size is known from the header (PNG, JPEG, GIF, BMP, QOI), before any
+  pixel.
+- A non-interlaced PNG shows its finished rows as they come: the first
+  `stream_rows` rows of `stream_shown` hold their final pixels, in the
+  format `stream_take` will give, and never change once shown, so they are
+  read without a lock. Other formats give their pixels at the end.
+- The image `stream_take` gives is the one `load.bytes` gives for the same
+  bytes. It is the caller's; `stream_shown` stays the Stream's until close.
+- Refused (a wrong CRC, a size no image may have, cut short, not an image),
+  the Stream is done with no image and `stream_error` says why; rows shown
+  before stay.
+- `stream_feed` and the queries take the Stream's lock only to hand bytes
+  over; the decoding is all on its thread. The final decode of a JPEG or
+  WebP takes the same lock as `bytes()`. `stream_close` stops the thread at
+  its next piece, or waits for a final decode already running.
+- Where no thread can be started, `stream_feed` and `stream_end` do the work
+  themselves. Close every Stream before `main` returns.
 
 ---
 
@@ -159,7 +196,10 @@ pages.
 caustic-compact at their tags: any format it decodes, into the nearest format
 here — gray R8, colour RGB8, anything transparent RGBA8, 16-bit channels by
 their high byte. `load_test` decodes PNGs of every colour type written byte by
-byte by `tools/make_pngs.py`, pixels known exactly. The three libraries this
+byte by `tools/make_pngs.py`, pixels known exactly, and streams PNGs, a JPEG
+and a BMP in pieces: size early, rows as final, the image as `bytes()`'s;
+cut short, a wrong CRC, an absurd size, cancelled at each point, four at
+once on four threads. The three libraries this
 repository builds on are also built for Windows and run under wine
 (`caustic-mk run test-win32`).
 

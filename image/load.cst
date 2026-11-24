@@ -17,13 +17,19 @@
 // can be started, and at once where none can. Every decode here — a Job's
 // and bytes()'s and file()'s — takes one lock: caustic-image's JPEG and WebP
 // decoders keep their state in module variables, so two at a time would
-// tread on each other. Decoding is whole or nothing: caustic-image decodes a
-// complete file, so there is no image in part while it runs.
+// tread on each other. A Job decodes a complete file: no image in part.
+//
+// A Stream decodes while the bytes are still arriving (caustic-image's
+// progressive.cst), on a thread of its own: its size is known from the
+// header, a non-interlaced PNG's finished rows appear as they come, and the
+// last bytes give the whole image — the one bytes() gives for the same bytes.
 use "std/mem.cst" as mem;
 use "std/thread.cst" as thread;
 use "std/sync.cst" as sync;
 use "std/os/linux.cst" as linux;
 use "caustic-image/decode.cst" as cdecode;
+use "caustic-image/progressive.cst" as pg;
+use "caustic-compact/core/bytes.cst" as cb;
 use "caustic-image/core/image.cst" as cimage;
 use "caustic-image/core/pixfmt.cst" as pixfmt;
 use "caustic-image/ops/ops.cst" as ops;
@@ -232,4 +238,314 @@ fn file(path as *u8) as buffer.Image {
     let is buffer.Image as im = bytes(data, n);
     mem.core.munmap(data, size);
     return im;
+}
+
+// --- As the bytes arrive ---
+//
+//   let is load.Stream as s;            // stays put from open to close
+//   load.stream_open(&s);
+//   load.stream_feed(&s, data, n);      // copies; returns at once
+//   load.stream_end(&s);                // no more bytes
+//   load.stream_size(&s, &w, &h)        // 1 once the header is read
+//   load.stream_rows(&s)                // rows of stream_shown(&s) final
+//   load.stream_done(&s)                // the whole image, or refused
+//   load.stream_take(&s)                // the image: no pixels if refused
+//   load.stream_close(&s);              // any time: also the cancel
+//
+// The Stream's thread owns the decoder and does all the work: feed, end and
+// the queries take a lock only long enough to hand bytes over or read a
+// word, so a program's loop never waits on a decode. stream_shown is an
+// Image the size of the picture, in the format take will give, whose first
+// stream_rows rows hold their final pixels — written once, never changed
+// after, so they may be read without a lock while more come; the rest is
+// zero. It is the Stream's, until close. Rows appear for non-interlaced
+// PNG; other formats give their size early and their pixels at the end.
+//
+// Refused — a CRC that does not match, a size no image may have, a file
+// cut short, not an image — the Stream is done with no image, stream_error
+// says why, and the rows shown before stay. close stops the thread at the
+// next bytes; a final decode already running (JPEG, WebP: one at a time
+// under the same lock as bytes()) is waited for. As with Jobs, close every
+// Stream before main returns. Where no thread can be started, the work is
+// done in feed and end themselves.
+
+struct Stream {
+    p        as pg.Progressive;   // the thread's alone
+    lock     as sync.Mutex;
+    more     as sync.Cond;
+    pending  as cb.Bytes;         // fed, not yet given to the decoder (under lock)
+    ended    as u32;              // no more bytes (under lock)
+    stop     as u32;              // closing
+    stage    as u32;              // 0 nothing yet, 1 size known, 2 rows, 3 done
+    _pad     as u32;
+    width    as i64;              // valid from stage 1
+    height   as i64;
+    rows     as i64;              // stream_rows: stored after the rows are written
+    shown    as buffer.Image;     // valid from stage 2
+    want     as i64;              // caustic-image format shown converts to
+    result   as buffer.Image;     // the whole image, when done
+    err      as i64;              // 0, or why not, when done
+    th       as thread.Thread;
+    threaded as i32;
+    open     as i32;
+}
+
+let is i32 as _inline with mut = 0;
+
+// Tests: Streams opened after this with on = 1 start no thread, as where
+// none can be — feed and end do the work.
+fn stream_inline(on as i32) as void { _inline = on; }
+
+fn _blank(im as *buffer.Image) as void {
+    im.pixels = cast(*u8, 0);
+    im.width = 0;
+    im.height = 0;
+    im.stride = 0;
+    im.format = buffer.RGBA8;
+    im.borrowed = 0;
+}
+
+// The nearest format here for a caustic-image one, as _converted makes it.
+fn _nearest(fmt as i64, want as *i64) as i32 {
+    let is i64 as ch = pixfmt.fmt_channels(fmt);
+    *want = pixfmt.FMT_RGBA8;
+    if (ch == 1) { *want = pixfmt.FMT_GRAY8; return buffer.R8; }
+    if (ch == 3) { *want = pixfmt.FMT_RGB8; return buffer.RGB8; }
+    return buffer.RGBA8;
+}
+
+// The decoder's rows from s.rows up, converted into shown; then published.
+fn _show(s as *Stream) as void {
+    let is *cimage.Image as src = pg.image_of(&s.p);
+    let is i64 as upto = pg.rows(&s.p);
+    if (upto <= s.rows || cast(i64, src.pixels) == 0) { return; }
+    if (cast(i64, s.shown.pixels) == 0) {
+        let is i32 as format = _nearest(src.fmt, &s.want);
+        s.shown = buffer.create(src.width, src.height, format);
+        if (cast(i64, s.shown.pixels) == 0) { return; }
+    }
+    // The new rows as an image of their own, converted as the whole will be.
+    let is cimage.Image as part;
+    part.pixels = cast(*u8, cast(i64, src.pixels) + s.rows * src.stride);
+    part.width = src.width;
+    part.height = upto - s.rows;
+    part.stride = src.stride;
+    part.fmt = src.fmt;
+    part.owned = 0;
+    let is cimage.Image as conv;
+    let is *cimage.Image as from with mut = &part;
+    if (src.fmt != s.want) {
+        if (ops.op_convert(&part, s.want, &conv) < 0) { return; }
+        from = &conv;
+    }
+    let is i64 as y with mut = 0;
+    while (y < part.height) {
+        mem.core.memcpy(cast(*u8, cast(i64, s.shown.pixels) + (s.rows + y) * s.shown.stride),
+                        cast(*u8, cast(i64, from.pixels) + y * from.stride), s.shown.stride);
+        y = y + 1;
+    }
+    if (src.fmt != s.want) { cimage.image_free(&conv); }
+    atomic_store(&s.rows, upto);
+    atomic_store(&s.stage, cast(u32, 2));
+}
+
+// What the decoder knows now, made visible.
+fn _publish(s as *Stream) as void {
+    if (atomic_load(&s.stage) == cast(u32, 0) && pg.width(&s.p) > 0) {
+        s.width = pg.width(&s.p);
+        s.height = pg.height(&s.p);
+        atomic_store(&s.stage, cast(u32, 1));
+    }
+    _show(s);
+}
+
+fn _finished(s as *Stream, err as i64) as void {
+    s.err = err;
+    atomic_store(&s.stage, cast(u32, 3));
+}
+
+// The bytes handed over, decoded; and, once they are all in, the end.
+// 1 when the Stream is done.
+fn _step(s as *Stream, got as *cb.Bytes, ended as u32) as i32 {
+    if (got.len > 0) {
+        let is i64 as st = pg.feed(&s.p, got.ptr, got.len);
+        _publish(s);
+        if (st < 0) { _finished(s, st); return 1; }
+    }
+    if (ended == cast(u32, 0)) { return 0; }
+    sync.mutex_lock(&_decoding);
+    let is i64 as rc = pg.finish(&s.p);
+    if (rc == pg.DONE) {
+        let is cimage.Image as whole;
+        pg.take(&s.p, &whole);
+        s.result = _converted(&whole);
+        cimage.image_free(&whole);
+    }
+    sync.mutex_unlock(&_decoding);
+    _publish(s);
+    if (rc != pg.DONE) { _finished(s, rc); return 1; }
+    if (cast(i64, s.result.pixels) == 0) { _finished(s, ERR_MEMORY); return 1; }
+    if (s.width == 0) {
+        s.width = s.result.width;
+        s.height = s.result.height;
+    }
+    _finished(s, 0);
+    return 1;
+}
+
+fn _stream_run(arg as i64) as i64 {
+    let is *Stream as s = cast(*Stream, arg);
+    while (1 == 1) {
+        sync.mutex_lock(&s.lock);
+        while (s.pending.len == 0 && s.ended == cast(u32, 0) && atomic_load(&s.stop) == cast(u32, 0)) {
+            sync.cond_wait(&s.more, &s.lock);
+        }
+        if (atomic_load(&s.stop) != cast(u32, 0)) {
+            sync.mutex_unlock(&s.lock);
+            _finished(s, ERR_CANCELLED);
+            return 0;
+        }
+        let is cb.Bytes as got = s.pending;
+        s.pending = cb.bytes_new(4096);
+        let is u32 as ended = s.ended;
+        sync.mutex_unlock(&s.lock);
+        let is i32 as over = _step(s, &got, ended);
+        cb.bytes_free(&got);
+        if (over == 1) { return 0; }
+    }
+    return 0;
+}
+
+// Ready for bytes, its thread started (or not, where none can be). 1; 0
+// when it could not be set up, the Stream then done with ERR_MEMORY.
+fn stream_open(s as *Stream) as i32 {
+    s.p = pg.progressive();
+    s.lock.state = cast(u32, 0);
+    s.more.seq = cast(u32, 0);
+    s.pending = cb.bytes_new(4096);
+    s.ended = cast(u32, 0);
+    s.stop = cast(u32, 0);
+    s.stage = cast(u32, 0);
+    s.width = 0;
+    s.height = 0;
+    s.rows = 0;
+    s.want = pixfmt.FMT_RGBA8;
+    _blank(&s.shown);
+    _blank(&s.result);
+    s.err = 0;
+    s.threaded = 0;
+    s.open = 1;
+    if (cast(i64, s.pending.ptr) <= 0) {
+        _finished(s, ERR_MEMORY);
+        return 0;
+    }
+    if (_inline == 0 && thread.spawn(&s.th, fn_ptr(_stream_run), cast(i64, s)) == 0) { s.threaded = 1; }
+    return 1;
+}
+
+// n more bytes at data, copied: the caller's again when this returns. 0
+// when they could not be kept (the Stream is then refused with ERR_MEMORY
+// at its end), or when it is closed or ended.
+fn stream_feed(s as *Stream, data as *u8, n as i64) as i32 {
+    if (s.open == 0 || n < 0) { return 0; }
+    if (s.threaded == 0) {
+        if (atomic_load(&s.stage) == cast(u32, 3) || s.ended != cast(u32, 0)) { return 0; }
+        let is cb.Bytes as got;
+        got.ptr = data;
+        got.len = n;
+        got.cap = n;
+        _step(s, &got, cast(u32, 0));
+        return 1;
+    }
+    sync.mutex_lock(&s.lock);
+    let is i32 as ok with mut = 1;
+    if (s.ended != cast(u32, 0)) { ok = 0; }
+    else if (n > 0 && cb.bytes_append(&s.pending, data, n) < 0) { ok = 0; }
+    if (ok == 1) { sync.cond_signal(&s.more); }
+    sync.mutex_unlock(&s.lock);
+    return ok;
+}
+
+// No more bytes: the last of the decoding begins.
+fn stream_end(s as *Stream) as void {
+    if (s.open == 0) { return; }
+    if (s.threaded == 0) {
+        if (atomic_load(&s.stage) != cast(u32, 3) && s.ended == cast(u32, 0)) {
+            s.ended = cast(u32, 1);
+            let is cb.Bytes as none;
+            none.ptr = cast(*u8, 0);
+            none.len = 0;
+            none.cap = 0;
+            _step(s, &none, cast(u32, 1));
+        }
+        return;
+    }
+    sync.mutex_lock(&s.lock);
+    s.ended = cast(u32, 1);
+    sync.cond_signal(&s.more);
+    sync.mutex_unlock(&s.lock);
+}
+
+// 1 and *w, *h once the size is known; 0 before.
+fn stream_size(s as *Stream, w as *i64, h as *i64) as i32 {
+    let is u32 as st = atomic_load(&s.stage);
+    if (st == cast(u32, 0)) { return 0; }
+    if (st == cast(u32, 3) && s.width == 0) { return 0; }   // refused before its size
+    *w = s.width;
+    *h = s.height;
+    return 1;
+}
+
+// How many rows of stream_shown hold their final pixels.
+fn stream_rows(s as *Stream) as i64 { return atomic_load(&s.rows); }
+
+// The rows so far, the Stream's own: no pixels before the first row.
+fn stream_shown(s as *Stream) as *buffer.Image {
+    if (atomic_load(&s.rows) == 0) { return cast(*buffer.Image, 0); }
+    return &s.shown;
+}
+
+// Whether it is decoded, or refused.
+fn stream_done(s as *Stream) as i32 { return cast(i32, atomic_load(&s.stage) == cast(u32, 3)); }
+
+// Why the Stream gives no image, 0 when it does (or is not done).
+fn stream_error(s as *Stream) as i64 {
+    if (atomic_load(&s.stage) != cast(u32, 3)) { return 0; }
+    return s.err;
+}
+
+// The whole image, waiting for it (after stream_end); no pixels when it was
+// refused. The image is the caller's.
+fn stream_take(s as *Stream) as buffer.Image {
+    if (s.threaded == 1 && s.ended != cast(u32, 0)) {
+        thread.join(&s.th);
+        s.threaded = 0;
+    }
+    let is buffer.Image as im = s.result;
+    if (atomic_load(&s.stage) != cast(u32, 3)) { _blank(&im); return im; }
+    _blank(&s.result);
+    return im;
+}
+
+// Everything given back: the thread stopped (or its final decode waited
+// for), the bytes, the decoder, the rows shown and an image not taken.
+// Twice is once.
+fn stream_close(s as *Stream) as void {
+    if (s.open == 0) { return; }
+    if (s.threaded == 1) {
+        sync.mutex_lock(&s.lock);
+        atomic_store(&s.stop, cast(u32, 1));
+        sync.cond_signal(&s.more);
+        sync.mutex_unlock(&s.lock);
+        thread.join(&s.th);
+        s.threaded = 0;
+    }
+    pg.close(&s.p);
+    cb.bytes_free(&s.pending);
+    if (cast(i64, s.shown.pixels) != 0) { buffer.destroy(&s.shown); }
+    if (cast(i64, s.result.pixels) != 0) { buffer.destroy(&s.result); }
+    _blank(&s.shown);
+    _blank(&s.result);
+    atomic_store(&s.rows, 0);
+    s.open = 0;
 }
