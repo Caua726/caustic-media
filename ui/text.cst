@@ -49,6 +49,7 @@ let is i64 as MAX_FONTS  with imut = 16;   // families, weights and styles remem
 let is i64 as MAX_STYLES with imut = 32;   // styles in one run
 let is i64 as MAX_COLOR_PAGES with imut = 16;
 let is i64 as MAX_SIZES  with imut = 8;    // fonts and sizes whose sizes() are remembered
+let is i64 as MAX_MARKS  with imut = 64;   // marks kept: draw_mark
 
 // How much a service holds, sized once: the glyph pages and their side — the
 // largest glyph it draws — the glyphs the caches remember, and the faces open
@@ -61,6 +62,7 @@ struct Limits {
     glyphs       as i64;   // coverage glyphs remembered
     color_glyphs as i64;
     faces        as i64;
+    mark_pages   as i64;   // marks — icons — kept as coverage on pages of their own, page by page
 }
 
 fn limits_default() as Limits {
@@ -72,6 +74,7 @@ fn limits_default() as Limits {
     l.glyphs = 4096;
     l.color_glyphs = 512;
     l.faces = 64;
+    l.mark_pages = 1;
     return l;
 }
 
@@ -343,6 +346,28 @@ struct Sizes {
     digit    as f64;
 }
 
+// A mark — an icon at a size — kept as its coverage, so that drawing it
+// again is a quad: what it was drawn with (its key, the linear part of the
+// physical transform, the fraction of a pixel it was moved by, the rule) and
+// where its coverage is, from the whole pixel it was moved to.
+struct Mark {
+    key   as i64;
+    xx    as f64;
+    xy    as f64;
+    yx    as f64;
+    yy    as f64;
+    fx    as f64;
+    fy    as f64;
+    rule  as i32;
+    on    as i32;     // in use
+    slot  as image.atlas.Slot;
+    left  as i64;
+    top   as i64;
+    w     as i64;
+    h     as i64;
+    last  as i64;     // the frame it was last drawn in
+}
+
 struct Service {
     lay      as layout.Layout;
     resolve  as ResolveFn;
@@ -370,6 +395,11 @@ struct Service {
     nsizes   as i64;
     snext    as i64;
     srun     as Run;                   // where sizes() lays its samples out
+    mcov     as coverage.Coverage;     // marks' coverage: pages no glyph is evicted from
+    marks    as [64]Mark;
+    marks_on as i32;                   // mcov was made
+    _pad1    as i32;
+    mfills   as i64;                   // marks rasterized: mark_fills()
 }
 
 
@@ -416,6 +446,14 @@ fn open(d as *dev.Device, l as *Limits, resolve as ResolveFn, user as *u8, famil
             image.atlas.ok(&s.colors) == 1) {
             s.drawing = 1;
         }
+        // Marks are drawn with the glyphs' rasterizer; their pages are their
+        // own, as large as the glyphs' — a quad drawn at a scale that is not
+        // whole samples a page of another size differently. None asked for:
+        // every mark is filled as a path each time.
+        if (l.mark_pages > 0) {
+            s.mcov = coverage.open(d, l.page, l.mark_pages, 1);
+            if (image.atlas.ok(&s.mcov.atlas) == 1) { s.marks_on = 1; }
+        }
     }
     return s;
 }
@@ -441,6 +479,7 @@ fn close(s as *Service) as void {
         atlas.close(&s.cache);
         outline.path.close(&s.path);
         coverage.close(&s.cov);
+        if (s.marks_on == 1) { coverage.close(&s.mcov); }
     }
     layout.close(&s.lay);
     run_close(&s.srun);
@@ -463,6 +502,120 @@ fn fill_path(s as *Service, c as *draw2d.Canvas, p as *path.Path, t as *raster.f
     return upload(s);
 }
 
+// --- Marks ---
+
+// The physical transform of logical t on canvas c: (x - origin) times the
+// scale, as shapes.fill_path takes it.
+fn _physical(c as *draw2d.Canvas, t as *raster.flatten.Transform) as raster.flatten.Transform {
+    let is f64 as k = draw2d.scale(c);
+    return raster.transform(t.xx * k, t.xy * k, t.yx * k, t.yy * k, (t.dx - c.origin_x) * k, (t.dy - c.origin_y) * k);
+}
+
+fn _mark_quad(s as *Service, c as *draw2d.Canvas, m as *Mark, wx as i64, wy as i64, col as math.color.Color) as void {
+    let is f64 as k = draw2d.scale(c);
+    let is f64 as pw = cast(f64, s.mcov.atlas.w);
+    let is f64 as ph = cast(f64, s.mcov.atlas.h);
+    draw2d.glyph(c, coverage.texture_of(&s.mcov, m.slot.page),
+                 cast(f64, wx + m.left) / k + c.origin_x, cast(f64, wy + m.top) / k + c.origin_y,
+                 cast(f64, m.w) / k, cast(f64, m.h) / k,
+                 cast(f64, m.slot.x) / pw, cast(f64, m.slot.y) / ph,
+                 cast(f64, m.slot.x + m.w) / pw, cast(f64, m.slot.y + m.h) / ph, col);
+}
+
+// Mark key drawn with logical transform t and rule as it was kept: 1 when it
+// was, and is drawn; 0 when it is not kept — the caller then has its path
+// made and calls fill_mark.
+fn draw_mark(s as *Service, c as *draw2d.Canvas, key as i64, t as *raster.flatten.Transform, rule as i32,
+             col as math.color.Color) as i32 {
+    if (s.drawing == 0 || s.marks_on == 0) { return 0; }
+    let is raster.flatten.Transform as d = _physical(c, t);
+    let is f64 as wx = fm.floor(d.dx);
+    let is f64 as wy = fm.floor(d.dy);
+    let is f64 as fx = d.dx - wx;
+    let is f64 as fy = d.dy - wy;
+    let is i64 as i with mut = 0;
+    while (i < MAX_MARKS) {
+        let is *Mark as m = &s.marks[i];
+        if (m.on == 1 && m.key == key && m.rule == rule && m.xx == d.xx && m.xy == d.xy && m.yx == d.yx &&
+            m.yy == d.yy && m.fx == fx && m.fy == fy) {
+            if (m.w > 0 && image.atlas.valid(&s.mcov.atlas, &m.slot) == 0) {
+                m.on = 0;
+                return 0;
+            }
+            m.last = s.frame;
+            if (m.w > 0) {
+                image.atlas.touch(&s.mcov.atlas, &m.slot);
+                _mark_quad(s, c, m, cast(i64, wx), cast(i64, wy), col);
+            }
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Path p, mark key, filled with logical transform t and rule as
+// fill_path fills it, and kept: rasterized moved by the fraction of a pixel
+// alone, so that wherever it is drawn again by whole pixels it is the same
+// coverage. Filled as a path, not kept, when it is larger than a mark page.
+fn fill_mark(s as *Service, c as *draw2d.Canvas, key as i64, p as *path.Path, t as *raster.flatten.Transform,
+             rule as i32, col as math.color.Color) as i32 {
+    if (s.drawing == 0) { return 0; }
+    if (s.marks_on == 0) { return fill_path(s, c, p, t, rule, col); }
+    let is raster.flatten.Transform as d = _physical(c, t);
+    let is f64 as wx = fm.floor(d.dx);
+    let is f64 as wy = fm.floor(d.dy);
+    let is raster.flatten.Transform as f = raster.transform(d.xx, d.xy, d.yx, d.yy, d.dx - wx, d.dy - wy);
+    let is raster.Box as b;
+    if (raster.bounds(p, &f, &b) == 0) {
+        draw2d.overflow(c);
+        return 0;
+    }
+    if (b.w > s.mcov.atlas.w || b.h > s.mcov.atlas.h) { return fill_path(s, c, p, t, rule, col); }
+    // The place of the one drawn longest ago, or a free one.
+    let is i64 as at with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < MAX_MARKS) {
+        let is *Mark as m = &s.marks[i];
+        if (m.on == 0) { at = i; i = MAX_MARKS; }
+        else if (at < 0 || m.last < s.marks[at].last) { at = i; }
+        i = i + 1;
+    }
+    let is *Mark as m = &s.marks[at];
+    m.on = 0;
+    m.key = key;
+    m.rule = rule;
+    m.xx = d.xx;
+    m.xy = d.xy;
+    m.yx = d.yx;
+    m.yy = d.yy;
+    m.fx = f.dx;
+    m.fy = f.dy;
+    m.left = b.left;
+    m.top = b.top;
+    m.w = b.w;
+    m.h = b.h;
+    m.last = s.frame;
+    if (b.w > 0 && b.h > 0) {
+        if (image.atlas.alloc(&s.mcov.atlas, b.w, b.h, &m.slot) != image.atlas.PLACED) {
+            return fill_path(s, c, p, t, rule, col);
+        }
+        let is *image.buffer.Image as pg = image.atlas.page(&s.mcov.atlas, m.slot.page);
+        let is *u8 as px = cast(*u8, cast(i64, pg.pixels) + m.slot.y * pg.stride + m.slot.x);
+        if (raster.draw(&s.cov.raster, p, &f, &b, rule, px, pg.stride) == 0) {
+            draw2d.overflow(c);
+            return 0;
+        }
+        s.mfills = s.mfills + 1;
+        _mark_quad(s, c, m, cast(i64, wx), cast(i64, wy), col);
+    }
+    m.on = 1;
+    return upload(s);
+}
+
+// How many marks s has rasterized: each mark once while it is kept.
+fn mark_fills(s as *Service) as i64 { return s.mfills; }
+
 // A frame begins: what the glyph caches hold for it is kept until the next.
 fn next_frame(s as *Service) as void {
     s.frame = s.frame + 1;
@@ -470,6 +623,7 @@ fn next_frame(s as *Service) as void {
         atlas.next_frame(&s.cache);
         atlas.next_frame(&s.ccache);
         coverage.next_frame(&s.cov);
+        if (s.marks_on == 1) { coverage.next_frame(&s.mcov); }
         image.atlas.next_frame(&s.colors);
     }
 }
@@ -784,6 +938,7 @@ fn _color_texture(s as *Service, p as i64) as i64 {
 fn upload(s as *Service) as i32 {
     if (s.drawing == 0) { return 1; }
     let is i32 as ok with mut = coverage.upload(&s.cov);
+    if (s.marks_on == 1 && coverage.upload(&s.mcov) == 0) { ok = 0; }
     let is i64 as p with mut = 0;
     while (p < image.atlas.pages(&s.colors)) {
         let is image.atlas.Region as rg;

@@ -837,6 +837,9 @@ the toolkit's text: one service per application that lays text out and draws it,
 - `close(s as *Service) as void`
 - `set_family(s as *Service, family as *u8) as void` — The interface font a style of no family is set in, from here on.
 - `fill_path(s as *Service, c as *draw2d.Canvas, p as *path.Path, t as *raster.flatten.Transform, rule as i32,` — Path p — its points mapped by t into logical units — filled in col on c under rule, through the service's coverage pages as its glyphs are: an icon (icons.cst).
+- `draw_mark(s as *Service, c as *draw2d.Canvas, key as i64, t as *raster.flatten.Transform, rule as i32,` — Mark key drawn with logical transform t and rule as it was kept: 1 when it was, and is drawn; 0 when it is not kept — the caller then has its path made and calls fill_mark.
+- `fill_mark(s as *Service, c as *draw2d.Canvas, key as i64, p as *path.Path, t as *raster.flatten.Transform,` — Path p, mark key, filled with logical transform t and rule as fill_path fills it, and kept: rasterized moved by the fraction of a pixel alone, so that wherever it is drawn again by whole pixels it is the same coverage.
+- `mark_fills(s as *Service) as i64` — How many marks s has rasterized: each mark once while it is kept.
 - `next_frame(s as *Service) as void` — A frame begins: what the glyph caches hold for it is kept until the next.
 - `font_for(s as *Service, family as *u8, weight as i64, italic as i32) as *font.Font` — The font for a family, weight and style: resolved once and remembered.
 - `lay_layout(s as *Service, l as *layout.Layout, lstyles as *model.Style, text as *u8, nbytes as i64,` — The run's text set in styles, each span of it in its style and the rest in style 0, in the box params describes: 1, or 0 when it could not be — a style with no font, more than MAX_STYLES of them, memory refused, or ...
