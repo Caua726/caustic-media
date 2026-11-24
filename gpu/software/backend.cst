@@ -1169,6 +1169,125 @@ fn _band_worker(arg as i64) as i64 {
     return 0;
 }
 
+// --- The band workers, kept between passes (Linux, keep_threads) ---
+//
+// Starting threads for every pass costs a stack mapped and freed and a clone
+// and a join for each, 170-270 us a pass for three. Between keep_threads(1)
+// and keep_threads(0) the workers are kept on Linux: each waits on its own
+// word until a pass is handed to it. keep_threads(0) ends and joins them
+// before it returns, and it must come before main returns: main ends with
+// exit, not exit_group, so threads still asleep would outlive it and the
+// process's status would be the last one's, not main's. As a net, a worker
+// with nothing for POOL_IDLE_MS ends itself. Outside, and on Windows and
+// CausticOS (no futex: a waiter there yields in a loop), threads are started
+// for each pass as before.
+//
+// A worker's word: GONE (0, not running), IDLE (1, waiting), GIVEN (2, a pass
+// handed to it), QUIT (3, told to end). Only the caller moves IDLE to GIVEN
+// or QUIT, only the worker GIVEN to IDLE or IDLE to GONE — each by
+// compare-and-swap, so a worker leaving as a pass is handed to it either
+// takes the pass or is seen gone and started again.
+let is i64 as POOL_IDLE_MS with imut = 100;
+let is u32 as _GONE with imut = 0;
+let is u32 as _IDLE with imut = 1;
+let is u32 as _GIVEN with imut = 2;
+let is u32 as _QUIT with imut = 3;
+let is i32 as _keep with mut = 0;
+let is [32]u32 as _pool_state with mut;
+let is [32]thread.Thread as _pool_ths with mut;
+let is [32]i32 as _pool_started with mut;   // a thread to join before its slot is used again
+let is i64 as _pool_job with mut = 0;        // *BandJob of the pass handed out
+let is u32 as _pool_left with mut = 0;       // workers given the pass and not done with it
+let is i64 as _pool_starts with mut = 0;     // threads started, for tests
+
+fn _pool_worker(arg as i64) as i64 {
+    let is i64 as k = arg;
+    let is *u32 as word = &_pool_state[k];
+    let is [2]i64 as ts;
+    ts[0] = POOL_IDLE_MS / 1000;
+    ts[1] = (POOL_IDLE_MS % 1000) * 1000000;
+    while (1) {
+        let is u32 as s = atomic_load(word);
+        if (s == _QUIT) { return 0; }
+        if (s == _GIVEN) {
+            _band_worker(_pool_job);
+            atomic_store(word, _IDLE);
+            if (atomic_add(&_pool_left, cast(u32, 0 - 1)) == cast(u32, 1)) {
+                os.linux.futex(cast(*u8, &_pool_left), os.linux.FUTEX_WAKE_PRIVATE, 1, cast(*u8, 0), cast(*u8, 0), 0);
+            }
+        } else {
+            let is i64 as r = os.linux.futex(cast(*u8, word), os.linux.FUTEX_WAIT_PRIVATE, cast(i64, _IDLE),
+                                              cast(*u8, &ts), cast(*u8, 0), 0);
+            // Timed out with nothing handed over: gone, unless a pass came
+            // just now, which the next turn takes.
+            if (r == 0 - 110 && atomic_cas(word, _IDLE, _GONE) == _IDLE) { return 0; }
+        }
+    }
+    return 0;
+}
+
+// job drawn by the caller and n - 1 kept workers; 0 when one could not be
+// started, which leaves its share to the others as before.
+fn _pool_run(job as *BandJob, n as i64) as void {
+    _pool_job = cast(i64, job);
+    atomic_store(&_pool_left, cast(u32, 0));
+    let is i64 as k with mut = 0;
+    while (k < n - 1) {
+        if (atomic_cas(&_pool_state[k], _IDLE, _GIVEN) == _IDLE) {
+            atomic_add(&_pool_left, cast(u32, 1));
+            os.linux.futex(cast(*u8, &_pool_state[k]), os.linux.FUTEX_WAKE_PRIVATE, 1, cast(*u8, 0), cast(*u8, 0), 0);
+        } else {
+            // Gone (or never started): its stack back, then a new one, given the pass.
+            if (_pool_started[k] == 1) {
+                thread.join(&_pool_ths[k]);
+                _pool_started[k] = 0;
+            }
+            atomic_store(&_pool_state[k], _GIVEN);
+            atomic_add(&_pool_left, cast(u32, 1));
+            if (thread.spawn(&_pool_ths[k], fn_ptr(_pool_worker), k) == 0) {
+                _pool_started[k] = 1;
+                _pool_starts = _pool_starts + 1;
+            } else {
+                atomic_store(&_pool_state[k], _GONE);
+                atomic_add(&_pool_left, cast(u32, 0 - 1));
+            }
+        }
+        k = k + 1;
+    }
+    _band_worker(cast(i64, job));
+    let is u32 as v with mut = atomic_load(&_pool_left);
+    while (v != cast(u32, 0)) {
+        os.linux.futex(cast(*u8, &_pool_left), os.linux.FUTEX_WAIT_PRIVATE, cast(i64, v), cast(*u8, 0), cast(*u8, 0), 0);
+        v = atomic_load(&_pool_left);
+    }
+}
+
+// Band workers kept between passes (1) or started for each (0, the
+// default); 0 ends and joins any kept, before it returns. Only Linux keeps
+// them. A program that turns it on turns it off before main returns.
+fn keep_threads(on as i32) as void {
+    if (on == 1 && os.current() == os.OS_LINUX) {
+        _keep = 1;
+        return;
+    }
+    _keep = 0;
+    let is i64 as k with mut = 0;
+    while (k < MAX_THREADS) {
+        if (atomic_cas(&_pool_state[k], _IDLE, _QUIT) == _IDLE) {
+            os.linux.futex(cast(*u8, &_pool_state[k]), os.linux.FUTEX_WAKE_PRIVATE, 1, cast(*u8, 0), cast(*u8, 0), 0);
+        }
+        if (_pool_started[k] == 1) {
+            thread.join(&_pool_ths[k]);
+            _pool_started[k] = 0;
+        }
+        atomic_store(&_pool_state[k], _GONE);
+        k = k + 1;
+    }
+}
+
+// How many band threads have been started since the process began: for tests.
+fn pool_starts() as i64 { return _pool_starts; }
+
 // Records from up to to drawn on _threads threads, the caller's one of them.
 // Twice as many bands as threads, so that one with little in it leaves its
 // thread free for the next. A thread that cannot be started leaves its share to
@@ -1189,6 +1308,11 @@ fn _draw_bands(ci as *cmd.Info, dv as *dev.Device, ex as *Exec, from as i64, to 
     let is [32]i32 as started;
     // The bands race on the rasterizer's test counter: none counted.
     raster.count_fills(0);
+    if (_keep == 1) {
+        _pool_run(&job, _threads);
+        raster.count_fills(1);
+        return;
+    }
     let is i64 as i with mut = 1;
     while (i < _threads) {
         started[i] = cast(i32, thread.spawn(&ths[i], fn_ptr(_band_worker), cast(i64, &job)) == 0);
