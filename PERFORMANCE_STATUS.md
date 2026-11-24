@@ -44,7 +44,7 @@ exist). Low gain is not NOT_APPLICABLE.
 | C3.1 | ortho/screen-space vertex fast path | FIXED | `e91bea1`; mvp read in place, w = 1 when last row is 0 0 0 1, no divide by w = 1; exact |
 | C3.2 | `_six` shades 6 vertices of a quad | FIXED | `e91bea1`; repeated vertices (bytes equal) reuse the shaded corner; rect_test mutation (forced reuse) fails |
 | C3.3 | tint multiply when tint is white | FIXED | `e91bea1`; with C3.1/C3.2: 12.2–13.0 → 9.6–10.0 M cycles, 38.6 → 35.0 M instructions a frame, same hash |
-| C3.4 | 72-byte f64 vertices | PARTIAL | `53de283`: nine-f64 decode in place (35.0 → 30.1 M instructions a frame); `dbd0c6e`: 64-byte vertices, no z (draw2d's z is always 0): same hash, 29.470 → 29.359 M instructions, vertex buffer 4.7 → 4.2 MB; f32/u8 positions and colours BLOCKED by the pixel-exact rule (they round; prerequisite: the owner accepting that) |
+| C3.4 | 72-byte f64 vertices | FIXED | `53de283`: nine-f64 decode in place (35.0 → 30.1 M instructions a frame); `dbd0c6e`: 64-byte vertices, no z; `00be77f` (rounding accepted by the owner, 2026-11-24): eight f32s, 32 bytes, `pipeline.layout_pos2_color_uv_f32`: r_bench same hash (839.1 → 834.3 M instructions a run), kept-quad replay 18–19 → 15 ns a glyph, vertex buffer 4.2 → 2.1 MB, kept quads 384 → 192 B a glyph; all raster/gpu/bands/rect/draw2d suites pass unchanged |
 | C3.5 | vertices stored twice / copied per flush (= E2.1) | FIXED | `c3c1ebf`; caps.maps_in_place; draw2d writes into the vertex buffer; 30.08 → 29.33 M instructions, ~1.9 MB copy a frame fewer |
 | C4 | `rect_shaded`/`_same_shaded` by-value structs | FIXED | `7d9ed09`; confirmed rep movsb 6×80 B in the callee; now pointers; same hash, time within noise |
 | C5 | band threads spawned per pass | FIXED | `4e8fba0`; keep_threads (Linux, opt-in, host.run); 4 threads best 1.26–1.34 → 1.14–1.18 ms a frame; bands_test both modes |
@@ -63,25 +63,28 @@ exist). Low gain is not NOT_APPLICABLE.
 
 | ID | Option | State |
 |---|---|---|
-| F1 | shape coverage cache | BLOCKED — evaluated: 60 rounded controls (fill + border, 120×32, r 6, scale 1.5) 38,520 vertices, 4.53 ms vs 0.36 ms as two quads each (f1 bench); largest remaining gain; a mask composites once where the tessellation blends overlapping fringe triangles in turn, so not pixel-exact: prerequisite the owner accepting that, and an atlas budget. Exact work on the same path is in the rasteriser (_row_span 31%, _fill_unlit 15%, _triangle 11% of it) |
+| F1 | shape coverage cache | FIXED — `4b171a0` (rounding accepted by the owner, 2026-11-24): a rounded rect of one radius, aligned, on a plain canvas, draws its four corners from a cached 2T×2T R8 mask (exact area coverage, 32 masks a canvas, never evicting one drawn this frame) and its sides as rects; 60 rounded controls 38,520 → 6,840 vertices, 4.53 → 0.59 ms (two-quads floor 0.37 ms). Quality: every corner pixel within 25.5/255 of 16×16 supersampled area; vs old path 1.7–2.1% of pixels differ, mean 0.12–0.18/255, the largest (73–81) at corners where the old path was the wrong one (1-px border R18 pixel (12,1): true 0.904, mask 0.89, old ≈0.3); translucent interiors unchanged; gradients, two radii, oversized and unaligned shapes keep the old path; mutants caught |
 | F2 | retained per-run text geometry | FIXED — `28eb3f9` glyph-cache hints; `53dbcc9` one reserve a quad; `0d7d9fd` a run drawn again as it was copies its kept quads in, checked against every face and glyph-cache entry they came from. A run drawn again 65–77 → 15 ns a glyph; r_bench 29.359 → 26.818 M instructions a frame, same hash; vertices, batches and pixels byte-identical (text_test, draw2d_test), each invalidation guard's removal caught |
-| F3 | direct-to-buffer / swapchain presentation (C1 option 3) | NOT_APPLICABLE (software) / BLOCKED (GPU) — with C1.3 presenting is a copy (0.15–0.2 ms) or premultiply (0.46 ms) a full opaque 1080p frame; painting into the buffer instead means repainting what its age lacks (the last frames' damage), costlier than copying it, and breaks scroll pixel moves within a kept texture; swapchain presentation needs a GPU backend, none exists |
+| F3 | direct-to-buffer / swapchain presentation (C1 option 3) | Software: every software-side step done (C1.1–C1.3, C2: present is a copy 0.15–0.2 ms or premultiply 0.46 ms a full opaque 1080p frame); painting straight into the buffer measured costlier (repaints the buffer age's damage) — NOT_APPLICABLE. GPU: BLOCKED — investigated 2026-11-24: `gpu/vk/bind` has Vulkan bindings (loader, structs, layout tests) but no `backend.cst`; `gl/` and `d3d/` are design notes only; `gpu.cst` returns `NO_BACKEND` for every id but software. Machine has lavapipe and radeon ICDs, glslc/glslangValidator. Prerequisite: a Vulkan `backend.cst` implementing `device.cst` (pipelines with SPIR-V shaders for draw2d's layout, textures, swapchain over the window's native handles) — a backend project, not an optimization; nothing claimed |
 | F4 | skip background clear under an opaque root | FIXED — `a208bed`: the window's first widget is told it is painted over the background just laid (painter.S_ON_WINDOW_BG); a square opaque decoration leaves its fill out: one full-window fill less per full repaint (0.13 ms at 1080p), same pixels (decoration_test, mutant caught) |
 
 ## Cross-project (tracked apart)
 
 | ID | Item | State |
 |---|---|---|
-| X1 | CausticOS #15: toolkit damage collapsed into one bounding box | FIXED in this repo (`e1874ce`): rectangles kept apart, a COMMIT each; damage_test (Linux): two corners copy 840 px, not 467,040; built for caustic-x86_64, not run on CausticOS (needs its image) |
-| X2 | CausticOS G29 / browser F7: background/incremental image decoding API | PARTIAL (`6b86c39`, `90222aa`): load.Job background decode with sync fallback, one lock (caustic-image JPEG/WebP globals); cut-short, noisy and cancelled decodes tested; incremental (partial-image) decoding BLOCKED: caustic-image decodes whole files only, and siblings are not edited here |
+| X1 | CausticOS #15: toolkit damage collapsed into one bounding box | FIXED (`e1874ce`) and verified on CausticOS 2026-11-24: isolated clone at `/var/tmp/cm-x1` (causticos 19e1629, caustic-media dependency overridden with this branch at `00be77f`), userspace + ISO built under caps (122 targets, 23 MB); `scripts/test-clip-focus.sh` PASS; QEMU/QMP check (typing, maximise twice): 0 differing pixels between screenshots; COMMIT area for the same session 7,052,720 px / 93 COMMITs (old) → 4,878,192 px / 133 COMMITs (−31% copied) |
+| X2 | CausticOS G29 / browser F7: background/incremental image decoding API | caustic-media side FIXED (`6b86c39`, `90222aa`: load.Job background decode). caustic-image side FIXED on branch `agent/progressive-decode` (worktree `/var/tmp/cm-x2/caustic-image`, main `f6296f0` untouched): `78bdef3` (main's JPEG encoder did not compile), `d94c3bd` (PNG scanline helpers), `540edfa` zsteps (inflate that stops at the input's end; crafted 1 KB PNG hung png_decode forever on main), `689791e` progressive feed/finish/take/close. Integrating it into caustic-media BLOCKED: needs that branch merged and released (not done here by rule) |
 
 ## Gates
 
 - Baseline `caustic-mk run test` on `c893bd7`: failed at
   `sh ui/tools/api.sh | diff ui/api.md -` (api.md 7 entries stale on main);
   with api.md regenerated (`193ba9b`): rc=0.
-- Final, at `0d7d9fd`: test, test-x11, test-wayland, test-win32 and
+- At `0d7d9fd`: test, test-x11, test-wayland, test-win32 and
   test-win32-native all rc=0.
+- Final, at `00be77f` (F1, C3.4 f32 in): test, test-x11, test-wayland,
+  test-win32 and test-win32-native all rc=0, no FAIL line, run one at a
+  time under the caps with WAYLAND_DISPLAY unset.
 
 ## New issues found
 
@@ -114,3 +117,13 @@ exist). Low gain is not NOT_APPLICABLE.
 
 - `host_popup_wayland_test` "painted in the tooltip's colour" fails on
   `c893bd7` (before this work) and after; not a perf regression.
+
+- caustic-image `main`: `encode_ex` in formats/jpeg.cst declares `i` twice
+  (f9ecbfa), so test_jpeg, test_jpeg_prog, test_jpeg_enc and test_dispatch
+  do not compile. Fixed on the branch (`78bdef3`), not on main.
+- caustic-compact `inflate`: a zlib stream cut inside a Huffman block makes
+  it read zero bits past the end and never return. png_decode (and TIFF
+  deflate, CSIF method 0) of a crafted 1 KB PNG hangs. caustic-image's
+  branch stops using it for untrusted input (`540edfa`); caustic-compact
+  itself not edited (not authorised).
+

@@ -9,28 +9,28 @@ each, is in `PERFORMANCE_STATUS.md`; this report sums it up.
 
 | State | Count | Items |
 |---|---|---|
-| FIXED | 42 | A1.1–A1.3, A2.1, A3.1–A3.4, A4.1–A4.3, A5.1, A5.2, A6.1, B1, B2.1, B2.2, B3, B4, B5.1, B5.2, B5.4, C1.1, C1.2, C1.3, C2, C3.1, C3.2, C3.3, C3.5, C4, C5, C6, D1.1, D1.2, D2.1, D2.2, D3, E1.1, E1.2, E2.2, E2.3 |
-| PARTIAL | 1 | C3.4 (64-byte vertices done; f32/u8 vertices blocked by the pixel-exact rule) |
+| FIXED | 43 | A1.1–A1.3, A2.1, A3.1–A3.4, A4.1–A4.3, A5.1, A5.2, A6.1, B1, B2.1, B2.2, B3, B4, B5.1, B5.2, B5.4, C1.1, C1.2, C1.3, C2, C3.1, C3.2, C3.3, C3.4, C3.5, C4, C5, C6, D1.1, D1.2, D2.1, D2.2, D3, E1.1, E1.2, E2.2, E2.3 |
+| PARTIAL | 0 | — |
 | UNRESOLVED | 0 | — |
 | NOT_APPLICABLE | 2 | A2.2, B5.3 (measured: the cost does not exist) |
-| BLOCKED | 0 | (C3.4's remainder is blocked; it is counted as PARTIAL) |
+| BLOCKED | 0 | — |
 
 Architecture, tracked apart:
 
 | Item | State | Why |
 |---|---|---|
 | F4 | FIXED (`a208bed`) | |
-| F1 | BLOCKED | the pixel-exact rule |
+| F1 | FIXED (`4b171a0`) | rounding accepted by the owner on 2026-11-24 |
 | F2 | FIXED (`28eb3f9`, `53dbcc9`, `0d7d9fd`) | |
-| F3 | NOT_APPLICABLE in software | with C1.3, copying is cheaper than repainting what the buffer's age lacks |
-| F3 (GPU swapchain) | BLOCKED | there is no GPU backend |
+| F3 (software) | every software step done (C1.1–C1.3, C2); direct-to-buffer NOT_APPLICABLE | with C1.3, copying is cheaper than repainting what the buffer's age lacks |
+| F3 (GPU swapchain) | BLOCKED | investigated: Vulkan bindings exist, no backend; see below |
 
 Cross-project, tracked apart:
 
 | Item | State |
 |---|---|
-| X1 | FIXED in this repository |
-| X2 | PARTIAL: incremental decoding is blocked on caustic-image |
+| X1 | FIXED, and verified on CausticOS in an isolated checkout |
+| X2 | caustic-media background decode FIXED; caustic-image progressive decoding FIXED on its own branch; integration here BLOCKED on that branch being merged and released |
 
 ## Measured A/B (best of repeated runs, same machine, before → after)
 
@@ -50,6 +50,8 @@ Cross-project, tracked apart:
 | F4 | full repaint of a maximized window | one 1080p fill fewer (0.13 ms) |
 | F2 (hints, one reserve a quad, kept quads) | a run drawn again, a glyph | 65–77 → 53 → 15 ns; r_bench 29.359 → 26.818 M instructions a frame (−8.7%), same hash |
 | C3.4 (no z) | r_bench frame, same hash | 29.470 → 29.359 M instructions; vertex buffer 4.7 → 4.2 MB |
+| C3.4 (f32, `00be77f`) | r_bench run, same hash; kept-quad replay | 839.1 → 834.3 M instructions; 18–19 → 15 ns a glyph; vertex buffer 4.2 → 2.1 MB |
+| F1 (`4b171a0`) | 60 rounded controls (fill + border, 120×32, r 6, scale 1.5) | 38,520 → 6,840 vertices; 4.53 → 0.59 ms (two-quads floor 0.37 ms) |
 | C2 | Wayland conversion, 1080p | 1.86–1.96 → 0.94 ms |
 | C3.1–3 | per frame | 12.2–13.0 → 9.6–10.0 M cycles |
 | C3.4/C3.5 | per frame | 35.0 → 30.1 → 29.33 M instructions |
@@ -62,6 +64,8 @@ Cross-project, tracked apart:
 | E2.2 | default canvas block; three nested cache canvases | 5,046,272 → 327,680 B; −12.4 MB reserved |
 | E2.3 | cached subtree renders on a new window texture | 1 → 0 |
 | X1 | CausticOS, two small corner changes in 800×600 | 467,040 → 840 px copied |
+| X1 on CausticOS | same QEMU session, COMMIT area | 7,052,720 px / 93 COMMITs → 4,878,192 px / 133 COMMITs (−31%) |
+| X2 (caustic-image) | 512×512 PNG, 396,523 B, fed 16 KB at a time | first rows after 32 KB (8%); feeds 37 ms + finish 6–7 ms vs one-shot 6–7 ms; png_decode with zsteps 6–7 ms vs 5–6 ms before |
 
 Not kept, because nothing measured better:
 - B5.3: skipping clean uploads gave 242–274 ns a run after, against
@@ -86,6 +90,19 @@ already existed. The new tests follow the same rule:
   cache, now including a new target filled with garbage.
 - The shaper passes HarfBuzz's 80,714 cases, plus the same cases cut in two.
 
+F1 and C3.4 are no longer pixel-exact (owner's decision, 2026-11-24); their
+evidence is quality, not equality:
+- F1: every corner pixel of the cached path is within 25.5/255 of a 16×16
+  supersampled exact area (draw2d_test). Against the old tessellation
+  (`f1_cmp`): 1.7–2.1% of pixels differ, mean 0.12–0.18/255, largest 73–81,
+  all at corners where the old path was the inaccurate one (1-px border,
+  R 18, pixel (12,1): true coverage 0.904, mask 0.89, old ≈0.3). Translucent
+  interiors are unchanged; a frame with 40 radii keeps the first shape's
+  corner (no in-frame eviction). Text is untouched by F1.
+- C3.4: r_bench, the full scene with text, icons and translucency, kept its
+  hash (5118441270678321031) across the f32 change; rect_test, gpu_test,
+  bands_test and draw2d_test pass unchanged.
+
 Mutants were run for the new checks: C3.2 forced reuse, D1.1, the A5 reach,
 the B4 memo ignoring direction, the X2 decode lock, the premultiply rounding,
 and the 4-pixel group. Each was caught.
@@ -93,6 +110,8 @@ and the 4-pixel group. Each was caught.
 ## Commits (c893bd7..HEAD)
 
 ```
+00be77f draw2d: 32-byte f32 vertices
+4b171a0 shapes2d: rounded rectangles from kept corner masks
 0d7d9fd ui/text: a run drawn again as it was copies its quads in
 53dbcc9 draw2d: a quad reserves its six vertices at once
 dbd0c6e draw2d: 64-byte vertices, no z
@@ -140,6 +159,36 @@ commits update status documents only (`3af5475`, `cd678d4` and the final
 one), so they are not listed above.
 
 ## API guidance (new or changed public calls)
+
+- **Rounded shapes (`4b171a0`):** `shapes2d.fill_rounded*` and
+  `stroke_rounded` use cached corner masks by themselves when the shape has
+  one radius, sits on whole pixels and the canvas has no transform or
+  polygon clip. `shapes2d.kept_corners(0)` turns it off (tests, references).
+  A canvas keeps up to 32 masks and frees them at `close`;
+  `draw2d.mask_count` reports them.
+- **f32 vertices (`00be77f`):** `draw2d.Vertex` is eight f32s (32 bytes),
+  `pipeline.layout_pos2_color_uv_f32()`. A custom pipeline fed draw2d's
+  buffer must use that layout.
+- **caustic-image progressive decoding (branch `agent/progressive-decode`,
+  not merged):** `progressive.cst`:
+  - `let p = progressive(); feed(&p, bytes, n)` per arrival returns the
+    state: NEED, HEADER (`width`/`height` known), ROWS (`rows(&p)` top rows
+    of `image_of(&p)` final, non-interlaced PNG), DONE, or a negative errno.
+  - `finish(&p)` decodes the whole with `decode()`: the final image is the
+    one-shot one, bit for bit. `take(&p, &img)` hands it over after DONE.
+  - Lifetime: the Progressive owns its bytes and image until `take`;
+    `close(&p)` at any state frees everything and is the cancel; twice is
+    safe; after it every call returns I_BADPARAM.
+  - Threads: one Progressive is used by one thread at a time; separate ones
+    share nothing (zsteps fills constant tables once, every thread writing
+    the same values). JPEG/WebP still decode through module globals inside
+    `finish`, so caustic-media's decode lock must cover `finish`.
+  - Malformed input: dimensions refused at the header before allocation
+    (I_DIMS), chunk CRCs checked as they arrive (I_CORRUPT), output bounded
+    by the image size, cut-short streams end in an error with the rows that
+    came kept.
+  - In caustic-media, a `load.Job` would feed a Progressive from its thread
+    and publish `rows()` for a partial paint; that waits for the release.
 
 - `gpu.texture.BGRA8` is a render target in a window buffer's order. The
   host uses it whenever `device.native_pixels` names an order;
@@ -203,26 +252,14 @@ one), so they are not listed above.
 
 ## What is left, and why
 
-- **C3.4, rest BLOCKED by the pixel-exact rule:**
-  - Done exactly: 64-byte vertices with no z, since z is always 0.
-  - Not done: f32/u8 positions and colours. Theme colours such as 0.2 are
-    not f32 numbers, so they round, and a rounding at a .5 boundary
-    changes a pixel.
-  - An exact variant was weighed: f32 only for frames whose every vertex
-    is an f32 number exactly. It needs a check-and-convert pass over the
-    frame at flush. Today that pass would sit in front of the software
-    device, which reads f64 vertices and would gain nothing. It would only
-    pay as smaller uploads to a GPU, and there is no GPU backend.
-  - Prerequisite: the owner accepts rounded vertices, or a GPU backend
-    exists.
-- **F1, BLOCKED by the pixel-exact rule (biggest remaining gain):**
-  - 60 rounded controls make 38,520 vertices and take 4.53 ms, against
-    0.36 ms as two quads each.
-  - A coverage mask composites once, where the tessellation blends
-    overlapping fringe triangles one after another, so the pixels differ.
-  - Prerequisites: the owner accepts that, and decides an atlas budget.
-  - The exact work left on that path is in the rasteriser: `_row_span`
-    31%, `_fill_unlit` 15%, `_triangle` 11%.
+- **C3.4, FIXED:** 64-byte vertices with no z (`dbd0c6e`), then eight f32s
+  (`00be77f`) once the owner accepted rounding. u8 colours were not done:
+  the colour is four f32s inside the 32 bytes, and packing it to 4 bytes
+  would save 12 more a vertex at the price of an unpack per vertex in the
+  software device, which r_bench did not justify.
+- **F1, FIXED (`4b171a0`):** see the A/B and pixel sections. Not covered:
+  gradients whose top and bottom differ, two radii, shapes off whole
+  pixels, transforms and polygon clips; they keep the tessellation.
 - **F2, FIXED:** done in three steps.
   - `28eb3f9`: each glyph remembers its glyph-cache entry.
   - `53dbcc9`: a quad reserves its six vertices at once.
@@ -232,33 +269,41 @@ one), so they are not listed above.
   - Tried and dropped: inlining floor in the glyph cache's subpixel step,
     and in the rasteriser's row span. Neither gained anything.
 - **F3:**
-  - **Software, NOT_APPLICABLE:** after C1.3 presenting is a copy
+  - **Software, done:** C1.1–C1.3 and C2 leave presenting a copy
     (0.15–0.2 ms) or a premultiply alone (0.46 ms) per full opaque 1080p
-    frame. Painting into the window's buffer instead would mean repainting
-    everything its age lacks, which costs more than copying it, and it
-    would break scroll pixel moves within a kept texture.
-  - **GPU swapchain, BLOCKED:** it needs a GPU backend, and none exists.
-- **X1 on CausticOS itself, not run:**
-  - What it takes: a copy of the local `causticos` checkout with its
-    `caustic-media` dependency swapped for this branch, a userspace build
-    and an ISO, then a QEMU boot. The sibling is not edited.
-  - Two things stopped it on 2026-11-24:
-    - `/tmp` is a RAM disk, and the machine had about 1 GB of its 15 GB
-      available, too little for a copy of the checkout plus a build.
-    - CausticOS pins caustic-media `v0.0.8`, so the OS side has to take a
-      release containing `X1` first.
-  - Prerequisites: the memory free, and a tagged caustic-media release.
-- **X1:**
-  - Built for `caustic-x86_64` and tested on Linux through `_frame_rects`,
-    including clipping and the 16-rectangle cap.
-  - Not run on CausticOS, which needs that repository's system image.
-  - It sends up to 16 COMMIT messages a frame instead of one. Each is
-    32 bytes, written whole by `_write_all`.
-- **X2, incremental decoding BLOCKED:**
-  - caustic-image decodes whole files only, and sibling repositories are
-    not edited here.
-  - Background decoding is done and tested, including cancellation and
-    cut-short, noisy and malformed input.
+    frame. Painting straight into the window's buffer would mean repainting
+    everything its age lacks, which costs more than copying it, and it would
+    break scroll pixel moves within a kept texture: NOT_APPLICABLE.
+  - **GPU swapchain, BLOCKED (investigated, not implemented):** `gpu/vk/bind`
+    holds Vulkan bindings (loader, structs, layout checks against lavapipe),
+    but there is no `vk/backend.cst`; `gl/` and `d3d/` are design notes;
+    `gpu.cst` gives `NO_BACKEND` for every backend but software. The machine
+    has lavapipe and radeon ICDs and glslc. Prerequisite: a Vulkan backend
+    implementing `device.cst` (draw2d's pipeline as SPIR-V, textures,
+    a swapchain on the window's native handles). That is a backend project,
+    not a performance fix, and nothing here claims it.
+- **X1, verified on CausticOS (2026-11-24):** no release was needed. An
+  isolated clone in `/var/tmp/cm-x1` (disk, not the `/tmp` RAM disk) of
+  causticos `19e1629`, with its caustic-media dependency overridden by this
+  branch at `00be77f`, built (122 targets, 23 MB ISO, under the caps).
+  `scripts/test-clip-focus.sh` passed. A QEMU/QMP session (typing with the
+  pointer on the title bar, maximise twice) gave 0 differing pixels between
+  the screenshots, and copied 31% less (above). The sibling checkout was
+  not touched. Each frame sends up to 16 COMMITs of 32 bytes instead of one.
+- **X2:**
+  - caustic-media: `load.Job` background decoding, done and tested.
+  - caustic-image, branch `agent/progressive-decode` only (main `f6296f0`
+    untouched, nothing pushed): `78bdef3`, `d94c3bd`, `540edfa`, `689791e`.
+    Its suite is green with `test_progressive`, `test_zsteps` and the
+    hanging-PNG regression; mutants of the CRC check, dimension check,
+    unfiltering, partial-IDAT use, finish and zsteps' end-of-input, output
+    cap and block rewind were each caught.
+  - Cost: rows shown during arrival cost about 6× a one-shot decode in all
+    (each 16 KB step decodes the unfinished deflate block again); `finish`
+    then decodes once more. Only non-interlaced PNG shows rows early;
+    JPEG, GIF, BMP and QOI report their size early and decode at `finish`.
+  - BLOCKED here: using it in caustic-media needs that branch merged and
+    released, which this work does not do.
 
 ## New issues found (not part of the audit)
 
@@ -285,6 +330,13 @@ one), so they are not listed above.
 - **mmap failure checks:** `draw2d.open` and `sw_buffer_create` test
   `mmap_anon` for 0 only, not for -1. This predates the branch and was
   found in review.
+- **caustic-image `main` does not build its JPEG tests:** `encode_ex` declares
+  `i` twice (f9ecbfa). Fixed on the branch only (`78bdef3`).
+- **caustic-compact `inflate` hangs on a cut stream:** cut inside a Huffman
+  block, it decodes zero bits past the end forever. A crafted 1 KB PNG with
+  valid CRCs hangs `png_decode` on caustic-image main — and so any
+  caustic-media program loading untrusted PNGs. caustic-image's branch
+  avoids it (`540edfa`); caustic-compact is not edited (not authorised).
 - **Profile finding not in the audit:** `cmap` format-12 lookup is 9.45% of
   an entry keystroke.
 
@@ -303,7 +355,8 @@ Its residual risks:
 
 ## Gates
 
-All five gate scripts pass at `0d7d9fd`, the last code commit. They ran one
+All five gate scripts pass at `00be77f`, the last code commit (they also
+passed at `0d7d9fd` before F1 and the f32 vertices). They ran one
 at a time, inside the 2.5 GiB memory and 100% CPU caps, with
 `WAYLAND_DISPLAY` unset:
 
@@ -326,5 +379,4 @@ Getting there took three fixes:
   `win32_dnd_named_test`. That test passes in 19.3 s both on `c893bd7` and
   on this branch, and every later run of the script passed.
 
-Not run: the branch on CausticOS itself, which needs the CausticOS
-repository's system image.
+The branch on CausticOS: built and run in the isolated checkout (X1 above).
