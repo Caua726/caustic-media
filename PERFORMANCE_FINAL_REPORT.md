@@ -9,16 +9,17 @@ each, is in `PERFORMANCE_STATUS.md`; this report sums it up.
 
 | State | Count | Items |
 |---|---|---|
-| FIXED | 37 | A1.1–A1.3, A2.1, A3.1–A3.4, A4.1–A4.3, A6.1, B1, B2.1, B2.2, B3, B4, B5.1, B5.2, B5.4, C1.1, C2, C3.1, C3.2, C3.3, C3.5, C4, C5, C6, D1.1, D1.2, D2.1, D2.2, D3, E1.1, E1.2, E2.3 |
-| PARTIAL | 5 | A5.1, A5.2, C1.2, C3.4, E2.2 |
-| UNRESOLVED | 2 | B5.3, C1.3 |
-| NOT_APPLICABLE | 1 | A2.2 |
-| BLOCKED | 0 | — |
+| FIXED | 40 | A1.1–A1.3, A2.1, A3.1–A3.4, A4.1–A4.3, A5.1, A5.2, A6.1, B1, B2.1, B2.2, B3, B4, B5.1, B5.2, B5.4, C1.1, C2, C3.1, C3.2, C3.3, C3.5, C4, C5, C6, D1.1, D1.2, D2.1, D2.2, D3, E1.1, E1.2, E2.2, E2.3 |
+| PARTIAL | 2 | C1.2 (the rest blocked on F3), C3.4 (the rest blocked by the pixel-exact rule) |
+| UNRESOLVED | 1 | C1.3 (bounded at ≤ 0.7 ms a full frame; its cost is below) |
+| NOT_APPLICABLE | 2 | A2.2, B5.3 (measured: the cost does not exist) |
+| BLOCKED | 0 | (two PARTIAL items have blocked remainders) |
 
 Tracked apart:
-- Architecture: F1–F4 were evaluated and measured. None was rewritten, as
-  the goal asked; all four are UNRESOLVED.
-- Cross-project: X1 is FIXED in this repository; X2 is PARTIAL.
+- Architecture: F1 is BLOCKED by the pixel-exact rule. F2, F3 and F4 are
+  evaluated with measured bounds and not implemented.
+- Cross-project: X1 is FIXED in this repository. X2 is PARTIAL; its
+  incremental decoding is blocked on caustic-image.
 
 ## Measured A/B (best of repeated runs, same machine, before → after)
 
@@ -28,7 +29,7 @@ Tracked apart:
 | A2.1 | layouts per changed cut label per frame; 40 labels × 30 frames | 5 → 3; 137 → 89 ms |
 | A3 | 200 frames × 60 icons + text | 96–106 → 24–32 ms |
 | A4 | entry layouts a keystroke | 5 → 2 |
-| A5 | clipped selection draw | 1.29–1.38 → 1.05–1.16 ms |
+| A5 | clipped selection draw | 1.29–1.38 → 1.05–1.16 ms; any run, raised glyphs included |
 | A6 | theme lookups | 61–64 → 50–51 µs |
 | B1/B3/B5 | a cached glyph drawn | 166–185 → 81–82 ns |
 | B4 | a4 bench, whole program | 1,241.8 → 1,216.3 M instructions |
@@ -43,7 +44,7 @@ Tracked apart:
 | D2 | settings said again | 515–605 → 37 µs |
 | D3 | pointer_shape, nothing changed | 4807 → 3 ns |
 | E1 | tree open | 1.24–1.64 → 0.63–0.79 ms |
-| E2.2 | default canvas block | 5,046,272 → 327,680 B |
+| E2.2 | default canvas block; three nested cache canvases | 5,046,272 → 327,680 B; −12.4 MB reserved |
 | E2.3 | cached subtree renders on a new window texture | 1 → 0 |
 | X1 | CausticOS, two small corner changes in 800×600 | 467,040 → 840 px copied |
 
@@ -77,6 +78,12 @@ and the 4-pixel group. Each was caught.
 ## Commits (c893bd7..HEAD)
 
 ```
+bbd5bb6 ui/host_popup_win32_test: the tooltip's colour read in its padding
+90222aa tests: decodes cut short or cancelled; CausticOS damage clipped and capped
+02a5fd5 gpu/software: the band pool's futex calls inside the test for Linux
+2261c02 ui/paint: a nested cache canvas starts small and grows
+da06bba ui/text: a clipped draw finds its glyphs by halving in any run
+ed3203b ui/host_popup_wayland_test: the tooltip's colour read in its padding
 bf5f84b gpu/bgra: four pixels a step while they are opaque
 9ffd9e9 gpu/bgra: premultiplied by shifts, red and blue in one product
 53297f5 text/shape: a plan kept for the next text that would compile the same
@@ -145,46 +152,61 @@ one), so they are not listed above.
 - `widget.theme_at(t, w, &room)` returns a pointer to the tree's own theme.
   Use it instead of copying `widget.theme(...)`.
 
-## What is left, and why (real blockers only)
+## What is left, and why
 
-- **C1.3 (BGRA target):**
-  - At most 0.7 ms on a full opaque 1080p frame. A plain read takes 0.23 ms
-    and the fused read 0.93 ms.
-  - The work would carry a target format through every raster write and
-    blend path.
-  - F3 removes the copy altogether, so it is the better place to spend the
-    effort.
-- **C1.2:** the recopy of the last frame's damage is inherent to two buffers
-  fed from an offscreen texture. It is now one fused, faster pass; only F3
-  removes it.
-- **C3.4:** compact f32/u8 vertices change positions and colours, so they
-  cannot be pixel-exact. The nine-f64 decode was kept instead.
-- **A5:** one clipped call per selection rectangle remains, but each call
-  walks only the lines that can reach its clip. Runs that are not sorted by
-  line still walk everything.
-- **E2.2:** the per-canvas vertex buffer (4.7 MB virtual) and the growth
-  limit remain. Shrinking them changes how big a frame can be.
-- **F1 (biggest remaining gain):**
+- **C1.3 (BGRA target), UNRESOLVED:**
+  - It would gain at most 0.7 ms on a full opaque 1080p frame. A plain
+    read takes 0.23 ms and the fused read and convert 0.93 ms.
+  - It would mean about 23 colour pack sites and texel unpacking in the
+    rasteriser's inner loops and the reference renderer, with uploads
+    swapped on the way in and reads swapped on the way out. Blending
+    needs no change, because it treats red and blue alike.
+  - F3 would make the offscreen texture's order moot.
+- **C1.2, rest BLOCKED on F3:** buffer age requires copying the last
+  frame's damage into the older buffer when painting into an offscreen
+  texture. That copy is now a single fused, faster pass. Only painting
+  into the platform buffer removes it.
+- **C3.4, rest BLOCKED by the pixel-exact rule:** compact f32/u8 vertices
+  move positions and colours by rounding. Prerequisite: the owner accepts
+  non-exact vertex quantisation.
+- **F1, BLOCKED by the pixel-exact rule (biggest remaining gain):**
   - 60 rounded controls make 38,520 vertices and take 4.53 ms, against
     0.36 ms as two quads each.
-  - A coverage cache would not be pixel-exact against the tessellation, and
-    the atlas budget must be decided first. That is a design decision for
-    the owner, not a speculative rewrite.
-- **F2:** about 12% of a text-heavy frame is text-side CPU. Rasterisation
-  (52%) is unaffected.
-- **F3:** this is the route to GPU backends. It needs buffer-age painting
-  on each platform.
-- **F4:** at most 0.13 ms per full 1080p repaint.
+  - A coverage mask composites once, where the tessellation blends
+    overlapping fringe triangles one after another, so the pixels differ.
+  - Prerequisites: the owner accepts that, and decides an atlas budget.
+  - The exact work left on that path is in the rasteriser: `_row_span`
+    31%, `_fill_unlit` 15%, `_triangle` 11%.
+- **F2, evaluated:** about 12% of a text-heavy frame is text-side CPU, and
+  rasterising the quads (52%) is untouched. It needs per-run quad caches
+  invalidated by atlas era.
+- **F3, evaluated:** it removes the 0.93 ms opaque and 4.3–4.45 ms
+  translucent fused copy per full 1080p frame, and the 8 MB offscreen
+  texture. It needs buffer-age painting on each platform, and it is the
+  route to GPU backends.
+- **F4, evaluated:** at most 0.13 ms per full 1080p repaint. It needs an
+  opacity hint that keeps rounded corners and shadows cleared.
 - **X1:** built for `caustic-x86_64` and tested on Linux through
-  `_frame_rects`. It was not run on CausticOS, which needs that
-  repository's image.
-  - It now sends up to 16 COMMIT messages a frame instead of one. Each is
-    32 bytes, written whole by `_write_all`, and the window manager adds
-    each to its damage.
-- **X2:** incremental, partial-image decoding needs changes inside
-  caustic-image. That is a sibling repository and was not edited.
+  `_frame_rects`, including clipping and the 16-rectangle cap. It was not
+  run on CausticOS, which needs that repository's system image. It sends
+  up to 16 COMMIT messages a frame instead of one; each is 32 bytes,
+  written whole by `_write_all`.
+- **X2, incremental decoding BLOCKED:** caustic-image decodes whole files
+  only, and sibling repositories are not edited here. Background decoding
+  is done and tested, including cancellation and cut-short, noisy and
+  malformed input.
 
 ## New issues found (not part of the audit)
+
+- **Caustic std math:** sin/cos send an argument near a multiple of π/2 —
+  where every corner arc starts — through the big-argument reduction.
+  That is 1.25% of the rounded-controls bench.
+- **Found and fixed here:** `4e8fba0` called `os.linux.futex` outside a
+  Linux test, so Windows builds of the toolkit stopped in codegen. Fixed
+  in `02a5fd5`.
+- **Tooltip colour checks:** on Wayland and Win32 they read a pixel on the
+  tooltip's own text, failing on `c893bd7` as well. They now read it in
+  the padding (`ed3203b`, `bbd5bb6`).
 
 - **Caustic runtime:** `_start` ends with `exit` (syscall 60), not
   `exit_group`. Threads still alive when `main` returns keep the process
@@ -195,8 +217,6 @@ one), so they are not listed above.
   variables, so two decodes at once crash (3 of 3 runs without the lock).
 - **Icons at scale 1.5:** the uncached path differs from itself by up to 229
   a channel between atlas slots. This predates the branch.
-- **`host_popup_wayland_test`:** "painted in the tooltip's colour" fails on
-  `c893bd7` as well. This predates the branch.
 - **`ui/api.md`:** was stale on `main`; regenerated in `193ba9b`.
 - **mmap failure checks:** `draw2d.open` and `sw_buffer_create` test
   `mmap_anon` for 0 only, not for -1. This predates the branch and was
@@ -219,14 +239,28 @@ Its residual risks:
 
 ## Gates
 
-All gates were run at `bf5f84b`, inside the memory and CPU caps, with
-`WAYLAND_DISPLAY` unset.
-- `caustic-mk run test` returned rc=0, with no FAIL lines. This includes the
-  `ui/api.md` gate and the new `causticos_damage_test`.
-- `caustic-mk run test-x11` returned rc=0.
-- `caustic-mk run test-wayland` returned rc=1 at `host_popup_wayland_test`
-  ("painted in the tooltip's colour"). That check fails the same way on
-  `c893bd7`, before this branch. The script stops there, so the 42 steps
-  after it were run one by one, and all passed.
-- Not run: `test-win32` and `test-win32-native` (Windows parts come later in
-  the project's order), and CausticOS on the system itself.
+All five gate scripts pass at `bbd5bb6`, the last code commit. They ran one
+at a time, inside the 2.5 GiB memory and 100% CPU caps, with
+`WAYLAND_DISPLAY` unset:
+
+| Script | Result |
+|---|---|
+| `caustic-mk run test` | rc=0, no FAIL (includes the `ui/api.md` gate, `causticos_damage_test`, `load_test`) |
+| `caustic-mk run test-x11` | rc=0 |
+| `caustic-mk run test-wayland` | rc=0 |
+| `caustic-mk run test-win32` | rc=0 |
+| `caustic-mk run test-win32-native` | rc=0 |
+
+Getting there took three fixes:
+- **Windows build (my regression):** the Win32 scripts first failed on a
+  Linux system call in Windows codegen, which this branch had introduced
+  (`02a5fd5` fixes it).
+- **Tooltip colour checks:** the Wayland and Win32 checks read a pixel on
+  the tooltip's text and failed on `c893bd7` as well. They now read it in
+  the padding (`ed3203b`, `bbd5bb6`).
+- **One timeout:** `test-win32-native` timed out once at
+  `win32_dnd_named_test`. That test passes in 19.3 s both on `c893bd7` and
+  on this branch, and the full script passed on the rerun.
+
+Not run: the branch on CausticOS itself, which needs the CausticOS
+repository's system image.
